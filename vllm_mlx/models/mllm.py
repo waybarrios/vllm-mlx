@@ -20,11 +20,13 @@ import tempfile
 from dataclasses import dataclass, field
 from io import BytesIO
 from pathlib import Path
-from typing import Iterator, Union
+from typing import Iterator, List, Optional, Union
 from urllib.parse import urlparse
 
 import requests
 import numpy as np
+
+from vllm_mlx.vlm_cache import VLMCacheManager, VLMCacheStats
 
 logger = logging.getLogger(__name__)
 
@@ -451,6 +453,8 @@ class MLXMultimodalLM:
         self,
         model_name: str,
         trust_remote_code: bool = True,
+        enable_cache: bool = True,
+        cache_size: int = 50,
     ):
         """
         Initialize the MLX multimodal language model.
@@ -458,14 +462,22 @@ class MLXMultimodalLM:
         Args:
             model_name: HuggingFace model name or local path
             trust_remote_code: Whether to trust remote code
+            enable_cache: Enable KV cache for repeated image/prompt combinations
+            cache_size: Maximum number of cache entries (default: 50)
         """
         self.model_name = model_name
         self.trust_remote_code = trust_remote_code
+        self.enable_cache = enable_cache
 
         self.model = None
         self.processor = None
         self.config = None
         self._loaded = False
+
+        # Initialize cache manager
+        self._cache_manager: Optional[VLMCacheManager] = None
+        if enable_cache:
+            self._cache_manager = VLMCacheManager(max_entries=cache_size)
 
     def load(self) -> None:
         """Load the model and processor."""
@@ -549,6 +561,7 @@ class MLXMultimodalLM:
         top_p: float = 0.9,
         video_fps: float = DEFAULT_FPS,
         video_max_frames: int = MAX_FRAMES,
+        use_cache: bool = True,
         **kwargs,
     ) -> MLLMOutput:
         """
@@ -564,6 +577,7 @@ class MLXMultimodalLM:
             top_p: Top-p sampling parameter
             video_fps: FPS for video frame extraction (default: 2.0)
             video_max_frames: Max frames to extract from video
+            use_cache: Whether to use KV cache for this request (default: True)
             **kwargs: Additional generation parameters
 
         Returns:
@@ -584,6 +598,7 @@ class MLXMultimodalLM:
 
         from mlx_vlm import generate
         from mlx_vlm.prompt_utils import apply_chat_template
+        from mlx_vlm.models import cache as vlm_cache
 
         images = images or []
         videos = videos or []
@@ -591,10 +606,13 @@ class MLXMultimodalLM:
 
         # Process all images (including frames from videos)
         all_images = []
+        all_image_sources = []  # Track original sources for cache key
 
         # Process image inputs
         if images:
-            all_images.extend(self._prepare_images(images))
+            processed = self._prepare_images(images)
+            all_images.extend(processed)
+            all_image_sources.extend(images)
 
         # Extract frames from videos
         for video_path in videos:
@@ -604,6 +622,9 @@ class MLXMultimodalLM:
                 max_frames=video_max_frames,
             )
             all_images.extend(frames)
+            # Use video path as source for cache key
+            video_source = video_path if isinstance(video_path, str) else str(video_path)
+            all_image_sources.append(f"video:{video_source}:fps{video_fps}:max{video_max_frames}")
             logger.info(f"Added {len(frames)} frames from video: {video_path}")
 
         # Apply chat template if needed
@@ -620,7 +641,25 @@ class MLXMultimodalLM:
         else:
             formatted_prompt = prompt
 
-        # Generate
+        # Check cache for existing KV state
+        prompt_cache = None
+        cache_hit = False
+
+        if use_cache and self._cache_manager and all_image_sources:
+            prompt_cache, cache_hit = self._cache_manager.fetch_cache(
+                all_image_sources, formatted_prompt
+            )
+            if cache_hit:
+                logger.info(f"VLM cache hit for {len(all_image_sources)} image(s)/video(s)")
+
+        # Create new cache if needed
+        if prompt_cache is None and self.model is not None:
+            try:
+                prompt_cache = vlm_cache.make_prompt_cache(self.model.language_model)
+            except Exception:
+                prompt_cache = None
+
+        # Generate with cache
         result = generate(
             self.model,
             self.processor,
@@ -630,8 +669,24 @@ class MLXMultimodalLM:
             temp=temperature,
             top_p=top_p,
             verbose=False,
+            prompt_cache=prompt_cache,
             **kwargs,
         )
+
+        # Store cache for future reuse (only on miss)
+        if use_cache and self._cache_manager and all_image_sources and not cache_hit:
+            if prompt_cache is not None:
+                try:
+                    prompt_tokens = getattr(result, 'prompt_tokens', 0)
+                    self._cache_manager.store_cache(
+                        all_image_sources,
+                        formatted_prompt,
+                        prompt_cache,
+                        num_tokens=prompt_tokens,
+                    )
+                    logger.info(f"VLM cache stored for {len(all_image_sources)} image(s)/video(s)")
+                except Exception as e:
+                    logger.debug(f"Failed to store VLM cache: {e}")
 
         # Handle GenerationResult object or plain string
         if hasattr(result, 'text'):
@@ -955,6 +1010,29 @@ class MLXMultimodalLM:
         )
         return output.text
 
+    def get_cache_stats(self) -> dict:
+        """
+        Get VLM cache statistics.
+
+        Returns:
+            Dictionary with cache stats including hits, misses, hit_rate,
+            tokens_saved, image_cache_hits, and evictions.
+        """
+        if self._cache_manager is None:
+            return {"enabled": False}
+
+        stats = self._cache_manager.get_stats()
+        stats["enabled"] = True
+        stats["cache_entries"] = len(self._cache_manager)
+        stats["max_entries"] = self._cache_manager.max_size
+        return stats
+
+    def clear_cache(self) -> None:
+        """Clear the VLM cache."""
+        if self._cache_manager:
+            self._cache_manager.clear()
+            logger.info("VLM cache cleared")
+
     def get_model_info(self) -> dict:
         """Get information about the loaded model."""
         if not self._loaded:
@@ -966,10 +1044,14 @@ class MLXMultimodalLM:
             "type": "multimodal-language-model",
             "supports_video": True,
             "supports_streaming": True,
+            "cache_enabled": self.enable_cache,
         }
 
         if self.config:
             info["model_type"] = getattr(self.config, "model_type", "unknown")
+
+        if self._cache_manager:
+            info["cache_stats"] = self._cache_manager.get_stats()
 
         return info
 

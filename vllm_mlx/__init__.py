@@ -19,6 +19,7 @@ from vllm_mlx.request import Request, RequestOutput, RequestStatus, SamplingPara
 from vllm_mlx.scheduler import Scheduler, SchedulerConfig, SchedulerOutput
 from vllm_mlx.engine import EngineCore, AsyncEngineCore, EngineConfig
 from vllm_mlx.prefix_cache import PrefixCacheManager, PrefixCacheStats
+from vllm_mlx.vlm_cache import VLMCacheManager, VLMCacheStats
 
 # vLLM integration components (require torch)
 # These are loaded lazily to allow CLI usage without torch
@@ -57,9 +58,12 @@ __all__ = [
     "EngineCore",
     "AsyncEngineCore",
     "EngineConfig",
-    # Prefix cache
+    # LLM Prefix cache
     "PrefixCacheManager",
     "PrefixCacheStats",
+    # VLM Cache (images/video)
+    "VLMCacheManager",
+    "VLMCacheStats",
     # Version
     "__version__",
 ]
