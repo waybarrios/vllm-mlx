@@ -1,6 +1,6 @@
 # vLLM-MLX Documentation
 
-**Apple Silicon MLX Backend for vLLM** - GPU-accelerated LLM inference on Mac
+**Apple Silicon MLX Backend for vLLM** - GPU-accelerated Text, Image, Video & Audio on Mac
 
 ## What is vLLM-MLX?
 
@@ -9,14 +9,17 @@ vllm-mlx brings native Apple Silicon GPU acceleration to vLLM by integrating:
 - **[MLX](https://github.com/ml-explore/mlx)**: Apple's ML framework with unified memory and Metal kernels
 - **[mlx-lm](https://github.com/ml-explore/mlx-lm)**: Optimized LLM inference with KV cache and quantization
 - **[mlx-vlm](https://github.com/Blaizzy/mlx-vlm)**: Vision-language models for multimodal inference
+- **[mlx-audio](https://github.com/Blaizzy/mlx-audio)**: Text-to-Speech and Speech-to-Text with native voices
 
 ## Key Features
 
+- **Multimodal** - Text, Image, Video & Audio in one platform
 - **Native GPU acceleration** on Apple Silicon (M1, M2, M3, M4)
-- **Vision-language models** - image, video, and audio understanding
+- **Native TTS voices** - Spanish, French, Chinese, Japanese + 5 more languages
 - **OpenAI API compatible** - drop-in replacement for OpenAI client
 - **MCP Tool Calling** - integrate external tools via Model Context Protocol
 - **Paged KV Cache** - memory-efficient caching with prefix sharing
+- **Continuous Batching** - high throughput for multiple concurrent users
 
 ## Quick Links
 
@@ -28,6 +31,7 @@ vllm-mlx brings native Apple Silicon GPU acceleration to vLLM by integrating:
 - [OpenAI-Compatible Server](guides/server.md)
 - [Python API](guides/python-api.md)
 - [Multimodal (Images & Video)](guides/multimodal.md)
+- [Audio (STT/TTS)](guides/audio.md)
 - [MCP & Tool Calling](guides/mcp-tools.md)
 - [Continuous Batching](guides/continuous-batching.md)
 

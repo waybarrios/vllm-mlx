@@ -137,30 +137,31 @@ For full documentation, see the [docs](docs/) directory:
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────┐
-│              vLLM API Layer                 │
-│     (OpenAI-compatible interface)           │
-└─────────────────────────────────────────────┘
-                      │
-                      ▼
-┌─────────────────────────────────────────────┐
-│              MLXPlatform                    │
-│   (vLLM platform plugin for Apple Silicon) │
-└─────────────────────────────────────────────┘
-                      │
-          ┌───────────┴───────────┐
-          ▼                       ▼
-┌──────────────────┐   ┌──────────────────┐
-│     mlx-lm       │   │     mlx-vlm       │
-│  (LLM inference) │   │  (MLLM inference) │
-└──────────────────┘   └──────────────────┘
-          │                       │
-          └───────────┬───────────┘
-                      ▼
-┌─────────────────────────────────────────────┐
-│                   MLX                       │
-│    (Apple ML Framework - Metal kernels)    │
-└─────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────┐
+│                    vLLM API Layer                       │
+│           (OpenAI-compatible interface)                 │
+└─────────────────────────────────────────────────────────┘
+                           │
+                           ▼
+┌─────────────────────────────────────────────────────────┐
+│                    MLXPlatform                          │
+│       (vLLM platform plugin for Apple Silicon)          │
+└─────────────────────────────────────────────────────────┘
+                           │
+          ┌────────────────┼────────────────┐
+          ▼                ▼                ▼
+┌──────────────────┐ ┌──────────────┐ ┌──────────────────┐
+│     mlx-lm       │ │   mlx-vlm    │ │    mlx-audio     │
+│  (LLM inference) │ │ (Vision+LLM) │ │   (TTS + STT)    │
+└──────────────────┘ └──────────────┘ └──────────────────┘
+          │                │                  │
+          └────────────────┴──────────────────┘
+                           │
+                           ▼
+┌─────────────────────────────────────────────────────────┐
+│                        MLX                              │
+│         (Apple ML Framework - Metal kernels)            │
+└─────────────────────────────────────────────────────────┘
 ```
 
 ## Performance
@@ -216,4 +217,5 @@ If you use vLLM-MLX in your research or project, please cite:
 - [MLX](https://github.com/ml-explore/mlx) - Apple's ML framework
 - [mlx-lm](https://github.com/ml-explore/mlx-lm) - LLM inference library
 - [mlx-vlm](https://github.com/Blaizzy/mlx-vlm) - Vision-language models
+- [mlx-audio](https://github.com/Blaizzy/mlx-audio) - Text-to-Speech and Speech-to-Text
 - [vLLM](https://github.com/vllm-project/vllm) - High-throughput LLM serving
