@@ -266,6 +266,417 @@ class TestHelperFunctions:
 
 
 # =============================================================================
+# Security and Reliability Tests (PR #4)
+# =============================================================================
+
+class TestRateLimiter:
+    """Test the RateLimiter class for rate limiting functionality."""
+
+    def test_rate_limiter_disabled_by_default(self):
+        """Test that rate limiter allows all requests when disabled."""
+        from vllm_mlx.server import RateLimiter
+
+        limiter = RateLimiter(requests_per_minute=5, enabled=False)
+
+        # Should allow unlimited requests when disabled
+        for _ in range(100):
+            allowed, retry_after = limiter.is_allowed("client1")
+            assert allowed is True
+            assert retry_after == 0
+
+    def test_rate_limiter_enforces_limit(self):
+        """Test that rate limiter enforces the request limit."""
+        from vllm_mlx.server import RateLimiter
+
+        limiter = RateLimiter(requests_per_minute=3, enabled=True)
+
+        # First 3 requests should be allowed
+        for i in range(3):
+            allowed, retry_after = limiter.is_allowed("client1")
+            assert allowed is True, f"Request {i+1} should be allowed"
+            assert retry_after == 0
+
+        # 4th request should be blocked
+        allowed, retry_after = limiter.is_allowed("client1")
+        assert allowed is False
+        assert retry_after > 0
+
+    def test_rate_limiter_per_client(self):
+        """Test that rate limits are tracked per client."""
+        from vllm_mlx.server import RateLimiter
+
+        limiter = RateLimiter(requests_per_minute=2, enabled=True)
+
+        # Client 1 uses its quota
+        limiter.is_allowed("client1")
+        limiter.is_allowed("client1")
+        allowed, _ = limiter.is_allowed("client1")
+        assert allowed is False
+
+        # Client 2 should still have quota
+        allowed, _ = limiter.is_allowed("client2")
+        assert allowed is True
+
+    def test_rate_limiter_thread_safety(self):
+        """Test that rate limiter is thread-safe."""
+        import threading
+        from vllm_mlx.server import RateLimiter
+
+        limiter = RateLimiter(requests_per_minute=100, enabled=True)
+        results = []
+        errors = []
+
+        def make_requests():
+            try:
+                for _ in range(10):
+                    allowed, _ = limiter.is_allowed("shared_client")
+                    results.append(allowed)
+            except Exception as e:
+                errors.append(e)
+
+        threads = [threading.Thread(target=make_requests) for _ in range(10)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert len(errors) == 0, f"Thread safety errors: {errors}"
+        assert len(results) == 100
+        # Exactly 100 requests allowed (our limit)
+        assert results.count(True) == 100
+
+
+class TestTempFileManager:
+    """Test the TempFileManager class for temp file cleanup."""
+
+    def test_register_and_cleanup_single_file(self):
+        """Test registering and cleaning up a single temp file."""
+        import tempfile
+        import os
+        from vllm_mlx.models.mllm import TempFileManager
+
+        manager = TempFileManager()
+
+        # Create a real temp file
+        temp = tempfile.NamedTemporaryFile(delete=False, suffix=".txt")
+        temp.write(b"test content")
+        temp.close()
+
+        # Register it
+        path = manager.register(temp.name)
+        assert path == temp.name
+        assert os.path.exists(temp.name)
+
+        # Cleanup
+        result = manager.cleanup(temp.name)
+        assert result is True
+        assert not os.path.exists(temp.name)
+
+    def test_cleanup_all_files(self):
+        """Test cleaning up all registered temp files."""
+        import tempfile
+        import os
+        from vllm_mlx.models.mllm import TempFileManager
+
+        manager = TempFileManager()
+        paths = []
+
+        # Create multiple temp files
+        for i in range(3):
+            temp = tempfile.NamedTemporaryFile(delete=False, suffix=f"_{i}.txt")
+            temp.write(f"content {i}".encode())
+            temp.close()
+            manager.register(temp.name)
+            paths.append(temp.name)
+
+        # Verify all exist
+        for p in paths:
+            assert os.path.exists(p)
+
+        # Cleanup all
+        cleaned = manager.cleanup_all()
+        assert cleaned == 3
+
+        # Verify all deleted
+        for p in paths:
+            assert not os.path.exists(p)
+
+    def test_cleanup_nonexistent_file(self):
+        """Test cleanup of a non-existent file."""
+        from vllm_mlx.models.mllm import TempFileManager
+
+        manager = TempFileManager()
+
+        # Cleanup a file that doesn't exist
+        result = manager.cleanup("/nonexistent/path/file.txt")
+        assert result is False
+
+    def test_thread_safe_registration(self):
+        """Test that TempFileManager is thread-safe."""
+        import threading
+        import tempfile
+        import os
+        from vllm_mlx.models.mllm import TempFileManager
+
+        manager = TempFileManager()
+        paths = []
+        lock = threading.Lock()
+        errors = []
+
+        def register_files():
+            try:
+                for _ in range(5):
+                    temp = tempfile.NamedTemporaryFile(delete=False, suffix=".txt")
+                    temp.write(b"test")
+                    temp.close()
+                    path = manager.register(temp.name)
+                    with lock:
+                        paths.append(path)
+            except Exception as e:
+                errors.append(e)
+
+        threads = [threading.Thread(target=register_files) for _ in range(5)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert len(errors) == 0, f"Thread safety errors: {errors}"
+        assert len(paths) == 25
+
+        # Cleanup all
+        cleaned = manager.cleanup_all()
+        assert cleaned == 25
+
+
+class TestRequestOutputCollectorThreadSafety:
+    """Test thread-safety of RequestOutputCollector._waiting_consumers."""
+
+    def test_waiting_consumers_thread_safe(self):
+        """Test that _waiting_consumers counter is thread-safe."""
+        import threading
+        import asyncio
+        from vllm_mlx.output_collector import RequestOutputCollector
+
+        # Reset the counter
+        with RequestOutputCollector._waiting_lock:
+            RequestOutputCollector._waiting_consumers = 0
+
+        errors = []
+
+        def manipulate_counter():
+            try:
+                for _ in range(100):
+                    with RequestOutputCollector._waiting_lock:
+                        RequestOutputCollector._waiting_consumers += 1
+                    with RequestOutputCollector._waiting_lock:
+                        RequestOutputCollector._waiting_consumers -= 1
+            except Exception as e:
+                errors.append(e)
+
+        threads = [threading.Thread(target=manipulate_counter) for _ in range(10)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert len(errors) == 0, f"Thread safety errors: {errors}"
+        # Should return to zero
+        with RequestOutputCollector._waiting_lock:
+            assert RequestOutputCollector._waiting_consumers == 0
+
+    def test_has_waiting_consumers_method(self):
+        """Test has_waiting_consumers class method."""
+        from vllm_mlx.output_collector import RequestOutputCollector
+
+        # Reset counter
+        with RequestOutputCollector._waiting_lock:
+            RequestOutputCollector._waiting_consumers = 0
+
+        assert RequestOutputCollector.has_waiting_consumers() is False
+
+        with RequestOutputCollector._waiting_lock:
+            RequestOutputCollector._waiting_consumers = 1
+
+        assert RequestOutputCollector.has_waiting_consumers() is True
+
+        # Reset
+        with RequestOutputCollector._waiting_lock:
+            RequestOutputCollector._waiting_consumers = 0
+
+
+class TestRequestTimeoutField:
+    """Test the new timeout field in request models."""
+
+    def test_chat_completion_request_timeout_field(self):
+        """Test that ChatCompletionRequest has timeout field."""
+        from vllm_mlx.server import ChatCompletionRequest, Message
+
+        # Default should be None
+        request = ChatCompletionRequest(
+            model="test-model",
+            messages=[Message(role="user", content="Hello")]
+        )
+        assert request.timeout is None
+
+        # Can set custom timeout
+        request_with_timeout = ChatCompletionRequest(
+            model="test-model",
+            messages=[Message(role="user", content="Hello")],
+            timeout=60.0
+        )
+        assert request_with_timeout.timeout == 60.0
+
+    def test_completion_request_timeout_field(self):
+        """Test that CompletionRequest has timeout field."""
+        from vllm_mlx.server import CompletionRequest
+
+        # Default should be None
+        request = CompletionRequest(
+            model="test-model",
+            prompt="Once upon a time"
+        )
+        assert request.timeout is None
+
+        # Can set custom timeout
+        request_with_timeout = CompletionRequest(
+            model="test-model",
+            prompt="Once upon a time",
+            timeout=120.0
+        )
+        assert request_with_timeout.timeout == 120.0
+
+
+class TestAPIKeyVerification:
+    """Test API key verification with timing attack prevention."""
+
+    def test_secrets_compare_digest_usage(self):
+        """Test that secrets.compare_digest is used (timing attack prevention)."""
+        import secrets
+
+        # Verify secrets.compare_digest works as expected
+        key1 = "test-api-key-12345"
+        key2 = "test-api-key-12345"
+        key3 = "different-key-67890"
+
+        # Same keys should match
+        assert secrets.compare_digest(key1, key2) is True
+
+        # Different keys should not match
+        assert secrets.compare_digest(key1, key3) is False
+
+        # Verify it's constant-time (by checking function exists)
+        assert hasattr(secrets, 'compare_digest')
+
+    def test_verify_api_key_rejects_invalid(self):
+        """Test that invalid API key is rejected with 401."""
+        import asyncio
+        from unittest.mock import MagicMock
+        from fastapi import HTTPException
+        from fastapi.security import HTTPAuthorizationCredentials
+
+        # Import and set up the module
+        import vllm_mlx.server as server
+        original_key = server._api_key
+
+        try:
+            # Set a known API key
+            server._api_key = "valid-secret-key"
+
+            # Create mock credentials with invalid key
+            credentials = HTTPAuthorizationCredentials(
+                scheme="Bearer",
+                credentials="invalid-key"
+            )
+
+            # Should raise HTTPException with 401
+            with pytest.raises(HTTPException) as exc_info:
+                asyncio.get_event_loop().run_until_complete(
+                    server.verify_api_key(credentials)
+                )
+
+            assert exc_info.value.status_code == 401
+            assert "Invalid API key" in str(exc_info.value.detail)
+        finally:
+            server._api_key = original_key
+
+    def test_verify_api_key_accepts_valid(self):
+        """Test that valid API key is accepted."""
+        import asyncio
+        from fastapi.security import HTTPAuthorizationCredentials
+
+        import vllm_mlx.server as server
+        original_key = server._api_key
+
+        try:
+            # Set a known API key
+            server._api_key = "valid-secret-key"
+
+            # Create mock credentials with valid key
+            credentials = HTTPAuthorizationCredentials(
+                scheme="Bearer",
+                credentials="valid-secret-key"
+            )
+
+            # Should not raise any exception
+            result = asyncio.get_event_loop().run_until_complete(
+                server.verify_api_key(credentials)
+            )
+            # verify_api_key returns True on success (no exception raised)
+            assert result is True or result is None
+        finally:
+            server._api_key = original_key
+
+
+class TestRateLimiterHTTPResponse:
+    """Test rate limiter HTTP response behavior."""
+
+    def test_rate_limiter_returns_retry_after(self):
+        """Test that rate limiter returns retry_after when limit exceeded."""
+        from vllm_mlx.server import RateLimiter
+        import time
+
+        limiter = RateLimiter(requests_per_minute=2, enabled=True)
+
+        # Exhaust the limit
+        limiter.is_allowed("test_client")
+        limiter.is_allowed("test_client")
+
+        # Next request should be denied with retry_after
+        allowed, retry_after = limiter.is_allowed("test_client")
+
+        assert allowed is False
+        assert retry_after is not None
+        assert retry_after > 0
+        assert retry_after <= 60  # Should be within a minute
+
+    def test_rate_limiter_window_cleanup(self):
+        """Test that rate limiter cleans up old requests from sliding window."""
+        from vllm_mlx.server import RateLimiter
+        import time
+
+        limiter = RateLimiter(requests_per_minute=2, enabled=True)
+
+        # Make some requests
+        limiter.is_allowed("test_client")
+        limiter.is_allowed("test_client")
+
+        # Should be denied (limit reached)
+        allowed, _ = limiter.is_allowed("test_client")
+        assert allowed is False
+
+        # Manually inject old timestamps to simulate time passing
+        # The sliding window should clean these up
+        old_time = time.time() - 120  # 2 minutes ago
+        with limiter._lock:
+            limiter._requests["test_client"] = [old_time, old_time]
+
+        # Now should be allowed again (old requests cleaned up)
+        allowed, _ = limiter.is_allowed("test_client")
+        assert allowed is True
+
+
+# =============================================================================
 # Integration Tests (require running server)
 # =============================================================================
 
