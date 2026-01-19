@@ -633,8 +633,32 @@ async def create_chat_completion(request: ChatCompletionRequest):
     """
     engine = get_engine()
 
-    # Extract text, images, and videos from messages
-    messages, images, videos = extract_multimodal_content(request.messages)
+    # For MLLM models, keep original messages with embedded images
+    # (MLLM.chat() extracts images from message content internally)
+    print(f"DEBUG: engine.is_mllm = {engine.is_mllm}")
+    if engine.is_mllm:
+        print("DEBUG: Taking MLLM path")
+        # Convert Pydantic messages to dicts preserving full content
+        messages = []
+        for msg in request.messages:
+            msg_dict = msg.model_dump() if hasattr(msg, 'model_dump') else dict(msg)
+            messages.append(msg_dict)
+        images, videos = [], []  # MLLM extracts these from messages
+        # Debug: log message structure
+        import logging
+        _logger = logging.getLogger(__name__)
+        _logger.info(f"MLLM: Processing {len(messages)} messages")
+        for i, m in enumerate(messages):
+            c = m.get('content')
+            if isinstance(c, list):
+                _logger.info(f"  Msg {i}: role={m.get('role')}, content is list with {len(c)} items")
+                for j, item in enumerate(c):
+                    _logger.info(f"    Item {j}: {item.get('type') if isinstance(item, dict) else type(item)}")
+            else:
+                _logger.info(f"  Msg {i}: role={m.get('role')}, content is {type(c).__name__}")
+    else:
+        # For LLM, extract text, images, and videos separately
+        messages, images, videos = extract_multimodal_content(request.messages)
 
     has_media = bool(images or videos)
 

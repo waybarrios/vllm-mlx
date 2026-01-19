@@ -1025,6 +1025,13 @@ class MLXMultimodalLM:
         images = []
         videos = []
         text_prompt = ""
+        
+        logger.info(f"MLLM.chat() called with {len(messages)} messages")
+        for i, msg in enumerate(messages):
+            logger.info(f"  Message {i}: role={msg.get('role')}, content type={type(msg.get('content'))}")
+            if isinstance(msg.get('content'), list):
+                for j, item in enumerate(msg.get('content', [])):
+                    logger.info(f"    Item {j}: type={item.get('type') if isinstance(item, dict) else type(item)}")
 
         for msg in messages:
             role = msg.get("role", "user")
@@ -1119,6 +1126,150 @@ class MLXMultimodalLM:
             finish_reason="stop",
             prompt_tokens=prompt_tokens,
             completion_tokens=generation_tokens,
+        )
+
+    def stream_chat(
+        self,
+        messages: list[dict],
+        max_tokens: int = 256,
+        temperature: float = 0.7,
+        **kwargs,
+    ) -> Iterator[MLLMOutput]:
+        """
+        Stream chat with OpenAI-compatible message format.
+
+        Supports multimodal content in messages:
+        - {"type": "text", "text": "..."}
+        - {"type": "image_url", "image_url": {"url": "..."}}
+        - {"type": "image_url", "image_url": {"url": "data:image/...;base64,..."}}
+
+        Args:
+            messages: List of chat messages (OpenAI format)
+            max_tokens: Maximum tokens to generate
+            temperature: Sampling temperature
+            **kwargs: Additional parameters
+
+        Yields:
+            MLLMOutput with incremental text chunks
+        """
+        if not self._loaded:
+            self.load()
+
+        try:
+            from mlx_vlm import stream_generate
+            from mlx_vlm.prompt_utils import apply_chat_template
+        except ImportError:
+            # Fallback to non-streaming if stream_generate not available
+            output = self.chat(
+                messages=messages,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                **kwargs,
+            )
+            yield output
+            return
+
+        # Extract text and images from messages (same logic as chat())
+        images = []
+        videos = []
+        text_prompt = ""
+
+        for msg in messages:
+            role = msg.get("role", "user")
+            content = msg.get("content", "")
+
+            if isinstance(content, str):
+                if role == "user":
+                    text_prompt = content
+            elif isinstance(content, list):
+                # OpenAI multimodal format
+                for item in content:
+                    if isinstance(item, str):
+                        text_prompt = item
+                        continue
+
+                    # Convert Pydantic models to dicts
+                    if hasattr(item, "model_dump"):
+                        item = item.model_dump()
+                    elif hasattr(item, "dict"):
+                        item = item.dict()
+
+                    if isinstance(item, dict):
+                        item_type = item.get("type", "")
+
+                        if item_type == "text":
+                            text_prompt = item.get("text", "")
+
+                        elif item_type == "image_url":
+                            img_url = item.get("image_url", {})
+                            if isinstance(img_url, str):
+                                images.append(img_url)
+                            else:
+                                images.append(img_url.get("url", ""))
+
+                        elif item_type == "image":
+                            images.append(item.get("image", item.get("url", "")))
+
+                        elif item_type == "video":
+                            videos.append(item.get("video", item.get("url", "")))
+
+        # Process images
+        all_images = []
+        if images:
+            all_images.extend(self._prepare_images(images))
+
+        # Process videos
+        video_fps = kwargs.pop("video_fps", DEFAULT_FPS)
+        video_max_frames = kwargs.pop("video_max_frames", MAX_FRAMES)
+        for video_path in videos:
+            frames = self._prepare_video(
+                video_path, fps=video_fps, max_frames=video_max_frames
+            )
+            all_images.extend(frames)
+
+        # Apply chat template
+        try:
+            formatted_prompt = apply_chat_template(
+                self.processor,
+                self.config,
+                text_prompt,
+                num_images=len(all_images),
+            )
+        except Exception as e:
+            logger.warning(f"Failed to apply chat template: {e}, using raw prompt")
+            formatted_prompt = text_prompt
+
+        # Stream generate tokens
+        accumulated_text = ""
+        token_count = 0
+
+        for chunk in stream_generate(
+            self.model,
+            self.processor,
+            formatted_prompt,
+            all_images if all_images else None,
+            max_tokens=max_tokens,
+            temp=temperature,
+            **kwargs,
+        ):
+            token_count += 1
+            # chunk is a GenerationResult with .text attribute containing the new token
+            new_text = chunk.text if hasattr(chunk, 'text') else str(chunk)
+            accumulated_text += new_text
+
+            yield MLLMOutput(
+                text=new_text,  # Just the new token for streaming
+                finish_reason=None,
+                prompt_tokens=getattr(chunk, 'prompt_tokens', 0),
+                completion_tokens=token_count,
+            )
+
+        # Final yield with finish_reason
+        yield MLLMOutput(
+            text="",
+            finish_reason="stop",
+            prompt_tokens=getattr(chunk, 'prompt_tokens', 0) if 'chunk' in dir() else 0,
+            completion_tokens=token_count,
         )
 
     def describe_image(
