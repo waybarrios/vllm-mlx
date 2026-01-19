@@ -305,18 +305,39 @@ class SimpleEngine(BaseEngine):
 
         # Build prompt using tokenizer
         if self._is_mllm:
-            # For MLLM, fall back to non-streaming chat
-            output = await self.chat(
-                messages=messages,
-                max_tokens=max_tokens,
-                temperature=temperature,
-                top_p=top_p,
-                tools=tools,
-                images=images,
-                videos=videos,
-                **kwargs,
-            )
-            yield output
+            # For MLLM, use stream_chat which yields tokens incrementally
+            accumulated_text = ""
+            token_count = 0
+
+            # Run stream_chat in thread pool since it's synchronous
+            def run_stream():
+                return list(self._model.stream_chat(
+                    messages=messages,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    **kwargs,
+                ))
+
+            chunks = await asyncio.to_thread(run_stream)
+
+            for chunk in chunks:
+                token_count += 1
+                new_text = chunk.text if hasattr(chunk, 'text') else str(chunk)
+                accumulated_text += new_text
+
+                finished = chunk.finish_reason is not None
+
+                yield GenerationOutput(
+                    text=accumulated_text,
+                    new_text=new_text,
+                    prompt_tokens=getattr(chunk, 'prompt_tokens', 0),
+                    completion_tokens=token_count,
+                    finished=finished,
+                    finish_reason=chunk.finish_reason if finished else None,
+                )
+
+                if finished:
+                    break
             return
 
         # For LLM, apply chat template and stream
