@@ -59,7 +59,7 @@ MLLM_PATTERNS = [
     "llava", "LLaVA",                   # LLaVA models
     "idefics", "Idefics",               # Idefics models
     "paligemma", "PaliGemma",           # PaliGemma
-    "gemma-3", "gemma3",                # Gemma 3 (multimodal)
+    "gemma-3", "gemma3",                # Gemma 3 (multimodal) - FIXED in mlx_vlm/models/gemma3/language.py
     "pixtral", "Pixtral",               # Pixtral
     "molmo", "Molmo",                   # Molmo
     "phi3-vision", "phi-3-vision",      # Phi-3 Vision
