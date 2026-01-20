@@ -26,6 +26,7 @@ def parse_tool_calls(text: str) -> Tuple[str, Optional[List[ToolCall]]]:
     Parse tool calls from model output.
 
     Supports multiple formats:
+    - Qwen3 bracket: [Calling tool: function_name({"arg": "value"})]
     - Qwen: <tool_call>{"name": "...", "arguments": {...}}</tool_call>
     - Llama: <function=name>{"arg": "value"}</function>
     - Nemotron: <tool_call><function=name><parameter=p>v</parameter></function></tool_call>
@@ -40,6 +41,33 @@ def parse_tool_calls(text: str) -> Tuple[str, Optional[List[ToolCall]]]:
     """
     tool_calls = []
     cleaned_text = text
+
+    # Pattern for Qwen3 bracket-style: [Calling tool: function_name({...})]
+    bracket_pattern = r'\[Calling tool:\s*(\w+)\((\{.*?\})\)\]'
+    bracket_matches = re.findall(bracket_pattern, text, re.DOTALL)
+
+    for name, args_str in bracket_matches:
+        try:
+            arguments = json.loads(args_str)
+            tool_calls.append(ToolCall(
+                id=f"call_{uuid.uuid4().hex[:8]}",
+                type="function",
+                function=FunctionCall(
+                    name=name.strip(),
+                    arguments=json.dumps(arguments) if isinstance(arguments, dict) else str(arguments)
+                )
+            ))
+        except json.JSONDecodeError:
+            continue
+
+    # Remove bracket tool calls from cleaned text
+    if bracket_matches:
+        cleaned_text = re.sub(
+            r'\[Calling tool:\s*\w+\(\{.*?\}\)\]',
+            '',
+            cleaned_text,
+            flags=re.DOTALL
+        ).strip()
 
     # Pattern for Nemotron-style: <tool_call><function=name><parameter=p>v</parameter></function></tool_call>
     nemotron_pattern = r'<tool_call>\s*<function=([^>]+)>(.*?)</function>\s*</tool_call>'
