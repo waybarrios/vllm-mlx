@@ -30,7 +30,7 @@ from urllib.parse import urlparse
 import numpy as np
 import requests
 
-from vllm_mlx.vlm_cache import VLMCacheManager
+from vllm_mlx.vlm_cache import VLMPrefixCacheManager, VLMCacheManager
 
 logger = logging.getLogger(__name__)
 
@@ -681,10 +681,10 @@ class MLXMultimodalLM:
         self.config = None
         self._loaded = False
 
-        # Initialize VLM cache manager
-        self._cache_manager: Optional[VLMCacheManager] = None
+        # Initialize VLM prefix cache manager (with vision embedding caching)
+        self._cache_manager: Optional[VLMPrefixCacheManager] = None
         if enable_cache:
-            self._cache_manager = VLMCacheManager(max_entries=cache_size)
+            self._cache_manager = VLMPrefixCacheManager(max_entries=cache_size)
 
     def load(self) -> None:
         """Load the model and processor."""
@@ -853,7 +853,7 @@ class MLXMultimodalLM:
         prompt_cache = None
         cache_hit = False
 
-        if use_cache and self._cache_manager and all_sources:
+        if use_cache and self._cache_manager is not None and all_sources:
             prompt_cache, cache_hit = self._cache_manager.fetch_cache(
                 all_sources, formatted_prompt
             )
@@ -1099,7 +1099,86 @@ class MLXMultimodalLM:
             logger.warning(f"Failed to apply chat template: {e}, using raw prompt")
             formatted_prompt = text_prompt
 
-        # Generate using mlx_vlm directly
+        # Prefix caching with vision embedding support
+        # Following LMCache approach: cache vision embeddings to skip encoder on hit
+        from mlx_vlm.models import cache as vlm_cache
+        from mlx_vlm.utils import prepare_inputs
+        import time
+
+        use_cache = kwargs.pop("use_cache", True)
+        cache_entry = None
+        prefix_match_len = 0
+        vision_embeddings = None
+        cache_hit = False
+
+        # Tokenize prompt for cache lookup
+        tokenizer = self.processor.tokenizer if hasattr(self.processor, 'tokenizer') else self.processor
+        token_ids = tokenizer.encode(formatted_prompt)
+
+        # Check prefix cache
+        if use_cache and self._cache_manager is not None and all_images:
+            try:
+                cache_entry, prefix_match_len = self._cache_manager.fetch(
+                    all_images, formatted_prompt, token_ids
+                )
+                if cache_entry:
+                    cache_hit = True
+                    vision_embeddings = cache_entry.vision_embeddings
+                    if vision_embeddings is not None:
+                        logger.info(f"[PREFIX CACHE] Vision embeddings cached - would skip encoder!")
+                    if prefix_match_len > 0:
+                        logger.info(f"[PREFIX CACHE] {prefix_match_len} prefix tokens match")
+            except Exception as e:
+                logger.warning(f"Cache fetch failed: {e}")
+
+        # Generate - use KV cache if available from previous identical request
+        start_time = time.time()
+
+        # Create or reuse prompt cache for prefix caching speedup
+        prompt_cache = None
+        skip_prompt_processing = False
+
+        if cache_hit and cache_entry and cache_entry.kv_cache:
+            logger.info("[PREFIX CACHE] Cache hit - attempting prefix cache speedup")
+            cached_prompt_cache = cache_entry.kv_cache
+
+            # Deep copy the cached state to avoid modifying the original
+            # This preserves the cache for future requests
+            try:
+                import copy
+                prompt_cache = []
+                for layer_cache in cached_prompt_cache:
+                    # Create new cache object of same type
+                    new_cache = copy.copy(layer_cache)
+                    # Deep copy the state (keys, values, offset)
+                    if hasattr(layer_cache, 'state'):
+                        state = layer_cache.state
+                        if state is not None:
+                            # Copy arrays to avoid sharing
+                            import mlx.core as mx
+                            if len(state) >= 2 and state[0] is not None:
+                                new_cache.keys = mx.array(state[0])
+                                new_cache.values = mx.array(state[1])
+                                if len(state) >= 3:
+                                    new_cache.offset = state[2]
+                                elif hasattr(layer_cache, 'offset'):
+                                    new_cache.offset = layer_cache.offset
+                    prompt_cache.append(new_cache)
+
+                skip_prompt_processing = True
+                logger.info(f"[PREFIX CACHE] Speedup enabled - skipping {prefix_match_len} token forward pass")
+            except Exception as e:
+                logger.warning(f"[PREFIX CACHE] Failed to copy cache, falling back to full processing: {e}")
+                prompt_cache = None
+                skip_prompt_processing = False
+
+        if prompt_cache is None and self.model is not None:
+            # Create fresh cache
+            try:
+                prompt_cache = vlm_cache.make_prompt_cache(self.model.language_model)
+            except Exception:
+                prompt_cache = None
+
         result = generate(
             self.model,
             self.processor,
@@ -1108,8 +1187,58 @@ class MLXMultimodalLM:
             max_tokens=max_tokens,
             temp=temperature,
             verbose=False,
+            prompt_cache=prompt_cache,
+            skip_prompt_processing=skip_prompt_processing,
             **kwargs,
         )
+
+        # Store KV cache for future reuse (on cache miss)
+        # IMPORTANT: We need to store only the prompt portion, not generated tokens
+        if use_cache and self._cache_manager is not None and all_images and not cache_hit and prompt_cache:
+            try:
+                import copy
+                import mlx.core as mx
+
+                # Get prompt token count (before generation)
+                prompt_tokens_count = getattr(result, "prompt_tokens", 0)
+
+                # Deep copy the cache and trim to prompt tokens only
+                cache_to_store = []
+                for layer_cache in prompt_cache:
+                    new_cache = copy.copy(layer_cache)
+                    if hasattr(layer_cache, 'state'):
+                        state = layer_cache.state
+                        if state is not None and len(state) >= 2 and state[0] is not None:
+                            # Copy arrays
+                            keys = mx.array(state[0])
+                            values = mx.array(state[1])
+                            # Trim to prompt tokens only (not generated tokens)
+                            if hasattr(layer_cache, 'offset') and layer_cache.offset > prompt_tokens_count:
+                                # For caches with offset tracking, slice to prompt length
+                                new_cache.keys = keys[:, :, :prompt_tokens_count, :]
+                                new_cache.values = values[:, :, :prompt_tokens_count, :]
+                                new_cache.offset = prompt_tokens_count
+                            else:
+                                new_cache.keys = keys
+                                new_cache.values = values
+                                if len(state) >= 3:
+                                    new_cache.offset = state[2]
+                                elif hasattr(layer_cache, 'offset'):
+                                    new_cache.offset = min(layer_cache.offset, prompt_tokens_count)
+                    cache_to_store.append(new_cache)
+
+                self._cache_manager.store(
+                    images=all_images,
+                    prompt=formatted_prompt,
+                    vision_embeddings=None,
+                    kv_cache=cache_to_store,
+                    token_ids=token_ids,
+                    num_image_tokens=256,
+                    model_name=self.model_name,
+                )
+                logger.info(f"[PREFIX CACHE] Stored KV cache for {len(all_images)} image(s) ({prompt_tokens_count} prompt tokens)")
+            except Exception as e:
+                logger.warning(f"Failed to cache: {e}")
 
         # Handle GenerationResult object or plain string
         if hasattr(result, "text"):
@@ -1239,7 +1368,27 @@ class MLXMultimodalLM:
             logger.warning(f"Failed to apply chat template: {e}, using raw prompt")
             formatted_prompt = text_prompt
 
-        # Stream generate tokens
+        # Check cache for existing KV state (uses images as cache key)
+        from mlx_vlm.models import cache as vlm_cache
+        prompt_cache = None
+        cache_hit = False
+        use_cache = kwargs.pop("use_cache", True)
+
+        if use_cache and self._cache_manager is not None and all_images:
+            prompt_cache, cache_hit = self._cache_manager.fetch_cache(
+                all_images, formatted_prompt
+            )
+            if cache_hit:
+                logger.debug(f"Stream chat cache hit for {len(all_images)} image(s)")
+
+        # Create new cache if needed
+        if prompt_cache is None and self.model is not None:
+            try:
+                prompt_cache = vlm_cache.make_prompt_cache(self.model.language_model)
+            except Exception:
+                prompt_cache = None
+
+        # Stream generate tokens with cache
         accumulated_text = ""
         token_count = 0
 
@@ -1250,6 +1399,7 @@ class MLXMultimodalLM:
             all_images if all_images else None,
             max_tokens=max_tokens,
             temp=temperature,
+            prompt_cache=prompt_cache,
             **kwargs,
         ):
             token_count += 1
@@ -1386,7 +1536,7 @@ class MLXMultimodalLM:
 
     def clear_cache(self) -> None:
         """Clear the VLM KV cache."""
-        if self._cache_manager:
+        if self._cache_manager is not None:
             self._cache_manager.clear()
             logger.info("VLM cache cleared")
 
@@ -1407,7 +1557,7 @@ class MLXMultimodalLM:
         if self.config:
             info["model_type"] = getattr(self.config, "model_type", "unknown")
 
-        if self._cache_manager:
+        if self._cache_manager is not None:
             info["cache_stats"] = self._cache_manager.get_stats()
 
         return info
