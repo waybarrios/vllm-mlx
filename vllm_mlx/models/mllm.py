@@ -1044,7 +1044,7 @@ class MLXMultimodalLM:
                 # OpenAI multimodal format
                 for item in content:
                     if isinstance(item, str):
-                        text_prompt = item
+                        text_prompt += item
                         continue
 
                     # Convert Pydantic models to dicts
@@ -1057,7 +1057,7 @@ class MLXMultimodalLM:
                         item_type = item.get("type", "")
 
                         if item_type == "text":
-                            text_prompt = item.get("text", "")
+                            text_prompt += item.get("text", "")
 
                         elif item_type == "image_url":
                             img_url = item.get("image_url", {})
@@ -1185,7 +1185,7 @@ class MLXMultimodalLM:
                 # OpenAI multimodal format
                 for item in content:
                     if isinstance(item, str):
-                        text_prompt = item
+                        text_prompt += item
                         continue
 
                     # Convert Pydantic models to dicts
@@ -1198,7 +1198,7 @@ class MLXMultimodalLM:
                         item_type = item.get("type", "")
 
                         if item_type == "text":
-                            text_prompt = item.get("text", "")
+                            text_prompt += item.get("text", "")
 
                         elif item_type == "image_url":
                             img_url = item.get("image_url", {})
