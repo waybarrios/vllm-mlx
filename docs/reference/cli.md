@@ -24,6 +24,9 @@ vllm-mlx serve <model> [options]
 |--------|-------------|---------|
 | `--port` | Server port | 8000 |
 | `--host` | Server host | 0.0.0.0 |
+| `--api-key` | API key for authentication | None |
+| `--rate-limit` | Requests per minute per client (0 = disabled) | 0 |
+| `--timeout` | Request timeout in seconds | 300 |
 | `--continuous-batching` | Enable batching for multi-user | False |
 | `--use-paged-cache` | Enable paged KV cache | False |
 | `--max-tokens` | Default max tokens | 32768 |
@@ -53,6 +56,36 @@ vllm-mlx serve mlx-community/Qwen3-4B-4bit --mcp-config mcp.json
 
 # Multimodal model
 vllm-mlx serve mlx-community/Qwen3-VL-4B-Instruct-3bit
+
+# With API key authentication
+vllm-mlx serve mlx-community/Llama-3.2-3B-Instruct-4bit --api-key your-secret-key
+
+# Production setup with security options
+vllm-mlx serve mlx-community/Qwen3-4B-4bit \
+  --api-key your-secret-key \
+  --rate-limit 60 \
+  --timeout 120 \
+  --continuous-batching
+```
+
+### Security
+
+When `--api-key` is set, all API requests require the `Authorization: Bearer <api-key>` header:
+
+```python
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://localhost:8000/v1",
+    api_key="your-secret-key"  # Must match --api-key
+)
+```
+
+Or with curl:
+
+```bash
+curl http://localhost:8000/v1/models \
+  -H "Authorization: Bearer your-secret-key"
 ```
 
 ## `vllm-mlx-bench`

@@ -1139,38 +1139,42 @@ class MLXMultimodalLM:
         skip_prompt_processing = False
 
         if cache_hit and cache_entry and cache_entry.kv_cache:
-            logger.info("[PREFIX CACHE] Cache hit - attempting prefix cache speedup")
-            cached_prompt_cache = cache_entry.kv_cache
-
-            # Deep copy the cached state to avoid modifying the original
-            # This preserves the cache for future requests
-            try:
-                import copy
-                prompt_cache = []
-                for layer_cache in cached_prompt_cache:
-                    # Create new cache object of same type
-                    new_cache = copy.copy(layer_cache)
-                    # Deep copy the state (keys, values, offset)
-                    if hasattr(layer_cache, 'state'):
-                        state = layer_cache.state
-                        if state is not None:
-                            # Copy arrays to avoid sharing
-                            import mlx.core as mx
-                            if len(state) >= 2 and state[0] is not None:
-                                new_cache.keys = mx.array(state[0])
-                                new_cache.values = mx.array(state[1])
-                                if len(state) >= 3:
-                                    new_cache.offset = state[2]
-                                elif hasattr(layer_cache, 'offset'):
-                                    new_cache.offset = layer_cache.offset
-                    prompt_cache.append(new_cache)
-
-                skip_prompt_processing = True
-                logger.info(f"[PREFIX CACHE] Speedup enabled - skipping {prefix_match_len} token forward pass")
-            except Exception as e:
-                logger.warning(f"[PREFIX CACHE] Failed to copy cache, falling back to full processing: {e}")
+            # NOTE: For multimodal (MLLM) with images, we CANNOT use skip_prompt_processing
+            # because the vision encoder must run each time to provide visual context.
+            # The skip_prompt_processing path only calls language_model() which has no vision.
+            # Passing cached KV states doesn't help for MLLM since full forward pass overwrites them.
+            if all_images:
+                logger.info("[PREFIX CACHE] Cache hit but images present - full forward pass required (no speedup)")
+                # Create fresh cache - can't reuse for MLLM with images
                 prompt_cache = None
                 skip_prompt_processing = False
+            else:
+                # Text-only: can use skip_prompt_processing for maximum speedup
+                logger.info("[PREFIX CACHE] Text-only cache hit - using skip_prompt_processing speedup")
+                cached_prompt_cache = cache_entry.kv_cache
+                try:
+                    import copy
+                    prompt_cache = []
+                    for layer_cache in cached_prompt_cache:
+                        new_cache = copy.copy(layer_cache)
+                        if hasattr(layer_cache, 'state'):
+                            state = layer_cache.state
+                            if state is not None:
+                                import mlx.core as mx
+                                if len(state) >= 2 and state[0] is not None:
+                                    new_cache.keys = mx.array(state[0])
+                                    new_cache.values = mx.array(state[1])
+                                    if len(state) >= 3:
+                                        new_cache.offset = state[2]
+                                    elif hasattr(layer_cache, 'offset'):
+                                        new_cache.offset = layer_cache.offset
+                        prompt_cache.append(new_cache)
+                    skip_prompt_processing = True
+                    logger.info(f"[PREFIX CACHE] Skipping {prefix_match_len} token forward pass")
+                except Exception as e:
+                    logger.warning(f"[PREFIX CACHE] Failed to copy cache: {e}")
+                    prompt_cache = None
+                    skip_prompt_processing = False
 
         if prompt_cache is None and self.model is not None:
             # Create fresh cache

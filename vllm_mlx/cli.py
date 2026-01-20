@@ -18,12 +18,37 @@ import sys
 
 def serve_command(args):
     """Start the OpenAI-compatible server."""
+    import logging
     import os
     import uvicorn
 
     # Import unified server
-    from .server import app, load_model
+    from . import server
+    from .server import app, load_model, RateLimiter
     from .scheduler import SchedulerConfig
+
+    logger = logging.getLogger(__name__)
+
+    # Configure server security settings
+    server._api_key = args.api_key
+    server._default_timeout = args.timeout
+    if args.rate_limit > 0:
+        server._rate_limiter = RateLimiter(requests_per_minute=args.rate_limit, enabled=True)
+
+    # Security summary at startup
+    print("=" * 60)
+    print("SECURITY CONFIGURATION")
+    print("=" * 60)
+    if args.api_key:
+        print("  Authentication: ENABLED (API key required)")
+    else:
+        print("  Authentication: DISABLED - Use --api-key to enable")
+    if args.rate_limit > 0:
+        print(f"  Rate limiting: ENABLED ({args.rate_limit} req/min)")
+    else:
+        print("  Rate limiting: DISABLED - Use --rate-limit to enable")
+    print(f"  Request timeout: {args.timeout}s")
+    print("=" * 60)
 
     print(f"Loading model: {args.model}")
     print(f"Default max tokens: {args.max_tokens}")
@@ -362,6 +387,25 @@ Examples:
         type=str,
         default=None,
         help="Path to MCP configuration file (JSON/YAML) for tool integration",
+    )
+    # Security options
+    serve_parser.add_argument(
+        "--api-key",
+        type=str,
+        default=None,
+        help="API key for authentication (if not set, no auth required)",
+    )
+    serve_parser.add_argument(
+        "--rate-limit",
+        type=int,
+        default=0,
+        help="Rate limit requests per minute per client (0 = disabled)",
+    )
+    serve_parser.add_argument(
+        "--timeout",
+        type=float,
+        default=300.0,
+        help="Default request timeout in seconds (default: 300)",
     )
 
     # Bench command
