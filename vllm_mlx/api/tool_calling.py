@@ -21,6 +21,66 @@ from jsonschema import validate, ValidationError
 from .models import FunctionCall, ResponseFormat, ToolCall, ToolDefinition
 
 
+def _parse_raw_json_tool_calls(text: str) -> Optional[List[dict]]:
+    """
+    Parse raw JSON tool calls from model output.
+
+    Handles:
+    - Single JSON object: {"name": "func", "arguments": {...}}
+    - Multiple objects separated by commas: {...}, {...}
+    - JSON array: [{...}, {...}]
+
+    Args:
+        text: Raw model output text
+
+    Returns:
+        List of tool call dicts with 'name' and 'arguments', or None if no valid tool calls found
+    """
+    if not text:
+        return None
+
+    text = text.strip()
+
+    # Try JSON array first
+    if text.startswith('['):
+        try:
+            parsed = json.loads(text)
+            if isinstance(parsed, list) and all(
+                isinstance(item, dict) and 'name' in item for item in parsed
+            ):
+                return [{'name': item['name'], 'arguments': item.get('arguments', {})}
+                        for item in parsed]
+        except json.JSONDecodeError:
+            pass
+
+    # Find JSON objects with balanced braces
+    tool_calls = []
+    depth = 0
+    start = None
+
+    for i, char in enumerate(text):
+        if char == '{':
+            if depth == 0:
+                start = i
+            depth += 1
+        elif char == '}':
+            depth -= 1
+            if depth == 0 and start is not None:
+                json_str = text[start:i+1]
+                try:
+                    obj = json.loads(json_str)
+                    if isinstance(obj, dict) and 'name' in obj:
+                        tool_calls.append({
+                            'name': obj['name'],
+                            'arguments': obj.get('arguments', {})
+                        })
+                except json.JSONDecodeError:
+                    pass
+                start = None
+
+    return tool_calls if tool_calls else None
+
+
 def parse_tool_calls(text: str) -> Tuple[str, Optional[List[ToolCall]]]:
     """
     Parse tool calls from model output.
@@ -30,6 +90,7 @@ def parse_tool_calls(text: str) -> Tuple[str, Optional[List[ToolCall]]]:
     - Qwen: <tool_call>{"name": "...", "arguments": {...}}</tool_call>
     - Llama: <function=name>{"arg": "value"}</function>
     - Nemotron: <tool_call><function=name><parameter=p>v</parameter></function></tool_call>
+    - Raw JSON: {"name": "...", "arguments": {...}} (single or multiple)
 
     Args:
         text: Raw model output text
@@ -154,6 +215,23 @@ def parse_tool_calls(text: str) -> Tuple[str, Optional[List[ToolCall]]]:
 
     # Note: We keep <think>...</think> tags for reasoning models
     # The user may want to see the model's reasoning process
+
+    # Fallback: Raw JSON tool calls (lowest priority)
+    # Only try if no other formats matched
+    if not tool_calls:
+        raw_json_calls = _parse_raw_json_tool_calls(cleaned_text)
+        if raw_json_calls:
+            for call_data in raw_json_calls:
+                tool_calls.append(ToolCall(
+                    id=f"call_{uuid.uuid4().hex[:8]}",
+                    type="function",
+                    function=FunctionCall(
+                        name=call_data['name'],
+                        arguments=json.dumps(call_data['arguments']) if isinstance(call_data['arguments'], dict) else str(call_data['arguments'])
+                    )
+                ))
+            # Clean the JSON from text since we parsed it as tool calls
+            cleaned_text = ""
 
     return cleaned_text, tool_calls if tool_calls else None
 
