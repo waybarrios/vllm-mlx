@@ -5,17 +5,19 @@ Type definitions for MCP client support.
 
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Dict, List, Literal, Optional
+from typing import Any, Dict, List, Optional
 
 
 class MCPTransport(str, Enum):
     """Supported MCP transport types."""
+
     STDIO = "stdio"
     SSE = "sse"
 
 
 class MCPServerState(str, Enum):
     """MCP server connection states."""
+
     DISCONNECTED = "disconnected"
     CONNECTING = "connecting"
     CONNECTED = "connected"
@@ -51,10 +53,14 @@ class MCPServerConfig:
 
         if self.transport == MCPTransport.STDIO:
             if not self.command:
-                raise ValueError(f"MCP server '{self.name}': stdio transport requires 'command'")
+                raise ValueError(
+                    f"MCP server '{self.name}': stdio transport requires 'command'"
+                )
         elif self.transport == MCPTransport.SSE:
             if not self.url:
-                raise ValueError(f"MCP server '{self.name}': sse transport requires 'url'")
+                raise ValueError(
+                    f"MCP server '{self.name}': sse transport requires 'url'"
+                )
 
         # Security validation
         self._validate_security()
@@ -65,6 +71,7 @@ class MCPServerConfig:
 
         if self.skip_security_validation:
             import logging
+
             logging.getLogger(__name__).warning(
                 f"MCP server '{self.name}': Security validation SKIPPED. "
                 f"This is dangerous and should only be used in development!"
@@ -128,7 +135,7 @@ class MCPTool:
                 "name": self.full_name,
                 "description": self.description,
                 "parameters": self.input_schema,
-            }
+            },
         }
 
 
@@ -149,6 +156,7 @@ class MCPToolResult:
             content = self.content
         else:
             import json
+
             content = json.dumps(self.content)
 
         return {

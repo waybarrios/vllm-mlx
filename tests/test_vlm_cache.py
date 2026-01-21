@@ -10,7 +10,6 @@ import os
 import tempfile
 import pytest
 from pathlib import Path
-from unittest.mock import MagicMock, patch
 
 from vllm_mlx.vlm_cache import (
     VLMCacheEntry,
@@ -516,7 +515,9 @@ if __name__ == "__main__":
 
         # Print rows
         for row in rows:
-            row_line = " | ".join(str(cell).ljust(col_widths[i]) for i, cell in enumerate(row))
+            row_line = " | ".join(
+                str(cell).ljust(col_widths[i]) for i, cell in enumerate(row)
+            )
             print(f"{pad}{row_line}")
 
     def print_cache_stats_table(manager, title="Cache Statistics"):
@@ -526,13 +527,13 @@ if __name__ == "__main__":
         print_table(
             ["Metric", "Value"],
             [
-                ["Hits", stats['hits']],
-                ["Misses", stats['misses']],
+                ["Hits", stats["hits"]],
+                ["Misses", stats["misses"]],
                 ["Hit Rate", f"{stats['hit_rate']*100:.1f}%"],
-                ["Tokens Saved", stats['tokens_saved']],
-                ["Image/Video Hits", stats['image_cache_hits']],
-                ["Evictions", stats['evictions']],
-            ]
+                ["Tokens Saved", stats["tokens_saved"]],
+                ["Image/Video Hits", stats["image_cache_hits"]],
+                ["Evictions", stats["evictions"]],
+            ],
         )
 
     def run_vlm_cache_test():
@@ -553,23 +554,24 @@ if __name__ == "__main__":
 
         print_header("VLM KV CACHE TEST")
         print(f"\n  Model: {VLM_MODEL}")
-        print(f"  Test: Verify KV cache reuse for repeated image/video + prompt combinations")
-        print(f"  Expected behavior:")
-        print(f"    - Same image + same prompt → cache HIT")
-        print(f"    - Same image + different prompt → cache MISS")
-        print(f"    - Different image + same prompt → cache MISS")
-        print(f"    - Same video + same fps/max_frames → cache HIT")
-        print(f"    - Same video + different fps/max_frames → cache MISS")
+        print(
+            "  Test: Verify KV cache reuse for repeated image/video + prompt combinations"
+        )
+        print("  Expected behavior:")
+        print("    - Same image + same prompt → cache HIT")
+        print("    - Same image + different prompt → cache MISS")
+        print("    - Different image + same prompt → cache MISS")
+        print("    - Same video + same fps/max_frames → cache HIT")
+        print("    - Same video + different fps/max_frames → cache MISS")
 
         # ============================================================
         # SETUP: Load Model and Create KV Cache
         # ============================================================
         print_subheader("SETUP: Loading Model")
         print(f"    Downloading: {VLM_MODEL}")
-        model_path = Path(snapshot_download(
-            VLM_MODEL,
-            allow_patterns=["*.safetensors", "*.json"]
-        ))
+        model_path = Path(
+            snapshot_download(VLM_MODEL, allow_patterns=["*.safetensors", "*.json"])
+        )
 
         load_start = time.perf_counter()
         model = load_model(model_path)
@@ -578,9 +580,11 @@ if __name__ == "__main__":
         print(f"    Model loaded in {load_time:.2f}s")
         print(f"    Model type: {config.get('model_type', 'unknown')}")
 
-        print(f"\n    Creating KV cache from model.language_model...")
+        print("\n    Creating KV cache from model.language_model...")
         real_kv_cache = vlm_cache.make_prompt_cache(model.language_model)
-        print(f"    KV cache: {len(real_kv_cache)} layers of {type(real_kv_cache[0]).__name__}")
+        print(
+            f"    KV cache: {len(real_kv_cache)} layers of {type(real_kv_cache[0]).__name__}"
+        )
 
         # ============================================================
         # SETUP: Download Test Images
@@ -591,6 +595,7 @@ if __name__ == "__main__":
         base_image = None
         import tempfile
         from PIL import Image
+
         for idx, url in enumerate(MLLM_TEST_IMAGE_URLS, start=1):
             try:
                 test_image = download_test_image(url)
@@ -608,7 +613,7 @@ if __name__ == "__main__":
             raise RuntimeError("No test images could be downloaded.")
 
         if base_image is not None:
-            print(f"\n    Creating resized variants for cache key testing...")
+            print("\n    Creating resized variants for cache key testing...")
             resize_sizes = [(224, 224), (336, 336), (512, 512), (768, 768)]
             for width, height in resize_sizes:
                 resized = base_image.resize((width, height), Image.Resampling.LANCZOS)
@@ -629,8 +634,10 @@ if __name__ == "__main__":
                 path = download_video(url)
                 video_paths.append(path)
                 video_info = get_video_info(path)
-                print(f"    Video {idx}: {video_info['width']}x{video_info['height']}, "
-                      f"{video_info['duration']:.1f}s @ {video_info['fps']:.1f}fps")
+                print(
+                    f"    Video {idx}: {video_info['width']}x{video_info['height']}, "
+                    f"{video_info['duration']:.1f}s @ {video_info['fps']:.1f}fps"
+                )
             except Exception as exc:
                 print(f"    Video {idx}: FAILED ({exc})")
         if not video_paths:
@@ -651,7 +658,7 @@ if __name__ == "__main__":
         print_subheader("TEST 1: Image Cache - Basic Hit/Miss")
         test_prompt = "Describe this image in detail"
         print(f"    Image: {primary_image_path}")
-        print(f"    Prompt: \"{test_prompt}\"")
+        print(f'    Prompt: "{test_prompt}"')
 
         # Test table for this section
         test1_rows = []
@@ -660,28 +667,61 @@ if __name__ == "__main__":
         t_start = time.perf_counter()
         cached, hit = cache_manager.fetch_cache([primary_image_path], test_prompt)
         t1 = (time.perf_counter() - t_start) * 1000
-        test1_rows.append(["1a", "First request (new)", "MISS", "HIT" if hit else "MISS", f"{t1:.2f}ms", "✓" if not hit else "✗"])
+        test1_rows.append(
+            [
+                "1a",
+                "First request (new)",
+                "MISS",
+                "HIT" if hit else "MISS",
+                f"{t1:.2f}ms",
+                "✓" if not hit else "✗",
+            ]
+        )
         assert not hit, "Expected cache miss"
 
         # Store cache
-        cache_manager.store_cache([primary_image_path], test_prompt, real_kv_cache, num_tokens=500)
+        cache_manager.store_cache(
+            [primary_image_path], test_prompt, real_kv_cache, num_tokens=500
+        )
 
         # Second request - hit
         t_start = time.perf_counter()
         cached, hit = cache_manager.fetch_cache([primary_image_path], test_prompt)
         t2 = (time.perf_counter() - t_start) * 1000
-        test1_rows.append(["1b", "Same image+prompt", "HIT", "HIT" if hit else "MISS", f"{t2:.2f}ms", "✓" if hit else "✗"])
+        test1_rows.append(
+            [
+                "1b",
+                "Same image+prompt",
+                "HIT",
+                "HIT" if hit else "MISS",
+                f"{t2:.2f}ms",
+                "✓" if hit else "✗",
+            ]
+        )
         assert hit, "Expected cache hit"
 
         # Different prompt - miss
         t_start = time.perf_counter()
-        cached, hit = cache_manager.fetch_cache([primary_image_path], "What colors are in this image?")
+        cached, hit = cache_manager.fetch_cache(
+            [primary_image_path], "What colors are in this image?"
+        )
         t3 = (time.perf_counter() - t_start) * 1000
-        test1_rows.append(["1c", "Same image, diff prompt", "MISS", "HIT" if hit else "MISS", f"{t3:.2f}ms", "✓" if not hit else "✗"])
+        test1_rows.append(
+            [
+                "1c",
+                "Same image, diff prompt",
+                "MISS",
+                "HIT" if hit else "MISS",
+                f"{t3:.2f}ms",
+                "✓" if not hit else "✗",
+            ]
+        )
         assert not hit, "Expected cache miss for different prompt"
 
         print("\n    Results:")
-        print_table(["Step", "Description", "Expected", "Actual", "Time", "Status"], test1_rows)
+        print_table(
+            ["Step", "Description", "Expected", "Actual", "Time", "Status"], test1_rows
+        )
         test_results.extend(test1_rows)
         print_cache_stats_table(cache_manager)
 
@@ -696,16 +736,39 @@ if __name__ == "__main__":
                 t_start = time.perf_counter()
                 cached, hit = cache_manager.fetch_cache([image_path], extra_prompt)
                 t_ms = (time.perf_counter() - t_start) * 1000
-                test2_rows.append([f"2.{idx}a", f"Image {idx} first", "MISS", "HIT" if hit else "MISS", f"{t_ms:.2f}ms", "✓" if not hit else "✗"])
+                test2_rows.append(
+                    [
+                        f"2.{idx}a",
+                        f"Image {idx} first",
+                        "MISS",
+                        "HIT" if hit else "MISS",
+                        f"{t_ms:.2f}ms",
+                        "✓" if not hit else "✗",
+                    ]
+                )
                 assert not hit
-                cache_manager.store_cache([image_path], extra_prompt, real_kv_cache, num_tokens=300)
+                cache_manager.store_cache(
+                    [image_path], extra_prompt, real_kv_cache, num_tokens=300
+                )
                 t_start = time.perf_counter()
                 cached, hit = cache_manager.fetch_cache([image_path], extra_prompt)
                 t_ms = (time.perf_counter() - t_start) * 1000
-                test2_rows.append([f"2.{idx}b", f"Image {idx} cached", "HIT", "HIT" if hit else "MISS", f"{t_ms:.2f}ms", "✓" if hit else "✗"])
+                test2_rows.append(
+                    [
+                        f"2.{idx}b",
+                        f"Image {idx} cached",
+                        "HIT",
+                        "HIT" if hit else "MISS",
+                        f"{t_ms:.2f}ms",
+                        "✓" if hit else "✗",
+                    ]
+                )
                 assert hit
             print("\n    Results:")
-            print_table(["Step", "Description", "Expected", "Actual", "Time", "Status"], test2_rows)
+            print_table(
+                ["Step", "Description", "Expected", "Actual", "Time", "Status"],
+                test2_rows,
+            )
             test_results.extend(test2_rows)
             print_cache_stats_table(cache_manager)
 
@@ -714,23 +777,48 @@ if __name__ == "__main__":
         # ============================================================
         if resized_image_entries:
             print_subheader("TEST 3: Resized Images = Different Cache Keys")
-            print(f"    (Cache uses content hash, so different sizes = different keys)")
+            print("    (Cache uses content hash, so different sizes = different keys)")
             test3_rows = []
-            for idx, (image_path, width, height) in enumerate(resized_image_entries, start=1):
+            for idx, (image_path, width, height) in enumerate(
+                resized_image_entries, start=1
+            ):
                 extra_prompt = f"Describe this {width}x{height} image"
                 t_start = time.perf_counter()
                 cached, hit = cache_manager.fetch_cache([image_path], extra_prompt)
                 t_ms = (time.perf_counter() - t_start) * 1000
-                test3_rows.append([f"3.{idx}a", f"{width}x{height} first", "MISS", "HIT" if hit else "MISS", f"{t_ms:.2f}ms", "✓" if not hit else "✗"])
+                test3_rows.append(
+                    [
+                        f"3.{idx}a",
+                        f"{width}x{height} first",
+                        "MISS",
+                        "HIT" if hit else "MISS",
+                        f"{t_ms:.2f}ms",
+                        "✓" if not hit else "✗",
+                    ]
+                )
                 assert not hit
-                cache_manager.store_cache([image_path], extra_prompt, real_kv_cache, num_tokens=200)
+                cache_manager.store_cache(
+                    [image_path], extra_prompt, real_kv_cache, num_tokens=200
+                )
                 t_start = time.perf_counter()
                 cached, hit = cache_manager.fetch_cache([image_path], extra_prompt)
                 t_ms = (time.perf_counter() - t_start) * 1000
-                test3_rows.append([f"3.{idx}b", f"{width}x{height} cached", "HIT", "HIT" if hit else "MISS", f"{t_ms:.2f}ms", "✓" if hit else "✗"])
+                test3_rows.append(
+                    [
+                        f"3.{idx}b",
+                        f"{width}x{height} cached",
+                        "HIT",
+                        "HIT" if hit else "MISS",
+                        f"{t_ms:.2f}ms",
+                        "✓" if hit else "✗",
+                    ]
+                )
                 assert hit
             print("\n    Results:")
-            print_table(["Step", "Description", "Expected", "Actual", "Time", "Status"], test3_rows)
+            print_table(
+                ["Step", "Description", "Expected", "Actual", "Time", "Status"],
+                test3_rows,
+            )
             test_results.extend(test3_rows)
             print_cache_stats_table(cache_manager)
 
@@ -750,17 +838,37 @@ if __name__ == "__main__":
         t_start = time.perf_counter()
         cached, hit = cache_manager.fetch_cache([video_key], video_prompt)
         t_ms = (time.perf_counter() - t_start) * 1000
-        test4_rows.append(["4a", "Video first request", "MISS", "HIT" if hit else "MISS", f"{t_ms:.2f}ms", "✓" if not hit else "✗"])
+        test4_rows.append(
+            [
+                "4a",
+                "Video first request",
+                "MISS",
+                "HIT" if hit else "MISS",
+                f"{t_ms:.2f}ms",
+                "✓" if not hit else "✗",
+            ]
+        )
         assert not hit
 
         # Store cache
-        cache_manager.store_cache([video_key], video_prompt, real_kv_cache, num_tokens=800)
+        cache_manager.store_cache(
+            [video_key], video_prompt, real_kv_cache, num_tokens=800
+        )
 
         # Same params - hit
         t_start = time.perf_counter()
         cached, hit = cache_manager.fetch_cache([video_key], video_prompt)
         t_ms = (time.perf_counter() - t_start) * 1000
-        test4_rows.append(["4b", "Same video+params", "HIT", "HIT" if hit else "MISS", f"{t_ms:.2f}ms", "✓" if hit else "✗"])
+        test4_rows.append(
+            [
+                "4b",
+                "Same video+params",
+                "HIT",
+                "HIT" if hit else "MISS",
+                f"{t_ms:.2f}ms",
+                "✓" if hit else "✗",
+            ]
+        )
         assert hit
 
         # Different fps - miss (important for video!)
@@ -768,7 +876,16 @@ if __name__ == "__main__":
         t_start = time.perf_counter()
         cached, hit = cache_manager.fetch_cache([video_key_diff_fps], video_prompt)
         t_ms = (time.perf_counter() - t_start) * 1000
-        test4_rows.append(["4c", "Different fps (4.0)", "MISS", "HIT" if hit else "MISS", f"{t_ms:.2f}ms", "✓" if not hit else "✗"])
+        test4_rows.append(
+            [
+                "4c",
+                "Different fps (4.0)",
+                "MISS",
+                "HIT" if hit else "MISS",
+                f"{t_ms:.2f}ms",
+                "✓" if not hit else "✗",
+            ]
+        )
         assert not hit
 
         # Different max_frames - miss
@@ -776,7 +893,16 @@ if __name__ == "__main__":
         t_start = time.perf_counter()
         cached, hit = cache_manager.fetch_cache([video_key_diff_frames], video_prompt)
         t_ms = (time.perf_counter() - t_start) * 1000
-        test4_rows.append(["4d", "Different max_frames (32)", "MISS", "HIT" if hit else "MISS", f"{t_ms:.2f}ms", "✓" if not hit else "✗"])
+        test4_rows.append(
+            [
+                "4d",
+                "Different max_frames (32)",
+                "MISS",
+                "HIT" if hit else "MISS",
+                f"{t_ms:.2f}ms",
+                "✓" if not hit else "✗",
+            ]
+        )
         assert not hit
 
         # Multiple fps/max_frames combinations
@@ -787,18 +913,42 @@ if __name__ == "__main__":
             t_start = time.perf_counter()
             cached, hit = cache_manager.fetch_cache([extra_key], extra_prompt)
             t_ms = (time.perf_counter() - t_start) * 1000
-            test4_rows.append([f"4.{fps_value}a", f"fps={fps_value} first", "MISS", "HIT" if hit else "MISS", f"{t_ms:.2f}ms", "✓" if not hit else "✗"])
+            test4_rows.append(
+                [
+                    f"4.{fps_value}a",
+                    f"fps={fps_value} first",
+                    "MISS",
+                    "HIT" if hit else "MISS",
+                    f"{t_ms:.2f}ms",
+                    "✓" if not hit else "✗",
+                ]
+            )
             assert not hit
-            cache_manager.store_cache([extra_key], extra_prompt, real_kv_cache,
-                num_tokens=600 + int(fps_value * 100) + max_frames)
+            cache_manager.store_cache(
+                [extra_key],
+                extra_prompt,
+                real_kv_cache,
+                num_tokens=600 + int(fps_value * 100) + max_frames,
+            )
             t_start = time.perf_counter()
             cached, hit = cache_manager.fetch_cache([extra_key], extra_prompt)
             t_ms = (time.perf_counter() - t_start) * 1000
-            test4_rows.append([f"4.{fps_value}b", f"fps={fps_value} cached", "HIT", "HIT" if hit else "MISS", f"{t_ms:.2f}ms", "✓" if hit else "✗"])
+            test4_rows.append(
+                [
+                    f"4.{fps_value}b",
+                    f"fps={fps_value} cached",
+                    "HIT",
+                    "HIT" if hit else "MISS",
+                    f"{t_ms:.2f}ms",
+                    "✓" if hit else "✗",
+                ]
+            )
             assert hit
 
         print("\n    Results:")
-        print_table(["Step", "Description", "Expected", "Actual", "Time", "Status"], test4_rows)
+        print_table(
+            ["Step", "Description", "Expected", "Actual", "Time", "Status"], test4_rows
+        )
         test_results.extend(test4_rows)
         print_cache_stats_table(cache_manager)
 
@@ -812,16 +962,42 @@ if __name__ == "__main__":
                 t_start = time.perf_counter()
                 cached, hit = cache_manager.fetch_cache([extra_video_key], extra_prompt)
                 t_ms = (time.perf_counter() - t_start) * 1000
-                test5_rows.append([f"5.{idx}a", f"Video {idx} first", "MISS", "HIT" if hit else "MISS", f"{t_ms:.2f}ms", "✓" if not hit else "✗"])
+                test5_rows.append(
+                    [
+                        f"5.{idx}a",
+                        f"Video {idx} first",
+                        "MISS",
+                        "HIT" if hit else "MISS",
+                        f"{t_ms:.2f}ms",
+                        "✓" if not hit else "✗",
+                    ]
+                )
                 assert not hit
-                cache_manager.store_cache([extra_video_key], extra_prompt, real_kv_cache, num_tokens=700 + idx * 10)
+                cache_manager.store_cache(
+                    [extra_video_key],
+                    extra_prompt,
+                    real_kv_cache,
+                    num_tokens=700 + idx * 10,
+                )
                 t_start = time.perf_counter()
                 cached, hit = cache_manager.fetch_cache([extra_video_key], extra_prompt)
                 t_ms = (time.perf_counter() - t_start) * 1000
-                test5_rows.append([f"5.{idx}b", f"Video {idx} cached", "HIT", "HIT" if hit else "MISS", f"{t_ms:.2f}ms", "✓" if hit else "✗"])
+                test5_rows.append(
+                    [
+                        f"5.{idx}b",
+                        f"Video {idx} cached",
+                        "HIT",
+                        "HIT" if hit else "MISS",
+                        f"{t_ms:.2f}ms",
+                        "✓" if hit else "✗",
+                    ]
+                )
                 assert hit
             print("\n    Results:")
-            print_table(["Step", "Description", "Expected", "Actual", "Time", "Status"], test5_rows)
+            print_table(
+                ["Step", "Description", "Expected", "Actual", "Time", "Status"],
+                test5_rows,
+            )
             test_results.extend(test5_rows)
             print_cache_stats_table(cache_manager)
 
@@ -836,7 +1012,7 @@ if __name__ == "__main__":
 
         # Access img1 to make it recently used
         small_cache.fetch_cache(["img1.jpg"], "p1")
-        print(f"    Touched img1 to make it recently used")
+        print("    Touched img1 to make it recently used")
 
         # Add new entry - should evict img2
         small_cache.store_cache(["img3.jpg"], "p3", real_kv_cache)
@@ -845,23 +1021,52 @@ if __name__ == "__main__":
         t_start = time.perf_counter()
         _, hit = small_cache.fetch_cache(["img2.jpg"], "p2")
         t_ms = (time.perf_counter() - t_start) * 1000
-        test6_rows.append(["6a", "img2 (oldest, evicted)", "MISS", "HIT" if hit else "MISS", f"{t_ms:.2f}ms", "✓" if not hit else "✗"])
+        test6_rows.append(
+            [
+                "6a",
+                "img2 (oldest, evicted)",
+                "MISS",
+                "HIT" if hit else "MISS",
+                f"{t_ms:.2f}ms",
+                "✓" if not hit else "✗",
+            ]
+        )
         assert not hit
 
         t_start = time.perf_counter()
         _, hit = small_cache.fetch_cache(["img1.jpg"], "p1")
         t_ms = (time.perf_counter() - t_start) * 1000
-        test6_rows.append(["6b", "img1 (recently used)", "HIT", "HIT" if hit else "MISS", f"{t_ms:.2f}ms", "✓" if hit else "✗"])
+        test6_rows.append(
+            [
+                "6b",
+                "img1 (recently used)",
+                "HIT",
+                "HIT" if hit else "MISS",
+                f"{t_ms:.2f}ms",
+                "✓" if hit else "✗",
+            ]
+        )
         assert hit
 
         t_start = time.perf_counter()
         _, hit = small_cache.fetch_cache(["img3.jpg"], "p3")
         t_ms = (time.perf_counter() - t_start) * 1000
-        test6_rows.append(["6c", "img3 (newest)", "HIT", "HIT" if hit else "MISS", f"{t_ms:.2f}ms", "✓" if hit else "✗"])
+        test6_rows.append(
+            [
+                "6c",
+                "img3 (newest)",
+                "HIT",
+                "HIT" if hit else "MISS",
+                f"{t_ms:.2f}ms",
+                "✓" if hit else "✗",
+            ]
+        )
         assert hit
 
         print("\n    Results:")
-        print_table(["Step", "Description", "Expected", "Actual", "Time", "Status"], test6_rows)
+        print_table(
+            ["Step", "Description", "Expected", "Actual", "Time", "Status"], test6_rows
+        )
         print(f"\n    Evictions: {small_cache.stats.evictions}")
 
         # ============================================================
@@ -874,13 +1079,13 @@ if __name__ == "__main__":
         print_table(
             ["Metric", "Value"],
             [
-                ["Total Hits", stats['hits']],
-                ["Total Misses", stats['misses']],
+                ["Total Hits", stats["hits"]],
+                ["Total Misses", stats["misses"]],
                 ["Hit Rate", f"{stats['hit_rate']*100:.1f}%"],
-                ["Tokens Saved", stats['tokens_saved']],
-                ["Image/Video Hits", stats['image_cache_hits']],
-                ["Evictions", stats['evictions']],
-            ]
+                ["Tokens Saved", stats["tokens_saved"]],
+                ["Image/Video Hits", stats["image_cache_hits"]],
+                ["Evictions", stats["evictions"]],
+            ],
         )
         print("\n" + "=" * 70)
         print("  ✓ ALL TESTS PASSED - VLM cache working correctly!")

@@ -95,15 +95,9 @@ def build_message_content(text: str, files: list[str] | None = None) -> list | s
         data_url, media_type = encode_file_to_base64(file_path)
 
         if media_type == "image":
-            content.append({
-                "type": "image_url",
-                "image_url": {"url": data_url}
-            })
+            content.append({"type": "image_url", "image_url": {"url": data_url}})
         elif media_type == "video":
-            content.append({
-                "type": "video_url",
-                "video_url": {"url": data_url}
-            })
+            content.append({"type": "video_url", "video_url": {"url": data_url}})
 
     return content if content else text
 
@@ -142,6 +136,7 @@ def create_chat_function(server_url: str, max_tokens: int, temperature: float):
 
         # Debug output
         import sys
+
         print(f"[Chat] Text: {text!r}", flush=True)
         print(f"[Chat] Files: {files}", flush=True)
         print(f"[Chat] History length: {len(history)}", flush=True)
@@ -163,8 +158,16 @@ def create_chat_function(server_url: str, max_tokens: int, temperature: float):
                         rebuilt_content = [{"type": "text", "text": content}]
                     elif isinstance(content, list):
                         # Extract just text parts
-                        text_parts = [p.get("text", "") for p in content if isinstance(p, dict) and p.get("type") == "text"]
-                        rebuilt_content = [{"type": "text", "text": " ".join(text_parts)}] if text_parts else []
+                        text_parts = [
+                            p.get("text", "")
+                            for p in content
+                            if isinstance(p, dict) and p.get("type") == "text"
+                        ]
+                        rebuilt_content = (
+                            [{"type": "text", "text": " ".join(text_parts)}]
+                            if text_parts
+                            else []
+                        )
                     else:
                         rebuilt_content = [{"type": "text", "text": str(content)}]
 
@@ -176,7 +179,11 @@ def create_chat_function(server_url: str, max_tokens: int, temperature: float):
                 else:
                     # No media, just text
                     if isinstance(content, list):
-                        text_parts = [p.get("text", "") for p in content if isinstance(p, dict) and p.get("type") == "text"]
+                        text_parts = [
+                            p.get("text", "")
+                            for p in content
+                            if isinstance(p, dict) and p.get("type") == "text"
+                        ]
                         content = " ".join(text_parts)
                     elif isinstance(content, dict):
                         content = content.get("text", str(content))
@@ -193,12 +200,19 @@ def create_chat_function(server_url: str, max_tokens: int, temperature: float):
             for file_path in files:
                 data_url, media_type = encode_file_to_base64(file_path)
                 if media_type == "image":
-                    media_items.append({"type": "image_url", "image_url": {"url": data_url}})
+                    media_items.append(
+                        {"type": "image_url", "image_url": {"url": data_url}}
+                    )
                 elif media_type == "video":
-                    media_items.append({"type": "video_url", "video_url": {"url": data_url}})
+                    media_items.append(
+                        {"type": "video_url", "video_url": {"url": data_url}}
+                    )
             if media_items:
                 media_cache[current_idx] = media_items
-                print(f"[Chat] Cached {len(media_items)} media items for message {current_idx}", flush=True)
+                print(
+                    f"[Chat] Cached {len(media_items)} media items for message {current_idx}",
+                    flush=True,
+                )
 
         # Debug
         print(f"[Chat] Sending {len(messages)} messages to server")
@@ -302,7 +316,11 @@ Note: Make sure the vllm-mlx server is running with a multimodal model:
                     role = msg.get("role", "user")
                     content = msg.get("content", "")
                     if isinstance(content, list):
-                        text_parts = [p.get("text", "") for p in content if isinstance(p, dict) and p.get("type") == "text"]
+                        text_parts = [
+                            p.get("text", "")
+                            for p in content
+                            if isinstance(p, dict) and p.get("type") == "text"
+                        ]
                         content = " ".join(text_parts)
                     messages.append({"role": role, "content": content})
 

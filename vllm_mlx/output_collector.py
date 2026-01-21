@@ -8,8 +8,8 @@ providing non-blocking output collection with intelligent aggregation.
 
 import asyncio
 import threading
-from dataclasses import dataclass, field
-from typing import List, Optional
+from dataclasses import dataclass
+from typing import Optional
 
 from .request import RequestOutput
 

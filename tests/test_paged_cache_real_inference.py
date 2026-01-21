@@ -95,10 +95,7 @@ Always explain your reasoning and provide learning resources."""
     ]
 
     # Create prompts
-    prompts = [
-        f"{system_prompt}\n\nUser: {q}\nAssistant:"
-        for q in user_questions
-    ]
+    prompts = [f"{system_prompt}\n\nUser: {q}\nAssistant:" for q in user_questions]
 
     # Tokenize to show prompt sizes
     prompt_tokens = [len(tokenizer.encode(p)) for p in prompts]
@@ -235,7 +232,7 @@ Always explain your reasoning and provide learning resources."""
 
     if "paged_cache" in stats:
         pc = stats["paged_cache"]
-        print(f"\n  Paged Cache Stats:")
+        print("\n  Paged Cache Stats:")
         print(f"    Blocks allocated: {pc.get('allocated_blocks', 'N/A')}")
         print(f"    Shared blocks: {pc.get('shared_blocks', 'N/A')}")
         print(f"    Cache hits: {pc.get('hits', 0)}")
@@ -245,12 +242,12 @@ Always explain your reasoning and provide learning resources."""
     print("\n" + "=" * 50)
     print("SUMMARY")
     print("=" * 50)
-    print(f"  Requests: 20 (2 rounds of 10)")
+    print("  Requests: 20 (2 rounds of 10)")
     print(f"  System prompt: ~{len(tokenizer.encode(system_prompt))} tokens (shared)")
-    print(f"\n  Without paged cache:")
+    print("\n  Without paged cache:")
     print(f"    Time: {time_no_paged:.2f}s")
     print(f"    Throughput: {total_tokens_no_paged/time_no_paged:.1f} tok/s")
-    print(f"\n  With paged cache:")
+    print("\n  With paged cache:")
     print(f"    Time: {time_paged:.2f}s")
     print(f"    Throughput: {total_tokens_paged/time_paged:.1f} tok/s")
 

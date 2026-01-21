@@ -22,6 +22,7 @@ DEFAULT_PARAKEET_MODEL = "mlx-community/parakeet-tdt-0.6b-v2"
 @dataclass
 class TranscriptionResult:
     """Result from audio transcription."""
+
     text: str
     language: Optional[str] = None
     duration: Optional[float] = None
@@ -67,6 +68,7 @@ class STTEngine:
 
         try:
             from mlx_audio.stt.utils import load_model
+
             self.model = load_model(self.model_name)
             self._loaded = True
             logger.info(f"STT model loaded: {self.model_name}")

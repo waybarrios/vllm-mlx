@@ -22,8 +22,13 @@ def pytest_addoption(parser):
 
 def pytest_configure(config):
     """Configure custom markers."""
-    config.addinivalue_line("markers", "slow: mark test as slow (requires model loading)")
-    config.addinivalue_line("markers", "integration: mark test as integration test (requires running server)")
+    config.addinivalue_line(
+        "markers", "slow: mark test as slow (requires model loading)"
+    )
+    config.addinivalue_line(
+        "markers",
+        "integration: mark test as integration test (requires running server)",
+    )
 
 
 def pytest_collection_modifyitems(config, items):

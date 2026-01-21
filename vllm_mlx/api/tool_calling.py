@@ -18,7 +18,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 from jsonschema import validate, ValidationError
 
-from .models import FunctionCall, ResponseFormat, ToolCall, ToolDefinition
+from .models import FunctionCall, ResponseFormat, ToolCall
 
 
 def _parse_raw_json_tool_calls(text: str) -> Optional[List[dict]]:
@@ -131,35 +131,38 @@ def parse_tool_calls(text: str) -> Tuple[str, Optional[List[ToolCall]]]:
         ).strip()
 
     # Pattern for Nemotron-style: <tool_call><function=name><parameter=p>v</parameter></function></tool_call>
-    nemotron_pattern = r'<tool_call>\s*<function=([^>]+)>(.*?)</function>\s*</tool_call>'
+    nemotron_pattern = (
+        r"<tool_call>\s*<function=([^>]+)>(.*?)</function>\s*</tool_call>"
+    )
     nemotron_matches = re.findall(nemotron_pattern, text, re.DOTALL)
 
     for name, params_block in nemotron_matches:
         # Parse parameters from <parameter=name>value</parameter> format
-        param_pattern = r'<parameter=([^>]+)>\s*(.*?)\s*</parameter>'
+        param_pattern = r"<parameter=([^>]+)>\s*(.*?)\s*</parameter>"
         params = re.findall(param_pattern, params_block, re.DOTALL)
         arguments = {p_name.strip(): p_value.strip() for p_name, p_value in params}
 
-        tool_calls.append(ToolCall(
-            id=f"call_{uuid.uuid4().hex[:8]}",
-            type="function",
-            function=FunctionCall(
-                name=name.strip(),
-                arguments=json.dumps(arguments)
+        tool_calls.append(
+            ToolCall(
+                id=f"call_{uuid.uuid4().hex[:8]}",
+                type="function",
+                function=FunctionCall(
+                    name=name.strip(), arguments=json.dumps(arguments)
+                ),
             )
-        ))
+        )
 
     # Remove Nemotron tool call tags from cleaned text
     if nemotron_matches:
         cleaned_text = re.sub(
-            r'<tool_call>\s*<function=[^>]+>.*?</function>\s*</tool_call>',
-            '',
+            r"<tool_call>\s*<function=[^>]+>.*?</function>\s*</tool_call>",
+            "",
             text,
-            flags=re.DOTALL
+            flags=re.DOTALL,
         ).strip()
 
     # Pattern for Qwen-style tool calls: <tool_call>{"json"}</tool_call>
-    qwen_pattern = r'<tool_call>\s*(\{.*?\})\s*</tool_call>'
+    qwen_pattern = r"<tool_call>\s*(\{.*?\})\s*</tool_call>"
     qwen_matches = re.findall(qwen_pattern, cleaned_text, re.DOTALL)
 
     for match in qwen_matches:
@@ -167,50 +170,56 @@ def parse_tool_calls(text: str) -> Tuple[str, Optional[List[ToolCall]]]:
             data = json.loads(match)
             name = data.get("name", "")
             arguments = data.get("arguments", {})
-            tool_calls.append(ToolCall(
-                id=f"call_{uuid.uuid4().hex[:8]}",
-                type="function",
-                function=FunctionCall(
-                    name=name,
-                    arguments=json.dumps(arguments) if isinstance(arguments, dict) else str(arguments)
+            tool_calls.append(
+                ToolCall(
+                    id=f"call_{uuid.uuid4().hex[:8]}",
+                    type="function",
+                    function=FunctionCall(
+                        name=name,
+                        arguments=(
+                            json.dumps(arguments)
+                            if isinstance(arguments, dict)
+                            else str(arguments)
+                        ),
+                    ),
                 )
-            ))
+            )
         except json.JSONDecodeError:
             continue
 
     # Remove Qwen tool call tags from cleaned text
     if qwen_matches:
         cleaned_text = re.sub(
-            r'<tool_call>\s*\{.*?\}\s*</tool_call>',
-            '',
-            cleaned_text,
-            flags=re.DOTALL
+            r"<tool_call>\s*\{.*?\}\s*</tool_call>", "", cleaned_text, flags=re.DOTALL
         ).strip()
 
     # Pattern for Llama-style: <function=name>{"json"}</function>
-    llama_pattern = r'<function=([^>]+)>(\{.*?\})</function>'
+    llama_pattern = r"<function=([^>]+)>(\{.*?\})</function>"
     llama_matches = re.findall(llama_pattern, cleaned_text, re.DOTALL)
 
     for name, args_str in llama_matches:
         try:
             arguments = json.loads(args_str)
-            tool_calls.append(ToolCall(
-                id=f"call_{uuid.uuid4().hex[:8]}",
-                type="function",
-                function=FunctionCall(
-                    name=name.strip(),
-                    arguments=json.dumps(arguments) if isinstance(arguments, dict) else str(arguments)
+            tool_calls.append(
+                ToolCall(
+                    id=f"call_{uuid.uuid4().hex[:8]}",
+                    type="function",
+                    function=FunctionCall(
+                        name=name.strip(),
+                        arguments=(
+                            json.dumps(arguments)
+                            if isinstance(arguments, dict)
+                            else str(arguments)
+                        ),
+                    ),
                 )
-            ))
+            )
         except json.JSONDecodeError:
             continue
 
     if llama_matches:
         cleaned_text = re.sub(
-            r'<function=[^>]+>\{.*?\}</function>',
-            '',
-            cleaned_text,
-            flags=re.DOTALL
+            r"<function=[^>]+>\{.*?\}</function>", "", cleaned_text, flags=re.DOTALL
         ).strip()
 
     # Note: We keep <think>...</think> tags for reasoning models
@@ -236,9 +245,7 @@ def parse_tool_calls(text: str) -> Tuple[str, Optional[List[ToolCall]]]:
     return cleaned_text, tool_calls if tool_calls else None
 
 
-def convert_tools_for_template(
-    tools: Optional[List]
-) -> Optional[List[dict]]:
+def convert_tools_for_template(tools: Optional[List]) -> Optional[List[dict]]:
     """
     Convert OpenAI tools format to format expected by tokenizer.apply_chat_template.
 
@@ -272,20 +279,26 @@ def convert_tools_for_template(
             if isinstance(tool_func, dict):
                 func_name = tool_func.get("name", "")
                 func_desc = tool_func.get("description", "")
-                func_params = tool_func.get("parameters", {"type": "object", "properties": {}})
+                func_params = tool_func.get(
+                    "parameters", {"type": "object", "properties": {}}
+                )
             else:
                 func_name = getattr(tool_func, "name", "")
                 func_desc = getattr(tool_func, "description", "")
-                func_params = getattr(tool_func, "parameters", {"type": "object", "properties": {}})
+                func_params = getattr(
+                    tool_func, "parameters", {"type": "object", "properties": {}}
+                )
 
-            converted.append({
-                "type": "function",
-                "function": {
-                    "name": func_name,
-                    "description": func_desc,
-                    "parameters": func_params
+            converted.append(
+                {
+                    "type": "function",
+                    "function": {
+                        "name": func_name,
+                        "description": func_desc,
+                        "parameters": func_params,
+                    },
                 }
-            })
+            )
 
     return converted if converted else None
 
@@ -306,7 +319,7 @@ def format_tool_call_for_message(tool_call: ToolCall) -> dict:
         "function": {
             "name": tool_call.function.name,
             "arguments": tool_call.function.arguments,
-        }
+        },
     }
 
 
@@ -314,9 +327,9 @@ def format_tool_call_for_message(tool_call: ToolCall) -> dict:
 # Structured Output (JSON Schema) Utilities
 # =============================================================================
 
+
 def validate_json_schema(
-    data: Any,
-    schema: Dict[str, Any]
+    data: Any, schema: Dict[str, Any]
 ) -> Tuple[bool, Optional[str]]:
     """
     Validate JSON data against a JSON Schema.
@@ -362,7 +375,7 @@ def extract_json_from_text(text: str) -> Optional[Dict[str, Any]]:
 
     # Strategy 2: Extract from markdown code blocks
     # Match ```json ... ``` or ``` ... ```
-    code_block_pattern = r'```(?:json)?\s*([\s\S]*?)\s*```'
+    code_block_pattern = r"```(?:json)?\s*([\s\S]*?)\s*```"
     matches = re.findall(code_block_pattern, text)
     for match in matches:
         try:
@@ -373,8 +386,8 @@ def extract_json_from_text(text: str) -> Optional[Dict[str, Any]]:
     # Strategy 3: Find JSON object or array in text
     # Look for { ... } or [ ... ]
     json_patterns = [
-        r'(\{[\s\S]*\})',  # Object
-        r'(\[[\s\S]*\])',  # Array
+        r"(\{[\s\S]*\})",  # Object
+        r"(\[[\s\S]*\])",  # Array
     ]
     for pattern in json_patterns:
         match = re.search(pattern, text)
@@ -388,8 +401,7 @@ def extract_json_from_text(text: str) -> Optional[Dict[str, Any]]:
 
 
 def parse_json_output(
-    text: str,
-    response_format: Optional[Union[ResponseFormat, Dict[str, Any]]] = None
+    text: str, response_format: Optional[Union[ResponseFormat, Dict[str, Any]]] = None
 ) -> Tuple[str, Optional[Dict[str, Any]], bool, Optional[str]]:
     """
     Parse JSON from model output when response_format is set.
@@ -413,10 +425,7 @@ def parse_json_output(
 
     # Normalize response_format to dict
     if isinstance(response_format, ResponseFormat):
-        rf_dict = {
-            "type": response_format.type,
-            "json_schema": None
-        }
+        rf_dict = {"type": response_format.type, "json_schema": None}
         if response_format.json_schema:
             rf_dict["json_schema"] = {
                 "name": response_format.json_schema.name,
@@ -460,7 +469,7 @@ def parse_json_output(
 
 
 def build_json_system_prompt(
-    response_format: Optional[Union[ResponseFormat, Dict[str, Any]]] = None
+    response_format: Optional[Union[ResponseFormat, Dict[str, Any]]] = None,
 ) -> Optional[str]:
     """
     Build a system prompt instruction for JSON output.
@@ -479,10 +488,7 @@ def build_json_system_prompt(
 
     # Normalize to dict
     if isinstance(response_format, ResponseFormat):
-        rf_dict = {
-            "type": response_format.type,
-            "json_schema": None
-        }
+        rf_dict = {"type": response_format.type, "json_schema": None}
         if response_format.json_schema:
             rf_dict["json_schema"] = {
                 "name": response_format.json_schema.name,

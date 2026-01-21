@@ -6,11 +6,10 @@ import sys
 
 import pytest
 
-
 # Skip all tests if not on Apple Silicon or MLX not available
 pytestmark = pytest.mark.skipif(
     sys.platform != "darwin" or platform.machine() != "arm64",
-    reason="Requires Apple Silicon"
+    reason="Requires Apple Silicon",
 )
 
 

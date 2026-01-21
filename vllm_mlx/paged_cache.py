@@ -79,6 +79,7 @@ def compute_block_hash(
 # KVCacheBlock - Following vLLM's design
 # =============================================================================
 
+
 @dataclass
 class CacheBlock:
     """
@@ -152,6 +153,7 @@ KVCacheBlock = CacheBlock
 # =============================================================================
 # FreeKVCacheBlockQueue - O(1) Doubly Linked List (vLLM style)
 # =============================================================================
+
 
 class FreeKVCacheBlockQueue:
     """
@@ -238,7 +240,9 @@ class FreeKVCacheBlockQueue:
         if n == 0:
             return []
 
-        assert self.num_free_blocks >= n, f"Need {n} blocks, have {self.num_free_blocks}"
+        assert (
+            self.num_free_blocks >= n
+        ), f"Need {n} blocks, have {self.num_free_blocks}"
 
         result = []
         curr = self.fake_head.next_free_block
@@ -337,6 +341,7 @@ class FreeKVCacheBlockQueue:
 # BlockHashToBlockMap - Hash-based prefix cache (vLLM style)
 # =============================================================================
 
+
 class BlockHashToBlockMap:
     """
     Cache mapping block hashes to blocks for prefix caching.
@@ -404,6 +409,7 @@ class BlockHashToBlockMap:
 # BlockTable - Per-request block mapping
 # =============================================================================
 
+
 @dataclass
 class BlockTable:
     """
@@ -443,9 +449,11 @@ class BlockTable:
 # CacheStats - Statistics for monitoring
 # =============================================================================
 
+
 @dataclass
 class CacheStats:
     """Statistics for cache monitoring."""
+
     total_blocks: int = 0
     allocated_blocks: int = 0
     free_blocks: int = 0
@@ -460,6 +468,7 @@ class CacheStats:
 # =============================================================================
 # PagedCacheManager - Main manager (vLLM BlockPool style)
 # =============================================================================
+
 
 class PagedCacheManager:
     """
@@ -607,9 +616,7 @@ class PagedCacheManager:
         if block.block_hash is None:
             return False
 
-        evicted = self.cached_block_hash_to_block.pop(
-            block.block_hash, block.block_id
-        )
+        evicted = self.cached_block_hash_to_block.pop(block.block_hash, block.block_id)
 
         if evicted:
             # Also remove from legacy hash index
@@ -953,12 +960,12 @@ class PagedCacheManager:
             remaining_tokens = tokens.copy()
 
             while len(remaining_tokens) >= self.block_size:
-                chunk = remaining_tokens[:self.block_size]
+                chunk = remaining_tokens[: self.block_size]
                 cached_block = self.find_cached_block(chunk)
 
                 if cached_block:
                     shared_blocks.append(cached_block.block_id)
-                    remaining_tokens = remaining_tokens[self.block_size:]
+                    remaining_tokens = remaining_tokens[self.block_size :]
                 else:
                     break
 
@@ -1032,9 +1039,7 @@ class PagedCacheManager:
         if source_block.ref_count == 1:
             self.stats.shared_blocks -= 1
 
-        logger.debug(
-            f"COW copy: block {source_block.block_id} -> {new_block.block_id}"
-        )
+        logger.debug(f"COW copy: block {source_block.block_id} -> {new_block.block_id}")
 
         return new_block
 
@@ -1128,7 +1133,8 @@ class PagedCacheManager:
                 "utilization": stats.allocated_blocks / self.max_blocks,
                 "cache_hit_rate": (
                     stats.cache_hits / (stats.cache_hits + stats.cache_misses)
-                    if (stats.cache_hits + stats.cache_misses) > 0 else 0
+                    if (stats.cache_hits + stats.cache_misses) > 0
+                    else 0
                 ),
             }
 
@@ -1166,9 +1172,7 @@ class PagedCacheManager:
         """Clear all cached data."""
         with self._lock:
             # Recreate blocks and queue
-            self.blocks = [
-                CacheBlock(block_id=i) for i in range(self.max_blocks)
-            ]
+            self.blocks = [CacheBlock(block_id=i) for i in range(self.max_blocks)]
             self.free_block_queue = FreeKVCacheBlockQueue(self.blocks)
 
             self.cached_block_hash_to_block.clear()

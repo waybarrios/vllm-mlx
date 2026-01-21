@@ -121,6 +121,7 @@ class MLXAttentionBackend:
     def supports_dtype(dtype: "torch.dtype") -> bool:
         """Check if dtype is supported."""
         import torch
+
         return dtype in [torch.float16, torch.bfloat16, torch.float32]
 
     @staticmethod
@@ -214,20 +215,21 @@ class MLXAttentionImpl:
         """
         try:
             import mlx.core as mx
-            import mlx.nn as nn
 
             # Convert inputs to MLX arrays if needed
             if not isinstance(query, mx.array):
-                query = mx.array(query.numpy() if hasattr(query, 'numpy') else query)
+                query = mx.array(query.numpy() if hasattr(query, "numpy") else query)
             if not isinstance(key, mx.array):
-                key = mx.array(key.numpy() if hasattr(key, 'numpy') else key)
+                key = mx.array(key.numpy() if hasattr(key, "numpy") else key)
             if not isinstance(value, mx.array):
-                value = mx.array(value.numpy() if hasattr(value, 'numpy') else value)
+                value = mx.array(value.numpy() if hasattr(value, "numpy") else value)
 
             # Use MLX's scaled dot product attention
             # Shape: (batch, seq_len, num_heads, head_size)
             attn_output = mx.fast.scaled_dot_product_attention(
-                query, key, value,
+                query,
+                key,
+                value,
                 scale=self.scale,
             )
 

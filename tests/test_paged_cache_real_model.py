@@ -11,7 +11,6 @@ Usage:
 """
 
 import argparse
-import gc
 import platform
 import sys
 import time
@@ -39,11 +38,15 @@ def print_header(title: str) -> None:
     print("=" * 70)
 
 
-def print_table(headers: List[str], rows: List[List[str]], col_widths: List[int] = None) -> None:
+def print_table(
+    headers: List[str], rows: List[List[str]], col_widths: List[int] = None
+) -> None:
     """Print a formatted table."""
     if col_widths is None:
-        col_widths = [max(len(str(row[i])) for row in [headers] + rows) + 2
-                      for i in range(len(headers))]
+        col_widths = [
+            max(len(str(row[i])) for row in [headers] + rows) + 2
+            for i in range(len(headers))
+        ]
 
     header_line = "|".join(h.center(w) for h, w in zip(headers, col_widths))
     separator = "+".join("-" * w for w in col_widths)
@@ -162,12 +165,14 @@ Let's begin the session. I'm ready to help with any technical questions you have
         cache, remaining = standard_cache.fetch_cache(tokens)
         cached_tokens = len(tokens) - len(remaining) if cache else 0
 
-        standard_results.append({
-            "user": i + 1,
-            "total_tokens": len(tokens),
-            "cached": cached_tokens,
-            "remaining": len(remaining) if remaining else len(tokens),
-        })
+        standard_results.append(
+            {
+                "user": i + 1,
+                "total_tokens": len(tokens),
+                "cached": cached_tokens,
+                "remaining": len(remaining) if remaining else len(tokens),
+            }
+        )
 
         # Store in cache (simulating after generation)
         standard_cache.store_cache(tokens, [f"cache_{i}"])
@@ -199,13 +204,15 @@ Let's begin the session. I'm ready to help with any technical questions you have
         block_table, remaining = paged_cache.fetch_cache(f"user-{i}", tokens)
         cached_tokens = block_table.num_tokens if block_table else 0
 
-        paged_results.append({
-            "user": i + 1,
-            "total_tokens": len(tokens),
-            "cached": cached_tokens,
-            "shared_blocks": len(block_table.block_ids) if block_table else 0,
-            "remaining": len(remaining),
-        })
+        paged_results.append(
+            {
+                "user": i + 1,
+                "total_tokens": len(tokens),
+                "cached": cached_tokens,
+                "shared_blocks": len(block_table.block_ids) if block_table else 0,
+                "remaining": len(remaining),
+            }
+        )
 
         # Store in cache
         paged_cache.store_cache(f"user-{i}", tokens, [f"cache_{i}"])
@@ -221,7 +228,7 @@ Let's begin the session. I'm ready to help with any technical questions you have
     print(f"  Time: {paged_time*1000:.1f}ms")
 
     # Calculate theoretical blocks without sharing
-    avg_tokens_per_request = sum(r['total_tokens'] for r in paged_results) / num_users
+    avg_tokens_per_request = sum(r["total_tokens"] for r in paged_results) / num_users
     blocks_per_request = (avg_tokens_per_request + 63) // 64
     theoretical_blocks = int(blocks_per_request * num_users)
 
@@ -233,21 +240,41 @@ Let's begin the session. I'm ready to help with any technical questions you have
     print_table(
         ["Metric", "Standard Cache", "Paged Cache"],
         [
-            ["Cache hits", str(standard_stats['hits']), str(paged_stats['hits'])],
-            ["Tokens saved", str(standard_stats['tokens_saved']), str(paged_stats['tokens_saved'])],
-            ["Blocks (theoretical)", str(theoretical_blocks), str(paged_stats['allocated_blocks'])],
-            ["Memory savings", "0%", f"{(1 - paged_stats['allocated_blocks']/theoretical_blocks)*100:.1f}%"],
+            ["Cache hits", str(standard_stats["hits"]), str(paged_stats["hits"])],
+            [
+                "Tokens saved",
+                str(standard_stats["tokens_saved"]),
+                str(paged_stats["tokens_saved"]),
+            ],
+            [
+                "Blocks (theoretical)",
+                str(theoretical_blocks),
+                str(paged_stats["allocated_blocks"]),
+            ],
+            [
+                "Memory savings",
+                "0%",
+                f"{(1 - paged_stats['allocated_blocks']/theoretical_blocks)*100:.1f}%",
+            ],
         ],
-        [20, 18, 18]
+        [20, 18, 18],
     )
 
     # Show per-user results
     print("\nPer-user breakdown (Paged Cache):")
     print_table(
         ["User", "Total Tokens", "Cached", "Shared Blocks", "New Tokens"],
-        [[str(r['user']), str(r['total_tokens']), str(r['cached']),
-          str(r['shared_blocks']), str(r['remaining'])] for r in paged_results[:5]],
-        [8, 14, 10, 15, 12]
+        [
+            [
+                str(r["user"]),
+                str(r["total_tokens"]),
+                str(r["cached"]),
+                str(r["shared_blocks"]),
+                str(r["remaining"]),
+            ]
+            for r in paged_results[:5]
+        ],
+        [8, 14, 10, 15, 12],
     )
     if num_users > 5:
         print(f"... and {num_users - 5} more users with similar sharing ...")
@@ -334,10 +361,7 @@ Always explain your reasoning thoroughly and provide learning resources when hel
     ]
 
     # Create prompts
-    prompts = [
-        f"{system_prompt}\n\nUser: {q}\nAssistant:"
-        for q in user_questions
-    ]
+    prompts = [f"{system_prompt}\n\nUser: {q}\nAssistant:" for q in user_questions]
 
     # Tokenize to show prompt sizes
     prompt_tokens = [len(tokenizer.encode(p)) for p in prompts]
@@ -473,7 +497,7 @@ Always explain your reasoning thoroughly and provide learning resources when hel
 
     if "paged_cache" in stats:
         pc = stats["paged_cache"]
-        print(f"\n  Paged Cache Stats:")
+        print("\n  Paged Cache Stats:")
         print(f"    Blocks allocated: {pc.get('allocated_blocks', 'N/A')}")
         print(f"    Shared blocks: {pc.get('shared_blocks', 'N/A')}")
         print(f"    Cache hits: {pc.get('hits', 0)}")
@@ -490,13 +514,29 @@ Always explain your reasoning thoroughly and provide learning resources when hel
         ["Metric", "Without Paged", "With Paged"],
         [
             ["Time", f"{time_no_paged:.2f}s", f"{time_paged:.2f}s"],
-            ["Throughput", f"{total_tokens_no_paged/time_no_paged:.1f} tok/s", f"{total_tokens_paged/time_paged:.1f} tok/s"],
-            ["Blocks allocated", "-", str(stats.get('paged_cache', {}).get('allocated_blocks', 0))],
-            ["Shared blocks", "-", str(stats.get('paged_cache', {}).get('shared_blocks', 0))],
-            ["Cache hits", "0", str(stats.get('paged_cache', {}).get('hits', 0))],
-            ["Tokens saved", "0", str(stats.get('paged_cache', {}).get('tokens_saved', 0))],
+            [
+                "Throughput",
+                f"{total_tokens_no_paged/time_no_paged:.1f} tok/s",
+                f"{total_tokens_paged/time_paged:.1f} tok/s",
+            ],
+            [
+                "Blocks allocated",
+                "-",
+                str(stats.get("paged_cache", {}).get("allocated_blocks", 0)),
+            ],
+            [
+                "Shared blocks",
+                "-",
+                str(stats.get("paged_cache", {}).get("shared_blocks", 0)),
+            ],
+            ["Cache hits", "0", str(stats.get("paged_cache", {}).get("hits", 0))],
+            [
+                "Tokens saved",
+                "0",
+                str(stats.get("paged_cache", {}).get("tokens_saved", 0)),
+            ],
         ],
-        [18, 15, 15]
+        [18, 15, 15],
     )
 
     print(f"\n  Speedup: {speedup:.2f}x")

@@ -116,9 +116,16 @@ class Request:
     block_table: Optional["BlockTable"] = None  # Block table for paged cache
     shared_prefix_blocks: int = 0  # Number of shared prefix blocks
 
-    # Multimodal content (images, video)
+    # Multimodal content (images, video) - raw inputs
     images: Optional[List[Any]] = None
     videos: Optional[List[Any]] = None
+
+    # Processed multimodal inputs for VLM batching
+    pixel_values: Optional[Any] = None  # Processed image tensors (mx.array)
+    image_grid_thw: Optional[Any] = None  # Grid info for Qwen-VL models
+    attention_mask: Optional[Any] = None  # Attention mask for multimodal input
+    multimodal_kwargs: Optional[Dict[str, Any]] = None  # Model-specific kwargs
+    is_multimodal: bool = False  # Flag indicating this is a multimodal request
 
     # Metadata
     finish_reason: Optional[str] = None

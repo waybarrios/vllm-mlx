@@ -15,7 +15,8 @@ def test_is_apple_silicon():
         # Should be available on Apple Silicon Mac
         # (assuming MLX is installed)
         try:
-            import mlx.core
+            import mlx.core  # noqa: F401
+
             assert is_mlx_available()
         except ImportError:
             pytest.skip("MLX not installed")
@@ -77,7 +78,7 @@ def test_plugin_entry_point():
         pytest.skip("Not on Apple Silicon")
 
     try:
-        import mlx.core
+        import mlx.core  # noqa: F401
     except ImportError:
         pytest.skip("MLX not installed")
 

@@ -12,6 +12,7 @@ from .models import (
     # Content types
     ImageUrl,
     VideoUrl,
+    AudioUrl,
     ContentPart,
     Message,
     # Tool calling
@@ -41,6 +42,11 @@ from .models import (
     MCPServersResponse,
     MCPExecuteRequest,
     MCPExecuteResponse,
+    # Audio
+    AudioTranscriptionRequest,
+    AudioTranscriptionResponse,
+    AudioSpeechRequest,
+    AudioSeparationRequest,
 )
 
 from .utils import (
@@ -66,6 +72,7 @@ __all__ = [
     # Models
     "ImageUrl",
     "VideoUrl",
+    "AudioUrl",
     "ContentPart",
     "Message",
     "FunctionCall",
@@ -89,6 +96,11 @@ __all__ = [
     "MCPServersResponse",
     "MCPExecuteRequest",
     "MCPExecuteResponse",
+    # Audio
+    "AudioTranscriptionRequest",
+    "AudioTranscriptionResponse",
+    "AudioSpeechRequest",
+    "AudioSeparationRequest",
     # Utils
     "clean_output_text",
     "is_mllm_model",

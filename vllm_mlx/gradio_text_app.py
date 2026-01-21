@@ -34,6 +34,7 @@ def create_chat_function(server_url: str, max_tokens: int, temperature: float):
     Returns:
         Chat function compatible with gr.ChatInterface
     """
+
     def chat(message: str, history: list) -> str:
         """
         Process a text message and return response.
@@ -55,7 +56,11 @@ def create_chat_function(server_url: str, max_tokens: int, temperature: float):
                 content = msg.get("content", "")
                 if isinstance(content, list):
                     # Extract text from multimodal content
-                    text_parts = [p.get("text", "") for p in content if isinstance(p, dict) and p.get("type") == "text"]
+                    text_parts = [
+                        p.get("text", "")
+                        for p in content
+                        if isinstance(p, dict) and p.get("type") == "text"
+                    ]
                     content = " ".join(text_parts)
                 messages.append({"role": role, "content": content})
 

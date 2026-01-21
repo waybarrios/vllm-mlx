@@ -45,7 +45,9 @@ def load_model_with_fallback(model_name: str, tokenizer_config: dict = None):
 
     # Check if model needs fallback (e.g., Nemotron)
     if _needs_tokenizer_fallback(model_name):
-        logger.info(f"Model {model_name} requires tokenizer fallback, loading directly...")
+        logger.info(
+            f"Model {model_name} requires tokenizer fallback, loading directly..."
+        )
         return _load_with_tokenizer_fallback(model_name)
 
     try:

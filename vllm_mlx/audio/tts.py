@@ -13,7 +13,7 @@ import io
 import logging
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterator, Optional, Union
+from typing import Iterator, Union
 
 import numpy as np
 
@@ -24,10 +24,17 @@ DEFAULT_TTS_MODEL = "mlx-community/Kokoro-82M-bf16"
 
 # Available voices per model family
 KOKORO_VOICES = [
-    "af_heart", "af_bella", "af_nicole", "af_sarah", "af_sky",
-    "am_adam", "am_michael",
-    "bf_emma", "bf_isabella",
-    "bm_george", "bm_lewis",
+    "af_heart",
+    "af_bella",
+    "af_nicole",
+    "af_sarah",
+    "af_sky",
+    "am_adam",
+    "am_michael",
+    "bf_emma",
+    "bf_isabella",
+    "bm_george",
+    "bm_lewis",
 ]
 
 CHATTERBOX_VOICES = ["default"]  # Uses reference audio for voice
@@ -36,6 +43,7 @@ CHATTERBOX_VOICES = ["default"]  # Uses reference audio for voice
 @dataclass
 class AudioOutput:
     """Output from TTS generation."""
+
     audio: np.ndarray
     sample_rate: int
     duration: float
@@ -96,9 +104,12 @@ class TTSEngine:
 
         try:
             from mlx_audio.tts.generate import load_model
+
             self.model = load_model(self.model_name)
             self._loaded = True
-            logger.info(f"TTS model loaded: {self.model_name} (family: {self._model_family})")
+            logger.info(
+                f"TTS model loaded: {self.model_name} (family: {self._model_family})"
+            )
         except ImportError as e:
             logger.error(f"mlx-audio not installed: {e}")
             raise ImportError(
@@ -140,13 +151,13 @@ class TTSEngine:
                 lang_code=lang_code,
             ):
                 audio_data = result.audio
-                if hasattr(result, 'sample_rate'):
+                if hasattr(result, "sample_rate"):
                     sample_rate = result.sample_rate
 
                 # Convert mlx array to numpy
                 if isinstance(audio_data, mx.array):
                     audio_np = np.array(audio_data.tolist(), dtype=np.float32)
-                elif hasattr(audio_data, 'tolist'):
+                elif hasattr(audio_data, "tolist"):
                     audio_np = np.array(audio_data.tolist(), dtype=np.float32)
                 else:
                     audio_np = np.array(audio_data, dtype=np.float32)
@@ -157,7 +168,11 @@ class TTSEngine:
                 raise RuntimeError("No audio generated")
 
             # Concatenate all chunks
-            full_audio = np.concatenate(audio_chunks) if len(audio_chunks) > 1 else audio_chunks[0]
+            full_audio = (
+                np.concatenate(audio_chunks)
+                if len(audio_chunks) > 1
+                else audio_chunks[0]
+            )
             duration = len(full_audio) / sample_rate
 
             return AudioOutput(
@@ -197,10 +212,10 @@ class TTSEngine:
             speed=speed,
         ):
             audio_data = result.audio
-            if hasattr(result, 'sample_rate'):
+            if hasattr(result, "sample_rate"):
                 sample_rate = result.sample_rate
 
-            if hasattr(audio_data, 'tolist'):
+            if hasattr(audio_data, "tolist"):
                 audio_np = np.array(audio_data.tolist(), dtype=np.float32)
             else:
                 audio_np = np.array(audio_data, dtype=np.float32)
@@ -227,11 +242,13 @@ class TTSEngine:
         """
         try:
             from mlx_audio.tts import save_audio
+
             save_audio(audio.audio, str(path), sample_rate=audio.sample_rate)
             logger.info(f"Audio saved to {path}")
         except ImportError:
             # Fallback to scipy
             import scipy.io.wavfile as wav
+
             # Ensure audio is in correct format
             audio_int16 = (audio.audio * 32767).astype(np.int16)
             wav.write(str(path), audio.sample_rate, audio_int16)

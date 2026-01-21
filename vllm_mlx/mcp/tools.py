@@ -24,11 +24,12 @@ def mcp_tool_to_openai(tool: MCPTool) -> Dict[str, Any]:
         "function": {
             "name": tool.full_name,
             "description": tool.description,
-            "parameters": tool.input_schema or {
+            "parameters": tool.input_schema
+            or {
                 "type": "object",
                 "properties": {},
             },
-        }
+        },
     }
 
 
@@ -98,7 +99,7 @@ def format_tool_result(result: MCPToolResult, tool_call_id: str) -> Dict[str, An
 
 
 def format_tool_results(
-    results: List[Tuple[MCPToolResult, str]]
+    results: List[Tuple[MCPToolResult, str]],
 ) -> List[Dict[str, Any]]:
     """
     Format multiple tool results as messages.

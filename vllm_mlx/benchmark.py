@@ -28,6 +28,7 @@ Usage:
 
 # Disable tokenizers parallelism warning (must be before importing transformers)
 import os
+
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 import argparse
@@ -49,12 +50,14 @@ from tabulate import tabulate
 
 try:
     import mlx.core as mx
+
     HAS_MLX = True
 except ImportError:
     HAS_MLX = False
 
 try:
     import psutil
+
     HAS_PSUTIL = True
 except ImportError:
     HAS_PSUTIL = False
@@ -64,9 +67,11 @@ except ImportError:
 # Resource Monitoring (Memory)
 # =============================================================================
 
+
 @dataclass
 class ResourceMetrics:
     """Resource usage metrics during benchmark."""
+
     # Memory metrics (in GB)
     process_memory_gb: float = 0.0
     mlx_cache_gb: float = 0.0
@@ -82,7 +87,7 @@ def reset_mlx_peak_memory():
 
     try:
         # Use new API (mx.*) if available, fallback to deprecated (mx.metal.*)
-        if hasattr(mx, 'reset_peak_memory'):
+        if hasattr(mx, "reset_peak_memory"):
             mx.reset_peak_memory()
         else:
             mx.metal.reset_peak_memory()
@@ -101,15 +106,21 @@ def get_mlx_memory_info(reset_peak: bool = True) -> dict:
 
     try:
         # Use new API (mx.*) if available, fallback to deprecated (mx.metal.*)
-        if hasattr(mx, 'get_cache_memory'):
+        if hasattr(mx, "get_cache_memory"):
             cache_memory = mx.get_cache_memory()
             peak_memory = mx.get_peak_memory()
-            active_memory = mx.get_active_memory() if hasattr(mx, 'get_active_memory') else 0
+            active_memory = (
+                mx.get_active_memory() if hasattr(mx, "get_active_memory") else 0
+            )
         else:
             # Fallback for older MLX versions
             cache_memory = mx.metal.get_cache_memory()
             peak_memory = mx.metal.get_peak_memory()
-            active_memory = mx.metal.get_active_memory() if hasattr(mx.metal, 'get_active_memory') else 0
+            active_memory = (
+                mx.metal.get_active_memory()
+                if hasattr(mx.metal, "get_active_memory")
+                else 0
+            )
 
         info = {
             "cache_memory_gb": cache_memory / (1024**3),
@@ -223,6 +234,7 @@ VLM_TEST_VIDEO_URLS = [
 @dataclass
 class BenchmarkResult:
     """Results from a single benchmark run."""
+
     prompt: str
     prompt_tokens: int
     generated_tokens: int
@@ -240,8 +252,16 @@ class BenchmarkResult:
         if self.generated_tokens > 1:
             # TPOT excludes the first token (which is measured by TTFT)
             generation_time = self.total_time - self.ttft
-            self.tpot = generation_time / (self.generated_tokens - 1) if self.generated_tokens > 1 else 0
-            self.generation_tps = (self.generated_tokens - 1) / generation_time if generation_time > 0 else 0
+            self.tpot = (
+                generation_time / (self.generated_tokens - 1)
+                if self.generated_tokens > 1
+                else 0
+            )
+            self.generation_tps = (
+                (self.generated_tokens - 1) / generation_time
+                if generation_time > 0
+                else 0
+            )
 
         # Processing TPS: how fast the prompt was processed (tokens / TTFT)
         if self.ttft > 0:
@@ -251,6 +271,7 @@ class BenchmarkResult:
 @dataclass
 class BenchmarkSummary:
     """Summary statistics across all benchmark runs."""
+
     model_name: str
     num_runs: int
     total_prompt_tokens: int
@@ -368,6 +389,7 @@ def benchmark_single_prompt(
     except Exception as e:
         print(f"Error during benchmark: {e}")
         import traceback
+
         traceback.print_exc()
         return None
 
@@ -404,12 +426,10 @@ def run_benchmark(
         "Hello, how are you?",
         "What is 2+2?",
         "Say hello in Spanish.",
-
         # Medium prompts (~30-60 tokens) - 3 prompts
         "What is the capital of France and why is it historically significant? Include some interesting facts about the city.",
         "Write a Python function to calculate fibonacci numbers using memoization. Explain how it works.",
         "Explain the difference between a list and a tuple in Python. When should you use each one?",
-
         # Long prompts (100+ tokens) - 4 prompts
         """Explain quantum computing in comprehensive detail. You should cover all of the following topics thoroughly:
         1. What are qubits and how do they fundamentally differ from classical bits in traditional computing?
@@ -418,7 +438,6 @@ def run_benchmark(
         4. What are the most promising potential applications of quantum computing in cryptography, drug discovery, and optimization?
         5. What are the current hardware limitations, error correction challenges, and decoherence problems?
         6. Compare the approaches of IBM, Google, and other major players in quantum computing research.""",
-
         """Write a comprehensive and detailed guide to building a production-ready REST API with Python Flask. Include all of the following sections with code examples:
         1. Setting up the project structure with blueprints, configuration management, and environment variables
         2. Creating routes and endpoints following RESTful conventions with proper HTTP methods
@@ -427,7 +446,6 @@ def run_benchmark(
         5. Implementing error handling best practices with custom exception handlers
         6. Writing comprehensive tests with pytest including unit tests and integration tests
         7. Setting up logging, monitoring, and API documentation with Swagger/OpenAPI""",
-
         """Describe the complete process of photosynthesis in plants with scientific detail. Your explanation should cover:
         1. The light-dependent reactions that occur in the thylakoid membrane, including photosystems I and II
         2. The electron transport chain and chemiosmosis for ATP synthesis
@@ -436,7 +454,6 @@ def run_benchmark(
         5. How environmental factors like light intensity, CO2 concentration, and temperature affect photosynthesis rate
         6. The importance of photosynthesis for life on Earth and its role in the carbon cycle
         7. C3, C4, and CAM photosynthesis adaptations in different plant species""",
-
         """You are a senior software architect with 15 years of experience. Design a complete microservices architecture for a large-scale e-commerce platform that handles millions of users. Your design should include:
         1. Service breakdown with detailed responsibilities: User service (authentication, profiles, preferences), Product catalog service (search, filtering, recommendations), Inventory service (stock management, warehouses), Order service (cart, checkout, order history), Payment service (multiple providers, refunds), Notification service (email, SMS, push)
         2. Database choices for each service with justification (PostgreSQL vs MongoDB vs Redis)
@@ -452,7 +469,7 @@ def run_benchmark(
     test_prompts = (prompts * ((num_prompts // len(prompts)) + 1))[:num_prompts]
 
     print(f"\n{'='*60}")
-    print(f"vllm-mlx Performance Benchmark")
+    print("vllm-mlx Performance Benchmark")
     print(f"{'='*60}")
 
     # Hardware info table
@@ -481,9 +498,9 @@ def run_benchmark(
 
     # Show prompt length distribution
     prompt_lengths = [len(tokenizer.encode(p)) for p in test_prompts]
-    short = sum(1 for l in prompt_lengths if l < 20)
-    medium = sum(1 for l in prompt_lengths if 20 <= l < 100)
-    long_p = sum(1 for l in prompt_lengths if l >= 100)
+    short = sum(1 for length in prompt_lengths if length < 20)
+    medium = sum(1 for length in prompt_lengths if 20 <= length < 100)
+    long_p = sum(1 for length in prompt_lengths if length >= 100)
     print("Prompt Distribution:")
     dist_data = [
         ["Short (<20 tokens)", short],
@@ -498,11 +515,13 @@ def run_benchmark(
     if warmup_runs > 0:
         print(f"Running {warmup_runs} warmup run(s)...")
         for i in range(warmup_runs):
-            benchmark_single_prompt(model, tokenizer, "Hello, how are you?", max_tokens=20)
+            benchmark_single_prompt(
+                model, tokenizer, "Hello, how are you?", max_tokens=20
+            )
 
         # Show model memory after warmup (MLX uses lazy evaluation)
         mlx_info = get_mlx_memory_info(reset_peak=True)
-        if mlx_info and mlx_info.get('peak_memory_gb', 0) > 0:
+        if mlx_info and mlx_info.get("peak_memory_gb", 0) > 0:
             print(f"Model memory: {mlx_info['peak_memory_gb']:.2f} GB (MLX peak)")
         print("Warmup complete.\n")
 
@@ -518,13 +537,15 @@ def run_benchmark(
 
         if result:
             results.append(result)
-            run_data.append([
-                i,
-                result.prompt_tokens,
-                result.generated_tokens,
-                f"{result.ttft*1000:.1f}",
-                f"{result.generation_tps:.1f}",
-            ])
+            run_data.append(
+                [
+                    i,
+                    result.prompt_tokens,
+                    result.generated_tokens,
+                    f"{result.ttft*1000:.1f}",
+                    f"{result.generation_tps:.1f}",
+                ]
+            )
             # Sample resources after each run
             monitor.sample()
 
@@ -532,11 +553,13 @@ def run_benchmark(
 
     # Print per-run results table
     print("Per-Run Results:")
-    print(tabulate(
-        run_data,
-        headers=["Run", "Input", "Output", "TTFT (ms)", "Gen TPS"],
-        tablefmt="simple",
-    ))
+    print(
+        tabulate(
+            run_data,
+            headers=["Run", "Input", "Output", "TTFT (ms)", "Gen TPS"],
+            tablefmt="simple",
+        )
+    )
     print()
 
     if not results:
@@ -560,34 +583,27 @@ def run_benchmark(
         total_prompt_tokens=total_prompt_tokens,
         total_generated_tokens=total_generated_tokens,
         total_time=overall_time,
-
         ttft_mean=statistics.mean(ttfts),
         ttft_min=min(ttfts),
         ttft_max=max(ttfts),
         ttft_p50=calculate_percentile(ttfts, 50),
         ttft_p95=calculate_percentile(ttfts, 95),
-
         tpot_mean=statistics.mean(tpots) if tpots else 0,
         tpot_min=min(tpots) if tpots else 0,
         tpot_max=max(tpots) if tpots else 0,
-
         generation_tps_mean=statistics.mean(gen_tps) if gen_tps else 0,
         generation_tps_max=max(gen_tps) if gen_tps else 0,
         processing_tps_mean=statistics.mean(proc_tps) if proc_tps else 0,
-
         latency_mean=statistics.mean(latencies),
         latency_min=min(latencies),
         latency_max=max(latencies),
         latency_p50=calculate_percentile(latencies, 50),
         latency_p95=calculate_percentile(latencies, 95),
-
         total_throughput_tps=total_tokens / overall_time,
         requests_per_second=len(results) / overall_time,
-
         hardware_chip=hw.chip_name,
         hardware_memory_gb=hw.total_memory_gb,
         hardware_bandwidth_gbs=hw.memory_bandwidth_gbs,
-
         resources=monitor.get_summary(),
     )
 
@@ -600,16 +616,27 @@ def run_benchmark(
 
 # MLLM model detection patterns
 MLLM_PATTERNS = [
-    "-VL-", "-VL/", "VL-",
-    "llava", "LLaVA",
-    "idefics", "Idefics",
-    "paligemma", "PaliGemma",
-    "pixtral", "Pixtral",
-    "molmo", "Molmo",
-    "phi3-vision", "phi-3-vision",
-    "cogvlm", "CogVLM",
-    "internvl", "InternVL",
-    "deepseek-vl", "DeepSeek-VL",
+    "-VL-",
+    "-VL/",
+    "VL-",
+    "llava",
+    "LLaVA",
+    "idefics",
+    "Idefics",
+    "paligemma",
+    "PaliGemma",
+    "pixtral",
+    "Pixtral",
+    "molmo",
+    "Molmo",
+    "phi3-vision",
+    "phi-3-vision",
+    "cogvlm",
+    "CogVLM",
+    "internvl",
+    "InternVL",
+    "deepseek-vl",
+    "DeepSeek-VL",
 ]
 
 # Test image URL (Yellow Labrador from Wikimedia Commons)
@@ -633,6 +660,7 @@ def is_mllm_model(model_name: str) -> bool:
 @dataclass
 class MLLMBenchmarkResult:
     """Result from a single MLLM benchmark run."""
+
     resolution: str
     width: int
     height: int
@@ -699,6 +727,7 @@ def benchmark_mllm_resolution(
 
     # Save to temp file for mlx_vlm
     import tempfile
+
     temp_file = tempfile.NamedTemporaryFile(suffix=".jpg", delete=False)
     img.save(temp_file.name, "JPEG", quality=85)
     image_path = temp_file.name
@@ -735,9 +764,9 @@ def benchmark_mllm_resolution(
     elapsed = time.perf_counter() - start_time
 
     # Extract text
-    if hasattr(result, 'text'):
+    if hasattr(result, "text"):
         text = result.text
-        tokens = getattr(result, 'generation_tokens', len(text.split()))
+        tokens = getattr(result, "generation_tokens", len(text.split()))
     else:
         text = str(result)
         tokens = len(text.split())
@@ -754,6 +783,7 @@ def benchmark_mllm_resolution(
 
     # Cleanup
     import os
+
     os.unlink(image_path)
 
     return MLLMBenchmarkResult(
@@ -818,7 +848,7 @@ def run_mllm_benchmark(
         ]
 
     print(f"\n{'='*70}")
-    print(f"vllm-mlx MLLM Performance Benchmark")
+    print("vllm-mlx MLLM Performance Benchmark")
     print(f"{'='*70}")
 
     # Info table
@@ -841,7 +871,7 @@ def run_mllm_benchmark(
     print(f"Model loaded in {load_time:.2f}s\n")
 
     # Download test image
-    print(f"Downloading test image...")
+    print("Downloading test image...")
     try:
         base_image = download_test_image(MLLM_TEST_IMAGE_URL)
         print(f"  Original size: {base_image.size[0]}x{base_image.size[1]}\n")
@@ -854,27 +884,27 @@ def run_mllm_benchmark(
         print(f"Running {warmup_runs} warmup run(s)...")
         for _ in range(warmup_runs):
             benchmark_mllm_resolution(
-                model, processor, config, base_image,
-                224, 224, max_tokens, warmup=True
+                model, processor, config, base_image, 224, 224, max_tokens, warmup=True
             )
 
         # Show model memory after warmup (MLX uses lazy evaluation)
         mlx_info = get_mlx_memory_info(reset_peak=True)
-        if mlx_info and mlx_info.get('peak_memory_gb', 0) > 0:
+        if mlx_info and mlx_info.get("peak_memory_gb", 0) > 0:
             print(f"Model memory: {mlx_info['peak_memory_gb']:.2f} GB (MLX peak)")
         print("Warmup complete.\n")
 
     # Run benchmarks
     print("-" * 80)
-    print(f"  {'Resolution':>10} | {'Pixels':>12} | {'Time':>6} | {'Tokens':>6} | {'Speed':>14} | {'Memory':>8}")
+    print(
+        f"  {'Resolution':>10} | {'Pixels':>12} | {'Time':>6} | {'Tokens':>6} | {'Speed':>14} | {'Memory':>8}"
+    )
     print("-" * 80)
 
     results = []
     for width, height in resolutions:
         try:
             result = benchmark_mllm_resolution(
-                model, processor, config, base_image,
-                width, height, max_tokens
+                model, processor, config, base_image, width, height, max_tokens
             )
             results.append(result)
         except Exception as e:
@@ -890,23 +920,37 @@ def print_mllm_summary(results: list[MLLMBenchmarkResult], model_name: str):
         return
 
     print(f"\n{'='*80}")
-    print(f"MLLM BENCHMARK RESULTS")
+    print("MLLM BENCHMARK RESULTS")
     print(f"{'='*80}\n")
 
     # Results table
     table_data = []
     for r in results:
-        table_data.append([
-            r.resolution,
-            f"{r.pixels:,}",
-            f"{r.time_seconds:.2f}s",
-            r.tokens_generated,
-            f"{r.tokens_per_second:.1f}",
-            f"{r.pixels / r.time_seconds / 1000:.1f}K" if r.time_seconds > 0 else "N/A",
-            f"{r.mlx_memory_gb:.2f}" if r.mlx_memory_gb > 0 else "-",
-        ])
+        table_data.append(
+            [
+                r.resolution,
+                f"{r.pixels:,}",
+                f"{r.time_seconds:.2f}s",
+                r.tokens_generated,
+                f"{r.tokens_per_second:.1f}",
+                (
+                    f"{r.pixels / r.time_seconds / 1000:.1f}K"
+                    if r.time_seconds > 0
+                    else "N/A"
+                ),
+                f"{r.mlx_memory_gb:.2f}" if r.mlx_memory_gb > 0 else "-",
+            ]
+        )
 
-    headers = ["Resolution", "Pixels", "Time", "Tokens", "Tok/s", "Pixels/s", "Mem (GB)"]
+    headers = [
+        "Resolution",
+        "Pixels",
+        "Time",
+        "Tokens",
+        "Tok/s",
+        "Pixels/s",
+        "Mem (GB)",
+    ]
     print(tabulate(table_data, headers=headers, tablefmt="simple"))
 
     # Summary stats
@@ -935,9 +979,11 @@ def print_mllm_summary(results: list[MLLMBenchmarkResult], model_name: str):
 # Video Benchmark Functions
 # =============================================================================
 
+
 @dataclass
 class VideoBenchmarkResult:
     """Result from a single video benchmark run."""
+
     config_name: str
     fps: float
     max_frames: int
@@ -963,7 +1009,7 @@ def create_test_video(
     temp_file = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False)
     temp_file.close()
 
-    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     out = cv2.VideoWriter(temp_file.name, fourcc, fps, (width, height))
 
     total_frames = int(duration * fps)
@@ -985,10 +1031,24 @@ def create_test_video(
         color, scene_name = scenes[scene_idx]
         frame[:] = color
 
-        cv2.putText(frame, scene_name, (width // 4, height // 2 - 30),
-                    cv2.FONT_HERSHEY_SIMPLEX, 1.5, (255, 255, 255), 3)
-        cv2.putText(frame, f"Frame {i}/{total_frames}", (width // 4, height // 2 + 30),
-                    cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2)
+        cv2.putText(
+            frame,
+            scene_name,
+            (width // 4, height // 2 - 30),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            1.5,
+            (255, 255, 255),
+            3,
+        )
+        cv2.putText(
+            frame,
+            f"Frame {i}/{total_frames}",
+            (width // 4, height // 2 + 30),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            1.0,
+            (255, 255, 255),
+            2,
+        )
 
         out.write(frame)
 
@@ -1080,7 +1140,9 @@ def benchmark_video_config(
 
     if not warmup:
         mem_str = f"{mlx_info.get('peak_memory_gb', 0):.1f} GB" if mlx_info else "-"
-        print(f"{frames_extracted:>2} frames | {elapsed:>5.2f}s | {completion_tokens:>3} tok | {tps:>6.1f} tok/s | {mem_str}")
+        print(
+            f"{frames_extracted:>2} frames | {elapsed:>5.2f}s | {completion_tokens:>3} tok | {tps:>6.1f} tok/s | {mem_str}"
+        )
 
     return VideoBenchmarkResult(
         config_name=config_name,
@@ -1092,7 +1154,9 @@ def benchmark_video_config(
         prompt_tokens=prompt_tokens,
         completion_tokens=completion_tokens,
         tokens_per_second=tps,
-        response_preview=output.text[:100] + "..." if len(output.text) > 100 else output.text,
+        response_preview=(
+            output.text[:100] + "..." if len(output.text) > 100 else output.text
+        ),
         memory_gb=process_mem,
         mlx_memory_gb=mlx_info.get("peak_memory_gb", 0.0),
     )
@@ -1150,7 +1214,7 @@ def run_video_benchmark(
         ]
 
     print(f"\n{'='*70}")
-    print(f"vllm-mlx Video Performance Benchmark")
+    print("vllm-mlx Video Performance Benchmark")
     print(f"{'='*70}")
 
     # Info table
@@ -1177,13 +1241,15 @@ def run_video_benchmark(
     elif video_url:
         video_path = download_video(video_url)
     else:
-        print(f"Downloading default test video (Big Buck Bunny 10s)...")
+        print("Downloading default test video (Big Buck Bunny 10s)...")
         video_path = download_video(DEFAULT_VIDEO_URL)
 
     video_info = get_video_info(video_path)
-    print(f"\nVideo: {video_info['width']}x{video_info['height']}, "
-          f"{video_info['duration']:.1f}s, {video_info['fps']:.1f} fps, "
-          f"{video_info['total_frames']} frames\n")
+    print(
+        f"\nVideo: {video_info['width']}x{video_info['height']}, "
+        f"{video_info['duration']:.1f}s, {video_info['fps']:.1f} fps, "
+        f"{video_info['total_frames']} frames\n"
+    )
 
     # Warmup
     if warmup_runs > 0:
@@ -1195,13 +1261,15 @@ def run_video_benchmark(
 
         # Show model memory after warmup (MLX uses lazy evaluation)
         mlx_info = get_mlx_memory_info(reset_peak=True)
-        if mlx_info and mlx_info.get('peak_memory_gb', 0) > 0:
+        if mlx_info and mlx_info.get("peak_memory_gb", 0) > 0:
             print(f"Model memory: {mlx_info['peak_memory_gb']:.2f} GB (MLX peak)")
         print("Warmup complete.\n")
 
     # Run benchmarks
     print("-" * 85)
-    print(f"  {'Configuration':>25} | {'Frames':>6} | {'Time':>6} | {'Tokens':>4} | {'Speed':>10} | {'Memory':>8}")
+    print(
+        f"  {'Configuration':>25} | {'Frames':>6} | {'Time':>6} | {'Tokens':>4} | {'Speed':>10} | {'Memory':>8}"
+    )
     print("-" * 85)
 
     results = []
@@ -1224,20 +1292,22 @@ def print_video_summary(results: list[VideoBenchmarkResult], model_name: str):
         return
 
     print(f"\n{'='*85}")
-    print(f"VIDEO BENCHMARK RESULTS")
+    print("VIDEO BENCHMARK RESULTS")
     print(f"{'='*85}\n")
 
     # Results table
     table_data = []
     for r in sorted(results, key=lambda x: x.frames_extracted):
-        table_data.append([
-            r.config_name,
-            r.frames_extracted,
-            f"{r.time_seconds:.2f}s",
-            r.completion_tokens,
-            f"{r.tokens_per_second:.1f}",
-            f"{r.mlx_memory_gb:.2f}" if r.mlx_memory_gb > 0 else "-",
-        ])
+        table_data.append(
+            [
+                r.config_name,
+                r.frames_extracted,
+                f"{r.time_seconds:.2f}s",
+                r.completion_tokens,
+                f"{r.tokens_per_second:.1f}",
+                f"{r.mlx_memory_gb:.2f}" if r.mlx_memory_gb > 0 else "-",
+            ]
+        )
 
     headers = ["Configuration", "Frames", "Time", "Tokens", "Tok/s", "Mem (GB)"]
     print(tabulate(table_data, headers=headers, tablefmt="simple"))
@@ -1259,9 +1329,15 @@ def print_video_summary(results: list[VideoBenchmarkResult], model_name: str):
     slowest = max(results, key=lambda r: r.time_seconds)
     most_frames = max(results, key=lambda r: r.frames_extracted)
 
-    print(f"\nFastest:     {fastest.config_name} ({fastest.time_seconds:.2f}s, {fastest.tokens_per_second:.1f} tok/s)")
-    print(f"Slowest:     {slowest.config_name} ({slowest.time_seconds:.2f}s, {slowest.tokens_per_second:.1f} tok/s)")
-    print(f"Most Frames: {most_frames.config_name} ({most_frames.frames_extracted} frames)")
+    print(
+        f"\nFastest:     {fastest.config_name} ({fastest.time_seconds:.2f}s, {fastest.tokens_per_second:.1f} tok/s)"
+    )
+    print(
+        f"Slowest:     {slowest.config_name} ({slowest.time_seconds:.2f}s, {slowest.tokens_per_second:.1f} tok/s)"
+    )
+    print(
+        f"Most Frames: {most_frames.config_name} ({most_frames.frames_extracted} frames)"
+    )
     print(f"{'='*85}")
 
 
@@ -1269,10 +1345,11 @@ def print_video_summary(results: list[VideoBenchmarkResult], model_name: str):
 # LLM Benchmark Summary
 # =============================================================================
 
+
 def print_summary(summary: BenchmarkSummary):
     """Print a formatted summary of benchmark results using tabulate."""
     print(f"\n{'='*60}")
-    print(f"BENCHMARK RESULTS")
+    print("BENCHMARK RESULTS")
     print(f"{'='*60}\n")
 
     # Overview table
@@ -1289,18 +1366,36 @@ def print_summary(summary: BenchmarkSummary):
 
     # Main metrics table
     metrics_data = [
-        ["TTFT (Time to First Token)", f"{summary.ttft_mean*1000:.1f} ms", f"{summary.ttft_p95*1000:.1f} ms"],
-        ["TPOT (Time Per Output Token)", f"{summary.tpot_mean*1000:.2f} ms", f"{summary.tpot_max*1000:.2f} ms"],
-        ["Generation Speed", f"{summary.generation_tps_mean:.1f} tok/s", f"{summary.generation_tps_max:.1f} tok/s"],
+        [
+            "TTFT (Time to First Token)",
+            f"{summary.ttft_mean*1000:.1f} ms",
+            f"{summary.ttft_p95*1000:.1f} ms",
+        ],
+        [
+            "TPOT (Time Per Output Token)",
+            f"{summary.tpot_mean*1000:.2f} ms",
+            f"{summary.tpot_max*1000:.2f} ms",
+        ],
+        [
+            "Generation Speed",
+            f"{summary.generation_tps_mean:.1f} tok/s",
+            f"{summary.generation_tps_max:.1f} tok/s",
+        ],
         ["Processing Speed", f"{summary.processing_tps_mean:.1f} tok/s", "-"],
-        ["Latency (per request)", f"{summary.latency_mean:.2f}s", f"{summary.latency_p95:.2f}s"],
+        [
+            "Latency (per request)",
+            f"{summary.latency_mean:.2f}s",
+            f"{summary.latency_p95:.2f}s",
+        ],
     ]
     print("Performance Metrics:")
-    print(tabulate(
-        metrics_data,
-        headers=["Metric", "Mean", "P95/Max"],
-        tablefmt="simple",
-    ))
+    print(
+        tabulate(
+            metrics_data,
+            headers=["Metric", "Mean", "P95/Max"],
+            tablefmt="simple",
+        )
+    )
     print()
 
     # Throughput table
@@ -1319,20 +1414,26 @@ def print_summary(summary: BenchmarkSummary):
         resource_data = []
 
         if res.process_memory_gb > 0:
-            resource_data.append(["Process Memory (peak)", f"{res.process_memory_gb:.2f} GB"])
+            resource_data.append(
+                ["Process Memory (peak)", f"{res.process_memory_gb:.2f} GB"]
+            )
 
         if res.mlx_peak_memory_gb > 0:
-            resource_data.append(["MLX Peak Memory", f"{res.mlx_peak_memory_gb:.2f} GB"])
+            resource_data.append(
+                ["MLX Peak Memory", f"{res.mlx_peak_memory_gb:.2f} GB"]
+            )
 
         if res.mlx_cache_gb > 0:
             resource_data.append(["MLX Cache Memory", f"{res.mlx_cache_gb:.2f} GB"])
 
         if res.system_memory_total_gb > 0:
             used_pct = (res.system_memory_used_gb / res.system_memory_total_gb) * 100
-            resource_data.append([
-                "System Memory",
-                f"{res.system_memory_used_gb:.1f} / {res.system_memory_total_gb:.0f} GB ({used_pct:.0f}%)"
-            ])
+            resource_data.append(
+                [
+                    "System Memory",
+                    f"{res.system_memory_used_gb:.1f} / {res.system_memory_total_gb:.0f} GB ({used_pct:.0f}%)",
+                ]
+            )
 
         print(tabulate(resource_data, tablefmt="plain"))
         print()
@@ -1451,26 +1552,32 @@ Examples:
             # Save to JSON if requested
             if args.output:
                 with open(args.output, "w") as f:
-                    json.dump({
-                        "type": "video",
-                        "model": args.model,
-                        "test_video": args.video_url or args.video_path or "Big Buck Bunny 10s",
-                        "results": [
-                            {
-                                "config_name": r.config_name,
-                                "fps": r.fps,
-                                "max_frames": r.max_frames,
-                                "frames_extracted": r.frames_extracted,
-                                "video_duration": r.video_duration,
-                                "time_seconds": r.time_seconds,
-                                "prompt_tokens": r.prompt_tokens,
-                                "completion_tokens": r.completion_tokens,
-                                "tokens_per_second": r.tokens_per_second,
-                                "response_preview": r.response_preview,
-                            }
-                            for r in results
-                        ]
-                    }, f, indent=2)
+                    json.dump(
+                        {
+                            "type": "video",
+                            "model": args.model,
+                            "test_video": args.video_url
+                            or args.video_path
+                            or "Big Buck Bunny 10s",
+                            "results": [
+                                {
+                                    "config_name": r.config_name,
+                                    "fps": r.fps,
+                                    "max_frames": r.max_frames,
+                                    "frames_extracted": r.frames_extracted,
+                                    "video_duration": r.video_duration,
+                                    "time_seconds": r.time_seconds,
+                                    "prompt_tokens": r.prompt_tokens,
+                                    "completion_tokens": r.completion_tokens,
+                                    "tokens_per_second": r.tokens_per_second,
+                                    "response_preview": r.response_preview,
+                                }
+                                for r in results
+                            ],
+                        },
+                        f,
+                        indent=2,
+                    )
                 print(f"\nResults saved to: {args.output}")
 
     elif run_mllm:
@@ -1488,24 +1595,28 @@ Examples:
             # Save to JSON if requested
             if args.output:
                 with open(args.output, "w") as f:
-                    json.dump({
-                        "type": "mllm_image",
-                        "model": args.model,
-                        "test_image": "Yellow Labrador (Wikimedia Commons)",
-                        "results": [
-                            {
-                                "resolution": r.resolution,
-                                "width": r.width,
-                                "height": r.height,
-                                "pixels": r.pixels,
-                                "time_seconds": r.time_seconds,
-                                "tokens_generated": r.tokens_generated,
-                                "tokens_per_second": r.tokens_per_second,
-                                "response_preview": r.response_preview,
-                            }
-                            for r in results
-                        ]
-                    }, f, indent=2)
+                    json.dump(
+                        {
+                            "type": "mllm_image",
+                            "model": args.model,
+                            "test_image": "Yellow Labrador (Wikimedia Commons)",
+                            "results": [
+                                {
+                                    "resolution": r.resolution,
+                                    "width": r.width,
+                                    "height": r.height,
+                                    "pixels": r.pixels,
+                                    "time_seconds": r.time_seconds,
+                                    "tokens_generated": r.tokens_generated,
+                                    "tokens_per_second": r.tokens_per_second,
+                                    "response_preview": r.response_preview,
+                                }
+                                for r in results
+                            ],
+                        },
+                        f,
+                        indent=2,
+                    )
                 print(f"\nResults saved to: {args.output}")
     else:
         # LLM Benchmark
@@ -1523,45 +1634,49 @@ Examples:
             # Save to JSON if requested
             if args.output:
                 with open(args.output, "w") as f:
-                    json.dump({
-                        "type": "llm",
-                        "model": summary.model_name,
-                        "hardware": {
-                            "chip": summary.hardware_chip,
-                            "memory_gb": summary.hardware_memory_gb,
-                            "bandwidth_gbs": summary.hardware_bandwidth_gbs,
+                    json.dump(
+                        {
+                            "type": "llm",
+                            "model": summary.model_name,
+                            "hardware": {
+                                "chip": summary.hardware_chip,
+                                "memory_gb": summary.hardware_memory_gb,
+                                "bandwidth_gbs": summary.hardware_bandwidth_gbs,
+                            },
+                            "num_runs": summary.num_runs,
+                            "total_prompt_tokens": summary.total_prompt_tokens,
+                            "total_generated_tokens": summary.total_generated_tokens,
+                            "total_time_seconds": summary.total_time,
+                            "ttft_ms": {
+                                "mean": summary.ttft_mean * 1000,
+                                "min": summary.ttft_min * 1000,
+                                "max": summary.ttft_max * 1000,
+                                "p50": summary.ttft_p50 * 1000,
+                                "p95": summary.ttft_p95 * 1000,
+                            },
+                            "tpot_ms": {
+                                "mean": summary.tpot_mean * 1000,
+                                "min": summary.tpot_min * 1000,
+                                "max": summary.tpot_max * 1000,
+                            },
+                            "tokens_per_second": {
+                                "generation_mean": summary.generation_tps_mean,
+                                "generation_max": summary.generation_tps_max,
+                                "processing_mean": summary.processing_tps_mean,
+                                "total_throughput": summary.total_throughput_tps,
+                            },
+                            "latency_seconds": {
+                                "mean": summary.latency_mean,
+                                "min": summary.latency_min,
+                                "max": summary.latency_max,
+                                "p50": summary.latency_p50,
+                                "p95": summary.latency_p95,
+                            },
+                            "requests_per_second": summary.requests_per_second,
                         },
-                        "num_runs": summary.num_runs,
-                        "total_prompt_tokens": summary.total_prompt_tokens,
-                        "total_generated_tokens": summary.total_generated_tokens,
-                        "total_time_seconds": summary.total_time,
-                        "ttft_ms": {
-                            "mean": summary.ttft_mean * 1000,
-                            "min": summary.ttft_min * 1000,
-                            "max": summary.ttft_max * 1000,
-                            "p50": summary.ttft_p50 * 1000,
-                            "p95": summary.ttft_p95 * 1000,
-                        },
-                        "tpot_ms": {
-                            "mean": summary.tpot_mean * 1000,
-                            "min": summary.tpot_min * 1000,
-                            "max": summary.tpot_max * 1000,
-                        },
-                        "tokens_per_second": {
-                            "generation_mean": summary.generation_tps_mean,
-                            "generation_max": summary.generation_tps_max,
-                            "processing_mean": summary.processing_tps_mean,
-                            "total_throughput": summary.total_throughput_tps,
-                        },
-                        "latency_seconds": {
-                            "mean": summary.latency_mean,
-                            "min": summary.latency_min,
-                            "max": summary.latency_max,
-                            "p50": summary.latency_p50,
-                            "p95": summary.latency_p95,
-                        },
-                        "requests_per_second": summary.requests_per_second,
-                    }, f, indent=2)
+                        f,
+                        indent=2,
+                    )
                 print(f"\nResults saved to: {args.output}")
 
 

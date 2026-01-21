@@ -6,17 +6,17 @@ import sys
 
 import pytest
 
-
 # Skip all tests if not on Apple Silicon
 pytestmark = pytest.mark.skipif(
     sys.platform != "darwin" or platform.machine() != "arm64",
-    reason="Requires Apple Silicon"
+    reason="Requires Apple Silicon",
 )
 
 
 # =============================================================================
 # Unit Tests - Request/Response Models
 # =============================================================================
+
 
 class TestRequestModels:
     """Test Pydantic request models."""
@@ -31,11 +31,11 @@ class TestRequestModels:
 
     def test_chat_message_multimodal(self):
         """Test chat message with multimodal content."""
-        from vllm_mlx.server import Message, ContentPart
+        from vllm_mlx.server import Message
 
         content = [
             {"type": "text", "text": "What's this?"},
-            {"type": "image_url", "image_url": {"url": "https://example.com/img.jpg"}}
+            {"type": "image_url", "image_url": {"url": "https://example.com/img.jpg"}},
         ]
         msg = Message(role="user", content=content)
 
@@ -71,8 +71,7 @@ class TestRequestModels:
         from vllm_mlx.server import ContentPart
 
         part = ContentPart(
-            type="image_url",
-            image_url={"url": "https://example.com/img.jpg"}
+            type="image_url", image_url={"url": "https://example.com/img.jpg"}
         )
         assert part.type == "image_url"
         # image_url can be dict or ImageUrl object
@@ -94,8 +93,7 @@ class TestRequestModels:
         from vllm_mlx.server import ContentPart
 
         part = ContentPart(
-            type="video_url",
-            video_url={"url": "https://example.com/video.mp4"}
+            type="video_url", video_url={"url": "https://example.com/video.mp4"}
         )
         assert part.type == "video_url"
         # video_url can be dict or VideoUrl object
@@ -113,8 +111,7 @@ class TestChatCompletionRequest:
         from vllm_mlx.server import ChatCompletionRequest, Message
 
         request = ChatCompletionRequest(
-            model="test-model",
-            messages=[Message(role="user", content="Hello")]
+            model="test-model", messages=[Message(role="user", content="Hello")]
         )
 
         assert request.model == "test-model"
@@ -161,10 +158,7 @@ class TestCompletionRequest:
         """Test basic completion request."""
         from vllm_mlx.server import CompletionRequest
 
-        request = CompletionRequest(
-            model="test-model",
-            prompt="Once upon a time"
-        )
+        request = CompletionRequest(model="test-model", prompt="Once upon a time")
 
         assert request.model == "test-model"
         assert request.prompt == "Once upon a time"
@@ -174,6 +168,7 @@ class TestCompletionRequest:
 # =============================================================================
 # Helper Function Tests
 # =============================================================================
+
 
 class TestHelperFunctions:
     """Test server helper functions."""
@@ -216,10 +211,16 @@ class TestHelperFunctions:
         from vllm_mlx.server import extract_multimodal_content, Message
 
         messages = [
-            Message(role="user", content=[
-                {"type": "text", "text": "What's this?"},
-                {"type": "image_url", "image_url": {"url": "https://example.com/img.jpg"}}
-            ])
+            Message(
+                role="user",
+                content=[
+                    {"type": "text", "text": "What's this?"},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": "https://example.com/img.jpg"},
+                    },
+                ],
+            )
         ]
 
         processed, images, videos = extract_multimodal_content(messages)
@@ -234,10 +235,13 @@ class TestHelperFunctions:
         from vllm_mlx.server import extract_multimodal_content, Message
 
         messages = [
-            Message(role="user", content=[
-                {"type": "text", "text": "Describe this video"},
-                {"type": "video", "video": "/path/to/video.mp4"}
-            ])
+            Message(
+                role="user",
+                content=[
+                    {"type": "text", "text": "Describe this video"},
+                    {"type": "video", "video": "/path/to/video.mp4"},
+                ],
+            )
         ]
 
         processed, images, videos = extract_multimodal_content(messages)
@@ -252,10 +256,16 @@ class TestHelperFunctions:
         from vllm_mlx.server import extract_multimodal_content, Message
 
         messages = [
-            Message(role="user", content=[
-                {"type": "text", "text": "What happens?"},
-                {"type": "video_url", "video_url": {"url": "https://example.com/video.mp4"}}
-            ])
+            Message(
+                role="user",
+                content=[
+                    {"type": "text", "text": "What happens?"},
+                    {
+                        "type": "video_url",
+                        "video_url": {"url": "https://example.com/video.mp4"},
+                    },
+                ],
+            )
         ]
 
         processed, images, videos = extract_multimodal_content(messages)
@@ -263,11 +273,10 @@ class TestHelperFunctions:
         assert len(videos) == 1
 
 
-
-
 # =============================================================================
 # Security and Reliability Tests (PR #4)
 # =============================================================================
+
 
 class TestRateLimiter:
     """Test the RateLimiter class for rate limiting functionality."""
@@ -415,7 +424,6 @@ class TestTempFileManager:
         """Test that TempFileManager is thread-safe."""
         import threading
         import tempfile
-        import os
         from vllm_mlx.models.mllm import TempFileManager
 
         manager = TempFileManager()
@@ -455,7 +463,6 @@ class TestRequestOutputCollectorThreadSafety:
     def test_waiting_consumers_thread_safe(self):
         """Test that _waiting_consumers counter is thread-safe."""
         import threading
-        import asyncio
         from vllm_mlx.output_collector import RequestOutputCollector
 
         # Reset the counter
@@ -514,8 +521,7 @@ class TestRequestTimeoutField:
 
         # Default should be None
         request = ChatCompletionRequest(
-            model="test-model",
-            messages=[Message(role="user", content="Hello")]
+            model="test-model", messages=[Message(role="user", content="Hello")]
         )
         assert request.timeout is None
 
@@ -523,7 +529,7 @@ class TestRequestTimeoutField:
         request_with_timeout = ChatCompletionRequest(
             model="test-model",
             messages=[Message(role="user", content="Hello")],
-            timeout=60.0
+            timeout=60.0,
         )
         assert request_with_timeout.timeout == 60.0
 
@@ -532,17 +538,12 @@ class TestRequestTimeoutField:
         from vllm_mlx.server import CompletionRequest
 
         # Default should be None
-        request = CompletionRequest(
-            model="test-model",
-            prompt="Once upon a time"
-        )
+        request = CompletionRequest(model="test-model", prompt="Once upon a time")
         assert request.timeout is None
 
         # Can set custom timeout
         request_with_timeout = CompletionRequest(
-            model="test-model",
-            prompt="Once upon a time",
-            timeout=120.0
+            model="test-model", prompt="Once upon a time", timeout=120.0
         )
         assert request_with_timeout.timeout == 120.0
 
@@ -566,17 +567,17 @@ class TestAPIKeyVerification:
         assert secrets.compare_digest(key1, key3) is False
 
         # Verify it's constant-time (by checking function exists)
-        assert hasattr(secrets, 'compare_digest')
+        assert hasattr(secrets, "compare_digest")
 
     def test_verify_api_key_rejects_invalid(self):
         """Test that invalid API key is rejected with 401."""
         import asyncio
-        from unittest.mock import MagicMock
         from fastapi import HTTPException
         from fastapi.security import HTTPAuthorizationCredentials
 
         # Import and set up the module
         import vllm_mlx.server as server
+
         original_key = server._api_key
 
         try:
@@ -585,8 +586,7 @@ class TestAPIKeyVerification:
 
             # Create mock credentials with invalid key
             credentials = HTTPAuthorizationCredentials(
-                scheme="Bearer",
-                credentials="invalid-key"
+                scheme="Bearer", credentials="invalid-key"
             )
 
             # Should raise HTTPException with 401
@@ -606,6 +606,7 @@ class TestAPIKeyVerification:
         from fastapi.security import HTTPAuthorizationCredentials
 
         import vllm_mlx.server as server
+
         original_key = server._api_key
 
         try:
@@ -614,8 +615,7 @@ class TestAPIKeyVerification:
 
             # Create mock credentials with valid key
             credentials = HTTPAuthorizationCredentials(
-                scheme="Bearer",
-                credentials="valid-secret-key"
+                scheme="Bearer", credentials="valid-secret-key"
             )
 
             # Should not raise any exception
@@ -634,7 +634,6 @@ class TestRateLimiterHTTPResponse:
     def test_rate_limiter_returns_retry_after(self):
         """Test that rate limiter returns retry_after when limit exceeded."""
         from vllm_mlx.server import RateLimiter
-        import time
 
         limiter = RateLimiter(requests_per_minute=2, enabled=True)
 
@@ -679,6 +678,7 @@ class TestRateLimiterHTTPResponse:
 # =============================================================================
 # Integration Tests (require running server)
 # =============================================================================
+
 
 @pytest.mark.slow
 @pytest.mark.integration

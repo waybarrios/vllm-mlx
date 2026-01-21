@@ -61,7 +61,9 @@ class MCPClientManager:
             if self._started:
                 return
 
-            logger.info(f"Starting MCP client manager with {len(self._clients)} servers")
+            logger.info(
+                f"Starting MCP client manager with {len(self._clients)} servers"
+            )
 
             # Connect to all servers in parallel
             tasks = [
@@ -187,9 +189,9 @@ class MCPClientManager:
             MCPToolResult with the result or error
         """
         # Parse full name
-        server_name, tool_name, _ = openai_call_to_mcp({
-            "function": {"name": full_name, "arguments": "{}"}
-        })
+        server_name, tool_name, _ = openai_call_to_mcp(
+            {"function": {"name": full_name, "arguments": "{}"}}
+        )
 
         # If no server prefix, try to find the tool
         if not server_name:

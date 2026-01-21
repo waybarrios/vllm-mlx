@@ -61,16 +61,21 @@ def load_mcp_config(path: Optional[Union[str, Path]] = None) -> MCPConfig:
     if config_path.suffix in (".yaml", ".yml"):
         try:
             import yaml
+
             data = yaml.safe_load(content)
         except ImportError:
-            raise ImportError("PyYAML required for .yaml config files: pip install pyyaml")
+            raise ImportError(
+                "PyYAML required for .yaml config files: pip install pyyaml"
+            )
     else:
         data = json.loads(content)
 
     return validate_config(data)
 
 
-def _find_config_file(explicit_path: Optional[Union[str, Path]] = None) -> Optional[Path]:
+def _find_config_file(
+    explicit_path: Optional[Union[str, Path]] = None,
+) -> Optional[Path]:
     """Find the config file to use."""
     # 1. Explicit path
     if explicit_path:
@@ -160,22 +165,22 @@ def create_example_config() -> str:
                 "command": "npx",
                 "args": ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"],
                 "enabled": True,
-                "timeout": 30
+                "timeout": 30,
             },
             "web-search": {
                 "transport": "sse",
                 "url": "http://localhost:3001/sse",
                 "enabled": True,
-                "timeout": 60
+                "timeout": 60,
             },
             "sqlite": {
                 "transport": "stdio",
                 "command": "uvx",
                 "args": ["mcp-server-sqlite", "--db-path", "data.db"],
-                "enabled": True
-            }
+                "enabled": True,
+            },
         },
         "max_tool_calls": 10,
-        "default_timeout": 30.0
+        "default_timeout": 30.0,
     }
     return json.dumps(example, indent=2)

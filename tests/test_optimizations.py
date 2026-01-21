@@ -6,9 +6,6 @@ Usage:
     pytest tests/test_optimizations.py -v
 """
 
-import pytest
-import mlx.core as mx
-
 
 class TestHardwareDetection:
     """Tests for hardware detection functionality."""
@@ -90,14 +87,14 @@ def run_quick_test():
     print("=" * 60)
 
     hw = detect_hardware()
-    print(f"\nHardware Detection:")
+    print("\nHardware Detection:")
     print(f"  Chip: {hw.chip_name}")
     print(f"  Memory: {hw.total_memory_gb:.1f} GB")
     print(f"  Bandwidth: {hw.memory_bandwidth_gbs} GB/s")
     print(f"  GPU Cores: {hw.gpu_cores}")
 
     status = get_optimization_status()
-    print(f"\nMLX-LM Features (built-in):")
+    print("\nMLX-LM Features (built-in):")
     for feature, value in status["mlx_lm_features"].items():
         print(f"  {feature}: {value}")
 

@@ -47,7 +47,7 @@ class BatchMambaCache(MambaCache):
         cache = MambaCache()
         # Extract the state arrays for this index
         cache.cache = [
-            mx.contiguous(c[idx:idx+1]) if c is not None else None
+            mx.contiguous(c[idx : idx + 1]) if c is not None else None
             for c in self.cache
         ]
         cache.left_padding = None  # Single sequence, no batch padding
@@ -95,14 +95,16 @@ def patch_mlx_lm_for_mamba():
     converting it to BatchMambaCache.
     """
     import importlib
-    gen_module = importlib.import_module('mlx_lm.generate')
+
+    gen_module = importlib.import_module("mlx_lm.generate")
     from mlx_lm.models.cache import (
-        KVCache, ArraysCache, RotatingKVCache, CacheList,
-        MambaCache as OrigMambaCache
+        KVCache,
+        ArraysCache,
+        RotatingKVCache,
+        CacheList,
+        MambaCache as OrigMambaCache,
     )
-    from mlx_lm.generate import (
-        BatchKVCache, BatchRotatingKVCache
-    )
+    from mlx_lm.generate import BatchKVCache, BatchRotatingKVCache
 
     # Store original function
     _original_make_cache = gen_module._make_cache
@@ -112,6 +114,7 @@ def patch_mlx_lm_for_mamba():
         Convert a list of regular caches into their corresponding
         batch-aware caches, with support for MambaCache.
         """
+
         def to_batch_cache(c):
             if isinstance(c, KVCache):
                 return BatchKVCache(left_padding)
@@ -123,7 +126,9 @@ def patch_mlx_lm_for_mamba():
                 return c
             elif isinstance(c, RotatingKVCache):
                 if c.keep > 0:
-                    raise ValueError("RotatingKVCache with keep tokens is not supported.")
+                    raise ValueError(
+                        "RotatingKVCache with keep tokens is not supported."
+                    )
                 return BatchRotatingKVCache(c.max_size, left_padding)
             elif isinstance(c, CacheList):
                 return CacheList(*(to_batch_cache(sub_c) for sub_c in c.caches))
@@ -167,6 +172,7 @@ def patch_mlx_lm_for_mamba():
 
 # Auto-patch when module is imported
 _patched = False
+
 
 def ensure_mamba_support():
     """Ensure MambaCache batching support is enabled."""

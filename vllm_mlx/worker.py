@@ -8,7 +8,7 @@ for model execution on Apple Silicon.
 
 import gc
 import logging
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 import torch
 
@@ -85,11 +85,15 @@ class MLXWorker:
 
             # Get device info
             from vllm_mlx.plugin import get_mlx_device_info
+
             info = get_mlx_device_info()
-            logger.info(f"MLX Device: {info['chip_name']} with {info['memory_gb']:.1f}GB")
+            logger.info(
+                f"MLX Device: {info['chip_name']} with {info['memory_gb']:.1f}GB"
+            )
 
             # Initialize model runner
             from vllm_mlx.model_runner import MLXModelRunner
+
             self.model_runner = MLXModelRunner(self.vllm_config)
 
         except ImportError as e:
@@ -188,6 +192,7 @@ class MLXWorker:
         """Check worker health."""
         try:
             import mlx.core as mx
+
             # Simple check - create and evaluate a small array
             test = mx.array([1.0, 2.0, 3.0])
             _ = mx.sum(test).item()
@@ -206,6 +211,7 @@ class MLXWorker:
         # Clear MLX cache
         try:
             import mlx.core as mx
+
             mx.metal.clear_cache()
         except Exception:
             pass

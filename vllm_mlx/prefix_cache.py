@@ -19,11 +19,12 @@ from typing import Any, Dict, List, Optional, Tuple
 
 try:
     import mlx.core as mx
+
     HAS_MLX = True
 except ImportError:
     HAS_MLX = False
 
-from .paged_cache import BlockTable, CacheBlock, PagedCacheManager
+from .paged_cache import BlockTable, PagedCacheManager
 
 logger = logging.getLogger(__name__)
 
@@ -161,9 +162,7 @@ class PrefixCacheManager:
 
         return None, None, None, 0
 
-    def fetch_cache(
-        self, tokens: List[int]
-    ) -> Tuple[Optional[List[Any]], List[int]]:
+    def fetch_cache(self, tokens: List[int]) -> Tuple[Optional[List[Any]], List[int]]:
         """
         Find cached prefix for the given tokens.
 
@@ -482,7 +481,7 @@ class BlockAwarePrefixCache:
                     block_table.block_ids.append(block_id)
                     block_table.num_tokens += block.token_count
 
-            remaining = tokens[len(matched_tokens):]
+            remaining = tokens[len(matched_tokens) :]
             self._hits += 1
             self._tokens_saved += len(matched_tokens)
 
@@ -525,11 +524,11 @@ class BlockAwarePrefixCache:
 
         # Check if cache_data contains extracted tensor states
         is_tensor_data = (
-            cache_data and
-            isinstance(cache_data, list) and
-            len(cache_data) > 0 and
-            isinstance(cache_data[0], dict) and
-            'state' in cache_data[0]
+            cache_data
+            and isinstance(cache_data, list)
+            and len(cache_data) > 0
+            and isinstance(cache_data[0], dict)
+            and "state" in cache_data[0]
         )
 
         # Get or create block table
@@ -610,9 +609,10 @@ class BlockAwarePrefixCache:
         )
 
         blocks_with_data = sum(
-            1 for bid in block_table.block_ids
-            if self.paged_cache.allocated_blocks.get(bid) and
-            self.paged_cache.allocated_blocks[bid].cache_data is not None
+            1
+            for bid in block_table.block_ids
+            if self.paged_cache.allocated_blocks.get(bid)
+            and self.paged_cache.allocated_blocks[bid].cache_data is not None
         )
 
         logger.debug(
@@ -646,14 +646,14 @@ class BlockAwarePrefixCache:
         try:
             block_slices = []
             for layer_state in cache_data:
-                if 'state' not in layer_state:
+                if "state" not in layer_state:
                     continue
 
-                keys, values = layer_state['state']
+                keys, values = layer_state["state"]
 
                 # KV cache shape: (batch, n_kv_heads, seq_len, head_dim)
                 # Slice along seq_len dimension (axis 2)
-                seq_len = keys.shape[2] if hasattr(keys, 'shape') else 0
+                seq_len = keys.shape[2] if hasattr(keys, "shape") else 0
 
                 if end_idx > seq_len:
                     # Requested range extends beyond available data
@@ -753,9 +753,7 @@ class BlockAwarePrefixCache:
             last_access=time.time(),
         )
 
-        logger.debug(
-            f"Forked cache: {source_request_id} -> {new_request_id}"
-        )
+        logger.debug(f"Forked cache: {source_request_id} -> {new_request_id}")
 
         return forked_table
 
@@ -876,6 +874,7 @@ class BlockAwarePrefixCache:
         except Exception as e:
             logger.warning(f"Failed to reconstruct cache: {e}")
             import traceback
+
             logger.debug(traceback.format_exc())
             return None
 
@@ -923,7 +922,11 @@ class BlockAwarePrefixCache:
         return {
             "hits": self._hits,
             "misses": self._misses,
-            "hit_rate": self._hits / (self._hits + self._misses) if (self._hits + self._misses) > 0 else 0,
+            "hit_rate": (
+                self._hits / (self._hits + self._misses)
+                if (self._hits + self._misses) > 0
+                else 0
+            ),
             "tokens_saved": self._tokens_saved,
             "active_requests": len(self._request_tables),
             **paged_stats,

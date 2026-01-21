@@ -61,6 +61,7 @@ class TestContinuousBatchingIntegration:
         """Load a small model for testing."""
         try:
             from mlx_lm import load
+
             model, tokenizer = load("mlx-community/Qwen3-0.6B-8bit")
             return model, tokenizer
         except Exception:
@@ -68,7 +69,12 @@ class TestContinuousBatchingIntegration:
 
     async def test_single_request(self, small_model):
         """Test single request processing."""
-        from vllm_mlx import AsyncEngineCore, EngineConfig, SamplingParams, SchedulerConfig
+        from vllm_mlx import (
+            AsyncEngineCore,
+            EngineConfig,
+            SamplingParams,
+            SchedulerConfig,
+        )
 
         model, tokenizer = small_model
         config = EngineConfig(
@@ -100,7 +106,12 @@ class TestContinuousBatchingIntegration:
 
     async def test_concurrent_requests(self, small_model):
         """Test multiple concurrent requests are batched."""
-        from vllm_mlx import AsyncEngineCore, EngineConfig, SamplingParams, SchedulerConfig
+        from vllm_mlx import (
+            AsyncEngineCore,
+            EngineConfig,
+            SamplingParams,
+            SchedulerConfig,
+        )
 
         model, tokenizer = small_model
         config = EngineConfig(
@@ -145,7 +156,12 @@ class TestContinuousBatchingIntegration:
 
     async def test_batching_improves_throughput(self, small_model):
         """Test that batching improves throughput vs sequential."""
-        from vllm_mlx import AsyncEngineCore, EngineConfig, SamplingParams, SchedulerConfig
+        from vllm_mlx import (
+            AsyncEngineCore,
+            EngineConfig,
+            SamplingParams,
+            SchedulerConfig,
+        )
 
         model, tokenizer = small_model
         config = EngineConfig(
@@ -206,13 +222,18 @@ class TestContinuousBatchingIntegration:
 
 if __name__ == "__main__":
     # Quick standalone test
-    import sys
 
     MODEL_NAME = "mlx-community/Qwen3-0.6B-8bit"
+    MODEL_NAME = "mlx-community/Qwen3-8B-6bit"
 
     async def run_benchmark():
         from mlx_lm import load
-        from vllm_mlx import AsyncEngineCore, EngineConfig, SamplingParams, SchedulerConfig
+        from vllm_mlx import (
+            AsyncEngineCore,
+            EngineConfig,
+            SamplingParams,
+            SchedulerConfig,
+        )
 
         print("=" * 60)
         print("Continuous Batching Benchmark")
@@ -254,7 +275,12 @@ if __name__ == "__main__":
                     add_generation_prompt=True,
                 )
                 result = await engine.engine.generate(formatted, params)
-                return (prompt, result.output_text[:50], result.prompt_tokens, result.completion_tokens)
+                return (
+                    prompt,
+                    result.output_text[:50],
+                    result.prompt_tokens,
+                    result.completion_tokens,
+                )
 
             results = await asyncio.gather(*[run_one(p) for p in prompts])
 

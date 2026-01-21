@@ -5,10 +5,7 @@ import pytest
 from transformers import AutoTokenizer
 from mlx_lm.tokenizer_utils import (
     NaiveStreamingDetokenizer,
-    SPMStreamingDetokenizer,
     BPEStreamingDetokenizer,
-    TokenizerWrapper,
-    StreamingDetokenizer,
 )
 
 
@@ -18,7 +15,7 @@ class TestStreamingDetokenizer:
     @pytest.fixture
     def qwen_tokenizer(self):
         """Load Qwen tokenizer."""
-        return AutoTokenizer.from_pretrained('mlx-community/Qwen3-0.6B-8bit')
+        return AutoTokenizer.from_pretrained("mlx-community/Qwen3-0.6B-8bit")
 
     def test_naive_streaming_matches_batch(self, qwen_tokenizer):
         """Verify NaiveStreamingDetokenizer output matches batch decode."""
@@ -37,8 +34,7 @@ class TestStreamingDetokenizer:
         batch_result = qwen_tokenizer.decode(tokens)
 
         assert streaming_result == batch_result, (
-            f"Streaming: {repr(streaming_result)}\n"
-            f"Batch: {repr(batch_result)}"
+            f"Streaming: {repr(streaming_result)}\n" f"Batch: {repr(batch_result)}"
         )
 
     def test_last_segment_incremental(self, qwen_tokenizer):
@@ -59,7 +55,7 @@ class TestStreamingDetokenizer:
         detok.finalize()
 
         # Concatenated segments should equal full text
-        full_from_segments = ''.join(segments) + detok.last_segment
+        full_from_segments = "".join(segments) + detok.last_segment
         assert full_from_segments == detok.text
 
     def test_reset_clears_state(self, qwen_tokenizer):
@@ -125,7 +121,7 @@ class TestSchedulerDetokenizer:
         class MockScheduler:
             def __init__(self):
                 self.tokenizer = AutoTokenizer.from_pretrained(
-                    'mlx-community/Qwen3-0.6B-8bit'
+                    "mlx-community/Qwen3-0.6B-8bit"
                 )
                 self._detokenizer_pool = {}
 
@@ -203,13 +199,14 @@ class TestOptimizedDetokenizer:
     def tokenizer_wrapper(self):
         """Load tokenizer via mlx_lm to get TokenizerWrapper with optimized detokenizer."""
         from mlx_lm import load
-        _, tokenizer = load('mlx-community/Qwen3-0.6B-8bit')
+
+        _, tokenizer = load("mlx-community/Qwen3-0.6B-8bit")
         return tokenizer
 
     def test_tokenizer_wrapper_has_optimized_detokenizer(self, tokenizer_wrapper):
         """Verify TokenizerWrapper has optimized detokenizer class."""
-        assert hasattr(tokenizer_wrapper, '_detokenizer_class')
-        assert hasattr(tokenizer_wrapper, 'detokenizer')
+        assert hasattr(tokenizer_wrapper, "_detokenizer_class")
+        assert hasattr(tokenizer_wrapper, "detokenizer")
         # Qwen uses BPE tokenizer
         assert tokenizer_wrapper._detokenizer_class == BPEStreamingDetokenizer
 
@@ -237,7 +234,7 @@ class TestOptimizedDetokenizer:
 
         def _get_detokenizer(tokenizer, request_id):
             if request_id not in _detokenizer_pool:
-                if hasattr(tokenizer, 'detokenizer'):
+                if hasattr(tokenizer, "detokenizer"):
                     detok = tokenizer.detokenizer
                 else:
                     detok = NaiveStreamingDetokenizer(tokenizer)

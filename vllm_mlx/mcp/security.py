@@ -12,7 +12,7 @@ import re
 import shutil
 import time
 from collections import defaultdict
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from threading import Lock
 from typing import Any, Callable, Dict, List, Optional, Set
@@ -375,6 +375,7 @@ HIGH_RISK_TOOL_PATTERNS: List[str] = [
 @dataclass
 class ToolExecutionAudit:
     """Record of a tool execution for audit purposes."""
+
     timestamp: float
     tool_name: str
     server_name: str
@@ -417,7 +418,9 @@ class ToolSandbox:
         """
         self.allowed_tools = allowed_tools
         self.blocked_tools = blocked_tools or set()
-        self.blocked_arg_patterns = blocked_arg_patterns or DANGEROUS_TOOL_ARG_PATTERNS.copy()
+        self.blocked_arg_patterns = (
+            blocked_arg_patterns or DANGEROUS_TOOL_ARG_PATTERNS.copy()
+        )
         self.max_calls_per_minute = max_calls_per_minute
         self.audit_callback = audit_callback
         self.enabled = enabled
@@ -462,13 +465,14 @@ class ToolSandbox:
 
         # Check blocklist first
         if self._is_blocked(tool_name, full_name):
-            raise MCPSecurityError(
-                f"Tool '{tool_name}' is blocked by security policy"
-            )
+            raise MCPSecurityError(f"Tool '{tool_name}' is blocked by security policy")
 
         # Check allowlist if configured
         if self.allowed_tools is not None:
-            if tool_name not in self.allowed_tools and full_name not in self.allowed_tools:
+            if (
+                tool_name not in self.allowed_tools
+                and full_name not in self.allowed_tools
+            ):
                 raise MCPSecurityError(
                     f"Tool '{tool_name}' is not in the allowed tools list"
                 )
@@ -487,9 +491,9 @@ class ToolSandbox:
     def _is_blocked(self, tool_name: str, full_name: str) -> bool:
         """Check if tool is in blocklist."""
         return (
-            tool_name in self.blocked_tools or
-            full_name in self.blocked_tools or
-            tool_name.lower() in self.blocked_tools
+            tool_name in self.blocked_tools
+            or full_name in self.blocked_tools
+            or tool_name.lower() in self.blocked_tools
         )
 
     def _check_high_risk_tool(self, tool_name: str) -> None:
@@ -505,6 +509,7 @@ class ToolSandbox:
 
     def _validate_arguments(self, tool_name: str, arguments: Dict[str, Any]) -> None:
         """Validate tool arguments for dangerous patterns."""
+
         def check_value(key: str, value: Any, path: str = "") -> None:
             current_path = f"{path}.{key}" if path else key
 
@@ -587,14 +592,15 @@ class ToolSandbox:
             self._audit_log.append(audit)
             # Trim if over max size
             if len(self._audit_log) > self._audit_log_max_size:
-                self._audit_log = self._audit_log[-self._audit_log_max_size:]
+                self._audit_log = self._audit_log[-self._audit_log_max_size :]
 
         # Log the execution
         if success:
             logger.info(
                 f"AUDIT: Tool executed - {server_name}__{tool_name} "
-                f"(took {execution_time_ms:.1f}ms)" if execution_time_ms else
-                f"AUDIT: Tool executed - {server_name}__{tool_name}"
+                f"(took {execution_time_ms:.1f}ms)"
+                if execution_time_ms
+                else f"AUDIT: Tool executed - {server_name}__{tool_name}"
             )
         else:
             logger.warning(
@@ -617,7 +623,11 @@ class ToolSandbox:
         def sanitize(obj: Any) -> Any:
             if isinstance(obj, dict):
                 return {
-                    k: "[REDACTED]" if any(s in k.lower() for s in sensitive_keys) else sanitize(v)
+                    k: (
+                        "[REDACTED]"
+                        if any(s in k.lower() for s in sensitive_keys)
+                        else sanitize(v)
+                    )
                     for k, v in obj.items()
                 }
             elif isinstance(obj, list):

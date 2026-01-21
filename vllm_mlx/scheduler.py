@@ -12,13 +12,11 @@ The scheduler follows vLLM's design with:
 """
 
 import logging
-import time
 from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
-import mlx.core as mx
 from mlx_lm.generate import BatchGenerator
 from mlx_lm.sample_utils import make_sampler
 
@@ -66,7 +64,9 @@ class SchedulerConfig:
     prefix_cache_size: int = 100  # Max cached entries
 
     # Paged cache settings (experimental - for memory efficiency)
-    use_paged_cache: bool = False  # Use BlockAwarePrefixCache instead of PrefixCacheManager
+    use_paged_cache: bool = (
+        False  # Use BlockAwarePrefixCache instead of PrefixCacheManager
+    )
     paged_cache_block_size: int = 64  # Tokens per block
     max_cache_blocks: int = 1000  # Maximum number of cache blocks
 
@@ -175,12 +175,18 @@ class Scheduler:
     def _get_stop_tokens(self) -> Set[int]:
         """Get stop token IDs from tokenizer."""
         stop_tokens = set()
-        if hasattr(self.tokenizer, 'eos_token_id') and self.tokenizer.eos_token_id is not None:
+        if (
+            hasattr(self.tokenizer, "eos_token_id")
+            and self.tokenizer.eos_token_id is not None
+        ):
             if isinstance(self.tokenizer.eos_token_id, list):
                 stop_tokens.update(self.tokenizer.eos_token_id)
             else:
                 stop_tokens.add(self.tokenizer.eos_token_id)
-        if hasattr(self.tokenizer, 'eos_token_ids') and self.tokenizer.eos_token_ids is not None:
+        if (
+            hasattr(self.tokenizer, "eos_token_ids")
+            and self.tokenizer.eos_token_ids is not None
+        ):
             if isinstance(self.tokenizer.eos_token_ids, (list, set, tuple)):
                 stop_tokens.update(self.tokenizer.eos_token_ids)
             else:
@@ -188,7 +194,9 @@ class Scheduler:
                 stop_tokens.add(self.tokenizer.eos_token_ids)
         return stop_tokens
 
-    def _create_batch_generator(self, sampling_params: SamplingParams) -> BatchGenerator:
+    def _create_batch_generator(
+        self, sampling_params: SamplingParams
+    ) -> BatchGenerator:
         """Create a BatchGenerator with the given sampling parameters."""
         sampler = make_sampler(
             temp=sampling_params.temperature,
@@ -220,7 +228,10 @@ class Scheduler:
         )
 
         # Create new generator if needed or if sampling params changed
-        if self.batch_generator is None or self._current_sampler_params != sampler_params:
+        if (
+            self.batch_generator is None
+            or self._current_sampler_params != sampler_params
+        ):
             # If we have an existing generator with requests, we need to drain it first
             if self.batch_generator is not None and self.running:
                 logger.warning(
@@ -263,13 +274,13 @@ class Scheduler:
                 if layer_cache is None:
                     return False
                 # Check if layer has expected structure
-                if hasattr(layer_cache, 'keys') and layer_cache.keys is None:
+                if hasattr(layer_cache, "keys") and layer_cache.keys is None:
                     return False
-                if hasattr(layer_cache, 'values') and layer_cache.values is None:
+                if hasattr(layer_cache, "values") and layer_cache.values is None:
                     return False
 
         # Check BatchKVCache structure
-        if hasattr(cache, 'caches'):
+        if hasattr(cache, "caches"):
             if cache.caches is None:
                 return False
             for c in cache.caches:
@@ -298,14 +309,16 @@ class Scheduler:
         extracted = []
         for layer_cache in raw_cache:
             try:
-                if hasattr(layer_cache, 'state') and hasattr(layer_cache, 'meta_state'):
+                if hasattr(layer_cache, "state") and hasattr(layer_cache, "meta_state"):
                     state = layer_cache.state  # (keys, values) MLX arrays
                     meta = layer_cache.meta_state  # (offset,) as strings
-                    extracted.append({
-                        'state': state,
-                        'meta_state': meta,
-                        'class_name': type(layer_cache).__name__,
-                    })
+                    extracted.append(
+                        {
+                            "state": state,
+                            "meta_state": meta,
+                            "class_name": type(layer_cache).__name__,
+                        }
+                    )
             except Exception as e:
                 logger.debug(f"Failed to extract state from cache layer: {e}")
                 continue
@@ -459,7 +472,10 @@ class Scheduler:
             # Note: Don't use `remaining_tokens or prompt_token_ids` because empty list
             # is falsy in Python. For exact cache match, remaining_tokens=[] but we should
             # pass just the last token so BatchGenerator can start generation.
-            if request.remaining_tokens is not None and len(request.remaining_tokens) == 0:
+            if (
+                request.remaining_tokens is not None
+                and len(request.remaining_tokens) == 0
+            ):
                 # Exact cache match - pass only last token for generation kickoff
                 tokens_to_process = request.prompt_token_ids[-1:]
             elif request.remaining_tokens:
@@ -497,7 +513,11 @@ class Scheduler:
                 scheduled.append(request)
 
                 self.total_prompt_tokens += request.num_prompt_tokens
-                cache_info = f", {request.cached_tokens} cached" if request.cached_tokens > 0 else ""
+                cache_info = (
+                    f", {request.cached_tokens} cached"
+                    if request.cached_tokens > 0
+                    else ""
+                )
                 logger.debug(
                     f"Scheduled request {request.request_id} (uid={uid}) "
                     f"with {request.num_prompt_tokens} tokens{cache_info}"
@@ -561,7 +581,7 @@ class Scheduler:
                 request.output_text = output.output_text
 
                 # Extract cache for future reuse
-                if hasattr(response, 'prompt_cache'):
+                if hasattr(response, "prompt_cache"):
                     try:
                         # prompt_cache may be callable or direct attribute
                         if callable(response.prompt_cache):
@@ -608,9 +628,14 @@ class Scheduler:
                 if self.block_aware_cache is not None:
                     # Store in paged cache
                     # Key includes both prompt and output tokens for multi-turn chat caching
-                    if hasattr(request, '_extracted_cache') and request._extracted_cache is not None:
+                    if (
+                        hasattr(request, "_extracted_cache")
+                        and request._extracted_cache is not None
+                    ):
                         try:
-                            full_token_sequence = list(request.prompt_token_ids) + list(request.output_token_ids)
+                            full_token_sequence = list(request.prompt_token_ids) + list(
+                                request.output_token_ids
+                            )
                             self.block_aware_cache.store_cache(
                                 request_id,
                                 full_token_sequence,
@@ -621,7 +646,9 @@ class Scheduler:
                                 f"({len(full_token_sequence)} tokens: {len(request.prompt_token_ids)} prompt + {len(request.output_token_ids)} output)"
                             )
                         except Exception as e:
-                            logger.debug(f"Failed to store paged cache for {request_id}: {e}")
+                            logger.debug(
+                                f"Failed to store paged cache for {request_id}: {e}"
+                            )
                     # NOTE: Do NOT call release_cache here - blocks should persist
                     # for future requests to share. The LRU eviction will clean up
                     # unused blocks when under memory pressure.
@@ -630,9 +657,14 @@ class Scheduler:
                     # Store in standard prefix cache
                     # Key includes both prompt and output tokens for multi-turn chat caching
                     # The next turn's prompt will include the previous response
-                    if hasattr(request, '_extracted_cache') and request._extracted_cache is not None:
+                    if (
+                        hasattr(request, "_extracted_cache")
+                        and request._extracted_cache is not None
+                    ):
                         try:
-                            full_token_sequence = list(request.prompt_token_ids) + list(request.output_token_ids)
+                            full_token_sequence = list(request.prompt_token_ids) + list(
+                                request.output_token_ids
+                            )
                             self.prefix_cache.store_cache(
                                 full_token_sequence,
                                 request._extracted_cache,
@@ -722,7 +754,9 @@ class Scheduler:
                 # Schedule waiting requests
                 scheduled = self._schedule_waiting()
                 output.scheduled_request_ids = [r.request_id for r in scheduled]
-                output.num_scheduled_tokens = sum(r.num_prompt_tokens for r in scheduled)
+                output.num_scheduled_tokens = sum(
+                    r.num_prompt_tokens for r in scheduled
+                )
 
                 # Run generation step if we have running requests
                 if self.batch_generator is not None and self.running:
@@ -833,19 +867,20 @@ class Scheduler:
 
         # Clear any model-level cache state
         # MLX models may have internal cache references
-        if hasattr(self.model, 'cache'):
+        if hasattr(self.model, "cache"):
             self.model.cache = None
 
         # Some MLX models store cache in layers
-        if hasattr(self.model, 'layers'):
+        if hasattr(self.model, "layers"):
             for layer in self.model.layers:
-                if hasattr(layer, 'cache'):
+                if hasattr(layer, "cache"):
                     layer.cache = None
-                if hasattr(layer, 'self_attn') and hasattr(layer.self_attn, 'cache'):
+                if hasattr(layer, "self_attn") and hasattr(layer.self_attn, "cache"):
                     layer.self_attn.cache = None
 
         # Force garbage collection of any lingering cache objects
         import gc
+
         gc.collect()
 
         logger.info("Deep reset completed - all caches cleared")

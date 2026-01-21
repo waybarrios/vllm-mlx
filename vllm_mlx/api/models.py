@@ -33,6 +33,12 @@ class VideoUrl(BaseModel):
     url: str
 
 
+class AudioUrl(BaseModel):
+    """Audio URL for audio content."""
+
+    url: str
+
+
 class ContentPart(BaseModel):
     """
     A part of a multimodal message content.
@@ -42,13 +48,15 @@ class ContentPart(BaseModel):
     - image_url: Image from URL or base64
     - video: Video from local path
     - video_url: Video from URL or base64
+    - audio_url: Audio from URL or base64
     """
 
-    type: str  # "text", "image_url", "video", "video_url"
+    type: str  # "text", "image_url", "video", "video_url", "audio_url"
     text: Optional[str] = None
     image_url: Optional[Union[ImageUrl, dict, str]] = None
     video: Optional[str] = None
     video_url: Optional[Union[VideoUrl, dict, str]] = None
+    audio_url: Optional[Union[AudioUrl, dict, str]] = None
 
 
 # =============================================================================
@@ -308,6 +316,47 @@ class MCPExecuteResponse(BaseModel):
 
 
 # =============================================================================
+# Audio (STT/TTS)
+# =============================================================================
+
+
+class AudioTranscriptionRequest(BaseModel):
+    """Request for audio transcription (STT)."""
+
+    model: str = "whisper-large-v3"
+    language: Optional[str] = None
+    response_format: str = "json"
+    temperature: float = 0.0
+    timestamp_granularities: Optional[List[str]] = None
+
+
+class AudioTranscriptionResponse(BaseModel):
+    """Response from audio transcription."""
+
+    text: str
+    language: Optional[str] = None
+    duration: Optional[float] = None
+    segments: Optional[List[dict]] = None
+
+
+class AudioSpeechRequest(BaseModel):
+    """Request for text-to-speech."""
+
+    model: str = "kokoro"
+    input: str
+    voice: str = "af_heart"
+    speed: float = 1.0
+    response_format: str = "wav"
+
+
+class AudioSeparationRequest(BaseModel):
+    """Request for audio source separation."""
+
+    model: str = "htdemucs"
+    stems: List[str] = Field(default_factory=lambda: ["vocals", "accompaniment"])
+
+
+# =============================================================================
 # Streaming (for SSE responses)
 # =============================================================================
 
@@ -336,3 +385,4 @@ class ChatCompletionChunk(BaseModel):
     created: int = Field(default_factory=lambda: int(time.time()))
     model: str
     choices: List[ChatCompletionChunkChoice]
+    usage: Usage | None = None

@@ -68,7 +68,11 @@ async def measure_streaming_latency(
 
                     try:
                         chunk = json.loads(data)
-                        content = chunk.get("choices", [{}])[0].get("delta", {}).get("content", "")
+                        content = (
+                            chunk.get("choices", [{}])[0]
+                            .get("delta", {})
+                            .get("content", "")
+                        )
                         if content:
                             token_count += 1
                             if first_token_time is None:
@@ -118,7 +122,9 @@ async def run_benchmark(
     all_tokens: List[int] = []
 
     for prompt in prompts:
-        print(f"Prompt: \"{prompt[:50]}...\"" if len(prompt) > 50 else f"Prompt: \"{prompt}\"")
+        print(
+            f'Prompt: "{prompt[:50]}..."' if len(prompt) > 50 else f'Prompt: "{prompt}"'
+        )
         print("-" * 40)
 
         prompt_ttft = []
@@ -139,7 +145,9 @@ async def run_benchmark(
                 prompt_total.append(total)
                 prompt_tokens.append(tokens)
 
-                print(f"  Run {i+1}: TTFT={ttft:.1f}ms, Tokens={tokens}, Total={total:.1f}ms")
+                print(
+                    f"  Run {i+1}: TTFT={ttft:.1f}ms, Tokens={tokens}, Total={total:.1f}ms"
+                )
 
             except Exception as e:
                 print(f"  Run {i+1}: ERROR - {e}")
@@ -167,7 +175,7 @@ async def run_benchmark(
         print("=" * 60)
         print("OVERALL SUMMARY")
         print("=" * 60)
-        print(f"Time-to-First-Token (TTFT):")
+        print("Time-to-First-Token (TTFT):")
         print(f"  Mean:   {statistics.mean(all_ttft):.1f}ms")
         print(f"  Median: {statistics.median(all_ttft):.1f}ms")
         print(f"  Min:    {min(all_ttft):.1f}ms")
@@ -177,7 +185,7 @@ async def run_benchmark(
         print()
 
         if all_itl:
-            print(f"Inter-Token Latency (ITL):")
+            print("Inter-Token Latency (ITL):")
             print(f"  Mean:   {statistics.mean(all_itl):.1f}ms")
             print(f"  Median: {statistics.median(all_itl):.1f}ms")
             print(f"  Min:    {min(all_itl):.1f}ms")
@@ -186,7 +194,7 @@ async def run_benchmark(
                 print(f"  StdDev: {statistics.stdev(all_itl):.1f}ms")
             print()
 
-        print(f"Total Generation Time:")
+        print("Total Generation Time:")
         print(f"  Mean:   {statistics.mean(all_total):.1f}ms")
         print()
 
@@ -202,6 +210,7 @@ async def run_benchmark(
 async def test_output_collector():
     """Unit test for RequestOutputCollector."""
     import sys
+
     sys.path.insert(0, str(__file__).rsplit("/", 2)[0])
 
     from vllm_mlx.output_collector import RequestOutputCollector, RequestStreamState
@@ -227,22 +236,26 @@ async def test_output_collector():
 
     # Test aggregation
     collector = RequestOutputCollector(aggregate=True)
-    collector.put(RequestOutput(
-        request_id="test2",
-        new_token_ids=[1],
-        new_text="Hello",
-        output_token_ids=[1],
-        output_text="Hello",
-        finished=False,
-    ))
-    collector.put(RequestOutput(
-        request_id="test2",
-        new_token_ids=[2],
-        new_text=" World",
-        output_token_ids=[1, 2],
-        output_text="Hello World",
-        finished=False,
-    ))
+    collector.put(
+        RequestOutput(
+            request_id="test2",
+            new_token_ids=[1],
+            new_text="Hello",
+            output_token_ids=[1],
+            output_text="Hello",
+            finished=False,
+        )
+    )
+    collector.put(
+        RequestOutput(
+            request_id="test2",
+            new_token_ids=[2],
+            new_text=" World",
+            output_token_ids=[1, 2],
+            output_text="Hello World",
+            finished=False,
+        )
+    )
 
     merged = collector.get_nowait()
     assert merged is not None
@@ -256,14 +269,16 @@ async def test_output_collector():
 
         async def producer():
             await asyncio.sleep(0.01)
-            collector.put(RequestOutput(
-                request_id="test3",
-                new_token_ids=[1],
-                new_text="Async",
-                output_token_ids=[1],
-                output_text="Async",
-                finished=False,
-            ))
+            collector.put(
+                RequestOutput(
+                    request_id="test3",
+                    new_token_ids=[1],
+                    new_text="Async",
+                    output_token_ids=[1],
+                    output_text="Async",
+                    finished=False,
+                )
+            )
 
         asyncio.create_task(producer())
         output = await collector.get()
@@ -275,14 +290,14 @@ async def test_output_collector():
     # Test RequestStreamState
     state = RequestStreamState(stream_interval=3)
     # First token always sends (sent_tokens == 0)
-    assert state.should_send(1, False) is True   # First token
+    assert state.should_send(1, False) is True  # First token
     state.mark_sent(1)
     assert state.should_send(2, False) is False  # Only 1 token since last send
     assert state.should_send(3, False) is False  # Only 2 tokens
-    assert state.should_send(4, False) is True   # 3 tokens - should send
+    assert state.should_send(4, False) is True  # 3 tokens - should send
     state.mark_sent(4)
     assert state.should_send(5, False) is False  # Only 1 token since last send
-    assert state.should_send(5, True) is True    # Finished always sends
+    assert state.should_send(5, True) is True  # Finished always sends
     print("  [PASS] RequestStreamState")
 
     print("\nAll unit tests passed!")
@@ -315,7 +330,9 @@ if __name__ == "__main__":
     if args.unit_test:
         asyncio.run(test_output_collector())
     else:
-        asyncio.run(run_benchmark(
-            num_iterations=args.iterations,
-            server_url=args.server_url,
-        ))
+        asyncio.run(
+            run_benchmark(
+                num_iterations=args.iterations,
+                server_url=args.server_url,
+            )
+        )

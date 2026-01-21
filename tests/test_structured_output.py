@@ -23,11 +23,8 @@ class TestValidateJsonSchema:
         """Test validation of a valid object against schema."""
         schema = {
             "type": "object",
-            "properties": {
-                "name": {"type": "string"},
-                "age": {"type": "integer"}
-            },
-            "required": ["name"]
+            "properties": {"name": {"type": "string"}, "age": {"type": "integer"}},
+            "required": ["name"],
         }
         data = {"name": "Alice", "age": 30}
         is_valid, error = validate_json_schema(data, schema)
@@ -48,7 +45,7 @@ class TestValidateJsonSchema:
         schema = {
             "type": "object",
             "properties": {"name": {"type": "string"}},
-            "required": ["name"]
+            "required": ["name"],
         }
         data = {}
         is_valid, error = validate_json_schema(data, schema)
@@ -59,12 +56,7 @@ class TestValidateJsonSchema:
         """Test validation of array types."""
         schema = {
             "type": "object",
-            "properties": {
-                "colors": {
-                    "type": "array",
-                    "items": {"type": "string"}
-                }
-            }
+            "properties": {"colors": {"type": "array", "items": {"type": "string"}}},
         }
         # Valid
         is_valid, _ = validate_json_schema({"colors": ["red", "blue"]}, schema)
@@ -86,21 +78,21 @@ class TestExtractJsonFromText:
 
     def test_json_in_markdown(self):
         """Test extraction from markdown code block."""
-        text = '''Here is the result:
+        text = """Here is the result:
 ```json
 {"name": "test", "value": 42}
 ```
-'''
+"""
         result = extract_json_from_text(text)
         assert result == {"name": "test", "value": 42}
 
     def test_json_in_plain_code_block(self):
         """Test extraction from plain code block without json marker."""
-        text = '''Result:
+        text = """Result:
 ```
 {"items": [1, 2, 3]}
 ```
-'''
+"""
         result = extract_json_from_text(text)
         assert result == {"items": [1, 2, 3]}
 
@@ -185,11 +177,11 @@ class TestParseJsonOutput:
                     "type": "object",
                     "properties": {
                         "name": {"type": "string"},
-                        "age": {"type": "integer"}
+                        "age": {"type": "integer"},
                     },
-                    "required": ["name", "age"]
-                }
-            }
+                    "required": ["name", "age"],
+                },
+            },
         }
         cleaned, parsed, is_valid, error = parse_json_output(text, response_format)
         assert parsed == {"name": "Alice", "age": 30}
@@ -205,11 +197,9 @@ class TestParseJsonOutput:
                 "name": "person",
                 "schema": {
                     "type": "object",
-                    "properties": {
-                        "name": {"type": "string"}
-                    }
-                }
-            }
+                    "properties": {"name": {"type": "string"}},
+                },
+            },
         }
         cleaned, parsed, is_valid, error = parse_json_output(text, response_format)
         assert parsed == {"name": 123}
@@ -234,8 +224,8 @@ class TestParseJsonOutput:
                 "properties": {
                     "colors": {"type": "array", "items": {"type": "string"}}
                 },
-                "required": ["colors"]
-            }
+                "required": ["colors"],
+            },
         )
         response_format = ResponseFormat(type="json_schema", json_schema=json_schema)
         cleaned, parsed, is_valid, error = parse_json_output(text, response_format)
@@ -272,9 +262,9 @@ class TestBuildJsonSystemPrompt:
                 "description": "A person object",
                 "schema": {
                     "type": "object",
-                    "properties": {"name": {"type": "string"}}
-                }
-            }
+                    "properties": {"name": {"type": "string"}},
+                },
+            },
         }
         result = build_json_system_prompt(response_format)
         assert result is not None
@@ -285,9 +275,7 @@ class TestBuildJsonSystemPrompt:
     def test_json_schema_model(self):
         """Test prompt with ResponseFormat model."""
         json_schema = ResponseFormatJsonSchema(
-            name="output",
-            description="Output format",
-            schema={"type": "object"}
+            name="output", description="Output format", schema={"type": "object"}
         )
         response_format = ResponseFormat(type="json_schema", json_schema=json_schema)
         result = build_json_system_prompt(response_format)
@@ -316,7 +304,7 @@ class TestInjectJsonInstruction:
 
         messages = [
             {"role": "system", "content": "You are helpful."},
-            {"role": "user", "content": "Hello"}
+            {"role": "user", "content": "Hello"},
         ]
         result = _inject_json_instruction(messages, "Return JSON only")
 
@@ -347,6 +335,7 @@ class TestStructuredOutputIntegration:
     def client(self):
         """Create OpenAI client pointing to local server."""
         from openai import OpenAI
+
         return OpenAI(base_url="http://localhost:8000/v1", api_key="not-needed")
 
     def test_json_object_mode(self, client):
@@ -354,7 +343,7 @@ class TestStructuredOutputIntegration:
         response = client.chat.completions.create(
             model="default",
             messages=[{"role": "user", "content": "List 3 colors"}],
-            response_format={"type": "json_object"}
+            response_format={"type": "json_object"},
         )
         content = response.choices[0].message.content
         # Should be valid JSON
@@ -373,15 +362,12 @@ class TestStructuredOutputIntegration:
                     "schema": {
                         "type": "object",
                         "properties": {
-                            "colors": {
-                                "type": "array",
-                                "items": {"type": "string"}
-                            }
+                            "colors": {"type": "array", "items": {"type": "string"}}
                         },
-                        "required": ["colors"]
-                    }
-                }
-            }
+                        "required": ["colors"],
+                    },
+                },
+            },
         )
         content = response.choices[0].message.content
         data = json.loads(content)

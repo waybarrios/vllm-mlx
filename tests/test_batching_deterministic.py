@@ -9,7 +9,6 @@ Run with: pytest tests/test_batching_deterministic.py -v
 import asyncio
 import pytest
 import time
-from typing import List, Tuple
 
 # Model to use for tests - small model for fast testing
 TEST_MODEL = "mlx-community/Llama-3.2-1B-Instruct-4bit"
@@ -20,6 +19,7 @@ def model_and_tokenizer():
     """Load model once for all tests in this module."""
     try:
         from mlx_lm import load
+
         model, tokenizer = load(TEST_MODEL)
         return model, tokenizer
     except Exception as e:
@@ -30,6 +30,7 @@ def model_and_tokenizer():
 def sampling_params():
     """Deterministic sampling params (temperature=0)."""
     from vllm_mlx import SamplingParams
+
     return SamplingParams(max_tokens=10, temperature=0.0, top_p=1.0)
 
 
@@ -65,14 +66,12 @@ class TestDeterministicSingleRequest:
 
         # All outputs should be identical
         assert len(outputs) == 3
-        assert outputs[0] == outputs[1] == outputs[2], (
-            f"Outputs differ: {outputs}"
-        )
+        assert outputs[0] == outputs[1] == outputs[2], f"Outputs differ: {outputs}"
 
     @pytest.mark.asyncio
     async def test_token_streaming_order(self, model_and_tokenizer, sampling_params):
         """Tokens should stream in order."""
-        from vllm_mlx import AsyncEngineCore, EngineConfig
+        from vllm_mlx import AsyncEngineCore
 
         model, tokenizer = model_and_tokenizer
 
@@ -98,7 +97,12 @@ class TestDeterministicConcurrentRequests:
     @pytest.mark.asyncio
     async def test_concurrent_same_prompt(self, model_and_tokenizer):
         """Multiple concurrent requests with same prompt should get same output."""
-        from vllm_mlx import AsyncEngineCore, EngineConfig, SamplingParams, SchedulerConfig
+        from vllm_mlx import (
+            AsyncEngineCore,
+            EngineConfig,
+            SamplingParams,
+            SchedulerConfig,
+        )
 
         model, tokenizer = model_and_tokenizer
         config = EngineConfig(
@@ -136,7 +140,12 @@ class TestDeterministicConcurrentRequests:
     @pytest.mark.asyncio
     async def test_concurrent_different_prompts(self, model_and_tokenizer):
         """Different prompts should get different (but deterministic) outputs."""
-        from vllm_mlx import AsyncEngineCore, EngineConfig, SamplingParams, SchedulerConfig
+        from vllm_mlx import (
+            AsyncEngineCore,
+            EngineConfig,
+            SamplingParams,
+            SchedulerConfig,
+        )
 
         model, tokenizer = model_and_tokenizer
         config = EngineConfig(
@@ -174,9 +183,9 @@ class TestDeterministicConcurrentRequests:
                 all_results.append(results)
 
         # Each run should produce same results
-        assert all_results[0] == all_results[1], (
-            f"Results differ between runs: {all_results}"
-        )
+        assert (
+            all_results[0] == all_results[1]
+        ), f"Results differ between runs: {all_results}"
 
 
 class TestBatchingPerformance:
@@ -185,7 +194,12 @@ class TestBatchingPerformance:
     @pytest.mark.asyncio
     async def test_batched_faster_than_sequential(self, model_and_tokenizer):
         """Batched requests should be faster than sequential."""
-        from vllm_mlx import AsyncEngineCore, EngineConfig, SamplingParams, SchedulerConfig
+        from vllm_mlx import (
+            AsyncEngineCore,
+            EngineConfig,
+            SamplingParams,
+            SchedulerConfig,
+        )
 
         model, tokenizer = model_and_tokenizer
         config = EngineConfig(
@@ -263,7 +277,7 @@ class TestRequestManagement:
     @pytest.mark.asyncio
     async def test_abort_request(self, model_and_tokenizer):
         """Test aborting a request mid-generation."""
-        from vllm_mlx import AsyncEngineCore, EngineConfig, SamplingParams
+        from vllm_mlx import AsyncEngineCore, SamplingParams
 
         model, tokenizer = model_and_tokenizer
         params = SamplingParams(max_tokens=100, temperature=0.0)
@@ -293,12 +307,15 @@ class TestRequestManagement:
     @pytest.mark.asyncio
     async def test_engine_stats(self, model_and_tokenizer):
         """Test engine statistics tracking."""
-        from vllm_mlx import AsyncEngineCore, EngineConfig, SamplingParams, SchedulerConfig
+        from vllm_mlx import (
+            AsyncEngineCore,
+            EngineConfig,
+            SamplingParams,
+            SchedulerConfig,
+        )
 
         model, tokenizer = model_and_tokenizer
-        config = EngineConfig(
-            scheduler_config=SchedulerConfig(max_num_seqs=4)
-        )
+        config = EngineConfig(scheduler_config=SchedulerConfig(max_num_seqs=4))
 
         params = SamplingParams(max_tokens=5, temperature=0.0)
 
@@ -329,7 +346,12 @@ class TestSchedulerPolicy:
     @pytest.mark.asyncio
     async def test_fcfs_ordering(self, model_and_tokenizer):
         """Test that FCFS policy processes requests in order."""
-        from vllm_mlx import AsyncEngineCore, EngineConfig, SamplingParams, SchedulerConfig
+        from vllm_mlx import (
+            AsyncEngineCore,
+            EngineConfig,
+            SamplingParams,
+            SchedulerConfig,
+        )
         from vllm_mlx.scheduler import SchedulingPolicy
 
         model, tokenizer = model_and_tokenizer

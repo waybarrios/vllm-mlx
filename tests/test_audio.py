@@ -6,7 +6,6 @@ Note: Some tests require mlx-audio to be installed.
 """
 
 import pytest
-from unittest.mock import Mock, patch, MagicMock
 import numpy as np
 
 
@@ -163,10 +162,7 @@ class TestAPIModels:
         """Test ContentPart with audio."""
         from vllm_mlx.api.models import ContentPart
 
-        part = ContentPart(
-            type="audio_url",
-            audio_url={"url": "test.mp3"}
-        )
+        part = ContentPart(type="audio_url", audio_url={"url": "test.mp3"})
         assert part.type == "audio_url"
         # Pydantic converts dict to AudioUrl model
         assert part.audio_url.url == "test.mp3"
@@ -219,10 +215,8 @@ class TestAudioImports:
             STTEngine,
             TTSEngine,
             AudioProcessor,
-            transcribe_audio,
-            generate_speech,
-            separate_voice,
         )
+
         assert STTEngine is not None
         assert TTSEngine is not None
         assert AudioProcessor is not None
@@ -232,10 +226,8 @@ class TestAudioImports:
         from vllm_mlx.api import (
             AudioUrl,
             AudioTranscriptionRequest,
-            AudioTranscriptionResponse,
-            AudioSpeechRequest,
-            AudioSeparationRequest,
         )
+
         assert AudioUrl is not None
         assert AudioTranscriptionRequest is not None
 

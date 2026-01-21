@@ -1,0 +1,68 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install ruff black
+
+      - name: Run ruff
+        run: ruff check vllm_mlx/ tests/ --select E,F,W --ignore E402,E501,E731,F811,F841
+
+      - name: Run black
+        run: black --check vllm_mlx/ tests/
+
+  type-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install mypy pydantic fastapi
+
+      - name: Run mypy
+        run: mypy vllm_mlx/ --ignore-missing-imports --no-error-summary
+        continue-on-error: true
+
+  unit-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pytest pytest-asyncio pydantic fastapi jsonschema
+
+      - name: Run unit tests (no MLX required)
+        run: |
+          pytest tests/test_mcp_security.py -v --tb=short
+          pytest tests/test_structured_output.py -v --tb=short -k "not Integration and not InjectJson"

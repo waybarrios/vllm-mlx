@@ -59,11 +59,10 @@ def mlx_platform_plugin() -> str | None:
     # Check if mlx-lm is available
     try:
         import mlx_lm
+
         logger.debug(f"mlx-lm version: {getattr(mlx_lm, '__version__', 'unknown')}")
     except ImportError:
-        logger.warning(
-            "mlx-lm not installed. Install with: pip install mlx-lm"
-        )
+        logger.warning("mlx-lm not installed. Install with: pip install mlx-lm")
         # Still allow MLX platform, but functionality will be limited
         pass
 
@@ -132,6 +131,7 @@ def get_mlx_device_info() -> dict:
     # Get MLX version
     try:
         import mlx
+
         info["mlx_version"] = getattr(mlx, "__version__", "Unknown")
     except Exception:
         pass
@@ -139,6 +139,7 @@ def get_mlx_device_info() -> dict:
     # Get mlx-lm version
     try:
         import mlx_lm
+
         info["mlx_lm_version"] = getattr(mlx_lm, "__version__", "Unknown")
     except Exception:
         pass
@@ -146,6 +147,7 @@ def get_mlx_device_info() -> dict:
     # Get mlx-vlm version
     try:
         import mlx_vlm
+
         info["mlx_vlm_version"] = getattr(mlx_vlm, "__version__", "Unknown")
     except Exception:
         pass

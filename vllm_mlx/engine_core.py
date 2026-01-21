@@ -15,13 +15,13 @@ import asyncio
 import logging
 import time
 import uuid
-from dataclasses import dataclass, field
-from typing import Any, AsyncIterator, Dict, List, Optional, Set, Union
+from dataclasses import dataclass
+from typing import Any, AsyncIterator, Dict, List, Optional, Union
 
-from .request import Request, RequestOutput, RequestStatus, SamplingParams
-from .scheduler import Scheduler, SchedulerConfig, SchedulerOutput
+from .request import Request, RequestOutput, SamplingParams
+from .scheduler import Scheduler, SchedulerConfig
 from .output_collector import RequestOutputCollector, RequestStreamState
-from .model_registry import get_registry, ModelOwnershipError
+from .model_registry import get_registry
 
 logger = logging.getLogger(__name__)
 
@@ -133,7 +133,7 @@ class EngineCore:
         # Cache config values for faster access
         step_interval = self.config.step_interval
         stream_interval = self.config.stream_interval
-        use_simple_streaming = (stream_interval == 1)
+        use_simple_streaming = stream_interval == 1
 
         while self._running:
             try:
@@ -161,7 +161,7 @@ class EngineCore:
                                     state = states.get(rid)
                                     if state and state.should_send(
                                         req_output.completion_tokens,
-                                        req_output.finished
+                                        req_output.finished,
                                     ):
                                         collector.put(req_output)
                                         state.mark_sent(req_output.completion_tokens)
@@ -278,8 +278,7 @@ class EngineCore:
                         output = collector.get_nowait()
                         if output is None:
                             output = await asyncio.wait_for(
-                                collector.get(),
-                                timeout=timeout
+                                collector.get(), timeout=timeout
                             )
                     else:
                         output = collector.get_nowait() or await collector.get()

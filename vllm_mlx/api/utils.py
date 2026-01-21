@@ -8,7 +8,6 @@ from typing import List, Tuple
 
 from .models import Message
 
-
 # =============================================================================
 # Special Token Patterns
 # =============================================================================
@@ -16,9 +15,9 @@ from .models import Message
 # Pattern to match special tokens that should be removed from output
 # Keeps <think>...</think> blocks intact for reasoning models
 SPECIAL_TOKENS_PATTERN = re.compile(
-    r'<\|im_end\|>|<\|im_start\|>|<\|endoftext\|>|'
-    r'<\|end\|>|<\|eot_id\|>|<\|start_header_id\|>|<\|end_header_id\|>|'
-    r'</s>|<s>|<pad>|\[PAD\]|\[SEP\]|\[CLS\]'
+    r"<\|im_end\|>|<\|im_start\|>|<\|endoftext\|>|"
+    r"<\|end\|>|<\|eot_id\|>|<\|start_header_id\|>|<\|end_header_id\|>|"
+    r"</s>|<s>|<pad>|\[PAD\]|\[SEP\]|\[CLS\]"
 )
 
 
@@ -38,13 +37,13 @@ def clean_output_text(text: str) -> str:
     """
     if not text:
         return text
-    text = SPECIAL_TOKENS_PATTERN.sub('', text)
+    text = SPECIAL_TOKENS_PATTERN.sub("", text)
     text = text.strip()
 
     # Add opening <think> tag if response has closing but not opening
     # This happens when enable_thinking=True in the chat template
-    if '</think>' in text and not text.lstrip().startswith('<think>'):
-        text = '<think>' + text
+    if "</think>" in text and not text.lstrip().startswith("<think>"):
+        text = "<think>" + text
 
     return text
 
@@ -55,16 +54,27 @@ def clean_output_text(text: str) -> str:
 
 # Patterns that indicate a multimodal language model (MLLM/VLM)
 MLLM_PATTERNS = [
-    "-VL-", "-VL/", "VL-",              # Qwen-VL, Qwen2-VL, Qwen3-VL, etc.
-    "llava", "LLaVA",                   # LLaVA models
-    "idefics", "Idefics",               # Idefics models
-    "paligemma", "PaliGemma",           # PaliGemma
-    "pixtral", "Pixtral",               # Pixtral
-    "molmo", "Molmo",                   # Molmo
-    "phi3-vision", "phi-3-vision",      # Phi-3 Vision
-    "cogvlm", "CogVLM",                 # CogVLM
-    "internvl", "InternVL",             # InternVL
-    "deepseek-vl", "DeepSeek-VL",       # DeepSeek-VL
+    "-VL-",
+    "-VL/",
+    "VL-",  # Qwen-VL, Qwen2-VL, Qwen3-VL, etc.
+    "llava",
+    "LLaVA",  # LLaVA models
+    "idefics",
+    "Idefics",  # Idefics models
+    "paligemma",
+    "PaliGemma",  # PaliGemma
+    "pixtral",
+    "Pixtral",  # Pixtral
+    "molmo",
+    "Molmo",  # Molmo
+    "phi3-vision",
+    "phi-3-vision",  # Phi-3 Vision
+    "cogvlm",
+    "CogVLM",  # CogVLM
+    "internvl",
+    "InternVL",  # InternVL
+    "deepseek-vl",
+    "DeepSeek-VL",  # DeepSeek-VL
 ]
 
 
@@ -93,8 +103,9 @@ is_vlm_model = is_mllm_model
 # Multimodal Content Extraction
 # =============================================================================
 
+
 def extract_multimodal_content(
-    messages: List[Message]
+    messages: List[Message],
 ) -> Tuple[List[dict], List[str], List[str]]:
     """
     Extract text content, images, and videos from OpenAI-format messages.
@@ -119,25 +130,40 @@ def extract_multimodal_content(
     videos = []
 
     for msg in messages:
-        role = msg.role
-        content = msg.content
+        # Handle both dict and Pydantic model messages
+        if isinstance(msg, dict):
+            role = msg.get("role", "user")
+            content = msg.get("content")
+        else:
+            role = msg.role
+            content = msg.content
 
         # Handle tool response messages (role="tool")
         if role == "tool":
             # Format tool result as assistant context
-            tool_call_id = getattr(msg, 'tool_call_id', None) or ''
+            if isinstance(msg, dict):
+                tool_call_id = msg.get("tool_call_id", "") or ""
+            else:
+                tool_call_id = getattr(msg, "tool_call_id", None) or ""
             tool_content = content if content else ""
-            processed_messages.append({
-                "role": "user",  # mlx-lm expects user/assistant roles
-                "content": f"[Tool Result ({tool_call_id})]: {tool_content}"
-            })
+            processed_messages.append(
+                {
+                    "role": "user",  # mlx-lm expects user/assistant roles
+                    "content": f"[Tool Result ({tool_call_id})]: {tool_content}",
+                }
+            )
             continue
 
         # Handle assistant messages with tool_calls
-        if role == "assistant" and hasattr(msg, 'tool_calls') and msg.tool_calls:
+        if isinstance(msg, dict):
+            tool_calls = msg.get("tool_calls")
+        else:
+            tool_calls = getattr(msg, "tool_calls", None)
+
+        if role == "assistant" and tool_calls:
             # Format tool calls as part of the assistant message
             tool_calls_text = []
-            for tc in msg.tool_calls:
+            for tc in tool_calls:
                 if isinstance(tc, dict):
                     func = tc.get("function", {})
                     name = func.get("name", "unknown")
@@ -164,9 +190,9 @@ def extract_multimodal_content(
             text_parts = []
             for item in content:
                 # Handle both Pydantic models and dicts
-                if hasattr(item, 'model_dump'):
+                if hasattr(item, "model_dump"):
                     item = item.model_dump()
-                elif hasattr(item, 'dict'):
+                elif hasattr(item, "dict"):
                     item = item.dict()
 
                 item_type = item.get("type", "")

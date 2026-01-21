@@ -21,6 +21,7 @@ logger = logging.getLogger(__name__)
 
 class ToolArgumentValidationError(Exception):
     """Raised when tool arguments fail validation against schema."""
+
     pass
 
 
@@ -42,7 +43,9 @@ def validate_tool_arguments(
     """
     schema = tool.input_schema
     if not schema:
-        logger.debug(f"Tool '{tool.full_name}' has no input schema, skipping validation")
+        logger.debug(
+            f"Tool '{tool.full_name}' has no input schema, skipping validation"
+        )
         return
 
     try:
@@ -145,6 +148,7 @@ class ToolExecutor:
         # Parse arguments if string
         if isinstance(arguments, str):
             import json
+
             try:
                 arguments = json.loads(arguments)
             except json.JSONDecodeError:
@@ -205,6 +209,7 @@ class ToolExecutor:
                 # Parse arguments if string
                 if isinstance(arguments, str):
                     import json
+
                     try:
                         arguments = json.loads(arguments)
                     except json.JSONDecodeError:
@@ -217,8 +222,11 @@ class ToolExecutor:
                 validation_error = self._validate_tool_call(tool_call)
                 if validation_error:
                     self.sandbox.record_execution(
-                        tool_name, server_name, arguments,
-                        success=False, error_message=validation_error,
+                        tool_name,
+                        server_name,
+                        arguments,
+                        success=False,
+                        error_message=validation_error,
                     )
                     return (
                         MCPToolResult(
@@ -231,11 +239,16 @@ class ToolExecutor:
                     )
 
                 # Validate sandbox policy
-                sandbox_error = self._validate_sandbox(tool_name, server_name, arguments)
+                sandbox_error = self._validate_sandbox(
+                    tool_name, server_name, arguments
+                )
                 if sandbox_error:
                     self.sandbox.record_execution(
-                        tool_name, server_name, arguments,
-                        success=False, error_message=sandbox_error,
+                        tool_name,
+                        server_name,
+                        arguments,
+                        success=False,
+                        error_message=sandbox_error,
                     )
                     return (
                         MCPToolResult(
@@ -257,7 +270,9 @@ class ToolExecutor:
 
                 # Record execution in audit log
                 self.sandbox.record_execution(
-                    tool_name, server_name, arguments,
+                    tool_name,
+                    server_name,
+                    arguments,
                     success=not result.is_error,
                     error_message=result.error_message,
                     execution_time_ms=execution_time_ms,
@@ -273,15 +288,17 @@ class ToolExecutor:
         for i, result in enumerate(results):
             call_id = tool_calls[i].get("id", "")
             if isinstance(result, Exception):
-                processed.append((
-                    MCPToolResult(
-                        tool_name=tool_calls[i].get("function", {}).get("name", ""),
-                        content=None,
-                        is_error=True,
-                        error_message=str(result),
-                    ),
-                    call_id,
-                ))
+                processed.append(
+                    (
+                        MCPToolResult(
+                            tool_name=tool_calls[i].get("function", {}).get("name", ""),
+                            content=None,
+                            is_error=True,
+                            error_message=str(result),
+                        ),
+                        call_id,
+                    )
+                )
             else:
                 processed.append(result)
 
@@ -302,6 +319,7 @@ class ToolExecutor:
             # Parse arguments if string
             if isinstance(arguments, str):
                 import json
+
                 try:
                     arguments = json.loads(arguments)
                 except json.JSONDecodeError:
@@ -314,36 +332,46 @@ class ToolExecutor:
             validation_error = self._validate_tool_call(tool_call)
             if validation_error:
                 self.sandbox.record_execution(
-                    tool_name, server_name, arguments,
-                    success=False, error_message=validation_error,
+                    tool_name,
+                    server_name,
+                    arguments,
+                    success=False,
+                    error_message=validation_error,
                 )
-                results.append((
-                    MCPToolResult(
-                        tool_name=name,
-                        content=None,
-                        is_error=True,
-                        error_message=validation_error,
-                    ),
-                    call_id,
-                ))
+                results.append(
+                    (
+                        MCPToolResult(
+                            tool_name=name,
+                            content=None,
+                            is_error=True,
+                            error_message=validation_error,
+                        ),
+                        call_id,
+                    )
+                )
                 continue
 
             # Validate sandbox policy
             sandbox_error = self._validate_sandbox(tool_name, server_name, arguments)
             if sandbox_error:
                 self.sandbox.record_execution(
-                    tool_name, server_name, arguments,
-                    success=False, error_message=sandbox_error,
+                    tool_name,
+                    server_name,
+                    arguments,
+                    success=False,
+                    error_message=sandbox_error,
                 )
-                results.append((
-                    MCPToolResult(
-                        tool_name=name,
-                        content=None,
-                        is_error=True,
-                        error_message=sandbox_error,
-                    ),
-                    call_id,
-                ))
+                results.append(
+                    (
+                        MCPToolResult(
+                            tool_name=name,
+                            content=None,
+                            is_error=True,
+                            error_message=sandbox_error,
+                        ),
+                        call_id,
+                    )
+                )
                 continue
 
             try:
@@ -357,7 +385,9 @@ class ToolExecutor:
 
                 # Record execution in audit log
                 self.sandbox.record_execution(
-                    tool_name, server_name, arguments,
+                    tool_name,
+                    server_name,
+                    arguments,
                     success=not result.is_error,
                     error_message=result.error_message,
                     execution_time_ms=execution_time_ms,
@@ -365,18 +395,23 @@ class ToolExecutor:
                 results.append((result, call_id))
             except Exception as e:
                 self.sandbox.record_execution(
-                    tool_name, server_name, arguments,
-                    success=False, error_message=str(e),
+                    tool_name,
+                    server_name,
+                    arguments,
+                    success=False,
+                    error_message=str(e),
                 )
-                results.append((
-                    MCPToolResult(
-                        tool_name=name,
-                        content=None,
-                        is_error=True,
-                        error_message=str(e),
-                    ),
-                    call_id,
-                ))
+                results.append(
+                    (
+                        MCPToolResult(
+                            tool_name=name,
+                            content=None,
+                            is_error=True,
+                            error_message=str(e),
+                        ),
+                        call_id,
+                    )
+                )
         return results
 
     async def execute_and_format(

@@ -10,7 +10,7 @@ import pytest
 # Skip all tests if not on Apple Silicon
 pytestmark = pytest.mark.skipif(
     sys.platform != "darwin" or platform.machine() != "arm64",
-    reason="Requires Apple Silicon"
+    reason="Requires Apple Silicon",
 )
 
 
@@ -578,6 +578,7 @@ class TestThreadSafety:
 # =============================================================================
 # BlockAwarePrefixCache Tests
 # =============================================================================
+
 
 class TestBlockAwarePrefixCache:
     """Test BlockAwarePrefixCache class."""

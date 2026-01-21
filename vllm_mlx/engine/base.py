@@ -15,6 +15,7 @@ class GenerationOutput:
 
     Compatible with both simple and batched engines.
     """
+
     text: str
     tokens: List[int] = field(default_factory=list)
     prompt_tokens: int = 0

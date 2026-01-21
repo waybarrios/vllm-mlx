@@ -18,13 +18,11 @@ import base64
 import logging
 import math
 import os
-import re
 import tempfile
 import threading
 from dataclasses import dataclass, field
-from io import BytesIO
 from pathlib import Path
-from typing import Iterator, List, Optional, Set, Tuple, Union
+from typing import Iterator, Optional, Set, Union
 from urllib.parse import urlparse
 
 import numpy as np
@@ -113,6 +111,7 @@ MAX_BASE64_VIDEO_LENGTH = 700 * 1024 * 1024  # 700 MB base64 string (~500 MB dec
 
 class FileSizeExceededError(Exception):
     """Raised when a downloaded file exceeds the size limit."""
+
     pass
 
 
@@ -153,7 +152,9 @@ def is_base64_video(s: str) -> bool:
     return s.startswith("data:video/")
 
 
-def decode_base64_image(base64_string: str, max_length: int = MAX_BASE64_IMAGE_LENGTH) -> bytes:
+def decode_base64_image(
+    base64_string: str, max_length: int = MAX_BASE64_IMAGE_LENGTH
+) -> bytes:
     """
     Decode base64 image to bytes.
 
@@ -202,7 +203,9 @@ def download_image(url: str, timeout: int = 30, max_size: int = MAX_IMAGE_SIZE) 
 
     # First, make a HEAD request to check Content-Length
     try:
-        head_response = requests.head(url, timeout=timeout, headers=headers, allow_redirects=True, verify=True)
+        head_response = requests.head(
+            url, timeout=timeout, headers=headers, allow_redirects=True, verify=True
+        )
         content_length = head_response.headers.get("content-length")
         if content_length and int(content_length) > max_size:
             raise FileSizeExceededError(
@@ -213,7 +216,9 @@ def download_image(url: str, timeout: int = 30, max_size: int = MAX_IMAGE_SIZE) 
         # HEAD request failed, proceed with GET and check during download
         pass
 
-    response = requests.get(url, timeout=timeout, headers=headers, stream=True, verify=True)
+    response = requests.get(
+        url, timeout=timeout, headers=headers, stream=True, verify=True
+    )
     response.raise_for_status()
 
     # Check Content-Length header from GET response
@@ -288,7 +293,9 @@ def download_video(url: str, timeout: int = 120, max_size: int = MAX_VIDEO_SIZE)
 
     # First, make a HEAD request to check Content-Length
     try:
-        head_response = requests.head(url, timeout=timeout, headers=headers, allow_redirects=True, verify=True)
+        head_response = requests.head(
+            url, timeout=timeout, headers=headers, allow_redirects=True, verify=True
+        )
         content_length = head_response.headers.get("content-length")
         if content_length and int(content_length) > max_size:
             raise FileSizeExceededError(
@@ -299,7 +306,9 @@ def download_video(url: str, timeout: int = 120, max_size: int = MAX_VIDEO_SIZE)
         # HEAD request failed, proceed with GET and check during download
         pass
 
-    response = requests.get(url, timeout=timeout, headers=headers, stream=True, verify=True)
+    response = requests.get(
+        url, timeout=timeout, headers=headers, stream=True, verify=True
+    )
     response.raise_for_status()
 
     # Check Content-Length header from GET response
@@ -358,7 +367,9 @@ def download_video(url: str, timeout: int = 120, max_size: int = MAX_VIDEO_SIZE)
     return _temp_manager.register(temp_file.name)
 
 
-def decode_base64_video(base64_string: str, max_length: int = MAX_BASE64_VIDEO_LENGTH) -> str:
+def decode_base64_video(
+    base64_string: str, max_length: int = MAX_BASE64_VIDEO_LENGTH
+) -> str:
     """
     Decode base64 video to temp file and return path.
 

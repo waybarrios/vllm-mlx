@@ -28,6 +28,7 @@ logger = logging.getLogger(__name__)
 @dataclass
 class SamplerOutput:
     """Output from sampling."""
+
     token_ids: list[int]
     logprobs: list[dict] | None = None
 
@@ -98,7 +99,9 @@ class MLXModelRunner:
         self._hardware_info = None  # Detected hardware profile
 
         logger.info(f"MLXModelRunner initialized for model: {self.model_config.model}")
-        logger.info(f"Low-level optimizations: {'ENABLED' if enable_optimizations else 'disabled'}")
+        logger.info(
+            f"Low-level optimizations: {'ENABLED' if enable_optimizations else 'disabled'}"
+        )
 
     def load_model(self) -> None:
         """Load model using mlx-lm with optimizations."""
@@ -177,11 +180,13 @@ class MLXModelRunner:
         try:
             # Compile the model's __call__ method
             # This creates fused Metal kernels for the forward pass
-            if hasattr(self.model, '__call__'):
+            if hasattr(self.model, "__call__"):
                 self._compiled_forward = mx.compile(self.model.__call__)
                 logger.info("Compiled forward pass enabled (mx.compile kernel fusion)")
             else:
-                logger.warning("Model does not have __call__ method, skipping compilation")
+                logger.warning(
+                    "Model does not have __call__ method, skipping compilation"
+                )
 
         except Exception as e:
             logger.warning(f"Failed to compile forward pass: {e}")
@@ -220,14 +225,15 @@ class MLXModelRunner:
             return 0
 
         # Get model config
-        config = getattr(self.model, 'config', None)
+        config = getattr(self.model, "config", None)
         if config is None:
             return 0
 
-        head_size = getattr(config, 'head_dim', 64)
-        num_kv_heads = getattr(config, 'num_key_value_heads',
-                               getattr(config, 'num_attention_heads', 32))
-        num_layers = getattr(config, 'num_hidden_layers', 32)
+        head_size = getattr(config, "head_dim", 64)
+        num_kv_heads = getattr(
+            config, "num_key_value_heads", getattr(config, "num_attention_heads", 32)
+        )
+        num_layers = getattr(config, "num_hidden_layers", 32)
         block_size = self.cache_config.block_size
 
         # 2 for K and V, 2 bytes for float16
@@ -349,7 +355,7 @@ class MLXModelRunner:
 
         # Process in chunks for large prompts
         for i in range(0, seq_len, chunk_size):
-            chunk = input_ids[:, i:i + chunk_size]
+            chunk = input_ids[:, i : i + chunk_size]
             logits, cache = forward_fn(chunk, cache=cache)
             mx.eval(cache)  # Force evaluation to free intermediate memory
 
@@ -381,8 +387,8 @@ class MLXModelRunner:
             from mlx_lm.sample_utils import make_sampler
 
             # Create sampler from sampling params
-            temp = getattr(sampling_params, 'temperature', 0.7)
-            top_p = getattr(sampling_params, 'top_p', 0.9)
+            temp = getattr(sampling_params, "temperature", 0.7)
+            top_p = getattr(sampling_params, "top_p", 0.9)
             sampler = make_sampler(temp=temp, top_p=top_p)
 
             # Convert token IDs to MLX array
@@ -397,7 +403,7 @@ class MLXModelRunner:
                 max_tokens=max_tokens,
                 sampler=sampler,
             ):
-                if hasattr(token_info, 'token'):
+                if hasattr(token_info, "token"):
                     generated_ids.append(token_info.token)
                 elif isinstance(token_info, tuple) and len(token_info) > 0:
                     generated_ids.append(token_info[0])
@@ -436,14 +442,16 @@ class MLXModelRunner:
         }
 
         if self._loaded and self.model is not None:
-            config = getattr(self.model, 'config', None)
+            config = getattr(self.model, "config", None)
             if config:
-                info.update({
-                    "vocab_size": getattr(config, 'vocab_size', None),
-                    "hidden_size": getattr(config, 'hidden_size', None),
-                    "num_layers": getattr(config, 'num_hidden_layers', None),
-                    "num_heads": getattr(config, 'num_attention_heads', None),
-                })
+                info.update(
+                    {
+                        "vocab_size": getattr(config, "vocab_size", None),
+                        "hidden_size": getattr(config, "hidden_size", None),
+                        "num_layers": getattr(config, "num_hidden_layers", None),
+                        "num_heads": getattr(config, "num_attention_heads", None),
+                    }
+                )
 
             # Add optimization status
             info["optimizations"] = {

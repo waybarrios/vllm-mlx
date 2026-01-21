@@ -273,9 +273,9 @@ class TestSchedulerIntegration:
         )
 
         # Check cache fields exist
-        assert hasattr(request, 'prompt_cache')
-        assert hasattr(request, 'cached_tokens')
-        assert hasattr(request, 'remaining_tokens')
+        assert hasattr(request, "prompt_cache")
+        assert hasattr(request, "cached_tokens")
+        assert hasattr(request, "remaining_tokens")
 
         # Check defaults
         assert request.prompt_cache is None
@@ -333,7 +333,9 @@ if __name__ == "__main__":
 
         # Print rows
         for row in rows:
-            row_line = " | ".join(str(cell).ljust(col_widths[i]) for i, cell in enumerate(row))
+            row_line = " | ".join(
+                str(cell).ljust(col_widths[i]) for i, cell in enumerate(row)
+            )
             print(f"    {row_line}")
 
     def print_stats_table(stats, title="Cache Statistics"):
@@ -341,24 +343,29 @@ if __name__ == "__main__":
         print(f"\n    {title}:")
         headers = ["Metric", "Value"]
         rows = [
-            ["Hits", stats['hits']],
-            ["Misses", stats['misses']],
+            ["Hits", stats["hits"]],
+            ["Misses", stats["misses"]],
             ["Hit Rate", f"{stats['hit_rate']*100:.1f}%"],
-            ["Tokens Saved", stats['tokens_saved']],
-            ["Total Queries", stats['total_queries']],
+            ["Tokens Saved", stats["tokens_saved"]],
+            ["Total Queries", stats["total_queries"]],
         ]
         print_table(headers, rows)
 
     async def run_cache_test():
         from mlx_lm import load
-        from vllm_mlx import AsyncEngineCore, EngineConfig, SamplingParams, SchedulerConfig
+        from vllm_mlx import (
+            AsyncEngineCore,
+            EngineConfig,
+            SamplingParams,
+            SchedulerConfig,
+        )
 
         print_header("LLM PREFIX CACHE TEST")
         print(f"\n  Model: {MODEL_NAME}")
-        print(f"  Test: Verify KV cache reuse for repeated prompts")
-        print(f"  Expected behavior:")
-        print(f"    - Same prompt → cache HIT (skip prompt processing)")
-        print(f"    - Different prompt → cache MISS (process from scratch)")
+        print("  Test: Verify KV cache reuse for repeated prompts")
+        print("  Expected behavior:")
+        print("    - Same prompt → cache HIT (skip prompt processing)")
+        print("    - Different prompt → cache MISS (process from scratch)")
 
         print_subheader("Loading Model")
         load_start = time.perf_counter()
@@ -404,7 +411,7 @@ if __name__ == "__main__":
             # TEST 1: First request - should be cache MISS
             # ============================================================
             print_subheader("TEST 1: First Request (Cache Miss Expected)")
-            print(f"    Prompt: \"{prompt1}\"")
+            print(f'    Prompt: "{prompt1}"')
             print(f"    Tokens: {tokens1}")
 
             start = time.perf_counter()
@@ -418,17 +425,26 @@ if __name__ == "__main__":
             t1 = time.perf_counter() - start
 
             stats1 = engine.get_cache_stats()
-            test1_pass = stats1['misses'] == 1 and stats1['hits'] == 0
-            test_results.append(["TEST 1", "First request", "MISS", "MISS" if stats1['hits'] == 0 else "HIT", f"{t1*1000:.1f}ms", "✓" if test1_pass else "✗"])
+            test1_pass = stats1["misses"] == 1 and stats1["hits"] == 0
+            test_results.append(
+                [
+                    "TEST 1",
+                    "First request",
+                    "MISS",
+                    "MISS" if stats1["hits"] == 0 else "HIT",
+                    f"{t1*1000:.1f}ms",
+                    "✓" if test1_pass else "✗",
+                ]
+            )
 
-            print(f"    Response: \"{response1.strip()[:50]}...\"")
+            print(f'    Response: "{response1.strip()[:50]}..."')
             print_stats_table(stats1)
 
             # ============================================================
             # TEST 2: Same prompt again - should be cache HIT
             # ============================================================
             print_subheader("TEST 2: Same Prompt Again (Cache Hit Expected)")
-            print(f"    Prompt: \"{prompt1}\" (same as TEST 1)")
+            print(f'    Prompt: "{prompt1}" (same as TEST 1)')
             print(f"    Tokens: {tokens1}")
 
             start = time.perf_counter()
@@ -442,10 +458,19 @@ if __name__ == "__main__":
             t2 = time.perf_counter() - start
 
             stats2 = engine.get_cache_stats()
-            test2_pass = stats2['hits'] == 1
-            test_results.append(["TEST 2", "Same prompt (cached)", "HIT", "HIT" if stats2['hits'] > stats1['hits'] else "MISS", f"{t2*1000:.1f}ms", "✓" if test2_pass else "✗"])
+            test2_pass = stats2["hits"] == 1
+            test_results.append(
+                [
+                    "TEST 2",
+                    "Same prompt (cached)",
+                    "HIT",
+                    "HIT" if stats2["hits"] > stats1["hits"] else "MISS",
+                    f"{t2*1000:.1f}ms",
+                    "✓" if test2_pass else "✗",
+                ]
+            )
 
-            print(f"    Response: \"{response2.strip()[:50]}...\"")
+            print(f'    Response: "{response2.strip()[:50]}..."')
             speedup = t1 / t2 if t2 > 0 else 0
             print(f"    Speedup: {speedup:.2f}x faster")
             print_stats_table(stats2)
@@ -454,7 +479,7 @@ if __name__ == "__main__":
             # TEST 3: Different prompt - should be cache MISS
             # ============================================================
             print_subheader("TEST 3: Different Prompt (Cache Miss Expected)")
-            print(f"    Prompt: \"{prompt2}\" (different from TEST 1)")
+            print(f'    Prompt: "{prompt2}" (different from TEST 1)')
             print(f"    Tokens: {tokens2}")
 
             start = time.perf_counter()
@@ -468,10 +493,19 @@ if __name__ == "__main__":
             t3 = time.perf_counter() - start
 
             stats3 = engine.get_cache_stats()
-            test3_pass = stats3['misses'] == 2
-            test_results.append(["TEST 3", "Different prompt", "MISS", "MISS" if stats3['misses'] > stats2['misses'] else "HIT", f"{t3*1000:.1f}ms", "✓" if test3_pass else "✗"])
+            test3_pass = stats3["misses"] == 2
+            test_results.append(
+                [
+                    "TEST 3",
+                    "Different prompt",
+                    "MISS",
+                    "MISS" if stats3["misses"] > stats2["misses"] else "HIT",
+                    f"{t3*1000:.1f}ms",
+                    "✓" if test3_pass else "✗",
+                ]
+            )
 
-            print(f"    Response: \"{response3.strip()[:50]}...\"")
+            print(f'    Response: "{response3.strip()[:50]}..."')
             print_stats_table(stats3)
 
             # ============================================================
@@ -483,7 +517,7 @@ if __name__ == "__main__":
             print("\n    Test Results:")
             print_table(
                 ["Test", "Description", "Expected", "Actual", "Time", "Status"],
-                test_results
+                test_results,
             )
 
             # Final stats table
@@ -493,12 +527,12 @@ if __name__ == "__main__":
                 ["Metric", "Value"],
                 [
                     ["Total Requests", 3],
-                    ["Cache Hits", final_stats['hits']],
-                    ["Cache Misses", final_stats['misses']],
+                    ["Cache Hits", final_stats["hits"]],
+                    ["Cache Misses", final_stats["misses"]],
                     ["Hit Rate", f"{final_stats['hit_rate']*100:.1f}%"],
-                    ["Tokens Saved", final_stats['tokens_saved']],
+                    ["Tokens Saved", final_stats["tokens_saved"]],
                     ["Speedup (cached)", f"{speedup:.2f}x"],
-                ]
+                ],
             )
 
             all_passed = test1_pass and test2_pass and test3_pass

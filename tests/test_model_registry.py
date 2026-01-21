@@ -12,7 +12,6 @@ from vllm_mlx import (
     ModelOwnershipError,
 )
 
-
 # Use a small model for fast tests
 TEST_MODEL = "mlx-community/Qwen3-0.6B-8bit"
 
@@ -21,6 +20,7 @@ TEST_MODEL = "mlx-community/Qwen3-0.6B-8bit"
 def model_and_tokenizer():
     """Load model once for all tests in module."""
     from mlx_lm import load
+
     return load(TEST_MODEL)
 
 
@@ -88,9 +88,7 @@ class TestModelRegistry:
         try:
             with pytest.raises(ModelOwnershipError):
                 EngineCore(
-                    model, tokenizer,
-                    engine_id="engine-2",
-                    force_model_ownership=False
+                    model, tokenizer, engine_id="engine-2", force_model_ownership=False
                 )
         finally:
             engine1.close()

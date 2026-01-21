@@ -23,6 +23,7 @@ DEFAULT_SAM_MODEL = "mlx-community/sam-audio-large-fp16"
 @dataclass
 class SeparationResult:
     """Result from audio separation."""
+
     target: np.ndarray  # Isolated audio (e.g., voice)
     residual: np.ndarray  # Background audio
     sample_rate: int
@@ -75,7 +76,7 @@ class AudioProcessor:
             self.model = SAMAudio.from_pretrained(self.model_name)
             self.processor = SAMAudioProcessor.from_pretrained(self.model_name)
 
-            if hasattr(self.model, 'sample_rate'):
+            if hasattr(self.model, "sample_rate"):
                 self.sample_rate = self.model.sample_rate
 
             self._loaded = True
@@ -123,16 +124,16 @@ class AudioProcessor:
                     descriptions=batch.descriptions,
                     chunk_seconds=chunk_seconds,
                     overlap_seconds=chunk_seconds / 3,
-                    anchor_ids=getattr(batch, 'anchor_ids', None),
-                    anchor_alignment=getattr(batch, 'anchor_alignment', None),
+                    anchor_ids=getattr(batch, "anchor_ids", None),
+                    anchor_alignment=getattr(batch, "anchor_alignment", None),
                 )
             else:
                 result = self.model.separate(
                     audios=batch.audios,
                     descriptions=batch.descriptions,
-                    sizes=getattr(batch, 'sizes', None),
-                    anchor_ids=getattr(batch, 'anchor_ids', None),
-                    anchor_alignment=getattr(batch, 'anchor_alignment', None),
+                    sizes=getattr(batch, "sizes", None),
+                    anchor_ids=getattr(batch, "anchor_ids", None),
+                    anchor_alignment=getattr(batch, "anchor_alignment", None),
                 )
 
             # Convert to numpy
@@ -143,7 +144,7 @@ class AudioProcessor:
                 target=target,
                 residual=residual,
                 sample_rate=self.sample_rate,
-                peak_memory=getattr(result, 'peak_memory', 0.0),
+                peak_memory=getattr(result, "peak_memory", 0.0),
             )
         except Exception as e:
             logger.error(f"Audio separation failed: {e}")
@@ -151,7 +152,7 @@ class AudioProcessor:
 
     def _to_numpy(self, audio) -> np.ndarray:
         """Convert audio to numpy array."""
-        if hasattr(audio, 'tolist'):
+        if hasattr(audio, "tolist"):
             return np.array(audio.tolist(), dtype=np.float32)
         return np.array(audio, dtype=np.float32)
 
@@ -173,9 +174,11 @@ class AudioProcessor:
 
         try:
             from mlx_audio.sts import save_audio
+
             save_audio(audio, str(path), sample_rate=sr)
         except ImportError:
             import scipy.io.wavfile as wav
+
             audio_int16 = (audio * 32767).astype(np.int16)
             wav.write(str(path), sr, audio_int16)
 

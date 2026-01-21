@@ -3,22 +3,21 @@
 
 import platform
 import sys
-import tempfile
 from pathlib import Path
 
 import pytest
 
-
 # Skip all tests if not on Apple Silicon
 pytestmark = pytest.mark.skipif(
     sys.platform != "darwin" or platform.machine() != "arm64",
-    reason="Requires Apple Silicon"
+    reason="Requires Apple Silicon",
 )
 
 
 # =============================================================================
 # Fixtures
 # =============================================================================
+
 
 @pytest.fixture
 def small_mllm_model():
@@ -66,7 +65,7 @@ def test_video_path(tmp_path):
     try:
         response = requests.get(url, timeout=60, stream=True)
         response.raise_for_status()
-        with open(path, 'wb') as f:
+        with open(path, "wb") as f:
             for chunk in response.iter_content(chunk_size=8192):
                 f.write(chunk)
         return str(path)
@@ -76,7 +75,7 @@ def test_video_path(tmp_path):
         import numpy as np
 
         path = tmp_path / "test_video.mp4"
-        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
         out = cv2.VideoWriter(str(path), fourcc, 30.0, (320, 240))
 
         # Create 30 frames (1 second)
@@ -92,6 +91,7 @@ def test_video_path(tmp_path):
 # =============================================================================
 # Unit Tests - No Model Loading Required
 # =============================================================================
+
 
 class TestMLLMHelperFunctions:
     """Test helper functions that don't require model loading."""
@@ -233,6 +233,7 @@ class TestVideoProcessing:
 # MLLM Model Tests
 # =============================================================================
 
+
 class TestMLLMModelInit:
     """Test MLLM model initialization (no model loading)."""
 
@@ -268,6 +269,7 @@ class TestMLLMModelInit:
 # =============================================================================
 # Integration Tests - Require Model Loading (Slow)
 # =============================================================================
+
 
 @pytest.mark.slow
 class TestMLLMImageGeneration:
@@ -364,8 +366,8 @@ class TestMLLMChat:
                 "role": "user",
                 "content": [
                     {"type": "image", "image": test_image_path},
-                    {"type": "text", "text": "What animal is this?"}
-                ]
+                    {"type": "text", "text": "What animal is this?"},
+                ],
             }
         ]
 
@@ -387,8 +389,8 @@ class TestMLLMChat:
                 "role": "user",
                 "content": [
                     {"type": "video", "video": test_video_path},
-                    {"type": "text", "text": "Describe the colors in this video."}
-                ]
+                    {"type": "text", "text": "Describe the colors in this video."},
+                ],
             }
         ]
 

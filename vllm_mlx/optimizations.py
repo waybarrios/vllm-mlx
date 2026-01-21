@@ -33,6 +33,7 @@ logger = logging.getLogger(__name__)
 @dataclass
 class HardwareInfo:
     """Hardware information for Apple Silicon."""
+
     chip_name: str
     total_memory_gb: float
     memory_bandwidth_gbs: float  # GB/s
@@ -73,6 +74,7 @@ def get_system_memory_gb() -> float:
     """
     try:
         import subprocess
+
         result = subprocess.run(
             ["sysctl", "-n", "hw.memsize"],
             capture_output=True,
@@ -80,13 +82,13 @@ def get_system_memory_gb() -> float:
             check=True,
         )
         mem_bytes = int(result.stdout.strip())
-        return mem_bytes / (1024 ** 3)
+        return mem_bytes / (1024**3)
     except Exception:
         # Fallback: try to get from MLX device info
         try:
             device_info = mx.metal.device_info()
             if "memory_size" in device_info:
-                return device_info["memory_size"] / (1024 ** 3)
+                return device_info["memory_size"] / (1024**3)
         except Exception:
             pass
         return 16.0  # Conservative default
@@ -108,7 +110,9 @@ def detect_hardware() -> HardwareInfo:
         actual_memory_gb = get_system_memory_gb()
 
         # Match with known profiles (check longest names first)
-        sorted_profiles = sorted(HARDWARE_PROFILES.items(), key=lambda x: len(x[0]), reverse=True)
+        sorted_profiles = sorted(
+            HARDWARE_PROFILES.items(), key=lambda x: len(x[0]), reverse=True
+        )
 
         for chip_name, profile in sorted_profiles:
             if chip_name in device_name:
@@ -179,7 +183,9 @@ def get_optimization_status() -> dict:
     """
     hw = detect_hardware()
     device_info = mx.metal.device_info()
-    flash_available = hasattr(mx, 'fast') and hasattr(mx.fast, 'scaled_dot_product_attention')
+    flash_available = hasattr(mx, "fast") and hasattr(
+        mx.fast, "scaled_dot_product_attention"
+    )
 
     return {
         "hardware": {

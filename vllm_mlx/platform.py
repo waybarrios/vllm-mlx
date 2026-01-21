@@ -54,6 +54,7 @@ def _is_mlx_available() -> bool:
     """Check if MLX is available and working."""
     try:
         import mlx.core as mx
+
         # Verify we can actually use MLX
         _ = mx.array([1.0, 2.0, 3.0])
         return True
@@ -64,10 +65,7 @@ def _is_mlx_available() -> bool:
 
 def _is_apple_silicon() -> bool:
     """Check if running on Apple Silicon."""
-    return (
-        sys.platform == "darwin"
-        and platform.machine() == "arm64"
-    )
+    return sys.platform == "darwin" and platform.machine() == "arm64"
 
 
 class MLXPlatform:
@@ -91,6 +89,7 @@ class MLXPlatform:
     @property
     def _enum(self):
         from vllm.platforms.interface import PlatformEnum
+
         return PlatformEnum.OOT
 
     device_name: str = "mlx"
@@ -126,6 +125,7 @@ class MLXPlatform:
         # bfloat16 may not be available on all Apple Silicon chips
         try:
             import mlx.core as mx
+
             # Check if bfloat16 is supported
             test = mx.array([1.0], dtype=mx.bfloat16)
             return [torch.bfloat16, torch.float16, torch.float32]
@@ -201,6 +201,7 @@ class MLXPlatform:
             # Set MLX seed
             try:
                 import mlx.core as mx
+
                 mx.random.seed(seed)
             except Exception:
                 pass
@@ -239,12 +240,12 @@ class MLXPlatform:
         logger.info(f"Detected: {chip_name} with {memory_gb:.1f}GB unified memory")
 
         # Disable CUDA-specific features
-        if hasattr(vllm_config, 'compilation_config'):
+        if hasattr(vllm_config, "compilation_config"):
             # Disable CUDA graphs
             vllm_config.compilation_config.cudagraph_capture_sizes = []
 
         # Set worker class to MLX worker
-        if hasattr(vllm_config, 'parallel_config'):
+        if hasattr(vllm_config, "parallel_config"):
             parallel_config = vllm_config.parallel_config
             if parallel_config.worker_cls == "auto":
                 parallel_config.worker_cls = "vllm_mlx.worker.MLXWorker"
@@ -255,7 +256,7 @@ class MLXPlatform:
                 parallel_config.enable_dbo = False
 
         # Configure cache
-        if hasattr(vllm_config, 'cache_config'):
+        if hasattr(vllm_config, "cache_config"):
             cache_config = vllm_config.cache_config
             if cache_config.block_size is None:
                 cache_config.block_size = 16  # Default for MLX
@@ -293,10 +294,11 @@ class MLXPlatform:
     def get_current_memory_usage(cls, device=None) -> float:
         """Get current memory usage in bytes."""
         try:
-            import mlx.core as mx
+
             # MLX doesn't have a direct memory query
             # Use system memory info instead
             import psutil
+
             process = psutil.Process()
             return float(process.memory_info().rss)
         except Exception:

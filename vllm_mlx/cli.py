@@ -33,7 +33,9 @@ def serve_command(args):
     server._api_key = args.api_key
     server._default_timeout = args.timeout
     if args.rate_limit > 0:
-        server._rate_limiter = RateLimiter(requests_per_minute=args.rate_limit, enabled=True)
+        server._rate_limiter = RateLimiter(
+            requests_per_minute=args.rate_limit, enabled=True
+        )
 
     # Security summary at startup
     print("=" * 60)
@@ -76,12 +78,14 @@ def serve_command(args):
             max_cache_blocks=args.max_cache_blocks,
         )
 
-        print(f"Mode: Continuous batching (for multiple concurrent users)")
+        print("Mode: Continuous batching (for multiple concurrent users)")
         print(f"Stream interval: {args.stream_interval} tokens")
         if args.use_paged_cache:
-            print(f"Paged cache: block_size={args.paged_cache_block_size}, max_blocks={args.max_cache_blocks}")
+            print(
+                f"Paged cache: block_size={args.paged_cache_block_size}, max_blocks={args.max_cache_blocks}"
+            )
     else:
-        print(f"Mode: Simple (maximum throughput)")
+        print("Mode: Simple (maximum throughput)")
 
     # Load model with unified server
     load_model(
@@ -130,13 +134,25 @@ def bench_command(args):
         )
 
         if args.use_paged_cache:
-            print(f"Paged cache: block_size={args.paged_cache_block_size}, max_blocks={args.max_cache_blocks}")
+            print(
+                f"Paged cache: block_size={args.paged_cache_block_size}, max_blocks={args.max_cache_blocks}"
+            )
 
         # Generate prompts
         prompts = [
             f"Write a short poem about {topic}."
-            for topic in ["nature", "love", "technology", "space", "music",
-                         "art", "science", "history", "food", "travel"][:args.num_prompts]
+            for topic in [
+                "nature",
+                "love",
+                "technology",
+                "space",
+                "music",
+                "art",
+                "science",
+                "history",
+                "food",
+                "travel",
+            ][: args.num_prompts]
         ]
 
         params = SamplingParams(
@@ -144,7 +160,9 @@ def bench_command(args):
             temperature=0.7,
         )
 
-        print(f"\nRunning benchmark with {len(prompts)} prompts, max_tokens={args.max_tokens}")
+        print(
+            f"\nRunning benchmark with {len(prompts)} prompts, max_tokens={args.max_tokens}"
+        )
         print("-" * 50)
 
         total_prompt_tokens = 0
@@ -180,7 +198,7 @@ def bench_command(args):
 
         total_tokens = total_prompt_tokens + total_completion_tokens
 
-        print(f"\nResults:")
+        print("\nResults:")
         print(f"  Total time: {total_time:.2f}s")
         print(f"  Prompts: {len(prompts)}")
         print(f"  Prompts/second: {len(prompts)/total_time:.2f}")
@@ -199,7 +217,6 @@ def bench_detok_command(args):
     import statistics
     from mlx_lm import load
     from mlx_lm.generate import generate
-    from mlx_lm.tokenizer_utils import NaiveStreamingDetokenizer
 
     print("=" * 70)
     print(" Streaming Detokenizer Benchmark")
@@ -223,7 +240,7 @@ def bench_detok_command(args):
 
     prompt_tokens = tokenizer.encode(prompt)
     all_tokens = tokenizer.encode(output)
-    generated_tokens = all_tokens[len(prompt_tokens):]
+    generated_tokens = all_tokens[len(prompt_tokens) :]
     print(f"Generated {len(generated_tokens)} tokens for benchmark")
     print()
 
@@ -272,7 +289,9 @@ def bench_detok_command(args):
     print(f"{'Streaming detokenizer:':<25} {streaming_mean:>10.2f}ms {speedup:>9.2f}x")
     print("-" * 70)
     print(f"{'Time saved per request:':<25} {time_saved:>10.2f}ms")
-    print(f"{'Per-token savings:':<25} {(time_saved/len(generated_tokens)*1000):>10.1f}µs")
+    print(
+        f"{'Per-token savings:':<25} {(time_saved/len(generated_tokens)*1000):>10.1f}µs"
+    )
     print()
 
     # Verify correctness (strip for BPE edge cases with leading/trailing spaces)
@@ -295,7 +314,10 @@ def bench_detok_command(args):
     else:
         # Check if most of the content matches (BPE edge cases at boundaries)
         common_len = min(len(streaming_stripped), len(batch_stripped)) - 10
-        if common_len > 0 and streaming_stripped[:common_len] == batch_stripped[:common_len]:
+        if (
+            common_len > 0
+            and streaming_stripped[:common_len] == batch_stripped[:common_len]
+        ):
             print("  ✓ Streaming output matches (BPE boundary difference)")
         else:
             print("  ✗ MISMATCH! Results differ")
@@ -318,7 +340,9 @@ Examples:
     # Serve command
     serve_parser = subparsers.add_parser("serve", help="Start OpenAI-compatible server")
     serve_parser.add_argument("model", type=str, help="Model to serve")
-    serve_parser.add_argument("--host", type=str, default="0.0.0.0", help="Host to bind")
+    serve_parser.add_argument(
+        "--host", type=str, default="0.0.0.0", help="Host to bind"
+    )
     serve_parser.add_argument("--port", type=int, default=8000, help="Port to bind")
     serve_parser.add_argument(
         "--max-num-seqs", type=int, default=256, help="Max concurrent sequences"
