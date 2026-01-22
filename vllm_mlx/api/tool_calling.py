@@ -42,14 +42,16 @@ def _parse_raw_json_tool_calls(text: str) -> Optional[List[dict]]:
     text = text.strip()
 
     # Try JSON array first
-    if text.startswith('['):
+    if text.startswith("["):
         try:
             parsed = json.loads(text)
             if isinstance(parsed, list) and all(
-                isinstance(item, dict) and 'name' in item for item in parsed
+                isinstance(item, dict) and "name" in item for item in parsed
             ):
-                return [{'name': item['name'], 'arguments': item.get('arguments', {})}
-                        for item in parsed]
+                return [
+                    {"name": item["name"], "arguments": item.get("arguments", {})}
+                    for item in parsed
+                ]
         except json.JSONDecodeError:
             pass
 
@@ -59,21 +61,20 @@ def _parse_raw_json_tool_calls(text: str) -> Optional[List[dict]]:
     start = None
 
     for i, char in enumerate(text):
-        if char == '{':
+        if char == "{":
             if depth == 0:
                 start = i
             depth += 1
-        elif char == '}':
+        elif char == "}":
             depth -= 1
             if depth == 0 and start is not None:
-                json_str = text[start:i+1]
+                json_str = text[start : i + 1]
                 try:
                     obj = json.loads(json_str)
-                    if isinstance(obj, dict) and 'name' in obj:
-                        tool_calls.append({
-                            'name': obj['name'],
-                            'arguments': obj.get('arguments', {})
-                        })
+                    if isinstance(obj, dict) and "name" in obj:
+                        tool_calls.append(
+                            {"name": obj["name"], "arguments": obj.get("arguments", {})}
+                        )
                 except json.JSONDecodeError:
                     pass
                 start = None
@@ -104,30 +105,33 @@ def parse_tool_calls(text: str) -> Tuple[str, Optional[List[ToolCall]]]:
     cleaned_text = text
 
     # Pattern for Qwen3 bracket-style: [Calling tool: function_name({...})]
-    bracket_pattern = r'\[Calling tool:\s*(\w+)\((\{.*?\})\)\]'
+    bracket_pattern = r"\[Calling tool:\s*(\w+)\((\{.*?\})\)\]"
     bracket_matches = re.findall(bracket_pattern, text, re.DOTALL)
 
     for name, args_str in bracket_matches:
         try:
             arguments = json.loads(args_str)
-            tool_calls.append(ToolCall(
-                id=f"call_{uuid.uuid4().hex[:8]}",
-                type="function",
-                function=FunctionCall(
-                    name=name.strip(),
-                    arguments=json.dumps(arguments) if isinstance(arguments, dict) else str(arguments)
+            tool_calls.append(
+                ToolCall(
+                    id=f"call_{uuid.uuid4().hex[:8]}",
+                    type="function",
+                    function=FunctionCall(
+                        name=name.strip(),
+                        arguments=(
+                            json.dumps(arguments)
+                            if isinstance(arguments, dict)
+                            else str(arguments)
+                        ),
+                    ),
                 )
-            ))
+            )
         except json.JSONDecodeError:
             continue
 
     # Remove bracket tool calls from cleaned text
     if bracket_matches:
         cleaned_text = re.sub(
-            r'\[Calling tool:\s*\w+\(\{.*?\}\)\]',
-            '',
-            cleaned_text,
-            flags=re.DOTALL
+            r"\[Calling tool:\s*\w+\(\{.*?\}\)\]", "", cleaned_text, flags=re.DOTALL
         ).strip()
 
     # Pattern for Nemotron-style: <tool_call><function=name><parameter=p>v</parameter></function></tool_call>
@@ -231,14 +235,20 @@ def parse_tool_calls(text: str) -> Tuple[str, Optional[List[ToolCall]]]:
         raw_json_calls = _parse_raw_json_tool_calls(cleaned_text)
         if raw_json_calls:
             for call_data in raw_json_calls:
-                tool_calls.append(ToolCall(
-                    id=f"call_{uuid.uuid4().hex[:8]}",
-                    type="function",
-                    function=FunctionCall(
-                        name=call_data['name'],
-                        arguments=json.dumps(call_data['arguments']) if isinstance(call_data['arguments'], dict) else str(call_data['arguments'])
+                tool_calls.append(
+                    ToolCall(
+                        id=f"call_{uuid.uuid4().hex[:8]}",
+                        type="function",
+                        function=FunctionCall(
+                            name=call_data["name"],
+                            arguments=(
+                                json.dumps(call_data["arguments"])
+                                if isinstance(call_data["arguments"], dict)
+                                else str(call_data["arguments"])
+                            ),
+                        ),
                     )
-                ))
+                )
             # Clean the JSON from text since we parsed it as tool calls
             cleaned_text = ""
 
