@@ -8,11 +8,12 @@ performance when serving a single user at a time.
 
 import asyncio
 import logging
-from typing import Any, AsyncIterator, Dict, List, Optional
+from collections.abc import AsyncIterator
+from typing import Any
 
-from .base import BaseEngine, GenerationOutput
-from ..api.utils import is_mllm_model, clean_output_text
 from ..api.tool_calling import convert_tools_for_template
+from ..api.utils import clean_output_text, is_mllm_model
+from .base import BaseEngine, GenerationOutput
 
 logger = logging.getLogger(__name__)
 
@@ -46,6 +47,9 @@ class SimpleEngine(BaseEngine):
 
         self._model = None
         self._loaded = False
+
+        # Lock to serialize MLX operations (prevents Metal command buffer conflicts)
+        self._generation_lock = asyncio.Lock()
 
     @property
     def model_name(self) -> str:
@@ -103,7 +107,7 @@ class SimpleEngine(BaseEngine):
         max_tokens: int = 256,
         temperature: float = 0.7,
         top_p: float = 0.9,
-        stop: Optional[List[str]] = None,
+        stop: list[str] | None = None,
         **kwargs,
     ) -> GenerationOutput:
         """
@@ -123,29 +127,30 @@ class SimpleEngine(BaseEngine):
         if not self._loaded:
             await self.start()
 
-        # Run in thread pool to allow asyncio timeout to work
-        output = await asyncio.to_thread(
-            self._model.generate,
-            prompt=prompt,
-            max_tokens=max_tokens,
-            temperature=temperature,
-            top_p=top_p,
-            stop=stop,
-            **kwargs,
-        )
+        async with self._generation_lock:
+            # Run in thread pool to allow asyncio timeout to work
+            output = await asyncio.to_thread(
+                self._model.generate,
+                prompt=prompt,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                stop=stop,
+                **kwargs,
+            )
 
-        # Clean output text
-        text = clean_output_text(output.text)
+            # Clean output text
+            text = clean_output_text(output.text)
 
-        return GenerationOutput(
-            text=text,
-            tokens=getattr(output, "tokens", []),
-            prompt_tokens=getattr(output, "prompt_tokens", 0),
-            completion_tokens=getattr(
-                output, "completion_tokens", len(getattr(output, "tokens", []))
-            ),
-            finish_reason=output.finish_reason,
-        )
+            return GenerationOutput(
+                text=text,
+                tokens=getattr(output, "tokens", []),
+                prompt_tokens=getattr(output, "prompt_tokens", 0),
+                completion_tokens=getattr(
+                    output, "completion_tokens", len(getattr(output, "tokens", []))
+                ),
+                finish_reason=output.finish_reason,
+            )
 
     async def stream_generate(
         self,
@@ -153,7 +158,7 @@ class SimpleEngine(BaseEngine):
         max_tokens: int = 256,
         temperature: float = 0.7,
         top_p: float = 0.9,
-        stop: Optional[List[str]] = None,
+        stop: list[str] | None = None,
         **kwargs,
     ) -> AsyncIterator[GenerationOutput]:
         """
@@ -173,68 +178,69 @@ class SimpleEngine(BaseEngine):
         if not self._loaded:
             await self.start()
 
-        accumulated_text = ""
-        prompt_tokens = 0
-        completion_tokens = 0
-        finished = False
+        async with self._generation_lock:
+            accumulated_text = ""
+            prompt_tokens = 0
+            completion_tokens = 0
+            finished = False
 
-        for chunk in self._model.stream_generate(
-            prompt=prompt,
-            max_tokens=max_tokens,
-            temperature=temperature,
-            top_p=top_p,
-            stop=stop,
-            **kwargs,
-        ):
-            prompt_tokens = (
-                chunk.prompt_tokens
-                if hasattr(chunk, "prompt_tokens")
-                else prompt_tokens
-            )
-            completion_tokens += 1
-            new_text = chunk.text if hasattr(chunk, "text") else str(chunk)
-            accumulated_text += new_text
+            for chunk in self._model.stream_generate(
+                prompt=prompt,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                stop=stop,
+                **kwargs,
+            ):
+                prompt_tokens = (
+                    chunk.prompt_tokens
+                    if hasattr(chunk, "prompt_tokens")
+                    else prompt_tokens
+                )
+                completion_tokens += 1
+                new_text = chunk.text if hasattr(chunk, "text") else str(chunk)
+                accumulated_text += new_text
 
-            finished = (
-                getattr(chunk, "finished", False) or completion_tokens >= max_tokens
-            )
-            finish_reason = None
-            if finished:
-                finish_reason = getattr(chunk, "finish_reason", "stop")
+                finished = (
+                    getattr(chunk, "finished", False) or completion_tokens >= max_tokens
+                )
+                finish_reason = None
+                if finished:
+                    finish_reason = getattr(chunk, "finish_reason", "stop")
 
-            yield GenerationOutput(
-                text=accumulated_text,
-                new_text=new_text,
-                prompt_tokens=prompt_tokens,
-                completion_tokens=completion_tokens,
-                finished=finished,
-                finish_reason=finish_reason,
-            )
+                yield GenerationOutput(
+                    text=accumulated_text,
+                    new_text=new_text,
+                    prompt_tokens=prompt_tokens,
+                    completion_tokens=completion_tokens,
+                    finished=finished,
+                    finish_reason=finish_reason,
+                )
 
-            if finished:
-                break
+                if finished:
+                    break
 
-        if not finished:
-            if prompt_tokens == 0:
-                prompt_tokens = len(self._model.tokenizer.encode(prompt))
-            yield GenerationOutput(
-                text=accumulated_text,
-                new_text="",
-                prompt_tokens=prompt_tokens,
-                completion_tokens=completion_tokens,
-                finished=True,
-                finish_reason=None,
-            )
+            if not finished:
+                if prompt_tokens == 0:
+                    prompt_tokens = len(self._model.tokenizer.encode(prompt))
+                yield GenerationOutput(
+                    text=accumulated_text,
+                    new_text="",
+                    prompt_tokens=prompt_tokens,
+                    completion_tokens=completion_tokens,
+                    finished=True,
+                    finish_reason=None,
+                )
 
     async def chat(
         self,
-        messages: List[Dict[str, Any]],
+        messages: list[dict[str, Any]],
         max_tokens: int = 256,
         temperature: float = 0.7,
         top_p: float = 0.9,
-        tools: Optional[List[dict]] = None,
-        images: Optional[List[str]] = None,
-        videos: Optional[List[str]] = None,
+        tools: list[dict] | None = None,
+        images: list[str] | None = None,
+        videos: list[str] | None = None,
         **kwargs,
     ) -> GenerationOutput:
         """
@@ -259,52 +265,53 @@ class SimpleEngine(BaseEngine):
         # Convert tools for template if provided
         template_tools = convert_tools_for_template(tools) if tools else None
 
-        if self._is_mllm:
-            # For MLLM, use the chat method which handles images/videos
-            # Run in thread pool to allow asyncio timeout to work
-            output = await asyncio.to_thread(
-                self._model.chat,
-                messages=messages,
-                max_tokens=max_tokens,
-                temperature=temperature,
-                **kwargs,
-            )
-            text = clean_output_text(output.text)
-            return GenerationOutput(
-                text=text,
-                prompt_tokens=output.prompt_tokens,
-                completion_tokens=output.completion_tokens,
-                finish_reason=output.finish_reason,
-            )
-        else:
-            # For LLM, use the chat method
-            # Run in thread pool to allow asyncio timeout to work
-            output = await asyncio.to_thread(
-                self._model.chat,
-                messages=messages,
-                max_tokens=max_tokens,
-                temperature=temperature,
-                top_p=top_p,
-                tools=template_tools,
-                **kwargs,
-            )
-            text = clean_output_text(output.text)
-            return GenerationOutput(
-                text=text,
-                tokens=output.tokens,
-                completion_tokens=len(output.tokens),
-                finish_reason=output.finish_reason,
-            )
+        async with self._generation_lock:
+            if self._is_mllm:
+                # For MLLM, use the chat method which handles images/videos
+                # Run in thread pool to allow asyncio timeout to work
+                output = await asyncio.to_thread(
+                    self._model.chat,
+                    messages=messages,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    **kwargs,
+                )
+                text = clean_output_text(output.text)
+                return GenerationOutput(
+                    text=text,
+                    prompt_tokens=output.prompt_tokens,
+                    completion_tokens=output.completion_tokens,
+                    finish_reason=output.finish_reason,
+                )
+            else:
+                # For LLM, use the chat method
+                # Run in thread pool to allow asyncio timeout to work
+                output = await asyncio.to_thread(
+                    self._model.chat,
+                    messages=messages,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    top_p=top_p,
+                    tools=template_tools,
+                    **kwargs,
+                )
+                text = clean_output_text(output.text)
+                return GenerationOutput(
+                    text=text,
+                    tokens=output.tokens,
+                    completion_tokens=len(output.tokens),
+                    finish_reason=output.finish_reason,
+                )
 
     async def stream_chat(
         self,
-        messages: List[Dict[str, Any]],
+        messages: list[dict[str, Any]],
         max_tokens: int = 256,
         temperature: float = 0.7,
         top_p: float = 0.9,
-        tools: Optional[List[dict]] = None,
-        images: Optional[List[str]] = None,
-        videos: Optional[List[str]] = None,
+        tools: list[dict] | None = None,
+        images: list[str] | None = None,
+        videos: list[str] | None = None,
         **kwargs,
     ) -> AsyncIterator[GenerationOutput]:
         """
@@ -378,7 +385,7 @@ class SimpleEngine(BaseEngine):
         ):
             yield output
 
-    def get_stats(self) -> Dict[str, Any]:
+    def get_stats(self) -> dict[str, Any]:
         """Get engine statistics."""
         return {
             "engine_type": "simple",
@@ -387,7 +394,7 @@ class SimpleEngine(BaseEngine):
             "loaded": self._loaded,
         }
 
-    def get_cache_stats(self) -> Optional[Dict[str, Any]]:
+    def get_cache_stats(self) -> dict[str, Any] | None:
         """Get cache statistics (for MLLM models)."""
         if self._is_mllm and self._model is not None:
             return self._model.get_cache_stats()

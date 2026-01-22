@@ -29,7 +29,7 @@ classifiers = [
 
 dependencies = [
     "mlx>=0.29.0",
-    "mlx-lm>=0.20.0",
+    "mlx-lm>=0.30.2",  # GLM-4 models require 0.30.2+
     "mlx-vlm>=0.1.0",  # VLM support
     "transformers>=4.40.0,<5.0.0",
     "tokenizers>=0.19.0",

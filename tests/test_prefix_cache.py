@@ -433,7 +433,7 @@ if __name__ == "__main__":
                     "MISS",
                     "MISS" if stats1["hits"] == 0 else "HIT",
                     f"{t1*1000:.1f}ms",
-                    "✓" if test1_pass else "✗",
+                    "PASS" if test1_pass else "FAIL",
                 ]
             )
 
@@ -466,7 +466,7 @@ if __name__ == "__main__":
                     "HIT",
                     "HIT" if stats2["hits"] > stats1["hits"] else "MISS",
                     f"{t2*1000:.1f}ms",
-                    "✓" if test2_pass else "✗",
+                    "PASS" if test2_pass else "FAIL",
                 ]
             )
 
@@ -501,7 +501,7 @@ if __name__ == "__main__":
                     "MISS",
                     "MISS" if stats3["misses"] > stats2["misses"] else "HIT",
                     f"{t3*1000:.1f}ms",
-                    "✓" if test3_pass else "✗",
+                    "PASS" if test3_pass else "FAIL",
                 ]
             )
 
@@ -539,9 +539,9 @@ if __name__ == "__main__":
 
             print("\n" + "=" * 70)
             if all_passed:
-                print("  ✓ ALL TESTS PASSED - Prefix cache working correctly!")
+                print("  [OK] ALL TESTS PASSED - Prefix cache working correctly")
             else:
-                print("  ✗ SOME TESTS FAILED - Check results above")
+                print("  [FAILED] SOME TESTS FAILED - Check results above")
             print("=" * 70)
 
     asyncio.run(run_cache_test())

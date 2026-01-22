@@ -674,7 +674,7 @@ if __name__ == "__main__":
                 "MISS",
                 "HIT" if hit else "MISS",
                 f"{t1:.2f}ms",
-                "✓" if not hit else "✗",
+                "PASS" if not hit else "FAIL",
             ]
         )
         assert not hit, "Expected cache miss"
@@ -695,7 +695,7 @@ if __name__ == "__main__":
                 "HIT",
                 "HIT" if hit else "MISS",
                 f"{t2:.2f}ms",
-                "✓" if hit else "✗",
+                "PASS" if hit else "FAIL",
             ]
         )
         assert hit, "Expected cache hit"
@@ -713,7 +713,7 @@ if __name__ == "__main__":
                 "MISS",
                 "HIT" if hit else "MISS",
                 f"{t3:.2f}ms",
-                "✓" if not hit else "✗",
+                "PASS" if not hit else "FAIL",
             ]
         )
         assert not hit, "Expected cache miss for different prompt"
@@ -743,7 +743,7 @@ if __name__ == "__main__":
                         "MISS",
                         "HIT" if hit else "MISS",
                         f"{t_ms:.2f}ms",
-                        "✓" if not hit else "✗",
+                        "PASS" if not hit else "FAIL",
                     ]
                 )
                 assert not hit
@@ -760,7 +760,7 @@ if __name__ == "__main__":
                         "HIT",
                         "HIT" if hit else "MISS",
                         f"{t_ms:.2f}ms",
-                        "✓" if hit else "✗",
+                        "PASS" if hit else "FAIL",
                     ]
                 )
                 assert hit
@@ -793,7 +793,7 @@ if __name__ == "__main__":
                         "MISS",
                         "HIT" if hit else "MISS",
                         f"{t_ms:.2f}ms",
-                        "✓" if not hit else "✗",
+                        "PASS" if not hit else "FAIL",
                     ]
                 )
                 assert not hit
@@ -810,7 +810,7 @@ if __name__ == "__main__":
                         "HIT",
                         "HIT" if hit else "MISS",
                         f"{t_ms:.2f}ms",
-                        "✓" if hit else "✗",
+                        "PASS" if hit else "FAIL",
                     ]
                 )
                 assert hit
@@ -845,7 +845,7 @@ if __name__ == "__main__":
                 "MISS",
                 "HIT" if hit else "MISS",
                 f"{t_ms:.2f}ms",
-                "✓" if not hit else "✗",
+                "PASS" if not hit else "FAIL",
             ]
         )
         assert not hit
@@ -866,7 +866,7 @@ if __name__ == "__main__":
                 "HIT",
                 "HIT" if hit else "MISS",
                 f"{t_ms:.2f}ms",
-                "✓" if hit else "✗",
+                "PASS" if hit else "FAIL",
             ]
         )
         assert hit
@@ -883,7 +883,7 @@ if __name__ == "__main__":
                 "MISS",
                 "HIT" if hit else "MISS",
                 f"{t_ms:.2f}ms",
-                "✓" if not hit else "✗",
+                "PASS" if not hit else "FAIL",
             ]
         )
         assert not hit
@@ -900,7 +900,7 @@ if __name__ == "__main__":
                 "MISS",
                 "HIT" if hit else "MISS",
                 f"{t_ms:.2f}ms",
-                "✓" if not hit else "✗",
+                "PASS" if not hit else "FAIL",
             ]
         )
         assert not hit
@@ -920,7 +920,7 @@ if __name__ == "__main__":
                     "MISS",
                     "HIT" if hit else "MISS",
                     f"{t_ms:.2f}ms",
-                    "✓" if not hit else "✗",
+                    "PASS" if not hit else "FAIL",
                 ]
             )
             assert not hit
@@ -940,7 +940,7 @@ if __name__ == "__main__":
                     "HIT",
                     "HIT" if hit else "MISS",
                     f"{t_ms:.2f}ms",
-                    "✓" if hit else "✗",
+                    "PASS" if hit else "FAIL",
                 ]
             )
             assert hit
@@ -969,7 +969,7 @@ if __name__ == "__main__":
                         "MISS",
                         "HIT" if hit else "MISS",
                         f"{t_ms:.2f}ms",
-                        "✓" if not hit else "✗",
+                        "PASS" if not hit else "FAIL",
                     ]
                 )
                 assert not hit
@@ -989,7 +989,7 @@ if __name__ == "__main__":
                         "HIT",
                         "HIT" if hit else "MISS",
                         f"{t_ms:.2f}ms",
-                        "✓" if hit else "✗",
+                        "PASS" if hit else "FAIL",
                     ]
                 )
                 assert hit
@@ -1028,7 +1028,7 @@ if __name__ == "__main__":
                 "MISS",
                 "HIT" if hit else "MISS",
                 f"{t_ms:.2f}ms",
-                "✓" if not hit else "✗",
+                "PASS" if not hit else "FAIL",
             ]
         )
         assert not hit
@@ -1043,7 +1043,7 @@ if __name__ == "__main__":
                 "HIT",
                 "HIT" if hit else "MISS",
                 f"{t_ms:.2f}ms",
-                "✓" if hit else "✗",
+                "PASS" if hit else "FAIL",
             ]
         )
         assert hit
@@ -1058,7 +1058,7 @@ if __name__ == "__main__":
                 "HIT",
                 "HIT" if hit else "MISS",
                 f"{t_ms:.2f}ms",
-                "✓" if hit else "✗",
+                "PASS" if hit else "FAIL",
             ]
         )
         assert hit
@@ -1088,7 +1088,7 @@ if __name__ == "__main__":
             ],
         )
         print("\n" + "=" * 70)
-        print("  ✓ ALL TESTS PASSED - VLM cache working correctly!")
+        print("  [OK] ALL TESTS PASSED - VLM cache working correctly")
         print("=" * 70)
 
         # Cleanup temp files

@@ -20,6 +20,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 from mlx_lm.generate import BatchGenerator
 from mlx_lm.sample_utils import make_sampler
 
+from .memory_cache import MemoryAwarePrefixCache, MemoryCacheConfig
 from .paged_cache import PagedCacheManager
 from .prefix_cache import BlockAwarePrefixCache, PrefixCacheManager
 from .request import Request, RequestOutput, RequestStatus, SamplingParams
@@ -59,9 +60,15 @@ class SchedulerConfig:
     prefill_batch_size: int = 8
     completion_batch_size: int = 32
     prefill_step_size: int = 2048
+
     # Prefix cache settings
     enable_prefix_cache: bool = True
-    prefix_cache_size: int = 100  # Max cached entries
+    prefix_cache_size: int = 100  # Max cached entries (legacy, ignored if memory-aware)
+
+    # Memory-aware cache settings (recommended for large models)
+    use_memory_aware_cache: bool = True  # Use memory-based eviction
+    cache_memory_mb: Optional[int] = None  # None = auto-detect (20% of available RAM)
+    cache_memory_percent: float = 0.20  # Fraction of available RAM if auto-detecting
 
     # Paged cache settings (experimental - for memory efficiency)
     use_paged_cache: bool = (
@@ -139,6 +146,7 @@ class Scheduler:
 
         # Prefix cache for KV state reuse
         self.prefix_cache: Optional[PrefixCacheManager] = None
+        self.memory_aware_cache: Optional[MemoryAwarePrefixCache] = None
         self.paged_cache_manager: Optional[PagedCacheManager] = None
         self.block_aware_cache: Optional[BlockAwarePrefixCache] = None
 
@@ -157,8 +165,22 @@ class Scheduler:
                     f"Paged cache enabled: block_size={self.config.paged_cache_block_size}, "
                     f"max_blocks={self.config.max_cache_blocks}"
                 )
+            elif self.config.use_memory_aware_cache:
+                # Use memory-aware cache (recommended for large models)
+                cache_config = MemoryCacheConfig(
+                    max_memory_mb=self.config.cache_memory_mb,
+                    max_memory_percent=self.config.cache_memory_percent,
+                )
+                self.memory_aware_cache = MemoryAwarePrefixCache(
+                    model=model,
+                    config=cache_config,
+                )
+                logger.info(
+                    f"Memory-aware cache enabled: "
+                    f"limit={self.memory_aware_cache.memory_limit_mb:.1f}MB"
+                )
             else:
-                # Use standard prefix cache
+                # Use legacy entry-count based prefix cache
                 self.prefix_cache = PrefixCacheManager(
                     model=model,
                     max_entries=self.config.prefix_cache_size,
@@ -242,9 +264,17 @@ class Scheduler:
 
             # Clear prefix cache when BatchGenerator changes
             # BatchKVCache objects are tied to their generator instance
-            if self.prefix_cache is not None and self.batch_generator is not None:
-                logger.debug("Clearing prefix cache: BatchGenerator being recreated")
-                self.prefix_cache.clear()
+            if self.batch_generator is not None:
+                if self.memory_aware_cache is not None:
+                    logger.debug(
+                        "Clearing memory-aware cache: BatchGenerator being recreated"
+                    )
+                    self.memory_aware_cache.clear()
+                elif self.prefix_cache is not None:
+                    logger.debug(
+                        "Clearing prefix cache: BatchGenerator being recreated"
+                    )
+                    self.prefix_cache.clear()
 
             self.batch_generator = self._create_batch_generator(sampling_params)
             self._current_sampler_params = sampler_params
@@ -372,8 +402,22 @@ class Scheduler:
                     )
             else:
                 request.remaining_tokens = request.prompt_token_ids
+        elif self.memory_aware_cache is not None:
+            # Use memory-aware prefix cache
+            cache, remaining = self.memory_aware_cache.fetch(request.prompt_token_ids)
+            if cache:
+                request.prompt_cache = cache
+                request.cached_tokens = len(request.prompt_token_ids) - len(remaining)
+                request.remaining_tokens = remaining
+                logger.debug(
+                    f"Request {request.request_id}: memory-aware cache hit, "
+                    f"{request.cached_tokens} tokens cached, "
+                    f"{len(remaining)} tokens remaining"
+                )
+            else:
+                request.remaining_tokens = request.prompt_token_ids
         elif self.prefix_cache is not None:
-            # Use standard prefix cache
+            # Use legacy prefix cache
             cache, remaining = self.prefix_cache.fetch_cache(request.prompt_token_ids)
             if cache:
                 request.prompt_cache = cache
@@ -653,8 +697,32 @@ class Scheduler:
                     # for future requests to share. The LRU eviction will clean up
                     # unused blocks when under memory pressure.
 
+                elif self.memory_aware_cache is not None:
+                    # Store in memory-aware prefix cache
+                    # Key includes both prompt and output tokens for multi-turn chat caching
+                    if (
+                        hasattr(request, "_extracted_cache")
+                        and request._extracted_cache is not None
+                    ):
+                        try:
+                            full_token_sequence = list(request.prompt_token_ids) + list(
+                                request.output_token_ids
+                            )
+                            self.memory_aware_cache.store(
+                                full_token_sequence,
+                                request._extracted_cache,
+                            )
+                            logger.debug(
+                                f"Stored memory-aware cache for request {request_id} "
+                                f"({len(full_token_sequence)} tokens: {len(request.prompt_token_ids)} prompt + {len(request.output_token_ids)} output)"
+                            )
+                        except Exception as e:
+                            logger.debug(
+                                f"Failed to store memory-aware cache for {request_id}: {e}"
+                            )
+
                 elif self.prefix_cache is not None:
-                    # Store in standard prefix cache
+                    # Store in legacy prefix cache
                     # Key includes both prompt and output tokens for multi-turn chat caching
                     # The next turn's prompt will include the previous response
                     if (
@@ -704,6 +772,8 @@ class Scheduler:
         # Clear caches
         if self.block_aware_cache is not None:
             self.block_aware_cache.clear()
+        if self.memory_aware_cache is not None:
+            self.memory_aware_cache.clear()
         if self.prefix_cache is not None:
             self.prefix_cache.clear()
 
@@ -822,6 +892,8 @@ class Scheduler:
         # Include cache stats
         if self.block_aware_cache is not None:
             stats["paged_cache"] = self.block_aware_cache.get_stats()
+        elif self.memory_aware_cache is not None:
+            stats["memory_aware_cache"] = self.memory_aware_cache.get_stats()
         elif self.prefix_cache is not None:
             stats["prefix_cache"] = self.prefix_cache.get_stats()
         return stats
@@ -830,6 +902,8 @@ class Scheduler:
         """Get cache statistics."""
         if self.block_aware_cache is not None:
             return self.block_aware_cache.get_stats()
+        elif self.memory_aware_cache is not None:
+            return self.memory_aware_cache.get_stats()
         elif self.prefix_cache is not None:
             return self.prefix_cache.get_stats()
         return None
@@ -852,6 +926,8 @@ class Scheduler:
         # Clear caches
         if self.block_aware_cache is not None:
             self.block_aware_cache.clear()
+        if self.memory_aware_cache is not None:
+            self.memory_aware_cache.clear()
         if self.prefix_cache is not None:
             self.prefix_cache.clear()
 

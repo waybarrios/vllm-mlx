@@ -170,7 +170,7 @@ Solution:"""
             )
 
             # Update progress bar with accuracy
-            status = "✓" if correct else "✗"
+            status = "PASS" if correct else "FAIL"
             accuracy = correct_count / len(results)
             pbar.set_postfix({"acc": f"{accuracy:.1%}", "last": f"{status} {expected}"})
 
@@ -271,7 +271,7 @@ Solution:"""
                 )
 
                 # Update progress bar with accuracy
-                status = "✓" if correct else "✗"
+                status = "PASS" if correct else "FAIL"
                 accuracy = correct_count / len(results)
                 pbar.set_postfix(
                     {"acc": f"{accuracy:.1%}", "last": f"{status} {expected}"}

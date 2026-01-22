@@ -72,6 +72,10 @@ def serve_command(args):
             completion_batch_size=args.completion_batch_size,
             enable_prefix_cache=enable_prefix_cache,
             prefix_cache_size=args.prefix_cache_size,
+            # Memory-aware cache options
+            use_memory_aware_cache=not args.no_memory_aware_cache,
+            cache_memory_mb=args.cache_memory_mb,
+            cache_memory_percent=args.cache_memory_percent,
             # Paged cache options
             use_paged_cache=args.use_paged_cache,
             paged_cache_block_size=args.paged_cache_block_size,
@@ -84,6 +88,15 @@ def serve_command(args):
             print(
                 f"Paged cache: block_size={args.paged_cache_block_size}, max_blocks={args.max_cache_blocks}"
             )
+        elif enable_prefix_cache and not args.no_memory_aware_cache:
+            cache_info = (
+                f"{args.cache_memory_mb}MB"
+                if args.cache_memory_mb
+                else f"{args.cache_memory_percent*100:.0f}% of RAM"
+            )
+            print(f"Memory-aware cache: {cache_info}")
+        elif enable_prefix_cache:
+            print(f"Prefix cache: max_entries={args.prefix_cache_size}")
     else:
         print("Mode: Simple (maximum throughput)")
 
@@ -123,6 +136,10 @@ def bench_command(args):
             completion_batch_size=args.completion_batch_size,
             enable_prefix_cache=enable_prefix_cache,
             prefix_cache_size=args.prefix_cache_size,
+            # Memory-aware cache options
+            use_memory_aware_cache=not args.no_memory_aware_cache,
+            cache_memory_mb=args.cache_memory_mb,
+            cache_memory_percent=args.cache_memory_percent,
             # Paged cache options
             use_paged_cache=args.use_paged_cache,
             paged_cache_block_size=args.paged_cache_block_size,
@@ -368,7 +385,25 @@ Examples:
         "--prefix-cache-size",
         type=int,
         default=100,
-        help="Max entries in prefix cache (default: 100)",
+        help="Max entries in prefix cache (default: 100, legacy mode only)",
+    )
+    # Memory-aware cache options (recommended for large models)
+    serve_parser.add_argument(
+        "--cache-memory-mb",
+        type=int,
+        default=None,
+        help="Cache memory limit in MB (default: auto-detect ~20%% of RAM)",
+    )
+    serve_parser.add_argument(
+        "--cache-memory-percent",
+        type=float,
+        default=0.20,
+        help="Fraction of available RAM for cache if auto-detecting (default: 0.20)",
+    )
+    serve_parser.add_argument(
+        "--no-memory-aware-cache",
+        action="store_true",
+        help="Disable memory-aware cache, use legacy entry-count based cache",
     )
     serve_parser.add_argument(
         "--stream-interval",
@@ -465,7 +500,25 @@ Examples:
         "--prefix-cache-size",
         type=int,
         default=100,
-        help="Max entries in prefix cache (default: 100)",
+        help="Max entries in prefix cache (default: 100, legacy mode only)",
+    )
+    # Memory-aware cache options (recommended for large models)
+    bench_parser.add_argument(
+        "--cache-memory-mb",
+        type=int,
+        default=None,
+        help="Cache memory limit in MB (default: auto-detect ~20%% of RAM)",
+    )
+    bench_parser.add_argument(
+        "--cache-memory-percent",
+        type=float,
+        default=0.20,
+        help="Fraction of available RAM for cache if auto-detecting (default: 0.20)",
+    )
+    bench_parser.add_argument(
+        "--no-memory-aware-cache",
+        action="store_true",
+        help="Disable memory-aware cache, use legacy entry-count based cache",
     )
     # Paged cache options (experimental)
     bench_parser.add_argument(
