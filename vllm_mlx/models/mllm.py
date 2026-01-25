@@ -24,7 +24,7 @@ import threading
 from dataclasses import dataclass, field
 from io import BytesIO
 from pathlib import Path
-from typing import Iterator, List, Optional, Set, Tuple, Union
+from typing import Dict, Iterator, List, Optional, Set, Tuple, Union
 from urllib.parse import urlparse
 
 import numpy as np
@@ -446,8 +446,23 @@ def process_video_input(video: Union[str, dict]) -> str:
     raise ValueError(f"Cannot process video: {video[:50]}...")
 
 
+# Cache for base64 images to avoid re-saving the same image
+_base64_image_cache: Dict[str, str] = {}  # hash -> temp file path
+
+
 def save_base64_image(base64_string: str) -> str:
-    """Save base64 image to temp file and return path."""
+    """Save base64 image to temp file and return path. Caches identical images."""
+    import hashlib
+
+    # Hash the base64 string to check cache
+    image_hash = hashlib.md5(base64_string[:1000].encode()).hexdigest()
+
+    # Return cached path if available and file still exists
+    if image_hash in _base64_image_cache:
+        cached_path = _base64_image_cache[image_hash]
+        if Path(cached_path).exists():
+            return cached_path
+
     image_bytes = decode_base64_image(base64_string)
 
     # Detect format from magic bytes
@@ -466,7 +481,9 @@ def save_base64_image(base64_string: str) -> str:
     temp_file.write(image_bytes)
     temp_file.close()
 
-    return _temp_manager.register(temp_file.name)
+    path = _temp_manager.register(temp_file.name)
+    _base64_image_cache[image_hash] = path
+    return path
 
 
 def process_image_input(image: Union[str, dict]) -> str:
@@ -1172,14 +1189,13 @@ class MLXMultimodalLM:
         skip_prompt_processing = False
 
         if cache_hit and cache_entry and cache_entry.kv_cache:
-            # NOTE: For multimodal (MLLM) with images, we CANNOT use skip_prompt_processing
-            # because the vision encoder must run each time to provide visual context.
-            # The skip_prompt_processing path only calls language_model() which has no vision.
-            # Passing cached KV states doesn't help for MLLM since full forward pass overwrites them.
+            # NOTE: mlx-vlm's generate_step() has its own multimodal KV cache with prefix matching
+            # (MULTIMODAL_KV_CACHE_ENABLED in mlx_vlm/utils.py). Let it handle caching.
+            # We only use vllm-mlx's cache for text-only requests (no images).
             if all_images:
-                logger.info("[PREFIX CACHE] Cache hit but images present - full forward pass required (no speedup)")
-                # Create fresh cache - can't reuse for MLLM with images
-                prompt_cache = None
+                # Let mlx-vlm's multimodal cache handle this - don't interfere
+                logger.info("[PREFIX CACHE] Images present - delegating to mlx-vlm multimodal cache")
+                prompt_cache = None  # Fresh cache, mlx-vlm will handle prefix matching
                 skip_prompt_processing = False
             else:
                 # Text-only: can use skip_prompt_processing for maximum speedup
