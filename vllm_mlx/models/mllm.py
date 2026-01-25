@@ -1019,32 +1019,29 @@ class MLXMultimodalLM:
             self.load()
 
         from mlx_vlm import generate
-        from mlx_vlm.prompt_utils import apply_chat_template
+        from mlx_vlm.prompt_utils import get_chat_template
 
         # Extract text and images from messages
-        images = []
+        # Build chat_messages for multi-turn support WITH proper image tokens per message
+        all_image_urls = []  # Raw URLs/paths to process later
         videos = []
-        text_prompt = ""
-        
+        chat_messages = []  # List of properly formatted messages for chat template
+
         logger.info(f"MLLM.chat() called with {len(messages)} messages")
-        for i, msg in enumerate(messages):
-            logger.info(f"  Message {i}: role={msg.get('role')}, content type={type(msg.get('content'))}")
-            if isinstance(msg.get('content'), list):
-                for j, item in enumerate(msg.get('content', [])):
-                    logger.info(f"    Item {j}: type={item.get('type') if isinstance(item, dict) else type(item)}")
 
         for msg in messages:
             role = msg.get("role", "user")
             content = msg.get("content", "")
+            msg_text = ""  # Text content for this message
+            msg_image_count = 0  # Number of images in THIS message
 
             if isinstance(content, str):
-                if role == "user":
-                    text_prompt = content
+                msg_text = content
             elif isinstance(content, list):
-                # OpenAI multimodal format
+                # OpenAI multimodal format - extract text and count images for THIS message
                 for item in content:
                     if isinstance(item, str):
-                        text_prompt += item
+                        msg_text += item
                         continue
 
                     # Convert Pydantic models to dicts
@@ -1057,25 +1054,44 @@ class MLXMultimodalLM:
                         item_type = item.get("type", "")
 
                         if item_type == "text":
-                            text_prompt += item.get("text", "")
+                            msg_text += item.get("text", "")
 
                         elif item_type == "image_url":
                             img_url = item.get("image_url", {})
                             if isinstance(img_url, str):
-                                images.append(img_url)
+                                all_image_urls.append(img_url)
                             else:
-                                images.append(img_url.get("url", ""))
+                                all_image_urls.append(img_url.get("url", ""))
+                            msg_image_count += 1
 
                         elif item_type == "image":
-                            images.append(item.get("image", item.get("url", "")))
+                            all_image_urls.append(item.get("image", item.get("url", "")))
+                            msg_image_count += 1
 
                         elif item_type == "video":
                             videos.append(item.get("video", item.get("url", "")))
 
+            # Build properly structured message for Qwen3-VL-MoE
+            # Format: {"role": "...", "content": [{"type": "image"}, ..., {"type": "text", "text": "..."}]}
+            if msg_text or msg_image_count > 0:
+                if role == "user" and msg_image_count > 0:
+                    # User message WITH images - build content array with image tokens FIRST
+                    content_list = []
+                    for _ in range(msg_image_count):
+                        content_list.append({"type": "image"})
+                    content_list.append({"type": "text", "text": msg_text, "content": msg_text})
+                    chat_messages.append({"role": role, "content": content_list})
+                elif role == "assistant":
+                    # Assistant messages - just text content (not array)
+                    chat_messages.append({"role": role, "content": msg_text})
+                else:
+                    # User/system message WITHOUT images - still use content array format
+                    chat_messages.append({"role": role, "content": [{"type": "text", "text": msg_text, "content": msg_text}]})
+
         # Process images
         all_images = []
-        if images:
-            all_images.extend(self._prepare_images(images))
+        if all_image_urls:
+            all_images.extend(self._prepare_images(all_image_urls))
 
         # Process videos
         video_fps = kwargs.pop("video_fps", DEFAULT_FPS)
@@ -1087,17 +1103,34 @@ class MLXMultimodalLM:
             all_images.extend(frames)
             logger.info(f"Added {len(frames)} frames from video: {video_path}")
 
-        # Apply chat template using mlx_vlm's utility
+        # Apply chat template directly - messages are already properly structured
+        logger.info(f"Applying chat template with {len(chat_messages)} messages, {len(all_images)} images")
+        for i, cm in enumerate(chat_messages):
+            content_preview = str(cm.get('content', ''))[:80]
+            logger.info(f"  Chat msg {i}: role={cm['role']}, content={content_preview}...")
         try:
-            formatted_prompt = apply_chat_template(
+            # Use get_chat_template directly since messages are already properly formatted
+            formatted_prompt = get_chat_template(
                 self.processor,
-                self.config,
-                text_prompt,
-                num_images=len(all_images),
+                chat_messages,
+                add_generation_prompt=True,
             )
         except Exception as e:
-            logger.warning(f"Failed to apply chat template: {e}, using raw prompt")
-            formatted_prompt = text_prompt
+            logger.warning(f"Failed to apply chat template: {e}, using last user message")
+            # Fallback to last user message if template fails
+            last_user_msg = ""
+            for m in reversed(chat_messages):
+                if m["role"] == "user":
+                    content = m.get("content", "")
+                    if isinstance(content, list):
+                        for item in content:
+                            if isinstance(item, dict) and item.get("type") == "text":
+                                last_user_msg = item.get("text", "")
+                                break
+                    else:
+                        last_user_msg = content
+                    break
+            formatted_prompt = last_user_msg
 
         # Prefix caching with vision embedding support
         # Following LMCache approach: cache vision embeddings to skip encoder on hit
@@ -1290,7 +1323,7 @@ class MLXMultimodalLM:
 
         try:
             from mlx_vlm import stream_generate
-            from mlx_vlm.prompt_utils import apply_chat_template
+            from mlx_vlm.prompt_utils import get_chat_template
         except ImportError:
             # Fallback to non-streaming if stream_generate not available
             output = self.chat(
@@ -1302,23 +1335,25 @@ class MLXMultimodalLM:
             yield output
             return
 
-        # Extract text and images from messages (same logic as chat())
-        images = []
+        # Extract text and images from messages
+        # Build chat_messages for multi-turn support WITH proper image tokens per message
+        all_image_urls = []  # Raw URLs/paths to process later
         videos = []
-        text_prompt = ""
+        chat_messages = []  # List of properly formatted messages for chat template
 
         for msg in messages:
             role = msg.get("role", "user")
             content = msg.get("content", "")
+            msg_text = ""  # Text content for this message
+            msg_image_count = 0  # Number of images in THIS message
 
             if isinstance(content, str):
-                if role == "user":
-                    text_prompt = content
+                msg_text = content
             elif isinstance(content, list):
-                # OpenAI multimodal format
+                # OpenAI multimodal format - extract text and count images for THIS message
                 for item in content:
                     if isinstance(item, str):
-                        text_prompt += item
+                        msg_text += item
                         continue
 
                     # Convert Pydantic models to dicts
@@ -1331,25 +1366,44 @@ class MLXMultimodalLM:
                         item_type = item.get("type", "")
 
                         if item_type == "text":
-                            text_prompt += item.get("text", "")
+                            msg_text += item.get("text", "")
 
                         elif item_type == "image_url":
                             img_url = item.get("image_url", {})
                             if isinstance(img_url, str):
-                                images.append(img_url)
+                                all_image_urls.append(img_url)
                             else:
-                                images.append(img_url.get("url", ""))
+                                all_image_urls.append(img_url.get("url", ""))
+                            msg_image_count += 1
 
                         elif item_type == "image":
-                            images.append(item.get("image", item.get("url", "")))
+                            all_image_urls.append(item.get("image", item.get("url", "")))
+                            msg_image_count += 1
 
                         elif item_type == "video":
                             videos.append(item.get("video", item.get("url", "")))
 
+            # Build properly structured message for Qwen3-VL-MoE
+            # Format: {"role": "...", "content": [{"type": "image"}, ..., {"type": "text", "text": "..."}]}
+            if msg_text or msg_image_count > 0:
+                if role == "user" and msg_image_count > 0:
+                    # User message WITH images - build content array with image tokens FIRST
+                    content_list = []
+                    for _ in range(msg_image_count):
+                        content_list.append({"type": "image"})
+                    content_list.append({"type": "text", "text": msg_text, "content": msg_text})
+                    chat_messages.append({"role": role, "content": content_list})
+                elif role == "assistant":
+                    # Assistant messages - just text content (not array)
+                    chat_messages.append({"role": role, "content": msg_text})
+                else:
+                    # User/system message WITHOUT images - still use content array format
+                    chat_messages.append({"role": role, "content": [{"type": "text", "text": msg_text, "content": msg_text}]})
+
         # Process images
         all_images = []
-        if images:
-            all_images.extend(self._prepare_images(images))
+        if all_image_urls:
+            all_images.extend(self._prepare_images(all_image_urls))
 
         # Process videos
         video_fps = kwargs.pop("video_fps", DEFAULT_FPS)
@@ -1360,17 +1414,30 @@ class MLXMultimodalLM:
             )
             all_images.extend(frames)
 
-        # Apply chat template
+        # Apply chat template directly - messages are already properly structured
         try:
-            formatted_prompt = apply_chat_template(
+            # Use get_chat_template directly since messages are already properly formatted
+            formatted_prompt = get_chat_template(
                 self.processor,
-                self.config,
-                text_prompt,
-                num_images=len(all_images),
+                chat_messages,
+                add_generation_prompt=True,
             )
         except Exception as e:
-            logger.warning(f"Failed to apply chat template: {e}, using raw prompt")
-            formatted_prompt = text_prompt
+            logger.warning(f"Failed to apply chat template: {e}, using last user message")
+            # Fallback to last user message if template fails
+            last_user_msg = ""
+            for m in reversed(chat_messages):
+                if m["role"] == "user":
+                    content = m.get("content", "")
+                    if isinstance(content, list):
+                        for item in content:
+                            if isinstance(item, dict) and item.get("type") == "text":
+                                last_user_msg = item.get("text", "")
+                                break
+                    else:
+                        last_user_msg = content
+                    break
+            formatted_prompt = last_user_msg
 
         # Check cache for existing KV state (uses images as cache key)
         from mlx_vlm.models import cache as vlm_cache
