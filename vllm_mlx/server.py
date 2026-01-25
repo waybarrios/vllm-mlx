@@ -292,6 +292,41 @@ async def health():
     }
 
 
+@app.get("/v1/cache/stats")
+async def cache_stats():
+    """Get cache statistics for debugging and monitoring."""
+    try:
+        from mlx_vlm.utils import (
+            get_multimodal_kv_cache_stats,
+            get_pixel_values_cache_stats,
+            get_pil_cache_stats,
+        )
+
+        return {
+            "multimodal_kv_cache": get_multimodal_kv_cache_stats(),
+            "pixel_values_cache": get_pixel_values_cache_stats(),
+            "pil_image_cache": get_pil_cache_stats(),
+        }
+    except ImportError:
+        return {"error": "Cache stats not available (mlx_vlm not loaded)"}
+
+
+@app.delete("/v1/cache")
+async def clear_cache():
+    """Clear all caches."""
+    try:
+        from mlx_vlm.utils import (
+            clear_multimodal_kv_cache,
+            clear_pixel_values_cache,
+        )
+
+        clear_multimodal_kv_cache()
+        clear_pixel_values_cache()
+        return {"status": "cleared", "caches": ["multimodal_kv", "pixel_values", "pil_image"]}
+    except ImportError:
+        return {"error": "Cache clear not available (mlx_vlm not loaded)"}
+
+
 @app.get("/v1/models", dependencies=[Depends(verify_api_key)])
 async def list_models() -> ModelsResponse:
     """List available models."""
