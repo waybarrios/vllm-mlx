@@ -1093,7 +1093,9 @@ class MLXMultimodalLM:
                             msg_image_count += 1
 
                         elif item_type == "image":
-                            all_image_urls.append(item.get("image", item.get("url", "")))
+                            all_image_urls.append(
+                                item.get("image", item.get("url", ""))
+                            )
                             msg_image_count += 1
 
                         elif item_type == "video":
@@ -1107,14 +1109,23 @@ class MLXMultimodalLM:
                     content_list = []
                     for _ in range(msg_image_count):
                         content_list.append({"type": "image"})
-                    content_list.append({"type": "text", "text": msg_text, "content": msg_text})
+                    content_list.append(
+                        {"type": "text", "text": msg_text, "content": msg_text}
+                    )
                     chat_messages.append({"role": role, "content": content_list})
                 elif role == "assistant":
                     # Assistant messages - just text content (not array)
                     chat_messages.append({"role": role, "content": msg_text})
                 else:
                     # User/system message WITHOUT images - still use content array format
-                    chat_messages.append({"role": role, "content": [{"type": "text", "text": msg_text, "content": msg_text}]})
+                    chat_messages.append(
+                        {
+                            "role": role,
+                            "content": [
+                                {"type": "text", "text": msg_text, "content": msg_text}
+                            ],
+                        }
+                    )
 
         # Process images
         all_images = []
@@ -1132,10 +1143,14 @@ class MLXMultimodalLM:
             logger.info(f"Added {len(frames)} frames from video: {video_path}")
 
         # Apply chat template directly - messages are already properly structured
-        logger.info(f"Applying chat template with {len(chat_messages)} messages, {len(all_images)} images")
+        logger.info(
+            f"Applying chat template with {len(chat_messages)} messages, {len(all_images)} images"
+        )
         for i, cm in enumerate(chat_messages):
-            content_preview = str(cm.get('content', ''))[:80]
-            logger.info(f"  Chat msg {i}: role={cm['role']}, content={content_preview}...")
+            content_preview = str(cm.get("content", ""))[:80]
+            logger.info(
+                f"  Chat msg {i}: role={cm['role']}, content={content_preview}..."
+            )
         try:
             # Use get_chat_template directly since messages are already properly formatted
             formatted_prompt = get_chat_template(
@@ -1144,7 +1159,9 @@ class MLXMultimodalLM:
                 add_generation_prompt=True,
             )
         except Exception as e:
-            logger.warning(f"Failed to apply chat template: {e}, using last user message")
+            logger.warning(
+                f"Failed to apply chat template: {e}, using last user message"
+            )
             # Fallback to last user message if template fails
             last_user_msg = ""
             for m in reversed(chat_messages):
@@ -1172,7 +1189,11 @@ class MLXMultimodalLM:
         cache_hit = False
 
         # Tokenize prompt for cache lookup
-        tokenizer = self.processor.tokenizer if hasattr(self.processor, 'tokenizer') else self.processor
+        tokenizer = (
+            self.processor.tokenizer
+            if hasattr(self.processor, "tokenizer")
+            else self.processor
+        )
         token_ids = tokenizer.encode(formatted_prompt)
 
         # Check prefix cache
@@ -1185,9 +1206,13 @@ class MLXMultimodalLM:
                     cache_hit = True
                     vision_embeddings = cache_entry.vision_embeddings
                     if vision_embeddings is not None:
-                        logger.info("[PREFIX CACHE] Vision embeddings cached - would skip encoder!")
+                        logger.info(
+                            "[PREFIX CACHE] Vision embeddings cached - would skip encoder!"
+                        )
                     if prefix_match_len > 0:
-                        logger.info(f"[PREFIX CACHE] {prefix_match_len} prefix tokens match")
+                        logger.info(
+                            f"[PREFIX CACHE] {prefix_match_len} prefix tokens match"
+                        )
             except Exception as e:
                 logger.warning(f"Cache fetch failed: {e}")
 
@@ -1204,32 +1229,40 @@ class MLXMultimodalLM:
             # We only use vllm-mlx's cache for text-only requests (no images).
             if all_images:
                 # Let mlx-vlm's multimodal cache handle this - don't interfere
-                logger.info("[PREFIX CACHE] Images present - delegating to mlx-vlm multimodal cache")
+                logger.info(
+                    "[PREFIX CACHE] Images present - delegating to mlx-vlm multimodal cache"
+                )
                 prompt_cache = None  # Fresh cache, mlx-vlm will handle prefix matching
                 skip_prompt_processing = False
             else:
                 # Text-only: can use skip_prompt_processing for maximum speedup
-                logger.info("[PREFIX CACHE] Text-only cache hit - using skip_prompt_processing speedup")
+                logger.info(
+                    "[PREFIX CACHE] Text-only cache hit - using skip_prompt_processing speedup"
+                )
                 cached_prompt_cache = cache_entry.kv_cache
                 try:
                     import copy
+
                     prompt_cache = []
                     for layer_cache in cached_prompt_cache:
                         new_cache = copy.copy(layer_cache)
-                        if hasattr(layer_cache, 'state'):
+                        if hasattr(layer_cache, "state"):
                             state = layer_cache.state
                             if state is not None:
                                 import mlx.core as mx
+
                                 if len(state) >= 2 and state[0] is not None:
                                     new_cache.keys = mx.array(state[0])
                                     new_cache.values = mx.array(state[1])
                                     if len(state) >= 3:
                                         new_cache.offset = state[2]
-                                    elif hasattr(layer_cache, 'offset'):
+                                    elif hasattr(layer_cache, "offset"):
                                         new_cache.offset = layer_cache.offset
                         prompt_cache.append(new_cache)
                     skip_prompt_processing = True
-                    logger.info(f"[PREFIX CACHE] Skipping {prefix_match_len} token forward pass")
+                    logger.info(
+                        f"[PREFIX CACHE] Skipping {prefix_match_len} token forward pass"
+                    )
                 except Exception as e:
                     logger.warning(f"[PREFIX CACHE] Failed to copy cache: {e}")
                     prompt_cache = None
@@ -1257,7 +1290,13 @@ class MLXMultimodalLM:
 
         # Store KV cache for future reuse (on cache miss)
         # IMPORTANT: We need to store only the prompt portion, not generated tokens
-        if use_cache and self._cache_manager is not None and all_images and not cache_hit and prompt_cache:
+        if (
+            use_cache
+            and self._cache_manager is not None
+            and all_images
+            and not cache_hit
+            and prompt_cache
+        ):
             try:
                 import copy
                 import mlx.core as mx
@@ -1269,14 +1308,21 @@ class MLXMultimodalLM:
                 cache_to_store = []
                 for layer_cache in prompt_cache:
                     new_cache = copy.copy(layer_cache)
-                    if hasattr(layer_cache, 'state'):
+                    if hasattr(layer_cache, "state"):
                         state = layer_cache.state
-                        if state is not None and len(state) >= 2 and state[0] is not None:
+                        if (
+                            state is not None
+                            and len(state) >= 2
+                            and state[0] is not None
+                        ):
                             # Copy arrays
                             keys = mx.array(state[0])
                             values = mx.array(state[1])
                             # Trim to prompt tokens only (not generated tokens)
-                            if hasattr(layer_cache, 'offset') and layer_cache.offset > prompt_tokens_count:
+                            if (
+                                hasattr(layer_cache, "offset")
+                                and layer_cache.offset > prompt_tokens_count
+                            ):
                                 # For caches with offset tracking, slice to prompt length
                                 new_cache.keys = keys[:, :, :prompt_tokens_count, :]
                                 new_cache.values = values[:, :, :prompt_tokens_count, :]
@@ -1286,8 +1332,10 @@ class MLXMultimodalLM:
                                 new_cache.values = values
                                 if len(state) >= 3:
                                     new_cache.offset = state[2]
-                                elif hasattr(layer_cache, 'offset'):
-                                    new_cache.offset = min(layer_cache.offset, prompt_tokens_count)
+                                elif hasattr(layer_cache, "offset"):
+                                    new_cache.offset = min(
+                                        layer_cache.offset, prompt_tokens_count
+                                    )
                     cache_to_store.append(new_cache)
 
                 self._cache_manager.store(
@@ -1299,7 +1347,9 @@ class MLXMultimodalLM:
                     num_image_tokens=256,
                     model_name=self.model_name,
                 )
-                logger.info(f"[PREFIX CACHE] Stored KV cache for {len(all_images)} image(s) ({prompt_tokens_count} prompt tokens)")
+                logger.info(
+                    f"[PREFIX CACHE] Stored KV cache for {len(all_images)} image(s) ({prompt_tokens_count} prompt tokens)"
+                )
             except Exception as e:
                 logger.warning(f"Failed to cache: {e}")
 
@@ -1403,7 +1453,9 @@ class MLXMultimodalLM:
                             msg_image_count += 1
 
                         elif item_type == "image":
-                            all_image_urls.append(item.get("image", item.get("url", "")))
+                            all_image_urls.append(
+                                item.get("image", item.get("url", ""))
+                            )
                             msg_image_count += 1
 
                         elif item_type == "video":
@@ -1417,14 +1469,23 @@ class MLXMultimodalLM:
                     content_list = []
                     for _ in range(msg_image_count):
                         content_list.append({"type": "image"})
-                    content_list.append({"type": "text", "text": msg_text, "content": msg_text})
+                    content_list.append(
+                        {"type": "text", "text": msg_text, "content": msg_text}
+                    )
                     chat_messages.append({"role": role, "content": content_list})
                 elif role == "assistant":
                     # Assistant messages - just text content (not array)
                     chat_messages.append({"role": role, "content": msg_text})
                 else:
                     # User/system message WITHOUT images - still use content array format
-                    chat_messages.append({"role": role, "content": [{"type": "text", "text": msg_text, "content": msg_text}]})
+                    chat_messages.append(
+                        {
+                            "role": role,
+                            "content": [
+                                {"type": "text", "text": msg_text, "content": msg_text}
+                            ],
+                        }
+                    )
 
         # Process images
         all_images = []
@@ -1449,7 +1510,9 @@ class MLXMultimodalLM:
                 add_generation_prompt=True,
             )
         except Exception as e:
-            logger.warning(f"Failed to apply chat template: {e}, using last user message")
+            logger.warning(
+                f"Failed to apply chat template: {e}, using last user message"
+            )
             # Fallback to last user message if template fails
             last_user_msg = ""
             for m in reversed(chat_messages):
@@ -1467,6 +1530,7 @@ class MLXMultimodalLM:
 
         # Check cache for existing KV state (uses images as cache key)
         from mlx_vlm.models import cache as vlm_cache
+
         prompt_cache = None
         cache_hit = False
         use_cache = kwargs.pop("use_cache", True)
@@ -1501,13 +1565,13 @@ class MLXMultimodalLM:
         ):
             token_count += 1
             # chunk is a GenerationResult with .text attribute containing the new token
-            new_text = chunk.text if hasattr(chunk, 'text') else str(chunk)
+            new_text = chunk.text if hasattr(chunk, "text") else str(chunk)
             accumulated_text += new_text
 
             yield MLLMOutput(
                 text=new_text,  # Just the new token for streaming
                 finish_reason=None,
-                prompt_tokens=getattr(chunk, 'prompt_tokens', 0),
+                prompt_tokens=getattr(chunk, "prompt_tokens", 0),
                 completion_tokens=token_count,
             )
 
@@ -1515,7 +1579,7 @@ class MLXMultimodalLM:
         yield MLLMOutput(
             text="",
             finish_reason="stop",
-            prompt_tokens=getattr(chunk, 'prompt_tokens', 0) if 'chunk' in dir() else 0,
+            prompt_tokens=getattr(chunk, "prompt_tokens", 0) if "chunk" in dir() else 0,
             completion_tokens=token_count,
         )
 

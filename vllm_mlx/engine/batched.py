@@ -96,18 +96,21 @@ class MLLMModelWrapper:
     def __init__(self, model):
         self._model = model
         # Detect if this is a Gemma 3 model (requires pixel_values as positional arg)
-        self._is_gemma3 = hasattr(model, 'model_type') and 'gemma3' in str(getattr(model, 'model_type', '')).lower()
+        self._is_gemma3 = (
+            hasattr(model, "model_type")
+            and "gemma3" in str(getattr(model, "model_type", "")).lower()
+        )
 
     def __call__(self, *args, **kwargs):
         """Call the model and extract logits from LanguageModelOutput."""
         # Gemma 3 requires pixel_values as a positional argument, unlike Qwen
         # which makes it optional. Inject pixel_values=None for text-only requests.
-        if self._is_gemma3 and 'pixel_values' not in kwargs:
-            kwargs['pixel_values'] = None
+        if self._is_gemma3 and "pixel_values" not in kwargs:
+            kwargs["pixel_values"] = None
 
         output = self._model(*args, **kwargs)
         # If output has logits attribute, return just the logits
-        if hasattr(output, 'logits'):
+        if hasattr(output, "logits"):
             return output.logits
         return output
 

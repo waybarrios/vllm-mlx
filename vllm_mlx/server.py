@@ -356,7 +356,10 @@ async def clear_cache():
 
         clear_multimodal_kv_cache()
         clear_pixel_values_cache()
-        return {"status": "cleared", "caches": ["multimodal_kv", "pixel_values", "pil_image"]}
+        return {
+            "status": "cleared",
+            "caches": ["multimodal_kv", "pixel_values", "pil_image"],
+        }
     except ImportError:
         return {"error": "Cache clear not available (mlx_vlm not loaded)"}
 
@@ -892,9 +895,7 @@ async def stream_chat_completion(
     response_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
 
     # Check if we should include usage in the final chunk
-    include_usage = (
-        request.stream_options and request.stream_options.include_usage
-    )
+    include_usage = request.stream_options and request.stream_options.include_usage
 
     # First chunk with role
     first_chunk = ChatCompletionChunk(
@@ -924,9 +925,9 @@ async def stream_chat_completion(
         last_output = output
 
         # Track token counts from output (updated each chunk)
-        if hasattr(output, 'prompt_tokens') and output.prompt_tokens:
+        if hasattr(output, "prompt_tokens") and output.prompt_tokens:
             prompt_tokens = output.prompt_tokens
-        if hasattr(output, 'completion_tokens') and output.completion_tokens:
+        if hasattr(output, "completion_tokens") and output.completion_tokens:
             completion_tokens = output.completion_tokens
 
         # Add <think> prefix on first content chunk for thinking models

@@ -344,18 +344,20 @@ class SimpleEngine(BaseEngine):
 
             # Run stream_chat in thread pool since it's synchronous
             def run_stream():
-                return list(self._model.stream_chat(
-                    messages=messages,
-                    max_tokens=max_tokens,
-                    temperature=temperature,
-                    **kwargs,
-                ))
+                return list(
+                    self._model.stream_chat(
+                        messages=messages,
+                        max_tokens=max_tokens,
+                        temperature=temperature,
+                        **kwargs,
+                    )
+                )
 
             chunks = await asyncio.to_thread(run_stream)
 
             for chunk in chunks:
                 token_count += 1
-                new_text = chunk.text if hasattr(chunk, 'text') else str(chunk)
+                new_text = chunk.text if hasattr(chunk, "text") else str(chunk)
                 accumulated_text += new_text
 
                 finished = chunk.finish_reason is not None
@@ -363,7 +365,7 @@ class SimpleEngine(BaseEngine):
                 yield GenerationOutput(
                     text=accumulated_text,
                     new_text=new_text,
-                    prompt_tokens=getattr(chunk, 'prompt_tokens', 0),
+                    prompt_tokens=getattr(chunk, "prompt_tokens", 0),
                     completion_tokens=token_count,
                     finished=finished,
                     finish_reason=chunk.finish_reason if finished else None,

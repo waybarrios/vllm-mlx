@@ -307,7 +307,10 @@ class MLLMPrefixCacheManager:
         if images:
             image_key = self._make_image_only_key(images)
             for key, entry in self._cache.items():
-                if entry.image_hash == image_key and entry.vision_embeddings is not None:
+                if (
+                    entry.image_hash == image_key
+                    and entry.vision_embeddings is not None
+                ):
                     # Image match - can reuse vision embeddings!
                     self.stats.partial_hits += 1
                     self.stats.vision_encoder_skips += 1

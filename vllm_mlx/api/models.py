@@ -161,7 +161,9 @@ class ChatCompletionRequest(BaseModel):
     top_p: float = 0.9
     max_tokens: Optional[int] = None
     stream: bool = False
-    stream_options: Optional[StreamOptions] = None  # Streaming options (include_usage, etc.)
+    stream_options: Optional[StreamOptions] = (
+        None  # Streaming options (include_usage, etc.)
+    )
     stop: Optional[List[str]] = None
     # Tool calling
     tools: Optional[List[ToolDefinition]] = None

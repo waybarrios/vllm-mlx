@@ -51,7 +51,12 @@ def __getattr__(name):
         return getattr(paged_cache, name)
 
     # MLLM cache (with legacy VLM aliases)
-    if name in ("MLLMCacheManager", "MLLMCacheStats", "VLMCacheManager", "VLMCacheStats"):
+    if name in (
+        "MLLMCacheManager",
+        "MLLMCacheStats",
+        "VLMCacheManager",
+        "VLMCacheStats",
+    ):
         from vllm_mlx import mllm_cache
 
         # Map legacy VLM names to MLLM

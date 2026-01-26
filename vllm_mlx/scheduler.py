@@ -205,10 +205,10 @@ class Scheduler:
         the tokenizer. This method extracts the actual tokenizer.
         """
         # If it has encode method, it's already a tokenizer
-        if hasattr(tokenizer, 'encode') and callable(tokenizer.encode):
+        if hasattr(tokenizer, "encode") and callable(tokenizer.encode):
             return tokenizer
         # If it's a processor, get the wrapped tokenizer
-        if hasattr(tokenizer, 'tokenizer'):
+        if hasattr(tokenizer, "tokenizer"):
             return tokenizer.tokenizer
         # Fallback to the original
         return tokenizer
@@ -392,11 +392,15 @@ class Scheduler:
         if request.prompt_token_ids is None:
             if isinstance(request.prompt, str):
                 # Handle both tokenizers and processors (for MLLM models)
-                if hasattr(self.tokenizer, 'encode'):
+                if hasattr(self.tokenizer, "encode"):
                     request.prompt_token_ids = self.tokenizer.encode(request.prompt)
-                elif hasattr(self.tokenizer, 'tokenizer') and hasattr(self.tokenizer.tokenizer, 'encode'):
+                elif hasattr(self.tokenizer, "tokenizer") and hasattr(
+                    self.tokenizer.tokenizer, "encode"
+                ):
                     # Processor wraps tokenizer (e.g., Qwen3VLProcessor)
-                    request.prompt_token_ids = self.tokenizer.tokenizer.encode(request.prompt)
+                    request.prompt_token_ids = self.tokenizer.tokenizer.encode(
+                        request.prompt
+                    )
                 else:
                     raise AttributeError(
                         f"Tokenizer {type(self.tokenizer)} has no 'encode' method. "
