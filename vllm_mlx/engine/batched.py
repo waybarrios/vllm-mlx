@@ -12,7 +12,6 @@ For MLLM models, this engine supports a hybrid approach:
 This is necessary because BatchGenerator only supports token IDs, not pixel_values.
 """
 
-import asyncio
 import logging
 from typing import Any, AsyncIterator, Dict, List, Optional
 

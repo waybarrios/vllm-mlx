@@ -22,7 +22,7 @@ import tempfile
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Iterator
 from urllib.parse import urlparse
 
 import numpy as np
@@ -1163,7 +1163,6 @@ class MLXMultimodalLM:
         # Prefix caching with vision embedding support
         # Following LMCache approach: cache vision embeddings to skip encoder on hit
         from mlx_vlm.models import cache as vlm_cache
-        from mlx_vlm.utils import prepare_inputs
         import time
 
         use_cache = kwargs.pop("use_cache", True)
@@ -1186,7 +1185,7 @@ class MLXMultimodalLM:
                     cache_hit = True
                     vision_embeddings = cache_entry.vision_embeddings
                     if vision_embeddings is not None:
-                        logger.info(f"[PREFIX CACHE] Vision embeddings cached - would skip encoder!")
+                        logger.info("[PREFIX CACHE] Vision embeddings cached - would skip encoder!")
                     if prefix_match_len > 0:
                         logger.info(f"[PREFIX CACHE] {prefix_match_len} prefix tokens match")
             except Exception as e:
