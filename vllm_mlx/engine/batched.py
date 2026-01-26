@@ -5,10 +5,14 @@ Batched engine for continuous batching with multiple concurrent users.
 This engine wraps AsyncEngineCore to provide continuous batching
 for better throughput when serving multiple concurrent requests.
 
-For MLLM (multimodal) models, it uses MLLMScheduler which handles
-vision encoding and concurrent multimodal request processing.
+For MLLM models, this engine supports a hybrid approach:
+- Text-only requests: Use BatchGenerator for continuous batching
+- Multimodal requests (with images/videos): Fall back to MLLM.chat() for correct processing
+
+This is necessary because BatchGenerator only supports token IDs, not pixel_values.
 """
 
+import asyncio
 import logging
 from typing import Any, AsyncIterator, Dict, List, Optional
 
@@ -17,6 +21,100 @@ from ..api.utils import is_mllm_model, clean_output_text, extract_multimodal_con
 from ..api.tool_calling import convert_tools_for_template
 
 logger = logging.getLogger(__name__)
+
+
+def _extract_media_from_messages(messages: List[Dict[str, Any]]) -> tuple:
+    """
+    Extract images and videos from OpenAI-format messages.
+
+    Returns:
+        Tuple of (has_media, images_list, videos_list)
+    """
+    images = []
+    videos = []
+
+    for msg in messages:
+        content = msg.get("content")
+        if not isinstance(content, list):
+            continue
+
+        for item in content:
+            # Handle Pydantic models
+            if hasattr(item, "model_dump"):
+                item = item.model_dump()
+            elif hasattr(item, "dict"):
+                item = item.dict()
+
+            if not isinstance(item, dict):
+                continue
+
+            item_type = item.get("type", "")
+
+            if item_type == "image_url":
+                img_url = item.get("image_url", {})
+                if isinstance(img_url, str):
+                    images.append(img_url)
+                elif isinstance(img_url, dict):
+                    url = img_url.get("url", "")
+                    if url:
+                        images.append(url)
+
+            elif item_type == "image":
+                img = item.get("image") or item.get("url", "")
+                if img:
+                    images.append(img)
+
+            elif item_type == "video_url":
+                vid_url = item.get("video_url", {})
+                if isinstance(vid_url, str):
+                    videos.append(vid_url)
+                elif isinstance(vid_url, dict):
+                    url = vid_url.get("url", "")
+                    if url:
+                        videos.append(url)
+
+            elif item_type == "video":
+                vid = item.get("video") or item.get("url", "")
+                if vid:
+                    videos.append(vid)
+
+    has_media = bool(images or videos)
+    return has_media, images, videos
+
+
+class MLLMModelWrapper:
+    """
+    Wrapper for MLLM models to make them compatible with BatchGenerator.
+
+    BatchGenerator expects model output to be subscriptable (logits array),
+    but MLLM models return LanguageModelOutput objects. This wrapper extracts
+    the logits from the output.
+
+    Also handles Gemma 3's required pixel_values argument by injecting None
+    for text-only requests.
+    """
+
+    def __init__(self, model):
+        self._model = model
+        # Detect if this is a Gemma 3 model (requires pixel_values as positional arg)
+        self._is_gemma3 = hasattr(model, 'model_type') and 'gemma3' in str(getattr(model, 'model_type', '')).lower()
+
+    def __call__(self, *args, **kwargs):
+        """Call the model and extract logits from LanguageModelOutput."""
+        # Gemma 3 requires pixel_values as a positional argument, unlike Qwen
+        # which makes it optional. Inject pixel_values=None for text-only requests.
+        if self._is_gemma3 and 'pixel_values' not in kwargs:
+            kwargs['pixel_values'] = None
+
+        output = self._model(*args, **kwargs)
+        # If output has logits attribute, return just the logits
+        if hasattr(output, 'logits'):
+            return output.logits
+        return output
+
+    def __getattr__(self, name):
+        """Forward all other attributes to the wrapped model."""
+        return getattr(self._model, name)
 
 
 class BatchedEngine(BaseEngine):
@@ -186,6 +284,7 @@ class BatchedEngine(BaseEngine):
             self._engine = None
 
         self._model = None
+        self._mllm = None
         self._tokenizer = None
         self._processor = None
         self._mllm_instance = None
@@ -426,6 +525,10 @@ class BatchedEngine(BaseEngine):
         """
         Chat completion (non-streaming).
 
+        For MLLM models with images/videos, uses the native MLLM.chat() method
+        which properly processes multimodal content through the vision encoder.
+        For text-only requests, uses BatchGenerator for continuous batching.
+
         Args:
             messages: List of chat messages (OpenAI format)
             max_tokens: Maximum tokens to generate
@@ -480,6 +583,10 @@ class BatchedEngine(BaseEngine):
     ) -> AsyncIterator[GenerationOutput]:
         """
         Stream chat completion token by token.
+
+        For MLLM models with images/videos, uses the native MLLM.stream_chat() method
+        which properly processes multimodal content through the vision encoder.
+        For text-only requests, uses BatchGenerator for continuous batching.
 
         Args:
             messages: List of chat messages (OpenAI format)

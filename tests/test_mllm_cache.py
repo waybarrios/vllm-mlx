@@ -1,31 +1,36 @@
 # SPDX-License-Identifier: Apache-2.0
 """
-Tests for VLM (Vision Language Model) KV cache functionality.
+Tests for MLLM (Multimodal Language Model) KV cache functionality.
 
-These tests verify the VLMCacheManager for caching KV states
+These tests verify the MLLMCacheManager for caching KV states
 when the same image/video + prompt combination is requested.
 """
 
 import os
 import tempfile
-import pytest
 from pathlib import Path
 
-from vllm_mlx.vlm_cache import (
-    VLMCacheEntry,
-    VLMCacheManager,
-    VLMCacheStats,
+import pytest
+
+from vllm_mlx.mllm_cache import (
+    MLLMCacheStats,
+    MLLMPrefixCacheEntry,
+    MLLMPrefixCacheManager,
     compute_image_hash,
     compute_images_hash,
 )
 
+# Aliases for test compatibility
+MLLMCacheEntry = MLLMPrefixCacheEntry
+MLLMCacheManager = MLLMPrefixCacheManager
 
-class TestVLMCacheStats:
-    """Tests for VLMCacheStats class."""
+
+class TestMLLMCacheStats:
+    """Tests for MLLMCacheStats class."""
 
     def test_initial_stats(self):
         """Test initial statistics are zero."""
-        stats = VLMCacheStats()
+        stats = MLLMCacheStats()
         assert stats.hits == 0
         assert stats.misses == 0
         assert stats.tokens_saved == 0
@@ -36,17 +41,17 @@ class TestVLMCacheStats:
 
     def test_hit_rate_calculation(self):
         """Test hit rate calculation."""
-        stats = VLMCacheStats(hits=3, misses=7, total_queries=10)
+        stats = MLLMCacheStats(hits=3, misses=7, total_queries=10)
         assert stats.hit_rate == 0.3
 
     def test_hit_rate_zero_queries(self):
         """Test hit rate with zero queries."""
-        stats = VLMCacheStats()
+        stats = MLLMCacheStats()
         assert stats.hit_rate == 0.0
 
     def test_to_dict(self):
         """Test conversion to dictionary."""
-        stats = VLMCacheStats(
+        stats = MLLMCacheStats(
             hits=5,
             misses=5,
             tokens_saved=100,
@@ -148,40 +153,42 @@ class TestImageHashing:
             os.unlink(path2)
 
 
-class TestVLMCacheEntry:
-    """Tests for VLMCacheEntry class."""
+class TestMLLMCacheEntry:
+    """Tests for MLLMPrefixCacheEntry class."""
 
     def test_cache_entry_creation(self):
         """Test creating a cache entry."""
-        cache = ["mock_kv_cache"]
-        entry = VLMCacheEntry(
-            prompt_cache=cache,
+        entry = MLLMPrefixCacheEntry(
             image_hash="abc123",
+            prompt_hash="def456",
+            kv_cache=["mock_kv_cache"],
             prompt_tokens=50,
         )
-        assert entry.prompt_cache == ["mock_kv_cache"]
+        assert entry.kv_cache == ["mock_kv_cache"]
         assert entry.image_hash == "abc123"
+        assert entry.prompt_hash == "def456"
         assert entry.prompt_tokens == 50
-        assert entry.count == 1
+        assert entry.hit_count == 0
 
-    def test_cache_entry_count_increment(self):
-        """Test incrementing reference count."""
-        entry = VLMCacheEntry(
-            prompt_cache=["cache"],
+    def test_cache_entry_hit_count_increment(self):
+        """Test incrementing hit count."""
+        entry = MLLMPrefixCacheEntry(
             image_hash="xyz",
+            prompt_hash="abc",
+            kv_cache=["cache"],
             prompt_tokens=10,
         )
-        entry.count += 1
-        assert entry.count == 2
+        entry.hit_count += 1
+        assert entry.hit_count == 1
 
 
-class TestVLMCacheManager:
-    """Tests for VLMCacheManager class."""
+class TestMLLMCacheManager:
+    """Tests for MLLMCacheManager class."""
 
     @pytest.fixture
     def cache_manager(self):
         """Create a cache manager with default settings."""
-        return VLMCacheManager(max_entries=10)
+        return MLLMCacheManager(max_entries=10)
 
     @pytest.fixture
     def temp_image(self):
@@ -194,7 +201,7 @@ class TestVLMCacheManager:
 
     def test_initialization(self):
         """Test cache manager initialization."""
-        manager = VLMCacheManager(max_entries=50)
+        manager = MLLMCacheManager(max_entries=50)
         assert manager.max_size == 50
         assert len(manager) == 0
 
@@ -282,7 +289,7 @@ class TestVLMCacheManager:
 
     def test_lru_eviction(self):
         """Test LRU eviction when cache is full."""
-        manager = VLMCacheManager(max_entries=3)
+        manager = MLLMCacheManager(max_entries=3)
 
         # Fill cache
         manager.store_cache(["img1.jpg"], "prompt1", ["cache1"])
@@ -302,7 +309,7 @@ class TestVLMCacheManager:
 
     def test_lru_touch_on_access(self):
         """Test that accessing a cache updates LRU order."""
-        manager = VLMCacheManager(max_entries=3)
+        manager = MLLMCacheManager(max_entries=3)
 
         # Fill cache
         manager.store_cache(["img1.jpg"], "p1", ["cache1"])
@@ -368,26 +375,30 @@ class TestVLMCacheManager:
         # Stats should also be reset
         assert cache_manager.stats.hits == 0
 
-    def test_cache_deep_copy(self, cache_manager, temp_image):
-        """Test that fetched cache is a deep copy."""
+    def test_cache_returns_reference(self, cache_manager, temp_image):
+        """Test that fetched cache returns the stored reference.
+
+        Note: For performance, the cache returns direct references to stored
+        KV caches. In practice, MLX arrays are immutable so this is safe.
+        """
         original = [[1, 2, 3]]
         cache_manager.store_cache([temp_image], "prompt", original)
 
-        cache, _ = cache_manager.fetch_cache([temp_image], "prompt")
+        cache, hit = cache_manager.fetch_cache([temp_image], "prompt")
+        assert hit is True
+        assert cache is not None
+        assert cache[0] == [1, 2, 3]
 
-        # Modify returned cache
-        cache[0].append(4)
-
-        # Original should be unchanged
+        # Cache returns the same reference (for performance)
         cache2, _ = cache_manager.fetch_cache([temp_image], "prompt")
-        assert cache2[0] == [1, 2, 3]
+        assert cache2 is cache  # Same reference
 
     def test_repr(self, cache_manager):
         """Test string representation."""
         repr_str = repr(cache_manager)
-        assert "VLMCacheManager" in repr_str
+        assert "MLLMPrefixCacheManager" in repr_str
         assert "entries=0" in repr_str
-        assert "max=10" in repr_str
+        assert "memory=" in repr_str
 
     def test_multi_image_cache(self, cache_manager):
         """Test caching with multiple images."""
@@ -481,7 +492,7 @@ class TestMLXMultimodalLMCache:
 
 
 if __name__ == "__main__":
-    # Verbose VLM cache test with real model
+    # Verbose MLLM cache test with real model
     # Uses mlx-vlm directly (no transformers processor bugs)
     import time
     from pathlib import Path
@@ -536,9 +547,9 @@ if __name__ == "__main__":
             ],
         )
 
-    def run_vlm_cache_test():
+    def run_mllm_cache_test():
         """
-        Test VLM cache with real model's KV cache and real images/videos.
+        Test MLLM cache with real model's KV cache and real images/videos.
         """
         from huggingface_hub import snapshot_download
         from mlx_vlm.utils import load_model, load_config
@@ -552,7 +563,7 @@ if __name__ == "__main__":
             VLM_TEST_VIDEO_URLS,
         )
 
-        print_header("VLM KV CACHE TEST")
+        print_header("MLLM KV CACHE TEST")
         print(f"\n  Model: {VLM_MODEL}")
         print(
             "  Test: Verify KV cache reuse for repeated image/video + prompt combinations"
@@ -646,8 +657,8 @@ if __name__ == "__main__":
         primary_image_path = image_paths[0]
         primary_video_path = video_paths[0]
 
-        # Initialize VLM Cache Manager
-        cache_manager = VLMCacheManager(max_entries=50)
+        # Initialize MLLM Cache Manager
+        cache_manager = MLLMCacheManager(max_entries=50)
 
         # Collect test results for summary table
         test_results = []
@@ -1005,7 +1016,7 @@ if __name__ == "__main__":
         # TEST 6: LRU Eviction
         # ============================================================
         print_subheader("TEST 6: LRU Eviction Policy")
-        small_cache = VLMCacheManager(max_entries=2)
+        small_cache = MLLMCacheManager(max_entries=2)
         small_cache.store_cache(["img1.jpg"], "p1", real_kv_cache)
         small_cache.store_cache(["img2.jpg"], "p2", real_kv_cache)
         print(f"    Cache capacity: 2 entries (currently {len(small_cache)}/2)")
@@ -1088,7 +1099,7 @@ if __name__ == "__main__":
             ],
         )
         print("\n" + "=" * 70)
-        print("  [OK] ALL TESTS PASSED - VLM cache working correctly")
+        print("  [OK] ALL TESTS PASSED - MLLM cache working correctly")
         print("=" * 70)
 
         # Cleanup temp files
@@ -1108,4 +1119,4 @@ if __name__ == "__main__":
             except OSError:
                 pass
 
-    run_vlm_cache_test()
+    run_mllm_cache_test()

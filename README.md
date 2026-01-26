@@ -201,6 +201,71 @@ For full documentation, see the [docs](docs/) directory:
 
 See [benchmarks](docs/benchmarks/) for detailed results.
 
+## Gemma 3 Support
+
+This fork includes patches for Gemma 3 vision support. Gemma 3 is a multimodal model but requires detection as MLLM.
+
+### Usage
+
+```bash
+# Start server with Gemma 3
+vllm-mlx serve mlx-community/gemma-3-27b-it-4bit --port 8000
+
+# Verify it loaded as MLLM (not LLM)
+curl http://localhost:8000/health
+# Should show: "model_type": "mllm"
+```
+
+### Long Context Patch (mlx-vlm)
+
+Gemma 3's default `sliding_window=1024` limits context to ~10K tokens on Apple Silicon (Metal GPU timeout at higher context). To enable longer context (up to ~50K tokens), patch mlx-vlm:
+
+**Location:** `~/.../site-packages/mlx_vlm/models/gemma3/language.py`
+
+Find the `make_cache` method and replace with:
+
+```python
+def make_cache(self):
+    import os
+    # Set GEMMA3_SLIDING_WINDOW=8192 for ~40K context
+    # Set GEMMA3_SLIDING_WINDOW=0 for ~50K context (full KVCache)
+    sliding_window = int(os.environ.get('GEMMA3_SLIDING_WINDOW', self.config.sliding_window))
+
+    caches = []
+    for i in range(self.config.num_hidden_layers):
+        if (
+            i % self.config.sliding_window_pattern
+            == self.config.sliding_window_pattern - 1
+        ):
+            caches.append(KVCache())
+        elif sliding_window == 0:
+            caches.append(KVCache())  # Full context for all layers
+        else:
+            caches.append(RotatingKVCache(max_size=sliding_window, keep=0))
+    return caches
+```
+
+**Usage:**
+
+```bash
+# Default (~10K max context)
+vllm-mlx serve mlx-community/gemma-3-27b-it-4bit --port 8000
+
+# Extended context (~40K max)
+GEMMA3_SLIDING_WINDOW=8192 vllm-mlx serve mlx-community/gemma-3-27b-it-4bit --port 8000
+
+# Maximum context (~50K max)
+GEMMA3_SLIDING_WINDOW=0 vllm-mlx serve mlx-community/gemma-3-27b-it-4bit --port 8000
+```
+
+**Benchmark Results (M4 Max 128GB):**
+
+| Setting | Max Context | Memory |
+|---------|-------------|--------|
+| Default (1024) | ~10K tokens | ~16GB |
+| `GEMMA3_SLIDING_WINDOW=8192` | ~40K tokens | ~25GB |
+| `GEMMA3_SLIDING_WINDOW=0` | ~50K tokens | ~35GB |
+
 ## Contributing
 
 We welcome contributions! See [Contributing Guide](docs/development/contributing.md) for details.

@@ -31,7 +31,7 @@ dependencies = [
     "mlx>=0.29.0",
     "mlx-lm>=0.30.2",  # GLM-4 models require 0.30.2+
     "mlx-vlm>=0.1.0",  # VLM support
-    "transformers>=4.40.0",  # mlx-lm 0.30.2+ requires transformers==5.0.0rc1
+    "transformers>=4.40.0,<=5.0.0rc1",  # Pinned to avoid rc3 video processing bug
     "tokenizers>=0.19.0",
     "huggingface-hub>=0.23.0",
     "numpy>=1.24.0",
@@ -43,6 +43,8 @@ dependencies = [
     "tabulate>=0.9.0",
     # Video processing for VLM
     "opencv-python>=4.8.0",
+    # Vision processor (required for transformers AutoProcessor)
+    "torchvision>=0.18.0",
     # Resource monitoring
     "psutil>=5.9.0",
     # Server

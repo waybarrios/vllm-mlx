@@ -10,7 +10,7 @@ Features:
 - Smart video frame extraction with configurable FPS
 - Base64 and URL image support
 - Streaming generation
-- VLM KV cache for repeated image/video+prompt combinations
+- MLLM KV cache for repeated image/video+prompt combinations
 """
 
 import atexit
@@ -22,13 +22,13 @@ import tempfile
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterator, Optional, Set, Union
+from typing import Any, Iterator
 from urllib.parse import urlparse
 
 import numpy as np
 import requests
 
-from vllm_mlx.vlm_cache import VLMCacheManager
+from vllm_mlx.mllm_cache import MLLMPrefixCacheManager
 
 logger = logging.getLogger(__name__)
 
@@ -37,7 +37,7 @@ class TempFileManager:
     """Thread-safe manager for tracking and cleaning up temporary files."""
 
     def __init__(self):
-        self._files: Set[str] = set()
+        self._files: set[str] = set()
         self._lock = threading.Lock()
         atexit.register(self.cleanup_all)
 
@@ -416,7 +416,7 @@ def decode_base64_video(
     return _temp_manager.register(temp_file.name)
 
 
-def process_video_input(video: Union[str, dict]) -> str:
+def process_video_input(video: str | dict) -> str:
     """
     Process video input in various formats and return local path.
 
@@ -457,8 +457,23 @@ def process_video_input(video: Union[str, dict]) -> str:
     raise ValueError(f"Cannot process video: {video[:50]}...")
 
 
+# Cache for base64 images to avoid re-saving the same image
+_base64_image_cache: dict[str, str] = {}  # hash -> temp file path
+
+
 def save_base64_image(base64_string: str) -> str:
-    """Save base64 image to temp file and return path."""
+    """Save base64 image to temp file and return path. Caches identical images."""
+    import hashlib
+
+    # Hash the base64 string to check cache
+    image_hash = hashlib.md5(base64_string[:1000].encode()).hexdigest()
+
+    # Return cached path if available and file still exists
+    if image_hash in _base64_image_cache:
+        cached_path = _base64_image_cache[image_hash]
+        if Path(cached_path).exists():
+            return cached_path
+
     image_bytes = decode_base64_image(base64_string)
 
     # Detect format from magic bytes
@@ -477,10 +492,12 @@ def save_base64_image(base64_string: str) -> str:
     temp_file.write(image_bytes)
     temp_file.close()
 
-    return _temp_manager.register(temp_file.name)
+    path = _temp_manager.register(temp_file.name)
+    _base64_image_cache[image_hash] = path
+    return path
 
 
-def process_image_input(image: Union[str, dict]) -> str:
+def process_image_input(image: str | dict) -> str:
     """
     Process image input in various formats and return local path.
 
@@ -692,10 +709,10 @@ class MLXMultimodalLM:
         self.config = None
         self._loaded = False
 
-        # Initialize VLM cache manager
-        self._cache_manager: Optional[VLMCacheManager] = None
+        # Initialize MLLM prefix cache manager (with vision embedding caching)
+        self._cache_manager: MLLMPrefixCacheManager | None = None
         if enable_cache:
-            self._cache_manager = VLMCacheManager(max_entries=cache_size)
+            self._cache_manager = MLLMPrefixCacheManager(max_entries=cache_size)
 
     def load(self) -> None:
         """Load the model and processor."""
@@ -736,7 +753,7 @@ class MLXMultimodalLM:
 
     def _prepare_video(
         self,
-        video_input: Union[str, dict],
+        video_input: str | dict,
         fps: float = DEFAULT_FPS,
         max_frames: int = MAX_FRAMES,
     ) -> list[str]:
@@ -864,12 +881,12 @@ class MLXMultimodalLM:
         prompt_cache = None
         cache_hit = False
 
-        if use_cache and self._cache_manager and all_sources:
+        if use_cache and self._cache_manager is not None and all_sources:
             prompt_cache, cache_hit = self._cache_manager.fetch_cache(
                 all_sources, formatted_prompt
             )
             if cache_hit:
-                logger.info(f"VLM cache hit for {len(all_sources)} source(s)")
+                logger.info(f"MLLM cache hit for {len(all_sources)} source(s)")
 
         # Create new cache if needed
         if prompt_cache is None and self.model is not None:
@@ -900,9 +917,9 @@ class MLXMultimodalLM:
                     self._cache_manager.store_cache(
                         all_sources, formatted_prompt, prompt_cache, num_tokens
                     )
-                    logger.info(f"VLM cache stored for {len(all_sources)} source(s)")
+                    logger.info(f"MLLM cache stored for {len(all_sources)} source(s)")
                 except Exception as e:
-                    logger.debug(f"Failed to store VLM cache: {e}")
+                    logger.debug(f"Failed to store MLLM cache: {e}")
 
         # Handle GenerationResult object or plain string
         if hasattr(result, "text"):
@@ -1030,25 +1047,29 @@ class MLXMultimodalLM:
             self.load()
 
         from mlx_vlm import generate
-        from mlx_vlm.prompt_utils import apply_chat_template
+        from mlx_vlm.prompt_utils import get_chat_template
 
         # Extract text and images from messages
-        images = []
+        # Build chat_messages for multi-turn support WITH proper image tokens per message
+        all_image_urls = []  # Raw URLs/paths to process later
         videos = []
-        text_prompt = ""
+        chat_messages = []  # List of properly formatted messages for chat template
+
+        logger.info(f"MLLM.chat() called with {len(messages)} messages")
 
         for msg in messages:
             role = msg.get("role", "user")
             content = msg.get("content", "")
+            msg_text = ""  # Text content for this message
+            msg_image_count = 0  # Number of images in THIS message
 
             if isinstance(content, str):
-                if role == "user":
-                    text_prompt = content
+                msg_text = content
             elif isinstance(content, list):
-                # OpenAI multimodal format
+                # OpenAI multimodal format - extract text and count images for THIS message
                 for item in content:
                     if isinstance(item, str):
-                        text_prompt = item
+                        msg_text += item
                         continue
 
                     # Convert Pydantic models to dicts
@@ -1061,25 +1082,44 @@ class MLXMultimodalLM:
                         item_type = item.get("type", "")
 
                         if item_type == "text":
-                            text_prompt = item.get("text", "")
+                            msg_text += item.get("text", "")
 
                         elif item_type == "image_url":
                             img_url = item.get("image_url", {})
                             if isinstance(img_url, str):
-                                images.append(img_url)
+                                all_image_urls.append(img_url)
                             else:
-                                images.append(img_url.get("url", ""))
+                                all_image_urls.append(img_url.get("url", ""))
+                            msg_image_count += 1
 
                         elif item_type == "image":
-                            images.append(item.get("image", item.get("url", "")))
+                            all_image_urls.append(item.get("image", item.get("url", "")))
+                            msg_image_count += 1
 
                         elif item_type == "video":
                             videos.append(item.get("video", item.get("url", "")))
 
+            # Build properly structured message for Qwen3-VL-MoE
+            # Format: {"role": "...", "content": [{"type": "image"}, ..., {"type": "text", "text": "..."}]}
+            if msg_text or msg_image_count > 0:
+                if role == "user" and msg_image_count > 0:
+                    # User message WITH images - build content array with image tokens FIRST
+                    content_list = []
+                    for _ in range(msg_image_count):
+                        content_list.append({"type": "image"})
+                    content_list.append({"type": "text", "text": msg_text, "content": msg_text})
+                    chat_messages.append({"role": role, "content": content_list})
+                elif role == "assistant":
+                    # Assistant messages - just text content (not array)
+                    chat_messages.append({"role": role, "content": msg_text})
+                else:
+                    # User/system message WITHOUT images - still use content array format
+                    chat_messages.append({"role": role, "content": [{"type": "text", "text": msg_text, "content": msg_text}]})
+
         # Process images
         all_images = []
-        if images:
-            all_images.extend(self._prepare_images(images))
+        if all_image_urls:
+            all_images.extend(self._prepare_images(all_image_urls))
 
         # Process videos
         video_fps = kwargs.pop("video_fps", DEFAULT_FPS)
@@ -1091,19 +1131,118 @@ class MLXMultimodalLM:
             all_images.extend(frames)
             logger.info(f"Added {len(frames)} frames from video: {video_path}")
 
-        # Apply chat template using mlx_vlm's utility
+        # Apply chat template directly - messages are already properly structured
+        logger.info(f"Applying chat template with {len(chat_messages)} messages, {len(all_images)} images")
+        for i, cm in enumerate(chat_messages):
+            content_preview = str(cm.get('content', ''))[:80]
+            logger.info(f"  Chat msg {i}: role={cm['role']}, content={content_preview}...")
         try:
-            formatted_prompt = apply_chat_template(
+            # Use get_chat_template directly since messages are already properly formatted
+            formatted_prompt = get_chat_template(
                 self.processor,
-                self.config,
-                text_prompt,
-                num_images=len(all_images),
+                chat_messages,
+                add_generation_prompt=True,
             )
         except Exception as e:
-            logger.warning(f"Failed to apply chat template: {e}, using raw prompt")
-            formatted_prompt = text_prompt
+            logger.warning(f"Failed to apply chat template: {e}, using last user message")
+            # Fallback to last user message if template fails
+            last_user_msg = ""
+            for m in reversed(chat_messages):
+                if m["role"] == "user":
+                    content = m.get("content", "")
+                    if isinstance(content, list):
+                        for item in content:
+                            if isinstance(item, dict) and item.get("type") == "text":
+                                last_user_msg = item.get("text", "")
+                                break
+                    else:
+                        last_user_msg = content
+                    break
+            formatted_prompt = last_user_msg
 
-        # Generate using mlx_vlm directly
+        # Prefix caching with vision embedding support
+        # Following LMCache approach: cache vision embeddings to skip encoder on hit
+        from mlx_vlm.models import cache as vlm_cache
+        from mlx_vlm.utils import prepare_inputs
+        import time
+
+        use_cache = kwargs.pop("use_cache", True)
+        cache_entry = None
+        prefix_match_len = 0
+        vision_embeddings = None
+        cache_hit = False
+
+        # Tokenize prompt for cache lookup
+        tokenizer = self.processor.tokenizer if hasattr(self.processor, 'tokenizer') else self.processor
+        token_ids = tokenizer.encode(formatted_prompt)
+
+        # Check prefix cache
+        if use_cache and self._cache_manager is not None and all_images:
+            try:
+                cache_entry, prefix_match_len = self._cache_manager.fetch(
+                    all_images, formatted_prompt, token_ids
+                )
+                if cache_entry:
+                    cache_hit = True
+                    vision_embeddings = cache_entry.vision_embeddings
+                    if vision_embeddings is not None:
+                        logger.info(f"[PREFIX CACHE] Vision embeddings cached - would skip encoder!")
+                    if prefix_match_len > 0:
+                        logger.info(f"[PREFIX CACHE] {prefix_match_len} prefix tokens match")
+            except Exception as e:
+                logger.warning(f"Cache fetch failed: {e}")
+
+        # Generate - use KV cache if available from previous identical request
+        start_time = time.time()
+
+        # Create or reuse prompt cache for prefix caching speedup
+        prompt_cache = None
+        skip_prompt_processing = False
+
+        if cache_hit and cache_entry and cache_entry.kv_cache:
+            # NOTE: mlx-vlm's generate_step() has its own multimodal KV cache with prefix matching
+            # (MULTIMODAL_KV_CACHE_ENABLED in mlx_vlm/utils.py). Let it handle caching.
+            # We only use vllm-mlx's cache for text-only requests (no images).
+            if all_images:
+                # Let mlx-vlm's multimodal cache handle this - don't interfere
+                logger.info("[PREFIX CACHE] Images present - delegating to mlx-vlm multimodal cache")
+                prompt_cache = None  # Fresh cache, mlx-vlm will handle prefix matching
+                skip_prompt_processing = False
+            else:
+                # Text-only: can use skip_prompt_processing for maximum speedup
+                logger.info("[PREFIX CACHE] Text-only cache hit - using skip_prompt_processing speedup")
+                cached_prompt_cache = cache_entry.kv_cache
+                try:
+                    import copy
+                    prompt_cache = []
+                    for layer_cache in cached_prompt_cache:
+                        new_cache = copy.copy(layer_cache)
+                        if hasattr(layer_cache, 'state'):
+                            state = layer_cache.state
+                            if state is not None:
+                                import mlx.core as mx
+                                if len(state) >= 2 and state[0] is not None:
+                                    new_cache.keys = mx.array(state[0])
+                                    new_cache.values = mx.array(state[1])
+                                    if len(state) >= 3:
+                                        new_cache.offset = state[2]
+                                    elif hasattr(layer_cache, 'offset'):
+                                        new_cache.offset = layer_cache.offset
+                        prompt_cache.append(new_cache)
+                    skip_prompt_processing = True
+                    logger.info(f"[PREFIX CACHE] Skipping {prefix_match_len} token forward pass")
+                except Exception as e:
+                    logger.warning(f"[PREFIX CACHE] Failed to copy cache: {e}")
+                    prompt_cache = None
+                    skip_prompt_processing = False
+
+        if prompt_cache is None and self.model is not None:
+            # Create fresh cache
+            try:
+                prompt_cache = vlm_cache.make_prompt_cache(self.model.language_model)
+            except Exception:
+                prompt_cache = None
+
         result = generate(
             self.model,
             self.processor,
@@ -1112,8 +1251,58 @@ class MLXMultimodalLM:
             max_tokens=max_tokens,
             temp=temperature,
             verbose=False,
+            prompt_cache=prompt_cache,
+            skip_prompt_processing=skip_prompt_processing,
             **kwargs,
         )
+
+        # Store KV cache for future reuse (on cache miss)
+        # IMPORTANT: We need to store only the prompt portion, not generated tokens
+        if use_cache and self._cache_manager is not None and all_images and not cache_hit and prompt_cache:
+            try:
+                import copy
+                import mlx.core as mx
+
+                # Get prompt token count (before generation)
+                prompt_tokens_count = getattr(result, "prompt_tokens", 0)
+
+                # Deep copy the cache and trim to prompt tokens only
+                cache_to_store = []
+                for layer_cache in prompt_cache:
+                    new_cache = copy.copy(layer_cache)
+                    if hasattr(layer_cache, 'state'):
+                        state = layer_cache.state
+                        if state is not None and len(state) >= 2 and state[0] is not None:
+                            # Copy arrays
+                            keys = mx.array(state[0])
+                            values = mx.array(state[1])
+                            # Trim to prompt tokens only (not generated tokens)
+                            if hasattr(layer_cache, 'offset') and layer_cache.offset > prompt_tokens_count:
+                                # For caches with offset tracking, slice to prompt length
+                                new_cache.keys = keys[:, :, :prompt_tokens_count, :]
+                                new_cache.values = values[:, :, :prompt_tokens_count, :]
+                                new_cache.offset = prompt_tokens_count
+                            else:
+                                new_cache.keys = keys
+                                new_cache.values = values
+                                if len(state) >= 3:
+                                    new_cache.offset = state[2]
+                                elif hasattr(layer_cache, 'offset'):
+                                    new_cache.offset = min(layer_cache.offset, prompt_tokens_count)
+                    cache_to_store.append(new_cache)
+
+                self._cache_manager.store(
+                    images=all_images,
+                    prompt=formatted_prompt,
+                    vision_embeddings=None,
+                    kv_cache=cache_to_store,
+                    token_ids=token_ids,
+                    num_image_tokens=256,
+                    model_name=self.model_name,
+                )
+                logger.info(f"[PREFIX CACHE] Stored KV cache for {len(all_images)} image(s) ({prompt_tokens_count} prompt tokens)")
+            except Exception as e:
+                logger.warning(f"Failed to cache: {e}")
 
         # Handle GenerationResult object or plain string
         if hasattr(result, "text"):
@@ -1130,6 +1319,205 @@ class MLXMultimodalLM:
             finish_reason="stop",
             prompt_tokens=prompt_tokens,
             completion_tokens=generation_tokens,
+        )
+
+    def stream_chat(
+        self,
+        messages: list[dict],
+        max_tokens: int = 256,
+        temperature: float = 0.7,
+        **kwargs,
+    ) -> Iterator[MLLMOutput]:
+        """
+        Stream chat with OpenAI-compatible message format.
+
+        Supports multimodal content in messages:
+        - {"type": "text", "text": "..."}
+        - {"type": "image_url", "image_url": {"url": "..."}}
+        - {"type": "image_url", "image_url": {"url": "data:image/...;base64,..."}}
+
+        Args:
+            messages: List of chat messages (OpenAI format)
+            max_tokens: Maximum tokens to generate
+            temperature: Sampling temperature
+            **kwargs: Additional parameters
+
+        Yields:
+            MLLMOutput with incremental text chunks
+        """
+        if not self._loaded:
+            self.load()
+
+        try:
+            from mlx_vlm import stream_generate
+            from mlx_vlm.prompt_utils import get_chat_template
+        except ImportError:
+            # Fallback to non-streaming if stream_generate not available
+            output = self.chat(
+                messages=messages,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                **kwargs,
+            )
+            yield output
+            return
+
+        # Extract text and images from messages
+        # Build chat_messages for multi-turn support WITH proper image tokens per message
+        all_image_urls = []  # Raw URLs/paths to process later
+        videos = []
+        chat_messages = []  # List of properly formatted messages for chat template
+
+        for msg in messages:
+            role = msg.get("role", "user")
+            content = msg.get("content", "")
+            msg_text = ""  # Text content for this message
+            msg_image_count = 0  # Number of images in THIS message
+
+            if isinstance(content, str):
+                msg_text = content
+            elif isinstance(content, list):
+                # OpenAI multimodal format - extract text and count images for THIS message
+                for item in content:
+                    if isinstance(item, str):
+                        msg_text += item
+                        continue
+
+                    # Convert Pydantic models to dicts
+                    if hasattr(item, "model_dump"):
+                        item = item.model_dump()
+                    elif hasattr(item, "dict"):
+                        item = item.dict()
+
+                    if isinstance(item, dict):
+                        item_type = item.get("type", "")
+
+                        if item_type == "text":
+                            msg_text += item.get("text", "")
+
+                        elif item_type == "image_url":
+                            img_url = item.get("image_url", {})
+                            if isinstance(img_url, str):
+                                all_image_urls.append(img_url)
+                            else:
+                                all_image_urls.append(img_url.get("url", ""))
+                            msg_image_count += 1
+
+                        elif item_type == "image":
+                            all_image_urls.append(item.get("image", item.get("url", "")))
+                            msg_image_count += 1
+
+                        elif item_type == "video":
+                            videos.append(item.get("video", item.get("url", "")))
+
+            # Build properly structured message for Qwen3-VL-MoE
+            # Format: {"role": "...", "content": [{"type": "image"}, ..., {"type": "text", "text": "..."}]}
+            if msg_text or msg_image_count > 0:
+                if role == "user" and msg_image_count > 0:
+                    # User message WITH images - build content array with image tokens FIRST
+                    content_list = []
+                    for _ in range(msg_image_count):
+                        content_list.append({"type": "image"})
+                    content_list.append({"type": "text", "text": msg_text, "content": msg_text})
+                    chat_messages.append({"role": role, "content": content_list})
+                elif role == "assistant":
+                    # Assistant messages - just text content (not array)
+                    chat_messages.append({"role": role, "content": msg_text})
+                else:
+                    # User/system message WITHOUT images - still use content array format
+                    chat_messages.append({"role": role, "content": [{"type": "text", "text": msg_text, "content": msg_text}]})
+
+        # Process images
+        all_images = []
+        if all_image_urls:
+            all_images.extend(self._prepare_images(all_image_urls))
+
+        # Process videos
+        video_fps = kwargs.pop("video_fps", DEFAULT_FPS)
+        video_max_frames = kwargs.pop("video_max_frames", MAX_FRAMES)
+        for video_path in videos:
+            frames = self._prepare_video(
+                video_path, fps=video_fps, max_frames=video_max_frames
+            )
+            all_images.extend(frames)
+
+        # Apply chat template directly - messages are already properly structured
+        try:
+            # Use get_chat_template directly since messages are already properly formatted
+            formatted_prompt = get_chat_template(
+                self.processor,
+                chat_messages,
+                add_generation_prompt=True,
+            )
+        except Exception as e:
+            logger.warning(f"Failed to apply chat template: {e}, using last user message")
+            # Fallback to last user message if template fails
+            last_user_msg = ""
+            for m in reversed(chat_messages):
+                if m["role"] == "user":
+                    content = m.get("content", "")
+                    if isinstance(content, list):
+                        for item in content:
+                            if isinstance(item, dict) and item.get("type") == "text":
+                                last_user_msg = item.get("text", "")
+                                break
+                    else:
+                        last_user_msg = content
+                    break
+            formatted_prompt = last_user_msg
+
+        # Check cache for existing KV state (uses images as cache key)
+        from mlx_vlm.models import cache as vlm_cache
+        prompt_cache = None
+        cache_hit = False
+        use_cache = kwargs.pop("use_cache", True)
+
+        if use_cache and self._cache_manager is not None and all_images:
+            prompt_cache, cache_hit = self._cache_manager.fetch_cache(
+                all_images, formatted_prompt
+            )
+            if cache_hit:
+                logger.debug(f"Stream chat cache hit for {len(all_images)} image(s)")
+
+        # Create new cache if needed
+        if prompt_cache is None and self.model is not None:
+            try:
+                prompt_cache = vlm_cache.make_prompt_cache(self.model.language_model)
+            except Exception:
+                prompt_cache = None
+
+        # Stream generate tokens with cache
+        accumulated_text = ""
+        token_count = 0
+
+        for chunk in stream_generate(
+            self.model,
+            self.processor,
+            formatted_prompt,
+            all_images if all_images else None,
+            max_tokens=max_tokens,
+            temp=temperature,
+            prompt_cache=prompt_cache,
+            **kwargs,
+        ):
+            token_count += 1
+            # chunk is a GenerationResult with .text attribute containing the new token
+            new_text = chunk.text if hasattr(chunk, 'text') else str(chunk)
+            accumulated_text += new_text
+
+            yield MLLMOutput(
+                text=new_text,  # Just the new token for streaming
+                finish_reason=None,
+                prompt_tokens=getattr(chunk, 'prompt_tokens', 0),
+                completion_tokens=token_count,
+            )
+
+        # Final yield with finish_reason
+        yield MLLMOutput(
+            text="",
+            finish_reason="stop",
+            prompt_tokens=getattr(chunk, 'prompt_tokens', 0) if 'chunk' in dir() else 0,
+            completion_tokens=token_count,
         )
 
     def describe_image(
@@ -1188,7 +1576,7 @@ class MLXMultimodalLM:
 
     def describe_video(
         self,
-        video: Union[str, dict],
+        video: str | dict,
         prompt: str = "Describe what happens in this video.",
         fps: float = 2.0,
         max_frames: int = 32,
@@ -1230,7 +1618,7 @@ class MLXMultimodalLM:
 
     def get_cache_stats(self) -> dict:
         """
-        Get VLM cache statistics.
+        Get MLLM cache statistics.
 
         Returns:
             Dictionary with cache stats (hits, misses, hit_rate, tokens_saved, etc.)
@@ -1245,10 +1633,10 @@ class MLXMultimodalLM:
         return stats
 
     def clear_cache(self) -> None:
-        """Clear the VLM KV cache."""
-        if self._cache_manager:
+        """Clear the MLLM KV cache."""
+        if self._cache_manager is not None:
             self._cache_manager.clear()
-            logger.info("VLM cache cleared")
+            logger.info("MLLM cache cleared")
 
     def get_model_info(self) -> dict:
         """Get information about the loaded model."""
@@ -1267,7 +1655,7 @@ class MLXMultimodalLM:
         if self.config:
             info["model_type"] = getattr(self.config, "model_type", "unknown")
 
-        if self._cache_manager:
+        if self._cache_manager is not None:
             info["cache_stats"] = self._cache_manager.get_stats()
 
         return info

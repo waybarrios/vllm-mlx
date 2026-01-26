@@ -418,18 +418,18 @@ class TestVisionCache:
 
     def test_cache_creation(self):
         """Test VLM cache creation."""
-        from vllm_mlx.vlm_cache import VLMCacheManager
+        from vllm_mlx.mllm_cache import MLLMCacheManager
 
-        cache = VLMCacheManager(max_entries=10)
+        cache = MLLMCacheManager(max_entries=10)
 
         assert len(cache) == 0
         assert cache.max_size == 10
 
     def test_cache_miss(self):
         """Test cache miss."""
-        from vllm_mlx.vlm_cache import VLMCacheManager
+        from vllm_mlx.mllm_cache import MLLMCacheManager
 
-        cache = VLMCacheManager()
+        cache = MLLMCacheManager()
 
         result, hit = cache.fetch_cache(["image.jpg"], "prompt")
 
@@ -439,9 +439,9 @@ class TestVisionCache:
 
     def test_cache_store_and_fetch(self):
         """Test storing and fetching from cache."""
-        from vllm_mlx.vlm_cache import VLMCacheManager
+        from vllm_mlx.mllm_cache import MLLMCacheManager
 
-        cache = VLMCacheManager()
+        cache = MLLMCacheManager()
 
         # Store cache
         test_cache = [{"key": "value"}]
@@ -457,9 +457,9 @@ class TestVisionCache:
 
     def test_cache_eviction(self):
         """Test cache eviction when full."""
-        from vllm_mlx.vlm_cache import VLMCacheManager
+        from vllm_mlx.mllm_cache import MLLMCacheManager
 
-        cache = VLMCacheManager(max_entries=2)
+        cache = MLLMCacheManager(max_entries=2)
 
         # Fill cache
         cache.store_cache(["img1.jpg"], "prompt1", [1], num_tokens=10)

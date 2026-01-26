@@ -130,6 +130,9 @@ class Scheduler:
         self.tokenizer = tokenizer
         self.config = config or SchedulerConfig()
 
+        # Detect if tokenizer is a processor (MLLM) and get the actual tokenizer
+        self._actual_tokenizer = self._get_actual_tokenizer(tokenizer)
+
         # Request management - following vLLM's design
         self.waiting: deque[Request] = deque()  # Waiting queue (FCFS)
         self.running: Dict[str, Request] = {}  # Running requests by ID
@@ -194,26 +197,46 @@ class Scheduler:
         self.total_prompt_tokens = 0
         self.total_completion_tokens = 0
 
+    def _get_actual_tokenizer(self, tokenizer: Any) -> Any:
+        """
+        Get the actual tokenizer from a processor or tokenizer.
+
+        MLLM models use processors (e.g., Qwen3VLProcessor) which wrap
+        the tokenizer. This method extracts the actual tokenizer.
+        """
+        # If it has encode method, it's already a tokenizer
+        if hasattr(tokenizer, 'encode') and callable(tokenizer.encode):
+            return tokenizer
+        # If it's a processor, get the wrapped tokenizer
+        if hasattr(tokenizer, 'tokenizer'):
+            return tokenizer.tokenizer
+        # Fallback to the original
+        return tokenizer
+
+    def _decode_tokens(self, token_ids: List[int]) -> str:
+        """
+        Decode token IDs to text, handling both tokenizers and processors.
+        """
+        return self._actual_tokenizer.decode(token_ids)
+
     def _get_stop_tokens(self) -> Set[int]:
-        """Get stop token IDs from tokenizer."""
+        """Get stop token IDs from tokenizer or processor."""
         stop_tokens = set()
-        if (
-            hasattr(self.tokenizer, "eos_token_id")
-            and self.tokenizer.eos_token_id is not None
-        ):
-            if isinstance(self.tokenizer.eos_token_id, list):
-                stop_tokens.update(self.tokenizer.eos_token_id)
-            else:
-                stop_tokens.add(self.tokenizer.eos_token_id)
-        if (
-            hasattr(self.tokenizer, "eos_token_ids")
-            and self.tokenizer.eos_token_ids is not None
-        ):
-            if isinstance(self.tokenizer.eos_token_ids, (list, set, tuple)):
-                stop_tokens.update(self.tokenizer.eos_token_ids)
-            else:
-                # Handle case where eos_token_ids is a single int
-                stop_tokens.add(self.tokenizer.eos_token_ids)
+        # Check both the processor/tokenizer and the actual tokenizer
+        for tok in [self.tokenizer, self._actual_tokenizer]:
+            if tok is None:
+                continue
+            if hasattr(tok, "eos_token_id") and tok.eos_token_id is not None:
+                if isinstance(tok.eos_token_id, list):
+                    stop_tokens.update(tok.eos_token_id)
+                else:
+                    stop_tokens.add(tok.eos_token_id)
+            if hasattr(tok, "eos_token_ids") and tok.eos_token_ids is not None:
+                if isinstance(tok.eos_token_ids, (list, set, tuple)):
+                    stop_tokens.update(tok.eos_token_ids)
+                else:
+                    # Handle case where eos_token_ids is a single int
+                    stop_tokens.add(tok.eos_token_ids)
         return stop_tokens
 
     def _create_batch_generator(
@@ -368,7 +391,17 @@ class Scheduler:
         # Tokenize if needed
         if request.prompt_token_ids is None:
             if isinstance(request.prompt, str):
-                request.prompt_token_ids = self.tokenizer.encode(request.prompt)
+                # Handle both tokenizers and processors (for MLLM models)
+                if hasattr(self.tokenizer, 'encode'):
+                    request.prompt_token_ids = self.tokenizer.encode(request.prompt)
+                elif hasattr(self.tokenizer, 'tokenizer') and hasattr(self.tokenizer.tokenizer, 'encode'):
+                    # Processor wraps tokenizer (e.g., Qwen3VLProcessor)
+                    request.prompt_token_ids = self.tokenizer.tokenizer.encode(request.prompt)
+                else:
+                    raise AttributeError(
+                        f"Tokenizer {type(self.tokenizer)} has no 'encode' method. "
+                        "Continuous batching requires a tokenizer with encode support."
+                    )
             else:
                 request.prompt_token_ids = list(request.prompt)
             request.num_prompt_tokens = len(request.prompt_token_ids)
@@ -597,7 +630,7 @@ class Scheduler:
             request.append_output_token(response.token)
 
             # Decode the new token
-            new_text = self.tokenizer.decode([response.token])
+            new_text = self._decode_tokens([response.token])
 
             # Create output
             output = RequestOutput(
@@ -621,7 +654,7 @@ class Scheduler:
                 finished_ids.add(request_id)
 
                 # Decode full output
-                output.output_text = self.tokenizer.decode(request.output_token_ids)
+                output.output_text = self._decode_tokens(request.output_token_ids)
                 request.output_text = output.output_text
 
                 # Extract cache for future reuse

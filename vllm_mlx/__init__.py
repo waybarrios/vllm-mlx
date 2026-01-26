@@ -12,7 +12,7 @@ Features:
 - Support for LLM and multimodal models
 """
 
-__version__ = "0.2.1"
+__version__ = "0.2.4"
 
 # All imports are lazy to allow usage on non-Apple Silicon platforms
 # (e.g., CI running on Linux) where mlx_lm is not available.
@@ -50,11 +50,13 @@ def __getattr__(name):
 
         return getattr(paged_cache, name)
 
-    # VLM cache
-    if name in ("VLMCacheManager", "VLMCacheStats"):
-        from vllm_mlx import vlm_cache
+    # MLLM cache (with legacy VLM aliases)
+    if name in ("MLLMCacheManager", "MLLMCacheStats", "VLMCacheManager", "VLMCacheStats"):
+        from vllm_mlx import mllm_cache
 
-        return getattr(vlm_cache, name)
+        # Map legacy VLM names to MLLM
+        mllm_name = name.replace("VLM", "MLLM") if name.startswith("VLM") else name
+        return getattr(mllm_cache, mllm_name)
 
     # Model registry
     if name in ("get_registry", "ModelOwnershipError"):
@@ -114,7 +116,10 @@ __all__ = [
     "CacheBlock",
     "BlockTable",
     "CacheStats",
-    # VLM cache (images/videos)
+    # MLLM cache (images/videos)
+    "MLLMCacheManager",
+    "MLLMCacheStats",
+    # Legacy aliases
     "VLMCacheManager",
     "VLMCacheStats",
     # Version

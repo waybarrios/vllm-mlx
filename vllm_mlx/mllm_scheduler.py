@@ -34,7 +34,7 @@ from .mllm_batch_generator import (
 )
 from .multimodal_processor import MultimodalProcessor
 from .request import RequestOutput, RequestStatus, SamplingParams
-from .vlm_cache import VLMCacheManager
+from .mllm_cache import MLLMCacheManager
 
 logger = logging.getLogger(__name__)
 
@@ -175,9 +175,9 @@ class MLLMScheduler:
         )
 
         # Vision cache for repeated images
-        self.vision_cache: Optional[VLMCacheManager] = None
+        self.vision_cache: Optional[MLLMCacheManager] = None
         if self.config.enable_vision_cache:
-            self.vision_cache = VLMCacheManager(
+            self.vision_cache = MLLMCacheManager(
                 max_entries=self.config.vision_cache_size
             )
 

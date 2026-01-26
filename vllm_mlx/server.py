@@ -43,10 +43,12 @@ import json
 import logging
 import os
 import secrets
+import threading
 import time
 import uuid
+from collections import defaultdict
 from contextlib import asynccontextmanager
-from typing import AsyncIterator, Optional
+from typing import AsyncIterator
 
 from fastapi import FastAPI, HTTPException, UploadFile
 from fastapi.responses import StreamingResponse
@@ -90,8 +92,8 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Global engine instance
-_engine: Optional[BaseEngine] = None
-_model_name: Optional[str] = None
+_engine: BaseEngine | None = None
+_model_name: str | None = None
 _default_max_tokens: int = 32768
 _default_timeout: float = 300.0  # Default request timeout in seconds (5 minutes)
 
@@ -100,7 +102,7 @@ _mcp_manager = None
 _mcp_executor = None
 
 # API key authentication
-_api_key: Optional[str] = None
+_api_key: str | None = None
 _auth_warning_logged: bool = False
 
 
@@ -136,9 +138,6 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-
-import threading
-from collections import defaultdict
 
 from fastapi import Depends, Request
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -327,6 +326,41 @@ async def health():
     }
 
 
+@app.get("/v1/cache/stats")
+async def cache_stats():
+    """Get cache statistics for debugging and monitoring."""
+    try:
+        from mlx_vlm.utils import (
+            get_multimodal_kv_cache_stats,
+            get_pixel_values_cache_stats,
+            get_pil_cache_stats,
+        )
+
+        return {
+            "multimodal_kv_cache": get_multimodal_kv_cache_stats(),
+            "pixel_values_cache": get_pixel_values_cache_stats(),
+            "pil_image_cache": get_pil_cache_stats(),
+        }
+    except ImportError:
+        return {"error": "Cache stats not available (mlx_vlm not loaded)"}
+
+
+@app.delete("/v1/cache")
+async def clear_cache():
+    """Clear all caches."""
+    try:
+        from mlx_vlm.utils import (
+            clear_multimodal_kv_cache,
+            clear_pixel_values_cache,
+        )
+
+        clear_multimodal_kv_cache()
+        clear_pixel_values_cache()
+        return {"status": "cleared", "caches": ["multimodal_kv", "pixel_values", "pil_image"]}
+    except ImportError:
+        return {"error": "Cache clear not available (mlx_vlm not loaded)"}
+
+
 @app.get("/v1/models", dependencies=[Depends(verify_api_key)])
 async def list_models() -> ModelsResponse:
     """List available models."""
@@ -416,7 +450,7 @@ _tts_engine = None
 async def create_transcription(
     file: UploadFile,
     model: str = "whisper-large-v3",
-    language: Optional[str] = None,
+    language: str | None = None,
     response_format: str = "json",
 ):
     """
@@ -673,8 +707,19 @@ async def create_chat_completion(request: ChatCompletionRequest):
     """
     engine = get_engine()
 
-    # Extract text, images, and videos from messages
-    messages, images, videos = extract_multimodal_content(request.messages)
+    # For MLLM models, keep original messages with embedded images
+    # (MLLM.chat() extracts images from message content internally)
+    if engine.is_mllm:
+        # Convert Pydantic messages to dicts preserving full content
+        messages = []
+        for msg in request.messages:
+            msg_dict = msg.model_dump() if hasattr(msg, "model_dump") else dict(msg)
+            messages.append(msg_dict)
+        images, videos = [], []  # MLLM extracts these from messages
+        logger.debug(f"MLLM: Processing {len(messages)} messages")
+    else:
+        # For LLM, extract text, images, and videos separately
+        messages, images, videos = extract_multimodal_content(request.messages)
 
     has_media = bool(images or videos)
 
@@ -846,6 +891,11 @@ async def stream_chat_completion(
     """Stream chat completion response."""
     response_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
 
+    # Check if we should include usage in the final chunk
+    include_usage = (
+        request.stream_options and request.stream_options.include_usage
+    )
+
     # First chunk with role
     first_chunk = ChatCompletionChunk(
         id=response_id,
@@ -863,9 +913,21 @@ async def stream_chat_completion(
     is_thinking_model = "nemotron" in request.model.lower()
     think_prefix_sent = False
 
+    # Track token counts for usage reporting
+    prompt_tokens = 0
+    completion_tokens = 0
+    last_output = None
+
     # Stream content
     async for output in engine.stream_chat(messages=messages, **kwargs):
         content = output.new_text
+        last_output = output
+
+        # Track token counts from output (updated each chunk)
+        if hasattr(output, 'prompt_tokens') and output.prompt_tokens:
+            prompt_tokens = output.prompt_tokens
+        if hasattr(output, 'completion_tokens') and output.completion_tokens:
+            completion_tokens = output.completion_tokens
 
         # Add <think> prefix on first content chunk for thinking models
         if is_thinking_model and not think_prefix_sent and content:
@@ -886,6 +948,20 @@ async def stream_chat_completion(
             usage=get_usage(output) if output.finished else None,
         )
         yield f"data: {chunk.model_dump_json()}\n\n"
+
+    # Send final chunk with usage if requested
+    if include_usage:
+        usage_chunk = ChatCompletionChunk(
+            id=response_id,
+            model=request.model,
+            choices=[],  # Empty choices for usage-only chunk
+            usage=Usage(
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                total_tokens=prompt_tokens + completion_tokens,
+            ),
+        )
+        yield f"data: {usage_chunk.model_dump_json()}\n\n"
 
     yield "data: [DONE]\n\n"
 

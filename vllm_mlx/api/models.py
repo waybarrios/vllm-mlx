@@ -146,6 +146,12 @@ class ResponseFormat(BaseModel):
 # =============================================================================
 
 
+class StreamOptions(BaseModel):
+    """Options for streaming responses."""
+
+    include_usage: bool = False  # Include usage stats in final chunk
+
+
 class ChatCompletionRequest(BaseModel):
     """Request for chat completion."""
 
@@ -155,6 +161,7 @@ class ChatCompletionRequest(BaseModel):
     top_p: float = 0.9
     max_tokens: Optional[int] = None
     stream: bool = False
+    stream_options: Optional[StreamOptions] = None  # Streaming options (include_usage, etc.)
     stop: Optional[List[str]] = None
     # Tool calling
     tools: Optional[List[ToolDefinition]] = None
@@ -385,4 +392,4 @@ class ChatCompletionChunk(BaseModel):
     created: int = Field(default_factory=lambda: int(time.time()))
     model: str
     choices: List[ChatCompletionChunkChoice]
-    usage: Usage | None = None
+    usage: Usage | None = None  # Included when stream_options.include_usage=true

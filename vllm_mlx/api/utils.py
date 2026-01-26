@@ -63,6 +63,8 @@ MLLM_PATTERNS = [
     "Idefics",  # Idefics models
     "paligemma",
     "PaliGemma",  # PaliGemma
+    "gemma-3",
+    "gemma3",  # Gemma 3 (multimodal)
     "pixtral",
     "Pixtral",  # Pixtral
     "molmo",
