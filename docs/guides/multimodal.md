@@ -193,6 +193,72 @@ output = mllm.generate(
 - Fewer frames = less memory usage
 - 64 frames is practical maximum (96+ causes GPU timeout)
 
+## MLLM Cache
+
+vllm-mlx includes a prefix cache system for multimodal models that can significantly speed up repeated requests with the same images.
+
+### How It Works
+
+When you send an image to the model, the vision encoder processes it into embeddings. This processing takes 1-2 seconds. The MLLM cache stores these embeddings along with the KV cache state, so subsequent requests with the same image skip the vision encoder entirely.
+
+The cache uses content-based hashing (similar to LMCache) to identify identical images regardless of how they're provided (URL, base64, or file path).
+
+### Enabling the Cache
+
+```bash
+# Enable with default settings (512 MB max)
+vllm-mlx serve mlx-community/Qwen3-VL-4B-Instruct-3bit --enable-mllm-cache
+
+# With custom memory limit
+vllm-mlx serve mlx-community/Qwen3-VL-4B-Instruct-3bit \
+    --enable-mllm-cache \
+    --mllm-cache-max-mb 1024
+```
+
+### Python API
+
+```python
+from vllm_mlx.mllm_cache import MLLMPrefixCacheManager
+
+# Create cache manager
+cache = MLLMPrefixCacheManager(max_memory_mb=512)
+
+# Store embeddings and KV cache after processing
+cache.store(
+    images=["photo.jpg"],
+    prompt="Describe this image",
+    vision_embeddings=embeddings,
+    kv_cache=kv_state,
+    num_tokens=128
+)
+
+# Fetch from cache on subsequent requests
+entry, match_len = cache.fetch(images=["photo.jpg"], prompt="Describe this image")
+if entry:
+    # Use cached embeddings, skip vision encoder
+    embeddings = entry.vision_embeddings
+    kv_state = entry.kv_cache
+```
+
+### Cache Statistics
+
+```python
+stats = cache.get_stats()
+print(f"Hit rate: {stats.hit_rate:.1%}")
+print(f"Memory used: {stats.memory_used_mb:.1f} MB")
+print(f"Tokens saved: {stats.tokens_saved}")
+```
+
+### Memory Management
+
+The cache uses LRU (Least Recently Used) eviction when memory limit is reached. Each entry tracks:
+
+- Vision embeddings size
+- KV cache size per layer
+- Access frequency for LRU ordering
+
+When memory pressure occurs, least recently accessed entries are evicted first.
+
 ## Gradio Chat UI
 
 For interactive multimodal chat:
