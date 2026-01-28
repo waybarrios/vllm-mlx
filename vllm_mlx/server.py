@@ -259,19 +259,23 @@ def load_model(
     _default_max_tokens = max_tokens
     _model_name = model_name
 
+    if force_mllm:
+        logger.info("Force MLLM mode enabled via --mllm flag")
+
     if use_batching:
         logger.info(f"Loading model with BatchedEngine: {model_name}")
         _engine = BatchedEngine(
             model_name=model_name,
             scheduler_config=scheduler_config,
             stream_interval=stream_interval,
+            force_mllm=force_mllm,
         )
         # BatchedEngine will be started in lifespan (uvicorn's event loop)
         # Just log for now
-        logger.info(f"LLM model loaded (batched mode): {model_name}")
+        logger.info(f"Model loaded (batched mode): {model_name}")
     else:
         logger.info(f"Loading model with SimpleEngine: {model_name}")
-        _engine = SimpleEngine(model_name=model_name)
+        _engine = SimpleEngine(model_name=model_name, force_mllm=force_mllm)
         # Start SimpleEngine synchronously (no background loop)
         # Use new_event_loop() for Python 3.10+ compatibility (get_event_loop() is deprecated)
         loop = asyncio.new_event_loop()

@@ -1759,6 +1759,10 @@ class MLXMultimodalLM:
             "Idefics",
             "paligemma",
             "PaliGemma",
+            "gemma-3",
+            "gemma3",  # Gemma 3 (multimodal)
+            "medgemma",
+            "MedGemma",  # MedGemma (medical multimodal)
             "pixtral",
             "Pixtral",
             "molmo",

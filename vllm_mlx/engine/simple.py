@@ -31,6 +31,7 @@ class SimpleEngine(BaseEngine):
         model_name: str,
         trust_remote_code: bool = True,
         enable_cache: bool = True,
+        force_mllm: bool = False,
     ):
         """
         Initialize the simple engine.
@@ -39,11 +40,12 @@ class SimpleEngine(BaseEngine):
             model_name: HuggingFace model name or local path
             trust_remote_code: Whether to trust remote code
             enable_cache: Enable VLM cache for multimodal models
+            force_mllm: Force loading as MLLM even if not auto-detected
         """
         self._model_name = model_name
         self._trust_remote_code = trust_remote_code
         self._enable_cache = enable_cache
-        self._is_mllm = is_mllm_model(model_name)
+        self._is_mllm = force_mllm or is_mllm_model(model_name)
 
         self._model = None
         self._loaded = False

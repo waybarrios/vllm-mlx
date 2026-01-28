@@ -136,6 +136,7 @@ class BatchedEngine(BaseEngine):
         trust_remote_code: bool = True,
         scheduler_config: Optional[Any] = None,
         stream_interval: int = 1,
+        force_mllm: bool = False,
     ):
         """
         Initialize the batched engine.
@@ -145,12 +146,13 @@ class BatchedEngine(BaseEngine):
             trust_remote_code: Whether to trust remote code
             scheduler_config: Optional scheduler configuration
             stream_interval: Tokens to batch before streaming (1=every token)
+            force_mllm: Force loading as MLLM even if not auto-detected
         """
         self._model_name = model_name
         self._trust_remote_code = trust_remote_code
         self._scheduler_config = scheduler_config
         self._stream_interval = stream_interval
-        self._is_mllm = is_mllm_model(model_name)
+        self._is_mllm = force_mllm or is_mllm_model(model_name)
 
         self._model = None
         self._processor = None  # For MLLM
