@@ -20,14 +20,22 @@ def serve_command(args):
     """Start the OpenAI-compatible server."""
     import logging
     import os
+    import sys
+
     import uvicorn
 
     # Import unified server
     from . import server
-    from .server import app, load_model, RateLimiter
     from .scheduler import SchedulerConfig
+    from .server import RateLimiter, app, load_model
 
     logger = logging.getLogger(__name__)
+
+    # Validate tool calling arguments
+    if args.enable_auto_tool_choice and not args.tool_call_parser:
+        print("Error: --enable-auto-tool-choice requires --tool-call-parser")
+        print("Example: --enable-auto-tool-choice --tool-call-parser mistral")
+        sys.exit(1)
 
     # Configure server security settings
     server._api_key = args.api_key
@@ -36,6 +44,14 @@ def serve_command(args):
         server._rate_limiter = RateLimiter(
             requests_per_minute=args.rate_limit, enabled=True
         )
+
+    # Configure tool calling
+    if args.enable_auto_tool_choice and args.tool_call_parser:
+        server._enable_auto_tool_choice = True
+        server._tool_call_parser = args.tool_call_parser
+    else:
+        server._enable_auto_tool_choice = False
+        server._tool_call_parser = None
 
     # Security summary at startup
     print("=" * 60)
@@ -50,6 +66,10 @@ def serve_command(args):
     else:
         print("  Rate limiting: DISABLED - Use --rate-limit to enable")
     print(f"  Request timeout: {args.timeout}s")
+    if args.enable_auto_tool_choice:
+        print(f"  Tool calling: ENABLED (parser: {args.tool_call_parser})")
+    else:
+        print("  Tool calling: Use --enable-auto-tool-choice to enable")
     print("=" * 60)
 
     print(f"Loading model: {args.model}")
@@ -118,7 +138,9 @@ def bench_command(args):
     """Run benchmark."""
     import asyncio
     import time
+
     from mlx_lm import load
+
     from .engine_core import AsyncEngineCore, EngineConfig
     from .request import SamplingParams
     from .scheduler import SchedulerConfig
@@ -230,8 +252,9 @@ def bench_command(args):
 
 def bench_detok_command(args):
     """Benchmark streaming detokenizer optimization."""
-    import time
     import statistics
+    import time
+
     from mlx_lm import load
     from mlx_lm.generate import generate
 
@@ -465,6 +488,36 @@ Examples:
         type=float,
         default=300.0,
         help="Default request timeout in seconds (default: 300)",
+    )
+    # Tool calling options
+    serve_parser.add_argument(
+        "--enable-auto-tool-choice",
+        action="store_true",
+        help="Enable auto tool choice for supported models. Use --tool-call-parser to specify which parser to use.",
+    )
+    serve_parser.add_argument(
+        "--tool-call-parser",
+        type=str,
+        default=None,
+        choices=[
+            "auto",
+            "mistral",
+            "qwen",
+            "llama",
+            "hermes",
+            "deepseek",
+            "kimi",
+            "granite",
+            "nemotron",
+            "xlam",
+            "functionary",
+        ],
+        help=(
+            "Select the tool call parser for the model. Options: "
+            "auto (auto-detect), mistral, qwen, llama, hermes, deepseek, "
+            "kimi, granite, nemotron, xlam, functionary. "
+            "Required for --enable-auto-tool-choice."
+        ),
     )
 
     # Bench command

@@ -39,6 +39,7 @@ vllm-mlx serve mlx-community/Llama-3.2-3B-Instruct-4bit --port 8000 --continuous
 | `--max-tokens` | Default max tokens | 32768 |
 | `--stream-interval` | Tokens per stream chunk | 1 |
 | `--mcp-config` | Path to MCP config file | None |
+| `--reasoning-parser` | Parser for reasoning models | None |
 
 ## API Endpoints
 
@@ -100,6 +101,90 @@ GET /health
 ```
 
 Returns server status.
+
+## Tool Calling
+
+Enable OpenAI-compatible tool calling with `--enable-auto-tool-choice`:
+
+```bash
+vllm-mlx serve mlx-community/Devstral-Small-2507-4bit \
+  --enable-auto-tool-choice \
+  --tool-call-parser mistral
+```
+
+Use the `--tool-call-parser` option to select the parser for your model:
+
+| Parser | Models |
+|--------|--------|
+| `auto` | Auto-detect (default) |
+| `mistral` | Mistral, Devstral |
+| `qwen` | Qwen, Qwen3 |
+| `llama` | Llama 3.x, 4.x |
+| `deepseek` | DeepSeek V3, R1 |
+| `granite` | IBM Granite |
+| `nemotron` | NVIDIA Nemotron |
+
+```python
+response = client.chat.completions.create(
+    model="default",
+    messages=[{"role": "user", "content": "What's the weather in Paris?"}],
+    tools=[{
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "description": "Get weather for a city",
+            "parameters": {
+                "type": "object",
+                "properties": {"city": {"type": "string"}},
+                "required": ["city"]
+            }
+        }
+    }]
+)
+
+if response.choices[0].message.tool_calls:
+    for tc in response.choices[0].message.tool_calls:
+        print(f"{tc.function.name}: {tc.function.arguments}")
+```
+
+See [Tool Calling Guide](tool-calling.md) for full documentation.
+
+## Reasoning Models
+
+For models that show their thinking process (Qwen3, DeepSeek-R1), use `--reasoning-parser` to separate reasoning from the final answer:
+
+```bash
+# Qwen3 models
+vllm-mlx serve mlx-community/Qwen3-8B-4bit --reasoning-parser qwen3
+
+# DeepSeek-R1 models
+vllm-mlx serve mlx-community/DeepSeek-R1-Distill-Qwen-7B-4bit --reasoning-parser deepseek_r1
+```
+
+The API response includes a `reasoning` field with the model's thought process:
+
+```python
+response = client.chat.completions.create(
+    model="default",
+    messages=[{"role": "user", "content": "What is 17 × 23?"}]
+)
+
+print(response.choices[0].message.reasoning)  # Step-by-step thinking
+print(response.choices[0].message.content)    # Final answer
+```
+
+For streaming, reasoning chunks arrive first, followed by content chunks:
+
+```python
+for chunk in stream:
+    delta = chunk.choices[0].delta
+    if delta.reasoning:
+        print(f"[Thinking] {delta.reasoning}")
+    if delta.content:
+        print(delta.content, end="")
+```
+
+See [Reasoning Models Guide](reasoning.md) for full details.
 
 ## Structured Output (JSON Mode)
 

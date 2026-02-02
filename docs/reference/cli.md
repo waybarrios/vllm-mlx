@@ -38,6 +38,9 @@ vllm-mlx serve <model> [options]
 | `--paged-cache-block-size` | Tokens per cache block | 64 |
 | `--max-cache-blocks` | Maximum cache blocks | 1000 |
 | `--max-num-seqs` | Max concurrent sequences | 256 |
+| `--reasoning-parser` | Parser for reasoning models (`qwen3`, `deepseek_r1`) | None |
+| `--enable-auto-tool-choice` | Enable automatic tool calling | False |
+| `--tool-call-parser` | Tool call parser (`auto`, `mistral`, `qwen`, `llama`, `deepseek`, `granite`, `nemotron`, etc.) | None |
 
 ### Examples
 
@@ -64,6 +67,20 @@ vllm-mlx serve mlx-community/Qwen3-4B-4bit --mcp-config mcp.json
 
 # Multimodal model
 vllm-mlx serve mlx-community/Qwen3-VL-4B-Instruct-3bit
+
+# Reasoning model (separates thinking from answer)
+vllm-mlx serve mlx-community/Qwen3-8B-4bit --reasoning-parser qwen3
+
+# DeepSeek reasoning model
+vllm-mlx serve mlx-community/DeepSeek-R1-Distill-Qwen-7B-4bit --reasoning-parser deepseek_r1
+
+# Tool calling with Mistral/Devstral
+vllm-mlx serve mlx-community/Devstral-Small-2507-4bit \
+  --enable-auto-tool-choice --tool-call-parser mistral
+
+# Tool calling with Granite
+vllm-mlx serve mlx-community/granite-4.0-tiny-preview-4bit \
+  --enable-auto-tool-choice --tool-call-parser granite
 
 # With API key authentication
 vllm-mlx serve mlx-community/Llama-3.2-3B-Instruct-4bit --api-key your-secret-key

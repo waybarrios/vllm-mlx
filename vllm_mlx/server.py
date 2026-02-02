@@ -43,50 +43,61 @@ import json
 import logging
 import os
 import secrets
+import tempfile
 import threading
 import time
 import uuid
 from collections import defaultdict
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from typing import AsyncIterator
 
-from fastapi import FastAPI, HTTPException, UploadFile
-from fastapi.responses import StreamingResponse
+import uvicorn
+from fastapi import Depends, FastAPI, HTTPException, Request, UploadFile
+from fastapi.responses import Response, StreamingResponse
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 # Import from new modular API
 # Re-export for backwards compatibility with tests
-from .api.models import AssistantMessage  # noqa: F401
-from .api.models import ChatCompletionChoice  # noqa: F401
-from .api.models import ChatCompletionChunk  # noqa: F401
-from .api.models import ChatCompletionChunkChoice  # noqa: F401
-from .api.models import ChatCompletionChunkDelta  # noqa: F401
-from .api.models import ChatCompletionRequest
-from .api.models import ChatCompletionResponse
-from .api.models import CompletionChoice  # noqa: F401
-from .api.models import CompletionRequest
-from .api.models import CompletionResponse
-from .api.models import ContentPart  # noqa: F401
-from .api.models import ImageUrl  # noqa: F401
-from .api.models import MCPExecuteRequest
-from .api.models import MCPExecuteResponse
-from .api.models import MCPServerInfo  # noqa: F401
-from .api.models import MCPServersResponse
-from .api.models import MCPToolInfo  # noqa: F401
-from .api.models import MCPToolsResponse
-from .api.models import Message  # noqa: F401
-from .api.models import ModelInfo  # noqa: F401
-from .api.models import ModelsResponse
-from .api.models import Usage  # noqa: F401
-from .api.models import VideoUrl  # noqa: F401
+from .api.models import (
+    AssistantMessage,  # noqa: F401
+    ChatCompletionChoice,  # noqa: F401
+    ChatCompletionChunk,  # noqa: F401
+    ChatCompletionChunkChoice,  # noqa: F401
+    ChatCompletionChunkDelta,  # noqa: F401
+    ChatCompletionRequest,
+    ChatCompletionResponse,
+    CompletionChoice,  # noqa: F401
+    CompletionRequest,
+    CompletionResponse,
+    ContentPart,  # noqa: F401
+    FunctionCall,
+    ImageUrl,  # noqa: F401
+    MCPExecuteRequest,
+    MCPExecuteResponse,
+    MCPServerInfo,  # noqa: F401
+    MCPServersResponse,
+    MCPToolInfo,  # noqa: F401
+    MCPToolsResponse,
+    Message,  # noqa: F401
+    ModelInfo,  # noqa: F401
+    ModelsResponse,
+    ToolCall,
+    Usage,  # noqa: F401
+    VideoUrl,  # noqa: F401
+)
 from .api.tool_calling import (
     build_json_system_prompt,
     convert_tools_for_template,
     parse_json_output,
     parse_tool_calls,
 )
-from .api.utils import clean_output_text, extract_multimodal_content
-from .api.utils import is_mllm_model  # noqa: F401
-from .engine import BaseEngine, BatchedEngine, SimpleEngine, GenerationOutput
+from .api.utils import (
+    clean_output_text,
+    extract_multimodal_content,
+    is_mllm_model,  # noqa: F401
+)
+from .engine import BaseEngine, BatchedEngine, GenerationOutput, SimpleEngine
+from .tool_parsers import ToolParserManager
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -104,6 +115,14 @@ _mcp_executor = None
 # API key authentication
 _api_key: str | None = None
 _auth_warning_logged: bool = False
+
+# Reasoning parser (for models like Qwen3, DeepSeek-R1)
+_reasoning_parser = None  # ReasoningParser instance when enabled
+
+# Tool calling configuration
+_enable_auto_tool_choice: bool = False
+_tool_call_parser: str | None = None  # Parser name: auto, mistral, qwen, llama, hermes
+_tool_parser_instance = None  # Instantiated parser
 
 
 @asynccontextmanager
@@ -137,10 +156,6 @@ app = FastAPI(
     version="0.2.1",
     lifespan=lifespan,
 )
-
-
-from fastapi import Depends, Request
-from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 security = HTTPBearer(auto_error=False)
 
@@ -235,6 +250,70 @@ def get_engine() -> BaseEngine:
     return _engine
 
 
+def _parse_tool_calls_with_parser(
+    output_text: str, request: ChatCompletionRequest | None = None
+) -> tuple[str, list | None]:
+    """
+    Parse tool calls from model output using the configured parser.
+
+    If --enable-auto-tool-choice is set with --tool-call-parser, uses the
+    selected parser. Otherwise falls back to the generic parse_tool_calls.
+
+    Args:
+        output_text: The model output text
+        request: The original request (for context)
+
+    Returns:
+        Tuple of (cleaned_text, tool_calls)
+    """
+    global _tool_parser_instance
+
+    # If auto tool choice is not enabled, use the generic parser
+    if not _enable_auto_tool_choice or not _tool_call_parser:
+        return parse_tool_calls(output_text)
+
+    # Initialize parser if needed
+    if _tool_parser_instance is None:
+        try:
+            parser_cls = ToolParserManager.get_tool_parser(_tool_call_parser)
+            # Get tokenizer from engine if available
+            tokenizer = None
+            if _engine is not None and hasattr(_engine, "_tokenizer"):
+                tokenizer = _engine._tokenizer
+            _tool_parser_instance = parser_cls(tokenizer)
+            logger.info(f"Initialized tool call parser: {_tool_call_parser}")
+        except Exception as e:
+            logger.warning(
+                f"Failed to initialize tool parser '{_tool_call_parser}': {e}"
+            )
+            logger.warning("Falling back to generic parser")
+            return parse_tool_calls(output_text)
+
+    # Use the configured parser
+    try:
+        # Reset parser state between requests
+        _tool_parser_instance.reset()
+        result = _tool_parser_instance.extract_tool_calls(output_text)
+        if result.tools_called:
+            tool_calls = [
+                ToolCall(
+                    id=tc.get("id", f"call_{uuid.uuid4().hex[:8]}"),
+                    type="function",
+                    function=FunctionCall(
+                        name=tc["name"],
+                        arguments=tc["arguments"],
+                    ),
+                )
+                for tc in result.tool_calls
+            ]
+            return result.content or "", tool_calls
+        else:
+            return result.content or output_text, None
+    except Exception as e:
+        logger.warning(f"Tool parser error: {e}")
+        return parse_tool_calls(output_text)
+
+
 def load_model(
     model_name: str,
     use_batching: bool = False,
@@ -254,10 +333,12 @@ def load_model(
         max_tokens: Default max tokens for generation
         force_mllm: Force loading as MLLM even if not auto-detected
     """
-    global _engine, _model_name, _default_max_tokens
+    global _engine, _model_name, _default_max_tokens, _tool_parser_instance
 
     _default_max_tokens = max_tokens
     _model_name = model_name
+    # Reset tool parser instance when model is reloaded (tokenizer may change)
+    _tool_parser_instance = None
 
     if force_mllm:
         logger.info("Force MLLM mode enabled via --mllm flag")
@@ -336,8 +417,8 @@ async def cache_stats():
     try:
         from mlx_vlm.utils import (
             get_multimodal_kv_cache_stats,
-            get_pixel_values_cache_stats,
             get_pil_cache_stats,
+            get_pixel_values_cache_stats,
         )
 
         return {
@@ -470,11 +551,9 @@ async def create_transcription(
     - parakeet-tdt-0.6b-v2 (English, fastest)
     """
     global _stt_engine
-    import os
-    import tempfile
 
     try:
-        from .audio.stt import STTEngine
+        from .audio.stt import STTEngine  # Lazy import - optional feature
 
         # Map model aliases to full names
         model_map = {
@@ -540,10 +619,9 @@ async def create_speech(
     - voxcpm (Chinese/English)
     """
     global _tts_engine
-    from fastapi.responses import Response
 
     try:
-        from .audio.tts import TTSEngine
+        from .audio.tts import TTSEngine  # Lazy import - optional feature
 
         # Map model aliases to full names
         model_map = {
@@ -783,8 +861,8 @@ async def create_chat_completion(request: ChatCompletionRequest):
         f"Chat completion: {output.completion_tokens} tokens in {elapsed:.2f}s ({tokens_per_sec:.1f} tok/s)"
     )
 
-    # Parse tool calls from output
-    cleaned_text, tool_calls = parse_tool_calls(output.text)
+    # Parse tool calls from output using configured parser
+    cleaned_text, tool_calls = _parse_tool_calls_with_parser(output.text, request)
 
     # Process response_format if specified
     if response_format and not tool_calls:
@@ -797,6 +875,14 @@ async def create_chat_completion(request: ChatCompletionRequest):
         if not is_valid:
             logger.warning(f"JSON validation failed: {error}")
 
+    # Extract reasoning content if parser is enabled
+    reasoning_text = None
+    if _reasoning_parser and not tool_calls:
+        text_to_parse = cleaned_text or output.text
+        reasoning_text, cleaned_text = _reasoning_parser.extract_reasoning(
+            text_to_parse
+        )
+
     # Determine finish reason
     finish_reason = "tool_calls" if tool_calls else output.finish_reason
 
@@ -806,6 +892,7 @@ async def create_chat_completion(request: ChatCompletionRequest):
             ChatCompletionChoice(
                 message=AssistantMessage(
                     content=clean_output_text(cleaned_text) if cleaned_text else None,
+                    reasoning=reasoning_text,
                     tool_calls=tool_calls,
                 ),
                 finish_reason=finish_reason,
@@ -913,10 +1000,17 @@ async def stream_chat_completion(
     )
     yield f"data: {first_chunk.model_dump_json()}\n\n"
 
-    # Track if we need to add <think> prefix for thinking models
+    # Track if we need to add <think> prefix for thinking models (when no reasoning parser)
     # The template adds <think> to the prompt, so the model output starts inside the think block
-    is_thinking_model = "nemotron" in request.model.lower()
+    is_thinking_model = "nemotron" in request.model.lower() and not _reasoning_parser
     think_prefix_sent = False
+
+    # Reset reasoning parser state for this stream
+    if _reasoning_parser:
+        _reasoning_parser.reset_state()
+
+    # Track accumulated text for reasoning parser
+    accumulated_text = ""
 
     # Track token counts for usage reporting
     prompt_tokens = 0
@@ -925,7 +1019,7 @@ async def stream_chat_completion(
 
     # Stream content
     async for output in engine.stream_chat(messages=messages, **kwargs):
-        content = output.new_text
+        delta_text = output.new_text
         last_output = output
 
         # Track token counts from output (updated each chunk)
@@ -934,25 +1028,56 @@ async def stream_chat_completion(
         if hasattr(output, "completion_tokens") and output.completion_tokens:
             completion_tokens = output.completion_tokens
 
-        # Add <think> prefix on first content chunk for thinking models
-        if is_thinking_model and not think_prefix_sent and content:
-            content = "<think>" + content
-            think_prefix_sent = True
+        # Use reasoning parser if enabled
+        if _reasoning_parser and delta_text:
+            previous_text = accumulated_text
+            accumulated_text += delta_text
+            delta_msg = _reasoning_parser.extract_reasoning_streaming(
+                previous_text, accumulated_text, delta_text
+            )
 
-        chunk = ChatCompletionChunk(
-            id=response_id,
-            model=request.model,
-            choices=[
-                ChatCompletionChunkChoice(
-                    delta=ChatCompletionChunkDelta(
-                        content=content if content else None
-                    ),
-                    finish_reason=output.finish_reason if output.finished else None,
-                )
-            ],
-            usage=get_usage(output) if output.finished else None,
-        )
-        yield f"data: {chunk.model_dump_json()}\n\n"
+            if delta_msg is None:
+                # Skip this chunk (e.g., <think> token itself)
+                continue
+
+            chunk = ChatCompletionChunk(
+                id=response_id,
+                model=request.model,
+                choices=[
+                    ChatCompletionChunkChoice(
+                        delta=ChatCompletionChunkDelta(
+                            content=delta_msg.content,
+                            reasoning=delta_msg.reasoning,
+                        ),
+                        finish_reason=output.finish_reason if output.finished else None,
+                    )
+                ],
+                usage=get_usage(output) if output.finished else None,
+            )
+            yield f"data: {chunk.model_dump_json()}\n\n"
+        else:
+            # Standard path without reasoning parsing
+            content = delta_text
+
+            # Add <think> prefix on first content chunk for thinking models
+            if is_thinking_model and not think_prefix_sent and content:
+                content = "<think>" + content
+                think_prefix_sent = True
+
+            chunk = ChatCompletionChunk(
+                id=response_id,
+                model=request.model,
+                choices=[
+                    ChatCompletionChunkChoice(
+                        delta=ChatCompletionChunkDelta(
+                            content=content if content else None
+                        ),
+                        finish_reason=output.finish_reason if output.finished else None,
+                    )
+                ],
+                usage=get_usage(output) if output.finished else None,
+            )
+            yield f"data: {chunk.model_dump_json()}\n\n"
 
     # Send final chunk with usage if requested
     if include_usage:
@@ -991,7 +1116,7 @@ async def init_mcp(config_path: str):
 
         logger.info(f"MCP initialized with {len(_mcp_manager.get_all_tools())} tools")
 
-    except ImportError as e:
+    except ImportError:
         logger.error("MCP SDK not installed. Install with: pip install mcp")
         raise
     except Exception as e:
@@ -1079,6 +1204,13 @@ Examples:
         default=0,
         help="Rate limit requests per minute per client (0 = disabled)",
     )
+    parser.add_argument(
+        "--reasoning-parser",
+        type=str,
+        default=None,
+        choices=["qwen3", "deepseek_r1"],
+        help="Enable reasoning content extraction with specified parser",
+    )
 
     args = parser.parse_args()
 
@@ -1113,6 +1245,15 @@ Examples:
     if args.mcp_config:
         os.environ["VLLM_MLX_MCP_CONFIG"] = args.mcp_config
 
+    # Initialize reasoning parser if specified
+    if args.reasoning_parser:
+        global _reasoning_parser
+        from .reasoning import get_parser
+
+        parser_cls = get_parser(args.reasoning_parser)
+        _reasoning_parser = parser_cls()
+        logger.info(f"Reasoning parser enabled: {args.reasoning_parser}")
+
     # Load model before starting server
     load_model(
         args.model,
@@ -1122,8 +1263,6 @@ Examples:
     )
 
     # Start server
-    import uvicorn
-
     uvicorn.run(app, host=args.host, port=args.port)
 
 
