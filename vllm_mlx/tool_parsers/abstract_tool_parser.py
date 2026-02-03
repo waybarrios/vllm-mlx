@@ -36,6 +36,27 @@ class ToolParser(ABC):
     Each parser implementation handles a specific model's tool calling format.
     """
 
+    # Class attribute to declare native format support.
+    # Set to True in subclasses whose corresponding model chat templates
+    # can handle role="tool" messages and tool_calls fields directly,
+    # without needing conversion to text format.
+    SUPPORTS_NATIVE_TOOL_FORMAT: bool = False
+
+    @classmethod
+    def supports_native_format(cls) -> bool:
+        """
+        Check if this parser supports native tool message format.
+
+        Native format means the parser's corresponding model chat template
+        can handle:
+        - role="tool" messages directly (not converted to role="user")
+        - tool_calls field on assistant messages (not converted to text)
+
+        Returns:
+            True if native format is supported
+        """
+        return cls.SUPPORTS_NATIVE_TOOL_FORMAT
+
     def __init__(self, tokenizer: PreTrainedTokenizerBase | None = None):
         """
         Initialize the tool parser.

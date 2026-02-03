@@ -13,16 +13,17 @@ This is necessary because BatchGenerator only supports token IDs, not pixel_valu
 """
 
 import logging
-from typing import Any, AsyncIterator, Dict, List, Optional
+from collections.abc import AsyncIterator
+from typing import Any
 
-from .base import BaseEngine, GenerationOutput
-from ..api.utils import is_mllm_model, clean_output_text, extract_multimodal_content
 from ..api.tool_calling import convert_tools_for_template
+from ..api.utils import clean_output_text, extract_multimodal_content, is_mllm_model
+from .base import BaseEngine, GenerationOutput
 
 logger = logging.getLogger(__name__)
 
 
-def _extract_media_from_messages(messages: List[Dict[str, Any]]) -> tuple:
+def _extract_media_from_messages(messages: list[dict[str, Any]]) -> tuple:
     """
     Extract images and videos from OpenAI-format messages.
 
@@ -134,7 +135,7 @@ class BatchedEngine(BaseEngine):
         self,
         model_name: str,
         trust_remote_code: bool = True,
-        scheduler_config: Optional[Any] = None,
+        scheduler_config: Any | None = None,
         stream_interval: int = 1,
         force_mllm: bool = False,
     ):
@@ -194,8 +195,8 @@ class BatchedEngine(BaseEngine):
 
     async def _start_mllm(self) -> None:
         """Start the MLLM engine with MLLMScheduler (continuous batching)."""
-        from ..models.mllm import MLXMultimodalLM
         from ..mllm_scheduler import MLLMScheduler, MLLMSchedulerConfig
+        from ..models.mllm import MLXMultimodalLM
 
         # Load the MLLM model
         self._mllm_instance = MLXMultimodalLM(
@@ -243,7 +244,7 @@ class BatchedEngine(BaseEngine):
 
     async def _start_llm(self) -> None:
         """Start the LLM engine with AsyncEngineCore."""
-        from ..engine_core import EngineConfig, AsyncEngineCore
+        from ..engine_core import AsyncEngineCore, EngineConfig
         from ..scheduler import SchedulerConfig
         from ..utils.tokenizer import load_model_with_fallback
 
@@ -288,7 +289,6 @@ class BatchedEngine(BaseEngine):
             self._engine = None
 
         self._model = None
-        self._mllm = None
         self._tokenizer = None
         self._processor = None
         self._mllm_instance = None
@@ -297,8 +297,8 @@ class BatchedEngine(BaseEngine):
 
     def _apply_chat_template(
         self,
-        messages: List[Dict[str, Any]],
-        tools: Optional[List[dict]] = None,
+        messages: list[dict[str, Any]],
+        tools: list[dict] | None = None,
         num_images: int = 0,
     ) -> str:
         """Apply chat template to messages."""
@@ -370,9 +370,9 @@ class BatchedEngine(BaseEngine):
         max_tokens: int = 256,
         temperature: float = 0.7,
         top_p: float = 0.9,
-        stop: Optional[List[str]] = None,
-        images: Optional[List[str]] = None,
-        videos: Optional[List[str]] = None,
+        stop: list[str] | None = None,
+        images: list[str] | None = None,
+        videos: list[str] | None = None,
         **kwargs,
     ) -> GenerationOutput:
         """
@@ -442,9 +442,9 @@ class BatchedEngine(BaseEngine):
         max_tokens: int = 256,
         temperature: float = 0.7,
         top_p: float = 0.9,
-        stop: Optional[List[str]] = None,
-        images: Optional[List[str]] = None,
-        videos: Optional[List[str]] = None,
+        stop: list[str] | None = None,
+        images: list[str] | None = None,
+        videos: list[str] | None = None,
         **kwargs,
     ) -> AsyncIterator[GenerationOutput]:
         """
@@ -517,13 +517,13 @@ class BatchedEngine(BaseEngine):
 
     async def chat(
         self,
-        messages: List[Dict[str, Any]],
+        messages: list[dict[str, Any]],
         max_tokens: int = 256,
         temperature: float = 0.7,
         top_p: float = 0.9,
-        tools: Optional[List[dict]] = None,
-        images: Optional[List[str]] = None,
-        videos: Optional[List[str]] = None,
+        tools: list[dict] | None = None,
+        images: list[str] | None = None,
+        videos: list[str] | None = None,
         **kwargs,
     ) -> GenerationOutput:
         """
@@ -550,6 +550,7 @@ class BatchedEngine(BaseEngine):
             await self.start()
 
         # Extract images/videos from messages (OpenAI multimodal format)
+        # Note: We only use extracted media here, messages are already processed by server
         _, extracted_images, extracted_videos = extract_multimodal_content(messages)
         all_images = (images or []) + extracted_images
         all_videos = (videos or []) + extracted_videos
@@ -576,13 +577,13 @@ class BatchedEngine(BaseEngine):
 
     async def stream_chat(
         self,
-        messages: List[Dict[str, Any]],
+        messages: list[dict[str, Any]],
         max_tokens: int = 256,
         temperature: float = 0.7,
         top_p: float = 0.9,
-        tools: Optional[List[dict]] = None,
-        images: Optional[List[str]] = None,
-        videos: Optional[List[str]] = None,
+        tools: list[dict] | None = None,
+        images: list[str] | None = None,
+        videos: list[str] | None = None,
         **kwargs,
     ) -> AsyncIterator[GenerationOutput]:
         """
@@ -609,6 +610,7 @@ class BatchedEngine(BaseEngine):
             await self.start()
 
         # Extract images/videos from messages (OpenAI multimodal format)
+        # Note: We only use extracted media here, messages are already processed by server
         _, extracted_images, extracted_videos = extract_multimodal_content(messages)
         all_images = (images or []) + extracted_images
         all_videos = (videos or []) + extracted_videos
@@ -634,7 +636,7 @@ class BatchedEngine(BaseEngine):
         ):
             yield output
 
-    def get_stats(self) -> Dict[str, Any]:
+    def get_stats(self) -> dict[str, Any]:
         """Get engine statistics."""
         stats = {
             "engine_type": "batched",
@@ -651,7 +653,7 @@ class BatchedEngine(BaseEngine):
 
         return stats
 
-    def get_cache_stats(self) -> Optional[Dict[str, Any]]:
+    def get_cache_stats(self) -> dict[str, Any] | None:
         """Get cache statistics."""
         if self._mllm_scheduler and self._mllm_scheduler.vision_cache:
             return self._mllm_scheduler.vision_cache.get_stats()

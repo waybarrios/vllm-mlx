@@ -46,6 +46,9 @@ class MistralToolParser(ToolParser):
     Used when --enable-auto-tool-choice --tool-call-parser mistral are set.
     """
 
+    # Mistral chat templates support native tool message format
+    SUPPORTS_NATIVE_TOOL_FORMAT = True
+
     BOT_TOKEN = "[TOOL_CALLS]"
     TOOL_CALL_REGEX = re.compile(r"\[{.*}\]", re.DOTALL)
 

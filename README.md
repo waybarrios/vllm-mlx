@@ -22,6 +22,7 @@ vllm-mlx brings native Apple Silicon GPU acceleration to vLLM by integrating:
 - **Native GPU acceleration** on Apple Silicon (M1, M2, M3, M4)
 - **Native TTS voices** - Spanish, French, Chinese, Japanese + 5 more languages
 - **OpenAI API compatible** - drop-in replacement for OpenAI client
+- **Reasoning Models** - extract thinking process from Qwen3, DeepSeek-R1
 - **MCP Tool Calling** - integrate external tools via Model Context Protocol
 - **Paged KV Cache** - memory-efficient caching with prefix sharing
 - **Continuous Batching** - high throughput for multiple concurrent users
@@ -115,6 +116,32 @@ python examples/tts_multilingual.py --list-languages
 | VibeVoice | EN | Realtime, low latency |
 | VoxCPM | ZH, EN | High quality Chinese/English |
 
+### Reasoning Models
+
+Extract the thinking process from reasoning models like Qwen3 and DeepSeek-R1:
+
+```bash
+# Start server with reasoning parser
+vllm-mlx serve mlx-community/Qwen3-8B-4bit --reasoning-parser qwen3
+```
+
+```python
+response = client.chat.completions.create(
+    model="default",
+    messages=[{"role": "user", "content": "What is 17 × 23?"}]
+)
+
+# Access reasoning separately from the answer
+print("Thinking:", response.choices[0].message.reasoning)
+print("Answer:", response.choices[0].message.content)
+```
+
+**Supported Parsers:**
+| Parser | Models | Description |
+|--------|--------|-------------|
+| `qwen3` | Qwen3 series | Requires both `<think>` and `</think>` tags |
+| `deepseek_r1` | DeepSeek-R1 | Handles implicit `<think>` tag |
+
 ## Documentation
 
 For full documentation, see the [docs](docs/) directory:
@@ -128,6 +155,7 @@ For full documentation, see the [docs](docs/) directory:
   - [Python API](docs/guides/python-api.md)
   - [Multimodal (Images & Video)](docs/guides/multimodal.md)
   - [Audio (STT/TTS)](docs/guides/audio.md)
+  - [Reasoning Models](docs/guides/reasoning.md)
   - [MCP & Tool Calling](docs/guides/mcp-tools.md)
   - [Continuous Batching](docs/guides/continuous-batching.md)
 
@@ -203,7 +231,7 @@ See [benchmarks](docs/benchmarks/) for detailed results.
 
 ## Gemma 3 Support
 
-This fork includes patches for Gemma 3 vision support. Gemma 3 is a multimodal model but requires detection as MLLM.
+vllm-mlx includes native support for Gemma 3 vision models. Gemma 3 is automatically detected as MLLM.
 
 ### Usage
 

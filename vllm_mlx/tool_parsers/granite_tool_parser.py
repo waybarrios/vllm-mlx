@@ -38,6 +38,9 @@ class GraniteToolParser(ToolParser):
     Used when --enable-auto-tool-choice --tool-call-parser granite are set.
     """
 
+    # Granite 3.1 chat templates support native tool message format
+    SUPPORTS_NATIVE_TOOL_FORMAT = True
+
     BOT_TOKEN = "<|tool_call|>"
     BOT_STRING = "<tool_call>"
 

@@ -35,6 +35,9 @@ class LlamaToolParser(ToolParser):
     Used when --enable-auto-tool-choice --tool-call-parser llama are set.
     """
 
+    # Llama 3+ chat templates support native tool message format
+    SUPPORTS_NATIVE_TOOL_FORMAT = True
+
     # Pattern for Llama-style: <function=name>{"json"}</function>
     FUNCTION_PATTERN = re.compile(r"<function=([^>]+)>(\{.*?\})</function>", re.DOTALL)
 

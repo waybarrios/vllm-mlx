@@ -44,6 +44,9 @@ class DeepSeekToolParser(ToolParser):
     Used when --enable-auto-tool-choice --tool-call-parser deepseek are set.
     """
 
+    # DeepSeek V3 chat templates support native tool message format
+    SUPPORTS_NATIVE_TOOL_FORMAT = True
+
     # Special DeepSeek tokens (unicode)
     TOOL_CALLS_START = "<｜tool▁calls▁begin｜>"
     TOOL_CALLS_END = "<｜tool▁calls▁end｜>"

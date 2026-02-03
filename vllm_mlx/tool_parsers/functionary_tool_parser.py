@@ -40,6 +40,9 @@ class FunctionaryToolParser(ToolParser):
     Used when --enable-auto-tool-choice --tool-call-parser functionary are set.
     """
 
+    # Functionary chat templates support native tool message format
+    SUPPORTS_NATIVE_TOOL_FORMAT = True
+
     # Functionary v3 format
     RECIPIENT_PATTERN = re.compile(
         r"<\|recipient\|>\s*(\w+)\s*\n<\|content\|>\s*(\{.*?\})(?=<\||$)",

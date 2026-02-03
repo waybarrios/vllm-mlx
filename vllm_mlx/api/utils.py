@@ -4,7 +4,6 @@ Utility functions for text processing and model detection.
 """
 
 import re
-from typing import List, Tuple
 
 from .models import Message
 
@@ -109,8 +108,9 @@ is_vlm_model = is_mllm_model
 
 
 def extract_multimodal_content(
-    messages: List[Message],
-) -> Tuple[List[dict], List[str], List[str]]:
+    messages: list[Message],
+    preserve_native_format: bool = False,
+) -> tuple[list[dict], list[str], list[str]]:
     """
     Extract text content, images, and videos from OpenAI-format messages.
 
@@ -122,6 +122,10 @@ def extract_multimodal_content(
 
     Args:
         messages: List of Message objects
+        preserve_native_format: If True, preserve native tool message format
+            (role="tool", tool_calls field) instead of converting to text.
+            Required for models with native tool support in chat templates
+            (e.g., Mistral, Llama 3+, DeepSeek V3).
 
     Returns:
         Tuple of (processed_messages, images, videos)
@@ -144,18 +148,29 @@ def extract_multimodal_content(
 
         # Handle tool response messages (role="tool")
         if role == "tool":
-            # Format tool result as assistant context
             if isinstance(msg, dict):
                 tool_call_id = msg.get("tool_call_id", "") or ""
             else:
                 tool_call_id = getattr(msg, "tool_call_id", None) or ""
             tool_content = content if content else ""
-            processed_messages.append(
-                {
-                    "role": "user",  # mlx-lm expects user/assistant roles
-                    "content": f"[Tool Result ({tool_call_id})]: {tool_content}",
-                }
-            )
+
+            if preserve_native_format:
+                # Preserve native tool format for models that support it
+                processed_messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": tool_call_id,
+                        "content": tool_content,
+                    }
+                )
+            else:
+                # Convert to user role for models without native support
+                processed_messages.append(
+                    {
+                        "role": "user",
+                        "content": f"[Tool Result ({tool_call_id})]: {tool_content}",
+                    }
+                )
             continue
 
         # Handle assistant messages with tool_calls
@@ -165,20 +180,36 @@ def extract_multimodal_content(
             tool_calls = getattr(msg, "tool_calls", None)
 
         if role == "assistant" and tool_calls:
-            # Format tool calls as part of the assistant message
-            tool_calls_text = []
-            for tc in tool_calls:
-                if isinstance(tc, dict):
-                    func = tc.get("function", {})
-                    name = func.get("name", "unknown")
-                    args = func.get("arguments", "{}")
-                    tool_calls_text.append(f"[Calling tool: {name}({args})]")
+            if preserve_native_format:
+                # Preserve native tool_calls format
+                tool_calls_list = []
+                for tc in tool_calls:
+                    if isinstance(tc, dict):
+                        tool_calls_list.append(tc)
+                    elif hasattr(tc, "model_dump"):
+                        tool_calls_list.append(tc.model_dump())
+                    elif hasattr(tc, "dict"):
+                        tool_calls_list.append(tc.dict())
 
-            text = content if content else ""
-            if tool_calls_text:
-                text = (text + "\n" if text else "") + "\n".join(tool_calls_text)
+                msg_dict = {"role": role, "content": content if content else ""}
+                if tool_calls_list:
+                    msg_dict["tool_calls"] = tool_calls_list
+                processed_messages.append(msg_dict)
+            else:
+                # Convert tool calls to text for models without native support
+                tool_calls_text = []
+                for tc in tool_calls:
+                    if isinstance(tc, dict):
+                        func = tc.get("function", {})
+                        name = func.get("name", "unknown")
+                        args = func.get("arguments", "{}")
+                        tool_calls_text.append(f"[Calling tool: {name}({args})]")
 
-            processed_messages.append({"role": role, "content": text})
+                text = content if content else ""
+                if tool_calls_text:
+                    text = (text + "\n" if text else "") + "\n".join(tool_calls_text)
+
+                processed_messages.append({"role": role, "content": text})
             continue
 
         # Handle None content

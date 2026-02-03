@@ -4,8 +4,9 @@ Base engine interface for vllm-mlx inference.
 """
 
 from abc import ABC, abstractmethod
+from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
-from typing import Any, AsyncIterator, Dict, List, Optional
+from typing import Any
 
 
 @dataclass
@@ -17,10 +18,10 @@ class GenerationOutput:
     """
 
     text: str
-    tokens: List[int] = field(default_factory=list)
+    tokens: list[int] = field(default_factory=list)
     prompt_tokens: int = 0
     completion_tokens: int = 0
-    finish_reason: Optional[str] = "stop"
+    finish_reason: str | None = "stop"
     # For streaming
     new_text: str = ""
     finished: bool = True
@@ -52,6 +53,20 @@ class BaseEngine(ABC):
         """Get the tokenizer."""
         pass
 
+    @property
+    def preserve_native_tool_format(self) -> bool:
+        """
+        Whether to preserve native tool message format.
+
+        When True, role="tool" messages and tool_calls fields are preserved
+        instead of being converted to text. Set by server based on tool parser.
+        """
+        return getattr(self, "_preserve_native_tool_format", False)
+
+    @preserve_native_tool_format.setter
+    def preserve_native_tool_format(self, value: bool) -> None:
+        self._preserve_native_tool_format = value
+
     @abstractmethod
     async def start(self) -> None:
         """Start the engine (load model if not loaded)."""
@@ -69,7 +84,7 @@ class BaseEngine(ABC):
         max_tokens: int = 256,
         temperature: float = 0.7,
         top_p: float = 0.9,
-        stop: Optional[List[str]] = None,
+        stop: list[str] | None = None,
         **kwargs,
     ) -> GenerationOutput:
         """
@@ -95,7 +110,7 @@ class BaseEngine(ABC):
         max_tokens: int = 256,
         temperature: float = 0.7,
         top_p: float = 0.9,
-        stop: Optional[List[str]] = None,
+        stop: list[str] | None = None,
         **kwargs,
     ) -> AsyncIterator[GenerationOutput]:
         """
@@ -117,13 +132,13 @@ class BaseEngine(ABC):
     @abstractmethod
     async def chat(
         self,
-        messages: List[Dict[str, Any]],
+        messages: list[dict[str, Any]],
         max_tokens: int = 256,
         temperature: float = 0.7,
         top_p: float = 0.9,
-        tools: Optional[List[dict]] = None,
-        images: Optional[List[str]] = None,
-        videos: Optional[List[str]] = None,
+        tools: list[dict] | None = None,
+        images: list[str] | None = None,
+        videos: list[str] | None = None,
         **kwargs,
     ) -> GenerationOutput:
         """
@@ -147,13 +162,13 @@ class BaseEngine(ABC):
     @abstractmethod
     async def stream_chat(
         self,
-        messages: List[Dict[str, Any]],
+        messages: list[dict[str, Any]],
         max_tokens: int = 256,
         temperature: float = 0.7,
         top_p: float = 0.9,
-        tools: Optional[List[dict]] = None,
-        images: Optional[List[str]] = None,
-        videos: Optional[List[str]] = None,
+        tools: list[dict] | None = None,
+        images: list[str] | None = None,
+        videos: list[str] | None = None,
         **kwargs,
     ) -> AsyncIterator[GenerationOutput]:
         """
@@ -174,10 +189,10 @@ class BaseEngine(ABC):
         """
         pass
 
-    def get_stats(self) -> Dict[str, Any]:
+    def get_stats(self) -> dict[str, Any]:
         """Get engine statistics. Override in subclasses."""
         return {}
 
-    def get_cache_stats(self) -> Optional[Dict[str, Any]]:
+    def get_cache_stats(self) -> dict[str, Any] | None:
         """Get cache statistics. Override in subclasses."""
         return None

@@ -314,6 +314,35 @@ def _parse_tool_calls_with_parser(
         return parse_tool_calls(output_text)
 
 
+def _detect_native_tool_support() -> bool:
+    """
+    Detect if the active tool parser supports native tool format.
+
+    Native format means role="tool" messages and tool_calls fields
+    are preserved instead of being converted to text.
+
+    Returns:
+        True if native format should be preserved
+    """
+    if not _enable_auto_tool_choice or not _tool_call_parser:
+        return False
+
+    try:
+        parser_cls = ToolParserManager.get_tool_parser(_tool_call_parser)
+        return parser_cls.supports_native_format()
+    except KeyError:
+        # Parser not found - this is a configuration error, log as error
+        logger.error(
+            f"Tool parser '{_tool_call_parser}' not found. "
+            f"Available parsers: {ToolParserManager.list_registered()}"
+        )
+        return False
+    except Exception as e:
+        # Unexpected error during detection
+        logger.warning(f"Failed to detect native tool support: {e}")
+        return False
+
+
 def load_model(
     model_name: str,
     use_batching: bool = False,
@@ -364,6 +393,11 @@ def load_model(
         loop.run_until_complete(_engine.start())
         model_type = "MLLM" if _engine.is_mllm else "LLM"
         logger.info(f"{model_type} model loaded (simple mode): {model_name}")
+
+    # Set native tool format support on the engine (thread-safe via instance property)
+    _engine.preserve_native_tool_format = _detect_native_tool_support()
+    if _engine.preserve_native_tool_format:
+        logger.info(f"Native tool format enabled for parser: {_tool_call_parser}")
 
     logger.info(f"Default max tokens: {_default_max_tokens}")
 
@@ -804,7 +838,10 @@ async def create_chat_completion(request: ChatCompletionRequest):
         logger.debug(f"MLLM: Processing {len(messages)} messages")
     else:
         # For LLM, extract text, images, and videos separately
-        messages, images, videos = extract_multimodal_content(request.messages)
+        messages, images, videos = extract_multimodal_content(
+            request.messages,
+            preserve_native_format=engine.preserve_native_tool_format,
+        )
 
     has_media = bool(images or videos)
 
