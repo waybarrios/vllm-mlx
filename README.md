@@ -31,7 +31,23 @@ vllm-mlx brings native Apple Silicon GPU acceleration to vLLM by integrating:
 
 ### Installation
 
+**Using uv (recommended):**
+
 ```bash
+# Install as CLI tool (system-wide)
+uv tool install git+https://github.com/waybarrios/vllm-mlx.git
+
+# Or install in a project/virtual environment
+uv pip install git+https://github.com/waybarrios/vllm-mlx.git
+```
+
+**Using pip:**
+
+```bash
+# Install from GitHub
+pip install git+https://github.com/waybarrios/vllm-mlx.git
+
+# Or clone and install in development mode
 git clone https://github.com/waybarrios/vllm-mlx.git
 cd vllm-mlx
 pip install -e .
