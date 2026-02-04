@@ -6,6 +6,7 @@ Inspired by vLLM's tool parser architecture but simplified for MLX backend.
 """
 
 import importlib
+import re
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -13,6 +14,13 @@ from functools import cached_property
 from typing import Any
 
 from transformers import PreTrainedTokenizerBase
+
+# Pattern to match and strip think tags
+# Handles two cases:
+# 1. Full tags: <think>...</think>
+# 2. Only closing tag: ...content before...</think> (when <think> is in prompt)
+THINK_TAG_PATTERN = re.compile(r"<think>.*?</think>", re.DOTALL)
+IMPLICIT_THINK_PATTERN = re.compile(r"^.*?</think>", re.DOTALL)
 
 
 @dataclass
@@ -56,6 +64,35 @@ class ToolParser(ABC):
             True if native format is supported
         """
         return cls.SUPPORTS_NATIVE_TOOL_FORMAT
+
+    @staticmethod
+    def strip_think_tags(text: str) -> str:
+        """
+        Strip think tags from text.
+
+        Handles two scenarios:
+        1. Full tags: <think>...</think> in output
+        2. Only closing tag: ...</think> when <think> was in prompt
+
+        Used as fallback when no reasoning parser is configured but the model
+        produces thinking tags. This prevents tool parsing failures with
+        models that use thinking tags (e.g., Ring-Mini-Linear-2.0 with hermes).
+
+        Args:
+            text: Model output that may contain think tags
+
+        Returns:
+            Text with think tags removed
+        """
+        # First try to strip full tags
+        result = THINK_TAG_PATTERN.sub("", text)
+
+        # If no full tags found but </think> exists, strip implicit think
+        # (when <think> was injected in the prompt)
+        if result == text and "</think>" in text:
+            result = IMPLICIT_THINK_PATTERN.sub("", text)
+
+        return result.strip()
 
     def __init__(self, tokenizer: PreTrainedTokenizerBase | None = None):
         """

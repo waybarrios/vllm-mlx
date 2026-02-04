@@ -1241,12 +1241,19 @@ Examples:
         default=0,
         help="Rate limit requests per minute per client (0 = disabled)",
     )
+    # Reasoning parser options - choices loaded dynamically from registry
+    from .reasoning import list_parsers
+
+    reasoning_choices = list_parsers()
     parser.add_argument(
         "--reasoning-parser",
         type=str,
         default=None,
-        choices=["qwen3", "deepseek_r1"],
-        help="Enable reasoning content extraction with specified parser",
+        choices=reasoning_choices,
+        help=(
+            "Enable reasoning content extraction with specified parser. "
+            f"Options: {', '.join(reasoning_choices)}."
+        ),
     )
 
     args = parser.parse_args()

@@ -49,8 +49,11 @@ class HermesToolParser(ToolParser):
         tool_calls = []
         cleaned_text = model_output
 
+        # Strip <think> tags first (fallback when no reasoning parser)
+        cleaned_text = self.strip_think_tags(cleaned_text)
+
         # Remove reasoning tags first (keep for content)
-        reasoning_matches = self.REASONING_PATTERN.findall(model_output)
+        reasoning_matches = self.REASONING_PATTERN.findall(cleaned_text)
         cleaned_text = self.REASONING_PATTERN.sub("", cleaned_text)
 
         # Parse tool calls
@@ -94,7 +97,7 @@ class HermesToolParser(ToolParser):
             )
         else:
             return ExtractedToolCallInformation(
-                tools_called=False, tool_calls=[], content=model_output
+                tools_called=False, tool_calls=[], content=cleaned_text
             )
 
     def extract_tool_calls_streaming(

@@ -53,6 +53,29 @@ def serve_command(args):
         server._enable_auto_tool_choice = False
         server._tool_call_parser = None
 
+    # Configure reasoning parser
+    if args.reasoning_parser:
+        try:
+            from .reasoning import get_parser
+
+            parser_cls = get_parser(args.reasoning_parser)
+            server._reasoning_parser = parser_cls()
+            logger.info(f"Reasoning parser enabled: {args.reasoning_parser}")
+        except KeyError as e:
+            print(f"Error: {e}")
+            sys.exit(1)
+        except ImportError as e:
+            print(f"Error: Failed to import reasoning module: {e}")
+            sys.exit(1)
+        except Exception as e:
+            print(
+                f"Error: Failed to initialize reasoning parser "
+                f"'{args.reasoning_parser}': {e}"
+            )
+            sys.exit(1)
+    else:
+        server._reasoning_parser = None
+
     # Security summary at startup
     print("=" * 60)
     print("SECURITY CONFIGURATION")
@@ -70,6 +93,10 @@ def serve_command(args):
         print(f"  Tool calling: ENABLED (parser: {args.tool_call_parser})")
     else:
         print("  Tool calling: Use --enable-auto-tool-choice to enable")
+    if args.reasoning_parser:
+        print(f"  Reasoning: ENABLED (parser: {args.reasoning_parser})")
+    else:
+        print("  Reasoning: Use --reasoning-parser to enable")
     print("=" * 60)
 
     print(f"Loading model: {args.model}")
@@ -517,6 +544,21 @@ Examples:
             "auto (auto-detect), mistral, qwen, llama, hermes, deepseek, "
             "kimi, granite, nemotron, xlam, functionary. "
             "Required for --enable-auto-tool-choice."
+        ),
+    )
+    # Reasoning parser options - choices loaded dynamically from registry
+    from .reasoning import list_parsers
+
+    reasoning_choices = list_parsers()
+    serve_parser.add_argument(
+        "--reasoning-parser",
+        type=str,
+        default=None,
+        choices=reasoning_choices,
+        help=(
+            "Enable reasoning content extraction with specified parser. "
+            "Extracts <think>...</think> tags into reasoning_content field. "
+            f"Options: {', '.join(reasoning_choices)}."
         ),
     )
 
