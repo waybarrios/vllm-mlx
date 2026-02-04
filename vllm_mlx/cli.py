@@ -53,6 +53,12 @@ def serve_command(args):
         server._enable_auto_tool_choice = False
         server._tool_call_parser = None
 
+    # Configure generation defaults
+    if args.default_temperature is not None:
+        server._default_temperature = args.default_temperature
+    if args.default_top_p is not None:
+        server._default_top_p = args.default_top_p
+
     # Security summary at startup
     print("=" * 60)
     print("SECURITY CONFIGURATION")
@@ -518,6 +524,19 @@ Examples:
             "kimi, granite, nemotron, xlam, functionary. "
             "Required for --enable-auto-tool-choice."
         ),
+    )
+    # Generation defaults
+    serve_parser.add_argument(
+        "--default-temperature",
+        type=float,
+        default=None,
+        help="Default temperature for generation when not specified in request",
+    )
+    serve_parser.add_argument(
+        "--default-top-p",
+        type=float,
+        default=None,
+        help="Default top_p for generation when not specified in request",
     )
 
     # Bench command

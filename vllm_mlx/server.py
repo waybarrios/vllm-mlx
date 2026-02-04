@@ -107,6 +107,8 @@ _engine: BaseEngine | None = None
 _model_name: str | None = None
 _default_max_tokens: int = 32768
 _default_timeout: float = 300.0  # Default request timeout in seconds (5 minutes)
+_default_temperature: float | None = None  # Set via --default-temperature
+_default_top_p: float | None = None  # Set via --default-top-p
 
 # Global MCP manager
 _mcp_manager = None
@@ -738,8 +740,14 @@ async def create_completion(request: CompletionRequest):
                 engine.generate(
                     prompt=prompt,
                     max_tokens=request.max_tokens or _default_max_tokens,
-                    temperature=request.temperature,
-                    top_p=request.top_p,
+                    temperature=(
+                        request.temperature
+                        if request.temperature is not None
+                        else _default_temperature
+                    ),
+                    top_p=(
+                        request.top_p if request.top_p is not None else _default_top_p
+                    ),
                     stop=request.stop,
                 ),
                 timeout=timeout,
@@ -856,8 +864,12 @@ async def create_chat_completion(request: ChatCompletionRequest):
     # Prepare kwargs
     chat_kwargs = {
         "max_tokens": request.max_tokens or _default_max_tokens,
-        "temperature": request.temperature,
-        "top_p": request.top_p,
+        "temperature": (
+            request.temperature
+            if request.temperature is not None
+            else _default_temperature
+        ),
+        "top_p": request.top_p if request.top_p is not None else _default_top_p,
     }
 
     # Add multimodal content
@@ -989,8 +1001,12 @@ async def stream_completion(
     async for output in engine.stream_generate(
         prompt=prompt,
         max_tokens=request.max_tokens or _default_max_tokens,
-        temperature=request.temperature,
-        top_p=request.top_p,
+        temperature=(
+            request.temperature
+            if request.temperature is not None
+            else _default_temperature
+        ),
+        top_p=request.top_p if request.top_p is not None else _default_top_p,
         stop=request.stop,
     ):
         data = {
@@ -1248,13 +1264,30 @@ Examples:
         choices=["qwen3", "deepseek_r1"],
         help="Enable reasoning content extraction with specified parser",
     )
+    parser.add_argument(
+        "--default-temperature",
+        type=float,
+        default=None,
+        help="Default temperature for generation when not specified in request",
+    )
+    parser.add_argument(
+        "--default-top-p",
+        type=float,
+        default=None,
+        help="Default top_p for generation when not specified in request",
+    )
 
     args = parser.parse_args()
 
     # Set global configuration
     global _api_key, _default_timeout, _rate_limiter
+    global _default_temperature, _default_top_p
     _api_key = args.api_key
     _default_timeout = args.timeout
+    if args.default_temperature is not None:
+        _default_temperature = args.default_temperature
+    if args.default_top_p is not None:
+        _default_top_p = args.default_top_p
 
     # Configure rate limiter
     if args.rate_limit > 0:
