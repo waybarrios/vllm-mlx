@@ -376,6 +376,7 @@ class ChatCompletionChunkDelta(BaseModel):
     role: Optional[str] = None
     content: Optional[str] = None
     tool_calls: Optional[List[dict]] = None
+    reasoning: Optional[str] = None  # For reasoning/thinking content (Qwen3, DeepSeek-R1)
 
 
 class ChatCompletionChunkChoice(BaseModel):
