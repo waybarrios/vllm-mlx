@@ -116,15 +116,13 @@ class Glm47ToolParser(ToolParser):
                 }
             )
 
-        # Remove tool call blocks from text
-        if tool_calls:
-            cleaned_text = self.TOOL_CALL_PATTERN.sub("", cleaned_text).strip()
-
+        # When tool calls are found, don't return reasoning text as content
+        # GLM often outputs thinking/reasoning before tool calls without <think> tags
         if tool_calls:
             return ExtractedToolCallInformation(
                 tools_called=True,
                 tool_calls=tool_calls,
-                content=cleaned_text if cleaned_text else None,
+                content=None,  # Don't include reasoning text when making tool calls
             )
         else:
             # Remove thinking from final output even if no tool calls
