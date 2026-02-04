@@ -740,8 +740,14 @@ async def create_completion(request: CompletionRequest):
                 engine.generate(
                     prompt=prompt,
                     max_tokens=request.max_tokens or _default_max_tokens,
-                    temperature=request.temperature if request.temperature is not None else _default_temperature,
-                    top_p=request.top_p if request.top_p is not None else _default_top_p,
+                    temperature=(
+                        request.temperature
+                        if request.temperature is not None
+                        else _default_temperature
+                    ),
+                    top_p=(
+                        request.top_p if request.top_p is not None else _default_top_p
+                    ),
                     stop=request.stop,
                 ),
                 timeout=timeout,
@@ -858,7 +864,11 @@ async def create_chat_completion(request: ChatCompletionRequest):
     # Prepare kwargs
     chat_kwargs = {
         "max_tokens": request.max_tokens or _default_max_tokens,
-        "temperature": request.temperature if request.temperature is not None else _default_temperature,
+        "temperature": (
+            request.temperature
+            if request.temperature is not None
+            else _default_temperature
+        ),
         "top_p": request.top_p if request.top_p is not None else _default_top_p,
     }
 
@@ -991,7 +1001,11 @@ async def stream_completion(
     async for output in engine.stream_generate(
         prompt=prompt,
         max_tokens=request.max_tokens or _default_max_tokens,
-        temperature=request.temperature if request.temperature is not None else _default_temperature,
+        temperature=(
+            request.temperature
+            if request.temperature is not None
+            else _default_temperature
+        ),
         top_p=request.top_p if request.top_p is not None else _default_top_p,
         stop=request.stop,
     ):
@@ -1074,7 +1088,9 @@ async def stream_chat_completion(
             if _engine is not None and hasattr(_engine, "_tokenizer"):
                 tokenizer = _engine._tokenizer
             _tool_parser_instance = parser_cls(tokenizer)
-            logger.info(f"Initialized tool call parser for streaming: {_tool_call_parser}")
+            logger.info(
+                f"Initialized tool call parser for streaming: {_tool_call_parser}"
+            )
         except Exception as e:
             logger.warning(f"Failed to initialize tool parser for streaming: {e}")
             tool_call_enabled = False
@@ -1167,7 +1183,9 @@ async def stream_chat_completion(
                             delta=ChatCompletionChunkDelta(
                                 content=content,
                             ),
-                            finish_reason=output.finish_reason if output.finished else None,
+                            finish_reason=(
+                                output.finish_reason if output.finished else None
+                            ),
                         )
                     ],
                     usage=get_usage(output) if output.finished else None,
@@ -1226,11 +1244,15 @@ async def stream_chat_completion(
                         finish_reason="tool_calls",
                     )
                 ],
-                usage=Usage(
-                    prompt_tokens=prompt_tokens,
-                    completion_tokens=completion_tokens,
-                    total_tokens=prompt_tokens + completion_tokens,
-                ) if last_output and last_output.finished else None,
+                usage=(
+                    Usage(
+                        prompt_tokens=prompt_tokens,
+                        completion_tokens=completion_tokens,
+                        total_tokens=prompt_tokens + completion_tokens,
+                    )
+                    if last_output and last_output.finished
+                    else None
+                ),
             )
             yield f"data: {chunk.model_dump_json()}\n\n"
             tool_calls_emitted = True
