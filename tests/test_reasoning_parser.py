@@ -114,12 +114,13 @@ class TestQwen3Parser:
         assert reasoning is None
         assert content == output
 
-    def test_only_end_tag_no_reasoning(self, parser):
-        """Qwen3 requires both tags - missing start tag means no reasoning."""
+    def test_only_end_tag_implicit_mode(self, parser):
+        """Qwen3 supports implicit mode - when <think> is in prompt, only </think> in output."""
         output = "Some text</think>more text"
         reasoning, content = parser.extract_reasoning(output)
-        assert reasoning is None
-        assert content == output
+        # Implicit mode: everything before </think> is reasoning
+        assert reasoning == "Some text"
+        assert content == "more text"
 
     # Streaming tests
 
@@ -640,20 +641,22 @@ class TestQwen3SpecificCases:
         """Create Qwen3 parser."""
         return get_parser("qwen3")()
 
-    def test_qwen3_requires_both_tags(self, parser):
-        """Qwen3 requires both tags to extract reasoning."""
-        # Only end tag - should be pure content
+    def test_qwen3_implicit_mode_support(self, parser):
+        """Qwen3 supports implicit mode for OpenCode compatibility."""
+        # Only end tag - implicit mode (think injected in prompt)
         output1 = "some text</think>more text"
         reasoning, content = parser.extract_reasoning(output1)
-        assert reasoning is None
-        assert content == output1
+        # Implicit mode: everything before </think> is reasoning
+        assert reasoning == "some text"
+        assert content == "more text"
 
-        # Only start tag - should be pure content (incomplete)
+        # Only start tag - no </think> means model is still generating
+        # Qwen3 requires </think> to extract reasoning (treats as pure content until then)
         output2 = "<think>incomplete reasoning"
         reasoning, content = parser.extract_reasoning(output2)
-        # For Qwen3, incomplete tags means the model is still thinking
-        # The content should be treated as incomplete reasoning or pure content
-        assert content == output2 or reasoning is None
+        # No </think> = no reasoning extraction, entire output is content
+        assert reasoning is None
+        assert content == output2
 
     def test_qwen3_empty_think_tags(self, parser):
         """Test empty think tags."""

@@ -11,9 +11,8 @@ These models define the request and response schemas for:
 
 import time
 import uuid
-from typing import List, Optional, Union
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, computed_field
 
 # =============================================================================
 # Content Types (for multimodal messages)
@@ -24,7 +23,7 @@ class ImageUrl(BaseModel):
     """Image URL with optional detail level."""
 
     url: str
-    detail: Optional[str] = None
+    detail: str | None = None
 
 
 class VideoUrl(BaseModel):
@@ -52,11 +51,11 @@ class ContentPart(BaseModel):
     """
 
     type: str  # "text", "image_url", "video", "video_url", "audio_url"
-    text: Optional[str] = None
-    image_url: Optional[Union[ImageUrl, dict, str]] = None
-    video: Optional[str] = None
-    video_url: Optional[Union[VideoUrl, dict, str]] = None
-    audio_url: Optional[Union[AudioUrl, dict, str]] = None
+    text: str | None = None
+    image_url: ImageUrl | dict | str | None = None
+    video: str | None = None
+    video_url: VideoUrl | dict | str | None = None
+    audio_url: AudioUrl | dict | str | None = None
 
 
 # =============================================================================
@@ -76,11 +75,11 @@ class Message(BaseModel):
     """
 
     role: str
-    content: Optional[Union[str, List[ContentPart], List[dict]]] = None
+    content: str | list[ContentPart] | list[dict] | None = None
     # For assistant messages with tool calls
-    tool_calls: Optional[List[dict]] = None
+    tool_calls: list[dict] | None = None
     # For tool response messages (role="tool")
-    tool_call_id: Optional[str] = None
+    tool_call_id: str | None = None
 
 
 # =============================================================================
@@ -119,9 +118,9 @@ class ResponseFormatJsonSchema(BaseModel):
     """JSON Schema definition for structured output."""
 
     name: str
-    description: Optional[str] = None
+    description: str | None = None
     schema_: dict = Field(alias="schema")  # JSON Schema specification
-    strict: Optional[bool] = False
+    strict: bool | None = False
 
     class Config:
         populate_by_name = True
@@ -138,7 +137,7 @@ class ResponseFormat(BaseModel):
     """
 
     type: str = "text"  # "text", "json_object", "json_schema"
-    json_schema: Optional[ResponseFormatJsonSchema] = None
+    json_schema: ResponseFormatJsonSchema | None = None
 
 
 # =============================================================================
@@ -156,33 +155,40 @@ class ChatCompletionRequest(BaseModel):
     """Request for chat completion."""
 
     model: str
-    messages: List[Message]
+    messages: list[Message]
     temperature: float = 0.7
     top_p: float = 0.9
-    max_tokens: Optional[int] = None
+    max_tokens: int | None = None
     stream: bool = False
-    stream_options: Optional[StreamOptions] = (
+    stream_options: StreamOptions | None = (
         None  # Streaming options (include_usage, etc.)
     )
-    stop: Optional[List[str]] = None
+    stop: list[str] | None = None
     # Tool calling
-    tools: Optional[List[ToolDefinition]] = None
-    tool_choice: Optional[Union[str, dict]] = None  # "auto", "none", or specific tool
+    tools: list[ToolDefinition] | None = None
+    tool_choice: str | dict | None = None  # "auto", "none", or specific tool
     # Structured output
-    response_format: Optional[Union[ResponseFormat, dict]] = None
+    response_format: ResponseFormat | dict | None = None
     # MLLM-specific parameters
-    video_fps: Optional[float] = None
-    video_max_frames: Optional[int] = None
+    video_fps: float | None = None
+    video_max_frames: int | None = None
     # Request timeout in seconds (None = use server default)
-    timeout: Optional[float] = None
+    timeout: float | None = None
 
 
 class AssistantMessage(BaseModel):
     """Response message from the assistant."""
 
     role: str = "assistant"
-    content: Optional[str] = None
-    tool_calls: Optional[List[ToolCall]] = None
+    content: str | None = None
+    reasoning: str | None = None  # Reasoning/thinking content (when --reasoning-parser is used)
+    tool_calls: list[ToolCall] | None = None
+
+    @computed_field
+    @property
+    def reasoning_content(self) -> str | None:
+        """Alias for reasoning field. Serialized for backwards compatibility with clients expecting reasoning_content."""
+        return self.reasoning
 
 
 class ChatCompletionChoice(BaseModel):
@@ -190,7 +196,7 @@ class ChatCompletionChoice(BaseModel):
 
     index: int = 0
     message: AssistantMessage
-    finish_reason: Optional[str] = "stop"
+    finish_reason: str | None = "stop"
 
 
 class Usage(BaseModel):
@@ -208,7 +214,7 @@ class ChatCompletionResponse(BaseModel):
     object: str = "chat.completion"
     created: int = Field(default_factory=lambda: int(time.time()))
     model: str
-    choices: List[ChatCompletionChoice]
+    choices: list[ChatCompletionChoice]
     usage: Usage = Field(default_factory=Usage)
 
 
@@ -221,14 +227,14 @@ class CompletionRequest(BaseModel):
     """Request for text completion."""
 
     model: str
-    prompt: Union[str, List[str]]
+    prompt: str | list[str]
     temperature: float = 0.7
     top_p: float = 0.9
-    max_tokens: Optional[int] = None
+    max_tokens: int | None = None
     stream: bool = False
-    stop: Optional[List[str]] = None
+    stop: list[str] | None = None
     # Request timeout in seconds (None = use server default)
-    timeout: Optional[float] = None
+    timeout: float | None = None
 
 
 class CompletionChoice(BaseModel):
@@ -236,7 +242,7 @@ class CompletionChoice(BaseModel):
 
     index: int = 0
     text: str
-    finish_reason: Optional[str] = "stop"
+    finish_reason: str | None = "stop"
 
 
 class CompletionResponse(BaseModel):
@@ -246,7 +252,7 @@ class CompletionResponse(BaseModel):
     object: str = "text_completion"
     created: int = Field(default_factory=lambda: int(time.time()))
     model: str
-    choices: List[CompletionChoice]
+    choices: list[CompletionChoice]
     usage: Usage = Field(default_factory=Usage)
 
 
@@ -268,7 +274,7 @@ class ModelsResponse(BaseModel):
     """Response for listing models."""
 
     object: str = "list"
-    data: List[ModelInfo]
+    data: list[ModelInfo]
 
 
 # =============================================================================
@@ -288,7 +294,7 @@ class MCPToolInfo(BaseModel):
 class MCPToolsResponse(BaseModel):
     """Response for listing MCP tools."""
 
-    tools: List[MCPToolInfo]
+    tools: list[MCPToolInfo]
     count: int
 
 
@@ -299,13 +305,13 @@ class MCPServerInfo(BaseModel):
     state: str
     transport: str
     tools_count: int
-    error: Optional[str] = None
+    error: str | None = None
 
 
 class MCPServersResponse(BaseModel):
     """Response for listing MCP servers."""
 
-    servers: List[MCPServerInfo]
+    servers: list[MCPServerInfo]
 
 
 class MCPExecuteRequest(BaseModel):
@@ -319,9 +325,9 @@ class MCPExecuteResponse(BaseModel):
     """Response from executing an MCP tool."""
 
     tool_name: str
-    content: Optional[Union[str, list, dict]] = None
+    content: str | list | dict | None = None
     is_error: bool = False
-    error_message: Optional[str] = None
+    error_message: str | None = None
 
 
 # =============================================================================
@@ -333,19 +339,19 @@ class AudioTranscriptionRequest(BaseModel):
     """Request for audio transcription (STT)."""
 
     model: str = "whisper-large-v3"
-    language: Optional[str] = None
+    language: str | None = None
     response_format: str = "json"
     temperature: float = 0.0
-    timestamp_granularities: Optional[List[str]] = None
+    timestamp_granularities: list[str] | None = None
 
 
 class AudioTranscriptionResponse(BaseModel):
     """Response from audio transcription."""
 
     text: str
-    language: Optional[str] = None
-    duration: Optional[float] = None
-    segments: Optional[List[dict]] = None
+    language: str | None = None
+    duration: float | None = None
+    segments: list[dict] | None = None
 
 
 class AudioSpeechRequest(BaseModel):
@@ -362,7 +368,7 @@ class AudioSeparationRequest(BaseModel):
     """Request for audio source separation."""
 
     model: str = "htdemucs"
-    stems: List[str] = Field(default_factory=lambda: ["vocals", "accompaniment"])
+    stems: list[str] = Field(default_factory=lambda: ["vocals", "accompaniment"])
 
 
 # =============================================================================
@@ -373,9 +379,16 @@ class AudioSeparationRequest(BaseModel):
 class ChatCompletionChunkDelta(BaseModel):
     """Delta content in a streaming chunk."""
 
-    role: Optional[str] = None
-    content: Optional[str] = None
-    tool_calls: Optional[List[dict]] = None
+    role: str | None = None
+    content: str | None = None
+    reasoning: str | None = None  # Reasoning/thinking content (when --reasoning-parser is used)
+    tool_calls: list[dict] | None = None
+
+    @computed_field
+    @property
+    def reasoning_content(self) -> str | None:
+        """Alias for reasoning field. Serialized for backwards compatibility with clients expecting reasoning_content."""
+        return self.reasoning
 
 
 class ChatCompletionChunkChoice(BaseModel):
@@ -383,7 +396,7 @@ class ChatCompletionChunkChoice(BaseModel):
 
     index: int = 0
     delta: ChatCompletionChunkDelta
-    finish_reason: Optional[str] = None
+    finish_reason: str | None = None
 
 
 class ChatCompletionChunk(BaseModel):
@@ -393,5 +406,5 @@ class ChatCompletionChunk(BaseModel):
     object: str = "chat.completion.chunk"
     created: int = Field(default_factory=lambda: int(time.time()))
     model: str
-    choices: List[ChatCompletionChunkChoice]
+    choices: list[ChatCompletionChunkChoice]
     usage: Usage | None = None  # Included when stream_options.include_usage=true
