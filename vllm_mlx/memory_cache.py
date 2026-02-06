@@ -318,6 +318,12 @@ class MemoryAwarePrefixCache:
         best_match: _CacheEntry | None = None
         best_length = 0
 
+        # Also check supersequence matches (longer cached sequences where
+        # our tokens are a prefix of the cached key).  This handles the
+        # common case of identical repeated prompts: the cache stores
+        # prompt+output tokens, but fetch uses only prompt tokens.
+        best_super: _CacheEntry | None = None
+
         for cached_key, entry in self._entries.items():
             cached_len = len(cached_key)
             # Check if cached sequence is a prefix of requested tokens
@@ -328,6 +334,11 @@ class MemoryAwarePrefixCache:
             ):
                 best_match = entry
                 best_length = cached_len
+            # Check if requested tokens are a prefix of cached sequence
+            elif cached_len >= len(tokens) and cached_key[: len(tokens)] == tokens_key:
+                # Prefer the longest match (most KV data already computed)
+                if best_super is None or cached_len > len(best_super.tokens):
+                    best_super = entry
 
         if best_match is not None:
             # Move matched entry to end (most recently used)
@@ -336,6 +347,13 @@ class MemoryAwarePrefixCache:
             self._stats.tokens_saved += best_length
             remaining = tokens[best_length:]
             return best_match.cache, remaining
+
+        if best_super is not None:
+            # Supersequence hit — cached entry covers all requested tokens
+            self._entries.move_to_end(best_super.tokens)
+            self._stats.hits += 1
+            self._stats.tokens_saved += len(tokens)
+            return best_super.cache, []
 
         self._stats.misses += 1
         return None, tokens
@@ -469,3 +487,183 @@ class MemoryAwarePrefixCache:
     def __contains__(self, tokens: list[int]) -> bool:
         """Check if tokens are cached."""
         return tuple(tokens) in self._entries
+
+    # -----------------------------------------------------------------
+    # Disk persistence — survives server restarts
+    # -----------------------------------------------------------------
+
+    def save_to_disk(self, cache_dir: str) -> bool:
+        """Save all cache entries to disk using mlx_lm's safetensors format.
+
+        Directory layout::
+
+            cache_dir/
+              index.json          # token keys + metadata per entry
+              entry_0.safetensors # KV arrays for entry 0
+              entry_1.safetensors
+              ...
+
+        Returns True if at least one entry was saved.
+        """
+        import json
+        import os
+        import time as _time
+
+        if not self._entries:
+            logger.info("[cache_persist] nothing to save (0 entries)")
+            return False
+
+        t0 = _time.monotonic()
+        os.makedirs(cache_dir, exist_ok=True)
+
+        try:
+            from mlx_lm.models.cache import save_prompt_cache
+        except ImportError:
+            logger.warning("[cache_persist] mlx_lm not available, cannot save")
+            return False
+
+        index = {
+            "version": 2,
+            "num_entries": len(self._entries),
+            "total_memory_bytes": self._current_memory,
+            "entries": [],
+        }
+
+        saved = 0
+        for i, (tokens_key, entry) in enumerate(self._entries.items()):
+            entry_path = os.path.join(cache_dir, f"entry_{i}.safetensors")
+            try:
+                save_prompt_cache(
+                    entry_path,
+                    entry.cache,
+                    metadata={"num_tokens": str(len(tokens_key))},
+                )
+                # Save tokens separately (can be 100K+ ints → binary is smaller)
+                tokens_path = os.path.join(cache_dir, f"entry_{i}_tokens.bin")
+                import array as _array
+
+                arr = _array.array("i", tokens_key)  # 32-bit signed ints
+                with open(tokens_path, "wb") as f:
+                    arr.tofile(f)
+
+                index["entries"].append(
+                    {
+                        "index": i,
+                        "num_tokens": len(tokens_key),
+                        "memory_bytes": entry.memory_bytes,
+                    }
+                )
+                saved += 1
+                logger.info(
+                    f"[cache_persist] saved entry {i}: "
+                    f"{len(tokens_key)} tokens, "
+                    f"{entry.memory_bytes / _BYTES_PER_MB:.1f}MB KV, "
+                    f"file={entry_path}"
+                )
+            except Exception as e:
+                logger.warning(f"[cache_persist] failed to save entry {i}: {e}")
+
+        index_path = os.path.join(cache_dir, "index.json")
+        with open(index_path, "w") as f:
+            json.dump(index, f, indent=2)
+
+        dt = _time.monotonic() - t0
+        logger.info(
+            f"[cache_persist] SAVED {saved}/{len(self._entries)} entries "
+            f"to {cache_dir} in {dt:.1f}s "
+            f"({self._current_memory / _BYTES_PER_MB:.0f}MB total)"
+        )
+        return saved > 0
+
+    def load_from_disk(self, cache_dir: str) -> int:
+        """Load cache entries from disk.
+
+        Returns the number of entries successfully loaded.
+        """
+        import json
+        import os
+        import time as _time
+
+        index_path = os.path.join(cache_dir, "index.json")
+        if not os.path.exists(index_path):
+            logger.info(f"[cache_persist] no index at {index_path}, nothing to load")
+            return 0
+
+        t0 = _time.monotonic()
+
+        try:
+            from mlx_lm.models.cache import load_prompt_cache
+        except ImportError:
+            logger.warning("[cache_persist] mlx_lm not available, cannot load")
+            return 0
+
+        with open(index_path) as f:
+            index = json.load(f)
+
+        version = index.get("version", 1)
+        if version < 2:
+            logger.warning(f"[cache_persist] unsupported version {version}, skipping")
+            return 0
+
+        loaded = 0
+        for entry_meta in index.get("entries", []):
+            i = entry_meta["index"]
+            entry_path = os.path.join(cache_dir, f"entry_{i}.safetensors")
+            tokens_path = os.path.join(cache_dir, f"entry_{i}_tokens.bin")
+
+            if not os.path.exists(entry_path) or not os.path.exists(tokens_path):
+                logger.warning(f"[cache_persist] missing files for entry {i}, skipping")
+                continue
+
+            try:
+                # Load tokens from binary
+                import array as _array
+
+                arr = _array.array("i")
+                with open(tokens_path, "rb") as f:
+                    arr.fromfile(f, entry_meta["num_tokens"])
+                tokens = list(arr)
+
+                # Load KV cache
+                cache = load_prompt_cache(entry_path)
+
+                # Estimate memory
+                memory = estimate_kv_cache_memory(cache)
+
+                # Check if it fits
+                if self._current_memory + memory > self._max_memory:
+                    logger.info(
+                        f"[cache_persist] entry {i} would exceed memory limit "
+                        f"({(self._current_memory + memory) / _BYTES_PER_MB:.0f}MB > "
+                        f"{self._max_memory / _BYTES_PER_MB:.0f}MB), stopping load"
+                    )
+                    break
+
+                tokens_key = tuple(tokens)
+                entry = _CacheEntry(
+                    tokens=tokens_key,
+                    cache=cache,
+                    memory_bytes=memory,
+                )
+                self._entries[tokens_key] = entry
+                self._current_memory += memory
+                loaded += 1
+
+                logger.info(
+                    f"[cache_persist] loaded entry {i}: "
+                    f"{len(tokens)} tokens, "
+                    f"{memory / _BYTES_PER_MB:.1f}MB KV"
+                )
+
+            except Exception as e:
+                logger.warning(f"[cache_persist] failed to load entry {i}: {e}")
+
+        self._stats.entry_count = len(self._entries)
+        self._stats.current_memory_bytes = self._current_memory
+
+        dt = _time.monotonic() - t0
+        logger.info(
+            f"[cache_persist] LOADED {loaded} entries from {cache_dir} "
+            f"in {dt:.1f}s ({self._current_memory / _BYTES_PER_MB:.0f}MB total)"
+        )
+        return loaded

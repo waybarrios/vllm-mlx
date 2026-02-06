@@ -78,6 +78,17 @@ class SchedulerConfig:
     paged_cache_block_size: int = 64  # Tokens per block
     max_cache_blocks: int = 1000  # Maximum number of cache blocks
 
+    # Chunked prefill: max tokens to prefill per scheduler step (0 = disabled)
+    # When enabled, large prompts are split into chunks so that active
+    # generation requests are not starved during long prefills.
+    chunked_prefill_tokens: int = 0
+
+    # Mid-prefill cache saving: save intermediate KV cache every N tokens
+    # during chunked prefill. If the client disconnects mid-prefill, the
+    # saved cache is reused for the next request with the same prefix.
+    # 0 = disabled. Only effective when chunked_prefill_tokens > 0.
+    mid_prefill_save_interval: int = 8192
+
 
 @dataclass
 class SchedulerOutput:
@@ -97,6 +108,299 @@ class SchedulerOutput:
     outputs: List[RequestOutput] = field(default_factory=list)
     # Whether any work was done
     has_work: bool = False
+
+
+def _install_chunked_prefill(
+    batch_gen: "BatchGenerator",
+    budget: int,
+    mid_prefill_save=None,
+) -> None:
+    """
+    Monkey-patch a BatchGenerator instance so that large prefills are
+    broken into chunks of at most *budget* tokens each.
+
+    Between chunks the generation loop gets a chance to produce one token
+    for every active request, preventing starvation during long prefills.
+
+    Args:
+        batch_gen: The BatchGenerator to patch.
+        budget: Max tokens per prefill chunk.
+        mid_prefill_save: Optional callback(uid, processed, prompt_cache)
+            called after each chunk to save intermediate KV cache state.
+    """
+    import time as _time
+
+    from mlx_lm.generate import (
+        Batch,
+        _left_pad_prompts,
+        _make_cache,
+        _merge_caches,
+        _right_pad_prompts,
+    )
+
+    # Keep references to originals
+    _orig_next = batch_gen._next
+    _orig_remove = batch_gen.remove
+
+    # Partial prefill state (None when no prefill in progress)
+    batch_gen._partial = None
+
+    def _generation_step(self=batch_gen):
+        """Run one generation step on the active batch. Returns responses."""
+        batch = self.active_batch
+        if batch is None or len(batch) == 0:
+            return []
+
+        tic_gen = _time.perf_counter()
+        y, logprobs = batch.y, batch.logprobs
+        for i, toks in enumerate(batch.tokens):
+            batch.tokens[i] = mx.concatenate((toks, y[i : i + 1]))
+        batch.y, batch.logprobs = self._step(
+            y[:, None],
+            batch.cache,
+            batch.samplers,
+            batch.logits_processors,
+            batch.tokens,
+        )
+        mx.async_eval(batch.y, batch.logprobs)
+
+        y = y.tolist()
+        self._stats.generation_time += _time.perf_counter() - tic_gen
+
+        keep_idx = []
+        end_idx = []
+        responses = []
+        for e, (t, uid, num_tok, max_tok) in enumerate(
+            zip(y, batch.uids, batch.num_tokens, batch.max_tokens)
+        ):
+            cache_out = None
+            num_tok += 1
+            batch.num_tokens[e] = num_tok
+            if t in self.stop_tokens:
+                finish_reason = "stop"
+                end_idx.append(e)
+            elif num_tok >= max_tok:
+                finish_reason = "length"
+                end_idx.append(e)
+            else:
+                finish_reason = None
+                keep_idx.append(e)
+            if finish_reason is not None:
+                cache_out = batch.extract_cache(e)
+            responses.append(
+                self.Response(uid, t, logprobs[e], finish_reason, cache_out)
+            )
+
+        if len(end_idx):
+            if len(keep_idx) > 0:
+                batch.filter(keep_idx)
+            else:
+                self.active_batch = None
+
+        self._stats.generation_tokens += len(responses)
+        return responses
+
+    def _chunked_next(self=batch_gen):  # noqa: C901
+        """
+        Replacement for _next() that chunks large prefills.
+
+        Only intercepts when:
+        1. A partial prefill is in progress (_partial is not None)
+        2. The next prompt batch exceeds the budget
+
+        Everything else delegates to the original _next().
+        """
+        # ----- Continue a partial prefill -----
+        if self._partial is not None:
+            tic = _time.perf_counter()
+            partial = self._partial
+            inputs = partial["inputs"]
+            prompt_cache = partial["cache"]
+            remaining = inputs.shape[1]
+
+            n_to_process = min(budget, remaining - 1) if remaining > 1 else 0
+
+            if n_to_process > 0:
+                self.model(inputs[:, :n_to_process], cache=prompt_cache)
+                mx.eval([c.state for c in prompt_cache])
+                inputs = inputs[:, n_to_process:]
+                partial["inputs"] = inputs
+                partial["processed"] += n_to_process
+
+                self.prompt_progress_callback(
+                    [
+                        (uid, partial["processed"], partial["total"])
+                        for uid in partial["uids"]
+                    ]
+                )
+
+                # Save intermediate cache for disconnect resilience
+                if mid_prefill_save is not None and len(partial["uids"]) == 1:
+                    mid_prefill_save(
+                        partial["uids"][0], partial["processed"], prompt_cache
+                    )
+
+                if partial.get("is_cached"):
+                    mx.clear_cache()
+
+            # Check if prefill is done (only 1 token left or 0)
+            if inputs.shape[1] <= 1:
+                # Finalize
+                if partial.get("is_cached"):
+                    mx.eval([c.state for c in prompt_cache])
+                    inputs = partial["last_inputs"]
+
+                for c in prompt_cache:
+                    c.finalize()
+                mx.clear_cache()
+
+                y, logprobs = self._step(
+                    inputs,
+                    prompt_cache,
+                    partial["samplers"],
+                    partial["logits_processors"],
+                    partial["tokens"],
+                )
+                mx.async_eval(y, logprobs)
+
+                new_batch = Batch(
+                    list(partial["uids"]),
+                    y,
+                    logprobs,
+                    list(partial["max_tokens"]),
+                    [0] * len(partial["uids"]),
+                    prompt_cache,
+                    list(partial["samplers"]),
+                    list(partial["logits_processors"]),
+                    partial["tokens"],
+                )
+
+                if self.active_batch is None:
+                    self.active_batch = new_batch
+                else:
+                    self.active_batch.extend(new_batch)
+
+                self._partial = None
+                self._stats.prompt_time += _time.perf_counter() - tic
+            else:
+                # Not done yet — record prompt time for this chunk
+                self._stats.prompt_time += _time.perf_counter() - tic
+
+            # Generation step for active requests between chunks
+            return _generation_step()
+
+        # ----- No partial — check if next prompt batch needs chunking -----
+        num_active = len(self.active_batch) if self.active_batch else 0
+        num_to_add = self.completion_batch_size - num_active
+
+        if num_to_add >= self.prefill_batch_size and self.unprocessed_prompts:
+            batch_prompts = self.unprocessed_prompts[: self.prefill_batch_size]
+            if batch_prompts:
+                total_tokens = sum(len(p[1]) for p in batch_prompts)
+
+                if total_tokens > budget:
+                    # Large prompt batch — start partial prefill
+                    tic = _time.perf_counter()
+
+                    # Eval outstanding generation tokens before switching
+                    if self.active_batch is not None:
+                        mx.eval(self.active_batch.y, self.active_batch.logprobs)
+                        self._stats.generation_time += _time.perf_counter() - tic
+                        tic = _time.perf_counter()
+
+                    (
+                        uids,
+                        inputs_raw,
+                        max_tokens_list,
+                        caches,
+                        samplers,
+                        logits_processors,
+                    ) = zip(*batch_prompts)
+                    lengths = [len(p) for p in inputs_raw]
+                    max_length = max(lengths)
+                    padding = [max_length - l for l in lengths]
+                    tokens = [mx.array(inp) for inp in inputs_raw]
+                    is_cached = not all(c[0].empty() for c in caches)
+
+                    self._stats.prompt_tokens += sum(lengths)
+
+                    if not is_cached:
+                        padded = _left_pad_prompts(inputs_raw, max_length=max_length)
+                        prompt_cache = _make_cache(self.model, padding)
+                    else:
+                        last_inputs = mx.array([p[-1:] for p in inputs_raw])
+                        padded = _right_pad_prompts(inputs_raw, max_length=max_length)
+                        prompt_cache = _merge_caches(caches)
+                        for c in prompt_cache:
+                            c.prepare(
+                                lengths=[l - 1 for l in lengths],
+                                right_padding=padding,
+                            )
+
+                    # Remove from unprocessed
+                    self.unprocessed_prompts = self.unprocessed_prompts[
+                        self.prefill_batch_size :
+                    ]
+
+                    # Process first chunk
+                    n_to_process = min(budget, padded.shape[1] - 1)
+                    if n_to_process > 0:
+                        self.model(padded[:, :n_to_process], cache=prompt_cache)
+                        mx.eval([c.state for c in prompt_cache])
+                        padded = padded[:, n_to_process:]
+                        if is_cached:
+                            mx.clear_cache()
+
+                    self._partial = {
+                        "uids": list(uids),
+                        "inputs": padded,
+                        "cache": prompt_cache,
+                        "tokens": tokens,
+                        "max_tokens": list(max_tokens_list),
+                        "samplers": list(samplers),
+                        "logits_processors": list(logits_processors),
+                        "processed": n_to_process,
+                        "total": max_length,
+                        "is_cached": is_cached,
+                    }
+                    if is_cached:
+                        self._partial["last_inputs"] = last_inputs
+
+                    self.prompt_progress_callback(
+                        [
+                            (uid, n_to_process, max_length)
+                            for uid in self._partial["uids"]
+                        ]
+                    )
+
+                    # Save intermediate cache for disconnect resilience
+                    if mid_prefill_save is not None and len(uids) == 1:
+                        mid_prefill_save(uids[0], n_to_process, prompt_cache)
+
+                    self._stats.prompt_time += _time.perf_counter() - tic
+
+                    # Generation step for active requests
+                    return _generation_step()
+
+        # Small prompts, pure generation, or no work — delegate to original
+        return _orig_next()
+
+    def _patched_remove(uids_to_remove, _self=batch_gen):
+        """Clear partial state if aborted request is being prefilled."""
+        if _self._partial is not None:
+            partial_uids = set(_self._partial["uids"])
+            if partial_uids & set(uids_to_remove):
+                logger.info(
+                    f"[chunked_prefill] clearing partial state for aborted uids: "
+                    f"{partial_uids & set(uids_to_remove)}"
+                )
+                _self._partial = None
+        _orig_remove(uids_to_remove)
+
+    batch_gen._next = _chunked_next
+    batch_gen.remove = _patched_remove
+
+    logger.info(f"[chunked_prefill] installed with budget={budget} tokens per step")
 
 
 class Scheduler:
@@ -201,7 +505,8 @@ class Scheduler:
         # Memory management: periodic mx.clear_cache() to free Metal command buffers
         # Lower interval = less VRAM spike during generation but slight throughput cost
         self._step_count = 0
-        self._clear_cache_interval = 32
+        self._clear_cache_interval = 16
+        self._memory_log_interval = 256
 
     def _get_actual_tokenizer(self, tokenizer: Any) -> Any:
         """
@@ -260,7 +565,16 @@ class Scheduler:
         if sampling_params.stop_token_ids:
             stop_tokens.update(sampling_params.stop_token_ids)
 
-        return BatchGenerator(
+        def _prefill_progress(progress_list):
+            """Log prefill progress for each uid chunk."""
+            for uid, processed, total in progress_list:
+                rid = self.uid_to_request_id.get(uid, "?")
+                logger.info(
+                    f"[prefill] request={rid[:12] if isinstance(rid, str) else rid} "
+                    f"tokens={processed}/{total}"
+                )
+
+        bg = BatchGenerator(
             model=self.model,
             max_tokens=sampling_params.max_tokens,
             stop_tokens=stop_tokens,
@@ -268,7 +582,84 @@ class Scheduler:
             prefill_batch_size=self.config.prefill_batch_size,
             completion_batch_size=self.config.completion_batch_size,
             prefill_step_size=self.config.prefill_step_size,
+            prompt_progress_callback=_prefill_progress,
         )
+
+        if self.config.chunked_prefill_tokens > 0:
+            mid_prefill_cb = None
+            save_interval = self.config.mid_prefill_save_interval
+            if save_interval > 0 and self.memory_aware_cache is not None:
+                mid_prefill_cb = self._make_mid_prefill_save_callback(save_interval)
+                logger.info(f"[mid_prefill_cache] enabled, interval={save_interval}")
+            _install_chunked_prefill(
+                bg, self.config.chunked_prefill_tokens, mid_prefill_cb
+            )
+
+        return bg
+
+    def _make_mid_prefill_save_callback(self, save_interval: int):
+        """Create a callback for saving intermediate KV cache during chunked prefill.
+
+        The callback is called after each chunk with (uid, processed_tokens,
+        prompt_cache).  It extracts the cache state (immutable MLX array
+        snapshots), reconstructs KVCache objects, and stores them in the
+        memory-aware prefix cache so that a subsequent request with the same
+        prompt prefix can skip the already-computed tokens.
+        """
+        import time as _time
+
+        def _mid_prefill_save(uid, processed_tokens, prompt_cache):
+            request_id = self.uid_to_request_id.get(uid)
+            if not request_id:
+                return
+            request = self.requests.get(request_id)
+            if not request or not request.prompt_token_ids:
+                return
+
+            total_cached = (request.cached_tokens or 0) + processed_tokens
+
+            # Throttle: only save every save_interval tokens
+            last_save = getattr(request, "_mid_prefill_last_save", 0)
+            if total_cached - last_save < save_interval:
+                return
+
+            # Extract immutable state snapshots
+            extracted = self._extract_cache_states(prompt_cache)
+            if not extracted:
+                return
+
+            # Reconstruct cache objects (directly usable by BatchGenerator)
+            reconstructed = self._reconstruct_cache_from_states(extracted)
+            if not reconstructed:
+                return
+
+            prefix_tokens = list(request.prompt_token_ids[:total_cached])
+
+            # Remove previous intermediate entry to avoid memory waste
+            old_key = getattr(request, "_mid_prefill_cache_key", None)
+            if old_key is not None:
+                self.memory_aware_cache.remove(list(old_key))
+
+            _t0 = _time.monotonic()
+            stored = self.memory_aware_cache.store(prefix_tokens, reconstructed)
+            _dt = _time.monotonic() - _t0
+
+            if stored:
+                request._mid_prefill_last_save = total_cached
+                request._mid_prefill_cache_key = tuple(prefix_tokens)
+                logger.info(
+                    f"[mid_prefill_cache] request={request_id[:12]} "
+                    f"saved {total_cached}/{len(request.prompt_token_ids)} tokens "
+                    f"({total_cached * 100 // len(request.prompt_token_ids)}%) "
+                    f"store_time={_dt:.3f}s"
+                )
+            else:
+                logger.debug(
+                    f"[mid_prefill_cache] request={request_id[:12]} "
+                    f"store rejected for {total_cached} tokens"
+                )
+
+        return _mid_prefill_save
 
     def _close_batch_generator(self) -> None:
         """Properly close BatchGenerator to restore wired_limit."""
@@ -380,13 +771,14 @@ class Scheduler:
         for layer_cache in raw_cache:
             try:
                 if hasattr(layer_cache, "state") and hasattr(layer_cache, "meta_state"):
-                    state = layer_cache.state  # (keys, values) MLX arrays
+                    state = layer_cache.state  # (keys, values) or more for Mamba
                     meta = layer_cache.meta_state  # (offset,) as strings
                     extracted.append(
                         {
                             "state": state,
                             "meta_state": meta,
                             "class_name": type(layer_cache).__name__,
+                            "class_ref": type(layer_cache),
                         }
                     )
             except Exception as e:
@@ -394,6 +786,56 @@ class Scheduler:
                 continue
 
         return extracted if len(extracted) == len(raw_cache) else []
+
+    def _reconstruct_cache_from_states(
+        self, extracted_states: List[Dict[str, Any]]
+    ) -> Optional[List[Any]]:
+        """
+        Reconstruct cache objects from extracted cache states.
+
+        This is the inverse of _extract_cache_states(). Uses mlx-lm's
+        _BaseCache.from_state() to reconstruct any cache type (KVCache,
+        MambaCache, etc.) from its state/meta_state.
+
+        Args:
+            extracted_states: List of dicts from _extract_cache_states()
+
+        Returns:
+            List of cache objects, or None if reconstruction fails
+        """
+        if not extracted_states:
+            return None
+
+        try:
+            caches = []
+            for layer_state in extracted_states:
+                state = layer_state.get("state")
+                meta_state = layer_state.get("meta_state")
+                cache_cls = layer_state.get("class_ref")
+                if state is None:
+                    return None
+
+                if cache_cls is not None and hasattr(cache_cls, "from_state"):
+                    cache = cache_cls.from_state(state, meta_state)
+                else:
+                    # Fallback: try KVCache manual reconstruction
+                    from mlx_lm.models.cache import KVCache
+
+                    if len(state) != 2:
+                        return None
+                    cache = KVCache()
+                    cache.keys, cache.values = state
+                    cache.offset = (
+                        int(meta_state[0]) if meta_state else cache.keys.shape[2]
+                    )
+
+                caches.append(cache)
+
+            return caches
+
+        except Exception as e:
+            logger.info(f"[mid_prefill_cache] reconstruct EXCEPTION: {e}")
+            return None
 
     def add_request(self, request: Request) -> None:
         """
@@ -458,18 +900,28 @@ class Scheduler:
                 request.remaining_tokens = request.prompt_token_ids
         elif self.memory_aware_cache is not None:
             # Use memory-aware prefix cache
+            import time as _time
+
+            _fetch_t0 = _time.monotonic()
             cache, remaining = self.memory_aware_cache.fetch(request.prompt_token_ids)
+            _fetch_dt = _time.monotonic() - _fetch_t0
             if cache:
                 request.prompt_cache = cache
                 request.cached_tokens = len(request.prompt_token_ids) - len(remaining)
                 request.remaining_tokens = remaining
-                logger.debug(
-                    f"Request {request.request_id}: memory-aware cache hit, "
-                    f"{request.cached_tokens} tokens cached, "
-                    f"{len(remaining)} tokens remaining"
+                logger.info(
+                    f"[cache_fetch] request={request.request_id[:12]} HIT "
+                    f"prompt_tokens={len(request.prompt_token_ids)} "
+                    f"cached={request.cached_tokens} remaining={len(remaining)} "
+                    f"time={_fetch_dt:.3f}s"
                 )
             else:
                 request.remaining_tokens = request.prompt_token_ids
+                logger.info(
+                    f"[cache_fetch] request={request.request_id[:12]} MISS "
+                    f"prompt_tokens={len(request.prompt_token_ids)} "
+                    f"time={_fetch_dt:.3f}s entries={len(self.memory_aware_cache._entries)}"
+                )
         elif self.prefix_cache is not None:
             # Use legacy prefix cache
             cache, remaining = self.prefix_cache.fetch_cache(request.prompt_token_ids)
@@ -507,10 +959,16 @@ class Scheduler:
         """
         request = self.requests.get(request_id)
         if request is None:
+            logger.info(f"[abort_request] {request_id[:12]} not found in requests dict")
             return False
+
+        was_waiting = False
+        was_running = False
+        removed_from_batch = False
 
         # Remove from waiting queue
         if request.status == RequestStatus.WAITING:
+            was_waiting = True
             try:
                 self.waiting.remove(request)
             except ValueError:
@@ -518,9 +976,11 @@ class Scheduler:
 
         # Remove from running (BatchGenerator)
         if request.request_id in self.request_id_to_uid:
+            was_running = True
             uid = self.request_id_to_uid[request.request_id]
             if self.batch_generator is not None:
                 self.batch_generator.remove([uid])
+                removed_from_batch = True
             del self.uid_to_request_id[uid]
             del self.request_id_to_uid[request.request_id]
 
@@ -531,7 +991,12 @@ class Scheduler:
         request.set_finished(RequestStatus.FINISHED_ABORTED)
         self.finished_req_ids.add(request_id)
 
-        logger.debug(f"Aborted request {request_id}")
+        logger.info(
+            f"[abort_request] {request_id[:12]} ABORTED "
+            f"was_waiting={was_waiting} was_running={was_running} "
+            f"removed_from_batch={removed_from_batch} "
+            f"remaining_running={len(self.running)} remaining_waiting={len(self.waiting)}"
+        )
         return True
 
     def has_requests(self) -> bool:
@@ -616,9 +1081,13 @@ class Scheduler:
                     if request.cached_tokens > 0
                     else ""
                 )
-                logger.debug(
-                    f"Scheduled request {request.request_id} (uid={uid}) "
-                    f"with {request.num_prompt_tokens} tokens{cache_info}"
+                tokens_to_prefill = len(tokens_to_process)
+                logger.info(
+                    f"[schedule] request={request.request_id[:12]} uid={uid} "
+                    f"prompt_tokens={request.num_prompt_tokens} "
+                    f"tokens_to_prefill={tokens_to_prefill}{cache_info} "
+                    f"max_tokens={request.sampling_params.max_tokens} "
+                    f"running={len(self.running)} waiting={len(self.waiting)}"
                 )
 
         return scheduled
@@ -752,6 +1221,15 @@ class Scheduler:
                     # unused blocks when under memory pressure.
 
                 elif self.memory_aware_cache is not None:
+                    # Remove mid-prefill intermediate entry (superseded by full cache)
+                    mid_key = getattr(request, "_mid_prefill_cache_key", None)
+                    if mid_key is not None:
+                        self.memory_aware_cache.remove(list(mid_key))
+                        logger.debug(
+                            f"[mid_prefill_cache] removed intermediate entry "
+                            f"({len(mid_key)} tokens) for {request_id[:12]}"
+                        )
+
                     # Store in memory-aware prefix cache
                     # Key includes both prompt and output tokens for multi-turn chat caching
                     if (
@@ -762,13 +1240,21 @@ class Scheduler:
                             full_token_sequence = list(request.prompt_token_ids) + list(
                                 request.output_token_ids
                             )
-                            self.memory_aware_cache.store(
+                            import time as _time
+
+                            _store_t0 = _time.monotonic()
+                            stored = self.memory_aware_cache.store(
                                 full_token_sequence,
                                 request._extracted_cache,
                             )
-                            logger.debug(
-                                f"Stored memory-aware cache for request {request_id} "
-                                f"({len(full_token_sequence)} tokens: {len(request.prompt_token_ids)} prompt + {len(request.output_token_ids)} output)"
+                            _store_dt = _time.monotonic() - _store_t0
+                            logger.info(
+                                f"[cache_store] request={request_id[:12]} "
+                                f"tokens={len(full_token_sequence)} "
+                                f"({len(request.prompt_token_ids)} prompt + {len(request.output_token_ids)} output) "
+                                f"stored={stored} time={_store_dt:.3f}s "
+                                f"cache_entries={len(self.memory_aware_cache._entries)} "
+                                f"cache_mem={self.memory_aware_cache._current_memory / 1e6:.0f}MB"
                             )
                         except Exception as e:
                             logger.debug(
@@ -952,6 +1438,22 @@ class Scheduler:
         if self._step_count % self._clear_cache_interval == 0:
             mx.clear_cache()
 
+        # Periodically log memory stats for monitoring
+        if self._step_count % self._memory_log_interval == 0:
+            try:
+                if mx.metal.is_available():
+                    active_gb = mx.get_active_memory() / 1e9
+                    peak_gb = mx.get_peak_memory() / 1e9
+                    cache_gb = mx.get_cache_memory() / 1e9
+                    logger.info(
+                        f"[Metal memory] active={active_gb:.1f}GB "
+                        f"peak={peak_gb:.1f}GB cache={cache_gb:.1f}GB "
+                        f"step={self._step_count} "
+                        f"running={len(self.running)} waiting={len(self.waiting)}"
+                    )
+            except Exception:
+                pass
+
         return output
 
     def get_request(self, request_id: str) -> Optional[Request]:
@@ -974,15 +1476,9 @@ class Scheduler:
         # Include Metal memory stats
         try:
             if mx.metal.is_available():
-                stats["metal_active_memory_gb"] = round(
-                    mx.metal.get_active_memory() / 1e9, 2
-                )
-                stats["metal_peak_memory_gb"] = round(
-                    mx.metal.get_peak_memory() / 1e9, 2
-                )
-                stats["metal_cache_memory_gb"] = round(
-                    mx.metal.get_cache_memory() / 1e9, 2
-                )
+                stats["metal_active_memory_gb"] = round(mx.get_active_memory() / 1e9, 2)
+                stats["metal_peak_memory_gb"] = round(mx.get_peak_memory() / 1e9, 2)
+                stats["metal_cache_memory_gb"] = round(mx.get_cache_memory() / 1e9, 2)
         except Exception:
             pass
 
@@ -1057,3 +1553,21 @@ class Scheduler:
         gc.collect()
 
         logger.info("Deep reset completed - all caches cleared")
+
+    # -----------------------------------------------------------------
+    # Cache persistence
+    # -----------------------------------------------------------------
+
+    def save_cache_to_disk(self, cache_dir: str) -> bool:
+        """Save prefix cache to disk for persistence across restarts."""
+        if self.memory_aware_cache is not None:
+            return self.memory_aware_cache.save_to_disk(cache_dir)
+        logger.info("[cache_persist] no memory-aware cache to save")
+        return False
+
+    def load_cache_from_disk(self, cache_dir: str) -> int:
+        """Load prefix cache from disk. Returns number of entries loaded."""
+        if self.memory_aware_cache is not None:
+            return self.memory_aware_cache.load_from_disk(cache_dir)
+        logger.info("[cache_persist] no memory-aware cache to load into")
+        return 0

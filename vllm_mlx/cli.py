@@ -100,9 +100,13 @@ def serve_command(args):
             use_paged_cache=args.use_paged_cache,
             paged_cache_block_size=args.paged_cache_block_size,
             max_cache_blocks=args.max_cache_blocks,
+            # Chunked prefill
+            chunked_prefill_tokens=args.chunked_prefill_tokens,
         )
 
         print("Mode: Continuous batching (for multiple concurrent users)")
+        if args.chunked_prefill_tokens > 0:
+            print(f"Chunked prefill: {args.chunked_prefill_tokens} tokens per step")
         print(f"Stream interval: {args.stream_interval} tokens")
         if args.use_paged_cache:
             print(
@@ -462,6 +466,14 @@ Examples:
         type=int,
         default=1000,
         help="Maximum number of cache blocks (default: 1000)",
+    )
+    # Chunked prefill
+    serve_parser.add_argument(
+        "--chunked-prefill-tokens",
+        type=int,
+        default=0,
+        help="Max prefill tokens per scheduler step (0=disabled). "
+        "Prevents starvation of active requests during long prefills.",
     )
     # MCP options
     serve_parser.add_argument(

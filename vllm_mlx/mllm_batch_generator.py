@@ -359,7 +359,7 @@ class MLLMBatchGenerator:
         self._old_wired_limit = None
         if mx.metal.is_available():
             self._old_wired_limit = mx.set_wired_limit(
-                mx.metal.device_info()["max_recommended_working_set_size"]
+                mx.device_info()["max_recommended_working_set_size"]
             )
 
     def close(self) -> None:

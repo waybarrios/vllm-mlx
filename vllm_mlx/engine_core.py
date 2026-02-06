@@ -131,18 +131,49 @@ class EngineCore:
         return self._running
 
     async def _engine_loop(self) -> None:
-        """Main engine loop - optimized for minimal overhead."""
-        # Cache config values for faster access
+        """Main engine loop - runs scheduler.step() in a thread to keep event loop free.
+
+        scheduler.step() includes synchronous MLX prefill that can block for
+        tens of seconds on long prompts. Running it in a thread executor lets
+        the asyncio event loop remain responsive, so disconnect polling and
+        HTTP handling continue to work during prefill.
+        """
+        import concurrent.futures
+
+        # Single-thread executor ensures MLX calls are never concurrent
+        _executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="mlx-step"
+        )
+        loop = asyncio.get_running_loop()
+
         step_interval = self.config.step_interval
         stream_interval = self.config.stream_interval
         use_simple_streaming = stream_interval == 1
 
+        # Emergency memory pressure threshold (200GB)
+        _memory_pressure_threshold = 200 * 1024 * 1024 * 1024
+        _memory_check_interval = 64
+
         while self._running:
             try:
                 if self.scheduler.has_requests():
-                    # Run one generation step
-                    output = self.scheduler.step()
+                    # Run step in thread so event loop stays free during prefill
+                    output = await loop.run_in_executor(_executor, self.scheduler.step)
                     self._steps_executed += 1
+
+                    # Emergency memory pressure check
+                    if self._steps_executed % _memory_check_interval == 0:
+                        try:
+                            active_mem = mx.get_active_memory()
+                            if active_mem > _memory_pressure_threshold:
+                                mx.clear_cache()
+                                logger.warning(
+                                    f"[Memory pressure] {active_mem / 1e9:.1f}GB > "
+                                    f"{_memory_pressure_threshold / 1e9:.0f}GB threshold, "
+                                    f"forced cache clear"
+                                )
+                        except Exception:
+                            pass
 
                     # Fast path: distribute outputs to collectors
                     outputs = output.outputs
@@ -177,9 +208,11 @@ class EngineCore:
                         if output.finished_request_ids:
                             mx.clear_cache()
 
-                        # OPTIMIZATION: Only yield if streaming consumers are waiting
-                        if RequestOutputCollector.has_waiting_consumers():
-                            await asyncio.sleep(0)
+                        # Always yield to prevent event loop starvation.
+                        # Without this, orphaned requests (client disconnected but
+                        # request still in scheduler) block the entire event loop,
+                        # making the server unresponsive to all HTTP requests.
+                        await asyncio.sleep(0)
                 else:
                     # No work, yield control
                     await asyncio.sleep(step_interval)
@@ -270,16 +303,24 @@ class EngineCore:
         Yields:
             RequestOutput objects as tokens are generated
         """
+        import time as _time
+
+        _t0 = _time.monotonic()
+        _token_count = 0
+
         collector = self._output_collectors.get(request_id)
         if collector is None:
-            # Request might not be added yet or already cleaned up
+            logger.warning(
+                f"[stream_outputs] {request_id[:12]} no collector found, returning immediately"
+            )
             return
 
+        logger.info(f"[stream_outputs] {request_id[:12]} START waiting for tokens")
+
+        finished_normally = False
         try:
             while True:
                 try:
-                    # Non-blocking drain pattern from vLLM
-                    # Try get_nowait first to avoid task switch if output ready
                     if timeout:
                         output = collector.get_nowait()
                         if output is None:
@@ -289,17 +330,48 @@ class EngineCore:
                     else:
                         output = collector.get_nowait() or await collector.get()
 
+                    _token_count += 1
+                    if _token_count == 1:
+                        logger.info(
+                            f"[stream_outputs] {request_id[:12]} first token after "
+                            f"{_time.monotonic() - _t0:.1f}s"
+                        )
+
                     yield output
 
                     if output.finished:
+                        finished_normally = True
+                        logger.info(
+                            f"[stream_outputs] {request_id[:12]} finished normally, "
+                            f"{_token_count} tokens in {_time.monotonic() - _t0:.1f}s"
+                        )
                         break
 
                 except asyncio.TimeoutError:
-                    logger.warning(f"Timeout waiting for request {request_id}")
+                    logger.warning(
+                        f"[stream_outputs] {request_id[:12]} TIMEOUT after "
+                        f"{_token_count} tokens, {_time.monotonic() - _t0:.1f}s"
+                    )
                     break
 
+        except (GeneratorExit, asyncio.CancelledError) as exc:
+            logger.info(
+                f"[stream_outputs] {request_id[:12]} {type(exc).__name__} after "
+                f"{_token_count} tokens, {_time.monotonic() - _t0:.1f}s"
+            )
+
         finally:
+            if not finished_normally:
+                logger.info(
+                    f"[stream_outputs] {request_id[:12]} ABORTING orphaned request "
+                    f"({_token_count} tokens generated in {_time.monotonic() - _t0:.1f}s)"
+                )
+                aborted = self.scheduler.abort_request(request_id)
+                logger.info(
+                    f"[stream_outputs] {request_id[:12]} abort_request returned {aborted}"
+                )
             self._cleanup_request(request_id)
+            logger.info(f"[stream_outputs] {request_id[:12]} cleanup done")
 
     async def generate(
         self,
@@ -335,29 +407,35 @@ class EngineCore:
         if event is None:
             raise RuntimeError(f"No event for request {request_id}")
 
-        # Wait for the request to finish
-        await event.wait()
+        try:
+            # Wait for the request to finish
+            await event.wait()
 
-        # Get the final output from collector
-        collector = self._output_collectors.get(request_id)
-        if collector is None:
-            raise RuntimeError(f"No collector for request {request_id}")
+            # Get the final output from collector
+            collector = self._output_collectors.get(request_id)
+            if collector is None:
+                raise RuntimeError(f"No collector for request {request_id}")
 
-        # Drain all outputs and get the last one
-        final_output = None
-        while True:
-            output = collector.get_nowait()
-            if output is None:
-                break
-            final_output = output
+            # Drain all outputs and get the last one
+            final_output = None
+            while True:
+                output = collector.get_nowait()
+                if output is None:
+                    break
+                final_output = output
 
-        # Cleanup
-        self._cleanup_request(request_id)
+            if final_output is None:
+                raise RuntimeError(f"No output for request {request_id}")
 
-        if final_output is None:
-            raise RuntimeError(f"No output for request {request_id}")
+            return final_output
 
-        return final_output
+        except (asyncio.CancelledError, GeneratorExit):
+            logger.info(f"[generate] {request_id[:12]} CANCELLED, aborting request")
+            self.scheduler.abort_request(request_id)
+            raise
+
+        finally:
+            self._cleanup_request(request_id)
 
     def generate_batch_sync(
         self,
@@ -428,6 +506,14 @@ class EngineCore:
     def get_cache_stats(self) -> Optional[Dict[str, Any]]:
         """Get prefix cache statistics."""
         return self.scheduler.get_cache_stats()
+
+    def save_cache_to_disk(self, cache_dir: str) -> bool:
+        """Save prefix cache to disk."""
+        return self.scheduler.save_cache_to_disk(cache_dir)
+
+    def load_cache_from_disk(self, cache_dir: str) -> int:
+        """Load prefix cache from disk."""
+        return self.scheduler.load_cache_from_disk(cache_dir)
 
     def _release_model(self) -> None:
         """Release model ownership."""
@@ -565,3 +651,11 @@ class AsyncEngineCore:
     def get_cache_stats(self) -> Optional[Dict[str, Any]]:
         """Get prefix cache statistics."""
         return self.engine.get_cache_stats()
+
+    def save_cache_to_disk(self, cache_dir: str) -> bool:
+        """Save prefix cache to disk."""
+        return self.engine.save_cache_to_disk(cache_dir)
+
+    def load_cache_from_disk(self, cache_dir: str) -> int:
+        """Load prefix cache from disk."""
+        return self.engine.load_cache_from_disk(cache_dir)

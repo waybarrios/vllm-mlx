@@ -127,7 +127,50 @@ _tool_call_parser: str | None = None  # Parser name: auto, mistral, qwen, llama,
 _tool_parser_instance = None  # Instantiated parser
 
 
-@asynccontextmanager
+def _load_prefix_cache_from_disk() -> None:
+    """Load prefix cache from disk during startup."""
+    try:
+        d = _get_cache_dir()
+        logger.info(f"[lifespan] Loading prefix cache from {d}")
+        loaded = _engine.load_cache_from_disk(d)
+        if loaded > 0:
+            logger.info(f"[lifespan] Loaded {loaded} prefix cache entries")
+        else:
+            logger.info("[lifespan] No prefix cache entries found on disk")
+    except Exception as e:
+        logger.warning(f"[lifespan] Failed to load cache from disk: {e}", exc_info=True)
+
+
+def _save_prefix_cache_to_disk() -> None:
+    """Save prefix cache to disk during shutdown."""
+    try:
+        d = _get_cache_dir()
+        logger.info(f"[lifespan] Saving prefix cache to {d}")
+        saved = _engine.save_cache_to_disk(d)
+        if saved:
+            logger.info(f"[lifespan] Saved prefix cache to {d}")
+        else:
+            logger.info("[lifespan] No cache to save")
+    except Exception as e:
+        logger.warning(f"[lifespan] Failed to save cache to disk: {e}", exc_info=True)
+
+
+def _get_cache_dir() -> str:
+    """Get cache persistence directory based on model name."""
+    # Use global _model_name which is always a string, set during load_model()
+    model_name = _model_name if _model_name else "default"
+    logger.info(
+        f"[_get_cache_dir] _model_name={_model_name!r} type={type(_model_name)}"
+    )
+    # Sanitize model name for filesystem
+    safe_name = str(model_name).replace("/", "--").replace("\\", "--")
+    cache_dir = os.path.join(
+        os.path.expanduser("~"), ".cache", "vllm-mlx", "prefix_cache", safe_name
+    )
+    logger.info(f"[_get_cache_dir] cache_dir={cache_dir!r}")
+    return cache_dir
+
+
 async def lifespan(app: FastAPI):
     """FastAPI lifespan for startup/shutdown events."""
     global _engine, _mcp_manager
@@ -136,12 +179,20 @@ async def lifespan(app: FastAPI):
     if _engine is not None and hasattr(_engine, "_loaded") and not _engine._loaded:
         await _engine.start()
 
+    # Load persisted cache from disk (AFTER engine start — AsyncEngineCore must exist)
+    if _engine is not None and hasattr(_engine, "load_cache_from_disk"):
+        _load_prefix_cache_from_disk()
+
     # Initialize MCP if config provided
     mcp_config = os.environ.get("VLLM_MLX_MCP_CONFIG")
     if mcp_config:
         await init_mcp(mcp_config)
 
     yield
+
+    # Shutdown: Save cache to disk BEFORE stopping engine
+    if _engine is not None and hasattr(_engine, "save_cache_to_disk"):
+        _save_prefix_cache_to_disk()
 
     # Shutdown: Close MCP connections and stop engine
     if _mcp_manager is not None:
@@ -709,6 +760,184 @@ async def list_voices(model: str = "kokoro"):
 
 
 # =============================================================================
+# Streaming disconnect detection
+# =============================================================================
+
+
+async def _disconnect_guard(
+    generator: AsyncIterator[str],
+    raw_request: Request,
+    poll_interval: float = 0.5,
+) -> AsyncIterator[str]:
+    """Wrap streaming generator to abort on client disconnect.
+
+    Uses asyncio racing: each __anext__() on the inner generator is
+    raced against a disconnect poller.  This catches disconnects even
+    during prefill when no chunks are being yielded for tens of seconds.
+
+    On disconnect, aclose() propagates down the generator chain to
+    engine_core.stream_outputs() finally-block → abort_request().
+    """
+    import time as _time
+
+    _t0 = _time.monotonic()
+
+    def _elapsed():
+        return f"{_time.monotonic() - _t0:.1f}s"
+
+    logger.info(f"[disconnect_guard] START poll_interval={poll_interval}s")
+
+    async def _wait_disconnect():
+        poll_count = 0
+        while True:
+            await asyncio.sleep(poll_interval)
+            poll_count += 1
+            is_disc = await raw_request.is_disconnected()
+            if poll_count % 10 == 0 or is_disc:
+                logger.info(
+                    f"[disconnect_guard] poll #{poll_count} "
+                    f"disconnected={is_disc} elapsed={_elapsed()}"
+                )
+            if is_disc:
+                return
+
+    chunk_count = 0
+    disconnect_task: asyncio.Task | None = None
+    anext_task: asyncio.Task | None = None
+    try:
+        aiter = generator.__aiter__()
+        disconnect_task = asyncio.create_task(_wait_disconnect())
+        while True:
+            anext_task = asyncio.ensure_future(aiter.__anext__())
+            done, _ = await asyncio.wait(
+                [anext_task, disconnect_task],
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if disconnect_task in done:
+                logger.info(
+                    f"[disconnect_guard] CLIENT DISCONNECTED after "
+                    f"{chunk_count} chunks, elapsed={_elapsed()}"
+                )
+                anext_task.cancel()
+                try:
+                    await anext_task
+                except (asyncio.CancelledError, StopAsyncIteration):
+                    pass
+                break
+            try:
+                chunk = anext_task.result()
+            except StopAsyncIteration:
+                logger.info(
+                    f"[disconnect_guard] generator exhausted normally, "
+                    f"{chunk_count} chunks, elapsed={_elapsed()}"
+                )
+                break
+            chunk_count += 1
+            if chunk_count == 1:
+                logger.info(
+                    f"[disconnect_guard] first chunk arrived, elapsed={_elapsed()}"
+                )
+            yield chunk
+    except GeneratorExit:
+        logger.info(
+            f"[disconnect_guard] GeneratorExit after {chunk_count} chunks, elapsed={_elapsed()}"
+        )
+    finally:
+        if disconnect_task and not disconnect_task.done():
+            disconnect_task.cancel()
+        if anext_task and not anext_task.done():
+            anext_task.cancel()
+        # NOTE: Do NOT call generator.aclose() here.  With run_in_executor,
+        # scheduler.step() runs in a background thread.  aclose() would throw
+        # GeneratorExit into the async-generator chain, which can trigger
+        # mlx::core::eval on the main thread while the executor thread is also
+        # mid-eval → Metal assertion failure → SIGABRT.
+        #
+        # Instead, rely on the task cancellation propagation:
+        #   anext_task.cancel() → CancelledError in stream_outputs()
+        #   → finally block → abort_request() → request removed from scheduler
+        logger.info(
+            f"[disconnect_guard] CLEANUP done, {chunk_count} chunks total, elapsed={_elapsed()}"
+        )
+
+
+async def _wait_with_disconnect(
+    coro,
+    raw_request: Request,
+    timeout: float,
+    poll_interval: float = 0.5,
+):
+    """Run a coroutine with both timeout and client disconnect detection.
+
+    For non-streaming requests where _disconnect_guard() can't be used.
+    Races the coroutine against a disconnect poller, same pattern as
+    _disconnect_guard but for awaitable (non-generator) coroutines.
+    """
+    import time as _time
+
+    _t0 = _time.monotonic()
+
+    task = asyncio.ensure_future(coro)
+
+    async def _wait_disconnect():
+        poll_count = 0
+        while True:
+            await asyncio.sleep(poll_interval)
+            poll_count += 1
+            is_disc = await raw_request.is_disconnected()
+            if poll_count % 10 == 0 or is_disc:
+                logger.info(
+                    f"[disconnect_guard] poll #{poll_count} "
+                    f"disconnected={is_disc} elapsed={_time.monotonic() - _t0:.1f}s"
+                )
+            if is_disc:
+                return
+
+    disconnect_task = asyncio.create_task(_wait_disconnect())
+
+    try:
+        done, _ = await asyncio.wait(
+            [task, disconnect_task],
+            timeout=timeout,
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+
+        if not done:
+            # Timeout
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
+            raise HTTPException(
+                status_code=504,
+                detail=f"Request timed out after {timeout:.1f} seconds",
+            )
+
+        if disconnect_task in done:
+            # Client disconnected
+            logger.info(
+                f"[disconnect_guard] CLIENT DISCONNECTED (non-stream) "
+                f"elapsed={_time.monotonic() - _t0:.1f}s"
+            )
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
+            return None  # Signal to caller that client disconnected
+
+        # Task completed
+        return task.result()
+
+    finally:
+        if not disconnect_task.done():
+            disconnect_task.cancel()
+        if not task.done():
+            task.cancel()
+
+
+# =============================================================================
 # Completion Endpoints
 # =============================================================================
 
@@ -716,16 +945,28 @@ async def list_voices(model: str = "kokoro"):
 @app.post(
     "/v1/completions", dependencies=[Depends(verify_api_key), Depends(check_rate_limit)]
 )
-async def create_completion(request: CompletionRequest):
+async def create_completion(request: CompletionRequest, raw_request: Request):
     """Create a text completion."""
     engine = get_engine()
 
     # Handle single prompt or list of prompts
     prompts = request.prompt if isinstance(request.prompt, list) else [request.prompt]
 
+    # --- Detailed request logging ---
+    prompt_preview = prompts[0][:200] if prompts else "(empty)"
+    prompt_len = sum(len(p) for p in prompts)
+    logger.info(
+        f"[REQUEST] POST /v1/completions stream={request.stream} "
+        f"max_tokens={request.max_tokens} temp={request.temperature} "
+        f"prompt_chars={prompt_len} prompt_preview={prompt_preview!r}"
+    )
+
     if request.stream:
         return StreamingResponse(
-            stream_completion(engine, prompts[0], request),
+            _disconnect_guard(
+                stream_completion(engine, prompts[0], request),
+                raw_request,
+            ),
             media_type="text/event-stream",
         )
 
@@ -737,21 +978,19 @@ async def create_completion(request: CompletionRequest):
     total_prompt_tokens = 0
 
     for i, prompt in enumerate(prompts):
-        try:
-            output = await asyncio.wait_for(
-                engine.generate(
-                    prompt=prompt,
-                    max_tokens=request.max_tokens or _default_max_tokens,
-                    temperature=request.temperature,
-                    top_p=request.top_p,
-                    stop=request.stop,
-                ),
-                timeout=timeout,
-            )
-        except asyncio.TimeoutError:
-            raise HTTPException(
-                status_code=504, detail=f"Request timed out after {timeout:.1f} seconds"
-            )
+        output = await _wait_with_disconnect(
+            engine.generate(
+                prompt=prompt,
+                max_tokens=request.max_tokens or _default_max_tokens,
+                temperature=request.temperature,
+                top_p=request.top_p,
+                stop=request.stop,
+            ),
+            raw_request,
+            timeout=timeout,
+        )
+        if output is None:
+            return Response(status_code=499)  # Client closed request
 
         choices.append(
             CompletionChoice(
@@ -786,7 +1025,7 @@ async def create_completion(request: CompletionRequest):
     "/v1/chat/completions",
     dependencies=[Depends(verify_api_key), Depends(check_rate_limit)],
 )
-async def create_chat_completion(request: ChatCompletionRequest):
+async def create_chat_completion(request: ChatCompletionRequest, raw_request: Request):
     """
     Create a chat completion (supports multimodal content for VLM models).
 
@@ -829,6 +1068,27 @@ async def create_chat_completion(request: ChatCompletionRequest):
     ```
     """
     engine = get_engine()
+
+    # --- Detailed request logging ---
+    n_msgs = len(request.messages)
+    msg_roles = [m.role for m in request.messages]
+    total_chars = 0
+    last_user_preview = ""
+    for m in request.messages:
+        content = m.content if isinstance(m.content, str) else str(m.content)
+        total_chars += len(content)
+        if m.role == "user":
+            last_user_preview = content[:300]
+    has_tools = bool(request.tools)
+    n_tools = len(request.tools) if request.tools else 0
+    logger.info(
+        f"[REQUEST] POST /v1/chat/completions stream={request.stream} "
+        f"model={request.model!r} max_tokens={request.max_tokens} "
+        f"temp={request.temperature} msgs={n_msgs} roles={msg_roles} "
+        f"total_chars={total_chars} tools={n_tools} "
+        f"response_format={request.response_format}"
+    )
+    logger.info(f"[REQUEST] last user message preview: {last_user_preview!r}")
 
     # For MLLM models, keep original messages with embedded images
     # (MLLM.chat() extracts images from message content internally)
@@ -879,7 +1139,10 @@ async def create_chat_completion(request: ChatCompletionRequest):
 
     if request.stream:
         return StreamingResponse(
-            stream_chat_completion(engine, messages, request, **chat_kwargs),
+            _disconnect_guard(
+                stream_chat_completion(engine, messages, request, **chat_kwargs),
+                raw_request,
+            ),
             media_type="text/event-stream",
         )
 
@@ -887,14 +1150,13 @@ async def create_chat_completion(request: ChatCompletionRequest):
     start_time = time.perf_counter()
     timeout = request.timeout or _default_timeout
 
-    try:
-        output = await asyncio.wait_for(
-            engine.chat(messages=messages, **chat_kwargs), timeout=timeout
-        )
-    except asyncio.TimeoutError:
-        raise HTTPException(
-            status_code=504, detail=f"Request timed out after {timeout:.1f} seconds"
-        )
+    output = await _wait_with_disconnect(
+        engine.chat(messages=messages, **chat_kwargs),
+        raw_request,
+        timeout=timeout,
+    )
+    if output is None:
+        return Response(status_code=499)  # Client closed request
 
     elapsed = time.perf_counter() - start_time
     tokens_per_sec = output.completion_tokens / elapsed if elapsed > 0 else 0
@@ -1002,12 +1264,34 @@ async def create_anthropic_message(
     body = await request.json()
     anthropic_request = AnthropicRequest(**body)
 
+    # --- Detailed request logging ---
+    n_msgs = len(anthropic_request.messages)
+    total_chars = 0
+    last_user_preview = ""
+    for m in anthropic_request.messages:
+        content = m.content if isinstance(m.content, str) else str(m.content)
+        total_chars += len(content)
+        if m.role == "user":
+            last_user_preview = content[:300]
+    sys_chars = len(anthropic_request.system) if anthropic_request.system else 0
+    n_tools = len(anthropic_request.tools) if anthropic_request.tools else 0
+    logger.info(
+        f"[REQUEST] POST /v1/messages (anthropic) stream={anthropic_request.stream} "
+        f"model={anthropic_request.model!r} max_tokens={anthropic_request.max_tokens} "
+        f"msgs={n_msgs} total_chars={total_chars} system_chars={sys_chars} "
+        f"tools={n_tools}"
+    )
+    logger.info(f"[REQUEST] last user message preview: {last_user_preview!r}")
+
     # Convert Anthropic request -> OpenAI request
     openai_request = anthropic_to_openai(anthropic_request)
 
     if anthropic_request.stream:
         return StreamingResponse(
-            _stream_anthropic_messages(engine, openai_request, anthropic_request),
+            _disconnect_guard(
+                _stream_anthropic_messages(engine, openai_request, anthropic_request),
+                request,
+            ),
             media_type="text/event-stream",
             headers={
                 "Cache-Control": "no-cache",
@@ -1033,14 +1317,13 @@ async def create_anthropic_message(
     start_time = time.perf_counter()
     timeout = _default_timeout
 
-    try:
-        output = await asyncio.wait_for(
-            engine.chat(messages=messages, **chat_kwargs), timeout=timeout
-        )
-    except asyncio.TimeoutError:
-        raise HTTPException(
-            status_code=504, detail=f"Request timed out after {timeout:.1f} seconds"
-        )
+    output = await _wait_with_disconnect(
+        engine.chat(messages=messages, **chat_kwargs),
+        request,
+        timeout=timeout,
+    )
+    if output is None:
+        return Response(status_code=499)  # Client closed request
 
     elapsed = time.perf_counter() - start_time
     tokens_per_sec = output.completion_tokens / elapsed if elapsed > 0 else 0
@@ -1093,54 +1376,69 @@ async def count_anthropic_tokens(request: Request):
     """
     Count tokens for an Anthropic Messages API request.
 
-    Provides a rough estimate based on character count.
+    Uses the model's tokenizer for accurate counting.
     Claude Code calls this endpoint for token budgeting.
+    Note: Don't parse via AnthropicRequest — count_tokens requests
+    from Claude Code don't include max_tokens.
     """
     body = await request.json()
-    anthropic_request = AnthropicRequest(**body)
 
-    # Estimate token count from messages
-    total_chars = 0
+    engine = get_engine()
+    tokenizer = engine.tokenizer
+
+    total_tokens = 0
 
     # System message
-    if anthropic_request.system:
-        if isinstance(anthropic_request.system, str):
-            total_chars += len(anthropic_request.system)
-        elif isinstance(anthropic_request.system, list):
-            for block in anthropic_request.system:
-                if isinstance(block, dict):
-                    total_chars += len(block.get("text", ""))
+    system = body.get("system", "")
+    if isinstance(system, str) and system:
+        total_tokens += len(tokenizer.encode(system))
+    elif isinstance(system, list):
+        for block in system:
+            if isinstance(block, dict):
+                text = block.get("text", "")
+                if text:
+                    total_tokens += len(tokenizer.encode(text))
 
     # Messages
-    for msg in anthropic_request.messages:
-        if isinstance(msg.content, str):
-            total_chars += len(msg.content)
-        elif isinstance(msg.content, list):
-            for block in msg.content:
-                if block.type == "text" and block.text:
-                    total_chars += len(block.text)
-                elif block.type == "tool_result":
-                    if isinstance(block.content, str):
-                        total_chars += len(block.content)
-                    elif isinstance(block.content, list):
-                        for item in block.content:
+    for msg in body.get("messages", []):
+        content = msg.get("content", "")
+        if isinstance(content, str):
+            if content:
+                total_tokens += len(tokenizer.encode(content))
+        elif isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict):
+                    text = block.get("text", "")
+                    if text:
+                        total_tokens += len(tokenizer.encode(text))
+                    # tool_use input
+                    if block.get("input"):
+                        total_tokens += len(
+                            tokenizer.encode(json.dumps(block["input"]))
+                        )
+                    # tool_result content
+                    sub_content = block.get("content", "")
+                    if isinstance(sub_content, str) and sub_content:
+                        total_tokens += len(tokenizer.encode(sub_content))
+                    elif isinstance(sub_content, list):
+                        for item in sub_content:
                             if isinstance(item, dict):
-                                total_chars += len(item.get("text", ""))
-                elif block.type == "tool_use" and block.input:
-                    total_chars += len(json.dumps(block.input))
+                                item_text = item.get("text", "")
+                                if item_text:
+                                    total_tokens += len(tokenizer.encode(item_text))
 
     # Tools
-    if anthropic_request.tools:
-        for tool in anthropic_request.tools:
-            total_chars += len(tool.name or "")
-            total_chars += len(tool.description or "")
-            if tool.input_schema:
-                total_chars += len(json.dumps(tool.input_schema))
+    for tool in body.get("tools", []):
+        name = tool.get("name", "")
+        if name:
+            total_tokens += len(tokenizer.encode(name))
+        desc = tool.get("description", "")
+        if desc:
+            total_tokens += len(tokenizer.encode(desc))
+        if tool.get("input_schema"):
+            total_tokens += len(tokenizer.encode(json.dumps(tool["input_schema"])))
 
-    # Rough estimate: ~4 chars per token
-    estimated_tokens = max(1, total_chars // 4)
-
-    return {"input_tokens": estimated_tokens}
+    return {"input_tokens": total_tokens}
 
 
 async def _stream_anthropic_messages(
@@ -1156,6 +1454,7 @@ async def _stream_anthropic_messages(
     content_block_stop -> message_delta -> message_stop
     """
     msg_id = f"msg_{uuid.uuid4().hex[:24]}"
+    start_time = time.perf_counter()
 
     # Extract messages for engine
     messages, images, videos = extract_multimodal_content(
@@ -1284,6 +1583,13 @@ async def _stream_anthropic_messages(
     }
     yield f"event: message_delta\ndata: {json.dumps(message_delta)}\n\n"
 
+    # Log throughput
+    elapsed = time.perf_counter() - start_time
+    tokens_per_sec = completion_tokens / elapsed if elapsed > 0 else 0
+    logger.info(
+        f"Anthropic messages (stream): {completion_tokens} tokens in {elapsed:.2f}s ({tokens_per_sec:.1f} tok/s)"
+    )
+
     # Emit message_stop
     yield f"event: message_stop\ndata: {json.dumps({'type': 'message_stop'})}\n\n"
 
@@ -1334,6 +1640,7 @@ async def stream_chat_completion(
 ) -> AsyncIterator[str]:
     """Stream chat completion response."""
     response_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
+    start_time = time.perf_counter()
 
     # Check if we should include usage in the final chunk
     include_usage = request.stream_options and request.stream_options.include_usage
@@ -1428,6 +1735,13 @@ async def stream_chat_completion(
                 usage=get_usage(output) if output.finished else None,
             )
             yield f"data: {chunk.model_dump_json()}\n\n"
+
+    # Log throughput
+    elapsed = time.perf_counter() - start_time
+    tokens_per_sec = completion_tokens / elapsed if elapsed > 0 else 0
+    logger.info(
+        f"Chat completion (stream): {completion_tokens} tokens in {elapsed:.2f}s ({tokens_per_sec:.1f} tok/s)"
+    )
 
     # Send final chunk with usage if requested
     if include_usage:

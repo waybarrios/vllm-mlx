@@ -260,6 +260,30 @@ class BatchedEngine(BaseEngine):
             tokenizer_config=tokenizer_config,
         )
 
+        # Set Metal memory limits to make allocation failures graceful
+        # instead of fatal Metal command buffer errors (SIGABRT)
+        try:
+            import mlx.core as mx
+
+            if mx.metal.is_available():
+                device_info = mx.device_info()
+                max_recommended = device_info.get(
+                    "max_recommended_working_set_size",
+                    device_info.get("memory_size", 0),
+                )
+                if max_recommended > 0:
+                    soft_limit = int(max_recommended * 0.90)
+                    mx.set_memory_limit(soft_limit)
+                    mx.set_cache_limit(32 * 1024 * 1024 * 1024)  # 32GB
+                    logger.info(
+                        f"Metal memory limits set: "
+                        f"allocation_limit={soft_limit / 1e9:.1f}GB "
+                        f"(90% of {max_recommended / 1e9:.1f}GB), "
+                        f"cache_limit=32GB"
+                    )
+        except Exception as e:
+            logger.warning(f"Failed to set Metal memory limits: {e}")
+
         # Create engine config
         scheduler_config = self._scheduler_config or SchedulerConfig()
         engine_config = EngineConfig(
@@ -345,10 +369,11 @@ class BatchedEngine(BaseEngine):
                 # Fall through to standard template
 
         if hasattr(tokenizer, "apply_chat_template"):
+            enable_thinking = "coder" not in self._model_name.lower()
             template_kwargs = {
                 "tokenize": False,
                 "add_generation_prompt": True,
-                "enable_thinking": True,
+                "enable_thinking": enable_thinking,
             }
             if tools:
                 template_kwargs["tools"] = tools
@@ -660,3 +685,15 @@ class BatchedEngine(BaseEngine):
         elif self._engine:
             return self._engine.get_cache_stats()
         return None
+
+    def save_cache_to_disk(self, cache_dir: str) -> bool:
+        """Save prefix cache to disk for persistence across restarts."""
+        if self._engine:
+            return self._engine.save_cache_to_disk(cache_dir)
+        return False
+
+    def load_cache_from_disk(self, cache_dir: str) -> int:
+        """Load prefix cache from disk. Returns number of entries loaded."""
+        if self._engine:
+            return self._engine.load_cache_from_disk(cache_dir)
+        return 0

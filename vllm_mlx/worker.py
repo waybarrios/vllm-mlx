@@ -212,7 +212,7 @@ class MLXWorker:
         try:
             import mlx.core as mx
 
-            mx.metal.clear_cache()
+            mx.clear_cache()
         except Exception:
             pass
 

@@ -663,15 +663,24 @@ class MLLMScheduler:
         if output_queue is None:
             return
 
-        while True:
-            output = await output_queue.get()
-            if output is None:
-                break
-            yield output
-
-        # Cleanup queue
-        if request_id in self.output_queues:
-            del self.output_queues[request_id]
+        finished_normally = False
+        try:
+            while True:
+                output = await output_queue.get()
+                if output is None:
+                    finished_normally = True
+                    break
+                yield output
+                if output.finished:
+                    finished_normally = True
+                    break
+        finally:
+            if not finished_normally:
+                logger.info(f"Aborting orphaned MLLM request {request_id}")
+                self.abort_request(request_id)
+            # Cleanup queue
+            if request_id in self.output_queues:
+                del self.output_queues[request_id]
 
     async def generate(
         self,
