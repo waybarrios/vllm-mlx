@@ -18,6 +18,8 @@ import uuid
 from dataclasses import dataclass
 from typing import Any, AsyncIterator, Dict, List, Optional, Union
 
+import mlx.core as mx
+
 from .request import Request, RequestOutput, SamplingParams
 from .scheduler import Scheduler, SchedulerConfig
 from .output_collector import RequestOutputCollector, RequestStreamState
@@ -170,6 +172,10 @@ class EngineCore:
                                 event = events.get(rid)
                                 if event:
                                     event.set()
+
+                        # Free Metal buffers after distributing finished outputs
+                        if output.finished_request_ids:
+                            mx.clear_cache()
 
                         # OPTIMIZATION: Only yield if streaming consumers are waiting
                         if RequestOutputCollector.has_waiting_consumers():
