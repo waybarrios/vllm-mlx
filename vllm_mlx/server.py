@@ -58,6 +58,8 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 # Import from new modular API
 # Re-export for backwards compatibility with tests
+from .api.anthropic_adapter import anthropic_to_openai, openai_to_anthropic
+from .api.anthropic_models import AnthropicRequest
 from .api.models import (
     AssistantMessage,  # noqa: F401
     ChatCompletionChoice,  # noqa: F401
@@ -308,7 +310,9 @@ def _parse_tool_calls_with_parser(
             ]
             return result.content or "", tool_calls
         else:
-            return result.content or output_text, None
+            # Fallback: specific parser didn't find tool calls,
+            # try generic parser which handles more formats (e.g. Nemotron XML)
+            return parse_tool_calls(output_text)
     except Exception as e:
         logger.warning(f"Tool parser error: {e}")
         return parse_tool_calls(output_text)
@@ -973,6 +977,315 @@ def _inject_json_instruction(messages: list, instruction: str) -> list:
         messages.insert(0, {"role": "system", "content": instruction})
 
     return messages
+
+
+# =============================================================================
+# Anthropic Messages API Endpoints
+# =============================================================================
+
+
+@app.post("/v1/messages")
+async def create_anthropic_message(
+    request: Request,
+):
+    """
+    Anthropic Messages API endpoint.
+
+    Translates Anthropic-format requests to OpenAI format, runs inference
+    through the existing engine, and converts the response back.
+
+    Supports both streaming and non-streaming modes.
+    """
+    engine = get_engine()
+
+    # Parse the raw body to handle Anthropic request format
+    body = await request.json()
+    anthropic_request = AnthropicRequest(**body)
+
+    # Convert Anthropic request -> OpenAI request
+    openai_request = anthropic_to_openai(anthropic_request)
+
+    if anthropic_request.stream:
+        return StreamingResponse(
+            _stream_anthropic_messages(engine, openai_request, anthropic_request),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+            },
+        )
+
+    # Non-streaming: run inference through existing engine
+    messages, images, videos = extract_multimodal_content(
+        openai_request.messages,
+        preserve_native_format=engine.preserve_native_tool_format,
+    )
+
+    chat_kwargs = {
+        "max_tokens": openai_request.max_tokens or _default_max_tokens,
+        "temperature": openai_request.temperature,
+        "top_p": openai_request.top_p,
+    }
+
+    if openai_request.tools:
+        chat_kwargs["tools"] = convert_tools_for_template(openai_request.tools)
+
+    start_time = time.perf_counter()
+    timeout = _default_timeout
+
+    try:
+        output = await asyncio.wait_for(
+            engine.chat(messages=messages, **chat_kwargs), timeout=timeout
+        )
+    except asyncio.TimeoutError:
+        raise HTTPException(
+            status_code=504, detail=f"Request timed out after {timeout:.1f} seconds"
+        )
+
+    elapsed = time.perf_counter() - start_time
+    tokens_per_sec = output.completion_tokens / elapsed if elapsed > 0 else 0
+    logger.info(
+        f"Anthropic messages: {output.completion_tokens} tokens in {elapsed:.2f}s ({tokens_per_sec:.1f} tok/s)"
+    )
+
+    # Parse tool calls
+    cleaned_text, tool_calls = _parse_tool_calls_with_parser(
+        output.text, openai_request
+    )
+
+    # Clean output text
+    final_content = None
+    if cleaned_text:
+        final_content = clean_output_text(cleaned_text)
+
+    # Determine finish reason
+    finish_reason = "tool_calls" if tool_calls else output.finish_reason
+
+    # Build OpenAI response to convert
+    openai_response = ChatCompletionResponse(
+        model=openai_request.model,
+        choices=[
+            ChatCompletionChoice(
+                message=AssistantMessage(
+                    content=final_content,
+                    tool_calls=tool_calls,
+                ),
+                finish_reason=finish_reason,
+            )
+        ],
+        usage=Usage(
+            prompt_tokens=output.prompt_tokens,
+            completion_tokens=output.completion_tokens,
+            total_tokens=output.prompt_tokens + output.completion_tokens,
+        ),
+    )
+
+    # Convert to Anthropic response
+    anthropic_response = openai_to_anthropic(openai_response, anthropic_request.model)
+    return Response(
+        content=anthropic_response.model_dump_json(exclude_none=True),
+        media_type="application/json",
+    )
+
+
+@app.post("/v1/messages/count_tokens")
+async def count_anthropic_tokens(request: Request):
+    """
+    Count tokens for an Anthropic Messages API request.
+
+    Provides a rough estimate based on character count.
+    Claude Code calls this endpoint for token budgeting.
+    """
+    body = await request.json()
+    anthropic_request = AnthropicRequest(**body)
+
+    # Estimate token count from messages
+    total_chars = 0
+
+    # System message
+    if anthropic_request.system:
+        if isinstance(anthropic_request.system, str):
+            total_chars += len(anthropic_request.system)
+        elif isinstance(anthropic_request.system, list):
+            for block in anthropic_request.system:
+                if isinstance(block, dict):
+                    total_chars += len(block.get("text", ""))
+
+    # Messages
+    for msg in anthropic_request.messages:
+        if isinstance(msg.content, str):
+            total_chars += len(msg.content)
+        elif isinstance(msg.content, list):
+            for block in msg.content:
+                if block.type == "text" and block.text:
+                    total_chars += len(block.text)
+                elif block.type == "tool_result":
+                    if isinstance(block.content, str):
+                        total_chars += len(block.content)
+                    elif isinstance(block.content, list):
+                        for item in block.content:
+                            if isinstance(item, dict):
+                                total_chars += len(item.get("text", ""))
+                elif block.type == "tool_use" and block.input:
+                    total_chars += len(json.dumps(block.input))
+
+    # Tools
+    if anthropic_request.tools:
+        for tool in anthropic_request.tools:
+            total_chars += len(tool.name or "")
+            total_chars += len(tool.description or "")
+            if tool.input_schema:
+                total_chars += len(json.dumps(tool.input_schema))
+
+    # Rough estimate: ~4 chars per token
+    estimated_tokens = max(1, total_chars // 4)
+
+    return {"input_tokens": estimated_tokens}
+
+
+async def _stream_anthropic_messages(
+    engine: BaseEngine,
+    openai_request: ChatCompletionRequest,
+    anthropic_request: AnthropicRequest,
+) -> AsyncIterator[str]:
+    """
+    Stream Anthropic Messages API SSE events.
+
+    Converts OpenAI streaming chunks to Anthropic event format:
+    message_start -> content_block_start -> content_block_delta* ->
+    content_block_stop -> message_delta -> message_stop
+    """
+    msg_id = f"msg_{uuid.uuid4().hex[:24]}"
+
+    # Extract messages for engine
+    messages, images, videos = extract_multimodal_content(
+        openai_request.messages,
+        preserve_native_format=engine.preserve_native_tool_format,
+    )
+
+    chat_kwargs = {
+        "max_tokens": openai_request.max_tokens or _default_max_tokens,
+        "temperature": openai_request.temperature,
+        "top_p": openai_request.top_p,
+    }
+
+    if openai_request.tools:
+        chat_kwargs["tools"] = convert_tools_for_template(openai_request.tools)
+
+    # Emit message_start
+    message_start = {
+        "type": "message_start",
+        "message": {
+            "id": msg_id,
+            "type": "message",
+            "role": "assistant",
+            "model": anthropic_request.model,
+            "content": [],
+            "stop_reason": None,
+            "stop_sequence": None,
+            "usage": {
+                "input_tokens": 0,
+                "output_tokens": 0,
+            },
+        },
+    }
+    yield f"event: message_start\ndata: {json.dumps(message_start)}\n\n"
+
+    # Emit content_block_start for text
+    content_block_start = {
+        "type": "content_block_start",
+        "index": 0,
+        "content_block": {"type": "text", "text": ""},
+    }
+    yield f"event: content_block_start\ndata: {json.dumps(content_block_start)}\n\n"
+
+    # Stream content deltas
+    accumulated_text = ""
+    completion_tokens = 0
+
+    async for output in engine.stream_chat(messages=messages, **chat_kwargs):
+        delta_text = output.new_text
+
+        # Track token counts
+        if hasattr(output, "completion_tokens") and output.completion_tokens:
+            completion_tokens = output.completion_tokens
+
+        if delta_text:
+            # Filter special tokens
+            content = delta_text
+            for tok in [
+                "<|im_end|>",
+                "<|im_start|>",
+                "<|endoftext|>",
+                "<|end|>",
+                "<|eot_id|>",
+                "</s>",
+                "<s>",
+            ]:
+                content = content.replace(tok, "")
+
+            if content:
+                accumulated_text += content
+                delta_event = {
+                    "type": "content_block_delta",
+                    "index": 0,
+                    "delta": {"type": "text_delta", "text": content},
+                }
+                yield f"event: content_block_delta\ndata: {json.dumps(delta_event)}\n\n"
+
+    # Check for tool calls in accumulated text
+    _, tool_calls = _parse_tool_calls_with_parser(accumulated_text, openai_request)
+
+    # Emit content_block_stop for text block
+    yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': 0})}\n\n"
+
+    # If there are tool calls, emit tool_use blocks
+    if tool_calls:
+        for i, tc in enumerate(tool_calls):
+            tool_index = i + 1
+            try:
+                tool_input = json.loads(tc.function.arguments)
+            except (json.JSONDecodeError, AttributeError):
+                tool_input = {}
+
+            # content_block_start for tool_use
+            tool_block_start = {
+                "type": "content_block_start",
+                "index": tool_index,
+                "content_block": {
+                    "type": "tool_use",
+                    "id": tc.id,
+                    "name": tc.function.name,
+                    "input": {},
+                },
+            }
+            yield f"event: content_block_start\ndata: {json.dumps(tool_block_start)}\n\n"
+
+            # Send input as a single delta
+            input_json = json.dumps(tool_input)
+            input_delta = {
+                "type": "content_block_delta",
+                "index": tool_index,
+                "delta": {"type": "input_json_delta", "partial_json": input_json},
+            }
+            yield f"event: content_block_delta\ndata: {json.dumps(input_delta)}\n\n"
+
+            # content_block_stop
+            yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': tool_index})}\n\n"
+
+    # Determine stop reason
+    stop_reason = "tool_use" if tool_calls else "end_turn"
+
+    # Emit message_delta with stop_reason and usage
+    message_delta = {
+        "type": "message_delta",
+        "delta": {"stop_reason": stop_reason, "stop_sequence": None},
+        "usage": {"output_tokens": completion_tokens},
+    }
+    yield f"event: message_delta\ndata: {json.dumps(message_delta)}\n\n"
+
+    # Emit message_stop
+    yield f"event: message_stop\ndata: {json.dumps({'type': 'message_stop'})}\n\n"
 
 
 # =============================================================================
