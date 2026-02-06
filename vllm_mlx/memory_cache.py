@@ -25,6 +25,7 @@ Example:
 from __future__ import annotations
 
 import logging
+import math
 from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Any
@@ -57,12 +58,38 @@ def _get_available_memory() -> int:
         return 0
 
 
+def _array_memory(arr) -> int:
+    """
+    Estimate array memory from shape+dtype without triggering lazy eval.
+
+    Accessing .nbytes on a lazy MLX array forces evaluation of the entire
+    computation graph, causing a VRAM spike. This function uses shape and
+    dtype metadata (which are always available without eval) to compute
+    the same value.
+
+    Args:
+        arr: An MLX array or similar object.
+
+    Returns:
+        Estimated memory in bytes.
+    """
+    if hasattr(arr, "shape") and hasattr(arr, "dtype"):
+        dtype = arr.dtype
+        if hasattr(dtype, "size"):
+            return math.prod(arr.shape) * dtype.size
+    # Fallback for non-MLX arrays or objects without shape/dtype
+    if hasattr(arr, "nbytes"):
+        return arr.nbytes
+    return 0
+
+
 def estimate_kv_cache_memory(cache: list[Any]) -> int:
     """
     Estimate memory usage of a KV cache in bytes.
 
     This function inspects MLX arrays in the cache and calculates their
-    total memory footprint.
+    total memory footprint using shape+dtype metadata to avoid triggering
+    lazy evaluation (which would cause a VRAM spike).
 
     Args:
         cache: List of layer cache objects, each containing keys/values tensors.
@@ -81,18 +108,14 @@ def estimate_kv_cache_memory(cache: list[Any]) -> int:
         if isinstance(layer_cache, dict) and "state" in layer_cache:
             # Extracted state dict
             keys, values = layer_cache["state"]
-            if hasattr(keys, "nbytes"):
-                total_bytes += keys.nbytes
-            if hasattr(values, "nbytes"):
-                total_bytes += values.nbytes
+            total_bytes += _array_memory(keys)
+            total_bytes += _array_memory(values)
         elif hasattr(layer_cache, "state") and not isinstance(layer_cache, dict):
             # Cache with state property returning (keys, values)
             try:
                 keys, values = layer_cache.state
-                if hasattr(keys, "nbytes"):
-                    total_bytes += keys.nbytes
-                if hasattr(values, "nbytes"):
-                    total_bytes += values.nbytes
+                total_bytes += _array_memory(keys)
+                total_bytes += _array_memory(values)
             except (TypeError, ValueError):
                 pass
         elif hasattr(layer_cache, "keys") and hasattr(layer_cache, "values"):
@@ -100,10 +123,10 @@ def estimate_kv_cache_memory(cache: list[Any]) -> int:
             keys_attr = layer_cache.keys
             values_attr = layer_cache.values
             # Ensure these are arrays, not methods
-            if not callable(keys_attr) and hasattr(keys_attr, "nbytes"):
-                total_bytes += keys_attr.nbytes
-            if not callable(values_attr) and hasattr(values_attr, "nbytes"):
-                total_bytes += values_attr.nbytes
+            if not callable(keys_attr):
+                total_bytes += _array_memory(keys_attr)
+            if not callable(values_attr):
+                total_bytes += _array_memory(values_attr)
 
     return total_bytes
 

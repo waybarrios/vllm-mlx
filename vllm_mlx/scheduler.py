@@ -17,6 +17,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Dict, List, Optional, Set, Tuple
 
+import mlx.core as mx
 from mlx_lm.generate import BatchGenerator
 from mlx_lm.sample_utils import make_sampler
 
@@ -197,6 +198,11 @@ class Scheduler:
         self.total_prompt_tokens = 0
         self.total_completion_tokens = 0
 
+        # Memory management: periodic mx.clear_cache() to free Metal command buffers
+        # Lower interval = less VRAM spike during generation but slight throughput cost
+        self._step_count = 0
+        self._clear_cache_interval = 32
+
     def _get_actual_tokenizer(self, tokenizer: Any) -> Any:
         """
         Get the actual tokenizer from a processor or tokenizer.
@@ -264,6 +270,16 @@ class Scheduler:
             prefill_step_size=self.config.prefill_step_size,
         )
 
+    def _close_batch_generator(self) -> None:
+        """Properly close BatchGenerator to restore wired_limit."""
+        if self.batch_generator is not None:
+            try:
+                if hasattr(self.batch_generator, "close"):
+                    self.batch_generator.close()
+            except Exception as e:
+                logger.debug(f"Error closing BatchGenerator: {e}")
+            self.batch_generator = None
+
     def _ensure_batch_generator(self, sampling_params: SamplingParams) -> None:
         """Ensure BatchGenerator exists with compatible settings."""
         sampler_params = (
@@ -299,6 +315,7 @@ class Scheduler:
                     )
                     self.prefix_cache.clear()
 
+            self._close_batch_generator()
             self.batch_generator = self._create_batch_generator(sampling_params)
             self._current_sampler_params = sampler_params
 
@@ -661,7 +678,7 @@ class Scheduler:
                 output.output_text = self._decode_tokens(request.output_token_ids)
                 request.output_text = output.output_text
 
-                # Extract cache for future reuse
+                # Extract cache for future reuse (critical for agentic multi-turn)
                 if hasattr(response, "prompt_cache"):
                     try:
                         # prompt_cache may be callable or direct attribute
@@ -781,6 +798,25 @@ class Scheduler:
                         except Exception as e:
                             logger.debug(f"Failed to store cache for {request_id}: {e}")
 
+            # Evaluate stored cache tensors incrementally (per-layer) to prevent
+            # a deferred batch evaluation spike when all lazy ops resolve at once.
+            # This spreads the VRAM cost across smaller per-layer evaluations.
+            if (
+                request is not None
+                and hasattr(request, "_extracted_cache")
+                and request._extracted_cache
+            ):
+                for layer in request._extracted_cache:
+                    if isinstance(layer, dict) and "state" in layer:
+                        keys, values = layer["state"]
+                        mx.eval(keys, values)
+                    elif hasattr(layer, "keys") and hasattr(layer, "values"):
+                        keys_attr = layer.keys
+                        values_attr = layer.values
+                        if not callable(keys_attr) and not callable(values_attr):
+                            mx.eval(keys_attr, values_attr)
+                mx.clear_cache()
+
             # Remove from running
             if request_id in self.running:
                 del self.running[request_id]
@@ -795,6 +831,10 @@ class Scheduler:
             # Track as finished
             self.finished_req_ids.add(request_id)
 
+        # Free Metal command buffers after cleanup (prevents end-of-generation spike)
+        if finished_ids:
+            mx.clear_cache()
+
     def _is_cache_corruption_error(self, error: Exception) -> bool:
         """Check if an error indicates cache corruption."""
         error_str = str(error)
@@ -802,8 +842,8 @@ class Scheduler:
 
     def _recover_from_cache_error(self) -> None:
         """Recover from cache corruption error."""
-        # Clear batch generator (this is the source of the corruption)
-        self.batch_generator = None
+        # Properly close batch generator (this is the source of the corruption)
+        self._close_batch_generator()
         self._current_sampler_params = None
 
         # Clear caches
@@ -907,6 +947,11 @@ class Scheduler:
         old_finished = self.finished_req_ids
         self.finished_req_ids = set()
 
+        # Periodically clear Metal cache to prevent memory accumulation
+        self._step_count += 1
+        if self._step_count % self._clear_cache_interval == 0:
+            mx.clear_cache()
+
         return output
 
     def get_request(self, request_id: str) -> Optional[Request]:
@@ -926,6 +971,21 @@ class Scheduler:
             "total_prompt_tokens": self.total_prompt_tokens,
             "total_completion_tokens": self.total_completion_tokens,
         }
+        # Include Metal memory stats
+        try:
+            if mx.metal.is_available():
+                stats["metal_active_memory_gb"] = round(
+                    mx.metal.get_active_memory() / 1e9, 2
+                )
+                stats["metal_peak_memory_gb"] = round(
+                    mx.metal.get_peak_memory() / 1e9, 2
+                )
+                stats["metal_cache_memory_gb"] = round(
+                    mx.metal.get_cache_memory() / 1e9, 2
+                )
+        except Exception:
+            pass
+
         # Include cache stats
         if self.block_aware_cache is not None:
             stats["paged_cache"] = self.block_aware_cache.get_stats()
@@ -957,7 +1017,7 @@ class Scheduler:
         self.finished_req_ids.clear()
         self.request_id_to_uid.clear()
         self.uid_to_request_id.clear()
-        self.batch_generator = None
+        self._close_batch_generator()
         self._current_sampler_params = None
 
         # Clear caches

@@ -10,6 +10,7 @@ from vllm_mlx.memory_cache import (
     MemoryAwarePrefixCache,
     MemoryCacheConfig,
     _CacheEntry,
+    _array_memory,
     _get_available_memory,
     estimate_kv_cache_memory,
 )
@@ -116,6 +117,21 @@ class MockArray:
         self.nbytes = nbytes
 
 
+class MockDtype:
+    """Mock dtype with size attribute."""
+
+    def __init__(self, size: int):
+        self.size = size
+
+
+class MockShapeArray:
+    """Mock array with shape and dtype (like MLX arrays) but no nbytes."""
+
+    def __init__(self, shape: tuple, dtype_size: int):
+        self.shape = shape
+        self.dtype = MockDtype(dtype_size)
+
+
 class MockKVCache:
     """Mock KV cache with keys/values attributes."""
 
@@ -134,6 +150,46 @@ class MockStateCache:
     @property
     def state(self):
         return (self._keys, self._values)
+
+
+class TestArrayMemory:
+    """Tests for _array_memory helper (shape-based, no lazy eval trigger)."""
+
+    def test_shape_dtype_estimation(self):
+        """Verify shape*dtype.size computation without .nbytes access."""
+        arr = MockShapeArray(shape=(2, 16, 128, 64), dtype_size=2)
+        # 2 * 16 * 128 * 64 * 2 = 524288
+        assert _array_memory(arr) == 2 * 16 * 128 * 64 * 2
+
+    def test_fallback_to_nbytes(self):
+        """Verify fallback to .nbytes when shape/dtype not available."""
+        arr = MockArray(nbytes=4096)
+        assert _array_memory(arr) == 4096
+
+    def test_zero_for_unknown_object(self):
+        """Return 0 for objects without shape/dtype/nbytes."""
+        assert _array_memory(42) == 0
+        assert _array_memory("string") == 0
+
+    def test_shape_dtype_preferred_over_nbytes(self):
+        """When both shape+dtype and nbytes exist, shape+dtype is used."""
+
+        class DualArray:
+            def __init__(self):
+                self.shape = (10,)
+                self.dtype = MockDtype(4)
+                self.nbytes = 9999  # should NOT be used
+
+        arr = DualArray()
+        assert _array_memory(arr) == 40  # 10 * 4, not 9999
+
+    def test_estimate_uses_shape_based_for_dict_state(self):
+        """estimate_kv_cache_memory uses _array_memory (shape-based) for dicts."""
+        keys = MockShapeArray(shape=(1, 8, 100, 64), dtype_size=2)
+        values = MockShapeArray(shape=(1, 8, 100, 64), dtype_size=2)
+        layer = {"state": (keys, values)}
+        expected = 2 * (1 * 8 * 100 * 64 * 2)
+        assert estimate_kv_cache_memory([layer]) == expected
 
 
 class TestEstimateKvCacheMemory:
