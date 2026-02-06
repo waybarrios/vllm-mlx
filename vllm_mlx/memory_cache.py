@@ -340,6 +340,14 @@ class MemoryAwarePrefixCache:
                 if best_super is None or cached_len > len(best_super.tokens):
                     best_super = entry
 
+        if best_super is not None:
+            # Supersequence hit — cached entry covers all requested tokens
+            # (always prefer over prefix match since remaining=[])
+            self._entries.move_to_end(best_super.tokens)
+            self._stats.hits += 1
+            self._stats.tokens_saved += len(tokens)
+            return best_super.cache, []
+
         if best_match is not None:
             # Move matched entry to end (most recently used)
             self._entries.move_to_end(best_match.tokens)
@@ -347,13 +355,6 @@ class MemoryAwarePrefixCache:
             self._stats.tokens_saved += best_length
             remaining = tokens[best_length:]
             return best_match.cache, remaining
-
-        if best_super is not None:
-            # Supersequence hit — cached entry covers all requested tokens
-            self._entries.move_to_end(best_super.tokens)
-            self._stats.hits += 1
-            self._stats.tokens_saved += len(tokens)
-            return best_super.cache, []
 
         self._stats.misses += 1
         return None, tokens
