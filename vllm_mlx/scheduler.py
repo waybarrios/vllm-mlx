@@ -318,7 +318,7 @@ def _install_chunked_prefill(
                     ) = zip(*batch_prompts)
                     lengths = [len(p) for p in inputs_raw]
                     max_length = max(lengths)
-                    padding = [max_length - l for l in lengths]
+                    padding = [max_length - ln for ln in lengths]
                     tokens = [mx.array(inp) for inp in inputs_raw]
                     is_cached = not all(c[0].empty() for c in caches)
 
@@ -333,7 +333,7 @@ def _install_chunked_prefill(
                         prompt_cache = _merge_caches(caches)
                         for c in prompt_cache:
                             c.prepare(
-                                lengths=[l - 1 for l in lengths],
+                                lengths=[ln - 1 for ln in lengths],
                                 right_padding=padding,
                             )
 
