@@ -1237,14 +1237,10 @@ class Scheduler:
                     # unused blocks when under memory pressure.
 
                 elif self.memory_aware_cache is not None:
-                    # Remove mid-prefill intermediate entry (superseded by full cache)
-                    mid_key = getattr(request, "_mid_prefill_cache_key", None)
-                    if mid_key is not None:
-                        self.memory_aware_cache.remove(list(mid_key))
-                        logger.debug(
-                            f"[mid_prefill_cache] removed intermediate entry "
-                            f"({len(mid_key)} tokens) for {request_id[:12]}"
-                        )
+                    # Keep mid-prefill entry as prefix cache for future
+                    # requests that share a common prefix (e.g. same system
+                    # prompt + tools but different user message).  LRU
+                    # eviction handles memory pressure.
 
                     # Store in memory-aware prefix cache
                     # Key includes both prompt and output tokens for multi-turn chat caching
@@ -1264,6 +1260,16 @@ class Scheduler:
                                 request._extracted_cache,
                             )
                             _store_dt = _time.monotonic() - _store_t0
+                            # Also store prompt-only entry so future requests
+                            # with the same prompt prefix but different ending
+                            # (e.g. different user message) get a prefix cache hit.
+                            prompt_only = list(request.prompt_token_ids)
+                            if tuple(prompt_only) != tuple(full_token_sequence):
+                                self.memory_aware_cache.store(
+                                    prompt_only,
+                                    request._extracted_cache,
+                                )
+
                             logger.info(
                                 f"[cache_store] request={request_id[:12]} "
                                 f"tokens={len(full_token_sequence)} "
