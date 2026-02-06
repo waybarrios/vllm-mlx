@@ -395,6 +395,7 @@ def _install_chunked_prefill(
                     f"{partial_uids & set(uids_to_remove)}"
                 )
                 _self._partial = None
+                mx.clear_cache()  # flush Metal encoders after dropping partial state
         _orig_remove(uids_to_remove)
 
     batch_gen._next = _chunked_next
@@ -496,6 +497,9 @@ class Scheduler:
                 logger.info(
                     f"Prefix cache enabled with max_entries={self.config.prefix_cache_size}"
                 )
+
+        # Thread-safe queue for deferred aborts (main thread → executor thread)
+        self._abort_queue: deque = deque()
 
         # Statistics
         self.num_requests_processed = 0
@@ -965,7 +969,30 @@ class Scheduler:
 
     def abort_request(self, request_id: str) -> bool:
         """
-        Abort a request.
+        Queue request for abort. Thread-safe, called from any thread.
+
+        The actual abort is deferred to the executor thread (inside step())
+        to avoid race conditions with in-flight Metal GPU operations.
+
+        Args:
+            request_id: The request ID to abort
+
+        Returns:
+            True (abort is always enqueued)
+        """
+        self._abort_queue.append(request_id)
+        logger.info(f"[abort_request] {request_id[:12]} enqueued for deferred abort")
+        return True
+
+    def _process_pending_aborts(self) -> None:
+        """Drain and process pending abort requests. Called from executor thread."""
+        while self._abort_queue:
+            request_id = self._abort_queue.popleft()
+            self._do_abort_request(request_id)
+
+    def _do_abort_request(self, request_id: str) -> bool:
+        """
+        Actually abort a request. Must be called from the executor thread.
 
         Args:
             request_id: The request ID to abort
@@ -1006,6 +1033,9 @@ class Scheduler:
         # Mark as aborted
         request.set_finished(RequestStatus.FINISHED_ABORTED)
         self.finished_req_ids.add(request_id)
+
+        # Flush Metal encoders after removing arrays from batch
+        mx.clear_cache()
 
         logger.info(
             f"[abort_request] {request_id[:12]} ABORTED "
@@ -1404,6 +1434,9 @@ class Scheduler:
         """
         output = SchedulerOutput()
 
+        # Process pending aborts FIRST (in executor thread, safe for MLX)
+        self._process_pending_aborts()
+
         for attempt in range(max_retries + 1):
             try:
                 # Schedule waiting requests
@@ -1525,9 +1558,12 @@ class Scheduler:
 
     def reset(self) -> None:
         """Reset the scheduler state."""
-        # Abort all requests
+        # Drain any pending deferred aborts
+        self._abort_queue.clear()
+
+        # Abort all requests directly (reset is synchronous)
         for request_id in list(self.requests.keys()):
-            self.abort_request(request_id)
+            self._do_abort_request(request_id)
 
         self.waiting.clear()
         self.running.clear()
