@@ -816,7 +816,23 @@ class Scheduler:
                     return None
 
                 if cache_cls is not None and hasattr(cache_cls, "from_state"):
-                    cache = cache_cls.from_state(state, meta_state)
+                    # BatchKVCache doesn't inherit from KVCache, so
+                    # _merge_caches can't handle it. Convert to KVCache
+                    # (safe because mid-prefill save is always batch_size=1).
+                    from mlx_lm.models.cache import (
+                        BatchKVCache as _BatchKVCache,
+                        KVCache as _KVCache,
+                    )
+
+                    if cache_cls is _BatchKVCache:
+                        # BatchKVCache.state = (keys, values, offset, left_padding)
+                        keys, values = state[0], state[1]
+                        cache = _KVCache()
+                        cache.keys = keys
+                        cache.values = values
+                        cache.offset = keys.shape[2]
+                    else:
+                        cache = cache_cls.from_state(state, meta_state)
                 else:
                     # Fallback: try KVCache manual reconstruction
                     from mlx_lm.models.cache import KVCache
