@@ -232,6 +232,28 @@ class _CacheEntry:
         )
 
 
+def _trim_cache_offset(cache: list[Any], trim_by: int) -> list[Any]:
+    """Create shallow copies of KVCache layers with offset reduced by *trim_by*.
+
+    This is used when returning a cached KV state to the scheduler so that
+    the last N positions are "freed" and the model will recompute them on the
+    next forward pass (preventing duplicate KV entries).
+    """
+    from mlx_lm.models.cache import KVCache
+
+    trimmed: list[Any] = []
+    for layer_cache in cache:
+        if hasattr(layer_cache, "offset") and hasattr(layer_cache, "keys"):
+            tc = KVCache.__new__(KVCache)
+            tc.keys = layer_cache.keys
+            tc.values = layer_cache.values
+            tc.offset = max(layer_cache.offset - trim_by, 0)
+            trimmed.append(tc)
+        else:
+            trimmed.append(layer_cache)
+    return trimmed
+
+
 class MemoryAwarePrefixCache:
     """
     Prefix cache with memory-based eviction.
@@ -341,12 +363,42 @@ class MemoryAwarePrefixCache:
                     best_super = entry
 
         if best_super is not None:
-            # Supersequence hit — cached entry covers all requested tokens
-            # (always prefer over prefix match since remaining=[])
-            self._entries.move_to_end(best_super.tokens)
-            self._stats.hits += 1
-            self._stats.tokens_saved += len(tokens)
-            return best_super.cache, []
+            # Supersequence hit — cached entry covers all requested tokens.
+            # However, for hybrid Mamba+Transformer models the MambaCache
+            # state is cumulative and includes output tokens.  Trimming
+            # only works for pure KVCache layers.  Check whether ALL
+            # layers are trimmable before using the supersequence match.
+            n_cached = len(best_super.tokens)
+            n_requested = len(tokens)
+            excess = n_cached - n_requested
+
+            has_non_trimmable = any(
+                not (hasattr(lc, "offset") and hasattr(lc, "keys"))
+                for lc in best_super.cache
+            )
+
+            if excess > 0 and has_non_trimmable:
+                # Cannot safely trim MambaCache/ArraysCache layers.
+                # Fall through to prefix match or miss.  The prompt-only
+                # entry (stored by _prompt_cache_save) should provide
+                # the correct exact-match hit on repeated prompts.
+                logger.debug(
+                    "[cache_fetch] supersequence match skipped: "
+                    "non-trimmable cache layers (hybrid model)"
+                )
+            elif excess > 0:
+                # Pure KVCache model — safe to trim
+                trimmed_cache = _trim_cache_offset(best_super.cache, excess)
+                self._entries.move_to_end(best_super.tokens)
+                self._stats.hits += 1
+                self._stats.tokens_saved += n_requested
+                return trimmed_cache, []
+            else:
+                # Exact length match via supersequence path
+                self._entries.move_to_end(best_super.tokens)
+                self._stats.hits += 1
+                self._stats.tokens_saved += n_requested
+                return best_super.cache, []
 
         if best_match is not None:
             # Move matched entry to end (most recently used)

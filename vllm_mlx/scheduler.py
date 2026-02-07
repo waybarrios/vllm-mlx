@@ -114,6 +114,7 @@ def _install_chunked_prefill(
     batch_gen: "BatchGenerator",
     budget: int,
     mid_prefill_save=None,
+    prompt_cache_save=None,
     pending_abort_ids: Optional[Set[str]] = None,
     uid_to_request_id: Optional[Dict[int, str]] = None,
 ) -> None:
@@ -143,9 +144,30 @@ def _install_chunked_prefill(
     # Keep references to originals
     _orig_next = batch_gen._next
     _orig_remove = batch_gen.remove
+    _orig_process_prompts = batch_gen._process_prompts
 
     # Partial prefill state (None when no prefill in progress)
     batch_gen._partial = None
+
+    # Monkey-patch _process_prompts to capture prompt-only cache state.
+    # At the point where _process_prompts returns, the Batch cache contains
+    # the exact prompt-only state: all prompt tokens have been processed
+    # through the model, but no output token has been fed back yet.
+    # This is the only safe capture point for hybrid Mamba+Transformer
+    # models whose MambaCache state is cumulative.
+    if prompt_cache_save is not None:
+
+        def _patched_process_prompts(prompts, _self=batch_gen):
+            batch = _orig_process_prompts(prompts)
+            for e, uid in enumerate(batch.uids):
+                if batch.num_tokens[e] == 0:
+                    try:
+                        prompt_cache_save(uid, batch.extract_cache(e))
+                    except Exception:
+                        pass
+            return batch
+
+        batch_gen._process_prompts = _patched_process_prompts
 
     def _generation_step(self=batch_gen):
         """Run one generation step on the active batch. Returns responses."""
@@ -611,15 +633,53 @@ class Scheduler:
             if save_interval > 0 and self.memory_aware_cache is not None:
                 mid_prefill_cb = self._make_mid_prefill_save_callback(save_interval)
                 logger.info(f"[mid_prefill_cache] enabled, interval={save_interval}")
+            prompt_cache_cb = None
+            if self.memory_aware_cache is not None:
+                prompt_cache_cb = self._make_prompt_cache_save_callback()
             _install_chunked_prefill(
                 bg,
                 self.config.chunked_prefill_tokens,
                 mid_prefill_cb,
+                prompt_cache_save=prompt_cache_cb,
                 pending_abort_ids=self._pending_abort_ids,
                 uid_to_request_id=self.uid_to_request_id,
             )
 
         return bg
+
+    def _make_prompt_cache_save_callback(self):
+        """Create a callback that stores prompt-only KV/Mamba cache.
+
+        Called from ``_generation_step`` right before the first output token
+        is fed into the model.  At that point ``num_tokens == 0`` and the
+        batch cache contains the exact prompt-only state (correct for both
+        KVCache and MambaCache/ArraysCache layers).
+
+        The cache is stored with key = prompt_token_ids so that a future
+        request with the identical prompt gets an exact hit.
+        """
+        import time as _time
+
+        def _prompt_cache_save(uid, extracted_cache):
+            request_id = self.uid_to_request_id.get(uid)
+            if not request_id:
+                return
+            request = self.requests.get(request_id)
+            if not request or not request.prompt_token_ids:
+                return
+
+            prompt_tokens = list(request.prompt_token_ids)
+            _t0 = _time.monotonic()
+            stored = self.memory_aware_cache.store(prompt_tokens, extracted_cache)
+            _dt = _time.monotonic() - _t0
+            if stored:
+                logger.info(
+                    f"[prompt_cache_save] request={request_id[:12]} "
+                    f"prompt_tokens={len(prompt_tokens)} "
+                    f"store_time={_dt:.3f}s"
+                )
+
+        return _prompt_cache_save
 
     def _make_mid_prefill_save_callback(self, save_interval: int):
         """Create a callback for saving intermediate KV cache during chunked prefill.
@@ -1312,15 +1372,16 @@ class Scheduler:
                                 request._extracted_cache,
                             )
                             _store_dt = _time.monotonic() - _store_t0
-                            # Also store prompt-only entry so future requests
-                            # with the same prompt prefix but different ending
-                            # (e.g. different user message) get a prefix cache hit.
-                            prompt_only = list(request.prompt_token_ids)
-                            if tuple(prompt_only) != tuple(full_token_sequence):
-                                self.memory_aware_cache.store(
-                                    prompt_only,
-                                    request._extracted_cache,
-                                )
+                            # NOTE: We intentionally do NOT store a prompt-only
+                            # cache entry.  Hybrid Mamba+Transformer models
+                            # (like Qwen3-Coder-Next) have MambaCache layers
+                            # whose state is cumulative and cannot be trimmed
+                            # back to "prompt only".  Reusing such state causes
+                            # the model to immediately produce EOS.
+                            # The full prompt+output entry is stored above; a
+                            # future request with the same prompt will hit the
+                            # supersequence match path in the fetch, which is
+                            # now disabled for safety (see memory_cache.py).
 
                             logger.info(
                                 f"[cache_store] request={request_id[:12]} "
