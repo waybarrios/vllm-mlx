@@ -787,21 +787,24 @@ class Scheduler:
                 )
                 return
 
-            # Clear prefix cache when BatchGenerator changes
-            # BatchKVCache objects are tied to their generator instance
+            # Keep prefix cache across BatchGenerator recreations.
+            # KV cache entries depend only on the input tokens, not on
+            # sampling params (temperature, top_p, min_p).  Since the
+            # server runs a single model, the cache is always valid.
             if self.batch_generator is not None:
+                n_entries = 0
                 if self.memory_aware_cache is not None:
                     n_entries = len(self.memory_aware_cache._entries)
-                    logger.info(
-                        f"[cache_clear] BatchGenerator recreated "
-                        f"(sampler params changed), dropping {n_entries} entries"
-                    )
-                    self.memory_aware_cache.clear()
                 elif self.prefix_cache is not None:
-                    logger.debug(
-                        "Clearing prefix cache: BatchGenerator being recreated"
+                    n_entries = (
+                        len(self.prefix_cache)
+                        if hasattr(self.prefix_cache, "__len__")
+                        else 0
                     )
-                    self.prefix_cache.clear()
+                logger.info(
+                    f"[batch_generator] recreating (sampler params changed), "
+                    f"keeping {n_entries} cache entries"
+                )
 
             self._close_batch_generator()
             self.batch_generator = self._create_batch_generator(sampling_params)
