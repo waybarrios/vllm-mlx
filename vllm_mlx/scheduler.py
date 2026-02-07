@@ -1247,8 +1247,11 @@ class Scheduler:
             # Append token to request
             request.append_output_token(response.token)
 
-            # Decode the new token
-            new_text = self._decode_tokens([response.token])
+            # Decode the new token (skip stop tokens — they are not content)
+            if response.finish_reason == "stop":
+                new_text = ""
+            else:
+                new_text = self._decode_tokens([response.token])
 
             # Create output
             output = RequestOutput(
