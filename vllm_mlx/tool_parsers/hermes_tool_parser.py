@@ -36,6 +36,11 @@ class HermesToolParser(ToolParser):
     """
 
     TOOL_CALL_PATTERN = re.compile(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.DOTALL)
+    # Nemotron XML: <tool_call><function=name><parameter=p>v</parameter></function></tool_call>
+    NEMOTRON_PATTERN = re.compile(
+        r"<tool_call>\s*<function=([^>]+)>(.*?)</function>\s*</tool_call>", re.DOTALL
+    )
+    PARAM_PATTERN = re.compile(r"<parameter=([^>]+)>\s*(.*?)\s*</parameter>", re.DOTALL)
     REASONING_PATTERN = re.compile(
         r"<tool_call_reasoning>(.*?)</tool_call_reasoning>", re.DOTALL
     )
@@ -77,6 +82,24 @@ class HermesToolParser(ToolParser):
 
         if matches:
             cleaned_text = self.TOOL_CALL_PATTERN.sub("", cleaned_text).strip()
+
+        # Try Nemotron XML format if no JSON tool calls found
+        if not tool_calls:
+            nemotron_matches = self.NEMOTRON_PATTERN.findall(cleaned_text)
+            for name, params_block in nemotron_matches:
+                params = self.PARAM_PATTERN.findall(params_block)
+                arguments = {
+                    p_name.strip(): p_value.strip() for p_name, p_value in params
+                }
+                tool_calls.append(
+                    {
+                        "id": generate_tool_id(),
+                        "name": name.strip(),
+                        "arguments": json.dumps(arguments, ensure_ascii=False),
+                    }
+                )
+            if nemotron_matches:
+                cleaned_text = self.NEMOTRON_PATTERN.sub("", cleaned_text).strip()
 
         # Include reasoning in content if present
         if reasoning_matches:

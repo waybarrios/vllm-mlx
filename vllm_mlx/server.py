@@ -1673,6 +1673,27 @@ async def stream_chat_completion(
     completion_tokens = 0
     last_output = None
 
+    # Tool call streaming state
+    global _tool_parser_instance
+    tool_parser = None
+    tool_accumulated_text = ""
+    tool_calls_detected = False
+    if _enable_auto_tool_choice and _tool_call_parser:
+        # Initialize parser if needed (same as _parse_tool_calls_with_parser)
+        if _tool_parser_instance is None:
+            try:
+                parser_cls = ToolParserManager.get_tool_parser(_tool_call_parser)
+                tokenizer = None
+                if _engine is not None and hasattr(_engine, "_tokenizer"):
+                    tokenizer = _engine._tokenizer
+                _tool_parser_instance = parser_cls(tokenizer)
+                logger.info(f"Initialized tool call parser: {_tool_call_parser}")
+            except Exception as e:
+                logger.warning(f"Failed to init tool parser for streaming: {e}")
+        if _tool_parser_instance is not None:
+            tool_parser = _tool_parser_instance
+            tool_parser.reset()
+
     # Stream content
     async for output in engine.stream_chat(messages=messages, **kwargs):
         delta_text = output.new_text
@@ -1720,6 +1741,40 @@ async def stream_chat_completion(
                 content = "<think>" + content
                 think_prefix_sent = True
 
+            # Tool call streaming parsing
+            if tool_parser and delta_text:
+                tool_previous = tool_accumulated_text
+                tool_accumulated_text += delta_text
+                tool_result = tool_parser.extract_tool_calls_streaming(
+                    tool_previous, tool_accumulated_text, delta_text
+                )
+
+                if tool_result is None:
+                    # Inside tool markup - suppress output
+                    continue
+
+                if "tool_calls" in tool_result:
+                    # Emit structured tool calls
+                    tool_calls_detected = True
+                    chunk = ChatCompletionChunk(
+                        id=response_id,
+                        model=request.model,
+                        choices=[
+                            ChatCompletionChunkChoice(
+                                delta=ChatCompletionChunkDelta(
+                                    tool_calls=tool_result["tool_calls"]
+                                ),
+                                finish_reason="tool_calls" if output.finished else None,
+                            )
+                        ],
+                        usage=get_usage(output) if output.finished else None,
+                    )
+                    yield f"data: {chunk.model_dump_json()}\n\n"
+                    continue
+
+                # Normal content from tool parser
+                content = tool_result.get("content", "")
+
             chunk = ChatCompletionChunk(
                 id=response_id,
                 model=request.model,
@@ -1728,12 +1783,51 @@ async def stream_chat_completion(
                         delta=ChatCompletionChunkDelta(
                             content=content if content else None
                         ),
-                        finish_reason=output.finish_reason if output.finished else None,
+                        finish_reason=(
+                            "tool_calls"
+                            if (output.finished and tool_calls_detected)
+                            else (output.finish_reason if output.finished else None)
+                        ),
                     )
                 ],
                 usage=get_usage(output) if output.finished else None,
             )
             yield f"data: {chunk.model_dump_json()}\n\n"
+
+    # Fallback: if tool parser accumulated text but never emitted tool_calls
+    # (e.g., </tool_call> never arrived - incomplete tool call)
+    if (
+        tool_parser
+        and tool_accumulated_text
+        and not tool_calls_detected
+        and "<tool_call>" in tool_accumulated_text
+    ):
+        result = tool_parser.extract_tool_calls(tool_accumulated_text)
+        if result.tools_called:
+            tool_chunk = ChatCompletionChunk(
+                id=response_id,
+                model=request.model,
+                choices=[
+                    ChatCompletionChunkChoice(
+                        delta=ChatCompletionChunkDelta(
+                            tool_calls=[
+                                {
+                                    "index": i,
+                                    "id": tc["id"],
+                                    "type": "function",
+                                    "function": {
+                                        "name": tc["name"],
+                                        "arguments": tc["arguments"],
+                                    },
+                                }
+                                for i, tc in enumerate(result.tool_calls)
+                            ]
+                        ),
+                        finish_reason="tool_calls",
+                    )
+                ],
+            )
+            yield f"data: {tool_chunk.model_dump_json()}\n\n"
 
     # Log throughput
     elapsed = time.perf_counter() - start_time
