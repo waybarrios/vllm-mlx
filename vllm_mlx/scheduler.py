@@ -312,6 +312,17 @@ def _install_chunked_prefill(
                     partial["tokens"],
                 )
 
+                # Save prompt-only cache BEFORE merging into active batch.
+                # This is the chunked-prefill equivalent of the
+                # _patched_process_prompts hook — at this point the cache
+                # contains the exact prompt-only state (num_tokens == 0).
+                if prompt_cache_save is not None and len(partial["uids"]) == 1:
+                    uid = partial["uids"][0]
+                    try:
+                        prompt_cache_save(uid, new_batch.extract_cache(0))
+                    except Exception:
+                        pass
+
                 if self.active_batch is None:
                     self.active_batch = new_batch
                 else:
@@ -780,8 +791,10 @@ class Scheduler:
             # BatchKVCache objects are tied to their generator instance
             if self.batch_generator is not None:
                 if self.memory_aware_cache is not None:
-                    logger.debug(
-                        "Clearing memory-aware cache: BatchGenerator being recreated"
+                    n_entries = len(self.memory_aware_cache._entries)
+                    logger.info(
+                        f"[cache_clear] BatchGenerator recreated "
+                        f"(sampler params changed), dropping {n_entries} entries"
                     )
                     self.memory_aware_cache.clear()
                 elif self.prefix_cache is not None:
@@ -1373,6 +1386,7 @@ class Scheduler:
                             stored = self.memory_aware_cache.store(
                                 full_token_sequence,
                                 request._extracted_cache,
+                                evict_prefixes=False,
                             )
                             _store_dt = _time.monotonic() - _store_t0
                             # NOTE: We intentionally do NOT store a prompt-only

@@ -409,9 +409,12 @@ class MemoryAwarePrefixCache:
             return best_match.cache, remaining
 
         self._stats.misses += 1
+
         return None, tokens
 
-    def store(self, tokens: list[int], cache: list[Any]) -> bool:
+    def store(
+        self, tokens: list[int], cache: list[Any], evict_prefixes: bool = True
+    ) -> bool:
         """
         Store KV cache for future reuse.
 
@@ -422,6 +425,11 @@ class MemoryAwarePrefixCache:
         Args:
             tokens: Token sequence that was processed.
             cache: The computed KV cache to store.
+            evict_prefixes: If True, evict existing entries whose token
+                sequence is a strict prefix of ``tokens``.  Set to False
+                when storing prompt+output entries to preserve prompt-only
+                entries created by prompt_cache_save (those are the entries
+                that future requests will actually match).
 
         Returns:
             True if stored successfully, False if rejected.
@@ -452,18 +460,28 @@ class MemoryAwarePrefixCache:
         # workload, request N+1 always extends the conversation from
         # request N — keeping the shorter entry wastes memory because
         # it is fully subsumed by the longer one.
-        to_remove = [
-            key
-            for key in self._entries
-            if len(key) < len(tokens_key) and tokens_key[: len(key)] == key
-        ]
+        #
+        # Skip when evict_prefixes=False (prompt+output stores).  The
+        # prompt+output key includes generated tokens that won't appear
+        # in the next request's prompt, so it must NOT evict the
+        # prompt-only entry which IS the correct prefix for future hits.
+        to_remove = (
+            [
+                key
+                for key in self._entries
+                if len(key) < len(tokens_key) and tokens_key[: len(key)] == key
+            ]
+            if evict_prefixes
+            else []
+        )
         for key in to_remove:
             old = self._entries.pop(key)
             self._current_memory -= old.memory_bytes
             self._stats.evictions += 1
             logger.debug(
-                f"Evicted prefix-subset: {len(key)} tokens, "
-                f"freed {old.memory_bytes / _BYTES_PER_MB:.2f}MB"
+                f"[prefix_evict] removed {len(key)} tokens, "
+                f"freed {old.memory_bytes / _BYTES_PER_MB:.2f}MB, "
+                f"new_entry={len(tokens_key)} tokens"
             )
         if to_remove:
             self._stats.entry_count = len(self._entries)
@@ -503,7 +521,7 @@ class MemoryAwarePrefixCache:
         self._stats.current_memory_bytes = self._current_memory
 
         logger.debug(
-            f"Evicted cache: {len(tokens_key)} tokens, "
+            f"[lru_evict] removed {len(tokens_key)} tokens, "
             f"freed {entry.memory_bytes / _BYTES_PER_MB:.2f}MB"
         )
 
