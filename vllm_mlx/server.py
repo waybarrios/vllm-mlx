@@ -355,6 +355,7 @@ def load_embedding_model(
     model_name: str | None,
     *,
     lock: bool = False,
+    reuse_existing: bool = True,
 ) -> None:
     """Load or reuse the embedding model engine when configured."""
     global _embedding_engine, _embedding_model_locked
@@ -365,7 +366,11 @@ def load_embedding_model(
     if lock:
         _embedding_model_locked = model_name
 
-    if _embedding_engine is not None and _embedding_engine.model_name == model_name:
+    if (
+        reuse_existing
+        and _embedding_engine is not None
+        and _embedding_engine.model_name == model_name
+    ):
         return
 
     from .embedding import EmbeddingEngine
