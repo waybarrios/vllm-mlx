@@ -35,6 +35,12 @@ class HermesToolParser(ToolParser):
     Used when --enable-auto-tool-choice --tool-call-parser hermes are set.
     """
 
+    # Qwen3 / Hermes chat templates handle role="tool" and tool_calls natively.
+    # Without this, tool history is converted to "[Calling tool: ...]" text,
+    # which causes the model to mimic that text format instead of producing
+    # proper <tool_call> XML after a few rounds of tool use.
+    SUPPORTS_NATIVE_TOOL_FORMAT = True
+
     TOOL_CALL_PATTERN = re.compile(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.DOTALL)
     # Nemotron XML: <tool_call><function=name><parameter=p>v</parameter></function></tool_call>
     NEMOTRON_PATTERN = re.compile(

@@ -185,11 +185,28 @@ def extract_multimodal_content(
                 tool_calls_list = []
                 for tc in tool_calls:
                     if isinstance(tc, dict):
-                        tool_calls_list.append(tc)
+                        tc_copy = tc
                     elif hasattr(tc, "model_dump"):
-                        tool_calls_list.append(tc.model_dump())
+                        tc_copy = tc.model_dump()
                     elif hasattr(tc, "dict"):
-                        tool_calls_list.append(tc.dict())
+                        tc_copy = tc.dict()
+                    else:
+                        continue
+
+                    # Chat templates (e.g. Qwen3) iterate arguments|items,
+                    # but OpenAI API sends arguments as a JSON string.
+                    # Parse it into a dict so the template can iterate it.
+                    func = tc_copy.get("function") or {}
+                    args = func.get("arguments")
+                    if isinstance(args, str):
+                        try:
+                            import json
+
+                            func["arguments"] = json.loads(args)
+                        except (json.JSONDecodeError, ValueError):
+                            pass
+
+                    tool_calls_list.append(tc_copy)
 
                 msg_dict = {"role": role, "content": content if content else ""}
                 if tool_calls_list:
