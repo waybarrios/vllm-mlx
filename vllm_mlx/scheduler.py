@@ -814,8 +814,11 @@ class Scheduler:
         """
         Validate that a cache object is usable.
 
-        This prevents NoneType errors when mlx-lm's BatchKVCache
-        contains invalid/stale references.
+        Checks for None references AND shape compatibility.  Restored
+        cache entries must have batch_size == 1 (single sequence) so
+        they can be merged into the running batch by _merge_caches.
+        A shape mismatch here (e.g. batch=2 from a stale entry) would
+        cause a concatenation crash inside _merge_caches.
 
         Args:
             cache: The cache object to validate
@@ -839,6 +842,23 @@ class Scheduler:
                     return False
                 if hasattr(layer_cache, "values") and layer_cache.values is None:
                     return False
+                # Validate batch dimension == 1 for KVCache layers
+                if hasattr(layer_cache, "keys") and layer_cache.keys is not None:
+                    if layer_cache.keys.shape[0] != 1:
+                        logger.debug(
+                            f"Cache layer invalid: keys batch={layer_cache.keys.shape[0]}, expected 1"
+                        )
+                        return False
+                # Validate batch dimension for MambaCache layers
+                if hasattr(layer_cache, "cache") and isinstance(
+                    layer_cache.cache, list
+                ):
+                    for arr in layer_cache.cache:
+                        if arr is not None and arr.shape[0] != 1:
+                            logger.debug(
+                                f"Cache layer invalid: mamba batch={arr.shape[0]}, expected 1"
+                            )
+                            return False
 
         # Check BatchKVCache structure
         if hasattr(cache, "caches"):
@@ -1203,12 +1223,34 @@ class Scheduler:
                 request.remaining_tokens = request.prompt_token_ids
                 tokens_to_process = request.prompt_token_ids
 
-            # Insert into BatchGenerator with optional cache
-            uids = self.batch_generator.insert(
-                [tokens_to_process],
-                max_tokens=[request.sampling_params.max_tokens],
-                caches=[cache_to_use] if cache_to_use else None,
-            )
+            # Insert into BatchGenerator with optional cache.
+            # Wrap in try/except: if cache shapes are incompatible
+            # (e.g. stale entry after BatchGenerator recreation),
+            # fall back to no-cache insert instead of crashing.
+            try:
+                uids = self.batch_generator.insert(
+                    [tokens_to_process],
+                    max_tokens=[request.sampling_params.max_tokens],
+                    caches=[cache_to_use] if cache_to_use else None,
+                )
+            except Exception as e:
+                if cache_to_use is not None:
+                    logger.warning(
+                        f"[cache_insert_error] request={request.request_id[:12]} "
+                        f"cache insert failed ({e}), retrying without cache"
+                    )
+                    cache_to_use = None
+                    request.prompt_cache = None
+                    request.cached_tokens = 0
+                    request.remaining_tokens = request.prompt_token_ids
+                    tokens_to_process = request.prompt_token_ids
+                    uids = self.batch_generator.insert(
+                        [tokens_to_process],
+                        max_tokens=[request.sampling_params.max_tokens],
+                        caches=None,
+                    )
+                else:
+                    raise
 
             if uids:
                 uid = uids[0]
