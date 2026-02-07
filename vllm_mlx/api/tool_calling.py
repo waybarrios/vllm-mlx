@@ -144,7 +144,13 @@ def parse_tool_calls(text: str) -> Tuple[str, Optional[List[ToolCall]]]:
         # Parse parameters from <parameter=name>value</parameter> format
         param_pattern = r"<parameter=([^>]+)>\s*(.*?)\s*</parameter>"
         params = re.findall(param_pattern, params_block, re.DOTALL)
-        arguments = {p_name.strip(): p_value.strip() for p_name, p_value in params}
+        arguments = {}
+        for p_name, p_value in params:
+            val = p_value.strip()
+            try:
+                arguments[p_name.strip()] = json.loads(val)
+            except (json.JSONDecodeError, ValueError):
+                arguments[p_name.strip()] = val
 
         tool_calls.append(
             ToolCall(

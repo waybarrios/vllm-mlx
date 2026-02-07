@@ -88,9 +88,13 @@ class HermesToolParser(ToolParser):
             nemotron_matches = self.NEMOTRON_PATTERN.findall(cleaned_text)
             for name, params_block in nemotron_matches:
                 params = self.PARAM_PATTERN.findall(params_block)
-                arguments = {
-                    p_name.strip(): p_value.strip() for p_name, p_value in params
-                }
+                arguments = {}
+                for p_name, p_value in params:
+                    val = p_value.strip()
+                    try:
+                        arguments[p_name.strip()] = json.loads(val)
+                    except (json.JSONDecodeError, ValueError):
+                        arguments[p_name.strip()] = val
                 tool_calls.append(
                     {
                         "id": generate_tool_id(),
