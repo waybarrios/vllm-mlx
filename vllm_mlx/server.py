@@ -93,6 +93,7 @@ from .api.tool_calling import (
     parse_tool_calls,
 )
 from .api.utils import (
+    SPECIAL_TOKENS_PATTERN,
     clean_output_text,
     extract_multimodal_content,
     is_mllm_model,  # noqa: F401
@@ -1510,17 +1511,7 @@ async def _stream_anthropic_messages(
 
         if delta_text:
             # Filter special tokens
-            content = delta_text
-            for tok in [
-                "<|im_end|>",
-                "<|im_start|>",
-                "<|endoftext|>",
-                "<|end|>",
-                "<|eot_id|>",
-                "</s>",
-                "<s>",
-            ]:
-                content = content.replace(tok, "")
+            content = SPECIAL_TOKENS_PATTERN.sub("", delta_text)
 
             if content:
                 accumulated_text += content
@@ -1735,6 +1726,10 @@ async def stream_chat_completion(
         else:
             # Standard path without reasoning parsing
             content = delta_text
+
+            # Filter special tokens that may leak into streaming output
+            if content:
+                content = SPECIAL_TOKENS_PATTERN.sub("", content)
 
             # Add <think> prefix on first content chunk for thinking models
             if is_thinking_model and not think_prefix_sent and content:
