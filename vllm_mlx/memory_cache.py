@@ -447,6 +447,28 @@ class MemoryAwarePrefixCache:
             )
             return False
 
+        # Prefix-subset eviction: remove entries whose token sequence
+        # is a strict prefix of the new entry.  In a multi-turn agentic
+        # workload, request N+1 always extends the conversation from
+        # request N — keeping the shorter entry wastes memory because
+        # it is fully subsumed by the longer one.
+        to_remove = [
+            key
+            for key in self._entries
+            if len(key) < len(tokens_key) and tokens_key[: len(key)] == key
+        ]
+        for key in to_remove:
+            old = self._entries.pop(key)
+            self._current_memory -= old.memory_bytes
+            self._stats.evictions += 1
+            logger.debug(
+                f"Evicted prefix-subset: {len(key)} tokens, "
+                f"freed {old.memory_bytes / _BYTES_PER_MB:.2f}MB"
+            )
+        if to_remove:
+            self._stats.entry_count = len(self._entries)
+            self._stats.current_memory_bytes = self._current_memory
+
         # Evict until we have room
         while (
             self._current_memory + entry.memory_bytes > self._max_memory
