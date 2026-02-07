@@ -230,6 +230,7 @@ class EngineCore:
         request_id: Optional[str] = None,
         images: Optional[List[Any]] = None,
         videos: Optional[List[Any]] = None,
+        prefix_boundary: int = 0,
     ) -> str:
         """
         Add a request for processing.
@@ -240,6 +241,7 @@ class EngineCore:
             request_id: Optional custom request ID
             images: Optional images for multimodal
             videos: Optional videos for multimodal
+            prefix_boundary: Token count for shared prefix (for cache)
 
         Returns:
             The request ID
@@ -256,6 +258,7 @@ class EngineCore:
             sampling_params=sampling_params,
             images=images,
             videos=videos,
+            prefix_boundary=prefix_boundary,
         )
 
         # Setup output collector with stream_interval from config

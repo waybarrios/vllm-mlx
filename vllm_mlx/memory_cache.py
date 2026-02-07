@@ -346,6 +346,13 @@ class MemoryAwarePrefixCache:
         # prompt+output tokens, but fetch uses only prompt tokens.
         best_super: _CacheEntry | None = None
 
+        # Track longest-common-prefix (LCP) for divergent sequences:
+        # cached and request share a prefix but then diverge.  This
+        # handles the agentic pattern where the same system+context
+        # prefix is reused with a different final user message.
+        best_lcp_entry: _CacheEntry | None = None
+        best_lcp_length = 0
+
         for cached_key, entry in self._entries.items():
             cached_len = len(cached_key)
             # Check if cached sequence is a prefix of requested tokens
@@ -361,6 +368,27 @@ class MemoryAwarePrefixCache:
                 # Prefer the longest match (most KV data already computed)
                 if best_super is None or cached_len > len(best_super.tokens):
                     best_super = entry
+            else:
+                # Divergent case: find longest common prefix (LCP).
+                # Quick guard: first token must match, and the entry must
+                # be long enough to potentially beat the current best.
+                min_len = min(cached_len, len(tokens_key))
+                current_best = max(best_length, best_lcp_length)
+                if min_len > current_best and cached_key[0] == tokens_key[0]:
+                    # Compute exact LCP length
+                    lcp = 0
+                    for j in range(min_len):
+                        if cached_key[j] != tokens_key[j]:
+                            break
+                        lcp = j + 1
+                    logger.debug(
+                        f"[cache_fetch] LCP scan: cached_len={cached_len} "
+                        f"req_len={len(tokens_key)} lcp={lcp} "
+                        f"current_best={current_best}"
+                    )
+                    if lcp > current_best:
+                        best_lcp_entry = entry
+                        best_lcp_length = lcp
 
         if best_super is not None:
             # Supersequence hit — cached entry covers all requested tokens.
@@ -407,6 +435,37 @@ class MemoryAwarePrefixCache:
             self._stats.tokens_saved += best_length
             remaining = tokens[best_length:]
             return best_match.cache, remaining
+
+        # Divergent prefix match: cached entry and request share a common
+        # prefix but then diverge (e.g. same system prompt + context,
+        # different final user message).  Trim cached KV state to the
+        # shared prefix length and prefill only the divergent suffix.
+        if best_lcp_entry is not None and best_lcp_length > best_length:
+            excess = len(best_lcp_entry.tokens) - best_lcp_length
+
+            has_non_trimmable = any(
+                not (hasattr(lc, "offset") and hasattr(lc, "keys"))
+                for lc in best_lcp_entry.cache
+            )
+            logger.debug(
+                f"[cache_fetch] LCP candidate: lcp={best_lcp_length} "
+                f"entry_len={len(best_lcp_entry.tokens)} excess={excess} "
+                f"non_trimmable={has_non_trimmable} "
+                f"cache_layers={len(best_lcp_entry.cache)} "
+                f"layer_types={[type(lc).__name__ for lc in best_lcp_entry.cache[:3]]}"
+            )
+
+            if not has_non_trimmable:
+                trimmed_cache = _trim_cache_offset(best_lcp_entry.cache, excess)
+                self._entries.move_to_end(best_lcp_entry.tokens)
+                self._stats.hits += 1
+                self._stats.tokens_saved += best_lcp_length
+                remaining = tokens[best_lcp_length:]
+                logger.debug(
+                    f"[cache_fetch] LCP hit: shared={best_lcp_length} "
+                    f"trimmed={excess} remaining={len(remaining)}"
+                )
+                return trimmed_cache, remaining
 
         self._stats.misses += 1
 

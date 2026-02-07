@@ -117,6 +117,7 @@ def _install_chunked_prefill(
     prompt_cache_save=None,
     pending_abort_ids: Optional[Set[str]] = None,
     uid_to_request_id: Optional[Dict[int, str]] = None,
+    requests: Optional[Dict[str, Any]] = None,
 ) -> None:
     """
     Monkey-patch a BatchGenerator instance so that large prefills are
@@ -346,8 +347,19 @@ def _install_chunked_prefill(
             if batch_prompts:
                 total_tokens = sum(len(p[1]) for p in batch_prompts)
 
-                if total_tokens > budget:
-                    # Large prompt batch — start partial prefill
+                # Check if any prompt has a prefix_boundary that
+                # requires two-phase prefill for cache save at that boundary.
+                _needs_boundary_split = False
+                if requests is not None and uid_to_request_id is not None:
+                    for _uid, _toks, *_ in batch_prompts:
+                        _rid = uid_to_request_id.get(_uid)
+                        _req = requests.get(_rid) if _rid else None
+                        if _req and getattr(_req, "prefix_boundary", 0) > 0:
+                            _needs_boundary_split = True
+                            break
+
+                if total_tokens > budget or _needs_boundary_split:
+                    # Large prompt batch or prefix boundary — start partial prefill
                     tic = _time.perf_counter()
 
                     # Eval outstanding generation tokens before switching
@@ -390,8 +402,23 @@ def _install_chunked_prefill(
                         self.prefill_batch_size :
                     ]
 
-                    # Process first chunk
-                    n_to_process = min(budget, padded.shape[1] - 1)
+                    # Process first chunk — if prefix_boundary is set,
+                    # use it as the first chunk size so that mid_prefill_save
+                    # can capture the exact prefix cache state (critical for
+                    # hybrid Mamba+Transformer models where trim is unsafe).
+                    # When the request already has cached tokens (cache hit),
+                    # adjust the boundary relative to the remaining tokens.
+                    _first_chunk = budget
+                    if _needs_boundary_split and len(batch_prompts) == 1:
+                        _uid0 = uids[0]
+                        _rid0 = uid_to_request_id.get(_uid0)
+                        _req0 = requests.get(_rid0) if _rid0 else None
+                        _pb = getattr(_req0, "prefix_boundary", 0) if _req0 else 0
+                        _cached = getattr(_req0, "cached_tokens", 0) if _req0 else 0
+                        _adjusted_pb = _pb - _cached
+                        if 0 < _adjusted_pb < padded.shape[1]:
+                            _first_chunk = _adjusted_pb
+                    n_to_process = min(_first_chunk, padded.shape[1] - 1)
                     if n_to_process > 0:
                         self.model(padded[:, :n_to_process], cache=prompt_cache)
                         mx.eval([c.state for c in prompt_cache])
@@ -638,7 +665,17 @@ class Scheduler:
             prompt_progress_callback=_prefill_progress,
         )
 
-        if self.config.chunked_prefill_tokens > 0:
+        # Install chunked prefill when explicitly configured OR when
+        # memory-aware cache is active (needed for prefix_boundary saves
+        # in agentic multi-turn workloads with hybrid Mamba+Transformer models).
+        chunked_budget = self.config.chunked_prefill_tokens
+        need_chunked = chunked_budget > 0 or self.memory_aware_cache is not None
+        if need_chunked:
+            if chunked_budget <= 0:
+                # No explicit budget — use a very large value so normal
+                # prompts pass through unchanged.  Prefix boundary splits
+                # still trigger via _needs_boundary_split.
+                chunked_budget = 999_999
             mid_prefill_cb = None
             save_interval = self.config.mid_prefill_save_interval
             if save_interval > 0 and self.memory_aware_cache is not None:
@@ -649,11 +686,12 @@ class Scheduler:
                 prompt_cache_cb = self._make_prompt_cache_save_callback()
             _install_chunked_prefill(
                 bg,
-                self.config.chunked_prefill_tokens,
+                chunked_budget,
                 mid_prefill_cb,
                 prompt_cache_save=prompt_cache_cb,
                 pending_abort_ids=self._pending_abort_ids,
                 uid_to_request_id=self.uid_to_request_id,
+                requests=self.requests,
             )
 
         return bg
@@ -681,7 +719,12 @@ class Scheduler:
 
             prompt_tokens = list(request.prompt_token_ids)
             _t0 = _time.monotonic()
-            stored = self.memory_aware_cache.store(prompt_tokens, extracted_cache)
+            # evict_prefixes=False: keep mid-prefill boundary entries so
+            # that future requests with the same prefix but different
+            # suffix get a prefix cache hit (critical for agentic multi-turn).
+            stored = self.memory_aware_cache.store(
+                prompt_tokens, extracted_cache, evict_prefixes=False
+            )
             _dt = _time.monotonic() - _t0
             if stored:
                 logger.info(
@@ -713,9 +756,15 @@ class Scheduler:
 
             total_cached = (request.cached_tokens or 0) + processed_tokens
 
-            # Throttle: only save every save_interval tokens
+            # Always save at prefix_boundary (message boundary for cache
+            # reuse with different final user messages).
+            prefix_boundary = getattr(request, "prefix_boundary", 0)
+            at_prefix_boundary = prefix_boundary > 0 and total_cached == prefix_boundary
+
+            # Throttle: only save every save_interval tokens,
+            # unless we're at the prefix boundary.
             last_save = getattr(request, "_mid_prefill_last_save", 0)
-            if total_cached - last_save < save_interval:
+            if not at_prefix_boundary and total_cached - last_save < save_interval:
                 return
 
             # Extract immutable state snapshots
