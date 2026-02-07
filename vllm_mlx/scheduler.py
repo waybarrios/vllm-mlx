@@ -114,6 +114,8 @@ def _install_chunked_prefill(
     batch_gen: "BatchGenerator",
     budget: int,
     mid_prefill_save=None,
+    pending_abort_ids: Optional[Set[str]] = None,
+    uid_to_request_id: Optional[Dict[int, str]] = None,
 ) -> None:
     """
     Monkey-patch a BatchGenerator instance so that large prefills are
@@ -212,6 +214,19 @@ def _install_chunked_prefill(
         """
         # ----- Continue a partial prefill -----
         if self._partial is not None:
+            # Check for pending aborts BEFORE processing next chunk
+            if pending_abort_ids is not None and uid_to_request_id is not None:
+                partial_rids = {uid_to_request_id.get(u) for u in self._partial["uids"]}
+                aborted_rids = partial_rids & pending_abort_ids
+                if aborted_rids:
+                    logger.info(
+                        f"[chunked_prefill] abort detected mid-prefill, "
+                        f"clearing partial for: {aborted_rids}"
+                    )
+                    self._partial = None
+                    mx.clear_cache()
+                    return _generation_step()
+
             tic = _time.perf_counter()
             partial = self._partial
             inputs = partial["inputs"]
@@ -498,8 +513,9 @@ class Scheduler:
                     f"Prefix cache enabled with max_entries={self.config.prefix_cache_size}"
                 )
 
-        # Thread-safe queue for deferred aborts (main thread → executor thread)
-        self._abort_queue: deque = deque()
+        # Thread-safe set for deferred aborts (main thread → executor thread)
+        # CPython GIL guarantees set.add() and `x in set` are atomic.
+        self._pending_abort_ids: Set[str] = set()
 
         # Statistics
         self.num_requests_processed = 0
@@ -596,7 +612,11 @@ class Scheduler:
                 mid_prefill_cb = self._make_mid_prefill_save_callback(save_interval)
                 logger.info(f"[mid_prefill_cache] enabled, interval={save_interval}")
             _install_chunked_prefill(
-                bg, self.config.chunked_prefill_tokens, mid_prefill_cb
+                bg,
+                self.config.chunked_prefill_tokens,
+                mid_prefill_cb,
+                pending_abort_ids=self._pending_abort_ids,
+                uid_to_request_id=self.uid_to_request_id,
             )
 
         return bg
@@ -980,58 +1000,60 @@ class Scheduler:
         Returns:
             True (abort is always enqueued)
         """
-        self._abort_queue.append(request_id)
+        self._pending_abort_ids.add(request_id)
         logger.info(f"[abort_request] {request_id[:12]} enqueued for deferred abort")
         return True
 
     def _process_pending_aborts(self) -> None:
         """Drain and process pending abort requests. Called from executor thread."""
-        while self._abort_queue:
-            request_id = self._abort_queue.popleft()
+        while self._pending_abort_ids:
+            request_id = self._pending_abort_ids.pop()
             self._do_abort_request(request_id)
 
     def _do_abort_request(self, request_id: str) -> bool:
         """
         Actually abort a request. Must be called from the executor thread.
 
+        Handles the case where the request was already removed from
+        self.requests by _cleanup_request() but still lives in the
+        BatchGenerator (e.g. in _partial or active_batch).
+
         Args:
             request_id: The request ID to abort
 
         Returns:
-            True if request was found and aborted, False otherwise
+            True if any cleanup was performed, False otherwise
         """
         request = self.requests.get(request_id)
-        if request is None:
-            logger.info(f"[abort_request] {request_id[:12]} not found in requests dict")
-            return False
-
         was_waiting = False
         was_running = False
         removed_from_batch = False
 
         # Remove from waiting queue
-        if request.status == RequestStatus.WAITING:
+        if request is not None and request.status == RequestStatus.WAITING:
             was_waiting = True
             try:
                 self.waiting.remove(request)
             except ValueError:
                 pass
 
-        # Remove from running (BatchGenerator)
-        if request.request_id in self.request_id_to_uid:
+        # Remove from running (BatchGenerator) — do this even if request
+        # was already cleaned up from self.requests, because the UID may
+        # still be live inside the BatchGenerator (_partial / active_batch).
+        if request_id in self.request_id_to_uid:
             was_running = True
-            uid = self.request_id_to_uid[request.request_id]
+            uid = self.request_id_to_uid[request_id]
             if self.batch_generator is not None:
                 self.batch_generator.remove([uid])
                 removed_from_batch = True
             del self.uid_to_request_id[uid]
-            del self.request_id_to_uid[request.request_id]
+            del self.request_id_to_uid[request_id]
 
         if request_id in self.running:
             del self.running[request_id]
 
-        # Mark as aborted
-        request.set_finished(RequestStatus.FINISHED_ABORTED)
+        if request is not None:
+            request.set_finished(RequestStatus.FINISHED_ABORTED)
         self.finished_req_ids.add(request_id)
 
         # Flush Metal encoders after removing arrays from batch
@@ -1559,7 +1581,7 @@ class Scheduler:
     def reset(self) -> None:
         """Reset the scheduler state."""
         # Drain any pending deferred aborts
-        self._abort_queue.clear()
+        self._pending_abort_ids.clear()
 
         # Abort all requests directly (reset is synchronous)
         for request_id in list(self.requests.keys()):
