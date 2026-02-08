@@ -49,19 +49,20 @@ if response.choices[0].message.tool_calls:
 
 Use `--tool-call-parser` to select a parser for your model family:
 
-| Parser | Models | Format |
-|--------|--------|--------|
-| `auto` | Any model | Auto-detects format (default) |
-| `mistral` | Mistral, Devstral | `[TOOL_CALLS]` token |
-| `qwen` | Qwen, Qwen3 | `<tool_call>` XML or `[Calling tool:]` |
-| `llama` | Llama 3.x, 4.x | `<function=name>` tags |
-| `hermes` | Hermes, NousResearch | `<tool_call>` XML |
-| `deepseek` | DeepSeek V3, R1 | Unicode delimiters |
-| `kimi` | Kimi K2, Moonshot | `<\|tool_call_begin\|>` tokens |
-| `granite` | IBM Granite 3.x, 4.x | `<\|tool_call\|>` or `<tool_call>` |
-| `nemotron` | NVIDIA Nemotron | `<parameter=name>` tags |
-| `xlam` | Salesforce xLAM | JSON with `tool_calls` array |
-| `functionary` | MeetKai Functionary | Multiple function blocks |
+| Parser | Aliases | Models | Format |
+|--------|---------|--------|--------|
+| `auto` | | Any model | Auto-detects format (tries all parsers) |
+| `mistral` | | Mistral, Devstral | `[TOOL_CALLS]` JSON array |
+| `qwen` | `qwen3` | Qwen, Qwen3 | `<tool_call>` XML or `[Calling tool:]` |
+| `llama` | `llama3`, `llama4` | Llama 3.x, 4.x | `<function=name>` tags |
+| `hermes` | `nous` | Hermes, NousResearch | `<tool_call>` JSON in XML |
+| `deepseek` | `deepseek_v3`, `deepseek_r1` | DeepSeek V3, R1 | Unicode delimiters |
+| `kimi` | `kimi_k2`, `moonshot` | Kimi K2, Moonshot | `<\|tool_call_begin\|>` tokens |
+| `granite` | `granite3` | IBM Granite 3.x, 4.x | `<\|tool_call\|>` or `<tool_call>` |
+| `nemotron` | `nemotron3` | NVIDIA Nemotron | `<tool_call><function=...><parameter=...>` |
+| `xlam` | | Salesforce xLAM | JSON with `tool_calls` array |
+| `functionary` | `meetkai` | MeetKai Functionary | Multiple function blocks |
+| `glm47` | `glm4` | GLM-4.7, GLM-4.7-Flash | `<tool_call>` with `<arg_key>`/`<arg_value>` XML |
 
 ## Model Examples
 
@@ -115,6 +116,30 @@ vllm-mlx serve mlx-community/granite-4.0-tiny-preview-4bit \
 # Nemotron 3 Nano
 vllm-mlx serve mlx-community/NVIDIA-Nemotron-3-Nano-30B-A3B-MLX-6Bit \
   --enable-auto-tool-choice --tool-call-parser nemotron
+```
+
+### GLM-4.7
+
+```bash
+# GLM-4.7 Flash
+vllm-mlx serve lmstudio-community/GLM-4.7-Flash-MLX-8bit \
+  --enable-auto-tool-choice --tool-call-parser glm47
+```
+
+### Kimi K2
+
+```bash
+# Kimi K2
+vllm-mlx serve mlx-community/Kimi-K2-Instruct-4bit \
+  --enable-auto-tool-choice --tool-call-parser kimi
+```
+
+### Salesforce xLAM
+
+```bash
+# xLAM
+vllm-mlx serve mlx-community/xLAM-2-fc-r-4bit \
+  --enable-auto-tool-choice --tool-call-parser xlam
 ```
 
 ## Auto Parser
@@ -200,14 +225,20 @@ response = client.chat.completions.create(
 )
 
 print(response.choices[0].message.content)
-# "The weather in Tokyo is sunny with a temperature of 22°C."
+# "The weather in Tokyo is sunny with a temperature of 22C."
 ```
+
+## Think Tag Handling
+
+Models that produce `<think>...</think>` reasoning tags (like DeepSeek-R1, Qwen3, GLM-4.7) are handled automatically. The parser strips thinking content before extracting tool calls, so reasoning tags never interfere with tool call parsing.
+
+This works even when `<think>` was injected in the prompt (implicit think tags with only a closing `</think>`).
 
 ## CLI Reference
 
 | Option | Description |
 |--------|-------------|
 | `--enable-auto-tool-choice` | Enable automatic tool calling |
-| `--tool-call-parser` | Select parser (`auto`, `mistral`, `qwen`, `llama`, etc.) |
+| `--tool-call-parser` | Select parser (see table above) |
 
 See [CLI Reference](../reference/cli.md) for all options.

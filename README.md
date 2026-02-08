@@ -15,6 +15,7 @@ vllm-mlx brings native Apple Silicon GPU acceleration to vLLM by integrating:
 - **[mlx-lm](https://github.com/ml-explore/mlx-lm)**: Optimized LLM inference with KV cache and quantization
 - **[mlx-vlm](https://github.com/Blaizzy/mlx-vlm)**: Vision-language models for multimodal inference
 - **[mlx-audio](https://github.com/Blaizzy/mlx-audio)**: Speech-to-Text and Text-to-Speech with native voices
+- **[mlx-embeddings](https://github.com/Blaizzy/mlx-embeddings)**: Text embeddings for semantic search and RAG
 
 ## Features
 
@@ -22,6 +23,7 @@ vllm-mlx brings native Apple Silicon GPU acceleration to vLLM by integrating:
 - **Native GPU acceleration** on Apple Silicon (M1, M2, M3, M4)
 - **Native TTS voices** - Spanish, French, Chinese, Japanese + 5 more languages
 - **OpenAI API compatible** - drop-in replacement for OpenAI client
+- **Embeddings** - OpenAI-compatible `/v1/embeddings` endpoint with mlx-embeddings
 - **Reasoning Models** - extract thinking process from Qwen3, DeepSeek-R1
 - **MCP Tool Calling** - integrate external tools via Model Context Protocol
 - **Paged KV Cache** - memory-efficient caching with prefix sharing
@@ -158,6 +160,26 @@ print("Answer:", response.choices[0].message.content)
 | `qwen3` | Qwen3 series | Requires both `<think>` and `</think>` tags |
 | `deepseek_r1` | DeepSeek-R1 | Handles implicit `<think>` tag |
 
+### Embeddings
+
+Generate text embeddings for semantic search, RAG, and similarity:
+
+```bash
+# Start server with an embedding model pre-loaded
+vllm-mlx serve mlx-community/Llama-3.2-3B-Instruct-4bit --embedding-model mlx-community/all-MiniLM-L6-v2-4bit
+```
+
+```python
+# Generate embeddings using the OpenAI SDK
+embeddings = client.embeddings.create(
+    model="mlx-community/all-MiniLM-L6-v2-4bit",
+    input=["Hello world", "How are you?"]
+)
+print(f"Dimensions: {len(embeddings.data[0].embedding)}")
+```
+
+See [Embeddings Guide](docs/guides/embeddings.md) for details on supported models and lazy loading.
+
 ## Documentation
 
 For full documentation, see the [docs](docs/) directory:
@@ -171,6 +193,7 @@ For full documentation, see the [docs](docs/) directory:
   - [Python API](docs/guides/python-api.md)
   - [Multimodal (Images & Video)](docs/guides/multimodal.md)
   - [Audio (STT/TTS)](docs/guides/audio.md)
+  - [Embeddings](docs/guides/embeddings.md)
   - [Reasoning Models](docs/guides/reasoning.md)
   - [MCP & Tool Calling](docs/guides/mcp-tools.md)
   - [Continuous Batching](docs/guides/continuous-batching.md)
@@ -189,31 +212,31 @@ For full documentation, see the [docs](docs/) directory:
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│                    vLLM API Layer                       │
-│           (OpenAI-compatible interface)                 │
-└─────────────────────────────────────────────────────────┘
-                           │
-                           ▼
-┌─────────────────────────────────────────────────────────┐
-│                    MLXPlatform                          │
-│       (vLLM platform plugin for Apple Silicon)          │
-└─────────────────────────────────────────────────────────┘
-                           │
-          ┌────────────────┼────────────────┐
-          ▼                ▼                ▼
-┌──────────────────┐ ┌──────────────┐ ┌──────────────────┐
-│     mlx-lm       │ │   mlx-vlm    │ │    mlx-audio     │
-│  (LLM inference) │ │ (Vision+LLM) │ │   (TTS + STT)    │
-└──────────────────┘ └──────────────┘ └──────────────────┘
-          │                │                  │
-          └────────────────┴──────────────────┘
-                           │
-                           ▼
-┌─────────────────────────────────────────────────────────┐
-│                        MLX                              │
-│         (Apple ML Framework - Metal kernels)            │
-└─────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────────┐
+│                           vLLM API Layer                                │
+│                    (OpenAI-compatible interface)                         │
+└─────────────────────────────────────────────────────────────────────────┘
+                                   │
+                                   ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│                            MLXPlatform                                  │
+│               (vLLM platform plugin for Apple Silicon)                  │
+└─────────────────────────────────────────────────────────────────────────┘
+                                   │
+        ┌─────────────┬────────────┴────────────┬─────────────┐
+        ▼             ▼                         ▼             ▼
+┌───────────────┐ ┌───────────────┐ ┌───────────────┐ ┌───────────────┐
+│    mlx-lm     │ │   mlx-vlm     │ │   mlx-audio   │ │mlx-embeddings │
+│(LLM inference)│ │ (Vision+LLM)  │ │  (TTS + STT)  │ │ (Embeddings)  │
+└───────────────┘ └───────────────┘ └───────────────┘ └───────────────┘
+        │             │                         │             │
+        └─────────────┴─────────────────────────┴─────────────┘
+                                   │
+                                   ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│                              MLX                                        │
+│                (Apple ML Framework - Metal kernels)                      │
+└─────────────────────────────────────────────────────────────────────────┘
 ```
 
 ## Performance
@@ -345,4 +368,5 @@ If you use vLLM-MLX in your research or project, please cite:
 - [mlx-lm](https://github.com/ml-explore/mlx-lm) - LLM inference library
 - [mlx-vlm](https://github.com/Blaizzy/mlx-vlm) - Vision-language models
 - [mlx-audio](https://github.com/Blaizzy/mlx-audio) - Text-to-Speech and Speech-to-Text
+- [mlx-embeddings](https://github.com/Blaizzy/mlx-embeddings) - Text embeddings
 - [vLLM](https://github.com/vllm-project/vllm) - High-throughput LLM serving

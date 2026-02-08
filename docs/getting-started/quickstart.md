@@ -81,9 +81,53 @@ response = client.chat.completions.create(
 )
 ```
 
+## Reasoning Models
+
+Separate the model's thinking process from the final answer:
+
+```bash
+vllm-mlx serve mlx-community/Qwen3-8B-4bit --reasoning-parser qwen3
+```
+
+```python
+response = client.chat.completions.create(
+    model="default",
+    messages=[{"role": "user", "content": "What is 17 × 23?"}]
+)
+print(response.choices[0].message.content)  # Final answer
+```
+
+## Embeddings
+
+Generate text embeddings for semantic search and RAG:
+
+```bash
+vllm-mlx serve mlx-community/Qwen3-4B-4bit --embedding-model mlx-community/multilingual-e5-small-mlx
+```
+
+```python
+response = client.embeddings.create(
+    model="mlx-community/multilingual-e5-small-mlx",
+    input="Hello world"
+)
+```
+
+## Tool Calling
+
+Enable function calling with any supported model:
+
+```bash
+vllm-mlx serve mlx-community/Devstral-Small-2507-4bit \
+  --enable-auto-tool-choice --tool-call-parser mistral
+```
+
 ## Next Steps
 
 - [Server Guide](../guides/server.md) - Full server configuration
 - [Python API](../guides/python-api.md) - Direct API usage
 - [Multimodal Guide](../guides/multimodal.md) - Images and video
+- [Audio Guide](../guides/audio.md) - Speech-to-Text and Text-to-Speech
+- [Embeddings Guide](../guides/embeddings.md) - Text embeddings
+- [Reasoning Models](../guides/reasoning.md) - Thinking models
+- [Tool Calling](../guides/tool-calling.md) - Function calling
 - [Supported Models](../reference/models.md) - Available models

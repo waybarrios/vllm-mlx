@@ -38,9 +38,12 @@ vllm-mlx serve <model> [options]
 | `--paged-cache-block-size` | Tokens per cache block | 64 |
 | `--max-cache-blocks` | Maximum cache blocks | 1000 |
 | `--max-num-seqs` | Max concurrent sequences | 256 |
+| `--default-temperature` | Default temperature when not specified in request | None |
+| `--default-top-p` | Default top_p when not specified in request | None |
 | `--reasoning-parser` | Parser for reasoning models (`qwen3`, `deepseek_r1`) | None |
+| `--embedding-model` | Pre-load an embedding model at startup | None |
 | `--enable-auto-tool-choice` | Enable automatic tool calling | False |
-| `--tool-call-parser` | Tool call parser (`auto`, `mistral`, `qwen`, `llama`, `deepseek`, `granite`, `nemotron`, etc.) | None |
+| `--tool-call-parser` | Tool call parser (`auto`, `mistral`, `qwen`, `llama`, `hermes`, `deepseek`, `kimi`, `granite`, `nemotron`, `xlam`, `functionary`, `glm47`) | None |
 
 ### Examples
 

@@ -47,8 +47,54 @@ jobs:
         run: mypy vllm_mlx/ --ignore-missing-imports --no-error-summary
         continue-on-error: true
 
-  unit-tests:
+  test-matrix:
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pytest pytest-asyncio pytest-cov pydantic fastapi jsonschema httpx psutil transformers requests
+
+      - name: Run unit tests (no MLX required)
+        run: |
+          pytest \
+            tests/test_mcp_security.py \
+            tests/test_structured_output.py \
+            tests/test_reasoning_parser.py \
+            tests/test_tool_parsers.py \
+            tests/test_streaming_json_encoder.py \
+            tests/test_native_tool_format.py \
+            tests/test_memory_cache.py \
+            tests/test_prefix_cache.py \
+            tests/test_mllm_cache.py \
+            tests/test_api_models.py \
+            tests/test_api_utils.py \
+            tests/test_request.py \
+            -v --tb=short \
+            -k "not Integration and not InjectJson and not TestMLXMultimodalLMCache" \
+            --cov=vllm_mlx \
+            --cov-report=term-missing \
+            --cov-report=xml
+
+      - name: Upload coverage
+        if: matrix.python-version == '3.11'
+        uses: codecov/codecov-action@v4
+        with:
+          file: ./coverage.xml
+          fail_ci_if_error: false
+
+  test-apple-silicon:
+    runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
 
@@ -57,12 +103,47 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install dependencies
+      - name: Install project and dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install pytest pytest-asyncio pydantic fastapi jsonschema
+          pip install -e ".[vision]"
+          pip install pytest pytest-asyncio
 
-      - name: Run unit tests (no MLX required)
+      - name: Verify Apple Silicon
         run: |
-          pytest tests/test_mcp_security.py -v --tb=short
-          pytest tests/test_structured_output.py -v --tb=short -k "not Integration and not InjectJson"
+          python -c "import platform; assert platform.machine() == 'arm64', 'Not ARM64'"
+          python -c "import mlx.core as mx; print(f'MLX OK: {mx.default_device()}')"
+
+      - name: Run MLX-dependent tests
+        run: |
+          pytest \
+            tests/test_platform.py \
+            tests/test_llm.py \
+            tests/test_mllm.py \
+            tests/test_server.py \
+            tests/test_paged_cache.py \
+            tests/test_mllm_continuous_batching.py \
+            tests/test_mllm_cache.py \
+            tests/test_optimizations.py \
+            tests/test_simple_engine.py \
+            tests/test_batching.py \
+            tests/test_continuous_batching.py \
+            -v --tb=short \
+            -m "not slow" \
+            -k "not Integration"
+
+  tests:
+    needs: [test-matrix, test-apple-silicon]
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - name: Check test results
+        run: |
+          if [ "${{ needs.test-matrix.result }}" != "success" ]; then
+            echo "Unit tests failed"
+            exit 1
+          fi
+          if [ "${{ needs.test-apple-silicon.result }}" != "success" ]; then
+            echo "Apple Silicon tests failed"
+            exit 1
+          fi

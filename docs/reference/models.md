@@ -8,12 +8,16 @@ Browse thousands of pre-optimized models at: **https://huggingface.co/mlx-commun
 
 | Model Family | Sizes | Quantization |
 |--------------|-------|--------------|
-| Llama 3.x | 1B, 3B, 8B, 70B | 4-bit |
-| Mistral | 7B, Mixtral 8x7B | 4-bit, 8-bit |
+| Llama 3.x, 4.x | 1B, 3B, 8B, 70B | 4-bit |
+| Mistral / Devstral | 7B, Mixtral 8x7B | 4-bit, 8-bit |
 | Qwen2/Qwen3 | 0.5B to 72B | Various |
+| DeepSeek V3, R1 | 7B, 33B, 67B | 4-bit |
+| Gemma 2, 3 | 2B, 9B, 27B | 4-bit |
+| GLM-4.7 | Flash, Base | 4-bit, 8-bit |
+| Kimi K2 | Various | 4-bit |
 | Phi-3 | 3.8B, 14B | 4-bit |
-| Gemma 2 | 2B, 9B, 27B | 4-bit |
-| DeepSeek | 7B, 33B, 67B | 4-bit |
+| Granite 3.x, 4.x | Various | 4-bit |
+| Nemotron | 3 Nano 30B | 6-bit |
 
 ### Recommended Models
 
@@ -45,12 +49,30 @@ Browse thousands of pre-optimized models at: **https://huggingface.co/mlx-commun
 | Balanced | `mlx-community/Qwen3-VL-8B-Instruct-4bit` | ~6 GB |
 | Quality | `mlx-community/Qwen3-VL-30B-A3B-Instruct-6bit` | ~20 GB |
 
+## Embedding Models (via mlx-embeddings)
+
+| Model Family | Example Models |
+|--------------|----------------|
+| **BERT** | `mlx-community/bert-base-uncased-mlx` |
+| **XLM-RoBERTa** | `mlx-community/multilingual-e5-small-mlx`, `multilingual-e5-large-mlx` |
+| **ModernBERT** | `mlx-community/ModernBERT-base-mlx` |
+
+## Audio Models (via mlx-audio)
+
+| Type | Model Family | Example Models |
+|------|--------------|----------------|
+| **STT** | Whisper | `mlx-community/whisper-large-v3-turbo` |
+| **STT** | Parakeet | `mlx-community/parakeet-tdt-0.6b-v2` |
+| **TTS** | Kokoro | `prince-canuma/Kokoro-82M` |
+| **TTS** | Chatterbox | `chatterbox/chatterbox-tts-0.1` |
+
 ## Model Detection
 
 vllm-mlx auto-detects multimodal models by name patterns:
 - Contains "VL", "Vision", "vision"
 - Contains "llava", "idefics", "paligemma"
 - Contains "pixtral", "molmo", "deepseek-vl"
+- Contains "MedGemma", "Gemma-3" (vision variants)
 
 ## Using Models
 
@@ -69,7 +91,8 @@ vllm-mlx serve /path/to/local/model
 ## Finding Models
 
 Filter mlx-community models by:
-- **LLM**: `Llama`, `Qwen`, `Mistral`, `Phi`, `Gemma`
-- **VLM**: `-VL-`, `llava`, `paligemma`, `pixtral`, `molmo`, `idefics`, `deepseek-vl`
+- **LLM**: `Llama`, `Qwen`, `Mistral`, `Phi`, `Gemma`, `DeepSeek`, `GLM`, `Kimi`, `Granite`, `Nemotron`
+- **VLM**: `-VL-`, `llava`, `paligemma`, `pixtral`, `molmo`, `idefics`, `deepseek-vl`, `MedGemma`
+- **Embedding**: `e5`, `bert`, `ModernBERT`
 - **Size**: `1B`, `3B`, `7B`, `8B`, `70B`
 - **Quantization**: `4bit`, `8bit`, `bf16`

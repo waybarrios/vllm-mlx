@@ -5,7 +5,16 @@
 - macOS on Apple Silicon (M1/M2/M3/M4)
 - Python 3.10+
 
-## From Source (Recommended)
+## Install with uv (Recommended)
+
+```bash
+git clone https://github.com/waybarrios/vllm-mlx.git
+cd vllm-mlx
+
+uv pip install -e .
+```
+
+## Install with pip
 
 ```bash
 git clone https://github.com/waybarrios/vllm-mlx.git
@@ -22,6 +31,18 @@ For video processing with transformers:
 pip install -e ".[vision]"
 ```
 
+### Optional: Audio Support (STT/TTS)
+
+```bash
+pip install mlx-audio
+```
+
+### Optional: Embeddings
+
+```bash
+pip install mlx-embeddings
+```
+
 ## What Gets Installed
 
 - `mlx`, `mlx-lm`, `mlx-vlm` - MLX framework and model libraries
@@ -29,6 +50,8 @@ pip install -e ".[vision]"
 - `opencv-python` - Video processing
 - `gradio` - Chat UI
 - `psutil` - Resource monitoring
+- `mlx-audio` (optional) - Speech-to-Text and Text-to-Speech
+- `mlx-embeddings` (optional) - Text embeddings
 
 ## Verify Installation
 

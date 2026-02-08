@@ -3,30 +3,31 @@
 ## System Overview
 
 ```
-┌─────────────────────────────────────────────┐
-│              vLLM API Layer                 │
-│     (OpenAI-compatible interface)           │
-└─────────────────────────────────────────────┘
-                      │
-                      ▼
-┌─────────────────────────────────────────────┐
-│              MLXPlatform                    │
-│   (vLLM platform plugin for Apple Silicon) │
-└─────────────────────────────────────────────┘
-                      │
-          ┌───────────┴───────────┐
-          ▼                       ▼
-┌──────────────────┐   ┌──────────────────┐
-│     mlx-lm       │   │     mlx-vlm       │
-│  (LLM inference) │   │  (MLLM inference) │
-└──────────────────┘   └──────────────────┘
-          │                       │
-          └───────────┬───────────┘
-                      ▼
-┌─────────────────────────────────────────────┐
-│                   MLX                       │
-│    (Apple ML Framework - Metal kernels)    │
-└─────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────┐
+│                     vLLM API Layer                        │
+│  (OpenAI-compatible: chat, completions, embeddings,      │
+│   audio, tools, MCP, reasoning)                          │
+└──────────────────────────────────────────────────────────┘
+                           │
+                           ▼
+┌──────────────────────────────────────────────────────────┐
+│                      MLXPlatform                          │
+│       (vLLM platform plugin for Apple Silicon)           │
+└──────────────────────────────────────────────────────────┘
+                           │
+       ┌──────────┬────────┴────────┬──────────┐
+       ▼          ▼                 ▼          ▼
+┌───────────┐┌───────────┐┌─────────────┐┌──────────────┐
+│  mlx-lm   ││  mlx-vlm  ││  mlx-audio  ││mlx-embeddings│
+│  (LLM)    ││  (Vision) ││  (STT/TTS)  ││ (Embeddings) │
+└───────────┘└───────────┘└─────────────┘└──────────────┘
+       │          │                 │          │
+       └──────────┴────────┬────────┴──────────┘
+                           ▼
+┌──────────────────────────────────────────────────────────┐
+│                         MLX                               │
+│          (Apple ML Framework - Metal kernels)            │
+└──────────────────────────────────────────────────────────┘
 ```
 
 ## Engine Architecture
@@ -112,36 +113,51 @@ Request Completion                    Cache Storage
 ```
 vllm_mlx/
 ├── api/
-│   ├── models.py       # Pydantic models
-│   ├── utils.py        # Shared utilities
-│   └── tool_calling.py # Tool call parsing
+│   ├── models.py         # Pydantic models
+│   ├── utils.py          # Shared utilities
+│   ├── streaming.py      # Streaming JSON encoder
+│   └── tool_calling.py   # Tool call parsing
+├── audio/
+│   ├── processor.py      # Audio preprocessing
+│   ├── stt.py            # Speech-to-Text
+│   └── tts.py            # Text-to-Speech
 ├── engine/
-│   ├── base.py         # BaseEngine ABC
-│   ├── simple.py       # SimpleEngine
-│   └── batched.py      # BatchedEngine
+│   ├── base.py           # BaseEngine ABC
+│   ├── simple.py         # SimpleEngine
+│   └── batched.py        # BatchedEngine
 ├── mcp/
-│   ├── client.py       # MCP client
-│   ├── config.py       # Config loading
-│   ├── executor.py     # Tool execution
-│   └── manager.py      # Server management
+│   ├── client.py         # MCP client
+│   ├── config.py         # Config loading
+│   ├── executor.py       # Tool execution
+│   ├── security.py       # Command validation
+│   ├── tools.py          # Tool sandbox
+│   └── manager.py        # Server management
 ├── models/
-│   ├── llm.py          # MLXLanguageModel
-│   └── mllm.py         # MLXMultimodalLM
-├── server.py           # FastAPI server
-├── engine_core.py      # AsyncEngineCore
-├── scheduler.py        # Request scheduler
-├── paged_cache.py      # Paged KV cache
-└── cli.py              # CLI commands
+│   ├── llm.py            # MLXLanguageModel
+│   └── mllm.py           # MLXMultimodalLM
+├── tool_parsers/         # Tool call parsers (12 formats)
+├── reasoning_parsers/    # Reasoning parsers (qwen3, deepseek_r1)
+├── server.py             # FastAPI server
+├── engine_core.py        # AsyncEngineCore
+├── scheduler.py          # LLM request scheduler
+├── mllm_scheduler.py     # MLLM request scheduler
+├── mllm_batch_generator.py # MLLM batch generation
+├── paged_cache.py        # Paged KV cache
+├── prefix_cache.py       # Prefix cache manager
+├── output_collector.py   # Request output collector
+├── model_registry.py     # Model detection & registry
+└── cli.py                # CLI commands
 ```
 
 ## Request Flow
 
-1. **API Request** → FastAPI endpoint
+1. **API Request** → FastAPI endpoint (auth, rate limit)
 2. **Engine Selection** → Simple or Batched based on config
-3. **Template Application** → Chat template formatting
-4. **Generation** → mlx-lm or mlx-vlm inference
-5. **Streaming** → SSE response chunks
-6. **Caching** → KV cache storage for reuse
+3. **Template Application** → Chat template formatting (with tool definitions if enabled)
+4. **Generation** → mlx-lm, mlx-vlm, mlx-audio, or mlx-embeddings
+5. **Post-processing** → Tool call parsing, reasoning extraction
+6. **Streaming** → SSE response chunks
+7. **Caching** → KV cache storage for reuse
 
 ## Hardware Detection
 

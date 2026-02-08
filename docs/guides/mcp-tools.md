@@ -228,10 +228,7 @@ python examples/mcp_chat.py
 
 ## Supported Tool Formats
 
-vllm-mlx parses tool calls from both Qwen and Llama formats:
-
-- Qwen: `<tool_call>{"name": "...", "arguments": {...}}</tool_call>`
-- Llama: `{"name": "...", "parameters": {...}}`
+vllm-mlx supports 12 tool call parsers covering all major model families. See [Tool Calling](tool-calling.md) for the full list of parsers, aliases, and examples.
 
 ## Security
 

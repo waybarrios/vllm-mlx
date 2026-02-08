@@ -34,12 +34,22 @@ vllm-mlx serve mlx-community/Llama-3.2-3B-Instruct-4bit --port 8000 --continuous
 |--------|-------------|---------|
 | `--port` | Server port | 8000 |
 | `--host` | Server host | 0.0.0.0 |
+| `--api-key` | API key for authentication | None |
+| `--rate-limit` | Requests per minute per client (0 = disabled) | 0 |
+| `--timeout` | Request timeout in seconds | 300 |
 | `--continuous-batching` | Enable batching for multi-user | False |
 | `--use-paged-cache` | Enable paged KV cache | False |
+| `--cache-memory-mb` | Cache memory limit in MB | Auto |
+| `--cache-memory-percent` | Fraction of RAM for cache | 0.20 |
 | `--max-tokens` | Default max tokens | 32768 |
+| `--default-temperature` | Default temperature when not specified | None |
+| `--default-top-p` | Default top_p when not specified | None |
 | `--stream-interval` | Tokens per stream chunk | 1 |
 | `--mcp-config` | Path to MCP config file | None |
-| `--reasoning-parser` | Parser for reasoning models | None |
+| `--reasoning-parser` | Parser for reasoning models (`qwen3`, `deepseek_r1`) | None |
+| `--embedding-model` | Pre-load an embedding model at startup | None |
+| `--enable-auto-tool-choice` | Enable automatic tool calling | False |
+| `--tool-call-parser` | Tool call parser (see [Tool Calling](tool-calling.md)) | None |
 
 ## API Endpoints
 
@@ -94,6 +104,22 @@ GET /v1/models
 
 Returns available models.
 
+### Embeddings
+
+```bash
+POST /v1/embeddings
+```
+
+```python
+response = client.embeddings.create(
+    model="mlx-community/multilingual-e5-small-mlx",
+    input="Hello world"
+)
+print(response.data[0].embedding[:5])  # First 5 dimensions
+```
+
+See [Embeddings Guide](embeddings.md) for details.
+
 ### Health Check
 
 ```bash
@@ -116,13 +142,18 @@ Use the `--tool-call-parser` option to select the parser for your model:
 
 | Parser | Models |
 |--------|--------|
-| `auto` | Auto-detect (default) |
+| `auto` | Auto-detect (tries all parsers) |
 | `mistral` | Mistral, Devstral |
 | `qwen` | Qwen, Qwen3 |
 | `llama` | Llama 3.x, 4.x |
+| `hermes` | Hermes, NousResearch |
 | `deepseek` | DeepSeek V3, R1 |
-| `granite` | IBM Granite |
+| `kimi` | Kimi K2, Moonshot |
+| `granite` | IBM Granite 3.x, 4.x |
 | `nemotron` | NVIDIA Nemotron |
+| `xlam` | Salesforce xLAM |
+| `functionary` | MeetKai Functionary |
+| `glm47` | GLM-4.7, GLM-4.7-Flash |
 
 ```python
 response = client.chat.completions.create(
@@ -339,5 +370,8 @@ For production with 50+ concurrent users:
 vllm-mlx serve mlx-community/Qwen3-0.6B-8bit \
   --continuous-batching \
   --use-paged-cache \
+  --api-key your-secret-key \
+  --rate-limit 60 \
+  --timeout 120 \
   --port 8000
 ```

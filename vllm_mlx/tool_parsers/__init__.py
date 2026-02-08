@@ -17,6 +17,7 @@ Available parsers:
 - nemotron/nemotron3: NVIDIA Nemotron models
 - xlam: Salesforce xLAM models
 - functionary/meetkai: MeetKai Functionary models
+- glm47/glm4: GLM-4.7 and GLM-4.7-Flash models
 
 Usage:
     from vllm_mlx.tool_parsers import ToolParserManager
@@ -53,6 +54,7 @@ from .mistral_tool_parser import MistralToolParser
 from .nemotron_tool_parser import NemotronToolParser
 from .qwen_tool_parser import QwenToolParser
 from .xlam_tool_parser import xLAMToolParser
+from .glm47_tool_parser import Glm47ToolParser
 
 __all__ = [
     # Base classes
@@ -71,4 +73,5 @@ __all__ = [
     "NemotronToolParser",
     "xLAMToolParser",
     "FunctionaryToolParser",
+    "Glm47ToolParser",
 ]
