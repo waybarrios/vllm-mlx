@@ -586,6 +586,19 @@ Examples:
             f"Options: {', '.join(reasoning_choices)}."
         ),
     )
+    # Generation defaults
+    serve_parser.add_argument(
+        "--default-temperature",
+        type=float,
+        default=None,
+        help="Override default temperature for all requests (default: use model default)",
+    )
+    serve_parser.add_argument(
+        "--default-top-p",
+        type=float,
+        default=None,
+        help="Override default top_p for all requests (default: use model default)",
+    )
     # Embedding model option
     serve_parser.add_argument(
         "--embedding-model",
