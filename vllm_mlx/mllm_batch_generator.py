@@ -646,22 +646,6 @@ class MLLMBatchGenerator:
                 first_tokens.append(sampled.item())
                 all_logprobs.append(logprobs.squeeze(0))
 
-            # Now we need to copy the VLM's cache state to the batch cache
-            # This is model-specific, but typically the language model cache
-            # is accessible via model.language_model or similar
-            if hasattr(self.model, "language_model") and hasattr(
-                self.model.language_model, "layers"
-            ):
-                for layer_idx, layer in enumerate(self.model.language_model.layers):
-                    if hasattr(layer, "self_attn") and hasattr(
-                        layer.self_attn, "cache"
-                    ):
-                        layer_cache = layer.self_attn.cache
-                        if layer_cache is not None and layer_idx < len(batch_cache):
-                            # Insert this request's cache into the batch cache at index i
-                            if hasattr(batch_cache[layer_idx], "insert_single"):
-                                batch_cache[layer_idx].insert_single(i, layer_cache)
-
         # Create initial y (first generated tokens)
         y = mx.array(first_tokens)
 
@@ -724,41 +708,23 @@ class MLLMBatchGenerator:
         prompt_processing = False
         batch = self.active_batch
         num_active = len(batch) if batch else 0
-        num_to_add = self.completion_batch_size - num_active
 
-        # Try to add more requests from unprocessed queue
-        while num_to_add >= self.prefill_batch_size:
-            requests = self.unprocessed_requests[: self.prefill_batch_size]
+        # Only start a new batch when there is no active batch generating.
+        # MLLM vision encoding produces per-request KV caches that cannot be
+        # safely extended into an active batch's cache (shape mismatch in
+        # attention layers). Instead, queued requests wait until the current
+        # batch finishes, then all get processed together in one prefill.
+        if num_active == 0:
+            requests = self.unprocessed_requests[: self.completion_batch_size]
 
-            # Nothing to add and nothing running
-            if len(requests) == 0 and num_active == 0:
+            if len(requests) == 0:
                 self.active_batch = None
                 return []
 
-            # Nothing to add but have running requests
-            if len(requests) == 0:
-                break
-
-            # Finish active generation tokens before prefill
-            if batch is not None and not prompt_processing:
-                mx.eval(batch.y, batch.logprobs)
-                self._stats.generation_time += time.perf_counter() - tic
-                tic = time.perf_counter()
-
-            # Process new batch
             new_batch = self._process_prompts(requests)
-            self.unprocessed_requests = self.unprocessed_requests[
-                self.prefill_batch_size :
-            ]
+            self.unprocessed_requests = self.unprocessed_requests[len(requests) :]
+            self.active_batch = new_batch
             prompt_processing = True
-
-            if self.active_batch is None:
-                self.active_batch = new_batch
-            else:
-                self.active_batch.extend(new_batch)
-
-            num_active = len(self.active_batch)
-            num_to_add -= len(requests)
 
         # Generate next token for active batch
         batch = self.active_batch
