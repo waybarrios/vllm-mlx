@@ -88,7 +88,10 @@ class TestStreamingJSONEncoder:
         assert data["id"] == "chatcmpl-xyz789"
         assert data["object"] == "chat.completion.chunk"
         assert data["choices"][0]["delta"]["role"] == "assistant"
-        assert "content" not in data["choices"][0]["delta"] or data["choices"][0]["delta"]["content"] is None
+        assert (
+            "content" not in data["choices"][0]["delta"]
+            or data["choices"][0]["delta"]["content"] is None
+        )
 
     def test_encode_chat_chunk_with_content(self):
         """Test encoding a chat chunk with content."""
@@ -110,7 +113,10 @@ class TestStreamingJSONEncoder:
         data = json.loads(json_str)
 
         assert data["choices"][0]["delta"]["content"] == "Hello"
-        assert "role" not in data["choices"][0]["delta"] or data["choices"][0]["delta"]["role"] is None
+        assert (
+            "role" not in data["choices"][0]["delta"]
+            or data["choices"][0]["delta"]["role"] is None
+        )
 
     def test_encode_chat_chunk_with_finish_reason(self):
         """Test encoding a chat chunk with finish_reason."""

@@ -130,7 +130,7 @@ class StreamingJSONEncoder:
         # Pattern: {"id":...,"object":...,"model":...,"choices":[{"index":N,"text":"TEXT","finish_reason":REASON}],"usage":...}
         choices_json = (
             f"{self._completion_choices_prefix}{index}"
-            f'{self._completion_text_prefix}{escaped_text}'
+            f"{self._completion_text_prefix}{escaped_text}"
             f"{self._completion_text_suffix}{finish_json}}}"
             "]"
         )
@@ -139,7 +139,10 @@ class StreamingJSONEncoder:
         # Final pattern: {prefix}{choices]}  or  {prefix}{choices],"usage":{...}}
         if usage is not None:
             usage_json = json.dumps(usage)
-            result = f"data: {self._prefix}{choices_json}," f'"usage":{usage_json}}}' + "\n\n"
+            result = (
+                f"data: {self._prefix}{choices_json},"
+                f'"usage":{usage_json}}}' + "\n\n"
+            )
         else:
             result = f"data: {self._prefix}{choices_json}}}" + "\n\n"
 
@@ -188,7 +191,10 @@ class StreamingJSONEncoder:
         # Final pattern: {prefix}{choices]}  or  {prefix}{choices],"usage":{...}}
         if usage is not None:
             usage_json = json.dumps(usage)
-            result = f"data: {self._prefix}{choices_json}," f'"usage":{usage_json}}}' + "\n\n"
+            result = (
+                f"data: {self._prefix}{choices_json},"
+                f'"usage":{usage_json}}}' + "\n\n"
+            )
         else:
             result = f"data: {self._prefix}{choices_json}}}" + "\n\n"
 

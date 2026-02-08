@@ -63,7 +63,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install pytest pytest-asyncio pytest-cov pydantic fastapi jsonschema httpx psutil transformers
+          pip install pytest pytest-asyncio pytest-cov pydantic fastapi jsonschema httpx psutil transformers requests
 
       - name: Run unit tests (no MLX required)
         run: |
@@ -78,7 +78,7 @@ jobs:
             tests/test_prefix_cache.py \
             tests/test_mllm_cache.py \
             -v --tb=short \
-            -k "not Integration and not InjectJson" \
+            -k "not Integration and not InjectJson and not TestMLXMultimodalLMCache" \
             --cov=vllm_mlx \
             --cov-report=term-missing \
             --cov-report=xml
