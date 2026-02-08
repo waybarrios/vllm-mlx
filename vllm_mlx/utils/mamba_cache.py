@@ -11,7 +11,17 @@ import logging
 from typing import List, Optional
 
 import mlx.core as mx
-from mlx_lm.models.cache import MambaCache
+
+# MambaCache was removed in mlx-lm 0.30.6 - make import conditional
+try:
+    from mlx_lm.models.cache import MambaCache
+
+    HAS_MAMBA_CACHE = True
+except ImportError:
+    # Fallback for mlx-lm >= 0.30.6 where MambaCache was removed
+    from mlx_lm.models.cache import ArraysCache as MambaCache
+
+    HAS_MAMBA_CACHE = False
 
 logger = logging.getLogger(__name__)
 
@@ -102,17 +112,27 @@ def patch_mlx_lm_for_mamba():
         ArraysCache,
         RotatingKVCache,
         CacheList,
-        MambaCache as OrigMambaCache,
     )
+
+    # MambaCache was removed in mlx-lm 0.30.6
+    try:
+        from mlx_lm.models.cache import MambaCache as OrigMambaCache
+    except ImportError:
+        OrigMambaCache = ArraysCache  # Fallback
     from mlx_lm.generate import BatchKVCache, BatchRotatingKVCache
 
     # Store original function
     _original_make_cache = gen_module._make_cache
 
-    def _patched_make_cache(model, left_padding):
+    def _patched_make_cache(model, left_padding, max_kv_size=None):
         """
         Convert a list of regular caches into their corresponding
         batch-aware caches, with support for MambaCache.
+
+        Args:
+            model: The model to create cache for
+            left_padding: Left padding for batch
+            max_kv_size: Maximum KV cache size (mlx-lm 0.30.6+)
         """
 
         def to_batch_cache(c):
@@ -138,6 +158,11 @@ def patch_mlx_lm_for_mamba():
         if hasattr(model, "make_cache"):
             cache = model.make_cache()
             return [to_batch_cache(c) for c in cache]
+        elif max_kv_size is not None:
+            # mlx-lm 0.30.6+: Use rotating cache with max_kv_size
+            return [
+                BatchRotatingKVCache(max_kv_size, left_padding) for _ in model.layers
+            ]
         else:
             return [BatchKVCache(left_padding) for _ in model.layers]
 
