@@ -304,6 +304,9 @@ class MemoryAwarePrefixCache:
         # Statistics
         self._stats = CacheStats(max_memory_bytes=self._max_memory)
 
+        # Track the match type from the last fetch() call
+        self._last_match_type: str | None = None
+
         logger.info(
             f"MemoryAwarePrefixCache initialized: "
             f"max_memory={self._max_memory / _BYTES_PER_MB:.1f}MB, "
@@ -331,6 +334,7 @@ class MemoryAwarePrefixCache:
         """
         if not tokens:
             self._stats.misses += 1
+            self._last_match_type = "miss"
             return None, tokens
 
         tokens_key = tuple(tokens)
@@ -341,6 +345,7 @@ class MemoryAwarePrefixCache:
             self._entries.move_to_end(tokens_key)
             self._stats.hits += 1
             self._stats.tokens_saved += len(tokens)
+            self._last_match_type = "exact"
             return entry.cache, []
 
         # --- O(log N) prefix & supersequence match via sorted index ---
@@ -410,11 +415,13 @@ class MemoryAwarePrefixCache:
                 self._entries.move_to_end(best_super.tokens)
                 self._stats.hits += 1
                 self._stats.tokens_saved += n_requested
+                self._last_match_type = "supersequence"
                 return trimmed_cache, []
             else:
                 self._entries.move_to_end(best_super.tokens)
                 self._stats.hits += 1
                 self._stats.tokens_saved += n_requested
+                self._last_match_type = "supersequence"
                 return best_super.cache, []
 
         # --- Prefix match ---
@@ -423,6 +430,7 @@ class MemoryAwarePrefixCache:
             self._stats.hits += 1
             self._stats.tokens_saved += best_length
             remaining = tokens[best_length:]
+            self._last_match_type = "prefix"
             return best_match.cache, remaining
 
         # --- LCP (Longest Common Prefix) for divergent sequences ---
@@ -484,9 +492,11 @@ class MemoryAwarePrefixCache:
                     f"[cache_fetch] LCP hit: shared={best_lcp_length} "
                     f"trimmed={excess} remaining={len(remaining)}"
                 )
+                self._last_match_type = "lcp"
                 return trimmed_cache, remaining
 
         self._stats.misses += 1
+        self._last_match_type = "miss"
 
         return None, tokens
 

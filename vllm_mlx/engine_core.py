@@ -521,6 +521,7 @@ class EngineCore:
             "steps_executed": self._steps_executed,
             "active_requests": len(self._output_collectors),
             "stream_interval": self.config.stream_interval,
+            "requests": self.scheduler.get_running_requests_info(),
             **scheduler_stats,
         }
 

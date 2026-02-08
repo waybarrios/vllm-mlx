@@ -1062,6 +1062,7 @@ class Scheduler:
                 request.prompt_token_ids,
             )
             if block_table and block_table.num_tokens > 0:
+                request.cache_hit_type = "hit"
                 # Reconstruct actual KVCache objects from stored tensor data
                 reconstructed = self.block_aware_cache.reconstruct_cache(block_table)
                 if reconstructed:
@@ -1077,11 +1078,13 @@ class Scheduler:
                     )
                 else:
                     # Reconstruction failed, treat as cache miss
+                    request.cache_hit_type = "miss"
                     request.remaining_tokens = request.prompt_token_ids
                     logger.debug(
                         f"Request {request.request_id}: paged cache reconstruction failed"
                     )
             else:
+                request.cache_hit_type = "miss"
                 request.remaining_tokens = request.prompt_token_ids
         elif self.memory_aware_cache is not None:
             # Use memory-aware prefix cache
@@ -1090,6 +1093,7 @@ class Scheduler:
             _fetch_t0 = _time.monotonic()
             cache, remaining = self.memory_aware_cache.fetch(request.prompt_token_ids)
             _fetch_dt = _time.monotonic() - _fetch_t0
+            request.cache_hit_type = self.memory_aware_cache._last_match_type
             if cache:
                 request.prompt_cache = cache
                 request.cached_tokens = len(request.prompt_token_ids) - len(remaining)
@@ -1111,6 +1115,7 @@ class Scheduler:
             # Use legacy prefix cache
             cache, remaining = self.prefix_cache.fetch_cache(request.prompt_token_ids)
             if cache:
+                request.cache_hit_type = "hit"
                 request.prompt_cache = cache
                 request.cached_tokens = len(request.prompt_token_ids) - len(remaining)
                 request.remaining_tokens = remaining
@@ -1120,8 +1125,10 @@ class Scheduler:
                     f"{len(remaining)} tokens remaining"
                 )
             else:
+                request.cache_hit_type = "miss"
                 request.remaining_tokens = request.prompt_token_ids
         else:
+            request.cache_hit_type = "miss"
             request.remaining_tokens = request.prompt_token_ids
 
         # Add to tracking
@@ -1353,6 +1360,12 @@ class Scheduler:
 
             # Append token to request
             request.append_output_token(response.token)
+
+            # Record first token time for TTFT metric
+            if request.first_token_time is None and request.num_output_tokens > 0:
+                import time as _time
+
+                request.first_token_time = _time.time()
 
             # Decode the new token (skip stop tokens — they are not content)
             if response.finish_reason == "stop":
@@ -1711,6 +1724,74 @@ class Scheduler:
     def remove_finished_request(self, request_id: str) -> Optional[Request]:
         """Remove a finished request from tracking."""
         return self.requests.pop(request_id, None)
+
+    def get_running_requests_info(self) -> List[Dict[str, Any]]:
+        """Per-request details for status endpoint."""
+        import time as _time
+
+        now = _time.time()
+        result = []
+
+        # Waiting requests
+        for req in self.waiting:
+            result.append(
+                {
+                    "request_id": req.request_id,
+                    "status": "waiting",
+                    "phase": "queued",
+                    "elapsed_s": round(now - req.arrival_time, 2),
+                    "prompt_tokens": req.num_prompt_tokens,
+                    "completion_tokens": 0,
+                    "max_tokens": req.max_tokens,
+                    "progress": 0.0,
+                    "tokens_per_second": None,
+                    "ttft_s": None,
+                    "cache_hit_type": req.cache_hit_type,
+                    "cached_tokens": req.cached_tokens,
+                }
+            )
+
+        # Running requests
+        for req in self.running.values():
+            n_out = req.num_output_tokens
+            elapsed = now - req.arrival_time
+
+            # Phase detection
+            if n_out == 0:
+                phase = "prefill"
+            else:
+                phase = "generation"
+
+            # Tokens per second (generation phase only)
+            tok_s = None
+            ttft = None
+            if req.first_token_time is not None:
+                ttft = round(req.first_token_time - req.arrival_time, 3)
+                gen_elapsed = now - req.first_token_time
+                if gen_elapsed > 0 and n_out > 0:
+                    tok_s = round(n_out / gen_elapsed, 1)
+
+            # Progress: completion_tokens / max_tokens
+            progress = round(n_out / req.max_tokens, 3) if req.max_tokens > 0 else 0.0
+
+            result.append(
+                {
+                    "request_id": req.request_id,
+                    "status": "running",
+                    "phase": phase,
+                    "elapsed_s": round(elapsed, 2),
+                    "prompt_tokens": req.num_prompt_tokens,
+                    "completion_tokens": n_out,
+                    "max_tokens": req.max_tokens,
+                    "progress": min(progress, 1.0),
+                    "tokens_per_second": tok_s,
+                    "ttft_s": ttft,
+                    "cache_hit_type": req.cache_hit_type,
+                    "cached_tokens": req.cached_tokens,
+                }
+            )
+
+        return result
 
     def get_stats(self) -> Dict[str, Any]:
         """Get scheduler statistics."""

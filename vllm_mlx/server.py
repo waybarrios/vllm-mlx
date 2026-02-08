@@ -500,6 +500,36 @@ async def health():
     }
 
 
+@app.get("/v1/status")
+async def status():
+    """Real-time status with per-request details for debugging and monitoring."""
+    if _engine is None:
+        return {"status": "not_loaded", "model": None, "requests": []}
+
+    stats = _engine.get_stats()
+
+    return {
+        "status": "running" if stats.get("running") else "stopped",
+        "model": _model_name,
+        "uptime_s": round(stats.get("uptime_seconds", 0), 1),
+        "steps_executed": stats.get("steps_executed", 0),
+        "num_running": stats.get("num_running", 0),
+        "num_waiting": stats.get("num_waiting", 0),
+        "total_requests_processed": stats.get("num_requests_processed", 0),
+        "total_prompt_tokens": stats.get("total_prompt_tokens", 0),
+        "total_completion_tokens": stats.get("total_completion_tokens", 0),
+        "metal": {
+            "active_memory_gb": stats.get("metal_active_memory_gb"),
+            "peak_memory_gb": stats.get("metal_peak_memory_gb"),
+            "cache_memory_gb": stats.get("metal_cache_memory_gb"),
+        },
+        "cache": stats.get("memory_aware_cache")
+        or stats.get("paged_cache")
+        or stats.get("prefix_cache"),
+        "requests": stats.get("requests", []),
+    }
+
+
 @app.get("/v1/cache/stats")
 async def cache_stats():
     """Get cache statistics for debugging and monitoring."""

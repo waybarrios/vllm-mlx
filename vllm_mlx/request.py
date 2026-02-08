@@ -130,6 +130,12 @@ class Request:
 
     # Metadata
     finish_reason: Optional[str] = None
+    first_token_time: Optional[float] = (
+        None  # Time when first output token was generated
+    )
+    cache_hit_type: Optional[str] = (
+        None  # Type of cache hit: exact/prefix/supersequence/lcp/miss
+    )
 
     @property
     def num_output_tokens(self) -> int:
