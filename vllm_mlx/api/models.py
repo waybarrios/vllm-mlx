@@ -181,7 +181,9 @@ class AssistantMessage(BaseModel):
 
     role: str = "assistant"
     content: str | None = None
-    reasoning: str | None = None  # Reasoning/thinking content (when --reasoning-parser is used)
+    reasoning: str | None = (
+        None  # Reasoning/thinking content (when --reasoning-parser is used)
+    )
     tool_calls: list[ToolCall] | None = None
 
     @computed_field
@@ -381,7 +383,9 @@ class ChatCompletionChunkDelta(BaseModel):
 
     role: str | None = None
     content: str | None = None
-    reasoning: str | None = None  # Reasoning/thinking content (when --reasoning-parser is used)
+    reasoning: str | None = (
+        None  # Reasoning/thinking content (when --reasoning-parser is used)
+    )
     tool_calls: list[dict] | None = None
 
     @computed_field

@@ -40,16 +40,14 @@ class HermesToolParser(ToolParser):
     TOOL_CALL_PATTERN = re.compile(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.DOTALL)
     # Lenient format: <tool_call or <tool_call> followed by JSON (handles malformed tags)
     TOOL_CALL_LENIENT_PATTERN = re.compile(
-        r'<tool_call[^{]*(\{"name":\s*"[^"]+",\s*"arguments":\s*\{[^}]*\}\})',
-        re.DOTALL
+        r'<tool_call[^{]*(\{"name":\s*"[^"]+",\s*"arguments":\s*\{[^}]*\}\})', re.DOTALL
     )
     REASONING_PATTERN = re.compile(
         r"<tool_call_reasoning>(.*?)</tool_call_reasoning>", re.DOTALL
     )
     # Fallback pattern for raw JSON tool calls (without tags)
     RAW_JSON_TOOL_PATTERN = re.compile(
-        r'\{"name":\s*"([^"]+)",\s*"arguments":\s*(\{[^}]*\})\}',
-        re.DOTALL
+        r'\{"name":\s*"([^"]+)",\s*"arguments":\s*(\{[^}]*\})\}', re.DOTALL
     )
 
     def extract_tool_calls(
