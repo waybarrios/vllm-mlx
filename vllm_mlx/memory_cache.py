@@ -24,6 +24,7 @@ Example:
 
 from __future__ import annotations
 
+import bisect
 import logging
 import math
 from collections import OrderedDict
@@ -291,6 +292,11 @@ class MemoryAwarePrefixCache:
         # Key: tuple(tokens), Value: _CacheEntry
         self._entries: OrderedDict[tuple[int, ...], _CacheEntry] = OrderedDict()
 
+        # Sorted index of token keys for efficient prefix/supersequence lookup.
+        # Tuple lexicographic ordering means a prefix key P is always < any
+        # extension of P, so bisect gives O(log N) range scans instead of O(N).
+        self._sorted_keys: list[tuple[int, ...]] = []
+
         # Memory tracking
         self._max_memory = self._config.compute_memory_limit()
         self._current_memory = 0
@@ -308,7 +314,10 @@ class MemoryAwarePrefixCache:
         """
         Find cached KV state for the given tokens.
 
-        This method searches for exact matches and prefix matches.
+        This method searches for exact matches, prefix matches, supersequence
+        matches, and longest-common-prefix (LCP) matches.  Uses a sorted key
+        index for O(log N) lookup instead of scanning all entries.
+
         Returns the cached KV state directly (no copy) since MLX arrays
         are immutable and safe to share.
 
@@ -326,76 +335,62 @@ class MemoryAwarePrefixCache:
 
         tokens_key = tuple(tokens)
 
-        # Check for exact match
+        # --- O(1) exact match ---
         if tokens_key in self._entries:
             entry = self._entries[tokens_key]
-            # Move to end (most recently used)
             self._entries.move_to_end(tokens_key)
             self._stats.hits += 1
             self._stats.tokens_saved += len(tokens)
-            # Return reference directly - MLX arrays are immutable
             return entry.cache, []
 
-        # Check for prefix matches (shorter cached sequences)
+        # --- O(log N) prefix & supersequence match via sorted index ---
         best_match: _CacheEntry | None = None
         best_length = 0
-
-        # Also check supersequence matches (longer cached sequences where
-        # our tokens are a prefix of the cached key).  This handles the
-        # common case of identical repeated prompts: the cache stores
-        # prompt+output tokens, but fetch uses only prompt tokens.
         best_super: _CacheEntry | None = None
 
-        # Track longest-common-prefix (LCP) for divergent sequences:
-        # cached and request share a prefix but then diverge.  This
-        # handles the agentic pattern where the same system+context
-        # prefix is reused with a different final user message.
-        best_lcp_entry: _CacheEntry | None = None
-        best_lcp_length = 0
+        sorted_keys = self._sorted_keys
+        if sorted_keys:
+            # Find insertion point for tokens_key in the sorted list.
+            # Keys that are prefixes of tokens_key or supersequences will be
+            # clustered around this position due to lexicographic ordering.
+            idx = bisect.bisect_left(sorted_keys, tokens_key)
 
-        for cached_key, entry in self._entries.items():
-            cached_len = len(cached_key)
-            # Check if cached sequence is a prefix of requested tokens
-            if (
-                cached_len < len(tokens)
-                and cached_len > best_length
-                and tokens_key[:cached_len] == cached_key
-            ):
-                best_match = entry
-                best_length = cached_len
-            # Check if requested tokens are a prefix of cached sequence
-            elif cached_len >= len(tokens) and cached_key[: len(tokens)] == tokens_key:
-                # Prefer the longest match (most KV data already computed)
-                if best_super is None or cached_len > len(best_super.tokens):
-                    best_super = entry
-            else:
-                # Divergent case: find longest common prefix (LCP).
-                # Quick guard: first token must match, and the entry must
-                # be long enough to potentially beat the current best.
-                min_len = min(cached_len, len(tokens_key))
-                current_best = max(best_length, best_lcp_length)
-                if min_len > current_best and cached_key[0] == tokens_key[0]:
-                    # Compute exact LCP length
-                    lcp = 0
-                    for j in range(min_len):
-                        if cached_key[j] != tokens_key[j]:
-                            break
-                        lcp = j + 1
-                    logger.debug(
-                        f"[cache_fetch] LCP scan: cached_len={cached_len} "
-                        f"req_len={len(tokens_key)} lcp={lcp} "
-                        f"current_best={current_best}"
-                    )
-                    if lcp > current_best:
-                        best_lcp_entry = entry
-                        best_lcp_length = lcp
+            # Scan backwards from idx to find cached keys that are PREFIXES
+            # of tokens_key (shorter cached sequences).  A prefix P of T
+            # satisfies P <= T lexicographically, so P is at idx-1 or earlier.
+            for i in range(idx - 1, -1, -1):
+                cached_key = sorted_keys[i]
+                cached_len = len(cached_key)
+                if cached_len >= len(tokens_key):
+                    continue  # Not a prefix (same length or longer)
+                # Check if cached_key is a prefix of tokens_key
+                if tokens_key[:cached_len] == cached_key:
+                    if cached_len > best_length:
+                        best_match = self._entries[cached_key]
+                        best_length = cached_len
+                    # Found best prefix — shorter entries can't be longer
+                    break
+                # Once we go past the prefix range, stop
+                if cached_key[0] != tokens_key[0]:
+                    break
 
+            # Scan forward from idx to find cached keys that are SUPERSEQUENCES
+            # of tokens_key (longer cached sequences starting with tokens_key).
+            for i in range(idx, len(sorted_keys)):
+                cached_key = sorted_keys[i]
+                cached_len = len(cached_key)
+                if cached_len < len(tokens_key):
+                    continue
+                # Check if tokens_key is a prefix of cached_key
+                if cached_key[: len(tokens_key)] == tokens_key:
+                    if best_super is None or cached_len > len(best_super.tokens):
+                        best_super = self._entries[cached_key]
+                else:
+                    # Past the supersequence range
+                    break
+
+        # --- Supersequence match handling ---
         if best_super is not None:
-            # Supersequence hit — cached entry covers all requested tokens.
-            # However, for hybrid Mamba+Transformer models the MambaCache
-            # state is cumulative and includes output tokens.  Trimming
-            # only works for pure KVCache layers.  Check whether ALL
-            # layers are trimmable before using the supersequence match.
             n_cached = len(best_super.tokens)
             n_requested = len(tokens)
             excess = n_cached - n_requested
@@ -406,41 +401,65 @@ class MemoryAwarePrefixCache:
             )
 
             if excess > 0 and has_non_trimmable:
-                # Cannot safely trim MambaCache/ArraysCache layers.
-                # Fall through to prefix match or miss.  The prompt-only
-                # entry (stored by _prompt_cache_save) should provide
-                # the correct exact-match hit on repeated prompts.
                 logger.debug(
                     "[cache_fetch] supersequence match skipped: "
                     "non-trimmable cache layers (hybrid model)"
                 )
             elif excess > 0:
-                # Pure KVCache model — safe to trim
                 trimmed_cache = _trim_cache_offset(best_super.cache, excess)
                 self._entries.move_to_end(best_super.tokens)
                 self._stats.hits += 1
                 self._stats.tokens_saved += n_requested
                 return trimmed_cache, []
             else:
-                # Exact length match via supersequence path
                 self._entries.move_to_end(best_super.tokens)
                 self._stats.hits += 1
                 self._stats.tokens_saved += n_requested
                 return best_super.cache, []
 
+        # --- Prefix match ---
         if best_match is not None:
-            # Move matched entry to end (most recently used)
             self._entries.move_to_end(best_match.tokens)
             self._stats.hits += 1
             self._stats.tokens_saved += best_length
             remaining = tokens[best_length:]
             return best_match.cache, remaining
 
-        # Divergent prefix match: cached entry and request share a common
-        # prefix but then diverge (e.g. same system prompt + context,
-        # different final user message).  Trim cached KV state to the
-        # shared prefix length and prefill only the divergent suffix.
-        if best_lcp_entry is not None and best_lcp_length > best_length:
+        # --- LCP (Longest Common Prefix) for divergent sequences ---
+        # This handles the agentic pattern: same system+context prefix
+        # but different final user message.  Use the sorted index to find
+        # the nearest neighbor which likely shares the longest prefix.
+        best_lcp_entry: _CacheEntry | None = None
+        best_lcp_length = 0
+
+        if sorted_keys:
+            idx = bisect.bisect_left(sorted_keys, tokens_key)
+            # Check neighbors around insertion point (they share the most
+            # common prefix due to lexicographic ordering).
+            for i in (idx - 1, idx):
+                if i < 0 or i >= len(sorted_keys):
+                    continue
+                cached_key = sorted_keys[i]
+                if cached_key == tokens_key:
+                    continue  # Skip exact (already handled)
+                min_len = min(len(cached_key), len(tokens_key))
+                if min_len <= best_lcp_length:
+                    continue
+                # Compute LCP length
+                lcp = 0
+                for j in range(min_len):
+                    if cached_key[j] != tokens_key[j]:
+                        break
+                    lcp = j + 1
+                if lcp > best_lcp_length:
+                    best_lcp_entry = self._entries[cached_key]
+                    best_lcp_length = lcp
+                    logger.debug(
+                        f"[cache_fetch] LCP scan: cached_len={len(cached_key)} "
+                        f"req_len={len(tokens_key)} lcp={lcp}"
+                    )
+
+        if best_lcp_entry is not None and best_lcp_length > 0:
             excess = len(best_lcp_entry.tokens) - best_lcp_length
 
             has_non_trimmable = any(
@@ -515,36 +534,34 @@ class MemoryAwarePrefixCache:
             return False
 
         # Prefix-subset eviction: remove entries whose token sequence
-        # is a strict prefix of the new entry.  In a multi-turn agentic
-        # workload, request N+1 always extends the conversation from
-        # request N — keeping the shorter entry wastes memory because
-        # it is fully subsumed by the longer one.
-        #
-        # Skip when evict_prefixes=False (prompt+output stores).  The
-        # prompt+output key includes generated tokens that won't appear
-        # in the next request's prompt, so it must NOT evict the
-        # prompt-only entry which IS the correct prefix for future hits.
-        to_remove = (
-            [
-                key
-                for key in self._entries
-                if len(key) < len(tokens_key) and tokens_key[: len(key)] == key
-            ]
-            if evict_prefixes
-            else []
-        )
-        for key in to_remove:
-            old = self._entries.pop(key)
-            self._current_memory -= old.memory_bytes
-            self._stats.evictions += 1
-            logger.debug(
-                f"[prefix_evict] removed {len(key)} tokens, "
-                f"freed {old.memory_bytes / _BYTES_PER_MB:.2f}MB, "
-                f"new_entry={len(tokens_key)} tokens"
-            )
-        if to_remove:
-            self._stats.entry_count = len(self._entries)
-            self._stats.current_memory_bytes = self._current_memory
+        # is a strict prefix of the new entry.  Uses sorted index for
+        # O(log N + K) lookup instead of O(N) scan.
+        if evict_prefixes and self._sorted_keys:
+            to_remove = []
+            idx = bisect.bisect_left(self._sorted_keys, tokens_key)
+            # Scan backwards — prefixes of tokens_key are immediately before idx
+            for i in range(idx - 1, -1, -1):
+                key = self._sorted_keys[i]
+                klen = len(key)
+                if klen >= len(tokens_key):
+                    continue
+                if tokens_key[:klen] == key:
+                    to_remove.append(key)
+                elif key[0] != tokens_key[0]:
+                    break
+            for key in to_remove:
+                old = self._entries.pop(key)
+                self._current_memory -= old.memory_bytes
+                self._stats.evictions += 1
+                self._remove_from_sorted(key)
+                logger.debug(
+                    f"[prefix_evict] removed {len(key)} tokens, "
+                    f"freed {old.memory_bytes / _BYTES_PER_MB:.2f}MB, "
+                    f"new_entry={len(tokens_key)} tokens"
+                )
+            if to_remove:
+                self._stats.entry_count = len(self._entries)
+                self._stats.current_memory_bytes = self._current_memory
 
         # Evict until we have room
         while (
@@ -556,6 +573,7 @@ class MemoryAwarePrefixCache:
         # Store entry
         self._entries[tokens_key] = entry
         self._current_memory += entry.memory_bytes
+        bisect.insort(self._sorted_keys, tokens_key)
         self._stats.entry_count = len(self._entries)
         self._stats.current_memory_bytes = self._current_memory
 
@@ -567,6 +585,12 @@ class MemoryAwarePrefixCache:
 
         return True
 
+    def _remove_from_sorted(self, key: tuple[int, ...]) -> None:
+        """Remove a key from the sorted index using bisect for O(log N)."""
+        idx = bisect.bisect_left(self._sorted_keys, key)
+        if idx < len(self._sorted_keys) and self._sorted_keys[idx] == key:
+            self._sorted_keys.pop(idx)
+
     def _evict_lru(self) -> None:
         """Evict the least recently used entry."""
         if not self._entries:
@@ -575,6 +599,7 @@ class MemoryAwarePrefixCache:
         # popitem(last=False) removes oldest entry (FIFO order = LRU)
         tokens_key, entry = self._entries.popitem(last=False)
         self._current_memory -= entry.memory_bytes
+        self._remove_from_sorted(tokens_key)
         self._stats.evictions += 1
         self._stats.entry_count = len(self._entries)
         self._stats.current_memory_bytes = self._current_memory
@@ -598,6 +623,7 @@ class MemoryAwarePrefixCache:
         entry = self._entries.pop(tokens_key, None)
         if entry is not None:
             self._current_memory -= entry.memory_bytes
+            self._remove_from_sorted(tokens_key)
             self._stats.entry_count = len(self._entries)
             self._stats.current_memory_bytes = self._current_memory
             return True
@@ -606,6 +632,7 @@ class MemoryAwarePrefixCache:
     def clear(self) -> None:
         """Clear all cached entries."""
         self._entries.clear()
+        self._sorted_keys.clear()
         self._current_memory = 0
         self._stats = CacheStats(max_memory_bytes=self._max_memory)
         logger.debug("Cache cleared")
@@ -799,6 +826,7 @@ class MemoryAwarePrefixCache:
                 )
                 self._entries[tokens_key] = entry
                 self._current_memory += memory
+                bisect.insort(self._sorted_keys, tokens_key)
                 loaded += 1
 
                 logger.info(

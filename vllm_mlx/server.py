@@ -1669,6 +1669,7 @@ async def stream_chat_completion(
     tool_parser = None
     tool_accumulated_text = ""
     tool_calls_detected = False
+    tool_markup_possible = False  # Fast path: skip parsing until '<' seen
     if _enable_auto_tool_choice and _tool_call_parser:
         # Initialize parser if needed (same as _parse_tool_calls_with_parser)
         if _tool_parser_instance is None:
@@ -1738,37 +1739,48 @@ async def stream_chat_completion(
 
             # Tool call streaming parsing
             if tool_parser and delta_text:
-                tool_previous = tool_accumulated_text
-                tool_accumulated_text += delta_text
-                tool_result = tool_parser.extract_tool_calls_streaming(
-                    tool_previous, tool_accumulated_text, delta_text
-                )
-
-                if tool_result is None:
-                    # Inside tool markup - suppress output
-                    continue
-
-                if "tool_calls" in tool_result:
-                    # Emit structured tool calls
-                    tool_calls_detected = True
-                    chunk = ChatCompletionChunk(
-                        id=response_id,
-                        model=request.model,
-                        choices=[
-                            ChatCompletionChunkChoice(
-                                delta=ChatCompletionChunkDelta(
-                                    tool_calls=tool_result["tool_calls"]
-                                ),
-                                finish_reason="tool_calls" if output.finished else None,
-                            )
-                        ],
-                        usage=get_usage(output) if output.finished else None,
+                # Fast path: skip full parsing until '<' is seen in the stream,
+                # which could start tool markup (e.g. <tool_call>). This avoids
+                # per-token string scanning on the growing accumulated text.
+                if not tool_markup_possible and "<" not in delta_text:
+                    tool_accumulated_text += delta_text
+                    # No tool markup yet, fall through to normal chunk emission
+                else:
+                    if not tool_markup_possible:
+                        tool_markup_possible = True
+                    tool_previous = tool_accumulated_text
+                    tool_accumulated_text += delta_text
+                    tool_result = tool_parser.extract_tool_calls_streaming(
+                        tool_previous, tool_accumulated_text, delta_text
                     )
-                    yield f"data: {chunk.model_dump_json()}\n\n"
-                    continue
 
-                # Normal content from tool parser
-                content = tool_result.get("content", "")
+                    if tool_result is None:
+                        # Inside tool markup - suppress output
+                        continue
+
+                    if "tool_calls" in tool_result:
+                        # Emit structured tool calls
+                        tool_calls_detected = True
+                        chunk = ChatCompletionChunk(
+                            id=response_id,
+                            model=request.model,
+                            choices=[
+                                ChatCompletionChunkChoice(
+                                    delta=ChatCompletionChunkDelta(
+                                        tool_calls=tool_result["tool_calls"]
+                                    ),
+                                    finish_reason=(
+                                        "tool_calls" if output.finished else None
+                                    ),
+                                )
+                            ],
+                            usage=get_usage(output) if output.finished else None,
+                        )
+                        yield f"data: {chunk.model_dump_json()}\n\n"
+                        continue
+
+                    # Normal content from tool parser
+                    content = tool_result.get("content", "")
 
             chunk = ChatCompletionChunk(
                 id=response_id,

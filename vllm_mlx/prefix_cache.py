@@ -186,8 +186,8 @@ class PrefixCacheManager:
                 self.stats.hits += 1
                 self.stats.tokens_saved += len(tokens)
                 self._touch_lru(tokens_tuple)
-                # Deep copy to prevent mutation
-                return copy.deepcopy(cache_entry.prompt_cache), []
+                # No copy needed - MLX arrays are immutable
+                return cache_entry.prompt_cache, []
 
         if shorter:
             # Shorter prefix cached - return cache and remaining tokens
@@ -197,7 +197,8 @@ class PrefixCacheManager:
                 self.stats.tokens_saved += len(shorter)
                 self._touch_lru(tuple(shorter))
                 remaining = tokens[len(shorter) :]
-                return copy.deepcopy(cache_entry.prompt_cache), remaining
+                # No copy needed - MLX arrays are immutable
+                return cache_entry.prompt_cache, remaining
 
         if longer:
             # Longer prefix cached - trim to match and return

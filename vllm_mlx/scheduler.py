@@ -585,7 +585,7 @@ class Scheduler:
         # Memory management: periodic mx.clear_cache() to free Metal command buffers
         # Lower interval = less VRAM spike during generation but slight throughput cost
         self._step_count = 0
-        self._clear_cache_interval = 16
+        self._clear_cache_interval = 32
         self._memory_log_interval = 256
 
     def _get_actual_tokenizer(self, tokenizer: Any) -> Any:
@@ -1547,7 +1547,6 @@ class Scheduler:
                         values_attr = layer.values
                         if not callable(keys_attr) and not callable(values_attr):
                             mx.eval(keys_attr, values_attr)
-                mx.clear_cache()
 
             # Remove from running
             if request_id in self.running:
