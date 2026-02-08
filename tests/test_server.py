@@ -117,7 +117,9 @@ class TestChatCompletionRequest:
         assert request.model == "test-model"
         assert len(request.messages) == 1
         assert request.max_tokens is None  # uses _default_max_tokens when None
-        assert request.temperature == 0.7  # default
+        assert (
+            request.temperature is None
+        )  # resolved at runtime by _resolve_temperature
         assert request.stream is False  # default
 
     def test_request_with_options(self):
