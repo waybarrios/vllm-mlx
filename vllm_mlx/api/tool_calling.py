@@ -82,7 +82,9 @@ def _parse_raw_json_tool_calls(text: str) -> Optional[List[dict]]:
     return tool_calls if tool_calls else None
 
 
-def parse_tool_calls(text: str) -> Tuple[str, Optional[List[ToolCall]]]:
+def parse_tool_calls(
+    text: str, request: dict[str, Any] | None = None
+) -> Tuple[str, Optional[List[ToolCall]]]:
     """
     Parse tool calls from model output.
 

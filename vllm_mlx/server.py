@@ -353,9 +353,11 @@ def _parse_tool_calls_with_parser(
     """
     global _tool_parser_instance
 
+    request_dict = request.model_dump() if request else None
+
     # If auto tool choice is not enabled, use the generic parser
     if not _enable_auto_tool_choice or not _tool_call_parser:
-        return parse_tool_calls(output_text)
+        return parse_tool_calls(output_text, request_dict)
 
     # Initialize parser if needed
     if _tool_parser_instance is None:
@@ -372,13 +374,13 @@ def _parse_tool_calls_with_parser(
                 f"Failed to initialize tool parser '{_tool_call_parser}': {e}"
             )
             logger.warning("Falling back to generic parser")
-            return parse_tool_calls(output_text)
+            return parse_tool_calls(output_text, request_dict)
 
     # Use the configured parser
     try:
         # Reset parser state between requests
         _tool_parser_instance.reset()
-        result = _tool_parser_instance.extract_tool_calls(output_text)
+        result = _tool_parser_instance.extract_tool_calls(output_text, request_dict)
         if result.tools_called:
             tool_calls = [
                 ToolCall(
@@ -395,10 +397,10 @@ def _parse_tool_calls_with_parser(
         else:
             # Fallback: specific parser didn't find tool calls,
             # try generic parser which handles more formats (e.g. Nemotron XML)
-            return parse_tool_calls(output_text)
+            return parse_tool_calls(output_text, request_dict)
     except Exception as e:
         logger.warning(f"Tool parser error: {e}")
-        return parse_tool_calls(output_text)
+        return parse_tool_calls(output_text, request_dict)
 
 
 def _detect_native_tool_support() -> bool:
