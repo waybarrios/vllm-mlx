@@ -36,6 +36,7 @@ class TestNativeToolFormatCapability:
             GraniteToolParser,
             FunctionaryToolParser,
             KimiToolParser,
+            HermesToolParser,
         ]
         for parser_cls in native_parsers:
             assert (
@@ -49,7 +50,6 @@ class TestNativeToolFormatCapability:
         """Parsers that don't support native tool format should return False."""
         non_native_parsers = [
             QwenToolParser,
-            HermesToolParser,
             NemotronToolParser,
             xLAMToolParser,
             AutoToolParser,
@@ -65,14 +65,22 @@ class TestNativeToolFormatCapability:
     def test_via_manager(self):
         """Test native format detection via ToolParserManager."""
         # Native support
-        for name in ["mistral", "llama", "deepseek", "granite", "functionary", "kimi"]:
+        for name in [
+            "mistral",
+            "llama",
+            "deepseek",
+            "granite",
+            "functionary",
+            "kimi",
+            "hermes",
+        ]:
             parser_cls = ToolParserManager.get_tool_parser(name)
             assert (
                 parser_cls.supports_native_format() is True
             ), f"Parser '{name}' should support native format"
 
         # No native support
-        for name in ["qwen", "hermes", "nemotron", "xlam", "auto"]:
+        for name in ["qwen", "nemotron", "xlam", "auto"]:
             parser_cls = ToolParserManager.get_tool_parser(name)
             assert (
                 parser_cls.supports_native_format() is False
