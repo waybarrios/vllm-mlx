@@ -284,9 +284,7 @@ class TestAnthropicToOpenai:
         assert result.messages[1].role == "user"
 
     def test_system_list(self):
-        req = self._make_request(
-            system=[{"type": "text", "text": "Be concise."}]
-        )
+        req = self._make_request(system=[{"type": "text", "text": "Be concise."}])
         result = anthropic_to_openai(req)
         assert result.messages[0].role == "system"
         assert result.messages[0].content == "Be concise."
