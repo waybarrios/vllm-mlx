@@ -590,7 +590,10 @@ async def create_embeddings(request: EmbeddingRequest) -> EmbeddingResponse:
         model_name = request.model
 
         # If an embedding model was pre-configured at startup, only allow that model
-        if _embedding_model_locked is not None and model_name != _embedding_model_locked:
+        if (
+            _embedding_model_locked is not None
+            and model_name != _embedding_model_locked
+        ):
             raise HTTPException(
                 status_code=400,
                 detail=(

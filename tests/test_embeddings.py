@@ -263,7 +263,6 @@ class TestEmbeddingsEndpoint:
             srv._embedding_model_locked = original_locked
 
 
-
 # =============================================================================
 # Slow Integration Test - Real Model
 # =============================================================================
