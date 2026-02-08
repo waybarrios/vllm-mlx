@@ -59,6 +59,7 @@ dependencies = [
     "pytz>=2024.1",
     # Note: mlx-audio moved to optional [audio] deps due to mlx-lm version conflict
     # See: https://github.com/waybarrios/vllm-mlx/issues/19
+    "mlx-embeddings>=0.0.5"
 ]
 
 [project.optional-dependencies]
@@ -107,7 +108,6 @@ mlx = "vllm_mlx.plugin:mlx_platform_plugin"
 
 [project.scripts]
 vllm-mlx = "vllm_mlx.cli:main"
-vllm-mlx-serve = "vllm_mlx.server_v2:main"
 vllm-mlx-chat = "vllm_mlx.gradio_app:main"
 vllm-mlx-bench = "vllm_mlx.benchmark:main"
 
@@ -121,6 +121,8 @@ target-version = ["py310", "py311", "py312", "py313"]
 
 [tool.ruff]
 line-length = 88
+
+[tool.ruff.lint]
 select = ["E", "F", "W", "I", "N", "UP", "B", "SIM"]
 ignore = ["E501", "B905"]
 

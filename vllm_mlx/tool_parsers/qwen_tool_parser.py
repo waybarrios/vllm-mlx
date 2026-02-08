@@ -50,10 +50,12 @@ class QwenToolParser(ToolParser):
         Extract tool calls from a complete Qwen model response.
         """
         tool_calls = []
-        cleaned_text = model_output
+
+        # Strip <think> tags first (fallback when no reasoning parser)
+        cleaned_text = self.strip_think_tags(model_output)
 
         # Try bracket pattern first (Qwen3 style)
-        bracket_matches = self.BRACKET_PATTERN.findall(model_output)
+        bracket_matches = self.BRACKET_PATTERN.findall(cleaned_text)
         for name, args_str in bracket_matches:
             try:
                 arguments = json.loads(args_str)
