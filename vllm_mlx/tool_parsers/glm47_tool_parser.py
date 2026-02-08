@@ -52,29 +52,27 @@ class Glm47ToolParser(ToolParser):
         r"<arg_key>\s*(.*?)\s*</arg_key>\s*<arg_value>(.*?)</arg_value>", re.DOTALL
     )
 
-    # Match thinking tags to remove from output
-    THINK_PATTERN = re.compile(r"<think>.*?</think>", re.DOTALL)
-
     def _deserialize(self, value: str) -> Any:
-        """Convert string value to appropriate Python type."""
+        """Convert string value to appropriate Python type.
+
+        Uses json.loads for type coercion, falls back to raw string.
+        """
         value = value.strip()
 
-        # Try JSON first
         try:
             return json.loads(value)
         except json.JSONDecodeError:
-            pass
+            return value
 
-        # Try as Python literal
-        try:
-            import ast
-
-            return ast.literal_eval(value)
-        except (ValueError, SyntaxError):
-            pass
-
-        # Return as string
-        return value
+    def _get_tool_names(self, request: dict[str, Any] | None) -> set[str]:
+        """Extract valid tool names from the request."""
+        if not request or "tools" not in request:
+            return set()
+        return {
+            t.get("function", {}).get("name", "")
+            for t in request.get("tools", [])
+            if isinstance(t, dict)
+        }
 
     def extract_tool_calls(
         self, model_output: str, request: dict[str, Any] | None = None
@@ -83,10 +81,13 @@ class Glm47ToolParser(ToolParser):
         Extract tool calls from a complete GLM-4.7 model response.
         """
         tool_calls = []
-        cleaned_text = model_output
 
-        # Remove thinking tags first
-        cleaned_text = self.THINK_PATTERN.sub("", cleaned_text)
+        # Strip think tags using the base class method (handles both
+        # full <think>...</think> and implicit ...</think> patterns)
+        cleaned_text = self.strip_think_tags(model_output)
+
+        # Get valid tool names for validation
+        valid_names = self._get_tool_names(request)
 
         # Find all tool call blocks
         matches = self.FUNC_DETAIL_PATTERN.findall(cleaned_text)
@@ -96,6 +97,10 @@ class Glm47ToolParser(ToolParser):
             args_section = match[1] if len(match) > 1 and match[1] else ""
 
             if not func_name:
+                continue
+
+            # Validate tool name against available tools if provided
+            if valid_names and func_name not in valid_names:
                 continue
 
             # Parse arguments
@@ -122,11 +127,9 @@ class Glm47ToolParser(ToolParser):
             return ExtractedToolCallInformation(
                 tools_called=True,
                 tool_calls=tool_calls,
-                content=None,  # Don't include reasoning text when making tool calls
+                content=None,
             )
         else:
-            # Remove thinking from final output even if no tool calls
-            cleaned_text = self.THINK_PATTERN.sub("", model_output).strip()
             return ExtractedToolCallInformation(
                 tools_called=False, tool_calls=[], content=cleaned_text
             )
@@ -148,29 +151,32 @@ class Glm47ToolParser(ToolParser):
         if "<think>" in current_text and "</think>" not in current_text:
             return None
 
-        if "<tool_call>" not in current_text:
-            # Remove thinking tags from delta
-            clean_delta = self.THINK_PATTERN.sub("", delta_text)
-            if clean_delta:
-                return {"content": clean_delta}
+        # Once <tool_call> is detected, buffer everything until it closes.
+        # Do NOT emit content deltas here, because if tool calls are found
+        # the non-streaming path sets content=None (reasoning before the
+        # tag should not leak as regular content).
+        if "<tool_call>" in current_text:
+            if "</tool_call>" in delta_text:
+                result = self.extract_tool_calls(current_text, request)
+                if result.tools_called:
+                    return {
+                        "tool_calls": [
+                            {
+                                "index": i,
+                                "id": tc["id"],
+                                "type": "function",
+                                "function": {
+                                    "name": tc["name"],
+                                    "arguments": tc["arguments"],
+                                },
+                            }
+                            for i, tc in enumerate(result.tool_calls)
+                        ]
+                    }
             return None
 
-        if "</tool_call>" in delta_text:
-            result = self.extract_tool_calls(current_text)
-            if result.tools_called:
-                return {
-                    "tool_calls": [
-                        {
-                            "index": i,
-                            "id": tc["id"],
-                            "type": "function",
-                            "function": {
-                                "name": tc["name"],
-                                "arguments": tc["arguments"],
-                            },
-                        }
-                        for i, tc in enumerate(result.tool_calls)
-                    ]
-                }
-
+        # No tool call detected yet; strip think tags and emit content
+        clean_delta = self.strip_think_tags(delta_text)
+        if clean_delta:
+            return {"content": clean_delta}
         return None
