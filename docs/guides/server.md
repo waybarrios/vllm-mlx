@@ -134,22 +134,41 @@ Returns server status.
 POST /v1/messages
 ```
 
-Anthropic-compatible endpoint that allows tools like Claude Code and OpenCode to connect directly to vllm-mlx. Supports streaming, tool calling, system messages, and token counting.
+Anthropic-compatible endpoint that allows tools like Claude Code and OpenCode to connect directly to vllm-mlx. Internally it translates Anthropic requests to OpenAI format, runs inference through the engine, and converts the response back to Anthropic format.
+
+Capabilities:
+- Non-streaming and streaming responses (SSE)
+- System messages (plain string or list of content blocks)
+- Multi-turn conversations with user and assistant messages
+- Tool calling with `tool_use` / `tool_result` content blocks
+- Token counting for budget tracking
+- Multimodal content (images via `source` blocks)
+- Client disconnect detection (returns HTTP 499)
+- Automatic special token filtering in streamed output
+
+#### Non-streaming
 
 ```python
 from anthropic import Anthropic
 
 client = Anthropic(base_url="http://localhost:8000", api_key="not-needed")
 
-# Non-streaming
 response = client.messages.create(
     model="default",
     max_tokens=256,
     messages=[{"role": "user", "content": "Hello!"}]
 )
 print(response.content[0].text)
+# Response includes: response.id, response.model, response.stop_reason,
+# response.usage.input_tokens, response.usage.output_tokens
+```
 
-# Streaming
+#### Streaming
+
+Streaming follows the Anthropic SSE event protocol. Events are emitted in this order:
+`message_start` -> `content_block_start` -> `content_block_delta` (repeated) -> `content_block_stop` -> `message_delta` -> `message_stop`
+
+```python
 with client.messages.stream(
     model="default",
     max_tokens=256,
@@ -159,9 +178,37 @@ with client.messages.stream(
         print(text, end="")
 ```
 
-With tool calling:
+#### System messages
+
+System messages can be a plain string or a list of content blocks:
 
 ```python
+# Plain string
+response = client.messages.create(
+    model="default",
+    max_tokens=256,
+    system="You are a helpful coding assistant.",
+    messages=[{"role": "user", "content": "Write a hello world in Python"}]
+)
+
+# List of content blocks
+response = client.messages.create(
+    model="default",
+    max_tokens=256,
+    system=[
+        {"type": "text", "text": "You are a helpful assistant."},
+        {"type": "text", "text": "Be concise in your answers."},
+    ],
+    messages=[{"role": "user", "content": "What is 2+2?"}]
+)
+```
+
+#### Tool calling
+
+Define tools with `name`, `description`, and `input_schema`. The model returns `tool_use` content blocks when it wants to call a tool. Send results back as `tool_result` blocks.
+
+```python
+# Step 1: Send request with tools
 response = client.messages.create(
     model="default",
     max_tokens=1024,
@@ -177,16 +224,117 @@ response = client.messages.create(
     }]
 )
 
+# Step 2: Check if model wants to use tools
 for block in response.content:
     if block.type == "tool_use":
-        print(f"{block.name}: {block.input}")
+        print(f"Tool: {block.name}, Input: {block.input}, ID: {block.id}")
+        # response.stop_reason will be "tool_use"
+
+# Step 3: Send tool result back
+response = client.messages.create(
+    model="default",
+    max_tokens=1024,
+    messages=[
+        {"role": "user", "content": "What's the weather in Paris?"},
+        {"role": "assistant", "content": response.content},
+        {"role": "user", "content": [
+            {
+                "type": "tool_result",
+                "tool_use_id": block.id,
+                "content": "Sunny, 22C"
+            }
+        ]}
+    ],
+    tools=[{
+        "name": "get_weather",
+        "description": "Get weather for a city",
+        "input_schema": {
+            "type": "object",
+            "properties": {"city": {"type": "string"}},
+            "required": ["city"]
+        }
+    }]
+)
+print(response.content[0].text)  # "The weather in Paris is sunny, 22C."
 ```
 
-Token counting (used by Claude Code for budget tracking):
+Tool choice modes:
+
+| `tool_choice` | Behavior |
+|---------------|----------|
+| `{"type": "auto"}` | Model decides whether to call tools (default) |
+| `{"type": "any"}` | Model must call at least one tool |
+| `{"type": "tool", "name": "get_weather"}` | Model must call the specified tool |
+| `{"type": "none"}` | Model will not call any tools |
+
+#### Multi-turn conversations
+
+```python
+messages = [
+    {"role": "user", "content": "My name is Alice."},
+    {"role": "assistant", "content": "Nice to meet you, Alice!"},
+    {"role": "user", "content": "What's my name?"},
+]
+
+response = client.messages.create(
+    model="default",
+    max_tokens=100,
+    messages=messages
+)
+```
+
+#### Token counting
 
 ```bash
 POST /v1/messages/count_tokens
 ```
+
+Counts input tokens for an Anthropic request using the model's tokenizer. Useful for budget tracking before sending a request. Counts tokens from system messages, conversation messages, tool_use inputs, tool_result content, and tool definitions (name, description, input_schema).
+
+```python
+import requests
+
+resp = requests.post("http://localhost:8000/v1/messages/count_tokens", json={
+    "model": "default",
+    "messages": [{"role": "user", "content": "Hello, how are you?"}],
+    "system": "You are helpful.",
+    "tools": [{
+        "name": "search",
+        "description": "Search the web",
+        "input_schema": {"type": "object", "properties": {"q": {"type": "string"}}}
+    }]
+})
+print(resp.json())  # {"input_tokens": 42}
+```
+
+#### curl examples
+
+Non-streaming:
+
+```bash
+curl http://localhost:8000/v1/messages \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "default",
+    "max_tokens": 256,
+    "messages": [{"role": "user", "content": "Hello!"}]
+  }'
+```
+
+Streaming:
+
+```bash
+curl http://localhost:8000/v1/messages \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "default",
+    "max_tokens": 256,
+    "stream": true,
+    "messages": [{"role": "user", "content": "Tell me a joke"}]
+  }'
+```
+
+Token counting:
 
 ```bash
 curl http://localhost:8000/v1/messages/count_tokens \
@@ -198,21 +346,86 @@ curl http://localhost:8000/v1/messages/count_tokens \
 # {"input_tokens": 12}
 ```
 
-Supported request fields:
+#### Request fields
 
-| Field | Type | Description |
-|-------|------|-------------|
-| `model` | string | Model name |
-| `messages` | list | Conversation messages |
-| `max_tokens` | int | Maximum tokens to generate |
-| `system` | string or list | System prompt |
-| `stream` | bool | Enable streaming (default false) |
-| `temperature` | float | Sampling temperature |
-| `top_p` | float | Top-p sampling |
-| `top_k` | int | Top-k sampling |
-| `stop_sequences` | list | Stop sequences |
-| `tools` | list | Tool definitions |
-| `tool_choice` | dict | Tool selection mode (auto, any, or specific tool) |
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `model` | string | yes | - | Model name (use `"default"` for the loaded model) |
+| `messages` | list | yes | - | Conversation messages with `role` and `content` |
+| `max_tokens` | int | yes | - | Maximum number of tokens to generate |
+| `system` | string or list | no | null | System prompt (string or list of `{"type": "text", "text": "..."}` blocks) |
+| `stream` | bool | no | false | Enable SSE streaming |
+| `temperature` | float | no | 0.7 | Sampling temperature (0.0 = deterministic, 1.0 = creative) |
+| `top_p` | float | no | 0.9 | Nucleus sampling threshold |
+| `top_k` | int | no | null | Top-k sampling |
+| `stop_sequences` | list | no | null | Sequences that stop generation |
+| `tools` | list | no | null | Tool definitions with `name`, `description`, `input_schema` |
+| `tool_choice` | dict | no | null | Tool selection mode (`auto`, `any`, `tool`, `none`) |
+| `metadata` | dict | no | null | Arbitrary metadata (passed through, not used by server) |
+
+#### Response format
+
+Non-streaming response:
+
+```json
+{
+  "id": "msg_abc123...",
+  "type": "message",
+  "role": "assistant",
+  "model": "default",
+  "content": [
+    {"type": "text", "text": "Hello! How can I help?"}
+  ],
+  "stop_reason": "end_turn",
+  "stop_sequence": null,
+  "usage": {
+    "input_tokens": 12,
+    "output_tokens": 8
+  }
+}
+```
+
+When tools are called, `content` includes `tool_use` blocks and `stop_reason` is `"tool_use"`:
+
+```json
+{
+  "content": [
+    {"type": "text", "text": "Let me check the weather."},
+    {
+      "type": "tool_use",
+      "id": "call_abc123",
+      "name": "get_weather",
+      "input": {"city": "Paris"}
+    }
+  ],
+  "stop_reason": "tool_use"
+}
+```
+
+Stop reasons:
+
+| `stop_reason` | Meaning |
+|---------------|---------|
+| `end_turn` | Model finished naturally |
+| `tool_use` | Model wants to call a tool |
+| `max_tokens` | Hit the `max_tokens` limit |
+
+#### Using with Claude Code
+
+Point Claude Code directly at your vllm-mlx server:
+
+```bash
+# Start the server
+vllm-mlx serve mlx-community/Qwen3-Coder-Next-235B-A22B-4bit \
+  --continuous-batching \
+  --enable-auto-tool-choice \
+  --tool-call-parser hermes
+
+# In another terminal, configure Claude Code
+export ANTHROPIC_BASE_URL=http://localhost:8000
+export ANTHROPIC_API_KEY=not-needed
+claude
+```
 
 ### Server Status
 
@@ -220,29 +433,84 @@ Supported request fields:
 GET /v1/status
 ```
 
-Real-time monitoring endpoint with per-request details, Metal memory usage, and cache statistics.
+Real-time monitoring endpoint that returns server-wide statistics and per-request details. Useful for debugging performance, tracking cache efficiency, and monitoring Metal GPU memory.
 
 ```bash
 curl -s http://localhost:8000/v1/status | python -m json.tool
+```
+
+Example response:
+
+```json
+{
+  "status": "running",
+  "model": "mlx-community/Qwen3-8B-4bit",
+  "uptime_s": 342.5,
+  "steps_executed": 1247,
+  "num_running": 1,
+  "num_waiting": 0,
+  "total_requests_processed": 15,
+  "total_prompt_tokens": 28450,
+  "total_completion_tokens": 3200,
+  "metal": {
+    "active_memory_gb": 5.2,
+    "peak_memory_gb": 8.1,
+    "cache_memory_gb": 2.3
+  },
+  "cache": {
+    "type": "memory_aware_cache",
+    "entries": 5,
+    "hit_rate": 0.87,
+    "memory_mb": 2350
+  },
+  "requests": [
+    {
+      "request_id": "req_abc123",
+      "phase": "generation",
+      "tokens_per_second": 45.2,
+      "ttft_s": 0.8,
+      "progress": 0.35,
+      "cache_hit_type": "prefix",
+      "cached_tokens": 1200,
+      "generated_tokens": 85,
+      "max_tokens": 256
+    }
+  ]
+}
 ```
 
 Response fields:
 
 | Field | Description |
 |-------|-------------|
-| `status` | Server state (`running`, `stopped`, `not_loaded`) |
-| `model` | Loaded model name |
-| `uptime_s` | Seconds since server start |
-| `num_running` | Requests currently generating |
-| `num_waiting` | Requests queued for prefill |
-| `total_requests_processed` | Lifetime request count |
-| `total_prompt_tokens` | Lifetime prompt tokens processed |
-| `total_completion_tokens` | Lifetime completion tokens generated |
-| `metal.active_memory_gb` | Current Metal GPU memory in use |
-| `metal.peak_memory_gb` | Peak Metal GPU memory |
-| `metal.cache_memory_gb` | Metal cache memory |
-| `cache` | Cache type (`memory_aware_cache`, `paged_cache`, `prefix_cache`) |
-| `requests` | List of active requests with phase, tokens/sec, TTFT, cache hit info |
+| `status` | Server state: `running`, `stopped`, or `not_loaded` |
+| `model` | Name of the loaded model |
+| `uptime_s` | Seconds since the server started |
+| `steps_executed` | Total inference steps executed |
+| `num_running` | Number of requests currently generating tokens |
+| `num_waiting` | Number of requests queued for prefill |
+| `total_requests_processed` | Total requests completed since startup |
+| `total_prompt_tokens` | Total prompt tokens processed since startup |
+| `total_completion_tokens` | Total completion tokens generated since startup |
+| `metal.active_memory_gb` | Current Metal GPU memory in use (GB) |
+| `metal.peak_memory_gb` | Peak Metal GPU memory usage (GB) |
+| `metal.cache_memory_gb` | Metal cache memory usage (GB) |
+| `cache` | Cache statistics (type, entries, hit rate, memory usage) |
+| `requests` | List of active requests with per-request details |
+
+Per-request fields in `requests`:
+
+| Field | Description |
+|-------|-------------|
+| `request_id` | Unique request identifier |
+| `phase` | Current phase: `queued`, `prefill`, or `generation` |
+| `tokens_per_second` | Generation throughput for this request |
+| `ttft_s` | Time to first token (seconds) |
+| `progress` | Completion percentage (0.0 to 1.0) |
+| `cache_hit_type` | Cache match type: `exact`, `prefix`, `supersequence`, `lcp`, or `miss` |
+| `cached_tokens` | Number of tokens served from cache |
+| `generated_tokens` | Tokens generated so far |
+| `max_tokens` | Maximum tokens requested |
 
 ## Tool Calling
 
