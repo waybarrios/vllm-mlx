@@ -59,6 +59,29 @@ def serve_command(args):
     if args.default_top_p is not None:
         server._default_top_p = args.default_top_p
 
+    # Configure reasoning parser
+    if args.reasoning_parser:
+        try:
+            from .reasoning import get_parser
+
+            parser_cls = get_parser(args.reasoning_parser)
+            server._reasoning_parser = parser_cls()
+            logger.info(f"Reasoning parser enabled: {args.reasoning_parser}")
+        except KeyError as e:
+            print(f"Error: {e}")
+            sys.exit(1)
+        except ImportError as e:
+            print(f"Error: Failed to import reasoning module: {e}")
+            sys.exit(1)
+        except Exception as e:
+            print(
+                f"Error: Failed to initialize reasoning parser "
+                f"'{args.reasoning_parser}': {e}"
+            )
+            sys.exit(1)
+    else:
+        server._reasoning_parser = None
+
     # Security summary at startup
     print("=" * 60)
     print("SECURITY CONFIGURATION")
@@ -76,6 +99,10 @@ def serve_command(args):
         print(f"  Tool calling: ENABLED (parser: {args.tool_call_parser})")
     else:
         print("  Tool calling: Use --enable-auto-tool-choice to enable")
+    if args.reasoning_parser:
+        print(f"  Reasoning: ENABLED (parser: {args.reasoning_parser})")
+    else:
+        print("  Reasoning: Use --reasoning-parser to enable")
     print("=" * 60)
 
     print(f"Loading model: {args.model}")
@@ -85,6 +112,12 @@ def serve_command(args):
     if args.mcp_config:
         print(f"MCP config: {args.mcp_config}")
         os.environ["VLLM_MLX_MCP_CONFIG"] = args.mcp_config
+
+    # Pre-load embedding model if specified
+    if args.embedding_model:
+        print(f"Pre-loading embedding model: {args.embedding_model}")
+        server.load_embedding_model(args.embedding_model, lock=True)
+        print(f"Embedding model loaded: {args.embedding_model}")
 
     # Build scheduler config for batched mode
     scheduler_config = None
@@ -537,6 +570,28 @@ Examples:
         type=float,
         default=None,
         help="Default top_p for generation when not specified in request",
+    )
+    # Reasoning parser options - choices loaded dynamically from registry
+    from .reasoning import list_parsers
+
+    reasoning_choices = list_parsers()
+    serve_parser.add_argument(
+        "--reasoning-parser",
+        type=str,
+        default=None,
+        choices=reasoning_choices,
+        help=(
+            "Enable reasoning content extraction with specified parser. "
+            "Extracts <think>...</think> tags into reasoning_content field. "
+            f"Options: {', '.join(reasoning_choices)}."
+        ),
+    )
+    # Embedding model option
+    serve_parser.add_argument(
+        "--embedding-model",
+        type=str,
+        default=None,
+        help="Pre-load an embedding model at startup (e.g. mlx-community/embeddinggemma-300m-6bit)",
     )
 
     # Bench command

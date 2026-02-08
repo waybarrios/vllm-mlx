@@ -10,7 +10,7 @@ This script measures:
 
 Usage:
     # Start server first:
-    python -m vllm_mlx.server_v2 --model mlx-community/Llama-3.2-3B-Instruct-4bit
+    vllm-mlx serve mlx-community/Llama-3.2-3B-Instruct-4bit
 
     # Run test:
     python tests/test_streaming_latency.py

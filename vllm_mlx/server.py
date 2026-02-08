@@ -70,6 +70,10 @@ from .api.models import (
     CompletionRequest,
     CompletionResponse,
     ContentPart,  # noqa: F401
+    EmbeddingData,
+    EmbeddingRequest,
+    EmbeddingResponse,
+    EmbeddingUsage,
     FunctionCall,
     ImageUrl,  # noqa: F401
     MCPExecuteRequest,
@@ -131,9 +135,14 @@ def _resolve_top_p(request_value: float | None) -> float:
         return _default_top_p
     return _FALLBACK_TOP_P
 
+
 # Global MCP manager
 _mcp_manager = None
 _mcp_executor = None
+
+# Global embedding engine (lazy loaded)
+_embedding_engine = None
+_embedding_model_locked: str | None = None  # Set when --embedding-model is used
 
 # API key authentication
 _api_key: str | None = None
@@ -366,6 +375,34 @@ def _detect_native_tool_support() -> bool:
         return False
 
 
+def load_embedding_model(
+    model_name: str | None,
+    *,
+    lock: bool = False,
+    reuse_existing: bool = True,
+) -> None:
+    """Load or reuse the embedding model engine when configured."""
+    global _embedding_engine, _embedding_model_locked
+
+    if not model_name:
+        return
+
+    if lock:
+        _embedding_model_locked = model_name
+
+    if (
+        reuse_existing
+        and _embedding_engine is not None
+        and _embedding_engine.model_name == model_name
+    ):
+        return
+
+    from .embedding import EmbeddingEngine
+
+    _embedding_engine = EmbeddingEngine(model_name)
+    _embedding_engine.load()
+
+
 def load_model(
     model_name: str,
     use_batching: bool = False,
@@ -513,6 +550,134 @@ async def list_models() -> ModelsResponse:
     if _model_name:
         models.append(ModelInfo(id=_model_name))
     return ModelsResponse(data=models)
+
+
+# =============================================================================
+# Embeddings Endpoint
+# =============================================================================
+
+
+@app.post(
+    "/v1/embeddings",
+    dependencies=[Depends(verify_api_key), Depends(check_rate_limit)],
+)
+async def create_embeddings(request: EmbeddingRequest) -> EmbeddingResponse:
+    """
+    Create embeddings for the given input text(s).
+
+    OpenAI-compatible embeddings API supporting single or batch inputs.
+
+    Single text:
+    ```json
+    {
+      "model": "mlx-community/all-MiniLM-L6-v2-4bit",
+      "input": "The quick brown fox jumps over the lazy dog"
+    }
+    ```
+
+    Batch of texts:
+    ```json
+    {
+      "model": "mlx-community/embeddinggemma-300m-6bit",
+      "input": [
+        "I love machine learning",
+        "Deep learning is fascinating",
+        "Neural networks are powerful"
+      ]
+    }
+    ```
+
+    Response:
+    ```json
+    {
+      "object": "list",
+      "data": [
+        {"object": "embedding", "index": 0, "embedding": [0.023, -0.982, ...]},
+        {"object": "embedding", "index": 1, "embedding": [0.112, -0.543, ...]},
+        {"object": "embedding", "index": 2, "embedding": [0.876, 0.221, ...]}
+      ],
+      "model": "mlx-community/embeddinggemma-300m-6bit",
+      "usage": {"prompt_tokens": 24, "total_tokens": 24}
+    }
+    ```
+
+    Supported models:
+    - mlx-community/all-MiniLM-L6-v2-4bit (fast, compact)
+    - mlx-community/embeddinggemma-300m-6bit (high quality)
+    - mlx-community/bge-large-en-v1.5-4bit (best for English)
+    - Any BERT/XLM-RoBERTa/ModernBERT model from HuggingFace
+    """
+    global _embedding_engine
+
+    try:
+        # Resolve model name
+        model_name = request.model
+
+        # If an embedding model was pre-configured at startup, only allow that model
+        if (
+            _embedding_model_locked is not None
+            and model_name != _embedding_model_locked
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Embedding model '{model_name}' is not available. "
+                    f"This server was started with --embedding-model {_embedding_model_locked}. "
+                    f"Only '{_embedding_model_locked}' can be used for embeddings. "
+                    f"Restart the server with a different --embedding-model to use '{model_name}'."
+                ),
+            )
+
+        # Lazy-load or swap embedding engine
+        load_embedding_model(model_name, lock=False, reuse_existing=True)
+
+        # Normalise input to list
+        texts = request.input if isinstance(request.input, list) else [request.input]
+
+        if not texts:
+            raise HTTPException(status_code=400, detail="Input must not be empty")
+
+        start_time = time.perf_counter()
+
+        # Count tokens for usage reporting
+        prompt_tokens = _embedding_engine.count_tokens(texts)
+
+        # Generate embeddings (batch)
+        embeddings = _embedding_engine.embed(texts)
+
+        elapsed = time.perf_counter() - start_time
+        logger.info(
+            f"Embeddings: {len(texts)} inputs, {prompt_tokens} tokens "
+            f"in {elapsed:.2f}s"
+        )
+
+        # Build OpenAI-compatible response with ordered indices
+        data = [
+            EmbeddingData(index=i, embedding=vec) for i, vec in enumerate(embeddings)
+        ]
+
+        return EmbeddingResponse(
+            data=data,
+            model=model_name,
+            usage=EmbeddingUsage(
+                prompt_tokens=prompt_tokens,
+                total_tokens=prompt_tokens,
+            ),
+        )
+
+    except ImportError:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "mlx-embeddings not installed. "
+                "Install with: pip install mlx-embeddings"
+            ),
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Embedding generation failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 # =============================================================================
@@ -1264,12 +1429,25 @@ Examples:
         default=0,
         help="Rate limit requests per minute per client (0 = disabled)",
     )
+    # Reasoning parser options - choices loaded dynamically from registry
+    from .reasoning import list_parsers
+
+    reasoning_choices = list_parsers()
     parser.add_argument(
         "--reasoning-parser",
         type=str,
         default=None,
-        choices=["qwen3", "deepseek_r1"],
-        help="Enable reasoning content extraction with specified parser",
+        choices=reasoning_choices,
+        help=(
+            "Enable reasoning content extraction with specified parser. "
+            f"Options: {', '.join(reasoning_choices)}."
+        ),
+    )
+    parser.add_argument(
+        "--embedding-model",
+        type=str,
+        default=None,
+        help="Pre-load an embedding model at startup (e.g. mlx-community/all-MiniLM-L6-v2-4bit)",
     )
     parser.add_argument(
         "--default-temperature",
@@ -1330,6 +1508,9 @@ Examples:
         parser_cls = get_parser(args.reasoning_parser)
         _reasoning_parser = parser_cls()
         logger.info(f"Reasoning parser enabled: {args.reasoning_parser}")
+
+    # Pre-load embedding model if specified
+    load_embedding_model(args.embedding_model, lock=True)
 
     # Load model before starting server
     load_model(

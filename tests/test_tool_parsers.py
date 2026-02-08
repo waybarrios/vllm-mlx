@@ -680,3 +680,63 @@ class TestStreamingParsing:
             delta_text="Hello world",
         )
         assert result == {"content": "Hello world"}
+
+
+class TestThinkTagStripping:
+    """Test <think> tag stripping in tool parsers (Issue #26)."""
+
+    def test_strip_think_tags_utility(self):
+        """Test the strip_think_tags static method."""
+        from vllm_mlx.tool_parsers.abstract_tool_parser import ToolParser
+
+        # Basic stripping
+        text = "<think>Let me analyze this</think>The answer is 42"
+        assert ToolParser.strip_think_tags(text) == "The answer is 42"
+
+        # Multi-line thinking
+        text = "<think>Step 1\nStep 2\nStep 3</think>Result"
+        assert ToolParser.strip_think_tags(text) == "Result"
+
+        # No think tags
+        text = "Just regular text"
+        assert ToolParser.strip_think_tags(text) == "Just regular text"
+
+        # Empty think tags
+        text = "<think></think>Content"
+        assert ToolParser.strip_think_tags(text) == "Content"
+
+    def test_hermes_with_think_tags(self):
+        """Test Hermes parser strips think tags before parsing tool calls."""
+        parser = HermesToolParser()
+
+        # Model output with think tags AND tool call (Ring-Mini-Linear-2.0 style)
+        output = """<think>Let me search for that information.</think>
+<tool_call>{"name": "search", "arguments": {"query": "weather"}}</tool_call>"""
+
+        result = parser.extract_tool_calls(output)
+        assert result.tools_called is True
+        assert len(result.tool_calls) == 1
+        assert result.tool_calls[0]["name"] == "search"
+
+    def test_qwen_with_think_tags(self):
+        """Test Qwen parser strips think tags before parsing tool calls."""
+        parser = QwenToolParser()
+
+        # Model output with think tags AND tool call
+        output = """<think>I need to get the weather data.</think>
+[Calling tool: get_weather({"city": "Tokyo"})]"""
+
+        result = parser.extract_tool_calls(output)
+        assert result.tools_called is True
+        assert len(result.tool_calls) == 1
+        assert result.tool_calls[0]["name"] == "get_weather"
+
+    def test_think_tags_with_no_tool_call(self):
+        """Test that think tags are stripped even when no tool call is present."""
+        parser = HermesToolParser()
+
+        output = "<think>Let me think about this</think>The answer is 42."
+        result = parser.extract_tool_calls(output)
+
+        assert result.tools_called is False
+        assert result.content == "The answer is 42."
