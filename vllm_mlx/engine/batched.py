@@ -419,8 +419,9 @@ class BatchedEngine(BaseEngine):
         if not self._loaded:
             await self.start()
 
-        if self._is_mllm and self._mllm_scheduler and (images or videos):
-            # Use MLLM scheduler for multimodal
+        if self._is_mllm and self._mllm_scheduler:
+            # Use MLLM scheduler for all requests on vision models
+            # (both multimodal and text-only, since LLM engine is not loaded for MLLM)
             output = await self._mllm_scheduler.generate(
                 prompt=prompt,
                 images=images,
@@ -437,7 +438,7 @@ class BatchedEngine(BaseEngine):
                 finish_reason=output.finish_reason,
             )
 
-        # Use LLM engine for text-only
+        # Use LLM engine for text-only (non-MLLM models)
         from ..request import SamplingParams
 
         sampling_params = SamplingParams(
@@ -491,8 +492,9 @@ class BatchedEngine(BaseEngine):
         if not self._loaded:
             await self.start()
 
-        if self._is_mllm and self._mllm_scheduler and (images or videos):
-            # Use MLLM scheduler for multimodal streaming
+        if self._is_mllm and self._mllm_scheduler:
+            # Use MLLM scheduler for all requests on vision models
+            # (both multimodal and text-only, since LLM engine is not loaded for MLLM)
             request_id = await self._mllm_scheduler.add_request_async(
                 prompt=prompt,
                 images=images,
@@ -513,7 +515,7 @@ class BatchedEngine(BaseEngine):
                 )
             return
 
-        # Use LLM engine for text-only
+        # Use LLM engine for text-only (non-MLLM models)
         from ..request import SamplingParams
 
         sampling_params = SamplingParams(

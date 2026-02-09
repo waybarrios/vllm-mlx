@@ -669,9 +669,10 @@ class MLLMScheduler:
                 if output is None:
                     finished_normally = True
                     break
-                yield output
                 if output.finished:
                     finished_normally = True
+                yield output
+                if output.finished:
                     break
         finally:
             if not finished_normally:
