@@ -63,6 +63,7 @@ Use `--tool-call-parser` to select a parser for your model family:
 | `xlam` | | Salesforce xLAM | JSON with `tool_calls` array |
 | `functionary` | `meetkai` | MeetKai Functionary | Multiple function blocks |
 | `glm47` | `glm4` | GLM-4.7, GLM-4.7-Flash | `<tool_call>` with `<arg_key>`/`<arg_value>` XML |
+| `minimax` | `minimax_m2` | MiniMax M2.1 | `<minimax:tool_call>` with `<invoke>`/`<parameter>` XML |
 
 ## Model Examples
 
@@ -126,6 +127,14 @@ vllm-mlx serve lmstudio-community/GLM-4.7-Flash-MLX-8bit \
   --enable-auto-tool-choice --tool-call-parser glm47
 ```
 
+### MiniMax M2.1
+
+```bash
+# MiniMax M2.1
+vllm-mlx serve mlx-community/MiniMax-M2.1-40k-4bit \
+  --enable-auto-tool-choice --tool-call-parser minimax
+```
+
 ### Kimi K2
 
 ```bash
@@ -155,9 +164,10 @@ The auto parser tries formats in this order:
 1. Mistral (`[TOOL_CALLS]`)
 2. Qwen bracket (`[Calling tool:]`)
 3. Nemotron (`<tool_call><function=...><parameter=...>`)
-4. Qwen/Hermes XML (`<tool_call>{...}</tool_call>`)
-5. Llama (`<function=name>{...}</function>`)
-6. Raw JSON
+4. MiniMax (`<minimax:tool_call><invoke>...</invoke></minimax:tool_call>`)
+5. Qwen/Hermes XML (`<tool_call>{...}</tool_call>`)
+6. Llama (`<function=name>{...}</function>`)
+7. Raw JSON
 
 ## Streaming Tool Calls
 

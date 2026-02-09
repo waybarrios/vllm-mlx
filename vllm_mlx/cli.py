@@ -564,11 +564,12 @@ Examples:
             "xlam",
             "functionary",
             "glm47",
+            "minimax",
         ],
         help=(
             "Select the tool call parser for the model. Options: "
             "auto (auto-detect), mistral, qwen, qwen3_coder, llama, hermes, "
-            "deepseek, kimi, granite, nemotron, xlam, functionary, glm47. "
+            "deepseek, kimi, granite, nemotron, xlam, functionary, glm47, minimax. "
             "Required for --enable-auto-tool-choice."
         ),
     )
