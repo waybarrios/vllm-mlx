@@ -23,6 +23,7 @@ vllm-mlx brings native Apple Silicon GPU acceleration to vLLM by integrating:
 - **Native GPU acceleration** on Apple Silicon (M1, M2, M3, M4)
 - **Native TTS voices** - Spanish, French, Chinese, Japanese + 5 more languages
 - **OpenAI API compatible** - drop-in replacement for OpenAI client
+- **Anthropic Messages API** - native `/v1/messages` endpoint for Claude Code and OpenCode
 - **Embeddings** - OpenAI-compatible `/v1/embeddings` endpoint with mlx-embeddings
 - **Reasoning Models** - extract thinking process from Qwen3, DeepSeek-R1
 - **MCP Tool Calling** - integrate external tools via Model Context Protocol
@@ -85,6 +86,33 @@ response = client.chat.completions.create(
 )
 print(response.choices[0].message.content)
 ```
+
+### Use with Anthropic SDK
+
+vllm-mlx exposes an Anthropic-compatible `/v1/messages` endpoint, so tools like Claude Code and OpenCode can connect directly.
+
+```python
+from anthropic import Anthropic
+
+client = Anthropic(base_url="http://localhost:8000", api_key="not-needed")
+
+response = client.messages.create(
+    model="default",
+    max_tokens=256,
+    messages=[{"role": "user", "content": "Hello!"}]
+)
+print(response.content[0].text)
+```
+
+To use with Claude Code:
+
+```bash
+export ANTHROPIC_BASE_URL=http://localhost:8000
+export ANTHROPIC_API_KEY=not-needed
+claude
+```
+
+See [Anthropic Messages API docs](docs/guides/server.md#anthropic-messages-api) for streaming, tool calling, system messages, and token counting.
 
 ### Multimodal (Images & Video)
 
@@ -190,6 +218,7 @@ For full documentation, see the [docs](docs/) directory:
 
 - **User Guides**
   - [OpenAI-Compatible Server](docs/guides/server.md)
+  - [Anthropic Messages API](docs/guides/server.md#anthropic-messages-api)
   - [Python API](docs/guides/python-api.md)
   - [Multimodal (Images & Video)](docs/guides/multimodal.md)
   - [Audio (STT/TTS)](docs/guides/audio.md)
