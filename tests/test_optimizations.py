@@ -6,6 +6,8 @@ Usage:
     pytest tests/test_optimizations.py -v
 """
 
+import pytest
+
 
 class TestHardwareDetection:
     """Tests for hardware detection functionality."""
