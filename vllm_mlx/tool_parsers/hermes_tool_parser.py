@@ -61,9 +61,7 @@ class HermesToolParser(ToolParser):
         r'\{"name":\s*"([^"]+)",\s*"arguments":\s*(\{[^}]*\})\}', re.DOTALL
     )
     # Bare Nemotron XML: <function=name>...</function> without <tool_call> wrapper
-    BARE_FUNCTION_PATTERN = re.compile(
-        r"<function=([^>]+)>(.*?)</function>", re.DOTALL
-    )
+    BARE_FUNCTION_PATTERN = re.compile(r"<function=([^>]+)>(.*?)</function>", re.DOTALL)
 
     def extract_tool_calls(
         self, model_output: str, request: dict[str, Any] | None = None
