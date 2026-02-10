@@ -82,6 +82,7 @@ jobs:
             tests/test_request.py \
             tests/test_anthropic_models.py \
             tests/test_anthropic_adapter.py \
+            tests/test_harmony_parsers.py \
             -v --tb=short \
             -k "not Integration and not InjectJson and not TestMLXMultimodalLMCache" \
             --cov=vllm_mlx \
