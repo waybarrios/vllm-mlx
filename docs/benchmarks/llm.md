@@ -176,10 +176,10 @@ vllm-mlx-bench --model mlx-community/Qwen3-0.6B-8bit --prompts 10
 vllm-mlx-bench --model mlx-community/Qwen3-0.6B-8bit --output results.json
 
 # Continuous batching test
-python tests/test_continuous_batching.py
+python tests/test_continuous_batching.py --model mlx-community/Qwen3-0.6B-8bit
 
 # Prefix cache test
-python tests/test_prefix_cache.py
+python tests/test_prefix_cache.py --model mlx-community/Qwen3-0.6B-8bit
 
 # Paged cache test
 python tests/test_paged_cache_real_inference.py
@@ -187,4 +187,11 @@ python tests/test_paged_cache_real_inference.py
 # Streaming detokenizer benchmark
 vllm-mlx bench-detok
 vllm-mlx bench-detok mlx-community/Llama-3.2-1B-Instruct-4bit --iterations 5
+```
+
+```bash
+# Alternative: set one model for standalone test scripts
+export VLLM_MLX_TEST_MODEL=mlx-community/Qwen3-0.6B-8bit
+python tests/test_continuous_batching.py
+python tests/test_prefix_cache.py
 ```
