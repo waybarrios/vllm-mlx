@@ -17,6 +17,8 @@ STT_MODELS = [
     ("mlx-community/whisper-medium-mlx", "whisper-medium"),
     ("mlx-community/whisper-large-v3-mlx", "whisper-large-v3"),
     ("mlx-community/whisper-large-v3-turbo", "whisper-large-v3-turbo"),
+    ("mlx-community/parakeet-tdt-0.6b-v2", "parakeet-tdt-0.6b-v2"),
+    ("mlx-community/parakeet-tdt-0.6b-v3", "parakeet-tdt-0.6b-v3"),
 ]
 
 TTS_MODELS = [
@@ -190,6 +192,20 @@ def benchmark_stt(model_name: str, alias: str, audio_path: str):
     }
 
 
+def check_whisper_backend():
+    """
+    Check whether the Whisper backend can be imported.
+
+    Returns:
+        (available: bool, reason: str)
+    """
+    try:
+        import mlx_audio.stt.models.whisper  # noqa: F401
+        return True, ""
+    except Exception as e:
+        return False, str(e)
+
+
 def run_tts_benchmarks():
     """Run all TTS benchmarks."""
     print("\n" + "="*70)
@@ -224,8 +240,16 @@ def run_stt_benchmarks(audio_path: str):
     print(" STT BENCHMARKS (Speech-to-Text)")
     print("="*70)
 
+    whisper_available, whisper_error = check_whisper_backend()
+    if not whisper_available:
+        print("Warning: Whisper backend unavailable; skipping Whisper models.")
+        print(f"Reason: {whisper_error}")
+
     results = []
     for model_name, alias in STT_MODELS:
+        if alias.startswith("whisper") and not whisper_available:
+            print(f"\nSkipping {alias}: Whisper backend unavailable")
+            continue
         try:
             result = benchmark_stt(model_name, alias, audio_path)
             results.append(result)
