@@ -650,7 +650,10 @@ class MemoryAwarePrefixCache:
         cache = _trim_to_offset(cache)
 
         # Quantize if enabled and sequence is long enough
-        if self._config.kv_quantize and len(tokens) >= self._config.kv_min_quantize_tokens:
+        if (
+            self._config.kv_quantize
+            and len(tokens) >= self._config.kv_min_quantize_tokens
+        ):
             cache = _quantize_cache(
                 cache, self._config.kv_bits, self._config.kv_group_size
             )

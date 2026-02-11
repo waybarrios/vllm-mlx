@@ -182,7 +182,9 @@ class TestPrefixCacheIntegration:
     def test_store_fetch_with_quantization(self):
         model = self._make_cache_and_model()
         config = MemoryCacheConfig(
-            kv_quantize=True, kv_bits=8, kv_min_quantize_tokens=0,
+            kv_quantize=True,
+            kv_bits=8,
+            kv_min_quantize_tokens=0,
             max_memory_mb=500,
         )
         pc = MemoryAwarePrefixCache(model, config)
@@ -268,13 +270,16 @@ class TestMinQuantizeTokensThreshold:
     def _make_model(self):
         class FakeModel:
             pass
+
         return FakeModel()
 
     def test_store_skips_quantization_below_threshold(self):
         """Sequences shorter than min_quantize_tokens should not be quantized."""
         model = self._make_model()
         config = MemoryCacheConfig(
-            kv_quantize=True, kv_bits=8, kv_min_quantize_tokens=256,
+            kv_quantize=True,
+            kv_bits=8,
+            kv_min_quantize_tokens=256,
             max_memory_mb=500,
         )
         pc = MemoryAwarePrefixCache(model, config)
@@ -285,15 +290,17 @@ class TestMinQuantizeTokensThreshold:
 
         stored_entry = list(pc._entries.values())[0]
         for layer in stored_entry.cache:
-            assert isinstance(layer, KVCache), (
-                "Short sequences should remain as KVCache (not quantized)"
-            )
+            assert isinstance(
+                layer, KVCache
+            ), "Short sequences should remain as KVCache (not quantized)"
 
     def test_store_quantizes_above_threshold(self):
         """Sequences >= min_quantize_tokens should be quantized."""
         model = self._make_model()
         config = MemoryCacheConfig(
-            kv_quantize=True, kv_bits=8, kv_min_quantize_tokens=256,
+            kv_quantize=True,
+            kv_bits=8,
+            kv_min_quantize_tokens=256,
             max_memory_mb=500,
         )
         pc = MemoryAwarePrefixCache(model, config)
@@ -304,9 +311,9 @@ class TestMinQuantizeTokensThreshold:
 
         stored_entry = list(pc._entries.values())[0]
         for layer in stored_entry.cache:
-            assert isinstance(layer, QuantizedKVCache), (
-                "Long sequences should be quantized"
-            )
+            assert isinstance(
+                layer, QuantizedKVCache
+            ), "Long sequences should be quantized"
 
     def test_trim_applied_without_quantization(self):
         """Oversized arrays should be trimmed even without quantization."""
@@ -329,7 +336,7 @@ class TestMinQuantizeTokensThreshold:
 
         stored_entry = list(pc._entries.values())[0]
         for layer in stored_entry.cache:
-            assert layer.keys.shape[2] == 100, (
-                f"Expected trimmed to 100, got {layer.keys.shape[2]}"
-            )
+            assert (
+                layer.keys.shape[2] == 100
+            ), f"Expected trimmed to 100, got {layer.keys.shape[2]}"
             assert layer.values.shape[2] == 100
