@@ -6,8 +6,9 @@ These tests verify the PrefixCacheManager for KV cache reuse
 to speed up inference with repeated prompts.
 """
 
-import pytest
 from unittest.mock import MagicMock
+
+import pytest
 
 from vllm_mlx.prefix_cache import (
     CacheEntry,
@@ -298,8 +299,8 @@ class TestSchedulerIntegration:
 
 if __name__ == "__main__":
     # Verbose standalone test with real model
-    import asyncio
     import argparse
+    import asyncio
     import os
     import time
 
@@ -307,9 +308,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--model",
         type=str,
-        default=os.environ.get(
-            "VLLM_MLX_TEST_MODEL", "mlx-community/Qwen3-0.6B-8bit"
-        ),
+        default=os.environ.get("VLLM_MLX_TEST_MODEL", "mlx-community/Qwen3-0.6B-8bit"),
         help="Model to benchmark",
     )
     args = parser.parse_args()
@@ -369,6 +368,7 @@ if __name__ == "__main__":
 
     async def run_cache_test():
         from mlx_lm import load
+
         from vllm_mlx import (
             AsyncEngineCore,
             EngineConfig,
@@ -381,7 +381,9 @@ if __name__ == "__main__":
         print("  Test: Verify KV cache reuse for repeated prompts")
         print("  Expected behavior:")
         print("    - Same prompt → cache HIT (skip prompt processing)")
-        print("    - Different prompt → cache MISS or PREFIX_HIT (shared template tokens)")
+        print(
+            "    - Different prompt → cache MISS or PREFIX_HIT (shared template tokens)"
+        )
 
         print_subheader("Loading Model")
         load_start = time.perf_counter()

@@ -8,8 +8,9 @@ multiple concurrent requests with improved throughput.
 
 import asyncio
 import time
-import pytest
 from unittest.mock import MagicMock
+
+import pytest
 
 from vllm_mlx.request import Request, SamplingParams
 from vllm_mlx.scheduler import Scheduler, SchedulerConfig
@@ -229,9 +230,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--model",
         type=str,
-        default=os.environ.get(
-            "VLLM_MLX_TEST_MODEL", "mlx-community/Qwen3-0.6B-8bit"
-        ),
+        default=os.environ.get("VLLM_MLX_TEST_MODEL", "mlx-community/Qwen3-0.6B-8bit"),
         help="Model to benchmark",
     )
     args = parser.parse_args()
@@ -240,6 +239,7 @@ if __name__ == "__main__":
 
     async def run_benchmark():
         from mlx_lm import load
+
         from vllm_mlx import (
             AsyncEngineCore,
             EngineConfig,
