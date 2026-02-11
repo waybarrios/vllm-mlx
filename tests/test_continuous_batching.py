@@ -230,7 +230,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--model",
         type=str,
-        default=os.environ.get("VLLM_MLX_TEST_MODEL", "mlx-community/Qwen3-0.6B-8bit"),
+        default=os.environ.get("VLLM_MLX_TEST_MODEL", "mlx-community/Qwen3-8B-6bit"),
         help="Model to benchmark",
     )
     args = parser.parse_args()

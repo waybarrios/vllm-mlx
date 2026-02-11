@@ -123,7 +123,7 @@ Memory savings: 80%+ for 10+ concurrent users
 ### Testing Prefix Cache
 
 ```bash
-python tests/test_prefix_cache.py --model mlx-community/Qwen3-0.6B-8bit
+python tests/test_prefix_cache.py
 ```
 
 ```
@@ -149,16 +149,9 @@ python tests/test_prefix_cache.py --model mlx-community/Qwen3-0.6B-8bit
 
 ```bash
 # Continuous batching benchmark
-python tests/test_continuous_batching.py --model mlx-community/Qwen3-0.6B-8bit
+python tests/test_continuous_batching.py
 
 # Prefix cache test
-python tests/test_prefix_cache.py --model mlx-community/Qwen3-0.6B-8bit
-```
-
-```bash
-# Alternative: set one model for standalone test scripts
-export VLLM_MLX_TEST_MODEL=mlx-community/Qwen3-0.6B-8bit
-python tests/test_continuous_batching.py
 python tests/test_prefix_cache.py
 ```
 
