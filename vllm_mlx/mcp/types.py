@@ -43,8 +43,7 @@ class MCPServerConfig:
     enabled: bool = True
     timeout: float = 30.0
 
-    # Security options
-    skip_security_validation: bool = False  # WARNING: Only for development!
+    # Security options removed: skip_security_validation was a bypass risk
 
     def __post_init__(self):
         """Validate configuration."""
@@ -67,16 +66,7 @@ class MCPServerConfig:
 
     def _validate_security(self) -> None:
         """Validate security of the configuration."""
-        from .security import validate_mcp_server_config, MCPSecurityError
-
-        if self.skip_security_validation:
-            import logging
-
-            logging.getLogger(__name__).warning(
-                f"MCP server '{self.name}': Security validation SKIPPED. "
-                f"This is dangerous and should only be used in development!"
-            )
-            return
+        from .security import MCPSecurityError, validate_mcp_server_config
 
         try:
             validate_mcp_server_config(
