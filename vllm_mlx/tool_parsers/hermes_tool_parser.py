@@ -10,6 +10,7 @@ import re
 import uuid
 from collections.abc import Sequence
 from typing import Any
+import ast
 
 from .abstract_tool_parser import (
     ExtractedToolCallInformation,
@@ -115,7 +116,12 @@ class HermesToolParser(ToolParser):
                     try:
                         arguments[p_name.strip()] = json.loads(val)
                     except (json.JSONDecodeError, ValueError):
-                        arguments[p_name.strip()] = val
+                        # Try converting Python literal syntax to JSON
+                        try:
+                            python_val = ast.literal_eval(val)
+                            arguments[p_name.strip()] = python_val
+                        except (ValueError, SyntaxError):
+                            arguments[p_name.strip()] = val
                 tool_calls.append(
                     {
                         "id": generate_tool_id(),
@@ -139,7 +145,12 @@ class HermesToolParser(ToolParser):
                     try:
                         arguments[p_name.strip()] = json.loads(val)
                     except (json.JSONDecodeError, ValueError):
-                        arguments[p_name.strip()] = val
+                        # Try converting Python literal syntax to JSON
+                        try:
+                            python_val = ast.literal_eval(val)
+                            arguments[p_name.strip()] = python_val
+                        except (ValueError, SyntaxError):
+                            arguments[p_name.strip()] = val
                 tool_calls.append(
                     {
                         "id": generate_tool_id(),
