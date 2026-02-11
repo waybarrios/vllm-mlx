@@ -71,6 +71,11 @@ class SchedulerConfig:
     cache_memory_mb: Optional[int] = None  # None = auto-detect (20% of available RAM)
     cache_memory_percent: float = 0.20  # Fraction of available RAM if auto-detecting
 
+    # KV cache quantization (reduces prefix cache memory)
+    kv_cache_quantization: bool = False
+    kv_cache_quantization_bits: int = 8
+    kv_cache_quantization_group_size: int = 64
+
     # Paged cache settings (experimental - for memory efficiency)
     use_paged_cache: bool = (
         False  # Use BlockAwarePrefixCache instead of PrefixCacheManager
@@ -554,6 +559,9 @@ class Scheduler:
                 cache_config = MemoryCacheConfig(
                     max_memory_mb=self.config.cache_memory_mb,
                     max_memory_percent=self.config.cache_memory_percent,
+                    kv_quantize=self.config.kv_cache_quantization,
+                    kv_bits=self.config.kv_cache_quantization_bits,
+                    kv_group_size=self.config.kv_cache_quantization_group_size,
                 )
                 self.memory_aware_cache = MemoryAwarePrefixCache(
                     model=model,

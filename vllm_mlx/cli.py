@@ -141,6 +141,10 @@ def serve_command(args):
             max_cache_blocks=args.max_cache_blocks,
             # Chunked prefill
             chunked_prefill_tokens=args.chunked_prefill_tokens,
+            # KV cache quantization
+            kv_cache_quantization=args.kv_cache_quantization,
+            kv_cache_quantization_bits=args.kv_cache_quantization_bits,
+            kv_cache_quantization_group_size=args.kv_cache_quantization_group_size,
         )
 
         print("Mode: Continuous batching (for multiple concurrent users)")
@@ -158,6 +162,11 @@ def serve_command(args):
                 else f"{args.cache_memory_percent*100:.0f}% of RAM"
             )
             print(f"Memory-aware cache: {cache_info}")
+            if args.kv_cache_quantization:
+                print(
+                    f"KV cache quantization: {args.kv_cache_quantization_bits}-bit, "
+                    f"group_size={args.kv_cache_quantization_group_size}"
+                )
         elif enable_prefix_cache:
             print(f"Prefix cache: max_entries={args.prefix_cache_size}")
     else:
@@ -209,6 +218,10 @@ def bench_command(args):
             use_paged_cache=args.use_paged_cache,
             paged_cache_block_size=args.paged_cache_block_size,
             max_cache_blocks=args.max_cache_blocks,
+            # KV cache quantization
+            kv_cache_quantization=args.kv_cache_quantization,
+            kv_cache_quantization_bits=args.kv_cache_quantization_bits,
+            kv_cache_quantization_group_size=args.kv_cache_quantization_group_size,
         )
         engine_config = EngineConfig(
             model_name=args.model,
@@ -471,6 +484,25 @@ Examples:
         action="store_true",
         help="Disable memory-aware cache, use legacy entry-count based cache",
     )
+    # KV cache quantization options
+    serve_parser.add_argument(
+        "--kv-cache-quantization",
+        action="store_true",
+        help="Quantize stored KV caches to reduce memory (8-bit by default)",
+    )
+    serve_parser.add_argument(
+        "--kv-cache-quantization-bits",
+        type=int,
+        default=8,
+        choices=[4, 8],
+        help="Bit width for KV cache quantization (default: 8)",
+    )
+    serve_parser.add_argument(
+        "--kv-cache-quantization-group-size",
+        type=int,
+        default=64,
+        help="Group size for KV cache quantization (default: 64)",
+    )
     serve_parser.add_argument(
         "--stream-interval",
         type=int,
@@ -658,6 +690,25 @@ Examples:
         "--no-memory-aware-cache",
         action="store_true",
         help="Disable memory-aware cache, use legacy entry-count based cache",
+    )
+    # KV cache quantization options
+    bench_parser.add_argument(
+        "--kv-cache-quantization",
+        action="store_true",
+        help="Quantize stored KV caches to reduce memory (8-bit by default)",
+    )
+    bench_parser.add_argument(
+        "--kv-cache-quantization-bits",
+        type=int,
+        default=8,
+        choices=[4, 8],
+        help="Bit width for KV cache quantization (default: 8)",
+    )
+    bench_parser.add_argument(
+        "--kv-cache-quantization-group-size",
+        type=int,
+        default=64,
+        help="Group size for KV cache quantization (default: 64)",
     )
     # Paged cache options (experimental)
     bench_parser.add_argument(
