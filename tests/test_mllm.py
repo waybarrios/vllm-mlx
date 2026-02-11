@@ -184,39 +184,37 @@ class TestVideoFrameExtraction:
 class TestImageProcessing:
     """Test image processing functions."""
 
-    def test_process_image_input_local_file(self, test_image_path):
-        """Test processing local image file."""
+    def test_process_image_input_local_file_rejected(self, test_image_path):
+        """Test that local file paths are rejected (path traversal prevention)."""
         from vllm_mlx.models.mllm import process_image_input
 
-        result = process_image_input(test_image_path)
-        assert result == test_image_path
+        with pytest.raises(ValueError):
+            process_image_input(test_image_path)
 
-    def test_process_image_input_dict_format(self, test_image_path):
-        """Test processing image in dict format."""
+    def test_process_image_input_dict_local_file_rejected(self, test_image_path):
+        """Test that local file paths in dict format are rejected."""
         from vllm_mlx.models.mllm import process_image_input
 
-        # OpenAI format
-        result = process_image_input({"url": test_image_path})
-        assert Path(result).exists()
+        with pytest.raises(ValueError):
+            process_image_input({"url": test_image_path})
 
 
 class TestVideoProcessing:
     """Test video processing functions."""
 
-    def test_process_video_input_local_file(self, test_video_path):
-        """Test processing local video file."""
+    def test_process_video_input_local_file_rejected(self, test_video_path):
+        """Test that local file paths are rejected (path traversal prevention)."""
         from vllm_mlx.models.mllm import process_video_input
 
-        result = process_video_input(test_video_path)
-        assert result == test_video_path
+        with pytest.raises(ValueError):
+            process_video_input(test_video_path)
 
-    def test_process_video_input_dict_format(self, test_video_path):
-        """Test processing video in dict format."""
+    def test_process_video_input_dict_local_file_rejected(self, test_video_path):
+        """Test that local file paths in dict format are rejected."""
         from vllm_mlx.models.mllm import process_video_input
 
-        # OpenAI format
-        result = process_video_input({"url": test_video_path})
-        assert Path(result).exists()
+        with pytest.raises(ValueError):
+            process_video_input({"url": test_video_path})
 
     def test_process_video_input_empty_raises(self):
         """Test that empty input raises error."""
