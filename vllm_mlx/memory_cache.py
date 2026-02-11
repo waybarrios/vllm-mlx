@@ -84,6 +84,13 @@ def _array_memory(arr) -> int:
     return 0
 
 
+def _tuple_memory(t) -> int:
+    """Estimate memory of a value that may be a list/tuple of arrays (quantized) or a single array."""
+    if isinstance(t, (tuple, list)):
+        return sum(_array_memory(a) for a in t)
+    return _array_memory(t)
+
+
 def estimate_kv_cache_memory(cache: list[Any]) -> int:
     """
     Estimate memory usage of a KV cache in bytes.
@@ -91,6 +98,9 @@ def estimate_kv_cache_memory(cache: list[Any]) -> int:
     This function inspects MLX arrays in the cache and calculates their
     total memory footprint using shape+dtype metadata to avoid triggering
     lazy evaluation (which would cause a VRAM spike).
+
+    Supports both standard KVCache (keys/values are arrays) and
+    QuantizedKVCache (keys/values are 3-tuples of arrays).
 
     Args:
         cache: List of layer cache objects, each containing keys/values tensors.
@@ -107,27 +117,28 @@ def estimate_kv_cache_memory(cache: list[Any]) -> int:
         # Handle different cache object types
         # Check dict first since dicts have .keys() method that would match below
         if isinstance(layer_cache, dict) and "state" in layer_cache:
-            # Extracted state dict
+            # Extracted state dict — state is (keys, values) where each may be
+            # a tuple of arrays (QuantizedKVCache) or a single array (KVCache)
             keys, values = layer_cache["state"]
-            total_bytes += _array_memory(keys)
-            total_bytes += _array_memory(values)
+            total_bytes += _tuple_memory(keys)
+            total_bytes += _tuple_memory(values)
         elif hasattr(layer_cache, "state") and not isinstance(layer_cache, dict):
             # Cache with state property returning (keys, values)
             try:
                 keys, values = layer_cache.state
-                total_bytes += _array_memory(keys)
-                total_bytes += _array_memory(values)
+                total_bytes += _tuple_memory(keys)
+                total_bytes += _tuple_memory(values)
             except (TypeError, ValueError):
                 pass
         elif hasattr(layer_cache, "keys") and hasattr(layer_cache, "values"):
-            # Standard KVCache with keys/values attributes (not dict)
+            # Standard KVCache or QuantizedKVCache with keys/values attributes
             keys_attr = layer_cache.keys
             values_attr = layer_cache.values
-            # Ensure these are arrays, not methods
+            # Ensure these are arrays/tuples, not methods
             if not callable(keys_attr):
-                total_bytes += _array_memory(keys_attr)
+                total_bytes += _tuple_memory(keys_attr)
             if not callable(values_attr):
-                total_bytes += _array_memory(values_attr)
+                total_bytes += _tuple_memory(values_attr)
 
     return total_bytes
 
@@ -234,17 +245,35 @@ class _CacheEntry:
 
 
 def _trim_cache_offset(cache: list[Any], trim_by: int) -> list[Any]:
-    """Create shallow copies of KVCache layers with offset reduced by *trim_by*.
+    """Create shallow copies of KVCache/QuantizedKVCache layers with offset reduced.
 
     This is used when returning a cached KV state to the scheduler so that
     the last N positions are "freed" and the model will recompute them on the
     next forward pass (preventing duplicate KV entries).
+
+    Supports both KVCache (keys/values are arrays) and QuantizedKVCache
+    (keys/values are 3-tuples of arrays).
     """
     from mlx_lm.models.cache import KVCache
 
+    try:
+        from mlx_lm.models.cache import (
+            QuantizedKVCache as _QKVCache,  # noqa: N812
+        )
+    except ImportError:
+        _QKVCache = None  # noqa: N806
+
     trimmed: list[Any] = []
     for layer_cache in cache:
-        if hasattr(layer_cache, "offset") and hasattr(layer_cache, "keys"):
+        if _QKVCache is not None and isinstance(layer_cache, _QKVCache):
+            tc = _QKVCache.__new__(_QKVCache)
+            tc.keys = layer_cache.keys
+            tc.values = layer_cache.values
+            tc.offset = max(layer_cache.offset - trim_by, 0)
+            tc.group_size = layer_cache.group_size
+            tc.bits = layer_cache.bits
+            trimmed.append(tc)
+        elif hasattr(layer_cache, "offset") and hasattr(layer_cache, "keys"):
             tc = KVCache.__new__(KVCache)
             tc.keys = layer_cache.keys
             tc.values = layer_cache.values
@@ -253,6 +282,73 @@ def _trim_cache_offset(cache: list[Any], trim_by: int) -> list[Any]:
         else:
             trimmed.append(layer_cache)
     return trimmed
+
+
+def quantize_kv_cache(
+    cache: list[Any], group_size: int = 64, bits: int = 8
+) -> list[Any]:
+    """Quantize KVCache layers to QuantizedKVCache for memory-efficient storage.
+
+    Converts each KVCache layer to QuantizedKVCache using mlx-lm's
+    ``to_quantized()`` method. Non-KVCache layers (e.g. MambaCache) are
+    left unchanged.
+
+    Args:
+        cache: List of cache layer objects (KVCache, MambaCache, etc.)
+        group_size: Quantization group size (default 64)
+        bits: Bits per element — 4 or 8 (default 8)
+
+    Returns:
+        New list with KVCache layers replaced by QuantizedKVCache.
+    """
+    result = []
+    for layer_cache in cache:
+        if hasattr(layer_cache, "to_quantized"):
+            result.append(layer_cache.to_quantized(group_size=group_size, bits=bits))
+        else:
+            result.append(layer_cache)
+    return result
+
+
+def dequantize_kv_cache(cache: list[Any]) -> list[Any]:
+    """Dequantize QuantizedKVCache layers back to KVCache.
+
+    Converts each QuantizedKVCache layer back to a standard KVCache so it
+    can be used with BatchGenerator (which does not support quantized caches).
+    Non-quantized layers are left unchanged.
+
+    Args:
+        cache: List of cache layer objects (QuantizedKVCache, KVCache, etc.)
+
+    Returns:
+        New list with QuantizedKVCache layers replaced by KVCache.
+    """
+    import mlx.core as mx
+    from mlx_lm.models.cache import KVCache, QuantizedKVCache
+
+    result = []
+    for layer_cache in cache:
+        if isinstance(layer_cache, QuantizedKVCache):
+            kv = KVCache()
+            # Dequantize keys and values from 3-tuple format
+            keys_q = layer_cache.keys
+            values_q = layer_cache.values
+            if keys_q is not None and values_q is not None:
+                kv.keys = mx.dequantize(
+                    *keys_q,
+                    group_size=layer_cache.group_size,
+                    bits=layer_cache.bits,
+                )
+                kv.values = mx.dequantize(
+                    *values_q,
+                    group_size=layer_cache.group_size,
+                    bits=layer_cache.bits,
+                )
+                kv.offset = layer_cache.offset
+            result.append(kv)
+        else:
+            result.append(layer_cache)
+    return result
 
 
 class MemoryAwarePrefixCache:

@@ -89,6 +89,12 @@ class SchedulerConfig:
     # 0 = disabled. Only effective when chunked_prefill_tokens > 0.
     mid_prefill_save_interval: int = 8192
 
+    # KV cache quantization: quantize cached KV states to reduce memory usage.
+    # None = disabled (default), 4 = 4-bit (~75% savings), 8 = 8-bit (~50% savings).
+    # Only affects prefix cache storage — BatchGenerator uses full-precision KV cache.
+    kv_bits: Optional[int] = None
+    kv_group_size: int = 64
+
 
 @dataclass
 class SchedulerOutput:
@@ -573,6 +579,14 @@ class Scheduler:
                     f"Prefix cache enabled with max_entries={self.config.prefix_cache_size}"
                 )
 
+        # KV cache quantization
+        if self.config.kv_bits is not None:
+            savings = "~75%" if self.config.kv_bits == 4 else "~50%"
+            logger.info(
+                f"KV cache quantization enabled: {self.config.kv_bits}-bit, "
+                f"group_size={self.config.kv_group_size} ({savings} memory savings)"
+            )
+
         # Thread-safe set for deferred aborts (main thread → executor thread)
         # CPython GIL guarantees set.add() and `x in set` are atomic.
         self._pending_abort_ids: Set[str] = set()
@@ -718,12 +732,24 @@ class Scheduler:
                 return
 
             prompt_tokens = list(request.prompt_token_ids)
+
+            # Quantize cache before storing if KV quantization enabled
+            cache_to_store = extracted_cache
+            if self.config.kv_bits is not None:
+                from .memory_cache import quantize_kv_cache
+
+                cache_to_store = quantize_kv_cache(
+                    cache_to_store,
+                    group_size=self.config.kv_group_size,
+                    bits=self.config.kv_bits,
+                )
+
             _t0 = _time.monotonic()
             # evict_prefixes=False: keep mid-prefill boundary entries so
             # that future requests with the same prefix but different
             # suffix get a prefix cache hit (critical for agentic multi-turn).
             stored = self.memory_aware_cache.store(
-                prompt_tokens, extracted_cache, evict_prefixes=False
+                prompt_tokens, cache_to_store, evict_prefixes=False
             )
             _dt = _time.monotonic() - _t0
             if stored:
@@ -777,6 +803,17 @@ class Scheduler:
             if not reconstructed:
                 return
 
+            # Quantize cache before storing if KV quantization enabled
+            cache_to_store = reconstructed
+            if self.config.kv_bits is not None:
+                from .memory_cache import quantize_kv_cache
+
+                cache_to_store = quantize_kv_cache(
+                    cache_to_store,
+                    group_size=self.config.kv_group_size,
+                    bits=self.config.kv_bits,
+                )
+
             prefix_tokens = list(request.prompt_token_ids[:total_cached])
 
             # Remove previous intermediate entry to avoid memory waste
@@ -785,7 +822,7 @@ class Scheduler:
                 self.memory_aware_cache.remove(list(old_key))
 
             _t0 = _time.monotonic()
-            stored = self.memory_aware_cache.store(prefix_tokens, reconstructed)
+            stored = self.memory_aware_cache.store(prefix_tokens, cache_to_store)
             _dt = _time.monotonic() - _t0
 
             if stored:
@@ -1095,6 +1132,11 @@ class Scheduler:
             _fetch_dt = _time.monotonic() - _fetch_t0
             request.cache_hit_type = self.memory_aware_cache._last_match_type
             if cache:
+                # Dequantize if KV cache quantization is active
+                if self.config.kv_bits is not None:
+                    from .memory_cache import dequantize_kv_cache
+
+                    cache = dequantize_kv_cache(cache)
                 request.prompt_cache = cache
                 request.cached_tokens = len(request.prompt_token_ids) - len(remaining)
                 request.remaining_tokens = remaining
@@ -1115,6 +1157,11 @@ class Scheduler:
             # Use legacy prefix cache
             cache, remaining = self.prefix_cache.fetch_cache(request.prompt_token_ids)
             if cache:
+                # Dequantize if KV cache quantization is active
+                if self.config.kv_bits is not None:
+                    from .memory_cache import dequantize_kv_cache
+
+                    cache = dequantize_kv_cache(cache)
                 request.cache_hit_type = "hit"
                 request.prompt_cache = cache
                 request.cached_tokens = len(request.prompt_token_ids) - len(remaining)
@@ -1487,12 +1534,23 @@ class Scheduler:
                             full_token_sequence = list(request.prompt_token_ids) + list(
                                 request.output_token_ids
                             )
+                            # Quantize cache before storing if KV quantization enabled
+                            cache_to_store = request._extracted_cache
+                            if self.config.kv_bits is not None:
+                                from .memory_cache import quantize_kv_cache
+
+                                cache_to_store = quantize_kv_cache(
+                                    cache_to_store,
+                                    group_size=self.config.kv_group_size,
+                                    bits=self.config.kv_bits,
+                                )
+
                             import time as _time
 
                             _store_t0 = _time.monotonic()
                             stored = self.memory_aware_cache.store(
                                 full_token_sequence,
-                                request._extracted_cache,
+                                cache_to_store,
                                 evict_prefixes=False,
                             )
                             _store_dt = _time.monotonic() - _store_t0
@@ -1532,9 +1590,19 @@ class Scheduler:
                             full_token_sequence = list(request.prompt_token_ids) + list(
                                 request.output_token_ids
                             )
+                            # Quantize cache before storing if KV quantization enabled
+                            cache_to_store = request._extracted_cache
+                            if self.config.kv_bits is not None:
+                                from .memory_cache import quantize_kv_cache
+
+                                cache_to_store = quantize_kv_cache(
+                                    cache_to_store,
+                                    group_size=self.config.kv_group_size,
+                                    bits=self.config.kv_bits,
+                                )
                             self.prefix_cache.store_cache(
                                 full_token_sequence,
-                                request._extracted_cache,
+                                cache_to_store,
                             )
                             logger.debug(
                                 f"Stored cache for request {request_id} "

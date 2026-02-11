@@ -141,9 +141,18 @@ def serve_command(args):
             max_cache_blocks=args.max_cache_blocks,
             # Chunked prefill
             chunked_prefill_tokens=args.chunked_prefill_tokens,
+            # KV cache quantization
+            kv_bits=args.kv_cache_bits,
+            kv_group_size=args.kv_cache_group_size,
         )
 
         print("Mode: Continuous batching (for multiple concurrent users)")
+        if args.kv_cache_bits:
+            savings = "~75%" if args.kv_cache_bits == 4 else "~50%"
+            print(
+                f"KV cache quantization: {args.kv_cache_bits}-bit "
+                f"(group_size={args.kv_cache_group_size}, {savings} memory savings)"
+            )
         if args.chunked_prefill_tokens > 0:
             print(f"Chunked prefill: {args.chunked_prefill_tokens} tokens per step")
         print(f"Stream interval: {args.stream_interval} tokens")
@@ -505,6 +514,21 @@ Examples:
         type=int,
         default=1000,
         help="Maximum number of cache blocks (default: 1000)",
+    )
+    # KV cache quantization
+    serve_parser.add_argument(
+        "--kv-cache-bits",
+        type=int,
+        default=None,
+        choices=[4, 8],
+        help="Quantize KV cache in prefix cache to reduce memory (4=~75%% savings, 8=~50%% savings). "
+        "Default: disabled (full precision).",
+    )
+    serve_parser.add_argument(
+        "--kv-cache-group-size",
+        type=int,
+        default=64,
+        help="Group size for KV cache quantization (default: 64)",
     )
     # Chunked prefill
     serve_parser.add_argument(
