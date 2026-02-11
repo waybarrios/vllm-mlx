@@ -40,6 +40,35 @@ CACHE_CORRUPTION_PATTERNS = [
 ]
 
 
+def _detect_repetition(recent_tokens: list[int], min_repeat: int = 8) -> bool:
+    """Detect degenerate repetition in recent token history.
+
+    Args:
+        recent_tokens: Ring buffer of recently generated token IDs.
+        min_repeat: Minimum number of identical tokens to trigger detection.
+
+    Returns:
+        True if degenerate repetition is detected.
+    """
+    if len(recent_tokens) < min_repeat:
+        return False
+    # Check single-token repetition (e.g., "0 0 0 0 0 0 0 0")
+    tail = recent_tokens[-min_repeat:]
+    if len(set(tail)) == 1:
+        return True
+    # Check short sequence repetition (e.g., "ab ab ab ab ab ab")
+    for seq_len in (2, 3, 4):
+        repeats_needed = 6
+        check_len = seq_len * repeats_needed
+        if len(recent_tokens) < check_len:
+            continue
+        tail = recent_tokens[-check_len:]
+        pattern = tail[:seq_len]
+        if all(tail[i] == pattern[i % seq_len] for i in range(check_len)):
+            return True
+    return False
+
+
 class SchedulingPolicy(Enum):
     """Scheduling policy for request ordering."""
 
@@ -150,6 +179,9 @@ def _install_chunked_prefill(
     # Partial prefill state (None when no prefill in progress)
     batch_gen._partial = None
 
+    # Repetition detection: track recent tokens per UID (ring buffer of last 32)
+    _repetition_buffers: Dict[int, list] = {}
+
     # Monkey-patch _process_prompts to capture prompt-only cache state.
     # At the point where _process_prompts returns, the Batch cache contains
     # the exact prompt-only state: all prompt tokens have been processed
@@ -201,17 +233,36 @@ def _install_chunked_prefill(
             cache_out = None
             num_tok += 1
             batch.num_tokens[e] = num_tok
+
+            # Track recent tokens for repetition detection
+            buf = _repetition_buffers.get(uid)
+            if buf is None:
+                buf = []
+                _repetition_buffers[uid] = buf
+            buf.append(t)
+            # Keep only last 32 tokens (ring buffer)
+            if len(buf) > 32:
+                del buf[: len(buf) - 32]
+
             if t in self.stop_tokens:
                 finish_reason = "stop"
                 end_idx.append(e)
             elif num_tok >= max_tok:
                 finish_reason = "length"
                 end_idx.append(e)
+            elif _detect_repetition(buf):
+                finish_reason = "stop"
+                end_idx.append(e)
+                logger.info(
+                    f"[repetition_detector] uid={uid} stopped after {num_tok} tokens"
+                )
             else:
                 finish_reason = None
                 keep_idx.append(e)
             if finish_reason is not None:
                 cache_out = batch.extract_cache(e)
+                # Clean up repetition buffer on finish
+                _repetition_buffers.pop(uid, None)
             responses.append(
                 self.Response(uid, t, logprobs[e], finish_reason, cache_out)
             )
@@ -471,6 +522,9 @@ def _install_chunked_prefill(
                 )
                 _self._partial = None
                 mx.clear_cache()  # flush Metal encoders after dropping partial state
+        # Clean up repetition buffers for removed UIDs
+        for uid in uids_to_remove:
+            _repetition_buffers.pop(uid, None)
         _orig_remove(uids_to_remove)
 
     batch_gen._next = _chunked_next
