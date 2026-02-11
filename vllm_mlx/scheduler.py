@@ -1523,6 +1523,10 @@ class Scheduler:
                                 f"cache_entries={len(self.memory_aware_cache._entries)} "
                                 f"cache_mem={self.memory_aware_cache._current_memory / 1e6:.0f}MB"
                             )
+                            # Release the original FP16 cache reference so
+                            # memory can be reclaimed (the quantized copy
+                            # lives inside the prefix cache now).
+                            request._extracted_cache = None
                         except Exception as e:
                             logger.debug(
                                 f"Failed to store memory-aware cache for {request_id}: {e}"
