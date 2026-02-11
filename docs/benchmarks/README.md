@@ -30,6 +30,10 @@ python tests/test_continuous_batching.py
 python tests/test_prefix_cache.py
 ```
 
+Defaults:
+- `tests/test_continuous_batching.py` → `mlx-community/Qwen3-8B-6bit`
+- `tests/test_prefix_cache.py` → `mlx-community/Qwen3-0.6B-8bit`
+
 To test different models, use the optional `--model` flag:
 
 ```bash
