@@ -6,6 +6,8 @@ Usage:
     pytest tests/test_optimizations.py -v
 """
 
+import pytest
+
 
 class TestHardwareDetection:
     """Tests for hardware detection functionality."""
@@ -60,15 +62,16 @@ class TestOptimizationStatus:
 class TestMemoryBandwidth:
     """Tests for memory bandwidth benchmarking."""
 
+    @pytest.mark.slow
     def test_memory_bandwidth_benchmark(self):
         """Test memory bandwidth benchmark."""
         from vllm_mlx.optimizations import benchmark_memory_bandwidth
 
         results = benchmark_memory_bandwidth()
 
-        assert "64MB" in results
-        assert "256MB" in results
-        assert "1024MB" in results
+        assert "1MB" in results
+        assert "4MB" in results
+        assert "16MB" in results
 
         print(f"\n{'='*50}")
         print("Memory Bandwidth Benchmark")

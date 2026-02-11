@@ -150,7 +150,7 @@ def benchmark_memory_bandwidth() -> dict:
     """
     import time
 
-    sizes_mb = [64, 256, 1024]
+    sizes_mb = [1, 4, 16]
     results = {}
 
     for size_mb in sizes_mb:

@@ -23,7 +23,7 @@ def generate_tool_id() -> str:
     return f"call_{uuid.uuid4().hex[:8]}"
 
 
-@ToolParserManager.register_module(["hermes", "nous"])
+@ToolParserManager.register_module(["hermes", "nous", "qwen3_coder"])
 class HermesToolParser(ToolParser):
     """
     Tool call parser for Hermes/Nous models.
@@ -60,6 +60,8 @@ class HermesToolParser(ToolParser):
     RAW_JSON_TOOL_PATTERN = re.compile(
         r'\{"name":\s*"([^"]+)",\s*"arguments":\s*(\{[^}]*\})\}', re.DOTALL
     )
+    # Bare Nemotron XML: <function=name>...</function> without <tool_call> wrapper
+    BARE_FUNCTION_PATTERN = re.compile(r"<function=([^>]+)>(.*?)</function>", re.DOTALL)
 
     def extract_tool_calls(
         self, model_output: str, request: dict[str, Any] | None = None
@@ -123,6 +125,30 @@ class HermesToolParser(ToolParser):
                 )
             if nemotron_matches:
                 cleaned_text = self.NEMOTRON_PATTERN.sub("", cleaned_text).strip()
+
+        # Try bare Nemotron XML: <function=name>...</function> without <tool_call> wrapper
+        # This happens when the chat template provides <tool_call> as generation prompt
+        # and the model generates <function=...> directly.
+        if not tool_calls:
+            bare_matches = self.BARE_FUNCTION_PATTERN.findall(cleaned_text)
+            for name, params_block in bare_matches:
+                params = self.PARAM_PATTERN.findall(params_block)
+                arguments = {}
+                for p_name, p_value in params:
+                    val = p_value.strip()
+                    try:
+                        arguments[p_name.strip()] = json.loads(val)
+                    except (json.JSONDecodeError, ValueError):
+                        arguments[p_name.strip()] = val
+                tool_calls.append(
+                    {
+                        "id": generate_tool_id(),
+                        "name": name.strip(),
+                        "arguments": json.dumps(arguments, ensure_ascii=False),
+                    }
+                )
+            if bare_matches:
+                cleaned_text = self.BARE_FUNCTION_PATTERN.sub("", cleaned_text).strip()
 
         # Fallback: try lenient pattern for malformed tags like <tool_call without >
         if not tool_calls:
@@ -200,6 +226,26 @@ class HermesToolParser(ToolParser):
                 tools_called=False, tool_calls=[], content=cleaned_text
             )
 
+    @staticmethod
+    def _format_streaming_tool_calls(
+        tool_calls: list[dict], start_index: int = 0
+    ) -> dict[str, Any]:
+        """Format tool calls for streaming response."""
+        return {
+            "tool_calls": [
+                {
+                    "index": start_index + i,
+                    "id": tc["id"],
+                    "type": "function",
+                    "function": {
+                        "name": tc["name"],
+                        "arguments": tc["arguments"],
+                    },
+                }
+                for i, tc in enumerate(tool_calls)
+            ]
+        }
+
     def extract_tool_calls_streaming(
         self,
         previous_text: str,
@@ -212,49 +258,61 @@ class HermesToolParser(ToolParser):
     ) -> dict[str, Any] | None:
         """
         Extract tool calls from streaming Hermes model output.
+
+        Uses tag counting to correctly handle multiple sequential tool calls.
         """
-        # Check for tagged tool calls
-        if "<tool_call>" in current_text:
-            if "</tool_call>" in delta_text:
+        # Count <tool_call> / </tool_call> tags for multi-tool support
+        open_count = current_text.count("<tool_call>")
+        close_count = current_text.count("</tool_call>")
+        prev_close_count = previous_text.count("</tool_call>")
+
+        if open_count > 0:
+            if open_count > close_count:
+                # Inside an incomplete tool call block, suppress output
+                return None
+
+            if close_count > prev_close_count:
+                # New tool call(s) completed in this delta
                 result = self.extract_tool_calls(current_text, request)
                 if result.tools_called:
-                    return {
-                        "tool_calls": [
-                            {
-                                "index": i,
-                                "id": tc["id"],
-                                "type": "function",
-                                "function": {
-                                    "name": tc["name"],
-                                    "arguments": tc["arguments"],
-                                },
-                            }
-                            for i, tc in enumerate(result.tool_calls)
-                        ]
-                    }
-            return None
+                    # Only emit newly completed tool calls (skip already emitted)
+                    new_calls = result.tool_calls[prev_close_count:]
+                    if new_calls:
+                        return self._format_streaming_tool_calls(
+                            new_calls, start_index=prev_close_count
+                        )
+
+            # All current tool calls already emitted, pass content through
+            return {"content": delta_text}
+
+        # Bare Nemotron XML: <function=name>...</function> without <tool_call> wrapper
+        # This happens when the chat template provides <tool_call> as generation prompt.
+        if "<function=" in current_text:
+            func_close_count = current_text.count("</function>")
+            prev_func_close = previous_text.count("</function>")
+
+            if current_text.count("<function=") > func_close_count:
+                # Inside an incomplete function block, suppress output
+                return None
+
+            if func_close_count > prev_func_close:
+                # New function block(s) completed
+                result = self.extract_tool_calls(current_text, request)
+                if result.tools_called:
+                    new_calls = result.tool_calls[prev_func_close:]
+                    if new_calls:
+                        return self._format_streaming_tool_calls(
+                            new_calls, start_index=prev_func_close
+                        )
+
+            return {"content": delta_text}
 
         # Fallback: check for raw JSON tool calls (detect closing brace pattern)
-        # Look for complete JSON object with "name" and "arguments"
         if '{"name":' in current_text and '"arguments":' in current_text:
-            # Check if we have a complete JSON object (ends with }})
             if delta_text.rstrip().endswith("}"):
                 result = self.extract_tool_calls(current_text, request)
                 if result.tools_called:
-                    return {
-                        "tool_calls": [
-                            {
-                                "index": i,
-                                "id": tc["id"],
-                                "type": "function",
-                                "function": {
-                                    "name": tc["name"],
-                                    "arguments": tc["arguments"],
-                                },
-                            }
-                            for i, tc in enumerate(result.tool_calls)
-                        ]
-                    }
+                    return self._format_streaming_tool_calls(result.tool_calls)
             return None
 
         return {"content": delta_text}

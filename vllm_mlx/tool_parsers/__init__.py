@@ -18,6 +18,7 @@ Available parsers:
 - xlam: Salesforce xLAM models
 - functionary/meetkai: MeetKai Functionary models
 - glm47/glm4: GLM-4.7 and GLM-4.7-Flash models
+- harmony/gpt-oss: GPT-OSS models (Harmony format with channels)
 
 Usage:
     from vllm_mlx.tool_parsers import ToolParserManager
@@ -55,6 +56,7 @@ from .nemotron_tool_parser import NemotronToolParser
 from .qwen_tool_parser import QwenToolParser
 from .xlam_tool_parser import xLAMToolParser
 from .glm47_tool_parser import Glm47ToolParser
+from .harmony_tool_parser import HarmonyToolParser
 
 __all__ = [
     # Base classes
@@ -74,4 +76,5 @@ __all__ = [
     "xLAMToolParser",
     "FunctionaryToolParser",
     "Glm47ToolParser",
+    "HarmonyToolParser",
 ]

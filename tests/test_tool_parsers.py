@@ -740,3 +740,423 @@ class TestThinkTagStripping:
 
         assert result.tools_called is False
         assert result.content == "The answer is 42."
+
+
+class TestQwen3CoderParser:
+    """Test Qwen3-Coder tool call parsing (Issue #47)."""
+
+    def test_qwen3_coder_alias_registered(self):
+        """Test that qwen3_coder is registered as an alias for HermesToolParser."""
+        parser_cls = ToolParserManager.get_tool_parser("qwen3_coder")
+        assert parser_cls == HermesToolParser
+
+    def test_qwen3_coder_xml_format(self):
+        """Test parsing Qwen3-Coder XML format (Nemotron-style)."""
+        parser = HermesToolParser()
+        text = (
+            "<tool_call>\n"
+            "<function=get_weather>\n"
+            "<parameter=city>Paris</parameter>\n"
+            "<parameter=units>celsius</parameter>\n"
+            "</function>\n"
+            "</tool_call>"
+        )
+        result = parser.extract_tool_calls(text)
+
+        assert result.tools_called
+        assert len(result.tool_calls) == 1
+        assert result.tool_calls[0]["name"] == "get_weather"
+        args = json.loads(result.tool_calls[0]["arguments"])
+        assert args["city"] == "Paris"
+        assert args["units"] == "celsius"
+
+    def test_qwen3_coder_with_think_tags(self):
+        """Test Qwen3-Coder XML format with think tags."""
+        parser = HermesToolParser()
+        text = (
+            "<think>I need to read this file.</think>\n"
+            "<tool_call>\n"
+            "<function=read_file>\n"
+            "<parameter=path>/src/main.py</parameter>\n"
+            "</function>\n"
+            "</tool_call>"
+        )
+        result = parser.extract_tool_calls(text)
+
+        assert result.tools_called
+        assert result.tool_calls[0]["name"] == "read_file"
+        args = json.loads(result.tool_calls[0]["arguments"])
+        assert args["path"] == "/src/main.py"
+
+    def test_qwen3_coder_multiline_parameter(self):
+        """Test Qwen3-Coder with multi-line parameter values (code)."""
+        parser = HermesToolParser()
+        text = (
+            "<tool_call>\n"
+            "<function=write_file>\n"
+            "<parameter=path>/src/hello.py</parameter>\n"
+            "<parameter=content>def hello():\n"
+            "    print('hello')\n</parameter>\n"
+            "</function>\n"
+            "</tool_call>"
+        )
+        result = parser.extract_tool_calls(text)
+
+        assert result.tools_called
+        assert result.tool_calls[0]["name"] == "write_file"
+        args = json.loads(result.tool_calls[0]["arguments"])
+        assert args["path"] == "/src/hello.py"
+        assert "def hello():" in args["content"]
+
+    def test_bare_function_without_tool_call_wrapper(self):
+        """Test bare <function=...> blocks without <tool_call> wrapper."""
+        parser = HermesToolParser()
+        text = (
+            "<function=get_weather>" "<parameter=city>Berlin</parameter>" "</function>"
+        )
+        result = parser.extract_tool_calls(text)
+
+        assert result.tools_called
+        assert len(result.tool_calls) == 1
+        assert result.tool_calls[0]["name"] == "get_weather"
+        args = json.loads(result.tool_calls[0]["arguments"])
+        assert args["city"] == "Berlin"
+
+    def test_bare_multi_function_without_wrapper(self):
+        """Test multiple bare <function=...> blocks without <tool_call> wrapper."""
+        parser = HermesToolParser()
+        text = (
+            "<function=read_file>"
+            "<parameter=path>/a.py</parameter>"
+            "</function>\n"
+            "<function=write_file>"
+            "<parameter=path>/b.py</parameter>"
+            "<parameter=content>hello</parameter>"
+            "</function>"
+        )
+        result = parser.extract_tool_calls(text)
+
+        assert result.tools_called
+        assert len(result.tool_calls) == 2
+        assert result.tool_calls[0]["name"] == "read_file"
+        assert result.tool_calls[1]["name"] == "write_file"
+
+    def test_qwen3_coder_multiple_tool_calls(self):
+        """Test multiple Nemotron XML tool calls (multi-tool scenario)."""
+        parser = HermesToolParser()
+        text = (
+            "<tool_call>\n"
+            "<function=read_file>\n"
+            "<parameter=path>/src/main.py</parameter>\n"
+            "</function>\n"
+            "</tool_call>\n"
+            "<tool_call>\n"
+            "<function=list_files>\n"
+            "<parameter=directory>/src</parameter>\n"
+            "</function>\n"
+            "</tool_call>"
+        )
+        result = parser.extract_tool_calls(text)
+
+        assert result.tools_called
+        assert len(result.tool_calls) == 2
+        assert result.tool_calls[0]["name"] == "read_file"
+        assert result.tool_calls[1]["name"] == "list_files"
+
+
+class TestHermesStreamingFixes:
+    """Test streaming fixes for Hermes parser (Issue #47)."""
+
+    def test_streaming_complete_tool_call(self):
+        """Test streaming with complete tool call in accumulated text."""
+        parser = HermesToolParser()
+
+        # Simulate token-by-token streaming
+        # Token 1: regular content
+        r = parser.extract_tool_calls_streaming(
+            previous_text="",
+            current_text="Sure, let me check.",
+            delta_text="Sure, let me check.",
+        )
+        assert r == {"content": "Sure, let me check."}
+
+        # Token 2: opening tag
+        r = parser.extract_tool_calls_streaming(
+            previous_text="Sure, let me check.",
+            current_text='Sure, let me check.<tool_call>{"name":',
+            delta_text='<tool_call>{"name":',
+        )
+        assert r is None  # Inside tool call, suppress
+
+        # Token 3: more JSON
+        r = parser.extract_tool_calls_streaming(
+            previous_text='Sure, let me check.<tool_call>{"name":',
+            current_text='Sure, let me check.<tool_call>{"name": "search", "arguments": {"q": "test"}}',
+            delta_text=' "search", "arguments": {"q": "test"}}',
+        )
+        assert r is None  # Still inside, no closing tag yet
+
+        # Token 4: closing tag
+        r = parser.extract_tool_calls_streaming(
+            previous_text='Sure, let me check.<tool_call>{"name": "search", "arguments": {"q": "test"}}',
+            current_text='Sure, let me check.<tool_call>{"name": "search", "arguments": {"q": "test"}}</tool_call>',
+            delta_text="</tool_call>",
+        )
+        assert r is not None
+        assert "tool_calls" in r
+        assert r["tool_calls"][0]["function"]["name"] == "search"
+
+    def test_streaming_split_closing_tag(self):
+        """Test that </tool_call> split across deltas is detected via current_text."""
+        parser = HermesToolParser()
+
+        # Accumulated text has <tool_call> but </tool_call is split
+        r = parser.extract_tool_calls_streaming(
+            previous_text='<tool_call>{"name": "func", "arguments": {}}',
+            current_text='<tool_call>{"name": "func", "arguments": {}}</tool_call',
+            delta_text="</tool_call",
+        )
+        # Not yet complete (missing >)
+        assert r is None
+
+        # Now the > arrives, completing </tool_call>
+        r = parser.extract_tool_calls_streaming(
+            previous_text='<tool_call>{"name": "func", "arguments": {}}</tool_call',
+            current_text='<tool_call>{"name": "func", "arguments": {}}</tool_call>',
+            delta_text=">",
+        )
+        assert r is not None
+        assert "tool_calls" in r
+        assert r["tool_calls"][0]["function"]["name"] == "func"
+
+    def test_streaming_content_after_tool_call(self):
+        """Test that content after </tool_call> is not suppressed."""
+        parser = HermesToolParser()
+
+        # Complete tool call already in text
+        full = '<tool_call>{"name": "func", "arguments": {}}</tool_call>'
+        r = parser.extract_tool_calls_streaming(
+            previous_text=full[:-1],  # everything except last >
+            current_text=full,
+            delta_text=">",
+        )
+        assert "tool_calls" in r
+
+        # Now content comes after the tool call
+        r = parser.extract_tool_calls_streaming(
+            previous_text=full,
+            current_text=full + "\nHere is the result.",
+            delta_text="\nHere is the result.",
+        )
+        # Should NOT be suppressed
+        assert r is not None
+        assert r.get("content") == "\nHere is the result."
+
+    def test_streaming_nemotron_xml_format(self):
+        """Test streaming with Qwen3-Coder/Nemotron XML format."""
+        parser = HermesToolParser()
+
+        chunks = [
+            "<tool_call>\n",
+            "<function=get_weather>\n",
+            "<parameter=city>London</parameter>\n",
+            "</function>\n",
+            "</tool_call>",
+        ]
+
+        accumulated = ""
+        tool_calls_found = False
+        for chunk in chunks:
+            prev = accumulated
+            accumulated += chunk
+            r = parser.extract_tool_calls_streaming(
+                previous_text=prev,
+                current_text=accumulated,
+                delta_text=chunk,
+            )
+            if r is not None and "tool_calls" in r:
+                tool_calls_found = True
+                assert r["tool_calls"][0]["function"]["name"] == "get_weather"
+                break
+
+        assert tool_calls_found, "Tool call should have been detected"
+
+    def test_streaming_no_false_positives(self):
+        """Test that regular text with < doesn't trigger false positives."""
+        parser = HermesToolParser()
+
+        r = parser.extract_tool_calls_streaming(
+            previous_text="",
+            current_text="Use x < 10 and y > 5",
+            delta_text="Use x < 10 and y > 5",
+        )
+        assert r == {"content": "Use x < 10 and y > 5"}
+
+    def test_streaming_multi_tool_calls(self):
+        """Test streaming with two sequential tool calls (Issue #47)."""
+        parser = HermesToolParser()
+
+        # First tool call arrives token by token
+        chunks = [
+            '<tool_call>{"name": "read_file", "arguments": {"path": "/a.py"}}',
+            "</tool_call>",
+            "\n",
+            '<tool_call>{"name": "list_dir", "arguments": {"dir": "/src"}}',
+            "</tool_call>",
+        ]
+
+        accumulated = ""
+        emitted_calls = []
+        for chunk in chunks:
+            prev = accumulated
+            accumulated += chunk
+            r = parser.extract_tool_calls_streaming(
+                previous_text=prev,
+                current_text=accumulated,
+                delta_text=chunk,
+            )
+            if r is not None and "tool_calls" in r:
+                emitted_calls.extend(r["tool_calls"])
+
+        assert len(emitted_calls) == 2
+        assert emitted_calls[0]["function"]["name"] == "read_file"
+        assert emitted_calls[1]["function"]["name"] == "list_dir"
+        # Verify indexes are correct
+        assert emitted_calls[0]["index"] == 0
+        assert emitted_calls[1]["index"] == 1
+
+    def test_streaming_multi_tool_no_duplicates(self):
+        """Test that completed tool calls are not re-emitted on second completion."""
+        parser = HermesToolParser()
+
+        first_complete = '<tool_call>{"name": "func1", "arguments": {}}</tool_call>'
+        # After first tool call is emitted, content between calls passes through
+        between = "\n"
+        second_start = '<tool_call>{"name": "func2", "arguments": {}}'
+        second_end = "</tool_call>"
+
+        # First tool call completed
+        r1 = parser.extract_tool_calls_streaming(
+            previous_text=first_complete[:-1],
+            current_text=first_complete,
+            delta_text=">",
+        )
+        assert r1 is not None and "tool_calls" in r1
+        assert len(r1["tool_calls"]) == 1
+        assert r1["tool_calls"][0]["function"]["name"] == "func1"
+
+        # Whitespace between
+        r2 = parser.extract_tool_calls_streaming(
+            previous_text=first_complete,
+            current_text=first_complete + between,
+            delta_text=between,
+        )
+        assert r2 == {"content": between}
+
+        # Second tool call building (inside block, suppress)
+        r3 = parser.extract_tool_calls_streaming(
+            previous_text=first_complete + between,
+            current_text=first_complete + between + second_start,
+            delta_text=second_start,
+        )
+        assert r3 is None  # Inside incomplete second tool call
+
+        # Second tool call completed
+        r4 = parser.extract_tool_calls_streaming(
+            previous_text=first_complete + between + second_start,
+            current_text=first_complete + between + second_start + second_end,
+            delta_text=second_end,
+        )
+        assert r4 is not None and "tool_calls" in r4
+        assert len(r4["tool_calls"]) == 1  # Only the NEW tool call
+        assert r4["tool_calls"][0]["function"]["name"] == "func2"
+        assert r4["tool_calls"][0]["index"] == 1  # Second index
+
+    def test_streaming_multi_nemotron_xml(self):
+        """Test streaming with multiple Nemotron XML tool calls."""
+        parser = HermesToolParser()
+
+        chunks = [
+            "<tool_call>\n<function=read_file>\n",
+            "<parameter=path>/a.py</parameter>\n",
+            "</function>\n</tool_call>\n",
+            "<tool_call>\n<function=write_file>\n",
+            "<parameter=path>/b.py</parameter>\n",
+            "<parameter=content>hello</parameter>\n",
+            "</function>\n</tool_call>",
+        ]
+
+        accumulated = ""
+        emitted_calls = []
+        for chunk in chunks:
+            prev = accumulated
+            accumulated += chunk
+            r = parser.extract_tool_calls_streaming(
+                previous_text=prev,
+                current_text=accumulated,
+                delta_text=chunk,
+            )
+            if r is not None and "tool_calls" in r:
+                emitted_calls.extend(r["tool_calls"])
+
+        assert len(emitted_calls) == 2
+        assert emitted_calls[0]["function"]["name"] == "read_file"
+        assert emitted_calls[1]["function"]["name"] == "write_file"
+
+    def test_streaming_bare_function_blocks(self):
+        """Test streaming with bare <function= blocks without <tool_call> wrapper."""
+        parser = HermesToolParser()
+
+        chunks = [
+            "<function=read_file>",
+            "<parameter=path>/src/main.py</parameter>",
+            "</function>",
+        ]
+
+        accumulated = ""
+        tool_calls_found = False
+        for chunk in chunks:
+            prev = accumulated
+            accumulated += chunk
+            r = parser.extract_tool_calls_streaming(
+                previous_text=prev,
+                current_text=accumulated,
+                delta_text=chunk,
+            )
+            if r is not None and "tool_calls" in r:
+                tool_calls_found = True
+                assert r["tool_calls"][0]["function"]["name"] == "read_file"
+                args = json.loads(r["tool_calls"][0]["function"]["arguments"])
+                assert args["path"] == "/src/main.py"
+                break
+
+        assert tool_calls_found, "Bare function block should have been detected"
+
+    def test_streaming_bare_multi_function_blocks(self):
+        """Test streaming with multiple bare <function= blocks."""
+        parser = HermesToolParser()
+
+        chunks = [
+            "<function=func1><parameter=a>1</parameter></function>",
+            "\n",
+            "<function=func2>",
+            "<parameter=b>2</parameter>",
+            "</function>",
+        ]
+
+        accumulated = ""
+        emitted_calls = []
+        for chunk in chunks:
+            prev = accumulated
+            accumulated += chunk
+            r = parser.extract_tool_calls_streaming(
+                previous_text=prev,
+                current_text=accumulated,
+                delta_text=chunk,
+            )
+            if r is not None and "tool_calls" in r:
+                emitted_calls.extend(r["tool_calls"])
+
+        assert len(emitted_calls) == 2
+        assert emitted_calls[0]["function"]["name"] == "func1"
+        assert emitted_calls[1]["function"]["name"] == "func2"
