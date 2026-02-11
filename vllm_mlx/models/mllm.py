@@ -33,6 +33,30 @@ from vllm_mlx.mllm_cache import MLLMPrefixCacheManager
 logger = logging.getLogger(__name__)
 
 
+def _validate_url_safety(url: str) -> None:
+    """Block requests to private/internal IPs and cloud metadata endpoints."""
+    import ipaddress
+    import socket
+
+    parsed = urlparse(url)
+    hostname = parsed.hostname
+    if not hostname:
+        raise ValueError(f"Invalid URL: {url}")
+
+    # Block known dangerous hostnames
+    if hostname in ("localhost", "localhost.localdomain"):
+        raise ValueError(f"Blocked request to localhost: {url}")
+
+    # Resolve and check IP
+    try:
+        ip = ipaddress.ip_address(socket.gethostbyname(hostname))
+    except (socket.gaierror, ValueError):
+        return  # Can't resolve — let requests handle it
+
+    if ip.is_private or ip.is_loopback or ip.is_link_local:
+        raise ValueError(f"Blocked request to private/internal IP ({ip}): {url}")
+
+
 class TempFileManager:
     """Thread-safe manager for tracking and cleaning up temporary files."""
 
@@ -196,7 +220,10 @@ def download_image(url: str, timeout: int = 30, max_size: int = MAX_IMAGE_SIZE) 
 
     Raises:
         FileSizeExceededError: If image exceeds max_size
+        ValueError: If URL targets private/internal network
     """
+    _validate_url_safety(url)
+
     headers = {
         "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
     }
@@ -284,7 +311,10 @@ def download_video(url: str, timeout: int = 120, max_size: int = MAX_VIDEO_SIZE)
 
     Raises:
         FileSizeExceededError: If video exceeds max_size
+        ValueError: If URL targets private/internal network
     """
+    _validate_url_safety(url)
+
     headers = {
         "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
     }
@@ -442,10 +472,6 @@ def process_video_input(video: str | dict) -> str:
     if not video:
         raise ValueError("Empty video input")
 
-    # Check if it's a local file
-    if Path(video).exists():
-        return video
-
     # Check if it's a URL
     if is_url(video):
         return download_video(video)
@@ -524,10 +550,6 @@ def process_image_input(image: str | dict) -> str:
     # Check if it's a URL
     if is_url(image):
         return download_image(image)
-
-    # Check if it's a local file (only for short strings that could be paths)
-    if len(image) < 4096 and Path(image).exists():
-        return image
 
     raise ValueError(f"Cannot process image: {image[:50]}...")
 
@@ -687,7 +709,7 @@ class MLXMultimodalLM:
     def __init__(
         self,
         model_name: str,
-        trust_remote_code: bool = True,
+        trust_remote_code: bool = False,
         enable_cache: bool = True,
         cache_size: int = 50,
     ):

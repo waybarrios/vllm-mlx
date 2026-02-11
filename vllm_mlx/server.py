@@ -254,6 +254,8 @@ class RateLimiter:
         self.window_size = 60.0  # 1 minute window
         self._requests: dict[str, list[float]] = defaultdict(list)
         self._lock = threading.Lock()
+        self._last_cleanup = time.time()
+        self._cleanup_interval = 300  # 5 minutes
 
     def is_allowed(self, client_id: str) -> tuple[bool, int]:
         """
@@ -269,6 +271,17 @@ class RateLimiter:
         window_start = current_time - self.window_size
 
         with self._lock:
+            # Periodic cleanup of stale clients
+            if current_time - self._last_cleanup > self._cleanup_interval:
+                self._last_cleanup = current_time
+                stale = [
+                    k
+                    for k, v in self._requests.items()
+                    if not v or max(v) < window_start
+                ]
+                for k in stale:
+                    del self._requests[k]
+
             # Clean old requests outside window
             self._requests[client_id] = [
                 t for t in self._requests[client_id] if t > window_start
@@ -288,6 +301,10 @@ class RateLimiter:
 
 # Global rate limiter (disabled by default)
 _rate_limiter = RateLimiter(requests_per_minute=60, enabled=False)
+
+# Audio/TTS limits
+MAX_AUDIO_UPLOAD_SIZE = 100 * 1024 * 1024  # 100MB
+MAX_TTS_INPUT_LENGTH = 10_000  # characters
 
 
 async def check_rate_limit(request: Request):
@@ -467,6 +484,7 @@ def load_model(
     stream_interval: int = 1,
     max_tokens: int = 32768,
     force_mllm: bool = False,
+    trust_remote_code: bool = False,
 ):
     """
     Load a model (auto-detects MLLM vs LLM).
@@ -478,6 +496,7 @@ def load_model(
         stream_interval: Tokens to batch before streaming (batched mode only)
         max_tokens: Default max tokens for generation
         force_mllm: Force loading as MLLM even if not auto-detected
+        trust_remote_code: Allow execution of custom code from model repos
     """
     global _engine, _model_name, _default_max_tokens, _tool_parser_instance
 
@@ -493,6 +512,7 @@ def load_model(
         logger.info(f"Loading model with BatchedEngine: {model_name}")
         _engine = BatchedEngine(
             model_name=model_name,
+            trust_remote_code=trust_remote_code,
             scheduler_config=scheduler_config,
             stream_interval=stream_interval,
             force_mllm=force_mllm,
@@ -502,7 +522,11 @@ def load_model(
         logger.info(f"Model loaded (batched mode): {model_name}")
     else:
         logger.info(f"Loading model with SimpleEngine: {model_name}")
-        _engine = SimpleEngine(model_name=model_name, force_mllm=force_mllm)
+        _engine = SimpleEngine(
+            model_name=model_name,
+            trust_remote_code=trust_remote_code,
+            force_mllm=force_mllm,
+        )
         # Start SimpleEngine synchronously (no background loop)
         # Use new_event_loop() for Python 3.10+ compatibility (get_event_loop() is deprecated)
         loop = asyncio.new_event_loop()
@@ -562,7 +586,7 @@ async def health():
     }
 
 
-@app.get("/v1/status")
+@app.get("/v1/status", dependencies=[Depends(verify_api_key)])
 async def status():
     """Real-time status with per-request details for debugging and monitoring."""
     if _engine is None:
@@ -592,7 +616,7 @@ async def status():
     }
 
 
-@app.get("/v1/cache/stats")
+@app.get("/v1/cache/stats", dependencies=[Depends(verify_api_key)])
 async def cache_stats():
     """Get cache statistics for debugging and monitoring."""
     try:
@@ -611,7 +635,7 @@ async def cache_stats():
         return {"error": "Cache stats not available (mlx_vlm not loaded)"}
 
 
-@app.delete("/v1/cache")
+@app.delete("/v1/cache", dependencies=[Depends(verify_api_key)])
 async def clear_cache():
     """Clear all caches."""
     try:
@@ -763,8 +787,8 @@ async def create_embeddings(request: EmbeddingRequest) -> EmbeddingResponse:
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Embedding generation failed: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"Embedding generation failed: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 # =============================================================================
@@ -821,6 +845,24 @@ async def execute_mcp_tool(request: MCPExecuteRequest) -> MCPExecuteResponse:
             status_code=503, detail="MCP not configured. Start server with --mcp-config"
         )
 
+    # Validate through sandbox before execution
+    from .mcp.security import MCPSecurityError, get_sandbox
+
+    sandbox = get_sandbox()
+    try:
+        # Extract server name from tool_name (format: server__tool)
+        parts = request.tool_name.split("__", 1)
+        server_name = parts[0] if len(parts) > 1 else "unknown"
+        tool_name = parts[1] if len(parts) > 1 else request.tool_name
+
+        sandbox.validate_tool_execution(
+            tool_name=tool_name,
+            server_name=server_name,
+            arguments=request.arguments or {},
+        )
+    except MCPSecurityError as e:
+        raise HTTPException(status_code=403, detail=str(e))
+
     result = await _mcp_manager.execute_tool(
         request.tool_name,
         request.arguments,
@@ -873,16 +915,26 @@ async def create_transcription(
             "parakeet": "mlx-community/parakeet-tdt-0.6b-v2",
             "parakeet-v3": "mlx-community/parakeet-tdt-0.6b-v3",
         }
-        model_name = model_map.get(model, model)
+        model_name = model_map.get(model)
+        if model_name is None:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unknown STT model '{model}'. Available: {list(model_map.keys())}",
+            )
 
         # Load engine if needed
         if _stt_engine is None or _stt_engine.model_name != model_name:
             _stt_engine = STTEngine(model_name)
             _stt_engine.load()
 
-        # Save uploaded file temporarily
+        # Save uploaded file temporarily (with size limit)
+        content = await file.read()
+        if len(content) > MAX_AUDIO_UPLOAD_SIZE:
+            raise HTTPException(
+                status_code=413,
+                detail=f"Audio file too large (max {MAX_AUDIO_UPLOAD_SIZE // 1024 // 1024}MB)",
+            )
         with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
-            content = await file.read()
             tmp.write(content)
             tmp_path = tmp.name
 
@@ -906,8 +958,8 @@ async def create_transcription(
             detail="mlx-audio not installed. Install with: pip install mlx-audio",
         )
     except Exception as e:
-        logger.error(f"Transcription failed: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"Transcription failed: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 @app.post("/v1/audio/speech", dependencies=[Depends(verify_api_key)])
@@ -929,6 +981,13 @@ async def create_speech(
     """
     global _tts_engine
 
+    # Validate TTS input length
+    if len(input) > MAX_TTS_INPUT_LENGTH:
+        raise HTTPException(
+            status_code=400,
+            detail=f"TTS input too long (max {MAX_TTS_INPUT_LENGTH} chars)",
+        )
+
     try:
         from .audio.tts import TTSEngine  # Lazy import - optional feature
 
@@ -941,7 +1000,12 @@ async def create_speech(
             "vibevoice": "mlx-community/VibeVoice-Realtime-0.5B-4bit",
             "voxcpm": "mlx-community/VoxCPM1.5",
         }
-        model_name = model_map.get(model, model)
+        model_name = model_map.get(model)
+        if model_name is None:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unknown TTS model '{model}'. Available: {list(model_map.keys())}",
+            )
 
         # Load engine if needed
         if _tts_engine is None or _tts_engine.model_name != model_name:
@@ -962,8 +1026,8 @@ async def create_speech(
             detail="mlx-audio not installed. Install with: pip install mlx-audio",
         )
     except Exception as e:
-        logger.error(f"TTS generation failed: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"TTS generation failed: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 @app.get("/v1/audio/voices", dependencies=[Depends(verify_api_key)])
@@ -1466,7 +1530,10 @@ def _inject_json_instruction(messages: list, instruction: str) -> list:
 # =============================================================================
 
 
-@app.post("/v1/messages")
+@app.post(
+    "/v1/messages",
+    dependencies=[Depends(verify_api_key), Depends(check_rate_limit)],
+)
 async def create_anthropic_message(
     request: Request,
 ):
@@ -1591,7 +1658,10 @@ async def create_anthropic_message(
     )
 
 
-@app.post("/v1/messages/count_tokens")
+@app.post(
+    "/v1/messages/count_tokens",
+    dependencies=[Depends(verify_api_key), Depends(check_rate_limit)],
+)
 async def count_anthropic_tokens(request: Request):
     """
     Count tokens for an Anthropic Messages API request.
@@ -2139,8 +2209,8 @@ Examples:
     parser.add_argument(
         "--host",
         type=str,
-        default="0.0.0.0",
-        help="Host to bind to",
+        default="127.0.0.1",
+        help="Host to bind to (default: 127.0.0.1; use 0.0.0.0 to expose to network)",
     )
     parser.add_argument(
         "--port",
@@ -2220,6 +2290,11 @@ Examples:
         default=None,
         help="Default top_p for generation when not specified in request",
     )
+    parser.add_argument(
+        "--trust-remote-code",
+        action="store_true",
+        help="Allow execution of custom code from HuggingFace model repos (security risk, use only with trusted models)",
+    )
 
     args = parser.parse_args()
 
@@ -2240,6 +2315,13 @@ Examples:
             f"Rate limiting enabled: {args.rate_limit} requests/minute per client"
         )
 
+    # Warn about network exposure without auth
+    if args.host == "0.0.0.0" and not args.api_key:
+        logger.warning(
+            "Server binding to 0.0.0.0 (all interfaces) without --api-key. "
+            "This exposes the server to the network without authentication."
+        )
+
     # Security summary at startup
     logger.info("=" * 60)
     logger.info("SECURITY CONFIGURATION")
@@ -2253,6 +2335,7 @@ Examples:
     else:
         logger.warning("  Rate limiting: DISABLED - Use --rate-limit to enable")
     logger.info(f"  Request timeout: {args.timeout}s")
+    logger.info(f"  Trust remote code: {args.trust_remote_code}")
     logger.info("=" * 60)
 
     # Set MCP config for lifespan
@@ -2277,6 +2360,7 @@ Examples:
         use_batching=args.continuous_batching,
         max_tokens=args.max_tokens,
         force_mllm=args.mllm,
+        trust_remote_code=args.trust_remote_code,
     )
 
     # Start server

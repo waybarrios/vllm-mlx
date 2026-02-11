@@ -134,7 +134,7 @@ class BatchedEngine(BaseEngine):
     def __init__(
         self,
         model_name: str,
-        trust_remote_code: bool = True,
+        trust_remote_code: bool = False,
         scheduler_config: Any | None = None,
         stream_interval: int = 1,
         force_mllm: bool = False,
