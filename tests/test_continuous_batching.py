@@ -222,9 +222,21 @@ class TestContinuousBatchingIntegration:
 
 if __name__ == "__main__":
     # Quick standalone test
+    import argparse
+    import os
 
-    MODEL_NAME = "mlx-community/Qwen3-0.6B-8bit"
-    MODEL_NAME = "mlx-community/Qwen3-8B-6bit"
+    parser = argparse.ArgumentParser(description="Continuous batching benchmark")
+    parser.add_argument(
+        "--model",
+        type=str,
+        default=os.environ.get(
+            "VLLM_MLX_TEST_MODEL", "mlx-community/Qwen3-0.6B-8bit"
+        ),
+        help="Model to benchmark",
+    )
+    args = parser.parse_args()
+
+    MODEL_NAME = args.model
 
     async def run_benchmark():
         from mlx_lm import load
