@@ -98,6 +98,11 @@ def estimate_kv_cache_memory(cache: list[Any]) -> int:
     Returns:
         Estimated memory usage in bytes.
     """
+    try:
+        from mlx_lm.models.cache import QuantizedKVCache as _QuantizedKVCache
+    except ImportError:
+        _QuantizedKVCache = None  # noqa: N806
+
     if not cache:
         return 0
 
@@ -112,8 +117,8 @@ def estimate_kv_cache_memory(cache: list[Any]) -> int:
             total_bytes += _array_memory(keys)
             total_bytes += _array_memory(values)
         # Handle QuantizedKVCache: keys/values are tuples of (data, scales, biases)
-        elif hasattr(layer_cache, "keys") and isinstance(
-            getattr(layer_cache, "keys", None), (list, tuple)
+        elif _QuantizedKVCache is not None and isinstance(
+            layer_cache, _QuantizedKVCache
         ):
             for arr in layer_cache.keys:
                 total_bytes += _array_memory(arr)
@@ -268,12 +273,10 @@ def _trim_cache_offset(cache: list[Any], trim_by: int) -> list[Any]:
     trimmed: list[Any] = []
     for layer_cache in cache:
         if _QKVCache is not None and isinstance(layer_cache, _QKVCache):
-            tc = _QKVCache.__new__(_QKVCache)
+            tc = _QKVCache(group_size=layer_cache.group_size, bits=layer_cache.bits)
             tc.keys = layer_cache.keys
             tc.values = layer_cache.values
             tc.offset = max(layer_cache.offset - trim_by, 0)
-            tc.group_size = layer_cache.group_size
-            tc.bits = layer_cache.bits
             trimmed.append(tc)
         elif (
             hasattr(layer_cache, "offset")
@@ -383,6 +386,10 @@ class MemoryAwarePrefixCache:
             f"max_entries={self._config.max_entries}"
         )
 
+    def _maybe_dequantize(self, cache: list[Any]) -> list[Any]:
+        """Dequantize cache if quantization is enabled."""
+        return _dequantize_cache(cache) if self._config.kv_quantize else cache
+
     def fetch(self, tokens: list[int]) -> tuple[list[Any] | None, list[int]]:
         """
         Find cached KV state for the given tokens.
@@ -416,12 +423,7 @@ class MemoryAwarePrefixCache:
             self._stats.hits += 1
             self._stats.tokens_saved += len(tokens)
             self._last_match_type = "exact"
-            cache_out = (
-                _dequantize_cache(entry.cache)
-                if self._config.kv_quantize
-                else entry.cache
-            )
-            return cache_out, []
+            return self._maybe_dequantize(entry.cache), []
 
         # --- O(log N) prefix & supersequence match via sorted index ---
         best_match: _CacheEntry | None = None
@@ -491,23 +493,13 @@ class MemoryAwarePrefixCache:
                 self._stats.hits += 1
                 self._stats.tokens_saved += n_requested
                 self._last_match_type = "supersequence"
-                trimmed_cache = (
-                    _dequantize_cache(trimmed_cache)
-                    if self._config.kv_quantize
-                    else trimmed_cache
-                )
-                return trimmed_cache, []
+                return self._maybe_dequantize(trimmed_cache), []
             else:
                 self._entries.move_to_end(best_super.tokens)
                 self._stats.hits += 1
                 self._stats.tokens_saved += n_requested
                 self._last_match_type = "supersequence"
-                cache_out = (
-                    _dequantize_cache(best_super.cache)
-                    if self._config.kv_quantize
-                    else best_super.cache
-                )
-                return cache_out, []
+                return self._maybe_dequantize(best_super.cache), []
 
         # --- Prefix match ---
         if best_match is not None:
@@ -516,12 +508,7 @@ class MemoryAwarePrefixCache:
             self._stats.tokens_saved += best_length
             remaining = tokens[best_length:]
             self._last_match_type = "prefix"
-            cache_out = (
-                _dequantize_cache(best_match.cache)
-                if self._config.kv_quantize
-                else best_match.cache
-            )
-            return cache_out, remaining
+            return self._maybe_dequantize(best_match.cache), remaining
 
         # --- LCP (Longest Common Prefix) for divergent sequences ---
         # This handles the agentic pattern: same system+context prefix
@@ -583,12 +570,7 @@ class MemoryAwarePrefixCache:
                     f"trimmed={excess} remaining={len(remaining)}"
                 )
                 self._last_match_type = "lcp"
-                trimmed_cache = (
-                    _dequantize_cache(trimmed_cache)
-                    if self._config.kv_quantize
-                    else trimmed_cache
-                )
-                return trimmed_cache, remaining
+                return self._maybe_dequantize(trimmed_cache), remaining
 
         self._stats.misses += 1
         self._last_match_type = "miss"

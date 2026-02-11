@@ -567,6 +567,28 @@ def bench_kv_cache_command(args):
     )
 
 
+def _add_kv_cache_quantization_args(parser):
+    """Add KV cache quantization arguments to a parser."""
+    parser.add_argument(
+        "--kv-cache-quantization",
+        action="store_true",
+        help="Quantize stored KV caches to reduce memory (8-bit by default)",
+    )
+    parser.add_argument(
+        "--kv-cache-quantization-bits",
+        type=int,
+        default=8,
+        choices=[4, 8],
+        help="Bit width for KV cache quantization (default: 8)",
+    )
+    parser.add_argument(
+        "--kv-cache-quantization-group-size",
+        type=int,
+        default=64,
+        help="Group size for KV cache quantization (default: 64)",
+    )
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="vllm-mlx: Apple Silicon MLX backend for vLLM",
@@ -631,24 +653,7 @@ Examples:
         help="Disable memory-aware cache, use legacy entry-count based cache",
     )
     # KV cache quantization options
-    serve_parser.add_argument(
-        "--kv-cache-quantization",
-        action="store_true",
-        help="Quantize stored KV caches to reduce memory (8-bit by default)",
-    )
-    serve_parser.add_argument(
-        "--kv-cache-quantization-bits",
-        type=int,
-        default=8,
-        choices=[4, 8],
-        help="Bit width for KV cache quantization (default: 8)",
-    )
-    serve_parser.add_argument(
-        "--kv-cache-quantization-group-size",
-        type=int,
-        default=64,
-        help="Group size for KV cache quantization (default: 64)",
-    )
+    _add_kv_cache_quantization_args(serve_parser)
     serve_parser.add_argument(
         "--stream-interval",
         type=int,
@@ -839,24 +844,7 @@ Examples:
         help="Disable memory-aware cache, use legacy entry-count based cache",
     )
     # KV cache quantization options
-    bench_parser.add_argument(
-        "--kv-cache-quantization",
-        action="store_true",
-        help="Quantize stored KV caches to reduce memory (8-bit by default)",
-    )
-    bench_parser.add_argument(
-        "--kv-cache-quantization-bits",
-        type=int,
-        default=8,
-        choices=[4, 8],
-        help="Bit width for KV cache quantization (default: 8)",
-    )
-    bench_parser.add_argument(
-        "--kv-cache-quantization-group-size",
-        type=int,
-        default=64,
-        help="Group size for KV cache quantization (default: 64)",
-    )
+    _add_kv_cache_quantization_args(bench_parser)
     # Paged cache options (experimental)
     bench_parser.add_argument(
         "--use-paged-cache",
