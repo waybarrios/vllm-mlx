@@ -75,6 +75,7 @@ class SchedulerConfig:
     kv_cache_quantization: bool = False
     kv_cache_quantization_bits: int = 8
     kv_cache_quantization_group_size: int = 64
+    kv_cache_min_quantize_tokens: int = 256
 
     # Paged cache settings (experimental - for memory efficiency)
     use_paged_cache: bool = (
@@ -562,6 +563,7 @@ class Scheduler:
                     kv_quantize=self.config.kv_cache_quantization,
                     kv_bits=self.config.kv_cache_quantization_bits,
                     kv_group_size=self.config.kv_cache_quantization_group_size,
+                    kv_min_quantize_tokens=self.config.kv_cache_min_quantize_tokens,
                 )
                 self.memory_aware_cache = MemoryAwarePrefixCache(
                     model=model,

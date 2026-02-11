@@ -9,6 +9,7 @@ from vllm_mlx.memory_cache import (
     MemoryCacheConfig,
     _dequantize_cache,
     _quantize_cache,
+    _trim_to_offset,
     estimate_kv_cache_memory,
 )
 
@@ -180,7 +181,10 @@ class TestPrefixCacheIntegration:
 
     def test_store_fetch_with_quantization(self):
         model = self._make_cache_and_model()
-        config = MemoryCacheConfig(kv_quantize=True, kv_bits=8, max_memory_mb=500)
+        config = MemoryCacheConfig(
+            kv_quantize=True, kv_bits=8, kv_min_quantize_tokens=0,
+            max_memory_mb=500,
+        )
         pc = MemoryAwarePrefixCache(model, config)
 
         cache = _make_kv_cache(n_layers=2, seq_len=50)
@@ -215,3 +219,117 @@ class TestPrefixCacheIntegration:
         pc_q8.store(tokens, cache)
 
         assert pc_q8._current_memory < pc_fp16._current_memory
+
+
+class TestTrimToOffset:
+    """Test the _trim_to_offset helper function."""
+
+    def test_trim_oversized_arrays(self):
+        """KV arrays larger than offset should be trimmed."""
+        cache = []
+        for _ in range(2):
+            kv = KVCache()
+            kv.keys = mx.random.normal((1, 8, 4096, 64))
+            kv.values = mx.random.normal((1, 8, 4096, 64))
+            kv.offset = 512
+            cache.append(kv)
+        mx.eval(*[kv.keys for kv in cache], *[kv.values for kv in cache])
+
+        trimmed = _trim_to_offset(cache)
+        for layer in trimmed:
+            assert layer.keys.shape[2] == 512
+            assert layer.values.shape[2] == 512
+            assert layer.offset == 512
+
+    def test_no_trim_when_exact(self):
+        """No trimming needed when arrays match offset."""
+        cache = _make_kv_cache(n_layers=2, seq_len=100)
+        trimmed = _trim_to_offset(cache)
+        for orig, tr in zip(cache, trimmed):
+            assert tr.keys.shape == orig.keys.shape
+            assert tr.values.shape == orig.values.shape
+
+    def test_non_kvcache_layers_preserved(self):
+        """Non-KVCache layers pass through unchanged."""
+        fake_layer = {"state": mx.zeros((1, 16, 64)), "type": "mamba"}
+        result = _trim_to_offset([fake_layer])
+        assert result[0] is fake_layer
+
+    def test_none_keys_passthrough(self):
+        """KVCache with None keys should pass through."""
+        kv = KVCache()
+        result = _trim_to_offset([kv])
+        assert result[0] is kv
+
+
+class TestMinQuantizeTokensThreshold:
+    """Test that short sequences skip quantization."""
+
+    def _make_model(self):
+        class FakeModel:
+            pass
+        return FakeModel()
+
+    def test_store_skips_quantization_below_threshold(self):
+        """Sequences shorter than min_quantize_tokens should not be quantized."""
+        model = self._make_model()
+        config = MemoryCacheConfig(
+            kv_quantize=True, kv_bits=8, kv_min_quantize_tokens=256,
+            max_memory_mb=500,
+        )
+        pc = MemoryAwarePrefixCache(model, config)
+
+        cache = _make_kv_cache(n_layers=2, seq_len=50)
+        tokens = list(range(50))
+        pc.store(tokens, cache)
+
+        stored_entry = list(pc._entries.values())[0]
+        for layer in stored_entry.cache:
+            assert isinstance(layer, KVCache), (
+                "Short sequences should remain as KVCache (not quantized)"
+            )
+
+    def test_store_quantizes_above_threshold(self):
+        """Sequences >= min_quantize_tokens should be quantized."""
+        model = self._make_model()
+        config = MemoryCacheConfig(
+            kv_quantize=True, kv_bits=8, kv_min_quantize_tokens=256,
+            max_memory_mb=500,
+        )
+        pc = MemoryAwarePrefixCache(model, config)
+
+        cache = _make_kv_cache(n_layers=2, seq_len=300)
+        tokens = list(range(300))
+        pc.store(tokens, cache)
+
+        stored_entry = list(pc._entries.values())[0]
+        for layer in stored_entry.cache:
+            assert isinstance(layer, QuantizedKVCache), (
+                "Long sequences should be quantized"
+            )
+
+    def test_trim_applied_without_quantization(self):
+        """Oversized arrays should be trimmed even without quantization."""
+        model = self._make_model()
+        config = MemoryCacheConfig(kv_quantize=False, max_memory_mb=500)
+        pc = MemoryAwarePrefixCache(model, config)
+
+        # Create oversized cache: arrays have 4096 but offset is 100
+        cache = []
+        for _ in range(2):
+            kv = KVCache()
+            kv.keys = mx.random.normal((1, 8, 4096, 64))
+            kv.values = mx.random.normal((1, 8, 4096, 64))
+            kv.offset = 100
+            cache.append(kv)
+        mx.eval(*[kv.keys for kv in cache], *[kv.values for kv in cache])
+
+        tokens = list(range(100))
+        pc.store(tokens, cache)
+
+        stored_entry = list(pc._entries.values())[0]
+        for layer in stored_entry.cache:
+            assert layer.keys.shape[2] == 100, (
+                f"Expected trimmed to 100, got {layer.keys.shape[2]}"
+            )
+            assert layer.values.shape[2] == 100

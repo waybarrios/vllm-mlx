@@ -163,6 +163,7 @@ class MemoryCacheConfig:
     kv_quantize: bool = False
     kv_bits: int = 8
     kv_group_size: int = 64
+    kv_min_quantize_tokens: int = 256
 
     def __post_init__(self) -> None:
         if not 0.0 < self.max_memory_percent <= 1.0:
@@ -287,6 +288,31 @@ def _trim_cache_offset(cache: list[Any], trim_by: int) -> list[Any]:
             trimmed.append(tc)
         else:
             trimmed.append(layer_cache)
+    return trimmed
+
+
+def _trim_to_offset(cache: list[Any]) -> list[Any]:
+    """Trim KV arrays to their actual used size (offset) before storage.
+
+    KV arrays are often pre-allocated larger than needed. This trims them
+    to save memory and avoid quantizing unused padding.
+    """
+    from mlx_lm.models.cache import KVCache
+
+    trimmed = []
+    for layer in cache:
+        if isinstance(layer, KVCache) and layer.keys is not None:
+            offset = layer.offset
+            if offset < layer.keys.shape[2]:
+                tc = KVCache.__new__(KVCache)
+                tc.keys = layer.keys[:, :, :offset, :]
+                tc.values = layer.values[:, :, :offset, :]
+                tc.offset = offset
+                trimmed.append(tc)
+            else:
+                trimmed.append(layer)
+        else:
+            trimmed.append(layer)
     return trimmed
 
 
@@ -620,8 +646,11 @@ class MemoryAwarePrefixCache:
         if not tokens or not cache:
             return False
 
-        # Quantize cache layers if configured
-        if self._config.kv_quantize:
+        # Trim oversized KV arrays to actual used size
+        cache = _trim_to_offset(cache)
+
+        # Quantize if enabled and sequence is long enough
+        if self._config.kv_quantize and len(tokens) >= self._config.kv_min_quantize_tokens:
             cache = _quantize_cache(
                 cache, self._config.kv_bits, self._config.kv_group_size
             )
