@@ -232,23 +232,23 @@ class TestURLValidation:
         assert "dangerous pattern" in str(exc_info.value)
 
 
-class TestUnsafeMode:
-    """Tests for unsafe mode (development only)."""
+class TestUnsafeModeRemoved:
+    """Tests that unsafe mode has been removed (security hardening)."""
 
-    def test_unsafe_mode_allows_any_command(self):
-        """Test that unsafe mode allows any command (with warning)."""
-        validator = MCPCommandValidator(allow_unsafe=True)
+    def test_allow_unsafe_parameter_rejected(self):
+        """Test that allow_unsafe parameter is no longer accepted."""
+        with pytest.raises(TypeError):
+            MCPCommandValidator(allow_unsafe=True)
 
-        # These should not raise even though they're dangerous
-        validator.validate_command("bash", "test")
-        validator.validate_command("/bin/sh -c 'dangerous'", "test")
+    def test_dangerous_commands_always_blocked(self):
+        """Test that dangerous commands are always blocked (no bypass)."""
+        validator = MCPCommandValidator(check_path_exists=False)
 
-    def test_unsafe_mode_allows_any_args(self):
-        """Test that unsafe mode allows any arguments."""
-        validator = MCPCommandValidator(allow_unsafe=True)
+        with pytest.raises(MCPSecurityError):
+            validator.validate_command("bash", "test")
 
-        # These should not raise
-        validator.validate_args(["; rm -rf /"], "test")
+        with pytest.raises(MCPSecurityError):
+            validator.validate_args(["; rm -rf /"], "test")
 
 
 class TestCustomWhitelist:
@@ -328,17 +328,16 @@ class TestMCPServerConfigSecurity:
         )
         assert config.url == "https://api.example.com/mcp"
 
-    def test_skip_security_validation(self):
-        """Test that skip_security_validation allows any command (with warning)."""
-        # This should not raise even with dangerous command
-        config = MCPServerConfig(
-            name="unsafe-server",
-            transport=MCPTransport.STDIO,
-            command="bash",
-            args=["-c", "echo hello"],
-            skip_security_validation=True,
-        )
-        assert config.command == "bash"
+    def test_skip_security_validation_removed(self):
+        """Test that skip_security_validation field has been removed."""
+        with pytest.raises(TypeError):
+            MCPServerConfig(
+                name="unsafe-server",
+                transport=MCPTransport.STDIO,
+                command="bash",
+                args=["-c", "echo hello"],
+                skip_security_validation=True,
+            )
 
 
 class TestDefaultWhitelist:
@@ -697,38 +696,34 @@ class TestToolSandboxAuditLogging:
 
 
 class TestToolSandboxHighRiskTools:
-    """Tests for high-risk tool detection."""
+    """Tests for high-risk tool blocking."""
 
-    def test_high_risk_tool_warning(self, caplog):
-        """Test that high-risk tools trigger warning."""
-        import logging
-
+    def test_high_risk_tool_blocked(self):
+        """Test that high-risk tools are blocked with MCPSecurityError."""
         sandbox = ToolSandbox()
 
-        with caplog.at_level(logging.WARNING):
+        with pytest.raises(MCPSecurityError) as exc_info:
             sandbox.validate_tool_execution(
                 tool_name="execute_command",
                 server_name="test",
                 arguments={"cmd": "ls"},
             )
 
-        assert "High-risk tool detected" in caplog.text
-        assert "execute" in caplog.text
+        assert "High-risk tool blocked" in str(exc_info.value)
+        assert "execute" in str(exc_info.value)
 
-    def test_high_risk_shell_tool(self, caplog):
-        """Test that shell tools trigger warning."""
-        import logging
-
+    def test_high_risk_shell_tool_blocked(self):
+        """Test that shell tools are blocked with MCPSecurityError."""
         sandbox = ToolSandbox()
 
-        with caplog.at_level(logging.WARNING):
+        with pytest.raises(MCPSecurityError) as exc_info:
             sandbox.validate_tool_execution(
                 tool_name="run_shell",
                 server_name="test",
                 arguments={},
             )
 
-        assert "High-risk tool detected" in caplog.text
+        assert "High-risk tool blocked" in str(exc_info.value)
 
 
 class TestCustomBlockedPatterns:
