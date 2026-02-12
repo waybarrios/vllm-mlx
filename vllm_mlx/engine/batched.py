@@ -325,69 +325,78 @@ class BatchedEngine(BaseEngine):
         tools: list[dict] | None = None,
         num_images: int = 0,
     ) -> str:
-        """Apply chat template to messages."""
-        tokenizer = self.tokenizer
+        """Apply chat template to messages.
 
-        if self._is_mllm and self._processor:
-            # Use mlx_vlm's chat template for MLLM
-            try:
-                from mlx_vlm.prompt_utils import apply_chat_template
-                from mlx_vlm.utils import load_config
+        Uses the processor's (or tokenizer's) apply_chat_template with the
+        full message list so that system prompts and conversation history
+        are preserved. The previous implementation extracted only the last
+        user message text via mlx_vlm.prompt_utils.apply_chat_template,
+        which dropped system prompts and all prior turns.
+        """
+        # Choose the best template applicator.
+        # For MLLM models, the processor handles special vision tokens.
+        # For text-only models, the tokenizer is sufficient.
+        template_applicator = None
+        if self._is_mllm and self._processor and hasattr(
+            self._processor, "apply_chat_template"
+        ):
+            template_applicator = self._processor
+        elif hasattr(self.tokenizer, "apply_chat_template"):
+            template_applicator = self.tokenizer
 
-                config = getattr(self._model, "config", None)
-                if config is None:
-                    config = load_config(self._model_name)
+        if template_applicator is not None:
+            # Convert OpenAI image_url content parts to HuggingFace format
+            # so the processor can insert the correct vision placeholder tokens.
+            if self._is_mllm and num_images > 0:
+                messages = self._prepare_mllm_messages(messages)
 
-                # Extract text from last user message
-                text_prompt = ""
-                for msg in reversed(messages):
-                    if msg.get("role") == "user":
-                        content = msg.get("content", "")
-                        if isinstance(content, str):
-                            text_prompt = content
-                        elif isinstance(content, list):
-                            for item in content:
-                                if isinstance(item, str):
-                                    text_prompt = item
-                                    break
-                                elif (
-                                    isinstance(item, dict)
-                                    and item.get("type") == "text"
-                                ):
-                                    text_prompt = item.get("text", "")
-                                    break
-                        break
-
-                return apply_chat_template(
-                    self._processor,
-                    config,
-                    text_prompt,
-                    num_images=num_images,
-                )
-            except Exception as e:
-                logger.warning(f"Failed to apply MLLM chat template: {e}")
-                # Fall through to standard template
-
-        if hasattr(tokenizer, "apply_chat_template"):
-            enable_thinking = "coder" not in self._model_name.lower()
             template_kwargs = {
                 "tokenize": False,
                 "add_generation_prompt": True,
-                "enable_thinking": enable_thinking,
             }
             if tools:
                 template_kwargs["tools"] = tools
 
             try:
-                return tokenizer.apply_chat_template(messages, **template_kwargs)
+                return template_applicator.apply_chat_template(
+                    messages, **template_kwargs
+                )
             except TypeError:
-                for key in ["tools", "enable_thinking"]:
+                # Some templates don't accept 'tools'
+                for key in ["tools"]:
                     if key in template_kwargs:
                         del template_kwargs[key]
-                return tokenizer.apply_chat_template(messages, **template_kwargs)
+                return template_applicator.apply_chat_template(
+                    messages, **template_kwargs
+                )
         else:
+            # Fallback for models without apply_chat_template
             prompt = "\n".join(f"{m['role']}: {m['content']}" for m in messages)
             return prompt + "\nassistant:"
+
+    @staticmethod
+    def _prepare_mllm_messages(
+        messages: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Convert OpenAI-style image_url content to HuggingFace format.
+
+        The OpenAI API uses ``{"type": "image_url", "image_url": {"url": ...}}``
+        while HuggingFace processors expect ``{"type": "image"}``.
+        """
+        prepared = []
+        for msg in messages:
+            content = msg.get("content")
+            if isinstance(content, list):
+                new_content = []
+                for part in content:
+                    if isinstance(part, dict) and part.get("type") == "image_url":
+                        new_content.append({"type": "image"})
+                    else:
+                        new_content.append(part)
+                prepared.append({**msg, "content": new_content})
+            else:
+                prepared.append(msg)
+        return prepared
 
     async def generate(
         self,
@@ -419,8 +428,10 @@ class BatchedEngine(BaseEngine):
         if not self._loaded:
             await self.start()
 
-        if self._is_mllm and self._mllm_scheduler and (images or videos):
-            # Use MLLM scheduler for multimodal
+        if self._is_mllm and self._mllm_scheduler:
+            # Use MLLM scheduler for all requests when model is multimodal.
+            # MLLM models only initialise the _mllm_scheduler (not _engine),
+            # so text-only requests must also be routed here.
             output = await self._mllm_scheduler.generate(
                 prompt=prompt,
                 images=images,
@@ -437,7 +448,7 @@ class BatchedEngine(BaseEngine):
                 finish_reason=output.finish_reason,
             )
 
-        # Use LLM engine for text-only
+        # Use LLM engine for text-only (non-MLLM models)
         from ..request import SamplingParams
 
         sampling_params = SamplingParams(
@@ -491,8 +502,8 @@ class BatchedEngine(BaseEngine):
         if not self._loaded:
             await self.start()
 
-        if self._is_mllm and self._mllm_scheduler and (images or videos):
-            # Use MLLM scheduler for multimodal streaming
+        if self._is_mllm and self._mllm_scheduler:
+            # Use MLLM scheduler for all streaming when model is multimodal
             request_id = await self._mllm_scheduler.add_request_async(
                 prompt=prompt,
                 images=images,
