@@ -43,9 +43,12 @@ python tests/test_prefix_cache.py --model mlx-community/Qwen3-8B-6bit
 
 ## Hardware
 
-All benchmarks run on:
-- **Chip**: Apple M4 Max
-- **Memory**: 128 GB unified memory
+Benchmarks have been collected on the following Apple Silicon configurations:
+
+| Chip | Memory | Python |
+|------|--------|--------|
+| Apple M4 Max | 128 GB unified | 3.13 |
+| Apple M1 Max | 64 GB unified | 3.12 |
 
 Results will vary on different Apple Silicon chips.
 

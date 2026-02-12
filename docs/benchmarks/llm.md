@@ -19,6 +19,12 @@ vllm-mlx-bench --model mlx-community/Llama-3.2-1B-Instruct-4bit --prompts 5 --ma
 
 *TTFT = Time to First Token (latency until the model starts generating)
 
+## Results (M1 Max, 64GB)
+
+| Model | Runs | Prompt Tok | Gen Tok | Total Time (s) | TTFT Mean (ms) | TPOT Mean (ms) | Gen Speed (tok/s) | Total Throughput (tok/s) |
+|-------|------|------------|---------|-----------------|-----------------|-----------------|-------------------|--------------------------|
+| Qwen3-0.6B-8bit | 5 | 56 | 1280 | 5.66 | 119.0 | 3.97 | 251.9 | 236.1 |
+
 ## Continuous Batching Results
 
 | Model | Single Request | Batch (5 req) | Speedup |
@@ -31,6 +37,12 @@ vllm-mlx-bench --model mlx-community/Llama-3.2-1B-Instruct-4bit --prompts 5 --ma
 
 *Batching 5 concurrent requests shows 1.5-3x throughput improvement.*
 
+### Continuous Batching (M1 Max, 64GB)
+
+| Requests | Total Tokens | Total Time (s) | Throughput (tok/s) | Requests/sec |
+|----------|--------------|-----------------|--------------------|--------------|
+| 5 | 315 | 0.64 | 492.5 | 7.82 |
+
 ## Streaming Performance
 
 | Model | TTFT | Generation Speed |
@@ -41,7 +53,30 @@ vllm-mlx-bench --model mlx-community/Llama-3.2-1B-Instruct-4bit --prompts 5 --ma
 | Qwen3-30B-A3B-4bit | ~10.2ms | 98.4 tok/s |
 | Qwen2.5-1.5B-Instruct-4bit | ~7.1ms | 140.3 tok/s |
 
+### Streaming Detokenizer (M1 Max, 64GB)
+
+`vllm-mlx bench-detok`:
+
+| Tokens | Iterations | Naive Time | Streaming Time | Speedup |
+|--------|------------|------------|----------------|---------|
+| 742 | 5 | 1.69ms | 0.71ms | 2.39x |
+
+`examples/benchmark_detokenizer.py`:
+
+| Sequence | Tokens | decode() | Streaming | Speedup |
+|----------|--------|----------|-----------|---------|
+| Short | 8 | 0.029ms | 0.028ms | 1.04x |
+| Medium | 103 | 0.206ms | 0.129ms | 1.59x |
+| Long | 511 | 1.040ms | 0.502ms | 2.07x |
+| 1K | 1191 | 2.446ms | 1.178ms | 2.08x |
+| 2K | 2381 | 4.949ms | 2.356ms | 2.10x |
+| 4K | 4761 | 9.887ms | 5.398ms | 1.83x |
+
+Average speedup: 1.79x
+
 ## Prefix Cache Results
+
+### Prefix Cache (M4 Max, 128GB)
 
 ```
 ======================================================================
@@ -61,6 +96,20 @@ vllm-mlx-bench --model mlx-community/Llama-3.2-1B-Instruct-4bit --prompts 5 --ma
   1d     | Return to prompt 1  | HIT      | HIT    | ✓
 ======================================================================
 ```
+
+### Prefix Cache (M1 Max, 64GB)
+
+| Test | Expected | Actual | Time | Status |
+|------|----------|--------|------|--------|
+| First request | MISS | MISS | 203.5ms | PASS |
+| Same prompt | HIT | HIT | 131.6ms | PASS |
+| Different prompt | MISS or PREFIX_HIT | PREFIX_HIT (5 tok) | 135.3ms | PASS |
+
+Final cache stats:
+
+| Cache Hits | Cache Misses | Hit Rate | Tokens Saved | Cached Speedup |
+|------------|--------------|----------|--------------|----------------|
+| 2 | 1 | 66.7% | 20 | 1.55x |
 
 ## Paged Cache Results
 
@@ -102,6 +151,38 @@ SUMMARY
   Tokens saved: 2,560 (~256 tokens × 10 requests)
 ==================================================
 ```
+
+### Paged KV Cache (M1 Max, 64GB)
+
+Inference benchmark (20 requests):
+
+| Mode | Time (s) | Throughput (tok/s) |
+|------|----------|--------------------|
+| Without paged cache | 3.43 | 291.8 |
+| With paged cache | 3.42 | 292.2 |
+
+| Speedup | Blocks Allocated | Shared Blocks | Cache Hits | Tokens Saved |
+|---------|------------------|---------------|------------|--------------|
+| 1.00x | 45 | 4 | 10 | 2560 |
+
+Real concurrent inference (20 requests):
+
+| Mode | Time (s) | Throughput (tok/s) |
+|------|----------|--------------------|
+| Without paged cache | 4.32 | 231.7 |
+| With paged cache | 4.35 | 229.7 |
+
+| Speedup | Blocks Allocated | Shared Blocks | Cache Hits | Tokens Saved |
+|---------|------------------|---------------|------------|--------------|
+| 0.99x | 49 | 8 | 10 | 5120 |
+
+Memory savings demo:
+
+| Scenario | Memory Savings |
+|----------|----------------|
+| Shared system prompts | 70.8% |
+| Concurrent memory efficiency | 83.5% |
+| Prefix sharing branches | 38.5% |
 
 ## Streaming Detokenizer Analysis
 

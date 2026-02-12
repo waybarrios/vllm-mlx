@@ -27,6 +27,34 @@ vllm-mlx-bench --model mlx-community/Qwen3-VL-8B-Instruct-4bit --quick
 
 **Summary:** Average 45.2 tok/s across all resolutions. Fastest at 224x224 (74.8 tok/s), slowest at 1920x1080 (14.1 tok/s)
 
+## Results - Qwen3-VL-8B-Instruct-4bit (M1 Max, 64GB)
+
+Local MLLM benchmark:
+
+| Resolution | Pixels | Time | Tokens | Speed |
+|------------|--------|------|--------|-------|
+| 224x224 | 50K | 1.84s | 78 | 42.5 tok/s |
+| 448x448 | 201K | 2.28s | 70 | 30.7 tok/s |
+| 768x768 | 590K | 4.39s | 91 | 20.7 tok/s |
+| 1024x1024 | 1.0M | 6.41s | 76 | 11.9 tok/s |
+
+| Configs | Total Time (s) | Total Tokens | Aggregate Tok/s |
+|---------|-----------------|--------------|-----------------|
+| 4 | 14.92 | 315 | 21.1 |
+
+## Results - Qwen3-VL-4B-Instruct-3bit Server (M1 Max, 64GB)
+
+| Resolution | Pixels | Time | Tokens | Speed |
+|------------|--------|------|--------|-------|
+| 224x224 | 50K | 1.65s | 113 | 68.4 tok/s |
+| 448x448 | 201K | 2.09s | 120 | 57.5 tok/s |
+| 768x768 | 590K | 2.93s | 106 | 36.2 tok/s |
+| 1024x1024 | 1.0M | 4.12s | 100 | 24.3 tok/s |
+
+| Configs | Total Time (s) | Total Tokens | Aggregate Tok/s |
+|---------|-----------------|--------------|-----------------|
+| 4 | 10.79 | 439 | 40.7 |
+
 ## MLLM Prefix Cache Results
 
 ```
