@@ -26,6 +26,27 @@ python examples/benchmark_audio.py --stt --audio path/to/audio.wav
 
 *RTF = Real-Time Factor (higher is faster). RTF of 100x means 1 minute of audio transcribes in ~0.6 seconds.*
 
+### Results (M1 Max, 64GB)
+
+STT with Parakeet (default environment, Whisper unavailable due to numpy dependency mismatch):
+
+| Model | Load Time | Transcribe Time | RTF |
+|-------|-----------|-----------------|-----|
+| parakeet-tdt-0.6b-v2 | 0.28s | 1.01s | **9.9x** |
+| parakeet-tdt-0.6b-v3 | 0.30s | 0.19s | **52.7x** |
+
+STT with Whisper (explicit `numpy==2.3.5` + `uv run --no-sync`):
+
+| Model | Load Time | Transcribe Time | RTF |
+|-------|-----------|-----------------|-----|
+| whisper-tiny | 4.02s | 1.05s | **9.5x** |
+| whisper-small | 10.15s | 1.03s | **9.7x** |
+| whisper-medium | 22.96s | 2.20s | **4.6x** |
+| whisper-large-v3 | 38.34s | 0.96s | **10.5x** |
+| whisper-large-v3-turbo | 21.79s | 0.70s | **14.3x** |
+| parakeet-tdt-0.6b-v2 | 0.47s | 0.18s | **54.4x** |
+| parakeet-tdt-0.6b-v3 | 1.13s | 0.18s | **54.6x** |
+
 ### Model Recommendations
 
 | Use Case | Recommended Model | Why |
@@ -78,6 +99,13 @@ python examples/benchmark_audio.py --tts
 
 *RTF = Real-Time Factor. RTF of 22x means 1 second of audio generates in ~0.045 seconds.*
 
+### TTS Results (M1 Max, 64GB)
+
+| Model | Load Time | Avg Chars/s | Avg RTF |
+|-------|-----------|-------------|---------|
+| Kokoro-82M-bf16 | 2.81s | 176.0 | **11.9x** |
+| Kokoro-82M-4bit | 0.22s | 225.6 | **15.5x** |
+
 ### TTS Quality
 
 Kokoro produces natural-sounding speech with:
@@ -117,6 +145,8 @@ python examples/benchmark_audio.py --tts
 - `mlx-community/whisper-medium-mlx`
 - `mlx-community/whisper-large-v3-mlx`
 - `mlx-community/whisper-large-v3-turbo`
+- `mlx-community/parakeet-tdt-0.6b-v2`
+- `mlx-community/parakeet-tdt-0.6b-v3`
 
 ### TTS Models
 - `mlx-community/Kokoro-82M-bf16` (recommended)

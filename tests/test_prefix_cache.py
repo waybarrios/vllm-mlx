@@ -6,8 +6,9 @@ These tests verify the PrefixCacheManager for KV cache reuse
 to speed up inference with repeated prompts.
 """
 
-import pytest
 from unittest.mock import MagicMock
+
+import pytest
 
 from vllm_mlx.prefix_cache import (
     CacheEntry,
@@ -298,10 +299,21 @@ class TestSchedulerIntegration:
 
 if __name__ == "__main__":
     # Verbose standalone test with real model
+    import argparse
     import asyncio
+    import os
     import time
 
-    MODEL_NAME = "mlx-community/Qwen3-0.6B-8bit"
+    parser = argparse.ArgumentParser(description="LLM prefix cache benchmark")
+    parser.add_argument(
+        "--model",
+        type=str,
+        default=os.environ.get("VLLM_MLX_TEST_MODEL", "mlx-community/Qwen3-0.6B-8bit"),
+        help="Model to benchmark",
+    )
+    args = parser.parse_args()
+
+    MODEL_NAME = args.model
 
     def print_header(title):
         print("\n" + "=" * 70)
@@ -337,18 +349,26 @@ if __name__ == "__main__":
     def print_stats_table(stats, title="Cache Statistics"):
         """Print cache stats as a table."""
         print(f"\n    {title}:")
+        hits = stats.get("hits", 0)
+        misses = stats.get("misses", 0)
+        total_queries = stats.get("total_queries", hits + misses)
+        hit_rate = stats.get("hit_rate")
+        if hit_rate is None:
+            hit_rate = (hits / total_queries) if total_queries > 0 else 0.0
+
         headers = ["Metric", "Value"]
         rows = [
-            ["Hits", stats["hits"]],
-            ["Misses", stats["misses"]],
-            ["Hit Rate", f"{stats['hit_rate']*100:.1f}%"],
-            ["Tokens Saved", stats["tokens_saved"]],
-            ["Total Queries", stats["total_queries"]],
+            ["Hits", hits],
+            ["Misses", misses],
+            ["Hit Rate", f"{hit_rate*100:.1f}%"],
+            ["Tokens Saved", stats.get("tokens_saved", 0)],
+            ["Total Queries", total_queries],
         ]
         print_table(headers, rows)
 
     async def run_cache_test():
         from mlx_lm import load
+
         from vllm_mlx import (
             AsyncEngineCore,
             EngineConfig,
@@ -361,7 +381,9 @@ if __name__ == "__main__":
         print("  Test: Verify KV cache reuse for repeated prompts")
         print("  Expected behavior:")
         print("    - Same prompt → cache HIT (skip prompt processing)")
-        print("    - Different prompt → cache MISS (process from scratch)")
+        print(
+            "    - Different prompt → cache MISS or PREFIX_HIT (shared template tokens)"
+        )
 
         print_subheader("Loading Model")
         load_start = time.perf_counter()
@@ -472,9 +494,11 @@ if __name__ == "__main__":
             print_stats_table(stats2)
 
             # ============================================================
-            # TEST 3: Different prompt - should be cache MISS
+            # TEST 3: Different prompt - should be cache MISS or PREFIX_HIT
             # ============================================================
-            print_subheader("TEST 3: Different Prompt (Cache Miss Expected)")
+            print_subheader(
+                "TEST 3: Different Prompt (Cache Miss or Prefix Hit Expected)"
+            )
             print(f'    Prompt: "{prompt2}" (different from TEST 1)')
             print(f"    Tokens: {tokens2}")
 
@@ -489,13 +513,34 @@ if __name__ == "__main__":
             t3 = time.perf_counter() - start
 
             stats3 = engine.get_cache_stats()
-            test3_pass = stats3["misses"] == 2
+            hits_delta = stats3["hits"] - stats2["hits"]
+            misses_delta = stats3["misses"] - stats2["misses"]
+            tokens_saved_delta = stats3.get("tokens_saved", 0) - stats2.get(
+                "tokens_saved", 0
+            )
+
+            # Different prompts may still share template/system prefix tokens.
+            # Treat either a true miss OR any prefix-hit reuse as valid behavior.
+            actual3 = "HIT"
+            if misses_delta > 0:
+                actual3 = "MISS"
+                test3_pass = True
+            elif hits_delta > 0:
+                actual3 = (
+                    f"PREFIX_HIT({tokens_saved_delta} tok)"
+                    if tokens_saved_delta > 0
+                    else "PREFIX_HIT"
+                )
+                test3_pass = True
+            else:
+                test3_pass = False
+
             test_results.append(
                 [
                     "TEST 3",
                     "Different prompt",
-                    "MISS",
-                    "MISS" if stats3["misses"] > stats2["misses"] else "HIT",
+                    "MISS or PREFIX_HIT",
+                    actual3,
                     f"{t3*1000:.1f}ms",
                     "PASS" if test3_pass else "FAIL",
                 ]

@@ -32,6 +32,30 @@ vllm-mlx-bench --model mlx-community/Qwen3-VL-8B-Instruct-4bit --video --video-u
 
 > **Note:** 96+ frames causes GPU timeout on most hardware due to memory/compute limits
 
+## Results - Qwen3-VL-8B-Instruct-4bit (M1 Max, 64GB)
+
+| Configuration | Frames | FPS | Time | Tokens | Speed |
+|---------------|--------|-----|------|--------|-------|
+| 4 frames @ 1fps | 4 | 1.0 | 8.84s | 256 | 29.0 tok/s |
+| 8 frames @ 2fps | 8 | 2.0 | 13.05s | 256 | 19.6 tok/s |
+| 16 frames @ 2fps | 16 | 2.0 | 21.60s | 256 | 11.9 tok/s |
+
+| Configs | Total Time (s) | Total Tokens | Aggregate Tok/s |
+|---------|-----------------|--------------|-----------------|
+| 3 | 43.48 | 768 | 17.7 |
+
+## Results - Qwen3-VL-4B-Instruct-3bit (M1 Max, 64GB)
+
+| Configuration | Frames | FPS | Time | Tokens | Speed |
+|---------------|--------|-----|------|--------|-------|
+| 4 frames @ 1fps | 4 | 1.0 | 5.09s | 150 | 29.5 tok/s |
+| 8 frames @ 2fps | 8 | 2.0 | 8.36s | 150 | 17.9 tok/s |
+| 16 frames @ 2fps | 16 | 2.0 | 15.21s | 150 | 9.9 tok/s |
+
+| Configs | Total Time (s) | Total Tokens | Aggregate Tok/s |
+|---------|-----------------|--------------|-----------------|
+| 3 | 28.66 | 450 | 15.7 |
+
 ## Video Cache Results
 
 ```
