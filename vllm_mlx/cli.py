@@ -105,6 +105,21 @@ def serve_command(args):
         print("  Reasoning: Use --reasoning-parser to enable")
     print("=" * 60)
 
+    # Pre-download model with retry/timeout
+    from .api.utils import is_mllm_model
+    from .utils.download import DownloadConfig, ensure_model_downloaded
+
+    download_config = DownloadConfig(
+        download_timeout=args.download_timeout,
+        max_retries=args.download_retries,
+        offline=getattr(args, "offline", False),
+    )
+    ensure_model_downloaded(
+        args.model,
+        config=download_config,
+        is_mllm=is_mllm_model(args.model),
+    )
+
     print(f"Loading model: {args.model}")
     print(f"Default max tokens: {args.max_tokens}")
 
@@ -192,6 +207,23 @@ def serve_command(args):
     # Start server
     print(f"Starting server at http://{args.host}:{args.port}")
     uvicorn.run(app, host=args.host, port=args.port, log_level="info")
+
+
+def download_command(args):
+    """Download a model to local cache without starting a server."""
+    from .utils.download import DownloadConfig, ensure_model_downloaded
+
+    config = DownloadConfig(
+        download_timeout=args.timeout,
+        max_retries=args.retries,
+    )
+    print(f"Downloading model: {args.model}")
+    path = ensure_model_downloaded(
+        args.model,
+        config=config,
+        is_mllm=args.mllm,
+    )
+    print(f"Model ready at: {path}")
 
 
 def bench_command(args):
@@ -827,6 +859,24 @@ Examples:
         default=None,
         help="Pre-load an embedding model at startup (e.g. mlx-community/embeddinggemma-300m-6bit)",
     )
+    # Download options
+    serve_parser.add_argument(
+        "--download-timeout",
+        type=int,
+        default=300,
+        help="Per-file download timeout in seconds (default: 300)",
+    )
+    serve_parser.add_argument(
+        "--download-retries",
+        type=int,
+        default=3,
+        help="Number of download retry attempts (default: 3)",
+    )
+    serve_parser.add_argument(
+        "--offline",
+        action="store_true",
+        help="Offline mode — only use locally cached models",
+    )
     # Bench command
     bench_parser = subparsers.add_parser("bench", help="Run benchmark")
     bench_parser.add_argument("model", type=str, help="Model to benchmark")
@@ -962,6 +1012,28 @@ Examples:
         help="Quantization group size (default: 64)",
     )
 
+    # Download command
+    download_parser = subparsers.add_parser(
+        "download", help="Download a model to local cache without starting a server"
+    )
+    download_parser.add_argument("model", type=str, help="Model to download")
+    download_parser.add_argument(
+        "--timeout",
+        type=int,
+        default=300,
+        help="Per-file download timeout in seconds (default: 300)",
+    )
+    download_parser.add_argument(
+        "--retries",
+        type=int,
+        default=3,
+        help="Number of retry attempts (default: 3)",
+    )
+    download_parser.add_argument(
+        "--mllm",
+        action="store_true",
+        help="Download as multimodal model (broader file patterns)",
+    )
     args = parser.parse_args()
 
     if args.command == "serve":
@@ -972,6 +1044,8 @@ Examples:
         bench_detok_command(args)
     elif args.command == "bench-kv-cache":
         bench_kv_cache_command(args)
+    elif args.command == "download":
+        download_command(args)
     else:
         parser.print_help()
         sys.exit(1)

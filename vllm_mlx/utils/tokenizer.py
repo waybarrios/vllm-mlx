@@ -9,7 +9,6 @@ directly from tokenizer.json.
 
 import json
 import logging
-from pathlib import Path
 
 from .chat_templates import DEFAULT_CHATML_TEMPLATE, NEMOTRON_CHAT_TEMPLATE
 
@@ -65,16 +64,12 @@ def _load_with_tokenizer_fallback(model_name: str):
     """Load model with fallback tokenizer for non-standard models like Nemotron."""
     from mlx_lm.utils import load_model
 
+    from .download import ensure_model_downloaded
+
     logger.info("Loading with tokenizer fallback...")
 
-    # Get model path - use local path if it exists, otherwise download from Hub
-    local_path = Path(model_name)
-    if local_path.is_dir():
-        model_path = local_path
-    else:
-        from huggingface_hub import snapshot_download
-
-        model_path = Path(snapshot_download(model_name))
+    # Get model path (with retry/timeout support)
+    model_path = ensure_model_downloaded(model_name, is_mllm=False)
 
     # Load model
     model, _ = load_model(model_path)
