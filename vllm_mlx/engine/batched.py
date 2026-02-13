@@ -5,11 +5,10 @@ Batched engine for continuous batching with multiple concurrent users.
 This engine wraps AsyncEngineCore to provide continuous batching
 for better throughput when serving multiple concurrent requests.
 
-For MLLM models, this engine supports a hybrid approach:
-- Text-only requests: Use BatchGenerator for continuous batching
-- Multimodal requests (with images/videos): Fall back to MLLM.chat() for correct processing
-
-This is necessary because BatchGenerator only supports token IDs, not pixel_values.
+For MLLM models, all requests (text-only and multimodal) are routed through
+the MLLMScheduler, which handles vision encoding and batched generation via
+MLLMBatchGenerator. MLLM models only initialise the MLLM scheduler (not the
+LLM engine), so text-only requests must also be routed through it.
 """
 
 import logging
@@ -361,8 +360,9 @@ class BatchedEngine(BaseEngine):
                 return template_applicator.apply_chat_template(
                     messages, **template_kwargs
                 )
-            except TypeError:
-                # Some templates don't accept 'tools'
+            except TypeError as e:
+                # Some templates don't accept 'tools'; retry without them.
+                logger.debug(f"Chat template TypeError, retrying without extras: {e}")
                 for key in ["tools"]:
                     if key in template_kwargs:
                         del template_kwargs[key]
@@ -382,17 +382,28 @@ class BatchedEngine(BaseEngine):
 
         The OpenAI API uses ``{"type": "image_url", "image_url": {"url": ...}}``
         while HuggingFace processors expect ``{"type": "image"}``.
+
+        Args:
+            messages: List of chat messages in OpenAI format. Each message is a
+                dict with at least ``role`` and ``content`` keys.
+
+        Returns:
+            A new list of messages with ``image_url`` parts replaced by
+            ``{"type": "image"}`` entries for the HuggingFace processor.
         """
         prepared = []
         for msg in messages:
+            if not isinstance(msg, dict):
+                continue
             content = msg.get("content")
             if isinstance(content, list):
                 new_content = []
                 for part in content:
                     if isinstance(part, dict) and part.get("type") == "image_url":
                         new_content.append({"type": "image"})
-                    else:
+                    elif isinstance(part, (dict, str)):
                         new_content.append(part)
+                    # skip non-dict/non-str parts to avoid passing unexpected types
                 prepared.append({**msg, "content": new_content})
             else:
                 prepared.append(msg)
@@ -567,9 +578,9 @@ class BatchedEngine(BaseEngine):
         """
         Chat completion (non-streaming).
 
-        For MLLM models with images/videos, uses the native MLLM.chat() method
-        which properly processes multimodal content through the vision encoder.
-        For text-only requests, uses BatchGenerator for continuous batching.
+        For MLLM models, all requests (including text-only) are routed through
+        the MLLMScheduler for vision-aware batched generation.
+        For non-MLLM models, uses the LLM engine with BatchGenerator.
 
         Args:
             messages: List of chat messages (OpenAI format)
@@ -678,9 +689,9 @@ class BatchedEngine(BaseEngine):
         """
         Stream chat completion token by token.
 
-        For MLLM models with images/videos, uses the native MLLM.stream_chat() method
-        which properly processes multimodal content through the vision encoder.
-        For text-only requests, uses BatchGenerator for continuous batching.
+        For MLLM models, all requests (including text-only) are streamed through
+        the MLLMScheduler for vision-aware batched generation.
+        For non-MLLM models, uses the LLM engine with BatchGenerator.
 
         Args:
             messages: List of chat messages (OpenAI format)
