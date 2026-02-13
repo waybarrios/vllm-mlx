@@ -6,15 +6,16 @@ Tests clean_output_text, is_mllm_model, and extract_multimodal_content
 from vllm_mlx/api/utils.py. No MLX dependency.
 """
 
+from vllm_mlx.api.models import ContentPart, ImageUrl, Message
 from vllm_mlx.api.utils import (
+    MLLM_PATTERNS,
+    SPECIAL_TOKENS_PATTERN,
+    _content_to_text,
     clean_output_text,
     extract_multimodal_content,
     is_mllm_model,
     is_vlm_model,
-    MLLM_PATTERNS,
-    SPECIAL_TOKENS_PATTERN,
 )
-from vllm_mlx.api.models import Message, ContentPart, ImageUrl
 
 
 class TestCleanOutputText:
@@ -438,3 +439,85 @@ class TestExtractMultimodalContent:
         processed, images, videos = extract_multimodal_content(messages)
         assert "First part." in processed[0]["content"]
         assert "Second part." in processed[0]["content"]
+
+    def test_assistant_tool_calls_with_list_content(self):
+        """Regression test for issue #61: list content + tool_calls causes TypeError."""
+        messages = [
+            Message(
+                role="assistant",
+                content=[ContentPart(type="text", text="Let me check.")],
+                tool_calls=[
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {
+                            "name": "get_weather",
+                            "arguments": '{"city": "Prague"}',
+                        },
+                    }
+                ],
+            )
+        ]
+        result, images, videos = extract_multimodal_content(messages)
+        assert isinstance(result[0]["content"], str)
+        assert "Let me check." in result[0]["content"]
+        assert "get_weather" in result[0]["content"]
+
+    def test_assistant_tool_calls_with_list_content_native(self):
+        """Regression test for issue #61: list content + tool_calls with native format."""
+        messages = [
+            Message(
+                role="assistant",
+                content=[ContentPart(type="text", text="Checking now.")],
+                tool_calls=[
+                    {
+                        "id": "call_2",
+                        "type": "function",
+                        "function": {
+                            "name": "search",
+                            "arguments": '{"q": "test"}',
+                        },
+                    }
+                ],
+            )
+        ]
+        result, images, videos = extract_multimodal_content(
+            messages, preserve_native_format=True
+        )
+        assert isinstance(result[0]["content"], str)
+        assert "Checking now." in result[0]["content"]
+        assert "tool_calls" in result[0]
+
+
+class TestContentToText:
+    """Tests for the _content_to_text helper."""
+
+    def test_none(self):
+        assert _content_to_text(None) == ""
+
+    def test_string(self):
+        assert _content_to_text("hello") == "hello"
+
+    def test_empty_string(self):
+        assert _content_to_text("") == ""
+
+    def test_list_of_content_parts(self):
+        parts = [
+            ContentPart(type="text", text="Hello"),
+            ContentPart(type="text", text="World"),
+        ]
+        assert _content_to_text(parts) == "Hello\nWorld"
+
+    def test_list_of_dicts(self):
+        parts = [
+            {"type": "text", "text": "foo"},
+            {"type": "image_url", "image_url": "http://img"},
+        ]
+        assert _content_to_text(parts) == "foo"
+
+    def test_list_with_no_text_parts(self):
+        parts = [{"type": "image_url", "image_url": "http://img"}]
+        assert _content_to_text(parts) == ""
+
+    def test_empty_list(self):
+        assert _content_to_text([]) == ""

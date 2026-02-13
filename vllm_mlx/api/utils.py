@@ -107,6 +107,25 @@ is_vlm_model = is_mllm_model
 # =============================================================================
 
 
+def _content_to_text(content) -> str:
+    """Extract text from content that can be str, list[ContentPart], or None."""
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            if hasattr(item, "model_dump"):
+                item = item.model_dump()
+            elif hasattr(item, "dict"):
+                item = item.dict()
+            if isinstance(item, dict) and item.get("type") == "text":
+                parts.append(item.get("text", ""))
+        return "\n".join(parts)
+    return str(content)
+
+
 def extract_multimodal_content(
     messages: list[Message],
     preserve_native_format: bool = False,
@@ -208,7 +227,7 @@ def extract_multimodal_content(
 
                     tool_calls_list.append(tc_copy)
 
-                msg_dict = {"role": role, "content": content if content else ""}
+                msg_dict = {"role": role, "content": _content_to_text(content)}
                 if tool_calls_list:
                     msg_dict["tool_calls"] = tool_calls_list
                 processed_messages.append(msg_dict)
@@ -222,7 +241,7 @@ def extract_multimodal_content(
                         args = func.get("arguments", "{}")
                         tool_calls_text.append(f"[Calling tool: {name}({args})]")
 
-                text = content if content else ""
+                text = _content_to_text(content)
                 if tool_calls_text:
                     text = (text + "\n" if text else "") + "\n".join(tool_calls_text)
 
