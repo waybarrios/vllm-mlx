@@ -31,7 +31,7 @@ dependencies = [
     "mlx>=0.29.0",
     "mlx-lm>=0.30.5",  # GLM-4 models require 0.30.5+ (new attention layers)
     "mlx-vlm>=0.1.0",  # VLM support
-    "transformers>=4.40.0,<=5.0.0rc1",  # Pinned to avoid rc3 video processing bug
+    "transformers>=5.0.0",  # mlx-lm 0.30.5+ requires transformers 5.0 (rc3 bug fixed in stable)
     "tokenizers>=0.19.0",
     "huggingface-hub>=0.23.0",
     "numpy>=1.24.0",
