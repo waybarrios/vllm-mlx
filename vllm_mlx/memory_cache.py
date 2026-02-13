@@ -154,6 +154,7 @@ class MemoryCacheConfig:
         kv_quantize: Whether to quantize KV cache layers for reduced memory.
         kv_bits: Number of bits for KV cache quantization.
         kv_group_size: Group size for KV cache quantization.
+        kv_min_quantize_tokens: Minimum sequence length for quantization to apply.
     """
 
     max_memory_mb: int | None = None
@@ -172,6 +173,10 @@ class MemoryCacheConfig:
             )
         if self.max_entries < 1:
             raise ValueError(f"max_entries must be >= 1, got {self.max_entries}")
+        if self.kv_min_quantize_tokens < 0:
+            raise ValueError(
+                f"kv_min_quantize_tokens must be >= 0, got {self.kv_min_quantize_tokens}"
+            )
 
     def compute_memory_limit(self) -> int:
         """
@@ -294,25 +299,49 @@ def _trim_cache_offset(cache: list[Any], trim_by: int) -> list[Any]:
 def _trim_to_offset(cache: list[Any]) -> list[Any]:
     """Trim KV arrays to their actual used size (offset) before storage.
 
-    KV arrays are often pre-allocated larger than needed. This trims them
-    to save memory and avoid quantizing unused padding.
+    KV arrays are often pre-allocated larger than needed (e.g. 4096 slots
+    when only 100 are used).  This slices them down to ``offset`` and
+    evaluates the result so the original large buffer can be freed.
+
+    Args:
+        cache: List of cache layer objects (KVCache or other types).
+
+    Returns:
+        New list with KVCache layers trimmed to their offset.
+        Non-KVCache layers are passed through unchanged.
     """
+    import mlx.core as mx
     from mlx_lm.models.cache import KVCache
 
+    needs_trim = any(
+        isinstance(layer, KVCache)
+        and layer.keys is not None
+        and 0 < layer.offset < layer.keys.shape[2]
+        for layer in cache
+    )
+    if not needs_trim:
+        return cache
+
     trimmed = []
+    eval_targets = []
     for layer in cache:
         if isinstance(layer, KVCache) and layer.keys is not None:
             offset = layer.offset
-            if offset < layer.keys.shape[2]:
-                tc = KVCache.__new__(KVCache)
-                tc.keys = layer.keys[:, :, :offset, :]
-                tc.values = layer.values[:, :, :offset, :]
-                tc.offset = offset
-                trimmed.append(tc)
-            else:
+            if offset <= 0 or offset >= layer.keys.shape[2]:
                 trimmed.append(layer)
+                continue
+            tc = KVCache()
+            tc.keys = layer.keys[:, :, :offset, :]
+            tc.values = layer.values[:, :, :offset, :]
+            tc.offset = offset
+            eval_targets.extend([tc.keys, tc.values])
+            trimmed.append(tc)
         else:
             trimmed.append(layer)
+
+    if eval_targets:
+        mx.eval(*eval_targets)
+
     return trimmed
 
 
@@ -646,6 +675,13 @@ class MemoryAwarePrefixCache:
         if not tokens or not cache:
             return False
 
+        tokens_key = tuple(tokens)
+
+        # If already cached, just update LRU order (skip expensive trim/quantize)
+        if tokens_key in self._entries:
+            self._entries.move_to_end(tokens_key)
+            return True
+
         # Trim oversized KV arrays to actual used size
         cache = _trim_to_offset(cache)
 
@@ -657,13 +693,6 @@ class MemoryAwarePrefixCache:
             cache = _quantize_cache(
                 cache, self._config.kv_bits, self._config.kv_group_size
             )
-
-        tokens_key = tuple(tokens)
-
-        # If already cached, just update LRU order
-        if tokens_key in self._entries:
-            self._entries.move_to_end(tokens_key)
-            return True
 
         # Create entry and estimate memory
         entry = _CacheEntry.create(tokens, cache)
