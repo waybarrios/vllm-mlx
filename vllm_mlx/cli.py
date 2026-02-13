@@ -145,6 +145,7 @@ def serve_command(args):
             kv_cache_quantization=args.kv_cache_quantization,
             kv_cache_quantization_bits=args.kv_cache_quantization_bits,
             kv_cache_quantization_group_size=args.kv_cache_quantization_group_size,
+            kv_cache_min_quantize_tokens=args.kv_cache_min_quantize_tokens,
         )
 
         print("Mode: Continuous batching (for multiple concurrent users)")
@@ -222,6 +223,7 @@ def bench_command(args):
             kv_cache_quantization=args.kv_cache_quantization,
             kv_cache_quantization_bits=args.kv_cache_quantization_bits,
             kv_cache_quantization_group_size=args.kv_cache_quantization_group_size,
+            kv_cache_min_quantize_tokens=args.kv_cache_min_quantize_tokens,
         )
         engine_config = EngineConfig(
             model_name=args.model,
@@ -650,6 +652,12 @@ Examples:
         help="Group size for KV cache quantization (default: 64)",
     )
     serve_parser.add_argument(
+        "--kv-cache-min-quantize-tokens",
+        type=int,
+        default=256,
+        help="Minimum tokens for quantization to apply (default: 256)",
+    )
+    serve_parser.add_argument(
         "--stream-interval",
         type=int,
         default=1,
@@ -856,6 +864,12 @@ Examples:
         type=int,
         default=64,
         help="Group size for KV cache quantization (default: 64)",
+    )
+    bench_parser.add_argument(
+        "--kv-cache-min-quantize-tokens",
+        type=int,
+        default=256,
+        help="Minimum tokens for quantization to apply (default: 256)",
     )
     # Paged cache options (experimental)
     bench_parser.add_argument(
