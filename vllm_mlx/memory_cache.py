@@ -267,14 +267,14 @@ def _trim_cache_offset(cache: list[Any], trim_by: int) -> list[Any]:
     from mlx_lm.models.cache import KVCache
 
     try:
-        from mlx_lm.models.cache import QuantizedKVCache as _QKVCache
+        from mlx_lm.models.cache import QuantizedKVCache
     except ImportError:
-        _QKVCache = None
+        QuantizedKVCache = None  # noqa: N806
 
     trimmed: list[Any] = []
     for layer_cache in cache:
-        if _QKVCache is not None and isinstance(layer_cache, _QKVCache):
-            tc = _QKVCache.__new__(_QKVCache)
+        if QuantizedKVCache is not None and isinstance(layer_cache, QuantizedKVCache):
+            tc = QuantizedKVCache.__new__(QuantizedKVCache)
             tc.keys = layer_cache.keys
             tc.values = layer_cache.values
             tc.offset = max(layer_cache.offset - trim_by, 0)
@@ -296,6 +296,20 @@ def _trim_cache_offset(cache: list[Any], trim_by: int) -> list[Any]:
     return trimmed
 
 
+def _needs_kv_trim(layer: Any) -> bool:
+    """Check if a cache layer has oversized KV arrays (duck-typed, no MLX import)."""
+    keys = getattr(layer, "keys", None)
+    offset = getattr(layer, "offset", None)
+    if keys is None or offset is None:
+        return False
+    if isinstance(keys, (list, tuple)):
+        return False  # QuantizedKVCache — skip
+    shape = getattr(keys, "shape", None)
+    if shape is None or len(shape) < 3:
+        return False
+    return 0 < offset < shape[2]
+
+
 def _trim_to_offset(cache: list[Any]) -> list[Any]:
     """Trim KV arrays to their actual used size (offset) before storage.
 
@@ -310,17 +324,11 @@ def _trim_to_offset(cache: list[Any]) -> list[Any]:
         New list with KVCache layers trimmed to their offset.
         Non-KVCache layers are passed through unchanged.
     """
+    if not any(_needs_kv_trim(layer) for layer in cache):
+        return cache
+
     import mlx.core as mx
     from mlx_lm.models.cache import KVCache
-
-    needs_trim = any(
-        isinstance(layer, KVCache)
-        and layer.keys is not None
-        and 0 < layer.offset < layer.keys.shape[2]
-        for layer in cache
-    )
-    if not needs_trim:
-        return cache
 
     trimmed = []
     eval_targets = []
