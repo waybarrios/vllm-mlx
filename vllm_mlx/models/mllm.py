@@ -945,6 +945,7 @@ class MLXMultimodalLM:
         videos: list[str] | None = None,
         max_tokens: int = 256,
         temperature: float = 0.7,
+        top_p: float = 0.9,
         video_fps: float = DEFAULT_FPS,
         **kwargs,
     ) -> Iterator[str]:
@@ -1015,6 +1016,7 @@ class MLXMultimodalLM:
             all_images if all_images else None,
             max_tokens=max_tokens,
             temp=temperature,
+            top_p=top_p,
             **kwargs,
         ):
             yield chunk
@@ -1024,6 +1026,7 @@ class MLXMultimodalLM:
         messages: list[dict],
         max_tokens: int = 256,
         temperature: float = 0.7,
+        top_p: float = 0.9,
         **kwargs,
     ) -> MLLMOutput:
         """
@@ -1282,6 +1285,7 @@ class MLXMultimodalLM:
             all_images if all_images else None,
             max_tokens=max_tokens,
             temp=temperature,
+            top_p=top_p,
             verbose=False,
             prompt_cache=prompt_cache,
             skip_prompt_processing=skip_prompt_processing,
@@ -1375,6 +1379,7 @@ class MLXMultimodalLM:
         messages: list[dict],
         max_tokens: int = 256,
         temperature: float = 0.7,
+        top_p: float = 0.9,
         **kwargs,
     ) -> Iterator[MLLMOutput]:
         """
@@ -1560,6 +1565,7 @@ class MLXMultimodalLM:
             all_images if all_images else None,
             max_tokens=max_tokens,
             temp=temperature,
+            top_p=top_p,
             prompt_cache=prompt_cache,
             **kwargs,
         ):
