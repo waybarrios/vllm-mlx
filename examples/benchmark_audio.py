@@ -5,10 +5,9 @@ Audio benchmarks for vllm-mlx.
 Benchmarks STT (Speech-to-Text), TTS (Text-to-Speech), and audio processing.
 """
 
-import time
-import tempfile
 import os
-from pathlib import Path
+import tempfile
+import time
 
 # Benchmark configurations
 STT_MODELS = [
@@ -17,6 +16,8 @@ STT_MODELS = [
     ("mlx-community/whisper-medium-mlx", "whisper-medium"),
     ("mlx-community/whisper-large-v3-mlx", "whisper-large-v3"),
     ("mlx-community/whisper-large-v3-turbo", "whisper-large-v3-turbo"),
+    ("mlx-community/parakeet-tdt-0.6b-v2", "parakeet-tdt-0.6b-v2"),
+    ("mlx-community/parakeet-tdt-0.6b-v3", "parakeet-tdt-0.6b-v3"),
 ]
 
 TTS_MODELS = [
@@ -34,12 +35,15 @@ TEST_TEXTS = [
 
 def generate_test_audio(duration_seconds: float = 5.0) -> str:
     """Generate a simple test audio file using TTS."""
-    import numpy as np
     import wave
+
+    import numpy as np
 
     # Create a simple sine wave tone
     sample_rate = 16000
-    t = np.linspace(0, duration_seconds, int(sample_rate * duration_seconds), dtype=np.float32)
+    t = np.linspace(
+        0, duration_seconds, int(sample_rate * duration_seconds), dtype=np.float32
+    )
     # Mix of frequencies for more realistic audio
     audio = 0.3 * np.sin(2 * np.pi * 440 * t)  # A4 note
     audio += 0.2 * np.sin(2 * np.pi * 880 * t)  # A5 note
@@ -48,7 +52,7 @@ def generate_test_audio(duration_seconds: float = 5.0) -> str:
 
     # Save to temp file
     fd, path = tempfile.mkstemp(suffix=".wav")
-    with wave.open(path, 'w') as f:
+    with wave.open(path, "w") as f:
         f.setnchannels(1)
         f.setsampwidth(2)
         f.setframerate(sample_rate)
@@ -57,7 +61,9 @@ def generate_test_audio(duration_seconds: float = 5.0) -> str:
     return path
 
 
-def benchmark_tts(model_name: str, alias: str, texts: list[str], voice: str = "af_heart"):
+def benchmark_tts(
+    model_name: str, alias: str, texts: list[str], voice: str = "af_heart"
+):
     """Benchmark TTS model."""
     from vllm_mlx.audio.tts import TTSEngine
 
@@ -93,18 +99,20 @@ def benchmark_tts(model_name: str, alias: str, texts: list[str], voice: str = "a
         print(f"  RTF (real-time factor): {rtf:.2f}x")
         print(f"  Sample rate: {output.sample_rate} Hz")
 
-        results.append({
-            "chars": len(text),
-            "audio_duration": output.duration,
-            "gen_time": gen_time,
-            "chars_per_sec": chars_per_sec,
-            "rtf": rtf,
-        })
+        results.append(
+            {
+                "chars": len(text),
+                "audio_duration": output.duration,
+                "gen_time": gen_time,
+                "chars_per_sec": chars_per_sec,
+                "rtf": rtf,
+            }
+        )
 
     # Summary
     avg_chars_per_sec = sum(r["chars_per_sec"] for r in results) / len(results)
     avg_rtf = sum(r["rtf"] for r in results) / len(results)
-    print(f"\n--- Summary ---")
+    print("\n--- Summary ---")
     print(f"Average chars/sec: {avg_chars_per_sec:.1f}")
     print(f"Average RTF: {avg_rtf:.2f}x")
 
@@ -118,12 +126,12 @@ def benchmark_tts(model_name: str, alias: str, texts: list[str], voice: str = "a
 
 def get_audio_duration(audio_path: str) -> float:
     """Get audio duration in seconds."""
-    import wave
     import contextlib
+    import wave
 
     # Try wav first
-    if audio_path.endswith('.wav'):
-        with contextlib.closing(wave.open(audio_path, 'r')) as f:
+    if audio_path.endswith(".wav"):
+        with contextlib.closing(wave.open(audio_path, "r")) as f:
             frames = f.getnframes()
             rate = f.getframerate()
             return frames / float(rate)
@@ -131,10 +139,20 @@ def get_audio_duration(audio_path: str) -> float:
     # For mp3 and other formats, use ffprobe if available
     try:
         import subprocess
+
         result = subprocess.run(
-            ['ffprobe', '-v', 'error', '-show_entries', 'format=duration',
-             '-of', 'default=noprint_wrappers=1:nokey=1', audio_path],
-            capture_output=True, text=True
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-show_entries",
+                "format=duration",
+                "-of",
+                "default=noprint_wrappers=1:nokey=1",
+                audio_path,
+            ],
+            capture_output=True,
+            text=True,
         )
         return float(result.stdout.strip())
     except (FileNotFoundError, ValueError):
@@ -174,8 +192,12 @@ def benchmark_stt(model_name: str, alias: str, audio_path: str):
     # Calculate metrics
     rtf = duration / trans_time if duration and trans_time > 0 else 0
 
-    print(f"\nResult:")
-    print(f"  Text: {result.text[:100]}..." if len(result.text) > 100 else f"  Text: {result.text}")
+    print("\nResult:")
+    print(
+        f"  Text: {result.text[:100]}..."
+        if len(result.text) > 100
+        else f"  Text: {result.text}"
+    )
     print(f"  Language: {result.language}")
     print(f"  Audio duration: {duration:.2f}s")
     print(f"  Transcription time: {trans_time:.2f}s")
@@ -190,11 +212,26 @@ def benchmark_stt(model_name: str, alias: str, audio_path: str):
     }
 
 
+def check_whisper_backend():
+    """
+    Check whether the Whisper backend can be imported.
+
+    Returns:
+        (available: bool, reason: str)
+    """
+    try:
+        import mlx_audio.stt.models.whisper  # noqa: F401
+
+        return True, ""
+    except Exception as e:
+        return False, str(e)
+
+
 def run_tts_benchmarks():
     """Run all TTS benchmarks."""
-    print("\n" + "="*70)
+    print("\n" + "=" * 70)
     print(" TTS BENCHMARKS (Text-to-Speech)")
-    print("="*70)
+    print("=" * 70)
 
     results = []
     for model_name, alias in TTS_MODELS:
@@ -207,25 +244,35 @@ def run_tts_benchmarks():
 
     # Print summary table
     if results:
-        print("\n" + "="*70)
+        print("\n" + "=" * 70)
         print(" TTS BENCHMARK RESULTS")
-        print("="*70)
+        print("=" * 70)
         print(f"{'Model':<25} {'Load (s)':<12} {'Chars/s':<12} {'RTF':<10}")
-        print("-"*70)
+        print("-" * 70)
         for r in results:
-            print(f"{r['model']:<25} {r['load_time']:<12.2f} {r['avg_chars_per_sec']:<12.1f} {r['avg_rtf']:<10.2f}x")
+            print(
+                f"{r['model']:<25} {r['load_time']:<12.2f} {r['avg_chars_per_sec']:<12.1f} {r['avg_rtf']:<10.2f}x"
+            )
 
     return results
 
 
 def run_stt_benchmarks(audio_path: str):
     """Run all STT benchmarks."""
-    print("\n" + "="*70)
+    print("\n" + "=" * 70)
     print(" STT BENCHMARKS (Speech-to-Text)")
-    print("="*70)
+    print("=" * 70)
+
+    whisper_available, whisper_error = check_whisper_backend()
+    if not whisper_available:
+        print("Warning: Whisper backend unavailable; skipping Whisper models.")
+        print(f"Reason: {whisper_error}")
 
     results = []
     for model_name, alias in STT_MODELS:
+        if alias.startswith("whisper") and not whisper_available:
+            print(f"\nSkipping {alias}: Whisper backend unavailable")
+            continue
         try:
             result = benchmark_stt(model_name, alias, audio_path)
             results.append(result)
@@ -235,13 +282,15 @@ def run_stt_benchmarks(audio_path: str):
 
     # Print summary table
     if results:
-        print("\n" + "="*70)
+        print("\n" + "=" * 70)
         print(" STT BENCHMARK RESULTS")
-        print("="*70)
+        print("=" * 70)
         print(f"{'Model':<25} {'Load (s)':<12} {'Trans (s)':<12} {'RTF':<10}")
-        print("-"*70)
+        print("-" * 70)
         for r in results:
-            print(f"{r['model']:<25} {r['load_time']:<12.2f} {r['trans_time']:<12.2f} {r['rtf']:<10.2f}x")
+            print(
+                f"{r['model']:<25} {r['load_time']:<12.2f} {r['trans_time']:<12.2f} {r['rtf']:<10.2f}x"
+            )
 
     return results
 

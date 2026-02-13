@@ -133,7 +133,7 @@ python tests/test_prefix_cache.py
   Model: mlx-community/Qwen3-0.6B-8bit
   Expected behavior:
     - Same prompt → cache HIT
-    - Different prompt → cache MISS
+    - Different prompt → cache MISS or PREFIX_HIT (shared template tokens)
 ----------------------------------------------------------------------
   Results:
   Step   | Description         | Expected | Actual | Status

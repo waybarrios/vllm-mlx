@@ -21,11 +21,34 @@ vllm-mlx-bench --model mlx-community/Qwen3-VL-8B-Instruct-4bit
 vllm-mlx-bench --model mlx-community/Qwen3-VL-8B-Instruct-4bit --video
 ```
 
+## Standalone Test Defaults
+
+Standalone benchmark test scripts have built-in default models, so you can run:
+
+```bash
+python tests/test_continuous_batching.py
+python tests/test_prefix_cache.py
+```
+
+Defaults:
+- `tests/test_continuous_batching.py` → `mlx-community/Qwen3-8B-6bit`
+- `tests/test_prefix_cache.py` → `mlx-community/Qwen3-0.6B-8bit`
+
+To test different models, use the optional `--model` flag:
+
+```bash
+python tests/test_continuous_batching.py --model mlx-community/Qwen3-0.6B-8bit
+python tests/test_prefix_cache.py --model mlx-community/Qwen3-8B-6bit
+```
+
 ## Hardware
 
-All benchmarks run on:
-- **Chip**: Apple M4 Max
-- **Memory**: 128 GB unified memory
+Benchmarks have been collected on the following Apple Silicon configurations:
+
+| Chip | Memory | Python |
+|------|--------|--------|
+| Apple M4 Max | 128 GB unified | 3.13 |
+| Apple M1 Max | 64 GB unified | 3.12 |
 
 Results will vary on different Apple Silicon chips.
 
