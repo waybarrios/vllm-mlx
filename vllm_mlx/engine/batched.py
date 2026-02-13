@@ -336,8 +336,10 @@ class BatchedEngine(BaseEngine):
         # For MLLM models, the processor handles special vision tokens.
         # For text-only models, the tokenizer is sufficient.
         template_applicator = None
-        if self._is_mllm and self._processor and hasattr(
-            self._processor, "apply_chat_template"
+        if (
+            self._is_mllm
+            and self._processor
+            and hasattr(self._processor, "apply_chat_template")
         ):
             template_applicator = self._processor
         elif hasattr(self.tokenizer, "apply_chat_template"):

@@ -618,8 +618,7 @@ class MLLMBatchGenerator:
             self._preprocess_request(req)
 
         total_prompt_tokens = sum(
-            req.input_ids.size if req.input_ids is not None else 1
-            for req in requests
+            req.input_ids.size if req.input_ids is not None else 1 for req in requests
         )
         self._stats.prompt_tokens += total_prompt_tokens
 
