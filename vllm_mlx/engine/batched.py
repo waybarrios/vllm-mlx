@@ -754,7 +754,16 @@ class BatchedEngine(BaseEngine):
         }
 
         if self._mllm_scheduler:
-            stats["mllm_scheduler"] = self._mllm_scheduler.get_stats()
+            mllm_stats = self._mllm_scheduler.get_stats()
+            stats["mllm_scheduler"] = mllm_stats
+            # Promote Metal memory stats to top-level for /v1/status
+            for key in (
+                "metal_active_memory_gb",
+                "metal_peak_memory_gb",
+                "metal_cache_memory_gb",
+            ):
+                if key in mllm_stats:
+                    stats[key] = mllm_stats[key]
         elif self._engine:
             stats.update(self._engine.get_stats())
 
