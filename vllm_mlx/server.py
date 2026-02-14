@@ -1387,24 +1387,23 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
     # Parse tool calls from output using configured parser
     cleaned_text, tool_calls = _parse_tool_calls_with_parser(output.text, request)
 
-    # Process response_format if specified
-    if response_format and not tool_calls:
-        cleaned_text, parsed_json, is_valid, error = parse_json_output(
-            cleaned_text or output.text, response_format
-        )
-        if parsed_json is not None:
-            # Return JSON as string
-            cleaned_text = json.dumps(parsed_json)
-        if not is_valid:
-            logger.warning(f"JSON validation failed: {error}")
-
-    # Extract reasoning content if parser is enabled
+    # Extract reasoning content FIRST (strips channel tokens before JSON extraction)
     reasoning_text = None
     if _reasoning_parser and not tool_calls:
         text_to_parse = cleaned_text or output.text
         reasoning_text, cleaned_text = _reasoning_parser.extract_reasoning(
             text_to_parse
         )
+
+    # Process response_format if specified (after reasoning parser cleaned the text)
+    if response_format and not tool_calls:
+        json_input = cleaned_text or output.text
+        _, parsed_json, is_valid, error = parse_json_output(json_input, response_format)
+        if parsed_json is not None:
+            # Return JSON as string
+            cleaned_text = json.dumps(parsed_json)
+        if not is_valid:
+            logger.warning(f"JSON validation failed: {error}")
 
     # Determine finish reason
     finish_reason = "tool_calls" if tool_calls else output.finish_reason

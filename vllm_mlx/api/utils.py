@@ -16,8 +16,54 @@ from .models import Message
 SPECIAL_TOKENS_PATTERN = re.compile(
     r"<\|im_end\|>|<\|im_start\|>|<\|endoftext\|>|"
     r"<\|end\|>|<\|eot_id\|>|<\|start_header_id\|>|<\|end_header_id\|>|"
+    r"<\|channel\|>|<\|message\|>|<\|start\|>|<\|return\|>|<\|call\|>|<\|constrain\|>|"
     r"</s>|<s>|<pad>|\[PAD\]|\[SEP\]|\[CLS\]"
 )
+
+
+# Regex for matching final channel marker with optional constrain token:
+#   <|channel|>final<|message|>
+#   <|channel|>final <|constrain|>JSON<|message|>
+_FINAL_CHANNEL_RE = re.compile(
+    r"<\|channel\|>final[^<]*(?:<\|constrain\|>[^<]*)?<\|message\|>"
+)
+
+
+def _clean_gpt_oss_output(text: str) -> str:
+    """
+    Extract final channel content from GPT-OSS channel-based output.
+
+    When reasoning parser is not enabled, this provides a fallback that
+    extracts the 'final' channel content so the API response is usable.
+
+    Handles both standard and extended format with constrain token:
+        <|channel|>final<|message|>...
+        <|channel|>final <|constrain|>JSON<|message|>...
+
+    Args:
+        text: Raw model output containing channel tokens.
+
+    Returns:
+        Extracted final content, or text with channel tokens stripped.
+    """
+    match = _FINAL_CHANNEL_RE.search(text)
+    if match:
+        content = text[match.end() :]
+        # Strip trailing structural tokens (including <|constrain|>)
+        content = re.sub(
+            r"<\|start\|>|<\|end\|>|<\|channel\|>|<\|return\|>|<\|call\|>|<\|message\|>|<\|constrain\|>",
+            "",
+            content,
+        )
+        return content.strip()
+
+    # No final channel — strip all channel/structural tokens (including constrain)
+    cleaned = re.sub(
+        r"<\|channel\|>[^<]*(?:<\|constrain\|>[^<]*)?<\|message\|>|<\|start\|>[^<]*|<\|return\|>|<\|call\|>|<\|constrain\|>[^<]*",
+        "",
+        text,
+    )
+    return cleaned.strip()
 
 
 def clean_output_text(text: str) -> str:
@@ -27,6 +73,8 @@ def clean_output_text(text: str) -> str:
     Keeps <think>...</think> blocks intact for reasoning models.
     Adds opening <think> tag if missing (happens when thinking is enabled
     in the prompt template but the tag is part of the prompt, not output).
+    Handles GPT-OSS channel-based format as fallback when reasoning parser
+    is not enabled.
 
     Args:
         text: Raw model output
@@ -36,6 +84,12 @@ def clean_output_text(text: str) -> str:
     """
     if not text:
         return text
+
+    # GPT-OSS channel format — extract final content before general stripping
+    if "<|channel|>" in text and "<|message|>" in text:
+        text = _clean_gpt_oss_output(text)
+        return text
+
     text = SPECIAL_TOKENS_PATTERN.sub("", text)
     text = text.strip()
 
