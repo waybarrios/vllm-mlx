@@ -22,6 +22,8 @@ import asyncio
 import logging
 import time
 import uuid
+
+import mlx.core as mx
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, AsyncIterator, Dict, List, Optional, Set, Tuple
@@ -752,6 +754,15 @@ class MLLMScheduler:
 
         if self.vision_cache:
             stats["vision_cache"] = self.vision_cache.get_stats()
+
+        # Include Metal memory stats
+        try:
+            if mx.metal.is_available():
+                stats["metal_active_memory_gb"] = round(mx.get_active_memory() / 1e9, 2)
+                stats["metal_peak_memory_gb"] = round(mx.get_peak_memory() / 1e9, 2)
+                stats["metal_cache_memory_gb"] = round(mx.get_cache_memory() / 1e9, 2)
+        except Exception:
+            pass
 
         return stats
 

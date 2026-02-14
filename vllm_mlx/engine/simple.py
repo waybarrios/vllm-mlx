@@ -415,12 +415,25 @@ class SimpleEngine(BaseEngine):
 
     def get_stats(self) -> dict[str, Any]:
         """Get engine statistics."""
-        return {
+        stats = {
             "engine_type": "simple",
             "model_name": self._model_name,
             "is_mllm": self._is_mllm,
             "loaded": self._loaded,
         }
+
+        # Include Metal memory stats
+        try:
+            import mlx.core as mx
+
+            if mx.metal.is_available():
+                stats["metal_active_memory_gb"] = round(mx.get_active_memory() / 1e9, 2)
+                stats["metal_peak_memory_gb"] = round(mx.get_peak_memory() / 1e9, 2)
+                stats["metal_cache_memory_gb"] = round(mx.get_cache_memory() / 1e9, 2)
+        except Exception:
+            pass
+
+        return stats
 
     def get_cache_stats(self) -> dict[str, Any] | None:
         """Get cache statistics (for MLLM models)."""

@@ -679,3 +679,244 @@ class TestQwen3SpecificCases:
             if expected_reasoning is None:
                 assert reasoning is None or reasoning.strip() == ""
             assert expected_content in (content or "")
+
+
+class TestGptOssParser:
+    """Tests for the GPT-OSS reasoning parser (channel-based format)."""
+
+    @pytest.fixture
+    def parser(self):
+        """Create a fresh GPT-OSS parser for each test."""
+        return get_parser("gpt_oss")()
+
+    # Non-streaming tests
+
+    def test_extract_both_channels(self, parser):
+        """Should extract reasoning from analysis and content from final."""
+        output = (
+            "<|channel|>analysis<|message|>Let me think step by step"
+            "<|start|>assistant<|channel|>final<|message|>The answer is 42<|return|>"
+        )
+        reasoning, content = parser.extract_reasoning(output)
+        assert reasoning == "Let me think step by step"
+        assert content == "The answer is 42"
+
+    def test_extract_only_final(self, parser):
+        """Should handle output with only final channel."""
+        output = "<|channel|>final<|message|>Just the answer<|return|>"
+        reasoning, content = parser.extract_reasoning(output)
+        assert reasoning is None
+        assert content == "Just the answer"
+
+    def test_extract_only_analysis(self, parser):
+        """Should handle output with only analysis channel."""
+        output = "<|channel|>analysis<|message|>Just thinking out loud"
+        reasoning, content = parser.extract_reasoning(output)
+        assert reasoning == "Just thinking out loud"
+        assert content is None
+
+    def test_no_channel_tokens_fallback(self, parser):
+        """No channel tokens should return pure content."""
+        output = "Just a regular response."
+        reasoning, content = parser.extract_reasoning(output)
+        assert reasoning is None
+        assert content == output
+
+    def test_empty_analysis_channel(self, parser):
+        """Empty analysis channel should return None reasoning."""
+        output = (
+            "<|channel|>analysis<|message|>"
+            "<|start|>assistant<|channel|>final<|message|>Content here<|return|>"
+        )
+        reasoning, content = parser.extract_reasoning(output)
+        assert reasoning is None
+        assert content == "Content here"
+
+    def test_multiline_analysis(self, parser):
+        """Should preserve multiline reasoning content."""
+        output = (
+            "<|channel|>analysis<|message|>Step 1: Analyze\nStep 2: Solve\nStep 3: Verify"
+            "<|start|>assistant<|channel|>final<|message|>Result: 42<|return|>"
+        )
+        reasoning, content = parser.extract_reasoning(output)
+        assert "Step 1" in reasoning
+        assert "Step 2" in reasoning
+        assert "Step 3" in reasoning
+        assert content == "Result: 42"
+
+    def test_no_return_token(self, parser):
+        """Should handle missing <|return|> at end."""
+        output = (
+            "<|channel|>analysis<|message|>Thinking"
+            "<|start|>assistant<|channel|>final<|message|>Answer"
+        )
+        reasoning, content = parser.extract_reasoning(output)
+        assert reasoning == "Thinking"
+        assert content == "Answer"
+
+    # Streaming tests
+
+    def test_streaming_full_flow(self, parser):
+        """Test streaming through analysis -> transition -> final phases."""
+        parser.reset_state()
+
+        # Simulate token-by-token streaming
+        tokens = [
+            "<|channel|>",
+            "analysis",
+            "<|message|>",
+            "Let me ",
+            "think",
+            "<|start|>",
+            "assistant",
+            "<|channel|>",
+            "final",
+            "<|message|>",
+            "The answer",
+            " is 42",
+            "<|return|>",
+        ]
+
+        accumulated = ""
+        reasoning_parts = []
+        content_parts = []
+
+        for token in tokens:
+            prev = accumulated
+            accumulated += token
+            result = parser.extract_reasoning_streaming(prev, accumulated, token)
+            if result:
+                if result.reasoning:
+                    reasoning_parts.append(result.reasoning)
+                if result.content:
+                    content_parts.append(result.content)
+
+        full_reasoning = "".join(reasoning_parts)
+        full_content = "".join(content_parts)
+
+        assert "Let me think" in full_reasoning
+        assert "The answer is 42" in full_content
+
+    def test_streaming_only_final(self, parser):
+        """Test streaming with only final channel."""
+        parser.reset_state()
+
+        tokens = [
+            "<|channel|>",
+            "final",
+            "<|message|>",
+            "Direct ",
+            "answer",
+            "<|return|>",
+        ]
+
+        accumulated = ""
+        content_parts = []
+
+        for token in tokens:
+            prev = accumulated
+            accumulated += token
+            result = parser.extract_reasoning_streaming(prev, accumulated, token)
+            if result and result.content:
+                content_parts.append(result.content)
+
+        assert "Direct answer" in "".join(content_parts)
+
+    def test_streaming_suppresses_structural_tokens(self, parser):
+        """Structural tokens should not leak into reasoning or content."""
+        parser.reset_state()
+
+        tokens = [
+            "<|channel|>analysis<|message|>",
+            "thinking",
+            "<|start|>",
+            "assistant",
+            "<|channel|>final<|message|>",
+            "answer",
+            "<|return|>",
+        ]
+
+        accumulated = ""
+        all_output = []
+
+        for token in tokens:
+            prev = accumulated
+            accumulated += token
+            result = parser.extract_reasoning_streaming(prev, accumulated, token)
+            if result:
+                if result.reasoning:
+                    all_output.append(result.reasoning)
+                if result.content:
+                    all_output.append(result.content)
+
+        combined = "".join(all_output)
+        assert "<|" not in combined
+
+    def test_registry_includes_gpt_oss(self):
+        """gpt_oss should be in the parser registry."""
+        assert "gpt_oss" in list_parsers()
+
+    def test_extract_constrain_format(self, parser):
+        """Should handle extended format with <|constrain|> token."""
+        output = (
+            "<|channel|>analysis<|message|>We need to output JSON"
+            "<|end|><|channel|>final <|constrain|>JSON<|message|>"
+            '{"hello":"world"}<|return|>'
+        )
+        reasoning, content = parser.extract_reasoning(output)
+        assert reasoning == "We need to output JSON"
+        assert content == '{"hello":"world"}'
+
+    def test_extract_constrain_no_analysis(self, parser):
+        """Should handle constrain format with only final channel."""
+        output = (
+            '<|channel|>final <|constrain|>JSON<|message|>{"key":"value"}<|return|>'
+        )
+        reasoning, content = parser.extract_reasoning(output)
+        assert reasoning is None
+        assert content == '{"key":"value"}'
+
+    def test_streaming_constrain_format(self, parser):
+        """Streaming should handle <|constrain|> in channel marker."""
+        parser.reset_state()
+
+        tokens = [
+            "<|channel|>analysis<|message|>",
+            "Thinking...",
+            "<|end|>",
+            "<|channel|>final <|constrain|>JSON<|message|>",
+            '{"result":',
+            '"ok"}',
+            "<|return|>",
+        ]
+
+        accumulated = ""
+        reasoning_parts = []
+        content_parts = []
+
+        for token in tokens:
+            prev = accumulated
+            accumulated += token
+            result = parser.extract_reasoning_streaming(prev, accumulated, token)
+            if result:
+                if result.reasoning:
+                    reasoning_parts.append(result.reasoning)
+                if result.content:
+                    content_parts.append(result.content)
+
+        full_reasoning = "".join(reasoning_parts)
+        full_content = "".join(content_parts)
+
+        assert "Thinking" in full_reasoning
+        assert '{"result":"ok"}' in full_content
+        assert "<|constrain|>" not in full_content
+
+    def test_constrain_tokens_stripped(self, parser):
+        """<|constrain|> should not leak into output."""
+        output = (
+            "<|channel|>final <|constrain|>JSON<|message|>"
+            '{"hello":"world"}<|return|>'
+        )
+        reasoning, content = parser.extract_reasoning(output)
+        assert "<|constrain|>" not in (content or "")
+        assert "<|channel|>" not in (content or "")

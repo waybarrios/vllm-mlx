@@ -259,6 +259,18 @@ class BatchedEngine(BaseEngine):
             tokenizer_config=tokenizer_config,
         )
 
+        # Validate MTP support if enabled
+        if self._scheduler_config and self._scheduler_config.enable_mtp:
+            from ..patches.qwen3_next_mtp import validate_mtp_support
+
+            if validate_mtp_support(self._model):
+                logger.info("[MTP] Model validated for MTP speculative decoding")
+            else:
+                logger.warning(
+                    "[MTP] MTP validation failed — --enable-mtp will be ignored. "
+                    "See warnings above for details."
+                )
+
         # Set Metal memory limits to make allocation failures graceful
         # instead of fatal Metal command buffer errors (SIGABRT)
         try:
@@ -754,7 +766,16 @@ class BatchedEngine(BaseEngine):
         }
 
         if self._mllm_scheduler:
-            stats["mllm_scheduler"] = self._mllm_scheduler.get_stats()
+            mllm_stats = self._mllm_scheduler.get_stats()
+            stats["mllm_scheduler"] = mllm_stats
+            # Promote Metal memory stats to top-level for /v1/status
+            for key in (
+                "metal_active_memory_gb",
+                "metal_peak_memory_gb",
+                "metal_cache_memory_gb",
+            ):
+                if key in mllm_stats:
+                    stats[key] = mllm_stats[key]
         elif self._engine:
             stats.update(self._engine.get_stats())
 
