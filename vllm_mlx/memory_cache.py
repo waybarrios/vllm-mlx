@@ -683,12 +683,6 @@ class MemoryAwarePrefixCache:
         if not tokens or not cache:
             return False
 
-        # Quantize cache layers if configured
-        if self._config.kv_quantize:
-            cache = _quantize_cache(
-                cache, self._config.kv_bits, self._config.kv_group_size
-            )
-
         tokens_key = tuple(tokens)
 
         # If already cached, just update LRU order (skip expensive trim/quantize)
