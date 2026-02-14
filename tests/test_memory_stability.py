@@ -247,9 +247,9 @@ class TestMemoryStats:
     def test_metal_stats_included(self, mock_mx):
         """Verify Metal memory stats appear in get_stats()."""
         mock_mx.metal.is_available.return_value = True
-        mock_mx.metal.get_active_memory.return_value = 10_000_000_000  # 10GB
-        mock_mx.metal.get_peak_memory.return_value = 15_000_000_000  # 15GB
-        mock_mx.metal.get_cache_memory.return_value = 2_000_000_000  # 2GB
+        mock_mx.get_active_memory.return_value = 10_000_000_000  # 10GB
+        mock_mx.get_peak_memory.return_value = 15_000_000_000  # 15GB
+        mock_mx.get_cache_memory.return_value = 2_000_000_000  # 2GB
 
         scheduler = _make_scheduler()
         stats = scheduler.get_stats()
