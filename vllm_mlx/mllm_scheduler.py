@@ -28,15 +28,16 @@ from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, AsyncIterator, Dict, List, Optional, Set, Tuple
 
+import mlx.core as mx
 
 from .mllm_batch_generator import (
     MLLMBatchGenerator,
     MLLMBatchRequest,
     MLLMBatchResponse,
 )
+from .mllm_cache import MLLMCacheManager
 from .multimodal_processor import MultimodalProcessor
 from .request import RequestOutput, RequestStatus, SamplingParams
-from .mllm_cache import MLLMCacheManager
 
 logger = logging.getLogger(__name__)
 
