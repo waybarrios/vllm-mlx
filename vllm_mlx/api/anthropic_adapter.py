@@ -54,7 +54,13 @@ def anthropic_to_openai(request: AnthropicRequest) -> ChatCompletionRequest:
             parts = []
             for block in request.system:
                 if isinstance(block, dict) and block.get("type") == "text":
-                    parts.append(block.get("text", ""))
+                    text = block.get("text", "")
+                    # Strip per-request tracking headers injected by clients
+                    # (e.g. "x-anthropic-billing-header: ...cch=HASH").
+                    # These change every request and break prompt prefix caching.
+                    if text.startswith("x-anthropic-"):
+                        continue
+                    parts.append(text)
                 elif isinstance(block, str):
                     parts.append(block)
             system_text = "\n".join(parts)
