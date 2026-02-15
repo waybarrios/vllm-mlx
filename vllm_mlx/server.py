@@ -1357,6 +1357,14 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
     if request.tools:
         chat_kwargs["tools"] = convert_tools_for_template(request.tools)
 
+    # Pass through chat_template_kwargs for per-request thinking control
+    if request.chat_template_kwargs:
+        chat_kwargs["chat_template_kwargs"] = request.chat_template_kwargs
+
+    # Map reasoning_effort to engine kwargs
+    if request.reasoning_effort is not None:
+        chat_kwargs["reasoning_effort"] = request.reasoning_effort
+
     if request.stream:
         return StreamingResponse(
             _disconnect_guard(
@@ -1389,7 +1397,8 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
 
     # Extract reasoning content FIRST (strips channel tokens before JSON extraction)
     reasoning_text = None
-    if _reasoning_parser and not tool_calls:
+    skip_reasoning = request.reasoning_effort == "none"
+    if _reasoning_parser and not tool_calls and not skip_reasoning:
         text_to_parse = cleaned_text or output.text
         reasoning_text, cleaned_text = _reasoning_parser.extract_reasoning(
             text_to_parse
@@ -1871,8 +1880,11 @@ async def stream_chat_completion(
     is_thinking_model = "nemotron" in request.model.lower() and not _reasoning_parser
     think_prefix_sent = False
 
+    # Skip reasoning parser when reasoning_effort="none"
+    skip_reasoning = request.reasoning_effort == "none"
+
     # Reset reasoning parser state for this stream
-    if _reasoning_parser:
+    if _reasoning_parser and not skip_reasoning:
         _reasoning_parser.reset_state()
 
     # Track accumulated text for reasoning parser
@@ -1916,8 +1928,8 @@ async def stream_chat_completion(
         if hasattr(output, "completion_tokens") and output.completion_tokens:
             completion_tokens = output.completion_tokens
 
-        # Use reasoning parser if enabled
-        if _reasoning_parser and delta_text:
+        # Use reasoning parser if enabled (skip when reasoning_effort="none")
+        if _reasoning_parser and delta_text and not skip_reasoning:
             previous_text = accumulated_text
             accumulated_text += delta_text
             delta_msg = _reasoning_parser.extract_reasoning_streaming(

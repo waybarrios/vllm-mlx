@@ -174,6 +174,10 @@ class ChatCompletionRequest(BaseModel):
     video_max_frames: int | None = None
     # Request timeout in seconds (None = use server default)
     timeout: float | None = None
+    # Thinking/reasoning control (OpenAI-compatible)
+    reasoning_effort: str | None = None  # "low", "medium", "high", "none"
+    # vLLM-compatible chat_template_kwargs pass-through
+    chat_template_kwargs: dict | None = None
 
 
 class AssistantMessage(BaseModel):

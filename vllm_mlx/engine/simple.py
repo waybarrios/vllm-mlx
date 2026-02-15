@@ -391,6 +391,16 @@ class SimpleEngine(BaseEngine):
             if template_tools:
                 template_kwargs["tools"] = template_tools
 
+            # Apply per-request chat_template_kwargs override
+            chat_template_kwargs = kwargs.pop("chat_template_kwargs", None)
+            if chat_template_kwargs:
+                template_kwargs.update(chat_template_kwargs)
+
+            # Map reasoning_effort to enable_thinking
+            reasoning_effort = kwargs.pop("reasoning_effort", None)
+            if reasoning_effort is not None:
+                template_kwargs["enable_thinking"] = reasoning_effort != "none"
+
             try:
                 prompt = tokenizer.apply_chat_template(messages, **template_kwargs)
             except TypeError:

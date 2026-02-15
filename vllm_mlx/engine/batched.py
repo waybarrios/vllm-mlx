@@ -335,6 +335,7 @@ class BatchedEngine(BaseEngine):
         messages: list[dict[str, Any]],
         tools: list[dict] | None = None,
         num_images: int = 0,
+        chat_template_kwargs: dict | None = None,
     ) -> str:
         """Apply chat template to messages.
 
@@ -370,14 +371,18 @@ class BatchedEngine(BaseEngine):
             if tools:
                 template_kwargs["tools"] = tools
 
+            # Per-request template overrides (e.g. enable_thinking)
+            if chat_template_kwargs:
+                template_kwargs.update(chat_template_kwargs)
+
             try:
                 return template_applicator.apply_chat_template(
                     messages, **template_kwargs
                 )
             except TypeError as e:
-                # Some templates don't accept 'tools'; retry without them.
+                # Some templates don't accept 'tools'/'enable_thinking'; retry without.
                 logger.debug(f"Chat template TypeError, retrying without extras: {e}")
-                for key in ["tools"]:
+                for key in ["tools", "enable_thinking"]:
                     if key in template_kwargs:
                         del template_kwargs[key]
                 return template_applicator.apply_chat_template(
@@ -612,6 +617,15 @@ class BatchedEngine(BaseEngine):
         if not self._loaded:
             await self.start()
 
+        # Extract per-request thinking control kwargs
+        chat_template_kwargs = kwargs.pop("chat_template_kwargs", None)
+        reasoning_effort = kwargs.pop("reasoning_effort", None)
+
+        # Merge reasoning_effort into effective chat_template_kwargs
+        effective_kwargs = dict(chat_template_kwargs or {})
+        if reasoning_effort is not None:
+            effective_kwargs["enable_thinking"] = reasoning_effort != "none"
+
         # Extract images/videos from messages (OpenAI multimodal format)
         # Note: We only use extracted media here, messages are already processed by server
         _, extracted_images, extracted_videos = extract_multimodal_content(messages)
@@ -626,6 +640,7 @@ class BatchedEngine(BaseEngine):
             messages,
             template_tools,
             num_images=len(all_images),
+            chat_template_kwargs=effective_kwargs or None,
         )
 
         return await self.generate(
@@ -723,6 +738,15 @@ class BatchedEngine(BaseEngine):
         if not self._loaded:
             await self.start()
 
+        # Extract per-request thinking control kwargs
+        chat_template_kwargs = kwargs.pop("chat_template_kwargs", None)
+        reasoning_effort = kwargs.pop("reasoning_effort", None)
+
+        # Merge reasoning_effort into effective chat_template_kwargs
+        effective_kwargs = dict(chat_template_kwargs or {})
+        if reasoning_effort is not None:
+            effective_kwargs["enable_thinking"] = reasoning_effort != "none"
+
         # Extract images/videos from messages (OpenAI multimodal format)
         # Note: We only use extracted media here, messages are already processed by server
         _, extracted_images, extracted_videos = extract_multimodal_content(messages)
@@ -737,6 +761,7 @@ class BatchedEngine(BaseEngine):
             messages,
             template_tools,
             num_images=len(all_images),
+            chat_template_kwargs=effective_kwargs or None,
         )
 
         # Compute prefix boundary for cache
