@@ -16,6 +16,7 @@ from vllm_mlx.tool_parsers import (
     HermesToolParser,
     KimiToolParser,
     LlamaToolParser,
+    MiniMaxToolParser,
     MistralToolParser,
     NemotronToolParser,
     QwenToolParser,
@@ -37,6 +38,7 @@ class TestNativeToolFormatCapability:
             FunctionaryToolParser,
             KimiToolParser,
             HermesToolParser,
+            MiniMaxToolParser,
         ]
         for parser_cls in native_parsers:
             assert (
@@ -73,6 +75,7 @@ class TestNativeToolFormatCapability:
             "functionary",
             "kimi",
             "hermes",
+            "minimax",
         ]:
             parser_cls = ToolParserManager.get_tool_parser(name)
             assert (

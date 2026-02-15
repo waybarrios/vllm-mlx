@@ -13,6 +13,7 @@ from vllm_mlx.tool_parsers import (
     HermesToolParser,
     KimiToolParser,
     LlamaToolParser,
+    MiniMaxToolParser,
     MistralToolParser,
     NemotronToolParser,
     QwenToolParser,
@@ -39,6 +40,7 @@ class TestToolParserManager:
             "nemotron",
             "xlam",
             "functionary",
+            "minimax",
         ]
         for p in expected:
             assert p in parsers, f"Parser '{p}' not found"
@@ -68,6 +70,8 @@ class TestToolParserManager:
             ("meetkai", FunctionaryToolParser),
             ("hermes", HermesToolParser),
             ("nous", HermesToolParser),
+            ("minimax", MiniMaxToolParser),
+            ("minimax_m2", MiniMaxToolParser),
         ]
         for name, expected_cls in test_cases:
             parser_cls = ToolParserManager.get_tool_parser(name)
@@ -92,6 +96,7 @@ class TestToolParserManager:
             "nemotron",
             "xlam",
             "functionary",
+            "minimax",
         ]:
             parser_cls = ToolParserManager.get_tool_parser(name)
             parser = parser_cls()  # Should not raise
@@ -521,6 +526,100 @@ class TestFunctionaryToolParser:
         assert not result.tools_called
 
 
+class TestMiniMaxToolParser:
+    """Test the MiniMax M2.1 tool parser."""
+
+    @pytest.fixture
+    def parser(self):
+        return MiniMaxToolParser()
+
+    def test_single_tool_call(self, parser):
+        """Test parsing a single MiniMax tool call."""
+        text = '<minimax:tool_call>\n<invoke name="get_weather">\n<parameter name="city">Paris</parameter>\n<parameter name="units">celsius</parameter>\n</invoke>\n</minimax:tool_call>'
+        result = parser.extract_tool_calls(text)
+
+        assert result.tools_called
+        assert len(result.tool_calls) == 1
+        assert result.tool_calls[0]["name"] == "get_weather"
+        args = json.loads(result.tool_calls[0]["arguments"])
+        assert args["city"] == "Paris"
+        assert args["units"] == "celsius"
+
+    def test_multiple_invocations(self, parser):
+        """Test parsing multiple invoke blocks in a single tool_call."""
+        text = '<minimax:tool_call>\n<invoke name="search_web">\n<parameter name="query">OpenAI</parameter>\n</invoke>\n<invoke name="search_web">\n<parameter name="query">Gemini</parameter>\n</invoke>\n</minimax:tool_call>'
+        result = parser.extract_tool_calls(text)
+
+        assert result.tools_called
+        assert len(result.tool_calls) == 2
+        assert result.tool_calls[0]["name"] == "search_web"
+        assert result.tool_calls[1]["name"] == "search_web"
+        args0 = json.loads(result.tool_calls[0]["arguments"])
+        args1 = json.loads(result.tool_calls[1]["arguments"])
+        assert args0["query"] == "OpenAI"
+        assert args1["query"] == "Gemini"
+
+    def test_with_think_tags(self, parser):
+        """Test that think tags are stripped before parsing."""
+        text = '<think>Let me check the weather</think>\n<minimax:tool_call>\n<invoke name="get_weather">\n<parameter name="city">Tokyo</parameter>\n</invoke>\n</minimax:tool_call>'
+        result = parser.extract_tool_calls(text)
+
+        assert result.tools_called
+        assert len(result.tool_calls) == 1
+        assert result.tool_calls[0]["name"] == "get_weather"
+
+    def test_no_tool_call(self, parser):
+        """Test that regular text is not parsed as tool call."""
+        text = "Hello, how can I help you today?"
+        result = parser.extract_tool_calls(text)
+
+        assert not result.tools_called
+        assert result.content == text
+
+    def test_tool_name_validation(self, parser):
+        """Test that invalid tool names are filtered out."""
+        text = '<minimax:tool_call>\n<invoke name="invalid_func">\n<parameter name="x">1</parameter>\n</invoke>\n</minimax:tool_call>'
+        request = {
+            "tools": [
+                {"function": {"name": "valid_func"}},
+            ]
+        }
+        result = parser.extract_tool_calls(text, request=request)
+
+        assert not result.tools_called
+
+    def test_parameter_deserialization(self, parser):
+        """Test that parameter values are properly deserialized."""
+        text = '<minimax:tool_call>\n<invoke name="test_func">\n<parameter name="count">42</parameter>\n<parameter name="active">true</parameter>\n<parameter name="items">[1, 2, 3]</parameter>\n<parameter name="label">hello world</parameter>\n</invoke>\n</minimax:tool_call>'
+        result = parser.extract_tool_calls(text)
+
+        assert result.tools_called
+        args = json.loads(result.tool_calls[0]["arguments"])
+        assert args["count"] == 42
+        assert args["active"] is True
+        assert args["items"] == [1, 2, 3]
+        assert args["label"] == "hello world"
+
+    def test_tool_call_id_uniqueness(self, parser):
+        """Test that each tool call gets a unique ID."""
+        text = '<minimax:tool_call>\n<invoke name="func1">\n<parameter name="a">1</parameter>\n</invoke>\n<invoke name="func2">\n<parameter name="b">2</parameter>\n</invoke>\n</minimax:tool_call>'
+        result = parser.extract_tool_calls(text)
+
+        assert result.tools_called
+        ids = [tc["id"] for tc in result.tool_calls]
+        assert len(ids) == len(set(ids)), "Tool call IDs should be unique"
+
+    def test_empty_input(self, parser):
+        """Test with empty input."""
+        result = parser.extract_tool_calls("")
+        assert not result.tools_called
+
+    def test_native_format_support(self, parser):
+        """Test that SUPPORTS_NATIVE_TOOL_FORMAT is True."""
+        assert MiniMaxToolParser.SUPPORTS_NATIVE_TOOL_FORMAT is True
+        assert MiniMaxToolParser.supports_native_format() is True
+
+
 class TestAutoToolParser:
     """Test the auto-detecting tool parser."""
 
@@ -669,6 +768,37 @@ class TestStreamingParsing:
             delta_text="[TOOL_CALLS]",
         )
         # Should start tool call parsing
+
+    def test_minimax_streaming(self):
+        """Test MiniMax streaming parsing."""
+        parser = MiniMaxToolParser()
+
+        # Regular content
+        result1 = parser.extract_tool_calls_streaming(
+            previous_text="",
+            current_text="Let me check",
+            delta_text="Let me check",
+        )
+        assert result1 == {"content": "Let me check"}
+
+        # Buffering while tool call is incomplete
+        result2 = parser.extract_tool_calls_streaming(
+            previous_text="",
+            current_text='<minimax:tool_call>\n<invoke name="get_weather">',
+            delta_text='<minimax:tool_call>\n<invoke name="get_weather">',
+        )
+        assert result2 is None
+
+        # Tool call complete
+        full_text = '<minimax:tool_call>\n<invoke name="get_weather">\n<parameter name="city">Paris</parameter>\n</invoke>\n</minimax:tool_call>'
+        result3 = parser.extract_tool_calls_streaming(
+            previous_text='<minimax:tool_call>\n<invoke name="get_weather">\n<parameter name="city">Paris</parameter>\n</invoke>\n',
+            current_text=full_text,
+            delta_text="</minimax:tool_call>",
+        )
+        assert result3 is not None
+        assert "tool_calls" in result3
+        assert result3["tool_calls"][0]["function"]["name"] == "get_weather"
 
     def test_auto_streaming(self):
         """Test auto parser streaming."""

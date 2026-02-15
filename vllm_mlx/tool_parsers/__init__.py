@@ -18,6 +18,7 @@ Available parsers:
 - xlam: Salesforce xLAM models
 - functionary/meetkai: MeetKai Functionary models
 - glm47/glm4: GLM-4.7 and GLM-4.7-Flash models
+- minimax/minimax_m2: MiniMax M2.1 models
 - harmony/gpt-oss: GPT-OSS models (Harmony format with channels)
 
 Usage:
@@ -56,6 +57,7 @@ from .nemotron_tool_parser import NemotronToolParser
 from .qwen_tool_parser import QwenToolParser
 from .xlam_tool_parser import xLAMToolParser
 from .glm47_tool_parser import Glm47ToolParser
+from .minimax_tool_parser import MiniMaxToolParser
 from .harmony_tool_parser import HarmonyToolParser
 
 __all__ = [
@@ -76,5 +78,6 @@ __all__ = [
     "xLAMToolParser",
     "FunctionaryToolParser",
     "Glm47ToolParser",
+    "MiniMaxToolParser",
     "HarmonyToolParser",
 ]
