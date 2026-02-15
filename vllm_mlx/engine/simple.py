@@ -7,9 +7,13 @@ performance when serving a single user at a time.
 """
 
 import asyncio
+import copy
 import logging
 from collections.abc import AsyncIterator
 from typing import Any
+
+from mlx_lm.models.cache import make_prompt_cache
+from mlx_lm.server import LRUPromptCache
 
 from ..api.tool_calling import convert_tools_for_template
 from ..api.utils import clean_output_text, is_mllm_model
@@ -32,6 +36,7 @@ class SimpleEngine(BaseEngine):
         trust_remote_code: bool = True,
         enable_cache: bool = True,
         force_mllm: bool = False,
+        prompt_cache_size: int = 10,
     ):
         """
         Initialize the simple engine.
@@ -41,6 +46,7 @@ class SimpleEngine(BaseEngine):
             trust_remote_code: Whether to trust remote code
             enable_cache: Enable VLM cache for multimodal models
             force_mllm: Force loading as MLLM even if not auto-detected
+            prompt_cache_size: Max entries in the prompt prefix KV cache (0 to disable)
         """
         self._model_name = model_name
         self._trust_remote_code = trust_remote_code
@@ -52,6 +58,10 @@ class SimpleEngine(BaseEngine):
 
         # Lock to serialize MLX operations (prevents Metal command buffer conflicts)
         self._generation_lock = asyncio.Lock()
+
+        # LRU trie-based prompt prefix cache for KV reuse across requests
+        self._prompt_cache_size = prompt_cache_size
+        self._prompt_cache = LRUPromptCache(max_size=prompt_cache_size) if prompt_cache_size > 0 else None
 
     @property
     def model_name(self) -> str:
@@ -101,6 +111,8 @@ class SimpleEngine(BaseEngine):
         """Stop the engine and cleanup resources."""
         self._model = None
         self._loaded = False
+        if self._prompt_cache_size > 0:
+            self._prompt_cache = LRUPromptCache(max_size=self._prompt_cache_size)
         logger.info("SimpleEngine stopped")
 
     async def generate(
@@ -181,24 +193,59 @@ class SimpleEngine(BaseEngine):
             await self.start()
 
         async with self._generation_lock:
+            # Look up prefix cache for KV reuse
+            cache = None
+            cache_snapshot = None
+            cache_key = None
+            remaining = prompt
+
+            if self._prompt_cache is not None:
+                tokenizer = self._model.tokenizer
+                tokens = tokenizer.encode(prompt)
+                cache, remaining = self._prompt_cache.fetch_nearest_cache(
+                    self._model_name, tokens
+                )
+                if cache is None:
+                    cache = make_prompt_cache(self._model.model)
+                reused = len(tokens) - len(remaining)
+                logger.info(
+                    f"Prompt cache: {reused}/{len(tokens)} tokens reused "
+                    f"({reused * 100 // max(len(tokens), 1)}%)"
+                )
+                cache_key = list(tokens)
+
+                # Snapshot cache BEFORE generation mutates it in place.
+                # deepcopy on MLX arrays is not part of mlx-lm's public API,
+                # so fall back to no caching if it fails.
+                try:
+                    cache_snapshot = copy.deepcopy(cache)
+                except Exception:
+                    logger.warning("Failed to snapshot prompt cache; skipping cache insert")
+                    cache_snapshot = None
+
             accumulated_text = ""
-            prompt_tokens = 0
+            prompt_tokens = len(tokens) if cache_key else 0
             completion_tokens = 0
             finished = False
 
-            for chunk in self._model.stream_generate(
-                prompt=prompt,
+            stream_kwargs = dict(
+                prompt=remaining,
                 max_tokens=max_tokens,
                 temperature=temperature,
                 top_p=top_p,
                 stop=stop,
                 **kwargs,
-            ):
-                prompt_tokens = (
-                    chunk.prompt_tokens
-                    if hasattr(chunk, "prompt_tokens")
-                    else prompt_tokens
-                )
+            )
+            if cache is not None:
+                stream_kwargs["prompt_cache"] = cache
+
+            for chunk in self._model.stream_generate(**stream_kwargs):
+                if prompt_tokens == 0:
+                    prompt_tokens = (
+                        chunk.prompt_tokens
+                        if hasattr(chunk, "prompt_tokens")
+                        else prompt_tokens
+                    )
                 completion_tokens += 1
                 new_text = chunk.text if hasattr(chunk, "text") else str(chunk)
                 accumulated_text += new_text
@@ -221,6 +268,12 @@ class SimpleEngine(BaseEngine):
 
                 if finished:
                     break
+
+            # Store prompt-only KV state for future prefix matching
+            if cache_snapshot is not None and cache_key is not None:
+                self._prompt_cache.insert_cache(
+                    self._model_name, cache_key, cache_snapshot
+                )
 
             if not finished:
                 if prompt_tokens == 0:

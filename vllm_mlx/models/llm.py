@@ -171,23 +171,25 @@ class MLXLanguageModel:
 
     def stream_generate(
         self,
-        prompt: str,
+        prompt: "str | list[int]",
         max_tokens: int = 256,
         temperature: float = 0.7,
         top_p: float = 0.9,
         repetition_penalty: float = 1.0,
         stop: list[str] | None = None,
+        prompt_cache: "list | None" = None,
     ) -> Iterator[StreamingOutput]:
         """
         Stream text generation token by token.
 
         Args:
-            prompt: Input prompt text
+            prompt: Input prompt text or token IDs
             max_tokens: Maximum number of tokens to generate
             temperature: Sampling temperature (0 = greedy)
             top_p: Top-p (nucleus) sampling parameter
             repetition_penalty: Penalty for repeating tokens
             stop: List of stop sequences
+            prompt_cache: Optional KV cache from previous generation
 
         Yields:
             StreamingOutput for each generated token
@@ -203,12 +205,17 @@ class MLXLanguageModel:
         token_count = 0
         accumulated_text = ""
 
+        kwargs = {}
+        if prompt_cache is not None:
+            kwargs["prompt_cache"] = prompt_cache
+
         for response in stream_generate(
             self.model,
             self.tokenizer,
             prompt=prompt,
             max_tokens=max_tokens,
             sampler=sampler,
+            **kwargs,
         ):
             token_count += 1
             # response.text is the new token text (not accumulated)
