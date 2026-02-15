@@ -63,13 +63,18 @@ def load_model_with_fallback(model_name: str, tokenizer_config: dict = None):
 
 def _load_with_tokenizer_fallback(model_name: str):
     """Load model with fallback tokenizer for non-standard models like Nemotron."""
-    from huggingface_hub import snapshot_download
     from mlx_lm.utils import load_model
 
     logger.info("Loading with tokenizer fallback...")
 
-    # Get model path
-    model_path = Path(snapshot_download(model_name))
+    # Get model path - use local path if it exists, otherwise download from Hub
+    local_path = Path(model_name)
+    if local_path.is_dir():
+        model_path = local_path
+    else:
+        from huggingface_hub import snapshot_download
+
+        model_path = Path(snapshot_download(model_name))
 
     # Load model
     model, _ = load_model(model_path)
