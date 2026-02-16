@@ -1928,16 +1928,82 @@ async def stream_chat_completion(
                 # Skip this chunk (e.g., <think> token itself)
                 continue
 
+            content = delta_msg.content
+            reasoning = delta_msg.reasoning
+
+            # Tool call parsing on content portion
+            if tool_parser and content:
+                if not tool_markup_possible and "<" not in content:
+                    tool_accumulated_text += content
+                    # No tool markup yet, fall through to normal emission
+                else:
+                    if not tool_markup_possible:
+                        tool_markup_possible = True
+                    tool_previous = tool_accumulated_text
+                    tool_accumulated_text += content
+                    tool_result = tool_parser.extract_tool_calls_streaming(
+                        tool_previous, tool_accumulated_text, content
+                    )
+
+                    if tool_result is None:
+                        # Inside tool markup - suppress content output
+                        if reasoning:
+                            # Still emit reasoning while buffering tool call
+                            chunk = ChatCompletionChunk(
+                                id=response_id,
+                                model=request.model,
+                                choices=[
+                                    ChatCompletionChunkChoice(
+                                        delta=ChatCompletionChunkDelta(
+                                            reasoning=reasoning,
+                                        ),
+                                        finish_reason=None,
+                                    )
+                                ],
+                                usage=None,
+                            )
+                            yield f"data: {chunk.model_dump_json()}\n\n"
+                        continue
+
+                    if "tool_calls" in tool_result:
+                        # Emit structured tool calls
+                        tool_calls_detected = True
+                        chunk = ChatCompletionChunk(
+                            id=response_id,
+                            model=request.model,
+                            choices=[
+                                ChatCompletionChunkChoice(
+                                    delta=ChatCompletionChunkDelta(
+                                        tool_calls=tool_result["tool_calls"],
+                                        reasoning=reasoning,
+                                    ),
+                                    finish_reason=(
+                                        "tool_calls" if output.finished else None
+                                    ),
+                                )
+                            ],
+                            usage=get_usage(output) if output.finished else None,
+                        )
+                        yield f"data: {chunk.model_dump_json()}\n\n"
+                        continue
+
+                    # Normal content from tool parser
+                    content = tool_result.get("content", "")
+
             chunk = ChatCompletionChunk(
                 id=response_id,
                 model=request.model,
                 choices=[
                     ChatCompletionChunkChoice(
                         delta=ChatCompletionChunkDelta(
-                            content=delta_msg.content,
-                            reasoning=delta_msg.reasoning,
+                            content=content if content else None,
+                            reasoning=reasoning,
                         ),
-                        finish_reason=output.finish_reason if output.finished else None,
+                        finish_reason=(
+                            "tool_calls"
+                            if (output.finished and tool_calls_detected)
+                            else (output.finish_reason if output.finished else None)
+                        ),
                     )
                 ],
                 usage=get_usage(output) if output.finished else None,
