@@ -18,6 +18,7 @@ Browse thousands of pre-optimized models at: **https://huggingface.co/mlx-commun
 | Phi-3 | 3.8B, 14B | 4-bit |
 | Granite 3.x, 4.x | Various | 4-bit |
 | Nemotron | 3 Nano 30B | 6-bit |
+| Step 3.5 | Flash 196B (MoE, 11B active) | 4-bit |
 
 ### Recommended Models
 

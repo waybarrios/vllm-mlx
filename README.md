@@ -164,7 +164,7 @@ python examples/tts_multilingual.py --list-languages
 
 ### Reasoning Models
 
-Extract the thinking process from reasoning models like Qwen3 and DeepSeek-R1:
+Extract the thinking process from reasoning models like Qwen3, DeepSeek-R1, and Step 3.5 Flash:
 
 ```bash
 # Start server with reasoning parser
@@ -187,6 +187,7 @@ print("Answer:", response.choices[0].message.content)
 |--------|--------|-------------|
 | `qwen3` | Qwen3 series | Requires both `<think>` and `</think>` tags |
 | `deepseek_r1` | DeepSeek-R1 | Handles implicit `<think>` tag |
+| `step3p5` | Step 3.5 Flash | Alias for `deepseek_r1`, `<think>` tags |
 
 ### Embeddings
 

@@ -84,6 +84,7 @@ def _register_builtin_parsers():
     register_parser("deepseek_r1", DeepSeekR1ReasoningParser)
     register_parser("gpt_oss", GptOssReasoningParser)
     register_parser("harmony", HarmonyReasoningParser)
+    register_parser("step3p5", DeepSeekR1ReasoningParser)
 
 
 # Register built-in parsers on module load
