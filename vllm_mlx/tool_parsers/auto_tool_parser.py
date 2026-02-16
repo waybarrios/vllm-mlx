@@ -53,6 +53,15 @@ class AutoToolParser(ToolParser):
     NEMOTRON_PARAM_PATTERN = re.compile(
         r"<parameter=([^>]+)>\s*(.*?)\s*</parameter>", re.DOTALL
     )
+    MINIMAX_PATTERN = re.compile(
+        r"<minimax:tool_call>(.*?)</minimax:tool_call>", re.DOTALL
+    )
+    MINIMAX_INVOKE_PATTERN = re.compile(
+        r'<invoke name="([^"]+)"\s*>(.*?)</invoke>', re.DOTALL
+    )
+    MINIMAX_PARAM_PATTERN = re.compile(
+        r'<parameter name="([^"]+)"\s*>(.*?)</parameter>', re.DOTALL
+    )
 
     def extract_tool_calls(
         self, model_output: str, request: dict[str, Any] | None = None
@@ -156,6 +165,34 @@ class AutoToolParser(ToolParser):
 
         if nemotron_matches:
             cleaned_text = self.NEMOTRON_PATTERN.sub("", cleaned_text).strip()
+
+        # 3.5. Try MiniMax format (before Qwen/Hermes as it's more specific)
+        minimax_blocks = self.MINIMAX_PATTERN.findall(cleaned_text)
+        for block in minimax_blocks:
+            invoke_matches = self.MINIMAX_INVOKE_PATTERN.findall(block)
+            for func_name, params_section in invoke_matches:
+                func_name = func_name.strip()
+                if not func_name:
+                    continue
+                arguments = {}
+                param_matches = self.MINIMAX_PARAM_PATTERN.findall(params_section)
+                for p_name, p_value in param_matches:
+                    key = p_name.strip()
+                    val = p_value.strip()
+                    try:
+                        arguments[key] = json.loads(val)
+                    except json.JSONDecodeError:
+                        arguments[key] = val
+                tool_calls.append(
+                    {
+                        "id": generate_tool_id(),
+                        "name": func_name,
+                        "arguments": json.dumps(arguments, ensure_ascii=False),
+                    }
+                )
+
+        if minimax_blocks:
+            cleaned_text = self.MINIMAX_PATTERN.sub("", cleaned_text).strip()
 
         # 4. Try Qwen/Hermes XML pattern
         xml_matches = self.QWEN_XML_PATTERN.findall(cleaned_text)
@@ -331,6 +368,7 @@ class AutoToolParser(ToolParser):
             "[Calling tool:",
             "<tool_call>",
             "<function=",
+            "<minimax:tool_call>",
         ]
 
         has_marker = any(m in current_text for m in markers)
@@ -339,7 +377,7 @@ class AutoToolParser(ToolParser):
             return {"content": delta_text}
 
         # Check for completion markers
-        end_markers = ["</tool_call>", "</function>", ")]"]
+        end_markers = ["</tool_call>", "</function>", ")]", "</minimax:tool_call>"]
         if any(m in delta_text for m in end_markers):
             result = self.extract_tool_calls(current_text)
             if result.tools_called:
