@@ -200,6 +200,10 @@ def _install_chunked_prefill(
             batch.tokens,
         )
         mx.async_eval(batch.y, batch.logprobs)
+        # Evaluate accumulated tokens to prevent Metal buffer buildup
+        # from lazy mx.concatenate() chains holding AGXAllocation handles
+        if batch.tokens:
+            mx.async_eval(*batch.tokens)
 
         y = y.tolist()
         self._stats.generation_time += _time.perf_counter() - tic_gen
@@ -2232,9 +2236,24 @@ class Scheduler:
         old_finished = self.finished_req_ids
         self.finished_req_ids = set()
 
-        # Periodically clear Metal cache to prevent memory accumulation
+        # Adaptive interval: scale inversely with concurrency to prevent
+        # Metal resource handle exhaustion under high-concurrency workloads.
+        active_seqs = len(self.running)
+        effective_interval = max(
+            8, self._clear_cache_interval // max(1, active_seqs // 8)
+        )
+
         self._step_count += 1
-        if self._step_count % self._clear_cache_interval == 0:
+        if self._step_count % effective_interval == 0:
+            # Evaluate batch tokens to collapse lazy concatenation chains
+            if (
+                self.batch_generator is not None
+                and self.batch_generator.active_batch is not None
+                and hasattr(self.batch_generator.active_batch, "tokens")
+            ):
+                tokens = self.batch_generator.active_batch.tokens
+                if tokens:
+                    mx.eval(*tokens)
             mx.clear_cache()
 
         # Periodically log memory stats for monitoring
