@@ -15,8 +15,6 @@ logger = logging.getLogger(__name__)
 
 # Default config search paths
 CONFIG_SEARCH_PATHS = [
-    "./mcp.json",
-    "./mcp.yaml",
     "~/.config/vllm-mlx/mcp.json",
     "~/.config/vllm-mlx/mcp.yaml",
 ]

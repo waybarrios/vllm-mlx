@@ -56,10 +56,12 @@ DANGEROUS_PATTERNS: List[re.Pattern] = [
     re.compile(r"\|\|\s*"),  # Command chaining with ||
     re.compile(r"`"),  # Backtick command substitution
     re.compile(r"\$\("),  # $() command substitution
+    re.compile(r"\$\{"),  # ${} variable expansion
     re.compile(r">\s*"),  # Output redirection
     re.compile(r"<\s*"),  # Input redirection
     re.compile(r"\.\./"),  # Path traversal
     re.compile(r"~"),  # Home directory expansion (can be abused)
+    re.compile(r"[\n\r]"),  # Newline command injection
 ]
 
 # Dangerous argument patterns
@@ -73,7 +75,12 @@ DANGEROUS_ARG_PATTERNS: List[re.Pattern] = [
     re.compile(r"\$\{"),
     re.compile(r">\s*/"),  # Redirect to absolute path
     re.compile(r"<\s*/"),  # Read from absolute path
+    re.compile(r"[\n\r]"),  # Newline command injection
 ]
+
+# Interpreter commands that can execute inline code
+INTERPRETER_COMMANDS = {"python", "python3", "node", "ruby", "perl"}
+DANGEROUS_INTERPRETER_ARGS = {"-c", "--command", "-e", "--eval", "exec", "eval"}
 
 
 class MCPSecurityError(Exception):
@@ -93,7 +100,6 @@ class MCPCommandValidator:
     def __init__(
         self,
         allowed_commands: Optional[Set[str]] = None,
-        allow_unsafe: bool = False,
         custom_whitelist: Optional[Set[str]] = None,
         check_path_exists: bool = True,
     ):
@@ -102,24 +108,14 @@ class MCPCommandValidator:
 
         Args:
             allowed_commands: Set of allowed command names. If None, uses default whitelist.
-            allow_unsafe: If True, allows any command (for development only).
-                         WARNING: This disables security checks!
             custom_whitelist: Additional commands to allow beyond the default whitelist.
             check_path_exists: If True, verify command exists in PATH. Set to False for testing.
         """
-        self.allow_unsafe = allow_unsafe
         self.allowed_commands = allowed_commands or ALLOWED_COMMANDS.copy()
         self.check_path_exists = check_path_exists
 
         if custom_whitelist:
             self.allowed_commands.update(custom_whitelist)
-
-        if allow_unsafe:
-            logger.warning(
-                "MCP SECURITY WARNING: Unsafe mode enabled. "
-                "All commands will be allowed without validation. "
-                "This should NEVER be used in production!"
-            )
 
     def validate_command(self, command: str, server_name: str) -> None:
         """
@@ -132,13 +128,6 @@ class MCPCommandValidator:
         Raises:
             MCPSecurityError: If the command is not allowed
         """
-        if self.allow_unsafe:
-            logger.warning(
-                f"MCP security bypassed for server '{server_name}': "
-                f"allowing command '{command}' (unsafe mode)"
-            )
-            return
-
         # Check for dangerous patterns in command
         for pattern in DANGEROUS_PATTERNS:
             if pattern.search(command):
@@ -193,9 +182,6 @@ class MCPCommandValidator:
         Raises:
             MCPSecurityError: If any argument contains dangerous patterns
         """
-        if self.allow_unsafe:
-            return
-
         for i, arg in enumerate(args):
             for pattern in DANGEROUS_ARG_PATTERNS:
                 if pattern.search(arg):
@@ -203,6 +189,14 @@ class MCPCommandValidator:
                         f"MCP server '{server_name}': Argument {i} contains dangerous "
                         f"pattern: '{arg}'. Potential command injection blocked."
                     )
+
+        # Block dangerous interpreter flags (e.g. python -c, node -e)
+        for arg in args:
+            if arg in DANGEROUS_INTERPRETER_ARGS:
+                raise MCPSecurityError(
+                    f"MCP server '{server_name}': Argument '{arg}' blocked — "
+                    f"inline code execution not allowed"
+                )
 
         logger.debug(
             f"MCP server '{server_name}': {len(args)} arguments validated successfully"
@@ -219,7 +213,7 @@ class MCPCommandValidator:
         Raises:
             MCPSecurityError: If any env var contains dangerous patterns
         """
-        if self.allow_unsafe or not env:
+        if not env:
             return
 
         # Dangerous environment variables that could affect execution
@@ -264,9 +258,6 @@ class MCPCommandValidator:
         Raises:
             MCPSecurityError: If the URL is not safe
         """
-        if self.allow_unsafe:
-            return
-
         # Must be http or https
         if not url.startswith(("http://", "https://")):
             raise MCPSecurityError(
@@ -497,15 +488,14 @@ class ToolSandbox:
         )
 
     def _check_high_risk_tool(self, tool_name: str) -> None:
-        """Check if tool matches high-risk patterns."""
+        """Check if tool matches high-risk patterns and block it."""
         tool_lower = tool_name.lower()
         for pattern in HIGH_RISK_TOOL_PATTERNS:
             if pattern in tool_lower:
-                logger.warning(
-                    f"High-risk tool detected: '{tool_name}' matches pattern '{pattern}'. "
-                    f"Ensure this tool is from a trusted MCP server."
+                raise MCPSecurityError(
+                    f"High-risk tool blocked: '{tool_name}' matches pattern '{pattern}'. "
+                    f"Add to allowed_tools explicitly to permit."
                 )
-                break
 
     def _validate_arguments(self, tool_name: str, arguments: Dict[str, Any]) -> None:
         """Validate tool arguments for dangerous patterns."""

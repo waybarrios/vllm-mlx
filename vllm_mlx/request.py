@@ -48,6 +48,9 @@ class RequestStatus(enum.IntEnum):
         return None
 
 
+MAX_TOKENS_LIMIT = 131072  # 128K hard upper bound
+
+
 @dataclass
 class SamplingParams:
     """Sampling parameters for text generation."""
@@ -66,6 +69,8 @@ class SamplingParams:
             self.stop = []
         if self.stop_token_ids is None:
             self.stop_token_ids = []
+        if self.max_tokens > MAX_TOKENS_LIMIT:
+            self.max_tokens = MAX_TOKENS_LIMIT
 
 
 @dataclass
