@@ -1316,7 +1316,7 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
         # Convert Pydantic messages to dicts preserving full content
         messages = []
         for msg in request.messages:
-            msg_dict = msg.model_dump() if hasattr(msg, "model_dump") else dict(msg)
+            msg_dict = msg.model_dump(exclude_none=True) if hasattr(msg, "model_dump") else dict(msg)
             messages.append(msg_dict)
         images, videos = [], []  # MLLM extracts these from messages
         logger.debug(f"MLLM: Processing {len(messages)} messages")
