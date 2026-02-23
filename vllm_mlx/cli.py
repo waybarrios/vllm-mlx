@@ -174,6 +174,10 @@ def serve_command(args):
             kv_cache_min_quantize_tokens=args.kv_cache_min_quantize_tokens,
         )
 
+        # Override prefill_step_size if explicitly set (0 = use engine default)
+        if args.prefill_step_size > 0:
+            scheduler_config.prefill_step_size = args.prefill_step_size
+
         print("Mode: Continuous batching (for multiple concurrent users)")
         if args.chunked_prefill_tokens > 0:
             print(f"Chunked prefill: {args.chunked_prefill_tokens} tokens per step")
@@ -289,6 +293,11 @@ def bench_command(args):
             kv_cache_quantization_group_size=args.kv_cache_quantization_group_size,
             kv_cache_min_quantize_tokens=args.kv_cache_min_quantize_tokens,
         )
+
+        # Override prefill_step_size if explicitly set (0 = use engine default)
+        if args.prefill_step_size > 0:
+            scheduler_config.prefill_step_size = args.prefill_step_size
+
         engine_config = EngineConfig(
             model_name=args.model,
             scheduler_config=scheduler_config,
@@ -669,6 +678,12 @@ Examples:
         "--completion-batch-size", type=int, default=32, help="Completion batch size"
     )
     serve_parser.add_argument(
+        "--prefill-step-size",
+        type=int,
+        default=0,
+        help="Max tokens per prefill forward pass (0=use engine default: 2048 for LLM, 1024 for MLLM)",
+    )
+    serve_parser.add_argument(
         "--enable-prefix-cache",
         action="store_true",
         default=True,
@@ -977,6 +992,12 @@ Examples:
     )
     bench_parser.add_argument(
         "--completion-batch-size", type=int, default=16, help="Completion batch size"
+    )
+    bench_parser.add_argument(
+        "--prefill-step-size",
+        type=int,
+        default=0,
+        help="Max tokens per prefill forward pass (0=use engine default: 2048 for LLM, 1024 for MLLM)",
     )
     bench_parser.add_argument(
         "--enable-prefix-cache",
