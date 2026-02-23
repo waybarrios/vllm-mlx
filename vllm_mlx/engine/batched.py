@@ -137,6 +137,7 @@ class BatchedEngine(BaseEngine):
         scheduler_config: Any | None = None,
         stream_interval: int = 1,
         force_mllm: bool = False,
+        gpu_memory_utilization: float = 0.90,
     ):
         """
         Initialize the batched engine.
@@ -147,11 +148,14 @@ class BatchedEngine(BaseEngine):
             scheduler_config: Optional scheduler configuration
             stream_interval: Tokens to batch before streaming (1=every token)
             force_mllm: Force loading as MLLM even if not auto-detected
+            gpu_memory_utilization: Fraction of device memory for Metal allocation
+                limit and emergency threshold (0.0-1.0, default 0.90)
         """
         self._model_name = model_name
         self._trust_remote_code = trust_remote_code
         self._scheduler_config = scheduler_config
         self._stream_interval = stream_interval
+        self._gpu_memory_utilization = gpu_memory_utilization
         self._is_mllm = force_mllm or is_mllm_model(model_name)
 
         self._model = None
@@ -283,13 +287,14 @@ class BatchedEngine(BaseEngine):
                     device_info.get("memory_size", 0),
                 )
                 if max_recommended > 0:
-                    soft_limit = int(max_recommended * 0.90)
+                    soft_limit = int(max_recommended * self._gpu_memory_utilization)
                     mx.set_memory_limit(soft_limit)
                     mx.set_cache_limit(32 * 1024 * 1024 * 1024)  # 32GB
+                    pct = self._gpu_memory_utilization * 100
                     logger.info(
                         f"Metal memory limits set: "
                         f"allocation_limit={soft_limit / 1e9:.1f}GB "
-                        f"(90% of {max_recommended / 1e9:.1f}GB), "
+                        f"({pct:.0f}% of {max_recommended / 1e9:.1f}GB), "
                         f"cache_limit=32GB"
                     )
         except Exception as e:
@@ -301,6 +306,7 @@ class BatchedEngine(BaseEngine):
             model_name=self._model_name,
             scheduler_config=scheduler_config,
             stream_interval=self._stream_interval,
+            gpu_memory_utilization=self._gpu_memory_utilization,
         )
 
         # Create async engine

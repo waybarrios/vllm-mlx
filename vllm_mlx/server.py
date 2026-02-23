@@ -467,6 +467,7 @@ def load_model(
     stream_interval: int = 1,
     max_tokens: int = 32768,
     force_mllm: bool = False,
+    gpu_memory_utilization: float = 0.90,
 ):
     """
     Load a model (auto-detects MLLM vs LLM).
@@ -478,6 +479,8 @@ def load_model(
         stream_interval: Tokens to batch before streaming (batched mode only)
         max_tokens: Default max tokens for generation
         force_mllm: Force loading as MLLM even if not auto-detected
+        gpu_memory_utilization: Fraction of device memory for Metal allocation
+            limit and emergency threshold (0.0-1.0, default 0.90)
     """
     global _engine, _model_name, _default_max_tokens, _tool_parser_instance
 
@@ -496,6 +499,7 @@ def load_model(
             scheduler_config=scheduler_config,
             stream_interval=stream_interval,
             force_mllm=force_mllm,
+            gpu_memory_utilization=gpu_memory_utilization,
         )
         # BatchedEngine will be started in lifespan (uvicorn's event loop)
         # Just log for now
