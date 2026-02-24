@@ -117,6 +117,10 @@ class Request:
     block_table: Optional["BlockTable"] = None  # Block table for paged cache
     shared_prefix_blocks: int = 0  # Number of shared prefix blocks
 
+    # Speculative decoding fields
+    spec_token_ids: Optional[List[int]] = None  # Draft token IDs proposed for this request
+    num_spec_accepted: int = 0  # Number of accepted speculative tokens this step
+
     # Multimodal content (images, video) - raw inputs
     images: Optional[List[Any]] = None
     videos: Optional[List[Any]] = None

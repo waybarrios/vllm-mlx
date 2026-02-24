@@ -85,6 +85,11 @@ def _register_builtin_parsers():
     register_parser("gpt_oss", GptOssReasoningParser)
     register_parser("harmony", HarmonyReasoningParser)
 
+    # Kimi K2.5 uses <think>...</think> tags like DeepSeek R1
+    register_parser("kimi", DeepSeekR1ReasoningParser)
+    register_parser("kimi_k2", DeepSeekR1ReasoningParser)
+    register_parser("moonshot", DeepSeekR1ReasoningParser)
+
 
 # Register built-in parsers on module load
 _register_builtin_parsers()

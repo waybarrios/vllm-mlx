@@ -588,6 +588,7 @@ async def status():
         "cache": stats.get("memory_aware_cache")
         or stats.get("paged_cache")
         or stats.get("prefix_cache"),
+        "spec_decode": stats.get("spec_decode"),
         "requests": stats.get("requests", []),
     }
 
@@ -1387,23 +1388,24 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
     # Parse tool calls from output using configured parser
     cleaned_text, tool_calls = _parse_tool_calls_with_parser(output.text, request)
 
-    # Extract reasoning content FIRST (strips channel tokens before JSON extraction)
+    # Process response_format if specified
+    if response_format and not tool_calls:
+        cleaned_text, parsed_json, is_valid, error = parse_json_output(
+            cleaned_text or output.text, response_format
+        )
+        if parsed_json is not None:
+            # Return JSON as string
+            cleaned_text = json.dumps(parsed_json)
+        if not is_valid:
+            logger.warning(f"JSON validation failed: {error}")
+
+    # Extract reasoning content if parser is enabled
     reasoning_text = None
     if _reasoning_parser and not tool_calls:
         text_to_parse = cleaned_text or output.text
         reasoning_text, cleaned_text = _reasoning_parser.extract_reasoning(
             text_to_parse
         )
-
-    # Process response_format if specified (after reasoning parser cleaned the text)
-    if response_format and not tool_calls:
-        json_input = cleaned_text or output.text
-        _, parsed_json, is_valid, error = parse_json_output(json_input, response_format)
-        if parsed_json is not None:
-            # Return JSON as string
-            cleaned_text = json.dumps(parsed_json)
-        if not is_valid:
-            logger.warning(f"JSON validation failed: {error}")
 
     # Determine finish reason
     finish_reason = "tool_calls" if tool_calls else output.finish_reason
@@ -1866,9 +1868,11 @@ async def stream_chat_completion(
     )
     yield f"data: {first_chunk.model_dump_json()}\n\n"
 
-    # Track if we need to add <think> prefix for thinking models (when no reasoning parser)
-    # The template adds <think> to the prompt, so the model output starts inside the think block
-    is_thinking_model = "nemotron" in request.model.lower() and not _reasoning_parser
+    # Thinking mode is controlled by VLLM_MLX_ENABLE_THINKING env var.
+    # When a reasoning parser is active, it handles extraction properly.
+    # The <think> prefix is only needed as fallback when thinking is enabled
+    # but no parser is active (shouldn't happen with current auto-detect logic).
+    is_thinking_model = os.environ.get("VLLM_MLX_ENABLE_THINKING", "") == "1" and not _reasoning_parser
     think_prefix_sent = False
 
     # Reset reasoning parser state for this stream
@@ -1953,7 +1957,9 @@ async def stream_chat_completion(
 
             # Add <think> prefix on first content chunk for thinking models
             if is_thinking_model and not think_prefix_sent and content:
-                content = "<think>" + content
+                # Guard against double <think> if model already emits the tag
+                if not content.lstrip().startswith("<think>"):
+                    content = "<think>" + content
                 think_prefix_sent = True
 
             # Tool call streaming parsing
@@ -2112,8 +2118,19 @@ async def init_mcp(config_path: str):
 # =============================================================================
 
 
-def main():
-    """Run the server."""
+def main(argv=None):
+    """Run the server.
+
+    Parameters
+    ----------
+    argv : list[str] | None
+        Command-line arguments to parse.  When *None* (the default),
+        ``sys.argv[1:]`` is used.  Passing an explicit list allows
+        callers such as ``distributed_launcher.py`` to invoke the
+        server without manipulating ``sys.argv``.
+    """
+    from .cli_args import add_all_serve_args, build_scheduler_config, validate_serve_args
+
     parser = argparse.ArgumentParser(
         description="vllm-mlx OpenAI-compatible server for LLM and MLLM inference",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -2129,98 +2146,10 @@ Examples:
     python -m vllm_mlx.server --model mlx-community/Qwen3-4B-4bit --mcp-config mcp.json
         """,
     )
-    parser.add_argument(
-        "--model",
-        type=str,
-        default="mlx-community/Llama-3.2-3B-Instruct-4bit",
-        help="Model to load (HuggingFace model name or local path)",
-    )
-    parser.add_argument(
-        "--host",
-        type=str,
-        default="0.0.0.0",
-        help="Host to bind to",
-    )
-    parser.add_argument(
-        "--port",
-        type=int,
-        default=8000,
-        help="Port to bind to",
-    )
-    parser.add_argument(
-        "--mllm",
-        action="store_true",
-        help="Force loading as MLLM (multimodal language model)",
-    )
-    parser.add_argument(
-        "--continuous-batching",
-        action="store_true",
-        help="Enable continuous batching for multiple concurrent users",
-    )
-    parser.add_argument(
-        "--mcp-config",
-        type=str,
-        default=None,
-        help="Path to MCP configuration file (JSON/YAML)",
-    )
-    parser.add_argument(
-        "--max-tokens",
-        type=int,
-        default=32768,
-        help="Default max tokens for generation",
-    )
-    parser.add_argument(
-        "--api-key",
-        type=str,
-        default=None,
-        help="API key for authentication (if not set, no auth required)",
-    )
-    parser.add_argument(
-        "--timeout",
-        type=float,
-        default=300.0,
-        help="Default request timeout in seconds (default: 300)",
-    )
-    parser.add_argument(
-        "--rate-limit",
-        type=int,
-        default=0,
-        help="Rate limit requests per minute per client (0 = disabled)",
-    )
-    # Reasoning parser options - choices loaded dynamically from registry
-    from .reasoning import list_parsers
+    add_all_serve_args(parser, positional_model=False)
 
-    reasoning_choices = list_parsers()
-    parser.add_argument(
-        "--reasoning-parser",
-        type=str,
-        default=None,
-        choices=reasoning_choices,
-        help=(
-            "Enable reasoning content extraction with specified parser. "
-            f"Options: {', '.join(reasoning_choices)}."
-        ),
-    )
-    parser.add_argument(
-        "--embedding-model",
-        type=str,
-        default=None,
-        help="Pre-load an embedding model at startup (e.g. mlx-community/all-MiniLM-L6-v2-4bit)",
-    )
-    parser.add_argument(
-        "--default-temperature",
-        type=float,
-        default=None,
-        help="Default temperature for generation when not specified in request",
-    )
-    parser.add_argument(
-        "--default-top-p",
-        type=float,
-        default=None,
-        help="Default top_p for generation when not specified in request",
-    )
-
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
+    validate_serve_args(args)
 
     # Set global configuration
     global _api_key, _default_timeout, _rate_limiter
@@ -2258,17 +2187,57 @@ Examples:
     if args.mcp_config:
         os.environ["VLLM_MLX_MCP_CONFIG"] = args.mcp_config
 
-    # Initialize reasoning parser if specified
-    if args.reasoning_parser:
+    # --- Thinking mode ---
+    # --enable-thinking: model generates <think>...</think> before responding.
+    # --reasoning-parser: explicit parser choice (implies --enable-thinking).
+    enable_thinking = getattr(args, 'enable_thinking', False) or bool(args.reasoning_parser)
+
+    if enable_thinking and not args.reasoning_parser:
+        # Auto-detect parser from model name
+        _thinking_model_map = {
+            "kimi": "kimi",
+            "qwen3": "qwen3",
+            "deepseek-r1": "deepseek_r1",
+            "deepseek_r1": "deepseek_r1",
+        }
+        model_lower = args.model.lower()
+        for pattern, parser_name in _thinking_model_map.items():
+            if pattern in model_lower:
+                args.reasoning_parser = parser_name
+                break
+        if not args.reasoning_parser:
+            # Fallback: use deepseek_r1 parser (generic <think> tag handler)
+            args.reasoning_parser = "deepseek_r1"
+        logger.info(f"Thinking mode enabled, parser: {args.reasoning_parser}")
+
+    # Activate reasoning parser
+    if enable_thinking and args.reasoning_parser:
         global _reasoning_parser
         from .reasoning import get_parser
-
         parser_cls = get_parser(args.reasoning_parser)
         _reasoning_parser = parser_cls()
-        logger.info(f"Reasoning parser enabled: {args.reasoning_parser}")
+        logger.info(f"Reasoning parser activated: {args.reasoning_parser}")
+
+    # Export flag for engine
+    if enable_thinking:
+        os.environ["VLLM_MLX_ENABLE_THINKING"] = "1"
+    else:
+        os.environ.pop("VLLM_MLX_ENABLE_THINKING", None)
+    os.environ.pop("VLLM_MLX_REASONING_PARSER", None)  # No longer needed
+
+    # Configure tool calling
+    if getattr(args, 'enable_auto_tool_choice', False) and getattr(args, 'tool_call_parser', None):
+        global _enable_auto_tool_choice, _tool_call_parser
+        _enable_auto_tool_choice = True
+        _tool_call_parser = args.tool_call_parser
 
     # Pre-load embedding model if specified
     load_embedding_model(args.embedding_model, lock=True)
+
+    # Build scheduler config
+    scheduler_config = None
+    if args.continuous_batching:
+        scheduler_config = build_scheduler_config(args)
 
     # Load model before starting server
     load_model(
@@ -2276,6 +2245,8 @@ Examples:
         use_batching=args.continuous_batching,
         max_tokens=args.max_tokens,
         force_mllm=args.mllm,
+        scheduler_config=scheduler_config,
+        stream_interval=args.stream_interval if args.continuous_batching else 1,
     )
 
     # Start server

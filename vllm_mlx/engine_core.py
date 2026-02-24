@@ -13,6 +13,7 @@ The design follows vLLM's engine architecture adapted for MLX.
 
 import asyncio
 import logging
+import os
 import time
 import uuid
 from dataclasses import dataclass
@@ -91,6 +92,14 @@ class EngineCore:
             config=scheduler_config,
         )
 
+        # Log speculative decoding status
+        if scheduler_config.speculative_method is not None:
+            logger.info(
+                f"Engine {self._engine_id} speculative decoding: "
+                f"method={scheduler_config.speculative_method}, "
+                f"k={scheduler_config.num_speculative_tokens}"
+            )
+
         # Output collectors for low-latency streaming (vLLM pattern)
         self._output_collectors: Dict[str, RequestOutputCollector] = {}
         self._stream_states: Dict[str, RequestStreamState] = {}
@@ -150,9 +159,26 @@ class EngineCore:
         stream_interval = self.config.stream_interval
         use_simple_streaming = stream_interval == 1
 
-        # Emergency memory pressure threshold (200GB)
-        _memory_pressure_threshold = 200 * 1024 * 1024 * 1024
+        # Emergency memory pressure threshold: 95% of Metal allocation limit.
+        # Avoids hardcoded values that are either too low (< model weight size,
+        # causing infinite clear_cache loops) or too high (> allocation limit,
+        # making the check useless).  Falls back to 90% of device memory.
         _memory_check_interval = 64
+        try:
+            _device_info = mx.device_info()
+            _max_rec = _device_info.get(
+                "max_recommended_working_set_size",
+                _device_info.get("memory_size", 0),
+            )
+            _memory_pressure_threshold = int(_max_rec * 0.95) if _max_rec > 0 else 0
+        except Exception:
+            _memory_pressure_threshold = 0  # disable check if detection fails
+        if _memory_pressure_threshold > 0:
+            logger.info(
+                f"Memory pressure threshold: "
+                f"{_memory_pressure_threshold / 1e9:.1f}GB "
+                f"(95% of {_max_rec / 1e9:.1f}GB)"
+            )
 
         while self._running:
             try:
@@ -180,7 +206,7 @@ class EngineCore:
                     self._steps_executed += 1
 
                     # Emergency memory pressure check
-                    if self._steps_executed % _memory_check_interval == 0:
+                    if _memory_pressure_threshold > 0 and self._steps_executed % _memory_check_interval == 0:
                         try:
                             active_mem = mx.get_active_memory()
                             if active_mem > _memory_pressure_threshold:
@@ -232,7 +258,6 @@ class EngineCore:
                         # making the server unresponsive to all HTTP requests.
                         await asyncio.sleep(0)
                 else:
-                    # No work, yield control
                     await asyncio.sleep(step_interval)
 
             except asyncio.CancelledError:
@@ -515,7 +540,7 @@ class EngineCore:
         scheduler_stats = self.scheduler.get_stats()
         uptime = time.time() - self._start_time if self._start_time else 0
 
-        return {
+        stats = {
             "running": self._running,
             "uptime_seconds": uptime,
             "steps_executed": self._steps_executed,
@@ -524,6 +549,21 @@ class EngineCore:
             "requests": self.scheduler.get_running_requests_info(),
             **scheduler_stats,
         }
+
+        # Add spec decode stats from scheduler
+        if self.scheduler._spec_decode_runtime is not None:
+            runtime = self.scheduler._spec_decode_runtime
+            stats["spec_decode"] = {
+                "enabled": True,
+                "method": self.scheduler.config.speculative_method,
+                "k": self.scheduler.config.num_speculative_tokens,
+                "total_drafts": runtime.stats.num_drafts,
+                "total_draft_tokens": runtime.stats.num_draft_tokens,
+                "total_accepted": runtime.stats.num_accepted_tokens,
+                "acceptance_rate": runtime.stats.acceptance_rate(),
+            }
+
+        return stats
 
     def get_cache_stats(self) -> Optional[Dict[str, Any]]:
         """Get prefix cache statistics."""

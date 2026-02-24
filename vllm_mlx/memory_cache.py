@@ -25,8 +25,10 @@ Example:
 from __future__ import annotations
 
 import bisect
+import json
 import logging
 import math
+import os
 from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Any
@@ -84,6 +86,50 @@ def _array_memory(arr) -> int:
     return 0
 
 
+def _estimate_single_cache_memory(layer_cache: Any) -> int:
+    """Estimate memory for a single cache layer object (non-CacheList).
+
+    Args:
+        layer_cache: A single cache object (KVCache, QuantizedKVCache, dict, etc.)
+
+    Returns:
+        Estimated memory in bytes.
+    """
+    total_bytes = 0
+    # Check dict first since dicts have .keys() method that would match below
+    if isinstance(layer_cache, dict) and "state" in layer_cache:
+        # Extracted state dict
+        keys, values = layer_cache["state"]
+        total_bytes += _array_memory(keys)
+        total_bytes += _array_memory(values)
+    # Handle QuantizedKVCache: keys/values are tuples of (data, scales, biases)
+    elif hasattr(layer_cache, "keys") and isinstance(
+        getattr(layer_cache, "keys", None), (list, tuple)
+    ):
+        for arr in layer_cache.keys:
+            total_bytes += _array_memory(arr)
+        for arr in layer_cache.values:
+            total_bytes += _array_memory(arr)
+    elif hasattr(layer_cache, "state") and not isinstance(layer_cache, dict):
+        # Cache with state property returning (keys, values)
+        try:
+            keys, values = layer_cache.state
+            total_bytes += _array_memory(keys)
+            total_bytes += _array_memory(values)
+        except (TypeError, ValueError):
+            pass
+    elif hasattr(layer_cache, "keys") and hasattr(layer_cache, "values"):
+        # Standard KVCache with keys/values attributes (not dict)
+        keys_attr = layer_cache.keys
+        values_attr = layer_cache.values
+        # Ensure these are arrays, not methods
+        if not callable(keys_attr):
+            total_bytes += _array_memory(keys_attr)
+        if not callable(values_attr):
+            total_bytes += _array_memory(values_attr)
+    return total_bytes
+
+
 def estimate_kv_cache_memory(cache: list[Any]) -> int:
     """
     Estimate memory usage of a KV cache in bytes.
@@ -91,6 +137,15 @@ def estimate_kv_cache_memory(cache: list[Any]) -> int:
     This function inspects MLX arrays in the cache and calculates their
     total memory footprint using shape+dtype metadata to avoid triggering
     lazy evaluation (which would cause a VRAM spike).
+
+    Handles CacheList layers (e.g., deepseek_v32, glm_moe_dsa) which contain
+    multiple sub-caches per layer. CacheList.state returns a flattened list of
+    all sub-cache states, so we iterate over sub-caches individually instead.
+
+    Note on TP (Tensor Parallelism): When the model is TP-sharded, the
+    cache already stores the actual tensors from this rank's model, which
+    are already head-sharded (1/N of total heads). So this function is
+    already correct for per-rank memory estimation — no TP adjustment needed.
 
     Args:
         cache: List of layer cache objects, each containing keys/values tensors.
@@ -101,42 +156,24 @@ def estimate_kv_cache_memory(cache: list[Any]) -> int:
     if not cache:
         return 0
 
+    # Lazy import to avoid import-time dependency on mlx_lm
+    _CacheList = None
+    try:
+        from mlx_lm.models.cache import CacheList as _CacheList
+    except ImportError:
+        pass
+
     total_bytes = 0
 
     for layer_cache in cache:
-        # Handle different cache object types
-        # Check dict first since dicts have .keys() method that would match below
-        if isinstance(layer_cache, dict) and "state" in layer_cache:
-            # Extracted state dict
-            keys, values = layer_cache["state"]
-            total_bytes += _array_memory(keys)
-            total_bytes += _array_memory(values)
-        # Handle QuantizedKVCache: keys/values are tuples of (data, scales, biases)
-        elif hasattr(layer_cache, "keys") and isinstance(
-            getattr(layer_cache, "keys", None), (list, tuple)
-        ):
-            for arr in layer_cache.keys:
-                total_bytes += _array_memory(arr)
-            for arr in layer_cache.values:
-                total_bytes += _array_memory(arr)
-            continue
-        elif hasattr(layer_cache, "state") and not isinstance(layer_cache, dict):
-            # Cache with state property returning (keys, values)
-            try:
-                keys, values = layer_cache.state
-                total_bytes += _array_memory(keys)
-                total_bytes += _array_memory(values)
-            except (TypeError, ValueError):
-                pass
-        elif hasattr(layer_cache, "keys") and hasattr(layer_cache, "values"):
-            # Standard KVCache with keys/values attributes (not dict)
-            keys_attr = layer_cache.keys
-            values_attr = layer_cache.values
-            # Ensure these are arrays, not methods
-            if not callable(keys_attr):
-                total_bytes += _array_memory(keys_attr)
-            if not callable(values_attr):
-                total_bytes += _array_memory(values_attr)
+        # Handle CacheList: iterate over sub-caches individually.
+        # CacheList.state returns a flattened list which can't be unpacked
+        # as a simple (keys, values) tuple, so we must recurse into sub-caches.
+        if _CacheList is not None and isinstance(layer_cache, _CacheList):
+            for sub_cache in layer_cache.caches:
+                total_bytes += _estimate_single_cache_memory(sub_cache)
+        else:
+            total_bytes += _estimate_single_cache_memory(layer_cache)
 
     return total_bytes
 
@@ -445,6 +482,10 @@ class MemoryAwarePrefixCache:
             f"max_memory={self._max_memory / _BYTES_PER_MB:.1f}MB, "
             f"max_entries={self._config.max_entries}"
         )
+
+    def _make_cache_key(self, tokens: tuple[int, ...]) -> tuple:
+        """Create a cache key from token tuple."""
+        return tokens
 
     def fetch(self, tokens: list[int]) -> tuple[list[Any] | None, list[int]]:
         """
@@ -854,18 +895,23 @@ class MemoryAwarePrefixCache:
     def save_to_disk(self, cache_dir: str) -> bool:
         """Save all cache entries to disk using mlx_lm's safetensors format.
 
-        Directory layout::
+        In TP mode, saves to a rank-specific subdirectory::
+
+            cache_dir/tp{N}/rank{R}/
+              index.json          # token keys + metadata per entry
+              tp_metadata.json    # TP configuration metadata
+              entry_0.safetensors # KV arrays for entry 0
+              ...
+
+        In single-device mode, saves directly to cache_dir::
 
             cache_dir/
-              index.json          # token keys + metadata per entry
-              entry_0.safetensors # KV arrays for entry 0
-              entry_1.safetensors
+              index.json
+              entry_0.safetensors
               ...
 
         Returns True if at least one entry was saved.
         """
-        import json
-        import os
         import time as _time
 
         if not self._entries:
@@ -873,7 +919,10 @@ class MemoryAwarePrefixCache:
             return False
 
         t0 = _time.monotonic()
-        os.makedirs(cache_dir, exist_ok=True)
+
+        save_dir = cache_dir
+
+        os.makedirs(save_dir, exist_ok=True)
 
         try:
             from mlx_lm.models.cache import save_prompt_cache
@@ -890,7 +939,7 @@ class MemoryAwarePrefixCache:
 
         saved = 0
         for i, (tokens_key, entry) in enumerate(self._entries.items()):
-            entry_path = os.path.join(cache_dir, f"entry_{i}.safetensors")
+            entry_path = os.path.join(save_dir, f"entry_{i}.safetensors")
             try:
                 save_prompt_cache(
                     entry_path,
@@ -898,7 +947,7 @@ class MemoryAwarePrefixCache:
                     metadata={"num_tokens": str(len(tokens_key))},
                 )
                 # Save tokens separately (can be 100K+ ints → binary is smaller)
-                tokens_path = os.path.join(cache_dir, f"entry_{i}_tokens.bin")
+                tokens_path = os.path.join(save_dir, f"entry_{i}_tokens.bin")
                 import array as _array
 
                 arr = _array.array("i", tokens_key)  # 32-bit signed ints
@@ -922,14 +971,14 @@ class MemoryAwarePrefixCache:
             except Exception as e:
                 logger.warning(f"[cache_persist] failed to save entry {i}: {e}")
 
-        index_path = os.path.join(cache_dir, "index.json")
+        index_path = os.path.join(save_dir, "index.json")
         with open(index_path, "w") as f:
             json.dump(index, f, indent=2)
 
         dt = _time.monotonic() - t0
         logger.info(
             f"[cache_persist] SAVED {saved}/{len(self._entries)} entries "
-            f"to {cache_dir} in {dt:.1f}s "
+            f"to {save_dir} in {dt:.1f}s "
             f"({self._current_memory / _BYTES_PER_MB:.0f}MB total)"
         )
         return saved > 0
@@ -939,11 +988,11 @@ class MemoryAwarePrefixCache:
 
         Returns the number of entries successfully loaded.
         """
-        import json
-        import os
         import time as _time
 
-        index_path = os.path.join(cache_dir, "index.json")
+        load_dir = cache_dir
+
+        index_path = os.path.join(load_dir, "index.json")
         if not os.path.exists(index_path):
             logger.info(f"[cache_persist] no index at {index_path}, nothing to load")
             return 0
@@ -967,8 +1016,8 @@ class MemoryAwarePrefixCache:
         loaded = 0
         for entry_meta in index.get("entries", []):
             i = entry_meta["index"]
-            entry_path = os.path.join(cache_dir, f"entry_{i}.safetensors")
-            tokens_path = os.path.join(cache_dir, f"entry_{i}_tokens.bin")
+            entry_path = os.path.join(load_dir, f"entry_{i}.safetensors")
+            tokens_path = os.path.join(load_dir, f"entry_{i}_tokens.bin")
 
             if not os.path.exists(entry_path) or not os.path.exists(tokens_path):
                 logger.warning(f"[cache_persist] missing files for entry {i}, skipping")
@@ -1023,7 +1072,7 @@ class MemoryAwarePrefixCache:
 
         dt = _time.monotonic() - t0
         logger.info(
-            f"[cache_persist] LOADED {loaded} entries from {cache_dir} "
+            f"[cache_persist] LOADED {loaded} entries from {load_dir} "
             f"in {dt:.1f}s ({self._current_memory / _BYTES_PER_MB:.0f}MB total)"
         )
         return loaded

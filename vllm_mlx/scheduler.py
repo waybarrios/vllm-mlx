@@ -25,6 +25,17 @@ from .memory_cache import MemoryAwarePrefixCache, MemoryCacheConfig
 from .paged_cache import PagedCacheManager
 from .prefix_cache import BlockAwarePrefixCache, PrefixCacheManager
 from .request import Request, RequestOutput, RequestStatus, SamplingParams
+from .spec_decode import (
+    SpecDecodeConfig,
+    SpecDecodeRuntime,
+    SpecDecodeStats,
+    AcceptResult,
+    RequestState,
+    VerifyResult,
+)
+from .spec_decode.cache_utils import batch_variable_trim, can_per_seq_trim
+from .spec_decode.ngram_proposer import NgramProposer
+from .spec_decode.rejection_sampler import RejectionSampler
 from .utils.mamba_cache import ensure_mamba_support
 
 logger = logging.getLogger(__name__)
@@ -95,11 +106,16 @@ class SchedulerConfig:
     # 0 = disabled. Only effective when chunked_prefill_tokens > 0.
     mid_prefill_save_interval: int = 8192
 
-    # MTP (Multi-Token Prediction) settings
-    # Uses the model's built-in MTP head to predict multiple tokens per step
-    enable_mtp: bool = False
-    mtp_num_draft_tokens: int = 1  # Number of draft tokens from MTP head
-    mtp_optimistic: bool = False  # Skip acceptance check for max speed
+    # Speculative decoding settings
+    speculative_method: Optional[str] = None  # None = disabled, "ngram" = n-gram proposer
+    num_speculative_tokens: int = 3  # Number of draft tokens per step (k)
+    spec_decode_disable_batch_size: Optional[int] = None  # Disable spec decode above this batch size
+    draft_model_name: Optional[str] = None  # Draft model path (for future model-based proposers)
+    spec_decode_auto_disable_threshold: float = 0.4  # Auto-disable below this acceptance rate
+    spec_decode_auto_disable_window: int = 50  # Rolling window size for auto-disable evaluation
+    model_name: Optional[str] = None  # Model name/path for MTP weight loading
+    mtp_model_name: Optional[str] = None  # Separate model for MTP weights (if different from main)
+
 
 
 @dataclass
@@ -120,6 +136,17 @@ class SchedulerOutput:
     outputs: List[RequestOutput] = field(default_factory=list)
     # Whether any work was done
     has_work: bool = False
+
+
+def _inner_cache(layer_cache):
+    """Get the first inner cache from a CacheList, or return as-is.
+
+    Used for introspecting batch state (offset, left_padding, _idx) which
+    is shared across sub-caches in a CacheList.
+    """
+    if hasattr(layer_cache, 'caches'):
+        return layer_cache.caches[0]
+    return layer_cache
 
 
 def _install_chunked_prefill(
@@ -260,7 +287,7 @@ def _install_chunked_prefill(
                     )
                     self._partial = None
                     mx.clear_cache()
-                    return self._generation_step()
+                    return _generation_step()
 
             tic = _time.perf_counter()
             partial = self._partial
@@ -271,7 +298,7 @@ def _install_chunked_prefill(
             n_to_process = min(budget, remaining - 1) if remaining > 1 else 0
 
             if n_to_process > 0:
-                self.model(mx.contiguous(inputs[:, :n_to_process]), cache=prompt_cache)
+                self.model(inputs[:, :n_to_process], cache=prompt_cache)
                 mx.eval([c.state for c in prompt_cache])
                 inputs = inputs[:, n_to_process:]
                 partial["inputs"] = inputs
@@ -348,7 +375,7 @@ def _install_chunked_prefill(
                 self._stats.prompt_time += _time.perf_counter() - tic
 
             # Generation step for active requests between chunks
-            return self._generation_step()
+            return _generation_step()
 
         # ----- No partial — check if next prompt batch needs chunking -----
         num_active = len(self.active_batch) if self.active_batch else 0
@@ -374,16 +401,11 @@ def _install_chunked_prefill(
                     # Large prompt batch or prefix boundary — start partial prefill
                     tic = _time.perf_counter()
 
-                    # Eval outstanding generation tokens before switching.
-                    # Also drain pending async_eval when active_batch is None
-                    # (previous request finished) — stale async_eval work on
-                    # generation_stream can block subsequent model forwards.
+                    # Eval outstanding generation tokens before switching
                     if self.active_batch is not None:
                         mx.eval(self.active_batch.y, self.active_batch.logprobs)
                         self._stats.generation_time += _time.perf_counter() - tic
                         tic = _time.perf_counter()
-                    else:
-                        mx.clear_cache()
 
                     (
                         uids,
@@ -437,10 +459,7 @@ def _install_chunked_prefill(
                             _first_chunk = _adjusted_pb
                     n_to_process = min(_first_chunk, padded.shape[1] - 1)
                     if n_to_process > 0:
-                        self.model(
-                            mx.contiguous(padded[:, :n_to_process]),
-                            cache=prompt_cache,
-                        )
+                        self.model(padded[:, :n_to_process], cache=prompt_cache)
                         mx.eval([c.state for c in prompt_cache])
                         padded = padded[:, n_to_process:]
                         if is_cached:
@@ -475,41 +494,10 @@ def _install_chunked_prefill(
                     self._stats.prompt_time += _time.perf_counter() - tic
 
                     # Generation step for active requests
-                    return self._generation_step()
+                    return _generation_step()
 
-                else:
-                    # Small prompt batch — process directly without _orig_next.
-                    # _orig_next's while loop processes multiple batches per call
-                    # which causes batch-dimension mismatches in DeltaRNN conv_state
-                    # when mixing prefix-cached and fresh prompts.
-                    # Processing one batch per _next call avoids this.
-                    tic = _time.perf_counter()
-
-                    # Eval outstanding generation tokens before prefill.
-                    # Also drain when active_batch is None to clear stale
-                    # async_eval work from the previous request.
-                    if self.active_batch is not None:
-                        mx.eval(self.active_batch.y, self.active_batch.logprobs)
-                        self._stats.generation_time += _time.perf_counter() - tic
-                        tic = _time.perf_counter()
-                    else:
-                        mx.clear_cache()
-
-                    new_batch = self._process_prompts(batch_prompts)
-                    self.unprocessed_prompts = self.unprocessed_prompts[
-                        self.prefill_batch_size :
-                    ]
-
-                    if self.active_batch is None:
-                        self.active_batch = new_batch
-                    else:
-                        self.active_batch.extend(new_batch)
-
-                    self._stats.prompt_time += _time.perf_counter() - tic
-                    return self._generation_step()
-
-        # Pure generation or no work — run generation step directly
-        return self._generation_step()
+        # Small prompts, pure generation, or no work — delegate to original
+        return _orig_next()
 
     def _patched_remove(uids_to_remove, _self=batch_gen):
         """Clear partial state if aborted request is being prefilled."""
@@ -525,420 +513,84 @@ def _install_chunked_prefill(
         _orig_remove(uids_to_remove)
 
     batch_gen._next = _chunked_next
-    batch_gen._generation_step = _generation_step
     batch_gen.remove = _patched_remove
 
     logger.info(f"[chunked_prefill] installed with budget={budget} tokens per step")
 
 
-def _install_mtp(
-    batch_gen: "BatchGenerator",
-    model: Any,
-    num_draft_tokens: int = 1,
-    optimistic: bool = False,
-) -> None:
+def _resolve_mtp_model_path(model_name: str, num_hidden_layers: int) -> str:
+    """Resolve an HF model name to a local path, downloading only MTP-related shards.
+
+    Instead of downloading the entire model (which can be 600GB+), this
+    downloads only the safetensors index and the specific shard files that
+    contain MTP layer weights.
+
+    Args:
+        model_name: HuggingFace model name (e.g. 'deepseek-ai/DeepSeek-V3-0324').
+        num_hidden_layers: Number of hidden layers in the main model.
+
+    Returns:
+        Local directory path containing the downloaded MTP weight files.
     """
-    Monkey-patch a BatchGenerator to use MTP (Multi-Token Prediction)
-    with always-advance strategy for hybrid MambaCache + KVCache.
+    import json
+    from huggingface_hub import hf_hub_download
 
-    Flow per generation step:
-    1. Use skip_state logits/hidden OR run model forward -> sample primary
-    2. MTP head drafts one token after primary
-    3. Verify [primary, draft] in one model call (always advances cache)
-    4. Accept: skip_state from pos 1, defer draft for next step emission
-       Reject: trim KVCache by 1, skip_state from pos 0 (no cold start)
-    5. Draft is emitted in the NEXT generation step after primary
-    """
-    _orig_step = batch_gen._step
+    # Known MTP prefix patterns
+    mtp_prefixes = [
+        f"model.layers.{num_hidden_layers}.",   # DeepSeek V3/V3.2, GLM
+        "model.mtp_layers.",                     # MiMo
+        "model.mtp.",                            # Kimi, MiMo V2
+    ]
 
-    # Greedy sampler for MTP draft tokens
-    _draft_sampler = make_sampler(temp=0.0)
+    # Step 1: Download the safetensors index
+    try:
+        index_path = hf_hub_download(model_name, "model.safetensors.index.json")
+    except Exception:
+        # No index file — try downloading entire model as fallback
+        logger.warning(
+            "No safetensors index found for '%s', falling back to snapshot_download",
+            model_name,
+        )
+        from huggingface_hub import snapshot_download
+        return snapshot_download(model_name)
 
-    # Skip state: when MTP accepts, the cache already consumed [primary, draft].
-    # Next _step call receives primary as input but must NOT re-feed it.
-    # Instead, use stored logits from the verify pass.
-    # Format: {'logits': (B, V), 'hidden': (B, 1, H)}
-    _skip_state = [None]
+    with open(index_path) as f:
+        index = json.load(f)
 
-    # Deferred drafts: draft tokens to emit in the NEXT generation step,
-    # keyed by UID for stability across batch changes.
-    # Format: {uid: {'token': int, 'logprobs': mx.array}}
-    _deferred_drafts = {}
+    weight_map = index.get("weight_map", {})
 
-    # MTP stats
-    _mtp_stats = {"accepted": 0, "rejected": 0, "errors": 0}
+    # Step 2: Find shard files containing MTP weights (try all known prefixes)
+    mtp_files: set[str] = set()
+    for prefix in mtp_prefixes:
+        for key, filename in weight_map.items():
+            if key.startswith(prefix):
+                mtp_files.add(filename)
+        if mtp_files:
+            break
 
-    def _mtp_step(
-        input_tokens,
-        prompt_cache,
-        samplers,
-        logits_processors,
-        tokens,
-    ):
-        """
-        Extended _step with MTP always-advance strategy.
+    if not mtp_files:
+        raise ValueError(
+            f"No MTP weights found in {model_name}'s weight map. "
+            f"Tried prefixes: {mtp_prefixes}. "
+            f"This model may not have MTP layers."
+        )
 
-        Every step (after skip):
-        1. Use skip_state logits/hidden OR run model forward
-        2. Sample primary token P
-        3. MTP head drafts token D
-        4. Verify [P, D] in one model call (always advances cache)
-        5. Accept: skip_state from position 1 (after D), defer D
-           Reject: trim KVCache by 1, skip_state from position 0 (after P)
-
-        No snapshot/restore — eliminates cold starts after rejection.
-        MambaCache layers accept minor pollution on reject (exponential decay).
-
-        During prefill (multi-token input), MTP is skipped entirely.
-        """
-        batch_size = input_tokens.shape[0]
-
-        # --- Prefill guard: skip MTP for multi-token input,
-        # during _process_prompts (active_batch not yet set), or when
-        # the cache doesn't belong to the active batch (e.g. during
-        # _process_prompts in the 2nd+ iteration of _orig_next's loop
-        # or during _chunked_next partial prefill finalization).
-        if (
-            input_tokens.shape[1] > 1
-            or batch_gen.active_batch is None
-            or prompt_cache is not batch_gen.active_batch.cache
-        ):
-            _skip_state[0] = None
-            return _orig_step(
-                input_tokens,
-                prompt_cache,
-                samplers,
-                logits_processors,
-                tokens,
-            )
-
-        # --- Check skip state from previous MTP step ---
-        skip = _skip_state[0]
-        if skip is not None:
-            if skip["logits"].shape[0] != batch_size:
-                # Batch size changed since skip was stored — invalidate
-                skip = None
-                _skip_state[0] = None
-
-        if skip is not None:
-            # Skip mode: model already processed input_tokens during
-            # previous verify. Use stored logits + hidden instead.
-            logits = skip["logits"]
-            hidden_states = skip["hidden"]
-            _skip_state[0] = None
-        else:
-            # Normal model forward
-            model_output = model(input_tokens, cache=prompt_cache, return_hidden=True)
-            if isinstance(model_output, tuple):
-                logits, hidden_states = model_output
-            else:
-                # Model doesn't support return_hidden — fall back
-                return _orig_step(
-                    input_tokens,
-                    prompt_cache,
-                    samplers,
-                    logits_processors,
-                    tokens,
-                )
-            logits = logits[:, -1, :]
-
-        # --- Apply logits processors + sample primary ---
-        if any(logits_processors):
-            processed_logits = []
-            for e in range(batch_size):
-                sample_logits = logits[e : e + 1]
-                for processor in logits_processors[e]:
-                    sample_logits = processor(tokens[e], sample_logits)
-                processed_logits.append(sample_logits)
-            logits = mx.concatenate(processed_logits, axis=0)
-
-        logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
-        if any(samplers):
-            all_samples = []
-            for e in range(batch_size):
-                sample_sampler = samplers[e] or batch_gen.sampler
-                sampled = sample_sampler(logprobs[e : e + 1])
-                all_samples.append(sampled)
-            primary_tokens = mx.concatenate(all_samples, axis=0)
-        else:
-            primary_tokens = batch_gen.sampler(logprobs)
-
-        # Get current UIDs (guaranteed non-empty: prefill guard above
-        # prevents MTP from running when active_batch is None).
-        current_uids = list(batch_gen.active_batch.uids)
-
-        # --- MTP draft + always-advance verify ---
-        try:
-            # Draft: predict token n+2 from hidden states + primary (n+1)
-            draft_logits = model.mtp_forward(
-                hidden_states[:, -1:, :],
-                primary_tokens[:, None],
-                mtp_cache=None,
-            )
-            draft_logits = draft_logits[:, -1, :]
-            draft_logprobs = draft_logits - mx.logsumexp(
-                draft_logits, axis=-1, keepdims=True
-            )
-            draft_tokens = _draft_sampler(draft_logprobs)
-
-            # Always-advance: feed [primary, draft] and let cache advance.
-            #
-            # Hybrid models (e.g. Qwen3-Next) mix attention (KVCache) and
-            # recurrent layers (MambaCache/DeltaRNN).  KVCache supports
-            # trim(1) to undo the draft token on reject, but recurrent
-            # state is irreversible — rejected drafts permanently pollute
-            # the RNN state, causing progressive output corruption.
-            #
-            # For hybrid models we snapshot recurrent state before verify
-            # and on reject: trim KV by 2 (remove both P and D), restore
-            # RNN snapshot, then re-advance with just P so both cache
-            # types end up consistent at [..., P].
-            _rnn_snapshots = {}
-            for _ci, _c in enumerate(prompt_cache):
-                if not (hasattr(_c, "is_trimmable") and _c.is_trimmable()):
-                    if hasattr(_c, "state"):
-                        _rnn_snapshots[_ci] = [
-                            s.copy() if s is not None else None for s in _c.state
-                        ]
-
-            verify_input = mx.concatenate(
-                [primary_tokens[:, None], draft_tokens[:, None]], axis=1
-            )
-            verify_output = model(verify_input, cache=prompt_cache, return_hidden=True)
-            if isinstance(verify_output, tuple):
-                verify_logits, verify_hidden = verify_output
-            else:
-                verify_logits = verify_output
-                verify_hidden = None
-
-            if optimistic:
-                # --- OPTIMISTIC: always accept, zero sync ---
-                if verify_hidden is not None:
-                    _skip_state[0] = {
-                        "logits": verify_logits[:, 1, :],
-                        "hidden": verify_hidden[:, -1:, :],
-                    }
-                    verify_lp = verify_logits[:, 0, :] - mx.logsumexp(
-                        verify_logits[:, 0, :], axis=-1, keepdims=True
-                    )
-                    mx.async_eval(
-                        _skip_state[0]["logits"],
-                        _skip_state[0]["hidden"],
-                        draft_tokens,
-                        verify_lp,
-                    )
-                    for e in range(batch_size):
-                        uid = current_uids[e]
-                        _deferred_drafts[uid] = {
-                            "token_array": draft_tokens[e : e + 1],
-                            "logprobs": verify_lp[e],
-                        }
-                else:
-                    _skip_state[0] = None
-                _mtp_stats["accepted"] += 1
-            else:
-                # --- VERIFIED MODE: single eval + Python comparison ---
-                verify_pred = mx.argmax(verify_logits[:, 0, :], axis=-1)
-                mx.eval(verify_pred, draft_tokens)
-                pred_list = verify_pred.tolist()
-                draft_list = draft_tokens.tolist()
-                all_accepted = pred_list == draft_list
-
-                if all_accepted and verify_hidden is not None:
-                    # --- ACCEPT ---
-                    _skip_state[0] = {
-                        "logits": verify_logits[:, 1, :],
-                        "hidden": verify_hidden[:, -1:, :],
-                    }
-                    mx.async_eval(_skip_state[0]["logits"], _skip_state[0]["hidden"])
-                    verify_lp = verify_logits[:, 0, :] - mx.logsumexp(
-                        verify_logits[:, 0, :], axis=-1, keepdims=True
-                    )
-                    for e in range(batch_size):
-                        uid = current_uids[e]
-                        _deferred_drafts[uid] = {
-                            "token": draft_list[e],
-                            "logprobs": verify_lp[e],
-                        }
-                    _mtp_stats["accepted"] += 1
-
-                else:
-                    # --- REJECT (always-advance) ---
-                    if _rnn_snapshots:
-                        # Hybrid model: undo the entire verify pass
-                        # (both P and D) for all cache types, then
-                        # re-advance with just P for a consistent state.
-                        for c in prompt_cache:
-                            if hasattr(c, "is_trimmable") and c.is_trimmable():
-                                c.trim(2)
-                        for _ci, _snap in _rnn_snapshots.items():
-                            prompt_cache[_ci].state = _snap
-                        # Re-advance with primary only — both KV and RNN
-                        # now advance by exactly 1 (the primary token).
-                        rerun_out = model(
-                            primary_tokens[:, None],
-                            cache=prompt_cache,
-                            return_hidden=True,
-                        )
-                        if isinstance(rerun_out, tuple):
-                            rerun_logits, rerun_hidden = rerun_out
-                        else:
-                            rerun_logits = rerun_out
-                            rerun_hidden = None
-                        if rerun_hidden is not None:
-                            _skip_state[0] = {
-                                "logits": rerun_logits[:, -1, :],
-                                "hidden": rerun_hidden[:, -1:, :],
-                            }
-                            mx.async_eval(
-                                _skip_state[0]["logits"],
-                                _skip_state[0]["hidden"],
-                            )
-                        else:
-                            _skip_state[0] = None
-                    else:
-                        # Pure attention model: simple trim(1) is enough.
-                        for c in prompt_cache:
-                            if hasattr(c, "is_trimmable") and c.is_trimmable():
-                                c.trim(1)
-                        if verify_hidden is not None:
-                            _skip_state[0] = {
-                                "logits": verify_logits[:, 0, :],
-                                "hidden": verify_hidden[:, 0:1, :],
-                            }
-                            mx.async_eval(
-                                _skip_state[0]["logits"],
-                                _skip_state[0]["hidden"],
-                            )
-                        else:
-                            _skip_state[0] = None
-                    for uid in current_uids:
-                        _deferred_drafts.pop(uid, None)
-                    _mtp_stats["rejected"] += 1
-
-        except Exception as e:
-            logger.debug(f"[MTP] draft/verify failed: {e}")
-            _skip_state[0] = None
-            _mtp_stats["errors"] += 1
-
-        return primary_tokens, list(logprobs)
-
-    # Wrap _next() to emit deferred MTP drafts after each primary token.
-    # This works regardless of whether _chunked_next or original _next is
-    # the current _next implementation, because it sits at the top level.
-    # Store as attribute so it's always the correct reference, even after
-    # BatchGenerator recreation.
-    batch_gen._inner_next = batch_gen._next
-
-    def _mtp_next(self=batch_gen):
-        """Wrapper around _next that emits deferred MTP draft tokens.
-
-        After each primary token, if the previous step's MTP draft was
-        accepted, it is emitted as an additional response.
-        """
-        # Clear stale MTP state when no batch is active.
-        # This prevents skip_state/deferred_drafts from a finished request
-        # from leaking into the next request and causing stale computation
-        # graph references on generation_stream.
-        if self.active_batch is None:
-            _skip_state[0] = None
-            _deferred_drafts.clear()
-
-        # Save deferred drafts from PREVIOUS step before _inner_next
-        # runs _mtp_step, which may store NEW deferred drafts.
-        prev_deferred = {}
-        if self.active_batch is not None:
-            for uid in self.active_batch.uids:
-                if uid in _deferred_drafts:
-                    prev_deferred[uid] = _deferred_drafts.pop(uid)
-
-        # Run the inner _next (original or chunked) — calls _mtp_step
-        responses = self._inner_next()
-
-        if not prev_deferred or not responses:
-            return responses
-
-        # Augment responses with deferred drafts from the previous step.
-        # The Response from _next reports the OLD batch.y (the primary
-        # from the *previous* _step call). The deferred draft follows
-        # that primary in the token stream, so emit it AFTER the primary.
-        augmented = []
-        draft_end_uids = set()
-        for r in responses:
-            uid = r.uid
-
-            # Emit the primary response first
-            augmented.append(r)
-
-            if r.finish_reason is not None:
-                # Sequence ended with primary — discard any pending draft
-                _deferred_drafts.pop(uid, None)
-                prev_deferred.pop(uid, None)
-                continue
-
-            # Emit deferred draft AFTER its primary
-            if uid in prev_deferred:
-                draft_info = prev_deferred.pop(uid)
-                if "token" in draft_info:
-                    draft_t = draft_info["token"]
-                else:
-                    draft_t = draft_info["token_array"].item()
-                draft_lp = draft_info["logprobs"]
-
-                if draft_t in self.stop_tokens:
-                    augmented.append(
-                        self.Response(uid, draft_t, draft_lp, "stop", None)
-                    )
-                    draft_end_uids.add(uid)
-                else:
-                    draft_finish = None
-                    batch = self.active_batch
-                    if batch is not None:
-                        for e, bu in enumerate(batch.uids):
-                            if bu == uid:
-                                batch.num_tokens[e] += 1
-                                batch.tokens[e] = mx.concatenate(
-                                    (batch.tokens[e], mx.array([draft_t]))
-                                )
-                                if batch.num_tokens[e] >= batch.max_tokens[e]:
-                                    draft_finish = "length"
-                                    draft_end_uids.add(uid)
-                                break
-
-                    draft_cache_out = None
-                    if draft_finish is not None and batch is not None:
-                        for e, bu in enumerate(batch.uids):
-                            if bu == uid:
-                                draft_cache_out = batch.extract_cache(e)
-                                break
-
-                    augmented.append(
-                        self.Response(
-                            uid, draft_t, draft_lp, draft_finish, draft_cache_out
-                        )
-                    )
-
-        # Remove sequences that finished due to draft tokens
-        if draft_end_uids and self.active_batch is not None:
-            keep = [
-                e
-                for e, u in enumerate(self.active_batch.uids)
-                if u not in draft_end_uids
-            ]
-            if keep:
-                self.active_batch.filter(keep)
-            else:
-                self.active_batch = None
-
-        return augmented
-
-    batch_gen._step = _mtp_step
-    batch_gen._next = _mtp_next
-
-    mode_str = "optimistic (no verify)" if optimistic else "always-advance"
     logger.info(
-        f"[MTP] installed with num_draft_tokens={num_draft_tokens}, " f"{mode_str} mode"
+        "MTP weights span %d shard files out of %d total — downloading selectively",
+        len(mtp_files),
+        len(set(weight_map.values())),
     )
+
+    # Step 3: Download only the needed shard files
+    for filename in sorted(mtp_files):
+        logger.info("Downloading MTP shard: %s", filename)
+        hf_hub_download(model_name, filename)
+
+    # Return the directory containing the downloaded files
+    # hf_hub_download caches to the same directory structure
+    from pathlib import Path
+    cache_dir = Path(index_path).parent
+    return str(cache_dir)
 
 
 class Scheduler:
@@ -989,6 +641,8 @@ class Scheduler:
         # BatchGenerator - the actual batching engine
         self.batch_generator: Optional[BatchGenerator] = None
         self._current_sampler_params: Optional[Tuple] = None
+
+        self._mtp_hidden_states: dict[str, Any] = {}  # Per-request hidden states for MTP
 
         # Prefix cache for KV state reuse
         self.prefix_cache: Optional[PrefixCacheManager] = None
@@ -1054,6 +708,12 @@ class Scheduler:
         self._clear_cache_interval = 32
         self._memory_log_interval = 256
 
+        # Speculative decoding (initialized lazily on first spec-eligible step)
+        self._spec_decode_runtime: Optional[SpecDecodeRuntime] = None
+        self._spec_decode_enabled = self.config.speculative_method is not None
+        if self._spec_decode_enabled:
+            self._init_spec_decode()
+
     def _get_actual_tokenizer(self, tokenizer: Any) -> Any:
         """
         Get the actual tokenizer from a processor or tokenizer.
@@ -1095,6 +755,492 @@ class Scheduler:
                     # Handle case where eos_token_ids is a single int
                     stop_tokens.add(tok.eos_token_ids)
         return stop_tokens
+
+    # -----------------------------------------------------------------
+    # Speculative decoding
+    # -----------------------------------------------------------------
+
+    def _init_spec_decode(self) -> None:
+        """Initialize speculative decoding components."""
+        spec_config = SpecDecodeConfig(
+            method=self.config.speculative_method,
+            num_speculative_tokens=self.config.num_speculative_tokens,
+            disable_by_batch_size=self.config.spec_decode_disable_batch_size,
+            auto_disable_threshold=self.config.spec_decode_auto_disable_threshold,
+            auto_disable_window=self.config.spec_decode_auto_disable_window,
+        )
+
+        # Create proposer based on method
+        if self.config.speculative_method == "ngram":
+            from .spec_decode.ngram_proposer import NgramProposer, NgramProposerConfig
+
+            proposer_config = NgramProposerConfig(
+                num_speculative_tokens=self.config.num_speculative_tokens,
+            )
+            proposer = NgramProposer(proposer_config)
+        elif self.config.speculative_method == "draft_model":
+            from .spec_decode.draft_model_proposer import (
+                DraftModelProposer,
+                DraftModelProposerConfig,
+            )
+
+            if not self.config.draft_model_name:
+                raise ValueError(
+                    "draft_model_name must be set when using speculative_method='draft_model'"
+                )
+            proposer_config = DraftModelProposerConfig(
+                num_speculative_tokens=self.config.num_speculative_tokens,
+                draft_model_name=self.config.draft_model_name,
+            )
+            proposer = DraftModelProposer(proposer_config)
+            proposer.load()
+        elif self.config.speculative_method == "mtp":
+            # External MTP adapters (DeepSeek V3, GLM-5, etc.)
+            from .spec_decode.mtp_module import load_mtp_weights, detect_mtp_prefix, detect_mtp_style
+            from .spec_decode.mtp_proposer import MTPProposer, MTPProposerConfig
+
+            model_config = self.model.args
+
+            # Resolve MTP weight source
+            mtp_source = self.config.mtp_model_name or self.config.model_name
+            if not mtp_source:
+                raise ValueError(
+                    "model_name or mtp_model_name must be set in SchedulerConfig "
+                    "for MTP weight loading"
+                )
+            import os
+            if os.path.isdir(mtp_source):
+                mtp_model_path = mtp_source
+            else:
+                mtp_model_path = _resolve_mtp_model_path(
+                    mtp_source, model_config.num_hidden_layers
+                )
+
+            # Auto-detect MTP prefix and style from weights
+            mtp_prefix, mtp_keys = detect_mtp_prefix(
+                mtp_model_path, model_config.num_hidden_layers
+            )
+            mtp_style = detect_mtp_style(mtp_keys, mtp_prefix)
+            logger.info(
+                "Detected MTP style='%s' with prefix='%s'",
+                mtp_style, mtp_prefix,
+            )
+
+            # Get decoder layer class from the loaded model
+            decoder_layer_cls = type(self.model.model.layers[0])
+
+            # Create appropriate MTP module based on detected style
+            if mtp_style == "standard":
+                from .spec_decode.mtp_adapters import StandardMTPModule
+                mtp_module = StandardMTPModule.from_model_config(
+                    model_config, decoder_layer_cls=decoder_layer_cls,
+                )
+            else:
+                from .spec_decode.mtp_adapters import SimpleMTPModule
+                mtp_module = SimpleMTPModule.from_model_config(
+                    model_config, decoder_layer_cls=decoder_layer_cls,
+                )
+
+            # Load MTP weights (and quantize to match main model if needed)
+            load_mtp_weights(
+                mtp_model_path, model_config.num_hidden_layers, mtp_module,
+                model_config=model_config, mtp_prefix=mtp_prefix,
+                main_model=self.model,
+            )
+
+            # Create proposer with shared embed_fn and lm_head
+            proposer_config = MTPProposerConfig(
+                num_speculative_tokens=self.config.num_speculative_tokens,
+            )
+            proposer = MTPProposer(
+                config=proposer_config,
+                mtp_module=mtp_module,
+                embed_fn=self.model.model.embed_tokens,
+                lm_head=self.model.lm_head,
+            )
+        else:
+            raise ValueError(
+                f"Unknown speculative method: {self.config.speculative_method}"
+            )
+
+        # Create rejection sampler (greedy for now, stochastic needs draft model logits)
+        sampler = RejectionSampler(method="greedy")
+
+        self._spec_decode_runtime = SpecDecodeRuntime(
+            model=self.model,
+            proposer=proposer,
+            rejection_sampler=sampler,
+            config=spec_config,
+        )
+        logger.info(
+            f"Speculative decoding enabled: method={self.config.speculative_method}, "
+            f"k={self.config.num_speculative_tokens}"
+        )
+
+    def _can_spec_decode(self) -> bool:
+        """Check if speculative decoding can run this step.
+
+        Returns False when:
+        - Spec decode is not enabled
+        - No active batch exists
+        - There are waiting requests (prefill needed -- don't mix with speculation)
+        - Batch size exceeds threshold
+        - Model is not transformer-only (Mamba/hybrid not supported)
+        """
+        if not self._spec_decode_enabled or self._spec_decode_runtime is None:
+            return False
+        if self.batch_generator is None:
+            return False
+        if self.batch_generator.active_batch is None:
+            return False
+        if self.waiting:  # Pending prefills -- run normal step
+            return False
+        # Don't spec decode if there are unprocessed prompts waiting for prefill
+        if hasattr(self.batch_generator, 'unprocessed_prompts') and self.batch_generator.unprocessed_prompts:
+            return False
+        # Check batch size threshold
+        batch_size = len(self.running)
+        if self._spec_decode_runtime.should_disable(batch_size):
+            return False
+        # Check for transformer-only model (Mamba/hybrid not supported for spec decode)
+        if hasattr(self.model, "args") and hasattr(self.model.args, "model_type"):
+            model_type = self.model.args.model_type
+            if model_type in ("mamba", "jamba", "nemotron"):
+                return False
+        # Check cache supports per-sequence trim (CacheList layers may not)
+        batch = self.batch_generator.active_batch
+        if batch is not None and not can_per_seq_trim(batch.cache):
+            return False
+        return True
+
+    def _step_spec_decode(self) -> Optional[list]:
+        """Execute one speculative decoding step.
+
+        Flow:
+        1. Build request states from running requests
+        2. Propose k draft tokens per request via NgramProposer
+        3. Build input tensor: [y, d1, ..., dk] per request
+        4. Run target model forward: logits = model(input_tokens, cache)
+        5. Build VerifyResult with per-request sliced logits
+        6. Run rejection sampling via runtime.accept_and_commit()
+        7. Build Response objects for each committed token
+        8. Rollback KV cache for rejected draft positions
+        9. Update batch state for next step
+
+        Returns:
+            List of Response-like objects, or None if no drafts were
+            generated (caller should fall back to the normal path).
+        """
+        batch = self.batch_generator.active_batch
+        runtime = self._spec_decode_runtime
+        k = runtime.config.num_speculative_tokens
+
+        # 1. Build request states
+        batch_y_list = batch.y.tolist()
+        request_states = {}
+        uid_to_request_id_local = {}
+        for i, uid in enumerate(batch.uids):
+            request_id = self.uid_to_request_id.get(uid)
+            if request_id is None:
+                continue
+            request = self.running.get(request_id)
+            if request is None:
+                continue
+            token_ids = list(request.prompt_token_ids or []) + list(
+                request.output_token_ids
+            ) + [batch_y_list[i]]
+            request_states[request_id] = RequestState(
+                request_id=request_id,
+                token_ids=token_ids,
+                batch_uid=uid,
+                hidden_states=self._mtp_hidden_states.get(request_id),
+            )
+            uid_to_request_id_local[uid] = request_id
+
+        if not request_states:
+            return []
+
+        # 2. Propose drafts
+        draft_metadata = runtime.propose_drafts(request_states)
+
+        # 3. Build input tensor for verification
+        # For each request: [y_i, draft_1, ..., draft_k] (padded to max_k+1)
+        # batch.y contains the last sampled token (not yet fed to model)
+        batch_y = batch.y.tolist()  # (B,)
+
+        # Map request order to batch indices
+        batch_request_ids = []
+        batch_indices = []
+        for i, uid in enumerate(batch.uids):
+            rid = uid_to_request_id_local.get(uid)
+            if rid and rid in request_states:
+                batch_request_ids.append(rid)
+                batch_indices.append(i)
+
+        if not batch_request_ids:
+            return []
+
+        # Build padded input tokens: shape (len(batch_request_ids), max_k + 1)
+        max_draft_len = 0
+        draft_per_request = {}
+        for rid in batch_request_ids:
+            drafts = draft_metadata.get_draft_tokens(rid)
+            draft_per_request[rid] = drafts
+            max_draft_len = max(max_draft_len, len(drafts))
+
+        if max_draft_len == 0 and self.config.speculative_method != "mtp":
+            # No drafts generated -- fall back to normal step
+            # (MTP continues to capture hidden states for bootstrap)
+            return None  # Signal caller to use normal path
+
+        input_rows = []
+        draft_lengths = []
+        for rid, batch_idx in zip(batch_request_ids, batch_indices):
+            y_token = batch_y[batch_idx]
+            drafts = draft_per_request[rid]
+            # Pad drafts to max_draft_len with 0 (causal mask makes padding harmless)
+            padded_drafts = list(drafts) + [0] * (max_draft_len - len(drafts))
+            row = [y_token] + padded_drafts  # length = max_draft_len + 1
+            input_rows.append(row)
+            draft_lengths.append(len(drafts))
+
+        input_tokens = mx.array(input_rows, dtype=mx.int32)  # (B_spec, max_k+1)
+
+        # 4. Run target model forward pass
+        # Feed the full [y, d1, ..., dk] sequence through the model with
+        # the existing KV cache. The model returns logits for each position.
+        _is_mtp = self.config.speculative_method == "mtp"
+        if _is_mtp:
+            # Capture PRE-NORM hidden states for MTP.
+            # model.model.__call__() applies self.norm(h) at the end,
+            # but MTP's hnorm expects raw decoder layer output.
+            inner = self.model.model  # DeepseekV32Model (or equivalent backbone)
+            h = inner.embed_tokens(input_tokens)
+            # Build attention mask using the first layer's cache offset.
+            # batch.cache[0] may be CacheList (deepseek_v32/glm_moe_dsa)
+            # or a plain KVCache; [0] accesses first KVCache in CacheList.
+            _c0 = batch.cache[0]
+            try:
+                _cache_for_mask = _c0[0] if _c0 else None
+            except (TypeError, IndexError):
+                _cache_for_mask = _c0
+            from mlx_lm.models.base import create_attention_mask
+            mask = create_attention_mask(h, _cache_for_mask, return_array=True)
+            for i in range(inner.num_layers):
+                h = inner.layers[inner.start_idx + i](h, mask, batch.cache[i])
+            hidden_states = h  # Pre-norm hidden states for MTP
+            logits = self.model.lm_head(inner.norm(h))
+        else:
+            logits = self.model(input_tokens, cache=batch.cache)
+            hidden_states = None
+        # logits shape: (B_spec, max_k+1, vocab_size)
+
+        mx.eval(logits)
+
+        # 5. Build VerifyResult
+        verify_result = VerifyResult()
+        verify_result.request_ids = list(batch_request_ids)
+
+        for i, rid in enumerate(batch_request_ids):
+            num_drafts = draft_lengths[i]
+            # Slice logits for this request: positions 0..num_drafts (inclusive)
+            # Position j verifies draft token j (0-indexed)
+            # Position num_drafts is the bonus position
+            req_logits = logits[i, : num_drafts + 1, :]  # (num_drafts+1, vocab)
+            verify_result.target_logits[rid] = req_logits
+
+        # 6. Run rejection sampling
+        accept_results = runtime.accept_and_commit(verify_result, draft_metadata)
+
+        # 6a. Store hidden states for MTP (at accepted positions)
+        if _is_mtp and hidden_states is not None:
+            for i, rid in enumerate(batch_request_ids):
+                result = accept_results.get(rid)
+                if result is not None:
+                    # The accepted position index in the logits/hidden tensor
+                    accepted_pos = result.num_accepted
+                    # Extract hidden state at the accepted position (shape: 1, 1, hidden_size)
+                    self._mtp_hidden_states[rid] = hidden_states[i : i + 1, accepted_pos : accepted_pos + 1, :]
+
+        # Log spec decode stats periodically
+        if runtime.stats.num_drafts % 50 == 0 and runtime.stats.num_drafts > 0:
+            logger.info(
+                f"[SpecDecode] steps={runtime.stats.num_drafts}, "
+                f"alpha={runtime.stats.acceptance_rate():.3f}, "
+                f"mean_accepted={runtime.stats.mean_accepted_length():.2f}/{k}, "
+                f"per_pos={[f'{r:.2f}' for r in runtime.stats.acceptance_rate_per_position]}"
+            )
+
+        # 7. Build Response objects and apply stop/max-token checks
+        responses = []
+        stop_tokens = self._get_stop_tokens()
+
+        rollback_counts = {}
+        finished_in_spec = []
+        canonical_committed = {}  # rid -> list of actually emitted token IDs
+
+        for i, rid in enumerate(batch_request_ids):
+            batch_idx = batch_indices[i]
+            uid = batch.uids[batch_idx]
+            result = accept_results.get(rid)
+            if result is None:
+                continue
+
+            request = self.running.get(rid)
+            if request is None:
+                continue
+
+            tokens_remaining = (
+                request.sampling_params.max_tokens - request.num_output_tokens
+            )
+
+            # Build committed tokens: old batch.y + accepted drafts (excluding
+            # the final bonus/correction token which becomes new batch.y).
+            committed_tokens = (
+                [batch_y[batch_idx]] + result.accepted_tokens[:-1]
+                if result.accepted_tokens
+                else []
+            )
+
+            emitted_for_rid = []
+
+            for t_idx, token in enumerate(committed_tokens):
+                if tokens_remaining <= 0:
+                    unemitted = len(committed_tokens) - t_idx
+                    rollback_counts[rid] = rollback_counts.get(rid, 0) + unemitted
+                    break
+
+                finish_reason = None
+                if token in stop_tokens:
+                    finish_reason = "stop"
+                elif tokens_remaining == 1:
+                    finish_reason = "length"
+
+                resp = type(
+                    "Response",
+                    (),
+                    {
+                        "uid": uid,
+                        "token": token,
+                        "finish_reason": finish_reason,
+                        "prompt_cache": None,
+                    },
+                )()
+
+                responses.append(resp)
+                emitted_for_rid.append(token)
+                tokens_remaining -= 1
+
+                if finish_reason is not None:
+                    unemitted = len(committed_tokens) - t_idx - 1
+                    if unemitted > 0:
+                        rollback_counts[rid] = (
+                            rollback_counts.get(rid, 0) + unemitted
+                        )
+                    finished_in_spec.append(rid)
+                    break
+
+            canonical_committed[rid] = emitted_for_rid
+            # Add original rollback count from rejection
+            rollback_counts[rid] = (
+                rollback_counts.get(rid, 0) + result.rollback_count
+            )
+
+        # 8. Rollback KV cache for rejected positions
+        # trim_per_sequence expects an mx.array of per-sequence trim amounts
+        trim_amounts = []
+        for batch_idx in range(len(batch.uids)):
+            uid = batch.uids[batch_idx]
+            rid = uid_to_request_id_local.get(uid)
+            if rid and rid in rollback_counts:
+                # Also account for padding: max_draft_len - actual_draft_len
+                actual_drafts = (
+                    draft_lengths[batch_request_ids.index(rid)]
+                    if rid in batch_request_ids
+                    else 0
+                )
+                padding_trim = max_draft_len - actual_drafts
+                total_trim = rollback_counts[rid] + padding_trim
+                trim_amounts.append(total_trim)
+            else:
+                # Requests not in spec decode path: trim the padding only
+                trim_amounts.append(max_draft_len)
+
+        if any(t > 0 for t in trim_amounts):
+            trim_array = mx.array(trim_amounts, dtype=mx.int32)
+            batch_variable_trim(batch.cache, trim_array)
+            # Materialize and fix _idx after trim
+            if batch.cache:
+                _c0 = _inner_cache(batch.cache[0])
+                mx.eval(_c0.offset, _c0.left_padding)
+            from vllm_mlx.spec_decode.cache_utils import fixup_cache_after_filter
+            fixup_cache_after_filter(batch.cache)
+
+        # 9. Update batch state for next step
+        # After spec decode, we need batch.y and batch.logprobs set correctly
+        # for the NEXT normal step. batch.y = the last committed token for
+        # each request. batch.logprobs = logits at the correction/bonus
+        # position, normalized.
+
+        new_y = []
+        new_logprobs = []
+        for batch_idx in range(len(batch.uids)):
+            uid = batch.uids[batch_idx]
+            rid = uid_to_request_id_local.get(uid)
+            if rid and rid in accept_results:
+                result = accept_results[rid]
+                i = batch_request_ids.index(rid)
+
+                if result.accepted_tokens:
+                    # Last committed token becomes new y
+                    new_y.append(result.accepted_tokens[-1])
+                    # Logprobs at the position after last accepted token
+                    # This is the correction/bonus position
+                    correction_pos = result.num_accepted  # 0-indexed position
+                    req_logits = verify_result.target_logits[rid]
+                    if correction_pos < req_logits.shape[0]:
+                        log_probs = mx.softmax(req_logits[correction_pos], axis=-1)
+                        log_probs = mx.log(log_probs + 1e-12)
+                        new_logprobs.append(log_probs)
+                    else:
+                        # Fallback: use last position
+                        log_probs = mx.softmax(req_logits[-1], axis=-1)
+                        log_probs = mx.log(log_probs + 1e-12)
+                        new_logprobs.append(log_probs)
+                else:
+                    # No tokens accepted -- keep original y
+                    new_y.append(batch_y[batch_idx])
+                    new_logprobs.append(
+                        batch.logprobs[batch_idx]
+                        if batch.logprobs
+                        else mx.zeros((1,))
+                    )
+            else:
+                new_y.append(batch_y[batch_idx])
+                new_logprobs.append(
+                    batch.logprobs[batch_idx]
+                    if batch.logprobs
+                    else mx.zeros((1,))
+                )
+
+        batch.y = mx.array(new_y, dtype=mx.int32)
+        batch.logprobs = new_logprobs
+
+        # Update tokens list using canonical committed (post-clipping)
+        for rid in accept_results:
+            if rid in batch_request_ids and rid in canonical_committed:
+                i = batch_request_ids.index(rid)
+                batch_idx = batch_indices[i]
+                emitted = canonical_committed[rid]
+                if emitted:
+                    batch.tokens[batch_idx] = mx.concatenate(
+                        (batch.tokens[batch_idx], mx.array(emitted))
+                    )
+                batch.num_tokens[batch_idx] += len(emitted)
+
+        mx.eval(batch.y, *batch.tokens)
+
+        return responses
 
     def _create_batch_generator(
         self, sampling_params: SamplingParams
@@ -1159,21 +1305,6 @@ class Scheduler:
                 uid_to_request_id=self.uid_to_request_id,
                 requests=self.requests,
             )
-
-        # Install MTP if the model supports it
-        if self.config.enable_mtp:
-            if hasattr(self.model, "mtp") and self.model.mtp is not None:
-                _install_mtp(
-                    bg,
-                    model=self.model,
-                    num_draft_tokens=self.config.mtp_num_draft_tokens,
-                    optimistic=self.config.mtp_optimistic,
-                )
-            else:
-                logger.warning(
-                    "[MTP] --enable-mtp is set but model has no MTP head "
-                    "(model.mtp is None). MTP will be disabled."
-                )
 
         return bg
 
@@ -1678,6 +1809,9 @@ class Scheduler:
             uid = self.request_id_to_uid[request_id]
             if self.batch_generator is not None:
                 self.batch_generator.remove([uid])
+                if self.batch_generator.active_batch is not None:
+                    from vllm_mlx.spec_decode.cache_utils import fixup_cache_after_filter
+                    fixup_cache_after_filter(self.batch_generator.active_batch.cache)
                 removed_from_batch = True
             del self.uid_to_request_id[uid]
             del self.request_id_to_uid[request_id]
@@ -1688,6 +1822,11 @@ class Scheduler:
         if request is not None:
             request.set_finished(RequestStatus.FINISHED_ABORTED)
         self.finished_req_ids.add(request_id)
+
+        # Clean up spec decode / MTP state
+        if self._spec_decode_runtime is not None:
+            self._spec_decode_runtime.remove_request(request_id)
+        self._mtp_hidden_states.pop(request_id, None)
 
         # Flush Metal encoders after removing arrays from batch
         mx.clear_cache()
@@ -2057,6 +2196,20 @@ class Scheduler:
                     del self.uid_to_request_id[uid]
                 del self.request_id_to_uid[request_id]
 
+                # Remove from batch generator (needed for spec decode path which
+                # bypasses BatchGenerator.next() internal removal)
+                if self.batch_generator is not None:
+                    self.batch_generator.remove([uid])
+                    # Fix stale _idx after filter and evaluate cache metadata
+                    if self.batch_generator.active_batch is not None:
+                        from vllm_mlx.spec_decode.cache_utils import fixup_cache_after_filter
+                        fixup_cache_after_filter(self.batch_generator.active_batch.cache)
+
+            # Clean up spec decode state
+            if self._spec_decode_runtime is not None:
+                self._spec_decode_runtime.remove_request(request_id)
+            self._mtp_hidden_states.pop(request_id, None)
+
             # Track as finished
             self.finished_req_ids.add(request_id)
 
@@ -2087,44 +2240,11 @@ class Scheduler:
         self.request_id_to_uid.clear()
         self.uid_to_request_id.clear()
 
+        # Clear MTP hidden states to prevent stale state after recovery
+        if hasattr(self, '_mtp_hidden_states') and self._mtp_hidden_states:
+            self._mtp_hidden_states.clear()
+
         logger.info("Cache recovery completed")
-
-    def _recover_from_generation_error(self) -> Set[str]:
-        """Recover from fatal generation error (OOM, Metal crash).
-
-        Aborts all running requests and resets batch state.
-        Unlike cache corruption recovery, does NOT reschedule —
-        the request that OOMed would just OOM again.
-
-        Returns:
-            Set of aborted request IDs.
-        """
-        # Close batch generator (clears _partial state, active_batch)
-        self._close_batch_generator()
-        self._current_sampler_params = None
-
-        # Abort all running requests
-        aborted_ids: Set[str] = set()
-        for request_id in list(self.running):
-            request = self.running.get(request_id)
-            if request is not None:
-                request.set_finished(RequestStatus.FINISHED_ABORTED)
-            aborted_ids.add(request_id)
-            self.finished_req_ids.add(request_id)
-        self.running.clear()
-
-        # Clear UID mappings (batch generator is gone)
-        self.request_id_to_uid.clear()
-        self.uid_to_request_id.clear()
-
-        # Release Metal memory
-        mx.clear_cache()
-
-        logger.warning(
-            f"[generation_error_recovery] aborted {len(aborted_ids)} running requests, "
-            f"batch generator closed, Metal cache cleared"
-        )
-        return aborted_ids
 
     def _reschedule_running_requests(self) -> None:
         """Move running requests back to waiting queue for retry."""
@@ -2140,6 +2260,10 @@ class Scheduler:
             # Move to waiting queue (at front for priority)
             self.waiting.appendleft(request)
             del self.running[request_id]
+
+        # Clear MTP hidden states - rescheduled requests will recompute from scratch
+        if hasattr(self, '_mtp_hidden_states') and self._mtp_hidden_states:
+            self._mtp_hidden_states.clear()
 
         if count > 0:
             logger.info(f"Rescheduled {count} requests for retry")
@@ -2176,14 +2300,53 @@ class Scheduler:
 
                 # Run generation step if we have running requests
                 if self.batch_generator is not None and self.running:
-                    responses = self.batch_generator.next()
-                    output.has_work = True
-
-                    if responses:
-                        outputs, finished_ids = self._process_batch_responses(responses)
-                        output.outputs = outputs
-                        output.finished_request_ids = finished_ids
-                        self._cleanup_finished(finished_ids)
+                    if self._can_spec_decode():
+                        # Speculative decoding path
+                        spec_responses = self._step_spec_decode()
+                        if spec_responses is not None:
+                            responses = spec_responses
+                            output.has_work = True
+                            if responses:
+                                outputs, finished_ids = (
+                                    self._process_batch_responses(responses)
+                                )
+                                output.outputs = outputs
+                                output.finished_request_ids = finished_ids
+                                self._cleanup_finished(finished_ids)
+                        else:
+                            # Spec decode returned None — fall back to normal decode
+                            responses = self.batch_generator.next()
+                            output.has_work = True
+                            if responses:
+                                # Invalidate stale MTP hidden states after normal decode
+                                if self._mtp_hidden_states and self.config.speculative_method == "mtp":
+                                    for resp in responses:
+                                        rid = self.uid_to_request_id.get(resp.uid)
+                                        if rid:
+                                            self._mtp_hidden_states.pop(rid, None)
+                                outputs, finished_ids = (
+                                    self._process_batch_responses(responses)
+                                )
+                                output.outputs = outputs
+                                output.finished_request_ids = finished_ids
+                                self._cleanup_finished(finished_ids)
+                    else:
+                        # Normal decode path
+                        responses = self.batch_generator.next()
+                        output.has_work = True
+                        if responses:
+                            # Invalidate stale MTP hidden states after normal decode
+                            if self._mtp_hidden_states and self.config.speculative_method == "mtp":
+                                for resp in responses:
+                                    rid = self.uid_to_request_id.get(resp.uid)
+                                    if rid:
+                                        self._mtp_hidden_states.pop(rid, None)
+                            outputs, finished_ids = (
+                                self._process_batch_responses(responses)
+                            )
+                            output.outputs = outputs
+                            output.finished_request_ids = finished_ids
+                            self._cleanup_finished(finished_ids)
 
                 # Success - break out of retry loop
                 break
@@ -2209,24 +2372,8 @@ class Scheduler:
                 else:
                     raise
             except Exception as e:
-                import traceback
-
-                logger.error(
-                    f"Error in batch generation step: {e}\n{traceback.format_exc()}"
-                )
-                # Recover from fatal errors (OOM, Metal crash) instead of
-                # re-raising, which would cause infinite loop in engine_core.
-                aborted_ids = self._recover_from_generation_error()
-                for rid in aborted_ids:
-                    output.outputs.append(
-                        RequestOutput(
-                            request_id=rid,
-                            finished=True,
-                            finish_reason="error",
-                        )
-                    )
-                output.finished_request_ids = aborted_ids
-                break
+                logger.error(f"Error in batch generation step: {e}")
+                raise
 
         # Clear finished tracking for next step
         old_finished = self.finished_req_ids
@@ -2356,6 +2503,23 @@ class Scheduler:
             stats["memory_aware_cache"] = self.memory_aware_cache.get_stats()
         elif self.prefix_cache is not None:
             stats["prefix_cache"] = self.prefix_cache.get_stats()
+
+        # Add spec decode stats
+        if self._spec_decode_runtime is not None:
+            stats["spec_decode"] = {
+                "enabled": self._spec_decode_enabled,
+                "auto_disabled": self._spec_decode_runtime.auto_disabled,
+                "method": self.config.speculative_method,
+                "num_speculative_tokens": self.config.num_speculative_tokens,
+                "total_drafts": self._spec_decode_runtime.stats.num_drafts,
+                "total_draft_tokens": self._spec_decode_runtime.stats.num_draft_tokens,
+                "total_accepted": self._spec_decode_runtime.stats.num_accepted_tokens,
+                "acceptance_rate": self._spec_decode_runtime.stats.acceptance_rate(),
+                "recent_acceptance_rate": self._spec_decode_runtime.stats.recent_acceptance_rate(),
+                "mean_accepted_length": self._spec_decode_runtime.stats.mean_accepted_length(),
+                "per_position_acceptance": self._spec_decode_runtime.stats.acceptance_rate_per_position,
+            }
+
         return stats
 
     def get_cache_stats(self) -> Optional[Dict[str, Any]]:

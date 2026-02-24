@@ -182,7 +182,10 @@ class SimpleEngine(BaseEngine):
 
         async with self._generation_lock:
             accumulated_text = ""
-            prompt_tokens = 0
+            if hasattr(self._model, "tokenizer") and hasattr(self._model.tokenizer, "encode"):
+                prompt_tokens = len(self._model.tokenizer.encode(prompt))
+            else:
+                prompt_tokens = 0
             completion_tokens = 0
             finished = False
 
@@ -223,8 +226,6 @@ class SimpleEngine(BaseEngine):
                     break
 
             if not finished:
-                if prompt_tokens == 0:
-                    prompt_tokens = len(self._model.tokenizer.encode(prompt))
                 yield GenerationOutput(
                     text=accumulated_text,
                     new_text="",
@@ -380,9 +381,11 @@ class SimpleEngine(BaseEngine):
         # For LLM, apply chat template and stream
         tokenizer = self._model.tokenizer
         if hasattr(tokenizer, "apply_chat_template"):
-            # Disable thinking mode for coder models since it interferes
-            # with tool call parsing (tags leak as raw text).
-            enable_thinking = "coder" not in self._model_name.lower()
+            # Thinking mode is controlled by the server's --reasoning-parser
+            # or auto-detection. When thinking is enabled, a parser is active
+            # to separate <think>...</think> from the response content.
+            import os
+            enable_thinking = os.environ.get("VLLM_MLX_ENABLE_THINKING", "") == "1"
             template_kwargs = {
                 "tokenize": False,
                 "add_generation_prompt": True,
@@ -415,25 +418,12 @@ class SimpleEngine(BaseEngine):
 
     def get_stats(self) -> dict[str, Any]:
         """Get engine statistics."""
-        stats = {
+        return {
             "engine_type": "simple",
             "model_name": self._model_name,
             "is_mllm": self._is_mllm,
             "loaded": self._loaded,
         }
-
-        # Include Metal memory stats
-        try:
-            import mlx.core as mx
-
-            if mx.metal.is_available():
-                stats["metal_active_memory_gb"] = round(mx.get_active_memory() / 1e9, 2)
-                stats["metal_peak_memory_gb"] = round(mx.get_peak_memory() / 1e9, 2)
-                stats["metal_cache_memory_gb"] = round(mx.get_cache_memory() / 1e9, 2)
-        except Exception:
-            pass
-
-        return stats
 
     def get_cache_stats(self) -> dict[str, Any] | None:
         """Get cache statistics (for MLLM models)."""

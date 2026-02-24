@@ -26,16 +26,38 @@ def serve_command(args):
 
     # Import unified server
     from . import server
-    from .scheduler import SchedulerConfig
+    from .cli_args import build_scheduler_config, resolve_prefix_cache, validate_serve_args
     from .server import RateLimiter, app, load_model
 
     logger = logging.getLogger(__name__)
 
-    # Validate tool calling arguments
-    if args.enable_auto_tool_choice and not args.tool_call_parser:
-        print("Error: --enable-auto-tool-choice requires --tool-call-parser")
-        print("Example: --enable-auto-tool-choice --tool-call-parser mistral")
-        sys.exit(1)
+    # Validate serve arguments (tool calling, speculative decoding, distributed, etc.)
+    validate_serve_args(args)
+
+    # Distributed mode: delegate to launcher and return early
+    if getattr(args, "distributed", False):
+        from .cli_args import rebuild_server_args_from_namespace
+        from .distributed_launcher import launch_distributed
+
+        server_args = rebuild_server_args_from_namespace(args)
+        script = os.path.abspath(
+            os.path.join(os.path.dirname(__file__), "distributed_launcher.py")
+        )
+        envs = (
+            dict(pair.split("=", 1) for pair in args.dist_env)
+            if args.dist_env
+            else None
+        )
+        launch_distributed(
+            script_or_module=script,
+            args=server_args or None,
+            backend=args.dist_backend,
+            num_ranks=args.dist_num_ranks,
+            hostfile=args.dist_hostfile,
+            hosts=args.dist_hosts,
+            envs=envs,
+        )
+        return
 
     # Configure server security settings
     server._api_key = args.api_key
@@ -59,14 +81,36 @@ def serve_command(args):
     if args.default_top_p is not None:
         server._default_top_p = args.default_top_p
 
-    # Configure reasoning parser
-    if args.reasoning_parser:
+    # Configure thinking mode and reasoning parser
+    # --enable-thinking: model generates <think>...</think> before responding.
+    # --reasoning-parser: explicit parser choice (implies --enable-thinking).
+    enable_thinking = getattr(args, 'enable_thinking', False) or bool(args.reasoning_parser)
+
+    if enable_thinking and not args.reasoning_parser:
+        # Auto-detect parser from model name
+        _thinking_model_map = {
+            "kimi": "kimi",
+            "qwen3": "qwen3",
+            "deepseek-r1": "deepseek_r1",
+            "deepseek_r1": "deepseek_r1",
+        }
+        model_lower = args.model.lower()
+        for pattern, parser_name in _thinking_model_map.items():
+            if pattern in model_lower:
+                args.reasoning_parser = parser_name
+                break
+        if not args.reasoning_parser:
+            # Fallback: use deepseek_r1 parser (generic <think> tag handler)
+            args.reasoning_parser = "deepseek_r1"
+        logger.info(f"Thinking mode enabled, parser: {args.reasoning_parser}")
+
+    if enable_thinking and args.reasoning_parser:
         try:
             from .reasoning import get_parser
 
             parser_cls = get_parser(args.reasoning_parser)
             server._reasoning_parser = parser_cls()
-            logger.info(f"Reasoning parser enabled: {args.reasoning_parser}")
+            logger.info(f"Reasoning parser activated: {args.reasoning_parser}")
         except KeyError as e:
             print(f"Error: {e}")
             sys.exit(1)
@@ -81,6 +125,13 @@ def serve_command(args):
             sys.exit(1)
     else:
         server._reasoning_parser = None
+
+    # Export flag for engine
+    if enable_thinking:
+        os.environ["VLLM_MLX_ENABLE_THINKING"] = "1"
+    else:
+        os.environ.pop("VLLM_MLX_ENABLE_THINKING", None)
+    os.environ.pop("VLLM_MLX_REASONING_PARSER", None)  # No longer needed
 
     # Security summary at startup
     print("=" * 60)
@@ -99,10 +150,10 @@ def serve_command(args):
         print(f"  Tool calling: ENABLED (parser: {args.tool_call_parser})")
     else:
         print("  Tool calling: Use --enable-auto-tool-choice to enable")
-    if args.reasoning_parser:
-        print(f"  Reasoning: ENABLED (parser: {args.reasoning_parser})")
+    if enable_thinking:
+        print(f"  Thinking: ENABLED (parser: {args.reasoning_parser})")
     else:
-        print("  Reasoning: Use --reasoning-parser to enable")
+        print("  Thinking: Use --enable-thinking to enable")
     print("=" * 60)
 
     print(f"Loading model: {args.model}")
@@ -122,41 +173,12 @@ def serve_command(args):
     # Build scheduler config for batched mode
     scheduler_config = None
     if args.continuous_batching:
-        # Handle prefix cache flags
-        enable_prefix_cache = args.enable_prefix_cache and not args.disable_prefix_cache
-
-        scheduler_config = SchedulerConfig(
-            max_num_seqs=args.max_num_seqs,
-            prefill_batch_size=args.prefill_batch_size,
-            completion_batch_size=args.completion_batch_size,
-            enable_prefix_cache=enable_prefix_cache,
-            prefix_cache_size=args.prefix_cache_size,
-            # Memory-aware cache options
-            use_memory_aware_cache=not args.no_memory_aware_cache,
-            cache_memory_mb=args.cache_memory_mb,
-            cache_memory_percent=args.cache_memory_percent,
-            # Paged cache options
-            use_paged_cache=args.use_paged_cache,
-            paged_cache_block_size=args.paged_cache_block_size,
-            max_cache_blocks=args.max_cache_blocks,
-            # Chunked prefill
-            chunked_prefill_tokens=args.chunked_prefill_tokens,
-            # MTP
-            enable_mtp=args.enable_mtp,
-            mtp_num_draft_tokens=args.mtp_num_draft_tokens,
-            mtp_optimistic=args.mtp_optimistic,
-            # KV cache quantization
-            kv_cache_quantization=args.kv_cache_quantization,
-            kv_cache_quantization_bits=args.kv_cache_quantization_bits,
-            kv_cache_quantization_group_size=args.kv_cache_quantization_group_size,
-            kv_cache_min_quantize_tokens=args.kv_cache_min_quantize_tokens,
-        )
+        enable_prefix_cache = resolve_prefix_cache(args)
+        scheduler_config = build_scheduler_config(args)
 
         print("Mode: Continuous batching (for multiple concurrent users)")
         if args.chunked_prefill_tokens > 0:
             print(f"Chunked prefill: {args.chunked_prefill_tokens} tokens per step")
-        if args.enable_mtp:
-            print(f"MTP: enabled, draft_tokens={args.mtp_num_draft_tokens}")
         print(f"Stream interval: {args.stream_interval} tokens")
         if args.use_paged_cache:
             print(
@@ -201,37 +223,15 @@ def bench_command(args):
 
     from mlx_lm import load
 
+    from .cli_args import build_scheduler_config
     from .engine_core import AsyncEngineCore, EngineConfig
     from .request import SamplingParams
-    from .scheduler import SchedulerConfig
-
-    # Handle prefix cache flags
-    enable_prefix_cache = args.enable_prefix_cache and not args.disable_prefix_cache
 
     async def run_benchmark():
         print(f"Loading model: {args.model}")
         model, tokenizer = load(args.model)
 
-        scheduler_config = SchedulerConfig(
-            max_num_seqs=args.max_num_seqs,
-            prefill_batch_size=args.prefill_batch_size,
-            completion_batch_size=args.completion_batch_size,
-            enable_prefix_cache=enable_prefix_cache,
-            prefix_cache_size=args.prefix_cache_size,
-            # Memory-aware cache options
-            use_memory_aware_cache=not args.no_memory_aware_cache,
-            cache_memory_mb=args.cache_memory_mb,
-            cache_memory_percent=args.cache_memory_percent,
-            # Paged cache options
-            use_paged_cache=args.use_paged_cache,
-            paged_cache_block_size=args.paged_cache_block_size,
-            max_cache_blocks=args.max_cache_blocks,
-            # KV cache quantization
-            kv_cache_quantization=args.kv_cache_quantization,
-            kv_cache_quantization_bits=args.kv_cache_quantization_bits,
-            kv_cache_quantization_group_size=args.kv_cache_quantization_group_size,
-            kv_cache_min_quantize_tokens=args.kv_cache_min_quantize_tokens,
-        )
+        scheduler_config = build_scheduler_config(args)
         engine_config = EngineConfig(
             model_name=args.model,
             scheduler_config=scheduler_config,
@@ -588,246 +588,14 @@ Examples:
     )
     subparsers = parser.add_subparsers(dest="command", help="Commands")
 
-    # Serve command
+    # Serve command — use shared argument definitions
     serve_parser = subparsers.add_parser("serve", help="Start OpenAI-compatible server")
-    serve_parser.add_argument("model", type=str, help="Model to serve")
-    serve_parser.add_argument(
-        "--host", type=str, default="0.0.0.0", help="Host to bind"
-    )
-    serve_parser.add_argument("--port", type=int, default=8000, help="Port to bind")
-    serve_parser.add_argument(
-        "--max-num-seqs", type=int, default=256, help="Max concurrent sequences"
-    )
-    serve_parser.add_argument(
-        "--prefill-batch-size", type=int, default=8, help="Prefill batch size"
-    )
-    serve_parser.add_argument(
-        "--completion-batch-size", type=int, default=32, help="Completion batch size"
-    )
-    serve_parser.add_argument(
-        "--enable-prefix-cache",
-        action="store_true",
-        default=True,
-        help="Enable prefix caching for repeated prompts (default: enabled)",
-    )
-    serve_parser.add_argument(
-        "--disable-prefix-cache",
-        action="store_true",
-        help="Disable prefix caching",
-    )
-    serve_parser.add_argument(
-        "--prefix-cache-size",
-        type=int,
-        default=100,
-        help="Max entries in prefix cache (default: 100, legacy mode only)",
-    )
-    # Memory-aware cache options (recommended for large models)
-    serve_parser.add_argument(
-        "--cache-memory-mb",
-        type=int,
-        default=None,
-        help="Cache memory limit in MB (default: auto-detect ~20%% of RAM)",
-    )
-    serve_parser.add_argument(
-        "--cache-memory-percent",
-        type=float,
-        default=0.20,
-        help="Fraction of available RAM for cache if auto-detecting (default: 0.20)",
-    )
-    serve_parser.add_argument(
-        "--no-memory-aware-cache",
-        action="store_true",
-        help="Disable memory-aware cache, use legacy entry-count based cache",
-    )
-    # KV cache quantization options
-    serve_parser.add_argument(
-        "--kv-cache-quantization",
-        action="store_true",
-        help="Quantize stored KV caches to reduce memory (8-bit by default)",
-    )
-    serve_parser.add_argument(
-        "--kv-cache-quantization-bits",
-        type=int,
-        default=8,
-        choices=[4, 8],
-        help="Bit width for KV cache quantization (default: 8)",
-    )
-    serve_parser.add_argument(
-        "--kv-cache-quantization-group-size",
-        type=int,
-        default=64,
-        help="Group size for KV cache quantization (default: 64)",
-    )
-    serve_parser.add_argument(
-        "--kv-cache-min-quantize-tokens",
-        type=int,
-        default=256,
-        help="Minimum tokens for quantization to apply (default: 256)",
-    )
-    serve_parser.add_argument(
-        "--stream-interval",
-        type=int,
-        default=1,
-        help="Tokens to batch before streaming (1=smooth, higher=throughput)",
-    )
-    serve_parser.add_argument(
-        "--max-tokens",
-        type=int,
-        default=32768,
-        help="Default max tokens for generation (default: 32768)",
-    )
-    serve_parser.add_argument(
-        "--continuous-batching",
-        action="store_true",
-        help="Enable continuous batching for multiple concurrent users (slower for single user)",
-    )
-    # Paged cache options (experimental)
-    serve_parser.add_argument(
-        "--use-paged-cache",
-        action="store_true",
-        help="Use paged KV cache for memory efficiency (experimental)",
-    )
-    serve_parser.add_argument(
-        "--paged-cache-block-size",
-        type=int,
-        default=64,
-        help="Tokens per cache block (default: 64)",
-    )
-    serve_parser.add_argument(
-        "--max-cache-blocks",
-        type=int,
-        default=1000,
-        help="Maximum number of cache blocks (default: 1000)",
-    )
-    # Chunked prefill
-    serve_parser.add_argument(
-        "--chunked-prefill-tokens",
-        type=int,
-        default=0,
-        help="Max prefill tokens per scheduler step (0=disabled). "
-        "Prevents starvation of active requests during long prefills.",
-    )
-    # MTP (Multi-Token Prediction)
-    serve_parser.add_argument(
-        "--enable-mtp",
-        action="store_true",
-        default=False,
-        help="Enable MTP (Multi-Token Prediction) for models with built-in MTP heads. "
-        "Uses cache snapshot/restore for speculative generation.",
-    )
-    serve_parser.add_argument(
-        "--mtp-num-draft-tokens",
-        type=int,
-        default=1,
-        help="Number of draft tokens per MTP step (default: 1)",
-    )
-    serve_parser.add_argument(
-        "--mtp-optimistic",
-        action="store_true",
-        default=False,
-        help="Skip MTP acceptance check for maximum speed. "
-        "~5-10%% wrong tokens. Best for chat, not for code.",
-    )
-    # MCP options
-    serve_parser.add_argument(
-        "--mcp-config",
-        type=str,
-        default=None,
-        help="Path to MCP configuration file (JSON/YAML) for tool integration",
-    )
-    # Security options
-    serve_parser.add_argument(
-        "--api-key",
-        type=str,
-        default=None,
-        help="API key for authentication (if not set, no auth required)",
-    )
-    serve_parser.add_argument(
-        "--rate-limit",
-        type=int,
-        default=0,
-        help="Rate limit requests per minute per client (0 = disabled)",
-    )
-    serve_parser.add_argument(
-        "--timeout",
-        type=float,
-        default=300.0,
-        help="Default request timeout in seconds (default: 300)",
-    )
-    # Tool calling options
-    serve_parser.add_argument(
-        "--enable-auto-tool-choice",
-        action="store_true",
-        help="Enable auto tool choice for supported models. Use --tool-call-parser to specify which parser to use.",
-    )
-    serve_parser.add_argument(
-        "--tool-call-parser",
-        type=str,
-        default=None,
-        choices=[
-            "auto",
-            "mistral",
-            "qwen",
-            "qwen3_coder",
-            "llama",
-            "hermes",
-            "deepseek",
-            "kimi",
-            "granite",
-            "nemotron",
-            "xlam",
-            "functionary",
-            "glm47",
-        ],
-        help=(
-            "Select the tool call parser for the model. Options: "
-            "auto (auto-detect), mistral, qwen, qwen3_coder, llama, hermes, "
-            "deepseek, kimi, granite, nemotron, xlam, functionary, glm47. "
-            "Required for --enable-auto-tool-choice."
-        ),
-    )
-    # Reasoning parser options - choices loaded dynamically from registry
-    from .reasoning import list_parsers
+    from .cli_args import add_all_serve_args, add_distributed_args
 
-    reasoning_choices = list_parsers()
-    serve_parser.add_argument(
-        "--reasoning-parser",
-        type=str,
-        default=None,
-        choices=reasoning_choices,
-        help=(
-            "Enable reasoning content extraction with specified parser. "
-            "Extracts <think>...</think> tags into reasoning_content field. "
-            f"Options: {', '.join(reasoning_choices)}."
-        ),
-    )
-    # Multimodal option
-    serve_parser.add_argument(
-        "--mllm",
-        action="store_true",
-        help="Force load model as multimodal (vision) even if name doesn't match auto-detection patterns",
-    )
-    # Generation defaults
-    serve_parser.add_argument(
-        "--default-temperature",
-        type=float,
-        default=None,
-        help="Override default temperature for all requests (default: use model default)",
-    )
-    serve_parser.add_argument(
-        "--default-top-p",
-        type=float,
-        default=None,
-        help="Override default top_p for all requests (default: use model default)",
-    )
-    # Embedding model option
-    serve_parser.add_argument(
-        "--embedding-model",
-        type=str,
-        default=None,
-        help="Pre-load an embedding model at startup (e.g. mlx-community/embeddinggemma-300m-6bit)",
-    )
-    # Bench command
+    add_all_serve_args(serve_parser, positional_model=True)
+    add_distributed_args(serve_parser)
+
+    # Bench command — bench-specific batch size defaults, shared cache args
     bench_parser = subparsers.add_parser("bench", help="Run benchmark")
     bench_parser.add_argument("model", type=str, help="Model to benchmark")
     bench_parser.add_argument(
@@ -845,84 +613,11 @@ Examples:
     bench_parser.add_argument(
         "--completion-batch-size", type=int, default=16, help="Completion batch size"
     )
-    bench_parser.add_argument(
-        "--enable-prefix-cache",
-        action="store_true",
-        default=True,
-        help="Enable prefix caching (default: enabled)",
-    )
-    bench_parser.add_argument(
-        "--disable-prefix-cache",
-        action="store_true",
-        help="Disable prefix caching",
-    )
-    bench_parser.add_argument(
-        "--prefix-cache-size",
-        type=int,
-        default=100,
-        help="Max entries in prefix cache (default: 100, legacy mode only)",
-    )
-    # Memory-aware cache options (recommended for large models)
-    bench_parser.add_argument(
-        "--cache-memory-mb",
-        type=int,
-        default=None,
-        help="Cache memory limit in MB (default: auto-detect ~20%% of RAM)",
-    )
-    bench_parser.add_argument(
-        "--cache-memory-percent",
-        type=float,
-        default=0.20,
-        help="Fraction of available RAM for cache if auto-detecting (default: 0.20)",
-    )
-    bench_parser.add_argument(
-        "--no-memory-aware-cache",
-        action="store_true",
-        help="Disable memory-aware cache, use legacy entry-count based cache",
-    )
-    # KV cache quantization options
-    bench_parser.add_argument(
-        "--kv-cache-quantization",
-        action="store_true",
-        help="Quantize stored KV caches to reduce memory (8-bit by default)",
-    )
-    bench_parser.add_argument(
-        "--kv-cache-quantization-bits",
-        type=int,
-        default=8,
-        choices=[4, 8],
-        help="Bit width for KV cache quantization (default: 8)",
-    )
-    bench_parser.add_argument(
-        "--kv-cache-quantization-group-size",
-        type=int,
-        default=64,
-        help="Group size for KV cache quantization (default: 64)",
-    )
-    bench_parser.add_argument(
-        "--kv-cache-min-quantize-tokens",
-        type=int,
-        default=256,
-        help="Minimum tokens for quantization to apply (default: 256)",
-    )
-    # Paged cache options (experimental)
-    bench_parser.add_argument(
-        "--use-paged-cache",
-        action="store_true",
-        help="Use paged KV cache for memory efficiency (experimental)",
-    )
-    bench_parser.add_argument(
-        "--paged-cache-block-size",
-        type=int,
-        default=64,
-        help="Tokens per cache block (default: 64)",
-    )
-    bench_parser.add_argument(
-        "--max-cache-blocks",
-        type=int,
-        default=1000,
-        help="Maximum number of cache blocks (default: 1000)",
-    )
+    from .cli_args import add_cache_args
+
+    add_cache_args(bench_parser)
+    # Defaults required by build_scheduler_config but not exposed in bench CLI
+    bench_parser.set_defaults(chunked_prefill_tokens=0, stream_interval=1)
 
     # Detokenizer benchmark
     detok_parser = subparsers.add_parser(

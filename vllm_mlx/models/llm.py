@@ -67,9 +67,19 @@ class MLXLanguageModel:
         self.tokenizer = None
         self._loaded = False
 
-    def load(self) -> None:
-        """Load the model and tokenizer."""
+    def load(self, communicator=None) -> None:
+        """Load the model and tokenizer.
+
+        Args:
+            communicator: Optional MLXCommunicator for distributed loading.
+                When provided and distributed, uses sharded_load() for TP.
+        """
         if self._loaded:
+            return
+
+        # Check if we should use distributed loading
+        if communicator is not None and communicator.is_distributed:
+            self.load_distributed(group=communicator.group)
             return
 
         try:
@@ -101,6 +111,85 @@ class MLXLanguageModel:
             )
         except Exception as e:
             logger.error(f"Failed to load model: {e}")
+            raise
+
+    def load_distributed(self, group=None) -> None:
+        """Load the model with tensor parallelism using sharded_load.
+
+        This method loads the model using mlx-lm's sharded_load() which:
+        1. Downloads model weights
+        2. Loads the model lazily
+        3. Calls model.shard(group) to apply tensor parallelism
+        4. Evaluates parameters layer-by-layer for memory efficiency
+        5. Synchronizes all ranks
+
+        Args:
+            group: An mx.distributed.Group for tensor parallelism.
+                If None, uses mx.distributed.init() to get the default group.
+        """
+        if self._loaded:
+            return
+
+        try:
+            import mlx.core as mx
+            from mlx_lm.utils import sharded_load
+
+            if group is None:
+                group = mx.distributed.init()
+
+            rank = group.rank()
+            world_size = group.size()
+
+            logger.info(
+                f"Loading model with tensor parallelism: {self.model_name} "
+                f"(rank={rank}, world_size={world_size})"
+            )
+
+            # Build tokenizer config
+            tokenizer_config = {"trust_remote_code": self.trust_remote_code}
+
+            # Qwen3 fix (same as single-device path)
+            if "qwen3" in self.model_name.lower() or "Qwen3" in self.model_name:
+                tokenizer_config["eos_token"] = "<|im_end|>"
+                logger.info("Qwen3 detected: setting eos_token to <|im_end|>")
+
+            # Use sharded_load for tensor parallelism
+            # pipeline_group=None (no pipeline parallelism)
+            # tensor_group=group (tensor parallelism)
+            self.model, self.tokenizer = sharded_load(
+                self.model_name,
+                pipeline_group=None,
+                tensor_group=group,
+            )
+
+            # Apply tokenizer config that sharded_load may not handle
+            if tokenizer_config.get("eos_token"):
+                try:
+                    self.tokenizer.eos_token = tokenizer_config["eos_token"]
+                    if hasattr(self.tokenizer, 'eos_token_id'):
+                        eos_id = self.tokenizer.convert_tokens_to_ids(tokenizer_config["eos_token"])
+                        if eos_id is not None:
+                            self.tokenizer.eos_token_id = eos_id
+                    logger.info(f"Applied custom eos_token: {tokenizer_config['eos_token']}")
+                except Exception as e:
+                    logger.warning(f"Failed to apply custom eos_token: {e}")
+
+            # Synchronize all ranks after loading
+            mx.eval(mx.distributed.all_sum(mx.array(1.0), group=group, stream=mx.cpu))
+
+            self._loaded = True
+            logger.info(
+                f"Model loaded with TP (rank={rank}, world_size={world_size}): "
+                f"{self.model_name}"
+            )
+
+        except ImportError as e:
+            raise ImportError(
+                f"mlx-lm >= 0.30.5 is required for sharded_load: {e}. "
+                "Install with: pip install 'mlx-lm>=0.30.5'"
+            )
+        except Exception as e:
+            logger.error(f"Failed to load model with tensor parallelism: {e}")
             raise
 
     def _create_sampler(
@@ -147,11 +236,16 @@ class MLXLanguageModel:
         # Create sampler with parameters
         sampler = self._create_sampler(temperature, top_p)
 
+        # Pre-encode prompt to avoid mlx_lm's add_special_tokens=True
+        # which crashes some tokenizers (e.g., Moonlight)
+        import mlx.core as mx
+        prompt_tokens = mx.array(self.tokenizer.encode(prompt))
+
         # Generate text
         output_text = generate(
             self.model,
             self.tokenizer,
-            prompt=prompt,
+            prompt=prompt_tokens,
             max_tokens=max_tokens,
             sampler=sampler,
             verbose=False,
@@ -200,13 +294,19 @@ class MLXLanguageModel:
         # Create sampler with parameters
         sampler = self._create_sampler(temperature, top_p)
 
+        # Pre-encode prompt to avoid mlx_lm's add_special_tokens=True
+        # which crashes some tokenizers (e.g., Moonlight)
+        import mlx.core as mx
+        prompt_tokens = mx.array(self.tokenizer.encode(prompt))
+        prompt_token_count = prompt_tokens.shape[0]
+
         token_count = 0
         accumulated_text = ""
 
         for response in stream_generate(
             self.model,
             self.tokenizer,
-            prompt=prompt,
+            prompt=prompt_tokens,
             max_tokens=max_tokens,
             sampler=sampler,
         ):
