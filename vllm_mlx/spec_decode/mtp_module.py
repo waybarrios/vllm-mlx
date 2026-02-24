@@ -103,9 +103,9 @@ class MTPModule(ABC, nn.Module):
 
 # Known MTP weight prefix patterns across model families
 _MTP_PREFIX_PATTERNS = [
-    "model.layers.{num_hidden_layers}.",   # DeepSeek V3/V3.2, GLM-5, GLM-4 MoE Lite
-    "model.mtp_layers.",                     # MiMo
-    "model.mtp.",                            # Kimi, MiMo V2 Flash
+    "model.layers.{num_hidden_layers}.",  # DeepSeek V3/V3.2, GLM-5, GLM-4 MoE Lite
+    "model.mtp_layers.",  # MiMo
+    "model.mtp.",  # Kimi, MiMo V2 Flash
 ]
 
 
@@ -154,12 +154,15 @@ def detect_mtp_prefix(
                 found_matching = matching
                 logger.info(
                     "Auto-detected MTP prefix '%s' (%d matching keys)",
-                    prefix, len(matching),
+                    prefix,
+                    len(matching),
                 )
             else:
                 logger.warning(
                     "Additional MTP prefix '%s' also matched (%d keys); using '%s'",
-                    prefix, len(matching), found_prefix,
+                    prefix,
+                    len(matching),
+                    found_prefix,
                 )
 
     if found_prefix is not None:
@@ -184,7 +187,7 @@ def detect_mtp_style(mtp_keys: list[str], prefix: str) -> str:
         "standard" if enorm/hnorm/eh_proj pattern found (DeepSeek-style),
         "simple" if only decoder block keys found (MiMo-style).
     """
-    suffixes = [k[len(prefix):] for k in mtp_keys]
+    suffixes = [k[len(prefix) :] for k in mtp_keys]
     has_enorm = any(s.startswith("enorm.") for s in suffixes)
     has_hnorm = any(s.startswith("hnorm.") for s in suffixes)
     has_eh_proj = any(s.startswith("eh_proj.") for s in suffixes)
@@ -222,9 +225,7 @@ def _sanitize_mtp_weights(
         pad_bottom = (-m) % bs
         pad_side = (-n) % bs
         weight = mx.pad(weight, ((0, pad_bottom), (0, pad_side)))
-        weight = weight.reshape(
-            ((m + pad_bottom) // bs, bs, (n + pad_side) // bs, bs)
-        )
+        weight = weight.reshape(((m + pad_bottom) // bs, bs, (n + pad_side) // bs, bs))
         weight = (weight * scale_inv[:, None, :, None]).reshape(
             m + pad_bottom, n + pad_side
         )
@@ -254,9 +255,7 @@ def _sanitize_mtp_weights(
                         if ek in weights:
                             to_join.append(weights.pop(ek))
                     if to_join:
-                        weights[f"mlp.switch_mlp.{m}.{k_type}"] = mx.stack(
-                            to_join
-                        )
+                        weights[f"mlp.switch_mlp.{m}.{k_type}"] = mx.stack(to_join)
 
     # Step 3: kv_b_proj splitting (→ embed_q + unembed_out)
     kv_b_key = "self_attn.kv_b_proj.weight"
@@ -274,23 +273,15 @@ def _sanitize_mtp_weights(
             biases = weights.pop("self_attn.kv_b_proj.biases")
             bits = (v.shape[-1] * 32) // kv_lora_rank
             group_size = kv_lora_rank // scales.shape[-1]
-            v = mx.dequantize(
-                v, scales, biases, bits=bits, group_size=group_size
-            )
+            v = mx.dequantize(v, scales, biases, bits=bits, group_size=group_size)
 
         v = v.reshape(num_heads, head_dim, -1)
-        wk = mx.contiguous(
-            v[:, :qk_nope_head_dim, :].swapaxes(-1, -2)
-        )
+        wk = mx.contiguous(v[:, :qk_nope_head_dim, :].swapaxes(-1, -2))
         wv = mx.contiguous(v[:, qk_nope_head_dim:, :])
 
         if quantized:
-            wk, wk_scales, wk_biases = mx.quantize(
-                wk, bits=bits, group_size=group_size
-            )
-            wv, wv_scales, wv_biases = mx.quantize(
-                wv, bits=bits, group_size=group_size
-            )
+            wk, wk_scales, wk_biases = mx.quantize(wk, bits=bits, group_size=group_size)
+            wv, wv_scales, wv_biases = mx.quantize(wv, bits=bits, group_size=group_size)
             weights["self_attn.embed_q.scales"] = wk_scales
             weights["self_attn.unembed_out.scales"] = wv_scales
             weights["self_attn.embed_q.biases"] = wk_biases
@@ -398,7 +389,7 @@ def load_mtp_weights(
     if model_config is not None and needs_sanitize:
         stripped = {}
         for key, value in mtp_weights.items():
-            suffix = key[len(mtp_prefix):]
+            suffix = key[len(mtp_prefix) :]
             stripped[suffix] = value
         stripped = _sanitize_mtp_weights(stripped, model_config)
         mtp_weights = {f"{mtp_prefix}{k}": v for k, v in stripped.items()}
@@ -413,11 +404,15 @@ def load_mtp_weights(
 
     remapped: dict[str, mx.array] = {}
     for key, value in mtp_weights.items():
-        suffix = key[len(mtp_prefix):]  # Remove prefix
+        suffix = key[len(mtp_prefix) :]  # Remove prefix
 
         if style == "standard":
             # DeepSeek-style: enorm/hnorm/eh_proj at top level, decoder components under decoder_layer.*
-            if suffix.startswith("enorm.") or suffix.startswith("hnorm.") or suffix.startswith("eh_proj."):
+            if (
+                suffix.startswith("enorm.")
+                or suffix.startswith("hnorm.")
+                or suffix.startswith("eh_proj.")
+            ):
                 remapped[suffix] = value
             elif (
                 suffix.startswith("self_attn.")
@@ -429,14 +424,19 @@ def load_mtp_weights(
             elif suffix.startswith("shared_head.norm."):
                 new_suffix = suffix.replace("shared_head.norm.", "shared_head_norm.")
                 remapped[new_suffix] = value
-            elif suffix.startswith("embed_tokens.") or suffix.startswith("shared_head.head."):
-                logger.info("Skipping MTP weight '%s' (using main model's shared weights)", key)
+            elif suffix.startswith("embed_tokens.") or suffix.startswith(
+                "shared_head.head."
+            ):
+                logger.info(
+                    "Skipping MTP weight '%s' (using main model's shared weights)", key
+                )
             else:
                 remapped[suffix] = value
                 logger.warning("Unknown MTP weight key pattern: %s", key)
         else:
             # Simple-style (MiMo, Kimi): decoder components go under layers.{idx}.*
             import re
+
             layer_match = re.match(r"^(\d+)\.(.*)", suffix)
             if layer_match:
                 # Multi-layer MTP (e.g., model.mtp_layers.0.*, model.mtp_layers.1.*)
@@ -444,7 +444,9 @@ def load_mtp_weights(
                 rest = layer_match.group(2)
                 remapped[f"layers.{layer_idx}.{rest}"] = value
             elif suffix.startswith("embed_tokens.") or suffix.startswith("lm_head."):
-                logger.info("Skipping MTP weight '%s' (using main model's shared weights)", key)
+                logger.info(
+                    "Skipping MTP weight '%s' (using main model's shared weights)", key
+                )
             elif (
                 suffix.startswith("self_attn.")
                 or suffix.startswith("mlp.")
@@ -470,20 +472,14 @@ def load_mtp_weights(
         if quant_config is not None:
             from mlx.utils import tree_flatten
 
-            pre_size = sum(
-                v.nbytes
-                for _, v in tree_flatten(mtp_module.parameters())
-            )
+            pre_size = sum(v.nbytes for _, v in tree_flatten(mtp_module.parameters()))
             nn.quantize(
                 mtp_module,
                 group_size=quant_config["group_size"],
                 bits=quant_config["bits"],
                 mode=quant_config["mode"],
             )
-            post_size = sum(
-                v.nbytes
-                for _, v in tree_flatten(mtp_module.parameters())
-            )
+            post_size = sum(v.nbytes for _, v in tree_flatten(mtp_module.parameters()))
             saved_mb = (pre_size - post_size) / (1024 * 1024)
             logger.info(
                 "Quantized MTP module to %d-bit (group_size=%d, mode=%s): "

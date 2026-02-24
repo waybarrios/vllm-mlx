@@ -270,9 +270,7 @@ class BatchedEngine(BaseEngine):
 
         if _preloaded is not None:
             self._model, self._tokenizer = _preloaded
-            logger.info(
-                "Using pre-loaded sharded model for distributed mode"
-            )
+            logger.info("Using pre-loaded sharded model for distributed mode")
         else:
             self._model, self._tokenizer = load_model_with_fallback(
                 self._model_name,
@@ -385,6 +383,7 @@ class BatchedEngine(BaseEngine):
                 # or auto-detection. When thinking is enabled, a parser is active
                 # to separate <think>...</think> from the response content.
                 import os
+
                 enable_thinking = os.environ.get("VLLM_MLX_ENABLE_THINKING", "") == "1"
                 template_kwargs["enable_thinking"] = enable_thinking
 

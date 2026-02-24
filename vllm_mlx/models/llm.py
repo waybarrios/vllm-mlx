@@ -166,11 +166,15 @@ class MLXLanguageModel:
             if tokenizer_config.get("eos_token"):
                 try:
                     self.tokenizer.eos_token = tokenizer_config["eos_token"]
-                    if hasattr(self.tokenizer, 'eos_token_id'):
-                        eos_id = self.tokenizer.convert_tokens_to_ids(tokenizer_config["eos_token"])
+                    if hasattr(self.tokenizer, "eos_token_id"):
+                        eos_id = self.tokenizer.convert_tokens_to_ids(
+                            tokenizer_config["eos_token"]
+                        )
                         if eos_id is not None:
                             self.tokenizer.eos_token_id = eos_id
-                    logger.info(f"Applied custom eos_token: {tokenizer_config['eos_token']}")
+                    logger.info(
+                        f"Applied custom eos_token: {tokenizer_config['eos_token']}"
+                    )
                 except Exception as e:
                     logger.warning(f"Failed to apply custom eos_token: {e}")
 
@@ -239,6 +243,7 @@ class MLXLanguageModel:
         # Pre-encode prompt to avoid mlx_lm's add_special_tokens=True
         # which crashes some tokenizers (e.g., Moonlight)
         import mlx.core as mx
+
         prompt_tokens = mx.array(self.tokenizer.encode(prompt))
 
         # Generate text
@@ -297,6 +302,7 @@ class MLXLanguageModel:
         # Pre-encode prompt to avoid mlx_lm's add_special_tokens=True
         # which crashes some tokenizers (e.g., Moonlight)
         import mlx.core as mx
+
         prompt_tokens = mx.array(self.tokenizer.encode(prompt))
         prompt_token_count = prompt_tokens.shape[0]
 

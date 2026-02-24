@@ -37,18 +37,14 @@ class SimpleMTPModule(MTPModule):
         super().__init__(config)
 
         if decoder_layer_cls is None:
-            raise ValueError(
-                "decoder_layer_cls must be provided for SimpleMTPModule"
-            )
+            raise ValueError("decoder_layer_cls must be provided for SimpleMTPModule")
 
         # Create MTP decoder layers
         self.layers = []
         base_idx = config.num_hidden_layers
         for i in range(config.num_mtp_layers):
             try:
-                layer = decoder_layer_cls(
-                    model_config, layer_idx=base_idx + i
-                )
+                layer = decoder_layer_cls(model_config, layer_idx=base_idx + i)
             except TypeError:
                 try:
                     layer = decoder_layer_cls(model_config)
@@ -98,6 +94,7 @@ class SimpleMTPModule(MTPModule):
             return [self._cache_factory() for _ in self.layers]
         try:
             from mlx_lm.models.cache import KVCache
+
             return [KVCache() for _ in self.layers]
         except ImportError:
             return None

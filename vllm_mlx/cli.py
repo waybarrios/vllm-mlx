@@ -26,7 +26,11 @@ def serve_command(args):
 
     # Import unified server
     from . import server
-    from .cli_args import build_scheduler_config, resolve_prefix_cache, validate_serve_args
+    from .cli_args import (
+        build_scheduler_config,
+        resolve_prefix_cache,
+        validate_serve_args,
+    )
     from .server import RateLimiter, app, load_model
 
     logger = logging.getLogger(__name__)
@@ -84,7 +88,9 @@ def serve_command(args):
     # Configure thinking mode and reasoning parser
     # --enable-thinking: model generates <think>...</think> before responding.
     # --reasoning-parser: explicit parser choice (implies --enable-thinking).
-    enable_thinking = getattr(args, 'enable_thinking', False) or bool(args.reasoning_parser)
+    enable_thinking = getattr(args, "enable_thinking", False) or bool(
+        args.reasoning_parser
+    )
 
     if enable_thinking and not args.reasoning_parser:
         # Auto-detect parser from model name

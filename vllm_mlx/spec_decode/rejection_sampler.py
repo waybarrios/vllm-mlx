@@ -100,9 +100,7 @@ class RejectionSampler:
 
         # Build padded draft array: shape (batch, max_k)
         # Use -1 as pad value (will never match any argmax token)
-        draft_padded = [
-            d + [-1] * (max_k - len(d)) for d in draft_token_ids
-        ]
+        draft_padded = [d + [-1] * (max_k - len(d)) for d in draft_token_ids]
         draft_arr = mx.array(draft_padded)  # (batch, max_k)
 
         # Compare: match[b, i] = (target_tokens[b, i] == draft_arr[b, i])
@@ -130,7 +128,9 @@ class RejectionSampler:
         # target_tokens shape is (batch, k+1), index along axis=1
         bonus_arr = mx.take_along_axis(
             target_tokens, bonus_indices[:, None], axis=1
-        ).squeeze(1)  # (batch,)
+        ).squeeze(
+            1
+        )  # (batch,)
 
         # Single eval call for all results
         mx.eval(target_tokens, num_accepted_arr, bonus_arr, cumprod_mask)
@@ -167,7 +167,7 @@ class RejectionSampler:
 
         # p_target covers k+1 positions, p_draft covers k positions
         p_target = mx.softmax(target_logits, axis=-1)  # (batch, k+1, vocab)
-        p_draft = mx.softmax(draft_logits, axis=-1)    # (batch, k, vocab)
+        p_draft = mx.softmax(draft_logits, axis=-1)  # (batch, k, vocab)
 
         if max_k == 0:
             # All requests have empty drafts — sample bonus from target
@@ -184,9 +184,7 @@ class RejectionSampler:
 
         # Build padded draft token index array: shape (batch, max_k)
         # Pad with 0 (a valid but irrelevant token index for masked positions)
-        draft_padded = [
-            d + [0] * (max_k - len(d)) for d in draft_token_ids
-        ]
+        draft_padded = [d + [0] * (max_k - len(d)) for d in draft_token_ids]
         draft_arr = mx.array(draft_padded)  # (batch, max_k)
 
         # Gather target and draft probabilities at draft token positions
@@ -195,10 +193,14 @@ class RejectionSampler:
         draft_idx_expanded = draft_arr[:, :, None]  # (batch, max_k, 1)
         p_t_at_draft = mx.take_along_axis(
             p_target[:, :max_k, :], draft_idx_expanded, axis=2
-        ).squeeze(2)  # (batch, max_k)
+        ).squeeze(
+            2
+        )  # (batch, max_k)
         p_d_at_draft = mx.take_along_axis(
             p_draft[:, :max_k, :], draft_idx_expanded, axis=2
-        ).squeeze(2)  # (batch, max_k)
+        ).squeeze(
+            2
+        )  # (batch, max_k)
 
         # Safe division for acceptance ratio
         p_d_safe = mx.maximum(p_d_at_draft, eps)
@@ -217,7 +219,9 @@ class RejectionSampler:
         accept_mask = accept_mask & valid_mask
 
         # Cumulative product to find first rejection
-        cumprod_mask = mx.cumprod(accept_mask.astype(mx.int32), axis=1)  # (batch, max_k)
+        cumprod_mask = mx.cumprod(
+            accept_mask.astype(mx.int32), axis=1
+        )  # (batch, max_k)
         num_accepted_arr = mx.sum(cumprod_mask, axis=1)  # (batch,)
 
         # Evaluate everything needed before Python-side branching
@@ -237,14 +241,10 @@ class RejectionSampler:
 
             if n == k_b:
                 # All draft tokens accepted — sample bonus from target at pos k
-                bonus_arrays.append(
-                    mx.random.categorical(target_logits[b, k_b, :])
-                )
+                bonus_arrays.append(mx.random.categorical(target_logits[b, k_b, :]))
             else:
                 # Rejected at position n — sample from adjusted distribution
-                adjusted = mx.maximum(
-                    p_target[b, n, :] - p_draft[b, n, :], 0.0
-                )
+                adjusted = mx.maximum(p_target[b, n, :] - p_draft[b, n, :], 0.0)
                 adjusted_sum = mx.sum(adjusted)
                 # Use adjusted if sum > 0, else fall back to target probs
                 adjusted_normalized = mx.where(
@@ -252,9 +252,7 @@ class RejectionSampler:
                     adjusted / mx.maximum(adjusted_sum, eps),
                     p_target[b, n, :],
                 )
-                bonus_arrays.append(
-                    mx.random.categorical(mx.log(adjusted_normalized))
-                )
+                bonus_arrays.append(mx.random.categorical(mx.log(adjusted_normalized)))
 
         # Single eval for all bonus token samples
         mx.eval(*bonus_arrays)

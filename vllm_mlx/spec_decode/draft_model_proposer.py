@@ -97,9 +97,7 @@ class DraftModelProposer(BaseProposer):
         try:
             import mlx_lm
 
-            logger.info(
-                f"Loading draft model: {self._config.draft_model_name}"
-            )
+            logger.info(f"Loading draft model: {self._config.draft_model_name}")
             self._model, self._tokenizer = mlx_lm.load(
                 self._config.draft_model_name,
                 tokenizer_config={"trust_remote_code": True},
@@ -140,9 +138,7 @@ class DraftModelProposer(BaseProposer):
             RuntimeError: If the model has not been loaded via load().
         """
         if self._model is None:
-            raise RuntimeError(
-                "Draft model not loaded. Call load() before propose()."
-            )
+            raise RuntimeError("Draft model not loaded. Call load() before propose().")
 
         if k <= 0 or len(token_ids) == 0:
             return []

@@ -26,11 +26,11 @@ from .paged_cache import PagedCacheManager
 from .prefix_cache import BlockAwarePrefixCache, PrefixCacheManager
 from .request import Request, RequestOutput, RequestStatus, SamplingParams
 from .spec_decode import (
+    AcceptResult,
+    RequestState,
     SpecDecodeConfig,
     SpecDecodeRuntime,
     SpecDecodeStats,
-    AcceptResult,
-    RequestState,
     VerifyResult,
 )
 from .spec_decode.cache_utils import batch_variable_trim, can_per_seq_trim
@@ -107,15 +107,26 @@ class SchedulerConfig:
     mid_prefill_save_interval: int = 8192
 
     # Speculative decoding settings
-    speculative_method: Optional[str] = None  # None = disabled, "ngram" = n-gram proposer
+    speculative_method: Optional[str] = (
+        None  # None = disabled, "ngram" = n-gram proposer
+    )
     num_speculative_tokens: int = 3  # Number of draft tokens per step (k)
-    spec_decode_disable_batch_size: Optional[int] = None  # Disable spec decode above this batch size
-    draft_model_name: Optional[str] = None  # Draft model path (for future model-based proposers)
-    spec_decode_auto_disable_threshold: float = 0.4  # Auto-disable below this acceptance rate
-    spec_decode_auto_disable_window: int = 50  # Rolling window size for auto-disable evaluation
+    spec_decode_disable_batch_size: Optional[int] = (
+        None  # Disable spec decode above this batch size
+    )
+    draft_model_name: Optional[str] = (
+        None  # Draft model path (for future model-based proposers)
+    )
+    spec_decode_auto_disable_threshold: float = (
+        0.4  # Auto-disable below this acceptance rate
+    )
+    spec_decode_auto_disable_window: int = (
+        50  # Rolling window size for auto-disable evaluation
+    )
     model_name: Optional[str] = None  # Model name/path for MTP weight loading
-    mtp_model_name: Optional[str] = None  # Separate model for MTP weights (if different from main)
-
+    mtp_model_name: Optional[str] = (
+        None  # Separate model for MTP weights (if different from main)
+    )
 
 
 @dataclass
@@ -144,7 +155,7 @@ def _inner_cache(layer_cache):
     Used for introspecting batch state (offset, left_padding, _idx) which
     is shared across sub-caches in a CacheList.
     """
-    if hasattr(layer_cache, 'caches'):
+    if hasattr(layer_cache, "caches"):
         return layer_cache.caches[0]
     return layer_cache
 
@@ -533,13 +544,14 @@ def _resolve_mtp_model_path(model_name: str, num_hidden_layers: int) -> str:
         Local directory path containing the downloaded MTP weight files.
     """
     import json
+
     from huggingface_hub import hf_hub_download
 
     # Known MTP prefix patterns
     mtp_prefixes = [
-        f"model.layers.{num_hidden_layers}.",   # DeepSeek V3/V3.2, GLM
-        "model.mtp_layers.",                     # MiMo
-        "model.mtp.",                            # Kimi, MiMo V2
+        f"model.layers.{num_hidden_layers}.",  # DeepSeek V3/V3.2, GLM
+        "model.mtp_layers.",  # MiMo
+        "model.mtp.",  # Kimi, MiMo V2
     ]
 
     # Step 1: Download the safetensors index
@@ -552,6 +564,7 @@ def _resolve_mtp_model_path(model_name: str, num_hidden_layers: int) -> str:
             model_name,
         )
         from huggingface_hub import snapshot_download
+
         return snapshot_download(model_name)
 
     with open(index_path) as f:
@@ -589,6 +602,7 @@ def _resolve_mtp_model_path(model_name: str, num_hidden_layers: int) -> str:
     # Return the directory containing the downloaded files
     # hf_hub_download caches to the same directory structure
     from pathlib import Path
+
     cache_dir = Path(index_path).parent
     return str(cache_dir)
 
@@ -642,7 +656,9 @@ class Scheduler:
         self.batch_generator: Optional[BatchGenerator] = None
         self._current_sampler_params: Optional[Tuple] = None
 
-        self._mtp_hidden_states: dict[str, Any] = {}  # Per-request hidden states for MTP
+        self._mtp_hidden_states: dict[str, Any] = (
+            {}
+        )  # Per-request hidden states for MTP
 
         # Prefix cache for KV state reuse
         self.prefix_cache: Optional[PrefixCacheManager] = None
@@ -796,7 +812,11 @@ class Scheduler:
             proposer.load()
         elif self.config.speculative_method == "mtp":
             # External MTP adapters (DeepSeek V3, GLM-5, etc.)
-            from .spec_decode.mtp_module import load_mtp_weights, detect_mtp_prefix, detect_mtp_style
+            from .spec_decode.mtp_module import (
+                detect_mtp_prefix,
+                detect_mtp_style,
+                load_mtp_weights,
+            )
             from .spec_decode.mtp_proposer import MTPProposer, MTPProposerConfig
 
             model_config = self.model.args
@@ -809,6 +829,7 @@ class Scheduler:
                     "for MTP weight loading"
                 )
             import os
+
             if os.path.isdir(mtp_source):
                 mtp_model_path = mtp_source
             else:
@@ -823,7 +844,8 @@ class Scheduler:
             mtp_style = detect_mtp_style(mtp_keys, mtp_prefix)
             logger.info(
                 "Detected MTP style='%s' with prefix='%s'",
-                mtp_style, mtp_prefix,
+                mtp_style,
+                mtp_prefix,
             )
 
             # Get decoder layer class from the loaded model
@@ -832,19 +854,26 @@ class Scheduler:
             # Create appropriate MTP module based on detected style
             if mtp_style == "standard":
                 from .spec_decode.mtp_adapters import StandardMTPModule
+
                 mtp_module = StandardMTPModule.from_model_config(
-                    model_config, decoder_layer_cls=decoder_layer_cls,
+                    model_config,
+                    decoder_layer_cls=decoder_layer_cls,
                 )
             else:
                 from .spec_decode.mtp_adapters import SimpleMTPModule
+
                 mtp_module = SimpleMTPModule.from_model_config(
-                    model_config, decoder_layer_cls=decoder_layer_cls,
+                    model_config,
+                    decoder_layer_cls=decoder_layer_cls,
                 )
 
             # Load MTP weights (and quantize to match main model if needed)
             load_mtp_weights(
-                mtp_model_path, model_config.num_hidden_layers, mtp_module,
-                model_config=model_config, mtp_prefix=mtp_prefix,
+                mtp_model_path,
+                model_config.num_hidden_layers,
+                mtp_module,
+                model_config=model_config,
+                mtp_prefix=mtp_prefix,
                 main_model=self.model,
             )
 
@@ -896,7 +925,10 @@ class Scheduler:
         if self.waiting:  # Pending prefills -- run normal step
             return False
         # Don't spec decode if there are unprocessed prompts waiting for prefill
-        if hasattr(self.batch_generator, 'unprocessed_prompts') and self.batch_generator.unprocessed_prompts:
+        if (
+            hasattr(self.batch_generator, "unprocessed_prompts")
+            and self.batch_generator.unprocessed_prompts
+        ):
             return False
         # Check batch size threshold
         batch_size = len(self.running)
@@ -946,9 +978,11 @@ class Scheduler:
             request = self.running.get(request_id)
             if request is None:
                 continue
-            token_ids = list(request.prompt_token_ids or []) + list(
-                request.output_token_ids
-            ) + [batch_y_list[i]]
+            token_ids = (
+                list(request.prompt_token_ids or [])
+                + list(request.output_token_ids)
+                + [batch_y_list[i]]
+            )
             request_states[request_id] = RequestState(
                 request_id=request_id,
                 token_ids=token_ids,
@@ -1025,6 +1059,7 @@ class Scheduler:
             except (TypeError, IndexError):
                 _cache_for_mask = _c0
             from mlx_lm.models.base import create_attention_mask
+
             mask = create_attention_mask(h, _cache_for_mask, return_array=True)
             for i in range(inner.num_layers):
                 h = inner.layers[inner.start_idx + i](h, mask, batch.cache[i])
@@ -1060,7 +1095,9 @@ class Scheduler:
                     # The accepted position index in the logits/hidden tensor
                     accepted_pos = result.num_accepted
                     # Extract hidden state at the accepted position (shape: 1, 1, hidden_size)
-                    self._mtp_hidden_states[rid] = hidden_states[i : i + 1, accepted_pos : accepted_pos + 1, :]
+                    self._mtp_hidden_states[rid] = hidden_states[
+                        i : i + 1, accepted_pos : accepted_pos + 1, :
+                    ]
 
         # Log spec decode stats periodically
         if runtime.stats.num_drafts % 50 == 0 and runtime.stats.num_drafts > 0:
@@ -1134,17 +1171,13 @@ class Scheduler:
                 if finish_reason is not None:
                     unemitted = len(committed_tokens) - t_idx - 1
                     if unemitted > 0:
-                        rollback_counts[rid] = (
-                            rollback_counts.get(rid, 0) + unemitted
-                        )
+                        rollback_counts[rid] = rollback_counts.get(rid, 0) + unemitted
                     finished_in_spec.append(rid)
                     break
 
             canonical_committed[rid] = emitted_for_rid
             # Add original rollback count from rejection
-            rollback_counts[rid] = (
-                rollback_counts.get(rid, 0) + result.rollback_count
-            )
+            rollback_counts[rid] = rollback_counts.get(rid, 0) + result.rollback_count
 
         # 8. Rollback KV cache for rejected positions
         # trim_per_sequence expects an mx.array of per-sequence trim amounts
@@ -1174,6 +1207,7 @@ class Scheduler:
                 _c0 = _inner_cache(batch.cache[0])
                 mx.eval(_c0.offset, _c0.left_padding)
             from vllm_mlx.spec_decode.cache_utils import fixup_cache_after_filter
+
             fixup_cache_after_filter(batch.cache)
 
         # 9. Update batch state for next step
@@ -1211,16 +1245,12 @@ class Scheduler:
                     # No tokens accepted -- keep original y
                     new_y.append(batch_y[batch_idx])
                     new_logprobs.append(
-                        batch.logprobs[batch_idx]
-                        if batch.logprobs
-                        else mx.zeros((1,))
+                        batch.logprobs[batch_idx] if batch.logprobs else mx.zeros((1,))
                     )
             else:
                 new_y.append(batch_y[batch_idx])
                 new_logprobs.append(
-                    batch.logprobs[batch_idx]
-                    if batch.logprobs
-                    else mx.zeros((1,))
+                    batch.logprobs[batch_idx] if batch.logprobs else mx.zeros((1,))
                 )
 
         batch.y = mx.array(new_y, dtype=mx.int32)
@@ -1600,10 +1630,8 @@ class Scheduler:
                     # BatchKVCache doesn't inherit from KVCache, so
                     # _merge_caches can't handle it. Convert to KVCache
                     # (safe because mid-prefill save is always batch_size=1).
-                    from mlx_lm.models.cache import (
-                        BatchKVCache as _BatchKVCache,
-                        KVCache as _KVCache,
-                    )
+                    from mlx_lm.models.cache import BatchKVCache as _BatchKVCache
+                    from mlx_lm.models.cache import KVCache as _KVCache
 
                     if cache_cls is _BatchKVCache:
                         # BatchKVCache.state = (keys, values, offset, left_padding)
@@ -1810,7 +1838,10 @@ class Scheduler:
             if self.batch_generator is not None:
                 self.batch_generator.remove([uid])
                 if self.batch_generator.active_batch is not None:
-                    from vllm_mlx.spec_decode.cache_utils import fixup_cache_after_filter
+                    from vllm_mlx.spec_decode.cache_utils import (
+                        fixup_cache_after_filter,
+                    )
+
                     fixup_cache_after_filter(self.batch_generator.active_batch.cache)
                 removed_from_batch = True
             del self.uid_to_request_id[uid]
@@ -2202,8 +2233,13 @@ class Scheduler:
                     self.batch_generator.remove([uid])
                     # Fix stale _idx after filter and evaluate cache metadata
                     if self.batch_generator.active_batch is not None:
-                        from vllm_mlx.spec_decode.cache_utils import fixup_cache_after_filter
-                        fixup_cache_after_filter(self.batch_generator.active_batch.cache)
+                        from vllm_mlx.spec_decode.cache_utils import (
+                            fixup_cache_after_filter,
+                        )
+
+                        fixup_cache_after_filter(
+                            self.batch_generator.active_batch.cache
+                        )
 
             # Clean up spec decode state
             if self._spec_decode_runtime is not None:
@@ -2241,7 +2277,7 @@ class Scheduler:
         self.uid_to_request_id.clear()
 
         # Clear MTP hidden states to prevent stale state after recovery
-        if hasattr(self, '_mtp_hidden_states') and self._mtp_hidden_states:
+        if hasattr(self, "_mtp_hidden_states") and self._mtp_hidden_states:
             self._mtp_hidden_states.clear()
 
         logger.info("Cache recovery completed")
@@ -2262,7 +2298,7 @@ class Scheduler:
             del self.running[request_id]
 
         # Clear MTP hidden states - rescheduled requests will recompute from scratch
-        if hasattr(self, '_mtp_hidden_states') and self._mtp_hidden_states:
+        if hasattr(self, "_mtp_hidden_states") and self._mtp_hidden_states:
             self._mtp_hidden_states.clear()
 
         if count > 0:
@@ -2307,8 +2343,8 @@ class Scheduler:
                             responses = spec_responses
                             output.has_work = True
                             if responses:
-                                outputs, finished_ids = (
-                                    self._process_batch_responses(responses)
+                                outputs, finished_ids = self._process_batch_responses(
+                                    responses
                                 )
                                 output.outputs = outputs
                                 output.finished_request_ids = finished_ids
@@ -2319,13 +2355,16 @@ class Scheduler:
                             output.has_work = True
                             if responses:
                                 # Invalidate stale MTP hidden states after normal decode
-                                if self._mtp_hidden_states and self.config.speculative_method == "mtp":
+                                if (
+                                    self._mtp_hidden_states
+                                    and self.config.speculative_method == "mtp"
+                                ):
                                     for resp in responses:
                                         rid = self.uid_to_request_id.get(resp.uid)
                                         if rid:
                                             self._mtp_hidden_states.pop(rid, None)
-                                outputs, finished_ids = (
-                                    self._process_batch_responses(responses)
+                                outputs, finished_ids = self._process_batch_responses(
+                                    responses
                                 )
                                 output.outputs = outputs
                                 output.finished_request_ids = finished_ids
@@ -2336,13 +2375,16 @@ class Scheduler:
                         output.has_work = True
                         if responses:
                             # Invalidate stale MTP hidden states after normal decode
-                            if self._mtp_hidden_states and self.config.speculative_method == "mtp":
+                            if (
+                                self._mtp_hidden_states
+                                and self.config.speculative_method == "mtp"
+                            ):
                                 for resp in responses:
                                     rid = self.uid_to_request_id.get(resp.uid)
                                     if rid:
                                         self._mtp_hidden_states.pop(rid, None)
-                            outputs, finished_ids = (
-                                self._process_batch_responses(responses)
+                            outputs, finished_ids = self._process_batch_responses(
+                                responses
                             )
                             output.outputs = outputs
                             output.finished_request_ids = finished_ids

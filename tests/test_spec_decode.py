@@ -27,7 +27,6 @@ from vllm_mlx.spec_decode import (
 from vllm_mlx.spec_decode.ngram_proposer import NgramProposer, NgramProposerConfig
 from vllm_mlx.spec_decode.rejection_sampler import RejectionResult, RejectionSampler
 
-
 # ======================================================================
 # TestNgramProposer
 # ======================================================================
@@ -387,14 +386,20 @@ class TestSpecDecodeStats(unittest.TestCase):
     def test_acceptance_rate_basic(self):
         """acceptance_rate() computes correctly."""
         stats = SpecDecodeStats()
-        stats.update(num_drafted=4, num_accepted=3, position_accepted=[True, True, True, False])
+        stats.update(
+            num_drafted=4, num_accepted=3, position_accepted=[True, True, True, False]
+        )
         self.assertAlmostEqual(stats.acceptance_rate(), 3 / 4)
 
     def test_mean_accepted_length_basic(self):
         """mean_accepted_length() computes correctly."""
         stats = SpecDecodeStats()
-        stats.update(num_drafted=4, num_accepted=3, position_accepted=[True, True, True, False])
-        stats.update(num_drafted=4, num_accepted=1, position_accepted=[True, False, False, False])
+        stats.update(
+            num_drafted=4, num_accepted=3, position_accepted=[True, True, True, False]
+        )
+        stats.update(
+            num_drafted=4, num_accepted=1, position_accepted=[True, False, False, False]
+        )
         # Total accepted = 4, total drafts = 2
         self.assertAlmostEqual(stats.mean_accepted_length(), 4 / 2)
 
@@ -402,12 +407,18 @@ class TestSpecDecodeStats(unittest.TestCase):
         """update() accumulates counts correctly over multiple rounds."""
         stats = SpecDecodeStats()
 
-        stats.update(num_drafted=3, num_accepted=2, position_accepted=[True, True, False])
+        stats.update(
+            num_drafted=3, num_accepted=2, position_accepted=[True, True, False]
+        )
         self.assertEqual(stats.num_drafts, 1)
         self.assertEqual(stats.num_draft_tokens, 3)
         self.assertEqual(stats.num_accepted_tokens, 2)
 
-        stats.update(num_drafted=5, num_accepted=4, position_accepted=[True, True, True, True, False])
+        stats.update(
+            num_drafted=5,
+            num_accepted=4,
+            position_accepted=[True, True, True, True, False],
+        )
         self.assertEqual(stats.num_drafts, 2)
         self.assertEqual(stats.num_draft_tokens, 8)
         self.assertEqual(stats.num_accepted_tokens, 6)
@@ -417,9 +428,13 @@ class TestSpecDecodeStats(unittest.TestCase):
         stats = SpecDecodeStats()
 
         # Round 1: positions [T, F, T]
-        stats.update(num_drafted=3, num_accepted=2, position_accepted=[True, False, True])
+        stats.update(
+            num_drafted=3, num_accepted=2, position_accepted=[True, False, True]
+        )
         # Round 2: positions [T, T, F]
-        stats.update(num_drafted=3, num_accepted=2, position_accepted=[True, True, False])
+        stats.update(
+            num_drafted=3, num_accepted=2, position_accepted=[True, True, False]
+        )
 
         rates = stats.acceptance_rate_per_position
         self.assertEqual(len(rates), 3)
@@ -457,7 +472,11 @@ class TestSpecDecodeStats(unittest.TestCase):
     def test_reset_clears_everything(self):
         """reset() clears all statistics."""
         stats = SpecDecodeStats()
-        stats.update(num_drafted=5, num_accepted=3, position_accepted=[True, True, True, False, False])
+        stats.update(
+            num_drafted=5,
+            num_accepted=3,
+            position_accepted=[True, True, True, False, False],
+        )
 
         stats.reset()
 
@@ -510,13 +529,17 @@ class TestMetadata(unittest.TestCase):
 
     def test_config_disable_by_batch_size_valid(self):
         """Valid disable_by_batch_size is accepted."""
-        config = SpecDecodeConfig(method="ngram", num_speculative_tokens=5, disable_by_batch_size=8)
+        config = SpecDecodeConfig(
+            method="ngram", num_speculative_tokens=5, disable_by_batch_size=8
+        )
         self.assertEqual(config.disable_by_batch_size, 8)
 
     def test_config_disable_by_batch_size_zero(self):
         """disable_by_batch_size < 1 raises ValueError."""
         with self.assertRaises(ValueError):
-            SpecDecodeConfig(method="ngram", num_speculative_tokens=5, disable_by_batch_size=0)
+            SpecDecodeConfig(
+                method="ngram", num_speculative_tokens=5, disable_by_batch_size=0
+            )
 
     def test_config_disable_by_batch_size_none(self):
         """disable_by_batch_size=None is allowed (default)."""
@@ -655,7 +678,9 @@ class TestRuntime(unittest.TestCase):
 
         request_states = {
             "req-1": RequestState(request_id="req-1", token_ids=[1, 2, 3], batch_uid=0),
-            "req-2": RequestState(request_id="req-2", token_ids=[4, 5, 6, 7], batch_uid=1),
+            "req-2": RequestState(
+                request_id="req-2", token_ids=[4, 5, 6, 7], batch_uid=1
+            ),
         }
 
         metadata = runtime.propose_drafts(request_states)

@@ -59,36 +59,36 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 # Re-export for backwards compatibility with tests
 from .api.anthropic_adapter import anthropic_to_openai, openai_to_anthropic
 from .api.anthropic_models import AnthropicRequest
+from .api.models import AssistantMessage  # noqa: F401
+from .api.models import ChatCompletionChoice  # noqa: F401
+from .api.models import ChatCompletionChunk  # noqa: F401
+from .api.models import ChatCompletionChunkChoice  # noqa: F401
+from .api.models import ChatCompletionChunkDelta  # noqa: F401
+from .api.models import CompletionChoice  # noqa: F401
+from .api.models import ContentPart  # noqa: F401
+from .api.models import ImageUrl  # noqa: F401
+from .api.models import MCPServerInfo  # noqa: F401
+from .api.models import MCPToolInfo  # noqa: F401
+from .api.models import Message  # noqa: F401
+from .api.models import ModelInfo  # noqa: F401
+from .api.models import Usage  # noqa: F401
+from .api.models import VideoUrl  # noqa: F401
 from .api.models import (
-    AssistantMessage,  # noqa: F401
-    ChatCompletionChoice,  # noqa: F401
-    ChatCompletionChunk,  # noqa: F401
-    ChatCompletionChunkChoice,  # noqa: F401
-    ChatCompletionChunkDelta,  # noqa: F401
     ChatCompletionRequest,
     ChatCompletionResponse,
-    CompletionChoice,  # noqa: F401
     CompletionRequest,
     CompletionResponse,
-    ContentPart,  # noqa: F401
     EmbeddingData,
     EmbeddingRequest,
     EmbeddingResponse,
     EmbeddingUsage,
     FunctionCall,
-    ImageUrl,  # noqa: F401
     MCPExecuteRequest,
     MCPExecuteResponse,
-    MCPServerInfo,  # noqa: F401
     MCPServersResponse,
-    MCPToolInfo,  # noqa: F401
     MCPToolsResponse,
-    Message,  # noqa: F401
-    ModelInfo,  # noqa: F401
     ModelsResponse,
     ToolCall,
-    Usage,  # noqa: F401
-    VideoUrl,  # noqa: F401
 )
 from .api.tool_calling import (
     build_json_system_prompt,
@@ -96,11 +96,11 @@ from .api.tool_calling import (
     parse_json_output,
     parse_tool_calls,
 )
+from .api.utils import is_mllm_model  # noqa: F401
 from .api.utils import (
     SPECIAL_TOKENS_PATTERN,
     clean_output_text,
     extract_multimodal_content,
-    is_mllm_model,  # noqa: F401
 )
 from .engine import BaseEngine, BatchedEngine, GenerationOutput, SimpleEngine
 from .tool_parsers import ToolParserManager
@@ -1872,7 +1872,9 @@ async def stream_chat_completion(
     # When a reasoning parser is active, it handles extraction properly.
     # The <think> prefix is only needed as fallback when thinking is enabled
     # but no parser is active (shouldn't happen with current auto-detect logic).
-    is_thinking_model = os.environ.get("VLLM_MLX_ENABLE_THINKING", "") == "1" and not _reasoning_parser
+    is_thinking_model = (
+        os.environ.get("VLLM_MLX_ENABLE_THINKING", "") == "1" and not _reasoning_parser
+    )
     think_prefix_sent = False
 
     # Reset reasoning parser state for this stream
@@ -2129,7 +2131,11 @@ def main(argv=None):
         callers such as ``distributed_launcher.py`` to invoke the
         server without manipulating ``sys.argv``.
     """
-    from .cli_args import add_all_serve_args, build_scheduler_config, validate_serve_args
+    from .cli_args import (
+        add_all_serve_args,
+        build_scheduler_config,
+        validate_serve_args,
+    )
 
     parser = argparse.ArgumentParser(
         description="vllm-mlx OpenAI-compatible server for LLM and MLLM inference",
@@ -2190,7 +2196,9 @@ Examples:
     # --- Thinking mode ---
     # --enable-thinking: model generates <think>...</think> before responding.
     # --reasoning-parser: explicit parser choice (implies --enable-thinking).
-    enable_thinking = getattr(args, 'enable_thinking', False) or bool(args.reasoning_parser)
+    enable_thinking = getattr(args, "enable_thinking", False) or bool(
+        args.reasoning_parser
+    )
 
     if enable_thinking and not args.reasoning_parser:
         # Auto-detect parser from model name
@@ -2214,6 +2222,7 @@ Examples:
     if enable_thinking and args.reasoning_parser:
         global _reasoning_parser
         from .reasoning import get_parser
+
         parser_cls = get_parser(args.reasoning_parser)
         _reasoning_parser = parser_cls()
         logger.info(f"Reasoning parser activated: {args.reasoning_parser}")
@@ -2226,7 +2235,9 @@ Examples:
     os.environ.pop("VLLM_MLX_REASONING_PARSER", None)  # No longer needed
 
     # Configure tool calling
-    if getattr(args, 'enable_auto_tool_choice', False) and getattr(args, 'tool_call_parser', None):
+    if getattr(args, "enable_auto_tool_choice", False) and getattr(
+        args, "tool_call_parser", None
+    ):
         global _enable_auto_tool_choice, _tool_call_parser
         _enable_auto_tool_choice = True
         _tool_call_parser = args.tool_call_parser

@@ -389,9 +389,7 @@ class SpecDecodeRuntime:
                 self._seq_lens[request_id] += len(committed_tokens)
 
             # Update statistics
-            position_accepted = [
-                i < num_accepted for i in range(num_drafted)
-            ]
+            position_accepted = [i < num_accepted for i in range(num_drafted)]
             self._stats.update(
                 num_drafted=num_drafted,
                 num_accepted=num_accepted,
@@ -511,5 +509,5 @@ class SpecDecodeRuntime:
             request_id: The request ID to remove.
         """
         self._seq_lens.pop(request_id, None)
-        if hasattr(self.proposer, 'remove_request'):
+        if hasattr(self.proposer, "remove_request"):
             self.proposer.remove_request(request_id)

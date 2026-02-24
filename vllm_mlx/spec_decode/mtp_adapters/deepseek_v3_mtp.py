@@ -157,7 +157,11 @@ class StandardMTPModule(MTPModule):
             return getattr(mod, class_name)
 
         # Try common decoder layer class names
-        for name in ["DecoderLayer", "TransformerBlock", f"{model_type.title()}DecoderLayer"]:
+        for name in [
+            "DecoderLayer",
+            "TransformerBlock",
+            f"{model_type.title()}DecoderLayer",
+        ]:
             cls = getattr(mod, name, None)
             if cls is not None:
                 return cls
@@ -215,6 +219,7 @@ class StandardMTPModule(MTPModule):
             return self._cache_factory()
         try:
             from mlx_lm.models.cache import KVCache
+
             return KVCache()
         except ImportError:
             return None

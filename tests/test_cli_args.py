@@ -14,7 +14,6 @@ from vllm_mlx.cli_args import (
     validate_serve_args,
 )
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -61,19 +60,28 @@ def test_build_scheduler_config_custom():
     """Custom CLI values should propagate into SchedulerConfig fields."""
     args = _parse(
         [
-            "--model", "X",
+            "--model",
+            "X",
             "--continuous-batching",
-            "--max-num-seqs", "128",
-            "--prefill-batch-size", "16",
-            "--completion-batch-size", "64",
+            "--max-num-seqs",
+            "128",
+            "--prefill-batch-size",
+            "16",
+            "--completion-batch-size",
+            "64",
             "--no-prefix-cache",
             "--kv-cache-quantization",
-            "--kv-cache-quantization-bits", "4",
+            "--kv-cache-quantization-bits",
+            "4",
             "--use-paged-cache",
-            "--paged-cache-block-size", "128",
-            "--chunked-prefill-tokens", "512",
-            "--speculative-method", "ngram",
-            "--num-speculative-tokens", "5",
+            "--paged-cache-block-size",
+            "128",
+            "--chunked-prefill-tokens",
+            "512",
+            "--speculative-method",
+            "ngram",
+            "--num-speculative-tokens",
+            "5",
         ]
     )
     cfg = build_scheduler_config(args)
@@ -188,13 +196,18 @@ def test_validate_timeout_invalid():
 def test_rebuild_server_args_roundtrip():
     """Rebuilt args, when re-parsed, should produce the same values."""
     original_argv = [
-        "--model", "test-model",
+        "--model",
+        "test-model",
         "--continuous-batching",
-        "--max-num-seqs", "128",
+        "--max-num-seqs",
+        "128",
         "--kv-cache-quantization",
-        "--speculative-method", "ngram",
-        "--api-key", "secret",
-        "--port", "9000",
+        "--speculative-method",
+        "ngram",
+        "--api-key",
+        "secret",
+        "--port",
+        "9000",
     ]
     args1 = _parse(original_argv)
     rebuilt = rebuild_server_args_from_namespace(args1)
@@ -251,9 +264,11 @@ def test_server_and_cli_parser_equivalence():
     # Server-style parser (--model flag)
     args_server = _parse(
         [
-            "--model", "test-model",
+            "--model",
+            "test-model",
             "--continuous-batching",
-            "--max-num-seqs", "64",
+            "--max-num-seqs",
+            "64",
             "--kv-cache-quantization",
         ],
         positional_model=False,
@@ -264,7 +279,8 @@ def test_server_and_cli_parser_equivalence():
         [
             "test-model",
             "--continuous-batching",
-            "--max-num-seqs", "64",
+            "--max-num-seqs",
+            "64",
             "--kv-cache-quantization",
         ],
         positional_model=True,

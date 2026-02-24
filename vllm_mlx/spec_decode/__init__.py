@@ -25,7 +25,13 @@ Usage:
 from .draft_model_proposer import DraftModelProposer, DraftModelProposerConfig
 from .metadata import SpecDecodeConfig, SpecDecodeMetadata
 from .metrics import SpecDecodeStats
-from .mtp_module import MTPModule, MTPModuleConfig, load_mtp_weights, detect_mtp_prefix, detect_mtp_style
+from .mtp_module import (
+    MTPModule,
+    MTPModuleConfig,
+    detect_mtp_prefix,
+    detect_mtp_style,
+    load_mtp_weights,
+)
 from .mtp_proposer import MTPProposer, MTPProposerConfig
 from .proposer import BaseProposer, Proposal, ProposalContext, ProposerConfig
 from .runtime import AcceptResult, RequestState, SpecDecodeRuntime, VerifyResult

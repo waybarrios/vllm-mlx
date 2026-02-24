@@ -21,10 +21,10 @@ from typing import Any, AsyncIterator, Dict, List, Optional, Union
 
 import mlx.core as mx
 
+from .model_registry import get_registry
+from .output_collector import RequestOutputCollector, RequestStreamState
 from .request import Request, RequestOutput, SamplingParams
 from .scheduler import Scheduler, SchedulerConfig
-from .output_collector import RequestOutputCollector, RequestStreamState
-from .model_registry import get_registry
 
 logger = logging.getLogger(__name__)
 
@@ -206,7 +206,10 @@ class EngineCore:
                     self._steps_executed += 1
 
                     # Emergency memory pressure check
-                    if _memory_pressure_threshold > 0 and self._steps_executed % _memory_check_interval == 0:
+                    if (
+                        _memory_pressure_threshold > 0
+                        and self._steps_executed % _memory_check_interval == 0
+                    ):
                         try:
                             active_mem = mx.get_active_memory()
                             if active_mem > _memory_pressure_threshold:
@@ -502,8 +505,9 @@ class EngineCore:
         Returns:
             List of RequestOutput in same order as prompts
         """
-        from .request import Request
         import uuid as uuid_module
+
+        from .request import Request
 
         if sampling_params is None:
             sampling_params = SamplingParams()

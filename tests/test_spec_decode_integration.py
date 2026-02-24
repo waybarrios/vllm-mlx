@@ -6,25 +6,24 @@ These tests verify the scheduler's spec decode path using mocked models
 and batch generators, without requiring actual LLM inference.
 """
 
-import pytest
-from unittest.mock import MagicMock
 from collections import deque
+from unittest.mock import MagicMock
 
 import mlx.core as mx
+import pytest
 
 from vllm_mlx.scheduler import SchedulerConfig
 from vllm_mlx.spec_decode import (
+    AcceptResult,
+    RequestState,
     SpecDecodeConfig,
     SpecDecodeRuntime,
     SpecDecodeStats,
-    AcceptResult,
-    RequestState,
     VerifyResult,
 )
 from vllm_mlx.spec_decode.metadata import SpecDecodeMetadata
 from vllm_mlx.spec_decode.ngram_proposer import NgramProposer, NgramProposerConfig
 from vllm_mlx.spec_decode.rejection_sampler import RejectionSampler
-
 
 # ======================================================================
 # TestSchedulerConfigSpecDecode
@@ -83,7 +82,9 @@ class TestCanSpecDecode:
         scheduler._spec_decode_runtime = kwargs.get("runtime", MagicMock())
         scheduler.batch_generator = kwargs.get("batch_generator", MagicMock())
         if scheduler.batch_generator is not None:
-            scheduler.batch_generator.unprocessed_prompts = kwargs.get("unprocessed_prompts", [])
+            scheduler.batch_generator.unprocessed_prompts = kwargs.get(
+                "unprocessed_prompts", []
+            )
         if "active_batch" in kwargs:
             scheduler.batch_generator.active_batch = kwargs["active_batch"]
         scheduler.waiting = kwargs.get("waiting", deque())
@@ -173,9 +174,7 @@ class TestCanSpecDecode:
         runtime.should_disable.return_value = False
         model = MagicMock()
         model.args.model_type = "llama"
-        s = self._make_scheduler_mock(
-            runtime=runtime, model=model, has_model_args=True
-        )
+        s = self._make_scheduler_mock(runtime=runtime, model=model, has_model_args=True)
         result = Scheduler._can_spec_decode(s)
         assert result is True
 
@@ -283,7 +282,9 @@ class TestInitSpecDecode:
 
         # SpecDecodeConfig.__post_init__ validates the method before
         # _init_spec_decode's own check, so we match either message.
-        with pytest.raises(ValueError, match="(Unknown speculative method|Invalid method)"):
+        with pytest.raises(
+            ValueError, match="(Unknown speculative method|Invalid method)"
+        ):
             Scheduler._init_spec_decode(scheduler)
 
     def test_runtime_uses_greedy_sampler(self):
@@ -659,9 +660,7 @@ class TestResponseGeneration:
             rollback_count=0,
         )
 
-        emitted, rollback = self._emit_tokens(
-            result.accepted_tokens, set(), 0
-        )
+        emitted, rollback = self._emit_tokens(result.accepted_tokens, set(), 0)
 
         assert len(emitted) == 0
         assert rollback == 3  # all tokens unemitted
@@ -675,9 +674,7 @@ class TestResponseGeneration:
             rollback_count=0,
         )
 
-        emitted, rollback = self._emit_tokens(
-            result.accepted_tokens, set(), 100
-        )
+        emitted, rollback = self._emit_tokens(result.accepted_tokens, set(), 100)
 
         assert len(emitted) == 4
         assert all(fr is None for _, fr in emitted)
@@ -692,9 +689,7 @@ class TestResponseGeneration:
             rollback_count=0,
         )
 
-        emitted, rollback = self._emit_tokens(
-            result.accepted_tokens, set(), 1
-        )
+        emitted, rollback = self._emit_tokens(result.accepted_tokens, set(), 1)
 
         assert len(emitted) == 1
         assert emitted[0] == (10, "length")
@@ -711,9 +706,7 @@ class TestResponseGeneration:
             rollback_count=0,
         )
 
-        emitted, rollback = self._emit_tokens(
-            result.accepted_tokens, {42}, 1
-        )
+        emitted, rollback = self._emit_tokens(result.accepted_tokens, {42}, 1)
 
         assert len(emitted) == 1
         assert emitted[0] == (42, "stop")
@@ -1102,7 +1095,9 @@ class TestCanSpecDecodeTP:
         scheduler._spec_decode_runtime = kwargs.get("runtime", MagicMock())
         scheduler.batch_generator = kwargs.get("batch_generator", MagicMock())
         if scheduler.batch_generator is not None:
-            scheduler.batch_generator.unprocessed_prompts = kwargs.get("unprocessed_prompts", [])
+            scheduler.batch_generator.unprocessed_prompts = kwargs.get(
+                "unprocessed_prompts", []
+            )
         if "active_batch" in kwargs:
             scheduler.batch_generator.active_batch = kwargs["active_batch"]
         scheduler.waiting = kwargs.get("waiting", deque())
@@ -1140,155 +1135,5 @@ class TestCanSpecDecodeTP:
         assert result is False
 
 
-# ======================================================================
-# TestWorkerSpecDecodeStep
-# ======================================================================
-
-
-class TestWorkerSpecDecodeStep:
-    """Test the worker spec decode step function with mocks."""
-
-    def test_worker_spec_decode_basic(self):
-        """Test basic worker spec decode step with mocked components."""
-        from vllm_mlx.distributed import SpecDecodePlan, SpecDecodeResult
-        from vllm_mlx.distributed_launcher import _worker_spec_decode_step
-
-        # Create mock components
-        spec_plan = SpecDecodePlan(
-            draft_tokens={"req-1": [10, 20]},
-            max_draft_len=2,
-            batch_order=[("req-1", 0)],
-            batch_y=[5],
-        )
-
-        # Mock batch
-        mock_batch = MagicMock()
-        mock_batch.uids = [100]
-        mock_batch.y = mx.array([5], dtype=mx.int32)
-        mock_batch.tokens = [mx.array([1, 2, 3], dtype=mx.int32)]
-        mock_batch.num_tokens = [0]
-        mock_batch.cache = MagicMock()
-
-        # Mock batch_generator
-        mock_bg = MagicMock()
-        mock_bg.active_batch = mock_batch
-
-        # Mock model that returns dummy logits
-        def mock_model_forward(input_tokens, cache=None):
-            # input shape: (1, 3) -> logits shape: (1, 3, vocab_size)
-            return mx.zeros((input_tokens.shape[0], input_tokens.shape[1], 10))
-
-        mock_model = MagicMock(side_effect=mock_model_forward)
-
-        # Mock communicator that returns a SpecDecodeResult
-        mock_comm = MagicMock()
-        spec_result = SpecDecodeResult(
-            step_id=1,
-            accepted_tokens={"req-1": [10, 20, 99]},  # 2 accepted + bonus
-            trim_amounts=[0],
-            new_y=[99],
-            finished_ids=[],
-        )
-        mock_comm.receive_spec_decode_result.return_value = spec_result
-
-        request_id_to_uid = {"req-1": 100}
-        uid_to_request_id = {100: "req-1"}
-
-        finished = _worker_spec_decode_step(
-            spec_plan=spec_plan,
-            batch_generator=mock_bg,
-            model=mock_model,
-            communicator=mock_comm,
-            request_id_to_uid=request_id_to_uid,
-            uid_to_request_id=uid_to_request_id,
-        )
-
-        # Should have called model forward
-        mock_model.assert_called_once()
-        # Should have received result
-        mock_comm.receive_spec_decode_result.assert_called_once()
-        # No finished IDs
-        assert finished == set()
-
-    def test_worker_spec_decode_no_active_batch(self):
-        """Test worker spec decode raises RuntimeError when no active batch exists."""
-        from vllm_mlx.distributed import SpecDecodePlan
-        from vllm_mlx.distributed_launcher import _worker_spec_decode_step
-
-        spec_plan = SpecDecodePlan(
-            draft_tokens={"req-1": [10]},
-            max_draft_len=1,
-            batch_order=[("req-1", 0)],
-            batch_y=[5],
-        )
-
-        mock_bg = MagicMock()
-        mock_bg.active_batch = None
-
-        mock_model = MagicMock()
-        mock_comm = MagicMock()
-        mock_comm.rank = 1
-
-        with pytest.raises(RuntimeError, match="no active batch"):
-            _worker_spec_decode_step(
-                spec_plan=spec_plan,
-                batch_generator=mock_bg,
-                model=mock_model,
-                communicator=mock_comm,
-                request_id_to_uid={},
-                uid_to_request_id={},
-            )
-
-    def test_worker_spec_decode_with_finished(self):
-        """Test worker spec decode handles finished requests."""
-        from vllm_mlx.distributed import SpecDecodePlan, SpecDecodeResult
-        from vllm_mlx.distributed_launcher import _worker_spec_decode_step
-
-        spec_plan = SpecDecodePlan(
-            draft_tokens={"req-1": [10], "req-2": [20]},
-            max_draft_len=1,
-            batch_order=[("req-1", 0), ("req-2", 1)],
-            batch_y=[5, 6],
-        )
-
-        mock_batch = MagicMock()
-        mock_batch.uids = [100, 200]
-        mock_batch.y = mx.array([5, 6], dtype=mx.int32)
-        mock_batch.tokens = [
-            mx.array([1, 2], dtype=mx.int32),
-            mx.array([3, 4], dtype=mx.int32),
-        ]
-        mock_batch.num_tokens = [0, 0]
-        mock_batch.cache = MagicMock()
-
-        mock_bg = MagicMock()
-        mock_bg.active_batch = mock_batch
-
-        def mock_forward(input_tokens, cache=None):
-            return mx.zeros((input_tokens.shape[0], input_tokens.shape[1], 10))
-
-        mock_model = MagicMock(side_effect=mock_forward)
-
-        spec_result = SpecDecodeResult(
-            step_id=1,
-            accepted_tokens={"req-1": [10, 99], "req-2": [20, 88]},
-            trim_amounts=[0, 0],
-            new_y=[99, 88],
-            finished_ids=["req-2"],
-        )
-        mock_comm = MagicMock()
-        mock_comm.receive_spec_decode_result.return_value = spec_result
-
-        request_id_to_uid = {"req-1": 100, "req-2": 200}
-        uid_to_request_id = {100: "req-1", 200: "req-2"}
-
-        finished = _worker_spec_decode_step(
-            spec_plan=spec_plan,
-            batch_generator=mock_bg,
-            model=mock_model,
-            communicator=mock_comm,
-            request_id_to_uid=request_id_to_uid,
-            uid_to_request_id=uid_to_request_id,
-        )
-
-        assert finished == {"req-2"}
+# NOTE: TestWorkerSpecDecodeStep tests moved to distributed TP PR
+# (requires vllm_mlx.distributed and vllm_mlx.distributed_launcher)

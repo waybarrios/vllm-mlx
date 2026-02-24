@@ -11,13 +11,14 @@ import sys
 import warnings
 from typing import Optional
 
-
 # ---------------------------------------------------------------------------
 # Argument builder functions
 # ---------------------------------------------------------------------------
 
 
-def add_model_args(parser: argparse.ArgumentParser, *, positional: bool = False) -> None:
+def add_model_args(
+    parser: argparse.ArgumentParser, *, positional: bool = False
+) -> None:
     """Add model-related arguments."""
     if positional:
         parser.add_argument("model", type=str, help="Model to serve")
@@ -256,8 +257,8 @@ def add_reasoning_args(parser: argparse.ArgumentParser) -> None:
         action="store_true",
         default=False,
         help="Enable thinking/reasoning mode. The model generates <think>...</think> "
-             "reasoning before its response. A reasoning parser is auto-activated "
-             "to separate thinking from content in the API response.",
+        "reasoning before its response. A reasoning parser is auto-activated "
+        "to separate thinking from content in the API response.",
     )
     reasoning_choices = list_parsers()
     parser.add_argument(
@@ -456,9 +457,10 @@ def validate_serve_args(args) -> None:
         sys.exit("Error: --speculative-method draft_model requires --draft-model")
 
     # --draft-model without draft_model method is a warning
-    if getattr(args, "draft_model", None) and getattr(
-        args, "speculative_method", None
-    ) != "draft_model":
+    if (
+        getattr(args, "draft_model", None)
+        and getattr(args, "speculative_method", None) != "draft_model"
+    ):
         warnings.warn(
             "--draft-model has no effect without --speculative-method draft_model"
         )
@@ -466,9 +468,7 @@ def validate_serve_args(args) -> None:
     # Cache memory percent must be in (0, 1]
     cache_pct = getattr(args, "cache_memory_percent", 0.20)
     if not (0 < cache_pct <= 1):
-        sys.exit(
-            f"Error: --cache-memory-percent must be in (0, 1], got {cache_pct}"
-        )
+        sys.exit(f"Error: --cache-memory-percent must be in (0, 1], got {cache_pct}")
 
     # Timeout must be positive
     timeout = getattr(args, "timeout", 300.0)
@@ -506,7 +506,10 @@ def rebuild_server_args_from_namespace(args) -> list[str]:
             result.append(flag)
 
     # Legacy --disable-prefix-cache → forward as --no-prefix-cache
-    if getattr(args, "disable_prefix_cache", False) and "--no-prefix-cache" not in result:
+    if (
+        getattr(args, "disable_prefix_cache", False)
+        and "--no-prefix-cache" not in result
+    ):
         result.append("--no-prefix-cache")
 
     # Valued args — include only when they differ from the default
@@ -527,7 +530,11 @@ def rebuild_server_args_from_namespace(args) -> list[str]:
         ("rate_limit", "--rate-limit", 0),
         ("timeout", "--timeout", 300.0),
         ("num_speculative_tokens", "--num-speculative-tokens", 3),
-        ("spec_decode_auto_disable_threshold", "--spec-decode-auto-disable-threshold", 0.4),
+        (
+            "spec_decode_auto_disable_threshold",
+            "--spec-decode-auto-disable-threshold",
+            0.4,
+        ),
         ("spec_decode_auto_disable_window", "--spec-decode-auto-disable-window", 50),
     ]
     for attr, flag, default in _VALUED_ARGS:

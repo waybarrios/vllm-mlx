@@ -182,7 +182,9 @@ class SimpleEngine(BaseEngine):
 
         async with self._generation_lock:
             accumulated_text = ""
-            if hasattr(self._model, "tokenizer") and hasattr(self._model.tokenizer, "encode"):
+            if hasattr(self._model, "tokenizer") and hasattr(
+                self._model.tokenizer, "encode"
+            ):
                 prompt_tokens = len(self._model.tokenizer.encode(prompt))
             else:
                 prompt_tokens = 0
@@ -385,6 +387,7 @@ class SimpleEngine(BaseEngine):
             # or auto-detection. When thinking is enabled, a parser is active
             # to separate <think>...</think> from the response content.
             import os
+
             enable_thinking = os.environ.get("VLLM_MLX_ENABLE_THINKING", "") == "1"
             template_kwargs = {
                 "tokenize": False,

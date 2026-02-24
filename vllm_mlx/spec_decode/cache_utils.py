@@ -147,6 +147,7 @@ def _fixup_layer_idx(layer: Any) -> None:
     """Recompute _idx for a single cache layer (recurse into CacheList)."""
     try:
         from mlx_lm.models.cache import CacheList
+
         if isinstance(layer, CacheList):
             for sub in layer.caches:
                 _fixup_layer_idx(sub)
@@ -158,7 +159,11 @@ def _fixup_layer_idx(layer: Any) -> None:
                 _fixup_layer_idx(sub)
             return
     # Recompute _idx
-    if hasattr(layer, "offset") and hasattr(layer, "left_padding") and hasattr(layer, "_idx"):
+    if (
+        hasattr(layer, "offset")
+        and hasattr(layer, "left_padding")
+        and hasattr(layer, "_idx")
+    ):
         new_idx = int(mx.max(layer.left_padding + layer.offset).item())
         if new_idx != layer._idx:
             logger.debug(f"fixup_cache_after_filter: _idx {layer._idx} -> {new_idx}")
@@ -178,6 +183,7 @@ def _collect_cache_metadata(layer: Any, tensors: list) -> None:
     """Collect offset/left_padding tensors from a cache layer."""
     try:
         from mlx_lm.models.cache import CacheList
+
         if isinstance(layer, CacheList):
             for sub in layer.caches:
                 _collect_cache_metadata(sub, tensors)

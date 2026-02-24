@@ -102,9 +102,11 @@ class SpecDecodeStats:
 
         # Recompute per-position acceptance rates
         self.acceptance_rate_per_position = [
-            self._position_accepted_counts[i] / self._position_total_counts[i]
-            if self._position_total_counts[i] > 0
-            else 0.0
+            (
+                self._position_accepted_counts[i] / self._position_total_counts[i]
+                if self._position_total_counts[i] > 0
+                else 0.0
+            )
             for i in range(len(self._position_total_counts))
         ]
 

@@ -74,7 +74,10 @@ class MTPProposer(BaseProposer):
         for _ in range(ctx.k):
             # MTP forward: hidden + token -> new_hidden
             new_hidden = self.mtp_module(
-                h, mx.array([[last_token]]), self.embed_fn, cache=cache,
+                h,
+                mx.array([[last_token]]),
+                self.embed_fn,
+                cache=cache,
             )
 
             # Apply shared lm_head to get logits
