@@ -95,3 +95,4 @@ temp/
 
 # MLX cache
 .mlx_cache/
+reasoning_bridge.diff
