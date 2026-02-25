@@ -62,6 +62,8 @@ class SchedulerConfig:
     prefill_batch_size: int = 8
     completion_batch_size: int = 32
     prefill_step_size: int = 2048
+    # Optional override for MLLM prefill guard (None = use MLLM default).
+    mllm_prefill_step_size: Optional[int] = None
 
     # Prefix cache settings
     enable_prefix_cache: bool = True

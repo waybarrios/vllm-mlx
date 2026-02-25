@@ -238,14 +238,13 @@ class BatchedEngine(BaseEngine):
             self._scheduler_config, "kv_cache_quantization_group_size", 64
         )
 
-        # Forward prefill_step_size only when explicitly overridden via CLI
-        # (i.e. differs from the SchedulerConfig dataclass default of 2048).
-        # Otherwise let MLLMSchedulerConfig use its own default (1024).
+        # Forward MLLM prefill-step override only when explicitly configured.
+        # This keeps default behavior unchanged for MLLM (1024) unless set.
         prefill_step_size = getattr(
-            self._scheduler_config, "prefill_step_size", None
+            self._scheduler_config, "mllm_prefill_step_size", None
         )
         mllm_extra = {}
-        if prefill_step_size is not None and prefill_step_size != 2048:
+        if prefill_step_size is not None:
             mllm_extra["prefill_step_size"] = prefill_step_size
         mllm_config = MLLMSchedulerConfig(
             max_num_seqs=max_num_seqs,

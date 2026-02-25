@@ -172,11 +172,10 @@ def serve_command(args):
             kv_cache_quantization_bits=args.kv_cache_quantization_bits,
             kv_cache_quantization_group_size=args.kv_cache_quantization_group_size,
             kv_cache_min_quantize_tokens=args.kv_cache_min_quantize_tokens,
+            mllm_prefill_step_size=(
+                args.prefill_step_size if args.prefill_step_size > 0 else None
+            ),
         )
-
-        # Override prefill_step_size if explicitly set (0 = use engine default)
-        if args.prefill_step_size > 0:
-            scheduler_config.prefill_step_size = args.prefill_step_size
 
         print("Mode: Continuous batching (for multiple concurrent users)")
         if args.chunked_prefill_tokens > 0:
@@ -292,11 +291,10 @@ def bench_command(args):
             kv_cache_quantization_bits=args.kv_cache_quantization_bits,
             kv_cache_quantization_group_size=args.kv_cache_quantization_group_size,
             kv_cache_min_quantize_tokens=args.kv_cache_min_quantize_tokens,
+            mllm_prefill_step_size=(
+                args.prefill_step_size if args.prefill_step_size > 0 else None
+            ),
         )
-
-        # Override prefill_step_size if explicitly set (0 = use engine default)
-        if args.prefill_step_size > 0:
-            scheduler_config.prefill_step_size = args.prefill_step_size
 
         engine_config = EngineConfig(
             model_name=args.model,
@@ -681,7 +679,7 @@ Examples:
         "--prefill-step-size",
         type=int,
         default=0,
-        help="Max tokens per prefill forward pass (0=use engine default: 2048 for LLM, 1024 for MLLM)",
+        help="Override MLLM prefill-step guard (0=use MLLM default: 1024)",
     )
     serve_parser.add_argument(
         "--enable-prefix-cache",
@@ -997,7 +995,7 @@ Examples:
         "--prefill-step-size",
         type=int,
         default=0,
-        help="Max tokens per prefill forward pass (0=use engine default: 2048 for LLM, 1024 for MLLM)",
+        help="Override MLLM prefill-step guard (0=use MLLM default: 1024)",
     )
     bench_parser.add_argument(
         "--enable-prefix-cache",
