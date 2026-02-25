@@ -164,8 +164,9 @@ _embedding_model_locked: str | None = None  # Set when --embedding-model is used
 _api_key: str | None = None
 _auth_warning_logged: bool = False
 
-# Reasoning parser (for models like Qwen3, DeepSeek-R1)
+# Reasoning parser (for models like Qwen3, DeepSeek-R1, MiniMax)
 _reasoning_parser = None  # ReasoningParser instance when enabled
+_reasoning_parser_name: str | None = None  # Parser name (e.g., "minimax")
 
 # Tool calling configuration
 _enable_auto_tool_choice: bool = False
@@ -179,6 +180,16 @@ _gc_control: bool = True  # Disable GC during generation to avoid latency spikes
 # Pinned prefix cache (Tier 0 optimization)
 _pin_system_prompt: bool = False  # Auto-pin system prompt prefix cache blocks
 _pinned_system_prompt_hash: str | None = None  # Hash of pinned system prompt
+
+# Tool-use system prompt (auto-injected when tools are provided and parser is active)
+_TOOL_USE_SYSTEM_SUFFIX = (
+    "\n\nIMPORTANT: When the user's request can be answered using the provided tools, "
+    "you MUST use the appropriate tool immediately. Do NOT ask for clarification when "
+    "a reasonable default exists. Do NOT explain what you will do — just do it. "
+    "Be direct and concise in your responses. "
+    "Do NOT think out loud or show your reasoning process. "
+    "Give direct answers only — no preamble like 'The user asks...' or 'Let me think...'."
+)
 
 
 def _maybe_pin_system_prompt(messages: list) -> None:
@@ -1620,6 +1631,36 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
 
     has_media = bool(images or videos)
 
+    # Auto-inject system prompt suffix for tool use and/or reasoning control
+    _inject_suffix = None
+    if request.tools and _tool_call_parser:
+        _inject_suffix = _TOOL_USE_SYSTEM_SUFFIX
+    elif _reasoning_parser_name == "minimax":
+        # MiniMax reasoning parser active — inject conciseness instruction
+        _inject_suffix = (
+            "\n\nDo NOT think out loud or show your reasoning process. "
+            "Give direct answers only — no preamble like 'The user asks...' or "
+            "'We should respond...' or 'Let me think...'. Be concise."
+        )
+
+    if _inject_suffix:
+        has_system = any(
+            (m.get("role") if isinstance(m, dict) else getattr(m, "role", None)) == "system"
+            for m in messages
+        )
+        if has_system:
+            for i, m in enumerate(messages):
+                role = m.get("role") if isinstance(m, dict) else getattr(m, "role", None)
+                if role == "system":
+                    if isinstance(m, dict):
+                        messages[i] = {**m, "content": m["content"] + _inject_suffix}
+                    else:
+                        messages[i]["content"] = m["content"] + _inject_suffix
+                    break
+        else:
+            system_msg = {"role": "system", "content": _inject_suffix.strip()}
+            messages = [system_msg] + list(messages)
+
     # Auto-pin system prompt prefix cache blocks (non-blocking, first request only)
     if _pin_system_prompt:
         _maybe_pin_system_prompt(messages)
@@ -2798,11 +2839,12 @@ Examples:
 
     # Initialize reasoning parser if specified
     if args.reasoning_parser:
-        global _reasoning_parser
+        global _reasoning_parser, _reasoning_parser_name
         from .reasoning import get_parser
 
         parser_cls = get_parser(args.reasoning_parser)
         _reasoning_parser = parser_cls()
+        _reasoning_parser_name = args.reasoning_parser
         logger.info(f"Reasoning parser enabled: {args.reasoning_parser}")
 
     # Pre-load embedding model if specified

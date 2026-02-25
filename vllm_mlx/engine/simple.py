@@ -207,7 +207,8 @@ class SimpleEngine(BaseEngine):
 
         async with self._generation_lock:
             accumulated_text = ""
-            prompt_tokens = 0
+            # Compute prompt tokens upfront since StreamingOutput doesn't carry them
+            prompt_tokens = len(self._model.tokenizer.encode(prompt))
             completion_tokens = 0
             finished = False
 
@@ -253,8 +254,6 @@ class SimpleEngine(BaseEngine):
                     break
 
             if not finished:
-                if prompt_tokens == 0:
-                    prompt_tokens = len(self._model.tokenizer.encode(prompt))
                 yield GenerationOutput(
                     text=accumulated_text,
                     new_text="",
@@ -328,9 +327,35 @@ class SimpleEngine(BaseEngine):
                     **kwargs,
                 )
                 text = clean_output_text(output.text)
+
+                # Compute prompt tokens from the chat template
+                prompt_tokens = getattr(output, "prompt_tokens", 0)
+                if not prompt_tokens:
+                    tokenizer = self._model.tokenizer
+                    if hasattr(tokenizer, "apply_chat_template"):
+                        try:
+                            prompt_ids = tokenizer.apply_chat_template(
+                                messages,
+                                tokenize=True,
+                                add_generation_prompt=True,
+                                tools=template_tools,
+                            )
+                            prompt_tokens = len(prompt_ids)
+                        except TypeError:
+                            try:
+                                prompt_ids = tokenizer.apply_chat_template(
+                                    messages,
+                                    tokenize=True,
+                                    add_generation_prompt=True,
+                                )
+                                prompt_tokens = len(prompt_ids)
+                            except Exception:
+                                pass
+
                 return GenerationOutput(
                     text=text,
                     tokens=output.tokens,
+                    prompt_tokens=prompt_tokens,
                     completion_tokens=len(output.tokens),
                     finish_reason=output.finish_reason,
                 )
