@@ -43,6 +43,9 @@ class SimpleEngine(BaseEngine):
         force_mllm: bool = False,
         draft_model: str | None = None,
         num_draft_tokens: int = 4,
+        prefill_step_size: int = 2048,
+        kv_bits: int | None = None,
+        kv_group_size: int = 64,
     ):
         """
         Initialize the simple engine.
@@ -54,6 +57,9 @@ class SimpleEngine(BaseEngine):
             force_mllm: Force loading as MLLM even if not auto-detected
             draft_model: Optional draft model path for speculative decoding
             num_draft_tokens: Number of tokens to generate speculatively per step
+            prefill_step_size: Tokens to process per prefill chunk (default: 2048)
+            kv_bits: KV cache quantization bits (None=no quantization, 4 or 8)
+            kv_group_size: Group size for KV cache quantization (default: 64)
         """
         self._model_name = model_name
         self._trust_remote_code = trust_remote_code
@@ -61,6 +67,9 @@ class SimpleEngine(BaseEngine):
         self._is_mllm = force_mllm or is_mllm_model(model_name)
         self._draft_model_name = draft_model
         self._num_draft_tokens = num_draft_tokens
+        self._prefill_step_size = prefill_step_size
+        self._kv_bits = kv_bits
+        self._kv_group_size = kv_group_size
 
         self._model = None
         self._loaded = False
@@ -110,6 +119,9 @@ class SimpleEngine(BaseEngine):
                 trust_remote_code=self._trust_remote_code,
                 draft_model=self._draft_model_name,
                 num_draft_tokens=self._num_draft_tokens,
+                prefill_step_size=self._prefill_step_size,
+                kv_bits=self._kv_bits,
+                kv_group_size=self._kv_group_size,
             )
 
         self._model.load()
@@ -207,8 +219,7 @@ class SimpleEngine(BaseEngine):
 
         async with self._generation_lock:
             accumulated_text = ""
-            # Compute prompt tokens upfront since StreamingOutput doesn't carry them
-            prompt_tokens = len(self._model.tokenizer.encode(prompt))
+            prompt_tokens = 0
             completion_tokens = 0
             finished = False
 
@@ -220,11 +231,7 @@ class SimpleEngine(BaseEngine):
                 stop=stop,
                 **kwargs,
             ):
-                prompt_tokens = (
-                    chunk.prompt_tokens
-                    if hasattr(chunk, "prompt_tokens")
-                    else prompt_tokens
-                )
+                prompt_tokens = getattr(chunk, "prompt_tokens", 0) or prompt_tokens
                 completion_tokens += 1
                 new_text = chunk.text if hasattr(chunk, "text") else str(chunk)
                 accumulated_text += new_text

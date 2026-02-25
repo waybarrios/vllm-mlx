@@ -35,6 +35,7 @@ class StreamingOutput:
     finished: bool = False
     finish_reason: str | None = None
     logprobs: Any = None  # mx.array of shape [vocab_size] from mlx-lm
+    prompt_tokens: int = 0
 
 
 class MLXLanguageModel:
@@ -57,6 +58,9 @@ class MLXLanguageModel:
         trust_remote_code: bool = False,
         draft_model: str | None = None,
         num_draft_tokens: int = 4,
+        prefill_step_size: int = 2048,
+        kv_bits: int | None = None,
+        kv_group_size: int = 64,
     ):
         """
         Initialize the MLX language model.
@@ -67,12 +71,18 @@ class MLXLanguageModel:
             trust_remote_code: Whether to trust remote code
             draft_model: Optional draft model path for speculative decoding
             num_draft_tokens: Number of tokens to generate speculatively per step
+            prefill_step_size: Tokens to process per prefill chunk (default: 2048)
+            kv_bits: KV cache quantization bits (None=no quantization, 4 or 8)
+            kv_group_size: Group size for KV cache quantization (default: 64)
         """
         self.model_name = model_name
         self.tokenizer_name = tokenizer_name or model_name
         self.trust_remote_code = trust_remote_code
         self.draft_model_name = draft_model
         self.num_draft_tokens = num_draft_tokens
+        self.prefill_step_size = prefill_step_size
+        self.kv_bits = kv_bits
+        self.kv_group_size = kv_group_size
 
         self.model = None
         self.tokenizer = None
@@ -320,7 +330,11 @@ class MLXLanguageModel:
         if not self._loaded:
             self.load()
 
+        import time as _time
+
         from mlx_lm import stream_generate
+
+        t0 = _time.perf_counter()
 
         # Tokenize the full prompt
         add_special_tokens = (
@@ -331,6 +345,8 @@ class MLXLanguageModel:
             prompt, add_special_tokens=add_special_tokens
         )
 
+        t_tokenize = _time.perf_counter()
+
         # Prepare cache and get only the tokens that need processing
         suffix_tokens = self._prepare_cache_for_prompt(full_token_ids)
         prefix_len = len(full_token_ids) - len(suffix_tokens)
@@ -340,6 +356,10 @@ class MLXLanguageModel:
                 f"Prompt cache hit: {prefix_len} cached / "
                 f"{len(suffix_tokens)} new tokens "
                 f"(saved {prefix_len} tokens of prefill)"
+            )
+        else:
+            logger.info(
+                f"Prompt cache miss: {len(full_token_ids)} tokens to prefill"
             )
 
         # Create sampler with parameters
@@ -353,7 +373,13 @@ class MLXLanguageModel:
             "max_tokens": max_tokens,
             "sampler": sampler,
             "prompt_cache": self._prompt_cache,
+            "prefill_step_size": self.prefill_step_size,
         }
+
+        # KV cache quantization reduces memory pressure for long prompts
+        if self.kv_bits is not None:
+            gen_kwargs["kv_bits"] = self.kv_bits
+            gen_kwargs["kv_group_size"] = self.kv_group_size
 
         # Add draft model for speculative decoding if available
         if self.draft_model is not None:
@@ -373,6 +399,7 @@ class MLXLanguageModel:
         else:
             prompt_to_send = suffix_tokens
 
+        t_first_token = None
         for response in stream_generate(
             self.model,
             self.tokenizer,
@@ -380,6 +407,15 @@ class MLXLanguageModel:
             **gen_kwargs,
         ):
             token_count += 1
+            if token_count == 1:
+                t_first_token = _time.perf_counter()
+                logger.info(
+                    f"TTFT breakdown: tokenize={t_tokenize - t0:.3f}s, "
+                    f"prefill+decode={t_first_token - t_tokenize:.3f}s, "
+                    f"total={t_first_token - t0:.3f}s "
+                    f"(prompt={len(full_token_ids)} tokens, "
+                    f"prefilled={len(prompt_to_send)} tokens)"
+                )
             # response.text is the new token text (not accumulated)
             new_text = response.text
             accumulated_text += new_text
@@ -396,6 +432,11 @@ class MLXLanguageModel:
             finish_reason = None
             if finished:
                 finish_reason = "stop" if should_stop else "length"
+                # Save cache BEFORE yielding the finished chunk.
+                # The caller may break/abandon this generator after
+                # receiving the finished chunk, so code after yield
+                # would never execute.
+                self._save_cache_snapshot(full_token_ids)
 
             yield StreamingOutput(
                 text=new_text,
@@ -403,15 +444,11 @@ class MLXLanguageModel:
                 finished=finished,
                 finish_reason=finish_reason,
                 logprobs=getattr(response, "logprobs", None),
+                prompt_tokens=len(full_token_ids),
             )
 
             if finished:
                 break
-
-        # Save cache state: prompt tokens only (not generated tokens)
-        # The cache now has prompt + generated tokens; we save the prompt part
-        # so next request can match against it
-        self._save_cache_snapshot(full_token_ids)
 
     def chat(
         self,

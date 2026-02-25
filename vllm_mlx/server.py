@@ -622,6 +622,9 @@ def load_model(
     gpu_memory_utilization: float = 0.90,
     draft_model: str | None = None,
     num_draft_tokens: int = 4,
+    prefill_step_size: int = 2048,
+    kv_bits: int | None = None,
+    kv_group_size: int = 64,
 ):
     """
     Load a model (auto-detects MLLM vs LLM).
@@ -637,6 +640,9 @@ def load_model(
             limit and emergency threshold (0.0-1.0, default 0.90)
         draft_model: Optional draft model for speculative decoding
         num_draft_tokens: Number of tokens to generate speculatively per step
+        prefill_step_size: Tokens to process per prefill chunk (default: 2048)
+        kv_bits: KV cache quantization bits (None=no quantization, 4 or 8)
+        kv_group_size: Group size for KV cache quantization (default: 64)
     """
     global _engine, _model_name, _default_max_tokens, _tool_parser_instance
 
@@ -688,6 +694,9 @@ def load_model(
             force_mllm=force_mllm,
             draft_model=draft_model,
             num_draft_tokens=num_draft_tokens,
+            prefill_step_size=prefill_step_size,
+            kv_bits=kv_bits,
+            kv_group_size=kv_group_size,
         )
         # Start SimpleEngine synchronously (no background loop)
         # Use new_event_loop() for Python 3.10+ compatibility (get_event_loop() is deprecated)
@@ -2798,6 +2807,26 @@ Examples:
         default=4,
         help="Number of tokens to generate speculatively per step (default: 4)",
     )
+    parser.add_argument(
+        "--prefill-step-size",
+        type=int,
+        default=2048,
+        help="Tokens to process per prefill chunk (default: 2048). "
+        "Larger values may improve TTFT on Apple Silicon with sufficient memory.",
+    )
+    parser.add_argument(
+        "--kv-bits",
+        type=int,
+        default=None,
+        choices=[4, 8],
+        help="KV cache quantization bits (4 or 8). Reduces memory for long contexts.",
+    )
+    parser.add_argument(
+        "--kv-group-size",
+        type=int,
+        default=64,
+        help="Group size for KV cache quantization (default: 64)",
+    )
 
     args = parser.parse_args()
 
@@ -2858,6 +2887,9 @@ Examples:
         force_mllm=args.mllm,
         draft_model=args.draft_model,
         num_draft_tokens=args.num_draft_tokens,
+        prefill_step_size=args.prefill_step_size,
+        kv_bits=args.kv_bits,
+        kv_group_size=args.kv_group_size,
     )
 
     # Start server

@@ -84,6 +84,7 @@ def serve_command(args):
 
             parser_cls = get_parser(args.reasoning_parser)
             server._reasoning_parser = parser_cls()
+            server._reasoning_parser_name = args.reasoning_parser
             logger.info(f"Reasoning parser enabled: {args.reasoning_parser}")
         except KeyError as e:
             print(f"Error: {e}")
@@ -216,6 +217,9 @@ def serve_command(args):
         gpu_memory_utilization=args.gpu_memory_utilization,
         draft_model=args.draft_model,
         num_draft_tokens=args.num_draft_tokens,
+        prefill_step_size=args.prefill_step_size,
+        kv_bits=args.kv_bits,
+        kv_group_size=args.kv_group_size,
     )
 
     # Start server
@@ -844,6 +848,25 @@ Examples:
         type=int,
         default=4,
         help="Number of tokens to generate speculatively per step (default: 4)",
+    )
+    serve_parser.add_argument(
+        "--prefill-step-size",
+        type=int,
+        default=2048,
+        help="Tokens to process per prefill chunk in simple mode (default: 2048)",
+    )
+    serve_parser.add_argument(
+        "--kv-bits",
+        type=int,
+        default=None,
+        choices=[4, 8],
+        help="KV cache quantization bits for simple mode (4 or 8). Reduces memory for long contexts.",
+    )
+    serve_parser.add_argument(
+        "--kv-group-size",
+        type=int,
+        default=64,
+        help="Group size for KV cache quantization in simple mode (default: 64)",
     )
     # Reasoning parser options - choices loaded dynamically from registry
     from .reasoning import list_parsers
