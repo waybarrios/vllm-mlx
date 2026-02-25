@@ -173,7 +173,7 @@ def serve_command(args):
             kv_cache_quantization_group_size=args.kv_cache_quantization_group_size,
             kv_cache_min_quantize_tokens=args.kv_cache_min_quantize_tokens,
             mllm_prefill_step_size=(
-                args.prefill_step_size if args.prefill_step_size > 0 else None
+                args.mllm_prefill_step_size if args.mllm_prefill_step_size > 0 else None
             ),
         )
 
@@ -291,9 +291,6 @@ def bench_command(args):
             kv_cache_quantization_bits=args.kv_cache_quantization_bits,
             kv_cache_quantization_group_size=args.kv_cache_quantization_group_size,
             kv_cache_min_quantize_tokens=args.kv_cache_min_quantize_tokens,
-            mllm_prefill_step_size=(
-                args.prefill_step_size if args.prefill_step_size > 0 else None
-            ),
         )
 
         engine_config = EngineConfig(
@@ -676,7 +673,7 @@ Examples:
         "--completion-batch-size", type=int, default=32, help="Completion batch size"
     )
     serve_parser.add_argument(
-        "--prefill-step-size",
+        "--mllm-prefill-step-size",
         type=int,
         default=0,
         help="Override MLLM prefill-step guard (0=use MLLM default: 1024)",
@@ -990,12 +987,6 @@ Examples:
     )
     bench_parser.add_argument(
         "--completion-batch-size", type=int, default=16, help="Completion batch size"
-    )
-    bench_parser.add_argument(
-        "--prefill-step-size",
-        type=int,
-        default=0,
-        help="Override MLLM prefill-step guard (0=use MLLM default: 1024)",
     )
     bench_parser.add_argument(
         "--enable-prefix-cache",
