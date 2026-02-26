@@ -95,3 +95,9 @@ temp/
 
 # MLX cache
 .mlx_cache/
+
+# Benchmark results / temp test files
+benchmark_results_*.json
+tier*_benchmark.json
+test_golden_*.py
+*.jinja
