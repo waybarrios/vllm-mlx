@@ -657,6 +657,8 @@ def load_model(
     kv_group_size: int = 64,
     cloud_model: str | None = None,
     cloud_threshold: int = 20000,
+    cloud_api_base: str | None = None,
+    cloud_api_key: str | None = None,
 ):
     """
     Load a model (auto-detects MLLM vs LLM).
@@ -687,7 +689,12 @@ def load_model(
     if cloud_model:
         from .cloud_router import CloudRouter
 
-        _cloud_router = CloudRouter(cloud_model=cloud_model, threshold=cloud_threshold)
+        _cloud_router = CloudRouter(
+            cloud_model=cloud_model,
+            threshold=cloud_threshold,
+            api_base=cloud_api_base,
+            api_key=cloud_api_key,
+        )
         logger.info(
             f"Cloud routing enabled: model={cloud_model}, threshold={cloud_threshold} new tokens"
         )
@@ -2997,6 +3004,18 @@ Examples:
         default=20000,
         help="New token threshold to trigger cloud routing (default: 20000)",
     )
+    parser.add_argument(
+        "--cloud-api-base",
+        type=str,
+        default=None,
+        help="Custom API base URL for cloud model (for OpenAI-compatible providers like Zhipu).",
+    )
+    parser.add_argument(
+        "--cloud-api-key",
+        type=str,
+        default=None,
+        help="API key for cloud model (overrides environment variable).",
+    )
 
     args = parser.parse_args()
 
@@ -3073,6 +3092,8 @@ Examples:
         kv_group_size=args.kv_group_size,
         cloud_model=args.cloud_model,
         cloud_threshold=args.cloud_threshold,
+        cloud_api_base=args.cloud_api_base,
+        cloud_api_key=args.cloud_api_key,
     )
 
     # Start server

@@ -25,14 +25,24 @@ class CloudRouter:
     litellm is imported lazily — only when a request actually routes to cloud.
     """
 
-    def __init__(self, cloud_model: str, threshold: int = 20000):
+    def __init__(
+        self,
+        cloud_model: str,
+        threshold: int = 20000,
+        api_base: str | None = None,
+        api_key: str | None = None,
+    ):
         """
         Args:
             cloud_model: litellm model string (e.g. "anthropic/claude-sonnet-4-5-20250929")
             threshold: Route to cloud when new_tokens exceeds this value
+            api_base: Custom API base URL (for OpenAI-compatible providers like Zhipu)
+            api_key: API key override (otherwise uses env vars)
         """
         self.cloud_model = cloud_model
         self.threshold = threshold
+        self.api_base = api_base
+        self.api_key = api_key
         self._litellm = None
 
     def _get_litellm(self):
@@ -157,6 +167,12 @@ class CloudRouter:
             "stream": stream,
             "drop_params": True,  # Let litellm drop unsupported params per provider
         }
+
+        # Custom API base and key for OpenAI-compatible providers (e.g. Zhipu)
+        if self.api_base:
+            call_kwargs["api_base"] = self.api_base
+        if self.api_key:
+            call_kwargs["api_key"] = self.api_key
 
         # Pass through standard OpenAI params (litellm handles provider compatibility)
         for key in (

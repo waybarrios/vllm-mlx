@@ -226,6 +226,8 @@ def serve_command(args):
         kv_group_size=args.kv_group_size,
         cloud_model=args.cloud_model,
         cloud_threshold=args.cloud_threshold,
+        cloud_api_base=args.cloud_api_base,
+        cloud_api_key=args.cloud_api_key,
     )
 
     # Start server
@@ -941,6 +943,18 @@ Examples:
         default=20000,
         help="New token threshold to trigger cloud routing (default: 20000). "
         "Only requests with more new (uncached) tokens than this are routed.",
+    )
+    serve_parser.add_argument(
+        "--cloud-api-base",
+        type=str,
+        default=None,
+        help="Custom API base URL for cloud model (for OpenAI-compatible providers like Zhipu).",
+    )
+    serve_parser.add_argument(
+        "--cloud-api-key",
+        type=str,
+        default=None,
+        help="API key for cloud model (overrides environment variable).",
     )
     # Embedding model option
     serve_parser.add_argument(
