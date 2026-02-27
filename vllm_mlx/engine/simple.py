@@ -262,6 +262,11 @@ class SimpleEngine(BaseEngine):
                     logprobs=getattr(chunk, "logprobs", None),
                 )
 
+                # Yield to event loop so the server can accept new requests
+                # and process preemption signals. Without this, the sync
+                # generation loop starves the event loop.
+                await asyncio.sleep(0)
+
                 if finished:
                     break
 
