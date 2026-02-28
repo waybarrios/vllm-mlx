@@ -465,8 +465,10 @@ def save_base64_image(base64_string: str) -> str:
     """Save base64 image to temp file and return path. Caches identical images."""
     import hashlib
 
-    # Hash the full base64 string to prevent collisions between images
-    # with identical headers (e.g. JPEG images sharing first 1000 chars)
+    # Hash the FULL base64 string — not just a prefix.
+    # Using only the first 1000 chars caused cache collisions between
+    # different images with identical JPEG headers (e.g. invoices from
+    # the same PDF renderer), returning a previous request's image.
     image_hash = hashlib.sha256(base64_string.encode()).hexdigest()
 
     # Return cached path if available and file still exists
