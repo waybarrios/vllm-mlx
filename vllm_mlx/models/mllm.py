@@ -1152,12 +1152,19 @@ class MLXMultimodalLM:
             logger.info(
                 f"  Chat msg {i}: role={cm['role']}, content={content_preview}..."
             )
+
+        # Forward tools to chat template if provided (fix: MLLM path was dropping tools)
+        template_extra_kwargs = {}
+        if kwargs.get("tools"):
+            template_extra_kwargs["tools"] = kwargs["tools"]
+
         try:
             # Use get_chat_template directly since messages are already properly formatted
             formatted_prompt = get_chat_template(
                 self.processor,
                 chat_messages,
                 add_generation_prompt=True,
+                **template_extra_kwargs,
             )
         except Exception as e:
             logger.warning(
@@ -1504,12 +1511,18 @@ class MLXMultimodalLM:
             all_images.extend(frames)
 
         # Apply chat template directly - messages are already properly structured
+        # Forward tools to chat template if provided (fix: MLLM path was dropping tools)
+        template_extra_kwargs = {}
+        if kwargs.get("tools"):
+            template_extra_kwargs["tools"] = kwargs["tools"]
+
         try:
             # Use get_chat_template directly since messages are already properly formatted
             formatted_prompt = get_chat_template(
                 self.processor,
                 chat_messages,
                 add_generation_prompt=True,
+                **template_extra_kwargs,
             )
         except Exception as e:
             logger.warning(
