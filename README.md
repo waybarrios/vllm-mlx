@@ -223,21 +223,58 @@ Disabled by default. Cost estimate: ~$0.02-0.05 per cloud-routed request with GP
 
 | Model | Params | Quant | RAM | Decode | Tool Parser | Best For |
 |-------|--------|-------|-----|--------|-------------|----------|
-| [Qwen3.5-122B-A10B](https://huggingface.co/nightmedia/Qwen3.5-122B-A10B-Text-mxfp4-mlx) | 122B/10B | mxfp4 | 72GB | ~35-50 tok/s | `hermes` | **Best tool calling** (BFCL 72.2) |
+| [Qwen3.5-122B-A10B](https://huggingface.co/nightmedia/Qwen3.5-122B-A10B-Text-mxfp4-mlx) | 122B/10B | mxfp4 | 74GB | **41-47 tok/s** | `hermes` | **Best overall** — tool calling + reasoning |
 | [Qwen3-Coder-Next](https://huggingface.co/lmstudio-community/Qwen3-Coder-Next-MLX-4bit) | 80B/3B | 4bit | 42GB | **~80-100 tok/s** | `hermes` | Speed + coding |
 | [Qwen3-Coder-Next](https://huggingface.co/lmstudio-community/Qwen3-Coder-Next-MLX-6bit) | 80B/3B | 6bit | 60GB | ~65 tok/s | `hermes` | **Best balance** |
-| [MiniMax-M2.5](https://huggingface.co/lmstudio-community/MiniMax-M2.5-MLX-4bit) | 229B/10B | 4bit | 120GB | 33-38 tok/s | `minimax` | Deep reasoning (192GB+) |
+| [MiniMax-M2.5](https://huggingface.co/lmstudio-community/MiniMax-M2.5-MLX-4bit) | 229B/10B | 4bit | 130GB | 33-38 tok/s | `minimax` | Deep reasoning (192GB+) |
 
 Benchmarks on Mac Studio M3 Ultra (256GB), 800 GB/s memory bandwidth.
+
+### Model Comparison: Qwen3.5-122B vs MiniMax-M2.5
+
+Tested on Mac Studio M3 Ultra (256GB) with OpenClaw (14 tools, multi-turn agent sessions):
+
+**Speed (with prompt cache hit):**
+
+| Metric | Qwen3.5-122B mxfp4 | MiniMax-M2.5 4bit |
+|--------|---------------------|-------------------|
+| Decode (short, <100 tok) | 25-37 tok/s | 33-38 tok/s |
+| Decode (long, 300+ tok) | **41-47 tok/s** | ~35 tok/s |
+| Decode peak (800 tok) | **46.3 tok/s** | 38 tok/s |
+| TTFT (cache hit) | **0.4-1.3s** | ~1-2s |
+| TTFT (cache miss, 8K tok) | 12s | ~12s |
+| Prefill throughput | ~670 tok/s | ~700 tok/s |
+
+**Agent reliability (OpenClaw, 14 tools):**
+
+| Metric | Qwen3.5-122B | MiniMax-M2.5 |
+|--------|--------------|--------------|
+| Tool-call loops | **None (78+ rounds)** | Confirmed — gets stuck in edit→read cycles |
+| Instruction following (IFEval) | **93.4%** | ~70% (estimated) |
+| Long conversation stability | **Stable at 23K+ tokens** | Degrades after ~90K tokens |
+| Max single output | **2196 tokens** (code review) | ~800 tokens |
+| Multi-step agent tasks | Completes reliably | Loops on complex tasks |
+
+**Resource usage:**
+
+| Metric | Qwen3.5-122B | MiniMax-M2.5 |
+|--------|--------------|--------------|
+| Model weight RAM | **74 GB** | 130 GB |
+| KV cache headroom (256GB) | **~180 GB** | ~120 GB |
+| Active params per token | 10B | 10B |
+
+**Verdict:** Qwen3.5-122B is the recommended model for agent workloads — faster decode on long outputs, half the memory, and no tool-call loops. MiniMax-M2.5 is slightly faster on short outputs but prone to agentic instability.
 
 ### Quick Start Commands
 
 ```bash
-# Qwen3.5-122B — best tool calling + reasoning, fits 192GB Macs
+# Qwen3.5-122B — best overall for agent workloads (74GB, 41-47 tok/s)
 python -m vllm_mlx.server \
   --model nightmedia/Qwen3.5-122B-A10B-Text-mxfp4-mlx \
   --tool-call-parser hermes \
-  --max-tokens 4096 \
+  --reasoning-parser qwen3 \
+  --prefill-step-size 8192 \
+  --kv-bits 8 \
   --port 8000
 
 # Qwen3-Coder-Next — fast coding agent (3B active, ~100 tok/s)
@@ -285,7 +322,8 @@ python -m vllm_mlx.server \
 
 | Model Family | `--tool-call-parser` | `--reasoning-parser` | Notes |
 |-------------|---------------------|---------------------|-------|
-| Qwen3.5, Qwen3-Coder-Next | `hermes` | *(none)* | Non-thinking mode, fast |
+| Qwen3.5-122B-A10B | `hermes` | `qwen3` | **Recommended** — best agent stability |
+| Qwen3-Coder-Next | `hermes` | *(none)* | Non-thinking mode, fast |
 | Qwen3 (thinking) | `qwen` or `qwen3_coder` | `qwen3` | With `<think>` tags |
 | MiniMax-M2.5 | `minimax` | `minimax` | XML tool format |
 | Llama 3.x | `llama` | *(none)* | JSON tool format |

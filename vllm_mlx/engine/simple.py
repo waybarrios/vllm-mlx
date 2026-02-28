@@ -262,6 +262,13 @@ class SimpleEngine(BaseEngine):
                     logprobs=getattr(chunk, "logprobs", None),
                 )
 
+                # Yield to event loop every 5 tokens so the server can
+                # accept connections, detect disconnects, and process
+                # queued requests. Without this, the sync generation
+                # loop starves the event loop during decode.
+                if completion_tokens % 5 == 0:
+                    await asyncio.sleep(0)
+
                 if finished:
                     break
 

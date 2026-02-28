@@ -429,63 +429,71 @@ class MLXLanguageModel:
             prompt_to_send = suffix_tokens
 
         t_first_token = None
-        for response in stream_generate(
-            self.model,
-            self.tokenizer,
-            prompt=prompt_to_send,
-            **gen_kwargs,
-        ):
-            token_count += 1
-            if token_count == 1:
-                t_first_token = _time.perf_counter()
-                logger.info(
-                    f"TTFT breakdown: tokenize={t_tokenize - t0:.3f}s, "
-                    f"prefill+decode={t_first_token - t_tokenize:.3f}s, "
-                    f"total={t_first_token - t0:.3f}s "
-                    f"(prompt={len(full_token_ids)} tokens, "
-                    f"prefilled={len(prompt_to_send)} tokens)"
+        cache_saved = False
+        try:
+            for response in stream_generate(
+                self.model,
+                self.tokenizer,
+                prompt=prompt_to_send,
+                **gen_kwargs,
+            ):
+                token_count += 1
+                if token_count == 1:
+                    t_first_token = _time.perf_counter()
+                    logger.info(
+                        f"TTFT breakdown: tokenize={t_tokenize - t0:.3f}s, "
+                        f"prefill+decode={t_first_token - t_tokenize:.3f}s, "
+                        f"total={t_first_token - t0:.3f}s "
+                        f"(prompt={len(full_token_ids)} tokens, "
+                        f"prefilled={len(prompt_to_send)} tokens)"
+                    )
+                # response.text is the new token text (not accumulated)
+                new_text = response.text
+                accumulated_text += new_text
+
+                # Check for stop sequences
+                should_stop = False
+                if stop:
+                    for stop_seq in stop:
+                        if stop_seq in accumulated_text:
+                            should_stop = True
+                            break
+
+                # Check if mlx-lm signalled completion (EOS token hit)
+                mlx_finished = getattr(response, "finish_reason", None) is not None
+
+                finished = should_stop or token_count >= max_tokens or mlx_finished
+                finish_reason = None
+                if finished:
+                    if should_stop:
+                        finish_reason = "stop"
+                    elif mlx_finished:
+                        finish_reason = getattr(response, "finish_reason", "stop")
+                    else:
+                        finish_reason = "length"
+                    # Save cache BEFORE yielding the finished chunk.
+                    # The caller may break/abandon this generator after
+                    # receiving the finished chunk, so code after yield
+                    # would never execute.
+                    self._save_cache_snapshot(full_token_ids)
+                    cache_saved = True
+
+                yield StreamingOutput(
+                    text=new_text,
+                    token=response.token if hasattr(response, "token") else 0,
+                    finished=finished,
+                    finish_reason=finish_reason,
+                    logprobs=getattr(response, "logprobs", None),
+                    prompt_tokens=len(full_token_ids),
                 )
-            # response.text is the new token text (not accumulated)
-            new_text = response.text
-            accumulated_text += new_text
 
-            # Check for stop sequences
-            should_stop = False
-            if stop:
-                for stop_seq in stop:
-                    if stop_seq in accumulated_text:
-                        should_stop = True
-                        break
-
-            # Check if mlx-lm signalled completion (EOS token hit)
-            mlx_finished = getattr(response, "finish_reason", None) is not None
-
-            finished = should_stop or token_count >= max_tokens or mlx_finished
-            finish_reason = None
-            if finished:
-                if should_stop:
-                    finish_reason = "stop"
-                elif mlx_finished:
-                    finish_reason = getattr(response, "finish_reason", "stop")
-                else:
-                    finish_reason = "length"
-                # Save cache BEFORE yielding the finished chunk.
-                # The caller may break/abandon this generator after
-                # receiving the finished chunk, so code after yield
-                # would never execute.
+                if finished:
+                    break
+        finally:
+            # Save cache on any exit (including GeneratorExit from client
+            # disconnect) so the next request can reuse the prompt prefix.
+            if not cache_saved:
                 self._save_cache_snapshot(full_token_ids)
-
-            yield StreamingOutput(
-                text=new_text,
-                token=response.token if hasattr(response, "token") else 0,
-                finished=finished,
-                finish_reason=finish_reason,
-                logprobs=getattr(response, "logprobs", None),
-                prompt_tokens=len(full_token_ids),
-            )
-
-            if finished:
-                break
 
     def chat(
         self,
