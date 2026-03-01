@@ -1666,6 +1666,205 @@ async def count_anthropic_tokens(request: Request):
     return {"input_tokens": total_tokens}
 
 
+class _AnthropicStreamScrubber:
+    """Stateful scrubber that strips model tool-call and reasoning markup
+    from streamed text deltas on the Anthropic ``/v1/messages`` endpoint.
+
+    Suppressed patterns:
+
+    * ``<think>...</think>`` – internal reasoning blocks
+    * ``<tool_call>...</tool_call>`` – Qwen/Hermes-style tool calls
+    * ``<function=NAME>...</function>`` – Llama-style tool calls
+    * ``<parameter=NAME>...</parameter>`` – Llama-style parameters
+    * Stray closing tags (``</think>``, ``</tool_call>``, ``</function>``,
+      ``</parameter>``) appearing outside their expected context
+
+    Handles tags that may be split across multiple token boundaries by
+    maintaining a small carry buffer.  The carry buffer always retains
+    the last ``CARRY_N`` characters so that a tag split across two
+    consecutive deltas can still be detected.
+
+    The scrubber operates as a simple state machine:
+
+    * **TEXT** – emit characters; scan for opening/stray-closing tags.
+    * **IN_THINK** – suppress until ``</think>``.
+    * **IN_TOOLCALL** – suppress until ``</tool_call>``.
+    * **IN_FUNCTION** – suppress until ``</function>``.
+    """
+
+    # --- Fixed (exact-match) tags ----------------------------------------
+    THINK_OPEN = "<think>"
+    THINK_CLOSE = "</think>"
+    TOOL_OPEN = "<tool_call>"
+    TOOL_CLOSE = "</tool_call>"
+    FUNC_CLOSE = "</function>"
+    PARAM_CLOSE = "</parameter>"
+
+    # Exact tags to scan for in TEXT mode.  Order doesn't matter – we
+    # always pick the earliest match.
+    _EXACT_TAGS = [
+        THINK_OPEN, THINK_CLOSE,
+        TOOL_OPEN, TOOL_CLOSE,
+        FUNC_CLOSE, PARAM_CLOSE,
+    ]
+
+    # --- Prefix (variable-length) opening tags ---------------------------
+    # These look like ``<function=name>`` or ``<parameter=name>`` where
+    # the name varies.  We detect the prefix then scan forward for ``>``.
+    FUNC_PREFIX = "<function="
+    PARAM_PREFIX = "<parameter="
+    _PREFIX_TAGS = [FUNC_PREFIX, PARAM_PREFIX]
+
+    # Carry buffer size – must be at least ``max(len(tag)) - 1`` for all
+    # fixed tags *and* all prefixes so we can detect split boundaries.
+    _ALL_MARKERS = _EXACT_TAGS + _PREFIX_TAGS
+    MAX_TAG = max(len(t) for t in _ALL_MARKERS)
+    CARRY_N = MAX_TAG - 1
+
+    # Map from opening signal → suppression mode
+    _MODE_MAP = {
+        THINK_OPEN: "IN_THINK",
+        TOOL_OPEN: "IN_TOOLCALL",
+        FUNC_PREFIX: "IN_FUNCTION",
+        PARAM_PREFIX: "IN_FUNCTION",  # parameters inside function blocks
+    }
+
+    # Map from suppression mode → closing tag
+    _CLOSE_MAP = {
+        "IN_THINK": THINK_CLOSE,
+        "IN_TOOLCALL": TOOL_CLOSE,
+        "IN_FUNCTION": FUNC_CLOSE,
+    }
+
+    def __init__(self) -> None:
+        self.mode: str = "TEXT"
+        self.carry: str = ""
+
+    # -----------------------------------------------------------------
+    # Internal helpers
+    # -----------------------------------------------------------------
+
+    def _find_earliest_marker(self, s: str, start: int) -> tuple[int, str, int] | None:
+        """Find the earliest opening or stray-closing tag in *s* from *start*.
+
+        Returns ``(position, marker, consume_length)`` or ``None``.
+        *consume_length* is how many characters to skip past the marker
+        (for exact tags this equals ``len(marker)``; for prefix tags it
+        extends to the closing ``>``).
+        """
+        best: tuple[int, str, int] | None = None
+
+        # Check exact tags.
+        for tag in self._EXACT_TAGS:
+            pos = s.find(tag, start)
+            if pos != -1 and (best is None or pos < best[0]):
+                best = (pos, tag, len(tag))
+
+        # Check prefix tags (e.g. ``<function=name>``).
+        for prefix in self._PREFIX_TAGS:
+            pos = s.find(prefix, start)
+            if pos != -1 and (best is None or pos < best[0]):
+                # Need to find the closing '>' to know full tag length.
+                gt = s.find(">", pos + len(prefix))
+                if gt != -1:
+                    consume = gt + 1 - pos  # e.g. len("<function=foo>")
+                    best = (pos, prefix, consume)
+                else:
+                    # '>' not yet in buffer – treat as a partial tag.
+                    # consume = -1 signals "truncated".
+                    best = (pos, prefix, -1)
+
+        return best
+
+    # -----------------------------------------------------------------
+    # Public API
+    # -----------------------------------------------------------------
+
+    def feed(self, delta: str) -> str:
+        """Process a new text delta and return only the safe-to-emit portion."""
+        s = self.carry + (delta or "")
+        out: list[str] = []
+        slen = len(s)
+        i = 0
+
+        while i < slen:
+            if self.mode == "TEXT":
+                hit = self._find_earliest_marker(s, i)
+
+                if hit is None:
+                    # No marker anywhere – emit up to carry boundary.
+                    safe_end = max(i, slen - self.CARRY_N)
+                    if safe_end > i:
+                        out.append(s[i:safe_end])
+                    self.carry = s[safe_end:]
+                    return "".join(out)
+
+                pos, marker, consume = hit
+
+                if consume < 0:
+                    # Prefix tag found but closing '>' missing – truncated.
+                    if pos > i:
+                        out.append(s[i:pos])
+                    self.carry = s[pos:]
+                    return "".join(out)
+
+                tag_end = pos + consume
+                if tag_end > slen:
+                    # Full tag not in buffer yet.
+                    if pos > i:
+                        out.append(s[i:pos])
+                    self.carry = s[pos:]
+                    return "".join(out)
+
+                # Emit text before the tag.
+                if pos > i:
+                    out.append(s[i:pos])
+
+                # Consume the tag.
+                i = tag_end
+
+                # Determine new mode (if any).
+                new_mode = self._MODE_MAP.get(marker)
+                if new_mode:
+                    self.mode = new_mode
+                # else: stray closing tag – consumed and suppressed, stay TEXT.
+
+            else:
+                # In a suppression mode – find the closing tag.
+                close_tag = self._CLOSE_MAP[self.mode]
+                close_pos = s.find(close_tag, i)
+                if close_pos == -1:
+                    # Closing tag not yet in buffer.
+                    self.carry = s[max(i, slen - self.CARRY_N):]
+                    return "".join(out)
+                i = close_pos + len(close_tag)
+                self.mode = "TEXT"
+
+        # Entire buffer consumed.
+        self.carry = ""
+        return "".join(out)
+
+    def flush(self) -> str:
+        """Flush remaining carry buffer at end of stream.
+
+        Emits leftover text only in TEXT mode (stripping any stray tags);
+        discards carry if inside a suppressed region.
+        """
+        if self.mode == "TEXT":
+            result = self.carry
+            # Strip any residual exact tags.
+            for tag in self._EXACT_TAGS:
+                result = result.replace(tag, "")
+            # Strip any residual prefix tags (e.g. ``<function=foo>``).
+            import re
+            result = re.sub(r"<function=[^>]*>", "", result)
+            result = re.sub(r"<parameter=[^>]*>", "", result)
+            self.carry = ""
+            return result
+        self.carry = ""
+        return ""
+
+
 async def _stream_anthropic_messages(
     engine: BaseEngine,
     openai_request: ChatCompletionRequest,
@@ -1677,6 +1876,10 @@ async def _stream_anthropic_messages(
     Converts OpenAI streaming chunks to Anthropic event format:
     message_start -> content_block_start -> content_block_delta* ->
     content_block_stop -> message_delta -> message_stop
+
+    When tools are present in the request, a streaming scrubber filters
+    out <think>...</think> and <tool_call>...</tool_call> markup that
+    the model may emit, so clients only see structured tool_use blocks.
     """
     msg_id = f"msg_{uuid.uuid4().hex[:24]}"
     start_time = time.perf_counter()
@@ -1723,6 +1926,12 @@ async def _stream_anthropic_messages(
     }
     yield f"event: content_block_start\ndata: {json.dumps(content_block_start)}\n\n"
 
+    # When tools are present, activate the stream scrubber to strip
+    # <think>...</think> and <tool_call>...</tool_call> markup so that
+    # clients only see clean text and structured tool_use blocks.
+    has_tools = bool(getattr(anthropic_request, "tools", None))
+    scrubber = _AnthropicStreamScrubber() if has_tools else None
+
     # Stream content deltas
     accumulated_text = ""
     completion_tokens = 0
@@ -1739,13 +1948,33 @@ async def _stream_anthropic_messages(
             content = SPECIAL_TOKENS_PATTERN.sub("", delta_text)
 
             if content:
+                # Always accumulate the raw (unfiltered) content for tool-call
+                # parsing at the end of the stream.
                 accumulated_text += content
-                delta_event = {
-                    "type": "content_block_delta",
-                    "index": 0,
-                    "delta": {"type": "text_delta", "text": content},
-                }
-                yield f"event: content_block_delta\ndata: {json.dumps(delta_event)}\n\n"
+
+                # If the scrubber is active, run the content through it to
+                # strip <think> and <tool_call> regions before emitting.
+                if scrubber is not None:
+                    content = scrubber.feed(content)
+
+                if content:
+                    delta_event = {
+                        "type": "content_block_delta",
+                        "index": 0,
+                        "delta": {"type": "text_delta", "text": content},
+                    }
+                    yield f"event: content_block_delta\ndata: {json.dumps(delta_event)}\n\n"
+
+    # Flush any remaining carry buffer from the scrubber
+    if scrubber is not None:
+        flushed = scrubber.flush()
+        if flushed:
+            delta_event = {
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "text_delta", "text": flushed},
+            }
+            yield f"event: content_block_delta\ndata: {json.dumps(delta_event)}\n\n"
 
     # Check for tool calls in accumulated text
     _, tool_calls = _parse_tool_calls_with_parser(accumulated_text, openai_request)
