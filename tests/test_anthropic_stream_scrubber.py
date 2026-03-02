@@ -1021,3 +1021,283 @@ class TestScrubberZeroLatencyCarry:
         result = scrubber.feed(text)
         assert result == text
         assert scrubber.carry == ""
+
+
+# =============================================================================
+# _AnthropicStreamRouter Tests
+# =============================================================================
+
+from vllm_mlx.server import _AnthropicStreamRouter, _is_thinking_enabled
+
+
+class TestRouterInitialState:
+    """Test router creation and initial state."""
+
+    def test_initial_mode_is_text(self):
+        router = _AnthropicStreamRouter()
+        assert router.mode == "TEXT"
+
+    def test_initial_carry_is_empty(self):
+        router = _AnthropicStreamRouter()
+        assert router.carry == ""
+
+
+class TestRouterPlainText:
+    """Router should pass through plain text as ('text', ...) pieces."""
+
+    def test_plain_text_emits_text_piece(self):
+        router = _AnthropicStreamRouter()
+        pieces = router.feed("Hello world")
+        assert len(pieces) == 1
+        assert pieces[0] == ("text", "Hello world")
+
+    def test_empty_string(self):
+        router = _AnthropicStreamRouter()
+        pieces = router.feed("")
+        assert pieces == []
+
+    def test_multiple_plain_deltas(self):
+        router = _AnthropicStreamRouter()
+        all_text = ""
+        for word in ["The ", "quick ", "brown ", "fox."]:
+            for kind, text in router.feed(word):
+                assert kind == "text"
+                all_text += text
+        for kind, text in router.flush():
+            if kind == "text":
+                all_text += text
+        assert all_text == "The quick brown fox."
+
+
+class TestRouterThinkingBlocks:
+    """Router should emit thinking_start/thinking/thinking_stop for <think> blocks."""
+
+    def test_think_block_single_delta(self):
+        router = _AnthropicStreamRouter()
+        pieces = router.feed("Hello <think>reasoning</think> world")
+        pieces += router.flush()
+
+        kinds = [k for k, _ in pieces]
+        assert "thinking_start" in kinds
+        assert "thinking" in kinds
+        assert "thinking_stop" in kinds
+
+        # Collect text and thinking separately
+        text = "".join(t for k, t in pieces if k == "text")
+        thinking = "".join(t for k, t in pieces if k == "thinking")
+        assert "Hello" in text
+        assert "world" in text
+        assert "reasoning" in thinking
+
+    def test_think_block_split_across_deltas(self):
+        router = _AnthropicStreamRouter()
+        all_pieces = []
+        for delta in ["Before <thi", "nk>secret</think> After"]:
+            all_pieces.extend(router.feed(delta))
+        all_pieces.extend(router.flush())
+
+        text = "".join(t for k, t in all_pieces if k == "text")
+        thinking = "".join(t for k, t in all_pieces if k == "thinking")
+        assert "Before" in text
+        assert "After" in text
+        assert "secret" in thinking
+
+    def test_think_then_text_streaming(self):
+        """Simulate realistic think-then-answer streaming."""
+        router = _AnthropicStreamRouter()
+        all_pieces = []
+        for delta in ["<think>", "Let me reason.", "</think>", "The answer."]:
+            all_pieces.extend(router.feed(delta))
+        all_pieces.extend(router.flush())
+
+        kinds = [k for k, _ in all_pieces]
+        text = "".join(t for k, t in all_pieces if k == "text")
+        thinking = "".join(t for k, t in all_pieces if k == "thinking")
+
+        assert "thinking_start" in kinds
+        assert "thinking_stop" in kinds
+        assert "Let me reason." in thinking
+        assert "The answer." in text
+
+    def test_multiple_think_blocks(self):
+        router = _AnthropicStreamRouter()
+        pieces = router.feed("A<think>r1</think>B<think>r2</think>C")
+        pieces += router.flush()
+
+        text = "".join(t for k, t in pieces if k == "text")
+        thinking = "".join(t for k, t in pieces if k == "thinking")
+        starts = sum(1 for k, _ in pieces if k == "thinking_start")
+        stops = sum(1 for k, _ in pieces if k == "thinking_stop")
+
+        assert "A" in text
+        assert "B" in text
+        assert "C" in text
+        assert "r1" in thinking
+        assert "r2" in thinking
+        assert starts == 2
+        assert stops == 2
+
+    def test_unclosed_think_at_end(self):
+        """Unclosed <think> at end should flush remaining as thinking."""
+        router = _AnthropicStreamRouter()
+        pieces = router.feed("<think>unfinished")
+        pieces += router.flush()
+
+        kinds = [k for k, _ in pieces]
+        thinking = "".join(t for k, t in pieces if k == "thinking")
+        assert "thinking_start" in kinds
+        assert "thinking_stop" in kinds  # flush closes it
+        assert "unfinished" in thinking
+
+
+class TestRouterToolCallSuppression:
+    """Router should suppress tool_call/function/parameter content (no pieces)."""
+
+    def test_tool_call_suppressed(self):
+        router = _AnthropicStreamRouter()
+        pieces = router.feed('Before <tool_call>{"fn":"x"}</tool_call> After')
+        pieces += router.flush()
+
+        text = "".join(t for k, t in pieces if k == "text")
+        all_content = "".join(t for _, t in pieces)
+        assert "Before" in text
+        assert "After" in text
+        assert '{"fn":"x"}' not in all_content
+
+    def test_function_tag_suppressed(self):
+        router = _AnthropicStreamRouter()
+        pieces = router.feed('<function=search>body</function>after')
+        pieces += router.flush()
+
+        text = "".join(t for k, t in pieces if k == "text")
+        assert "after" in text
+        assert "body" not in "".join(t for _, t in pieces)
+
+
+class TestRouterMixedContent:
+    """Test router with think + tool_call combined."""
+
+    def test_think_then_tool_call(self):
+        router = _AnthropicStreamRouter()
+        text_input = '<think>reasoning</think>visible<tool_call>data</tool_call>end'
+        pieces = router.feed(text_input)
+        pieces += router.flush()
+
+        text = "".join(t for k, t in pieces if k == "text")
+        thinking = "".join(t for k, t in pieces if k == "thinking")
+
+        assert "reasoning" in thinking
+        assert "visible" in text
+        assert "end" in text
+        assert "data" not in text
+        assert "data" not in thinking
+
+    def test_realistic_streaming(self):
+        """Token-by-token streaming with thinking."""
+        router = _AnthropicStreamRouter()
+        tokens = [
+            "<", "think", ">",
+            "Let", " me", " check",
+            "</", "think", ">",
+            "The", " answer", " is", " 42", ".",
+        ]
+        all_pieces = []
+        for tok in tokens:
+            all_pieces.extend(router.feed(tok))
+        all_pieces.extend(router.flush())
+
+        text = "".join(t for k, t in all_pieces if k == "text")
+        thinking = "".join(t for k, t in all_pieces if k == "thinking")
+
+        assert "Let me check" in thinking
+        assert "The answer is 42." in text
+
+
+class TestRouterFlush:
+    """Test router flush() behavior."""
+
+    def test_flush_text_mode(self):
+        router = _AnthropicStreamRouter()
+        router.feed("text<")  # '<' held in carry
+        pieces = router.flush()
+        # Should emit the '<' as text
+        text = "".join(t for k, t in pieces if k == "text")
+        assert "<" in text
+
+    def test_flush_in_think_mode(self):
+        router = _AnthropicStreamRouter()
+        router.feed("<think>leftover")
+        pieces = router.flush()
+        kinds = [k for k, _ in pieces]
+        assert "thinking" in kinds
+        assert "thinking_stop" in kinds
+
+    def test_flush_in_toolcall_mode(self):
+        router = _AnthropicStreamRouter()
+        router.feed("<tool_call>stuff")
+        pieces = router.flush()
+        # Should discard (tool_call content suppressed)
+        assert pieces == []
+
+
+# =============================================================================
+# _is_thinking_enabled Helper
+# =============================================================================
+
+
+class TestIsThinkingEnabled:
+    """Test the _is_thinking_enabled helper function."""
+
+    def test_none_thinking(self):
+        from vllm_mlx.api.anthropic_models import AnthropicRequest, AnthropicMessage
+        req = AnthropicRequest(
+            model="test", messages=[AnthropicMessage(role="user", content="hi")],
+            max_tokens=100, thinking=None,
+        )
+        assert _is_thinking_enabled(req) is False
+
+    def test_no_thinking_field(self):
+        from vllm_mlx.api.anthropic_models import AnthropicRequest, AnthropicMessage
+        req = AnthropicRequest(
+            model="test", messages=[AnthropicMessage(role="user", content="hi")],
+            max_tokens=100,
+        )
+        assert _is_thinking_enabled(req) is False
+
+    def test_thinking_enabled_dict(self):
+        from vllm_mlx.api.anthropic_models import AnthropicRequest, AnthropicMessage
+        req = AnthropicRequest(
+            model="test", messages=[AnthropicMessage(role="user", content="hi")],
+            max_tokens=100, thinking={"type": "enabled", "budget_tokens": 5000},
+        )
+        assert _is_thinking_enabled(req) is True
+
+    def test_thinking_disabled_dict(self):
+        from vllm_mlx.api.anthropic_models import AnthropicRequest, AnthropicMessage
+        req = AnthropicRequest(
+            model="test", messages=[AnthropicMessage(role="user", content="hi")],
+            max_tokens=100, thinking={"type": "disabled"},
+        )
+        assert _is_thinking_enabled(req) is False
+
+    def test_thinking_enabled_model(self):
+        from vllm_mlx.api.anthropic_models import (
+            AnthropicRequest, AnthropicMessage, AnthropicThinkingConfig,
+        )
+        req = AnthropicRequest(
+            model="test", messages=[AnthropicMessage(role="user", content="hi")],
+            max_tokens=100,
+            thinking=AnthropicThinkingConfig(type="enabled", budget_tokens=8000),
+        )
+        assert _is_thinking_enabled(req) is True
+
+    def test_thinking_disabled_model(self):
+        from vllm_mlx.api.anthropic_models import (
+            AnthropicRequest, AnthropicMessage, AnthropicThinkingConfig,
+        )
+        req = AnthropicRequest(
+            model="test", messages=[AnthropicMessage(role="user", content="hi")],
+            max_tokens=100,
+            thinking=AnthropicThinkingConfig(type="disabled"),
+        )
+        assert _is_thinking_enabled(req) is False

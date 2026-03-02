@@ -50,6 +50,13 @@ class AnthropicToolDef(BaseModel):
     input_schema: dict | None = None
 
 
+class AnthropicThinkingConfig(BaseModel):
+    """Configuration for extended thinking (Anthropic streaming)."""
+
+    type: str = "enabled"  # "enabled" or "disabled"
+    budget_tokens: int | None = None
+
+
 class AnthropicRequest(BaseModel):
     """Request for Anthropic Messages API."""
 
@@ -65,6 +72,7 @@ class AnthropicRequest(BaseModel):
     tool_choice: dict | None = None
     metadata: dict | None = None
     top_k: int | None = None
+    thinking: AnthropicThinkingConfig | dict | None = None
 
 
 # =============================================================================

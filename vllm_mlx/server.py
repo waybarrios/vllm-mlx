@@ -1876,6 +1876,168 @@ class _AnthropicStreamScrubber:
         return ""
 
 
+class _AnthropicStreamRouter:
+    """Stream router that translates ``<think>`` regions into Anthropic
+    ``thinking_delta`` events while still suppressing tool-call markup.
+
+    Unlike :class:`_AnthropicStreamScrubber` (which drops *everything*
+    inside ``<think>``), this router *yields* thinking content so it can
+    be emitted on a separate ``thinking`` content-block channel.
+
+    ``feed()`` returns a list of ``(kind, text)`` tuples:
+
+    * ``("text", "...")`` – normal text for ``text_delta``
+    * ``("thinking_start", "")`` – signals start of a thinking block
+    * ``("thinking", "...")`` – thinking content for ``thinking_delta``
+    * ``("thinking_stop", "")`` – signals end of a thinking block
+    * Tool-call / function / parameter content is silently suppressed.
+
+    The router reuses the same tag-detection helpers as
+    :class:`_AnthropicStreamScrubber`.
+    """
+
+    # Reuse tag constants from the scrubber.
+    THINK_OPEN = _AnthropicStreamScrubber.THINK_OPEN
+    THINK_CLOSE = _AnthropicStreamScrubber.THINK_CLOSE
+    TOOL_OPEN = _AnthropicStreamScrubber.TOOL_OPEN
+    TOOL_CLOSE = _AnthropicStreamScrubber.TOOL_CLOSE
+    FUNC_CLOSE = _AnthropicStreamScrubber.FUNC_CLOSE
+    PARAM_CLOSE = _AnthropicStreamScrubber.PARAM_CLOSE
+    FUNC_PREFIX = _AnthropicStreamScrubber.FUNC_PREFIX
+    PARAM_PREFIX = _AnthropicStreamScrubber.PARAM_PREFIX
+
+    _EXACT_TAGS = _AnthropicStreamScrubber._EXACT_TAGS
+    _PREFIX_TAGS = _AnthropicStreamScrubber._PREFIX_TAGS
+    CARRY_N = _AnthropicStreamScrubber.CARRY_N
+
+    _MODE_MAP = _AnthropicStreamScrubber._MODE_MAP
+    _CLOSE_MAP = _AnthropicStreamScrubber._CLOSE_MAP
+
+    def __init__(self) -> None:
+        self.mode: str = "TEXT"
+        self.carry: str = ""
+        # Delegate marker scanning to a scrubber instance.
+        self._scanner = _AnthropicStreamScrubber()
+
+    def _find_earliest_marker(self, s: str, start: int):
+        return self._scanner._find_earliest_marker(s, start)
+
+    def feed(self, delta: str) -> list[tuple[str, str]]:
+        """Process a delta and return a list of ``(kind, text)`` pieces."""
+        s = self.carry + (delta or "")
+        pieces: list[tuple[str, str]] = []
+        slen = len(s)
+        i = 0
+
+        while i < slen:
+            if self.mode == "TEXT":
+                hit = self._find_earliest_marker(s, i)
+
+                if hit is None:
+                    # No marker – emit text, retain carry only if '<' near tail.
+                    tail = s[max(i, slen - self.CARRY_N):]
+                    lt_pos = tail.rfind("<")
+                    if lt_pos != -1:
+                        carry_start = max(i, slen - self.CARRY_N) + lt_pos
+                        if carry_start > i:
+                            pieces.append(("text", s[i:carry_start]))
+                        self.carry = s[carry_start:]
+                    else:
+                        if slen > i:
+                            pieces.append(("text", s[i:]))
+                        self.carry = ""
+                    return pieces
+
+                pos, marker, consume = hit
+
+                if consume < 0:
+                    if pos > i:
+                        pieces.append(("text", s[i:pos]))
+                    self.carry = s[pos:]
+                    return pieces
+
+                tag_end = pos + consume
+                if tag_end > slen:
+                    if pos > i:
+                        pieces.append(("text", s[i:pos]))
+                    self.carry = s[pos:]
+                    return pieces
+
+                # Emit text before the tag.
+                if pos > i:
+                    pieces.append(("text", s[i:pos]))
+
+                i = tag_end
+                new_mode = self._MODE_MAP.get(marker)
+                if new_mode:
+                    self.mode = new_mode
+                    if new_mode == "IN_THINK":
+                        pieces.append(("thinking_start", ""))
+                # else: stray closing tag – consumed silently
+
+            elif self.mode == "IN_THINK":
+                # Find closing </think>.
+                close_pos = s.find(self.THINK_CLOSE, i)
+                if close_pos == -1:
+                    # Emit thinking content up to carry boundary.
+                    safe_end = max(i, slen - self.CARRY_N)
+                    if safe_end > i:
+                        pieces.append(("thinking", s[i:safe_end]))
+                    self.carry = s[safe_end:]
+                    return pieces
+                # Emit thinking content before closing tag.
+                if close_pos > i:
+                    pieces.append(("thinking", s[i:close_pos]))
+                pieces.append(("thinking_stop", ""))
+                i = close_pos + len(self.THINK_CLOSE)
+                self.mode = "TEXT"
+
+            else:
+                # IN_TOOLCALL or IN_FUNCTION – suppress content.
+                close_tag = self._CLOSE_MAP[self.mode]
+                close_pos = s.find(close_tag, i)
+                if close_pos == -1:
+                    self.carry = s[max(i, slen - self.CARRY_N):]
+                    return pieces
+                i = close_pos + len(close_tag)
+                self.mode = "TEXT"
+
+        self.carry = ""
+        return pieces
+
+    def flush(self) -> list[tuple[str, str]]:
+        """Flush at end of stream."""
+        pieces: list[tuple[str, str]] = []
+        if self.mode == "IN_THINK":
+            # Emit any remaining thinking content.
+            if self.carry:
+                pieces.append(("thinking", self.carry))
+            pieces.append(("thinking_stop", ""))
+        elif self.mode == "TEXT" and self.carry:
+            result = self.carry
+            for tag in self._EXACT_TAGS:
+                result = result.replace(tag, "")
+            import re
+            result = re.sub(r"<function=[^>]*>", "", result)
+            result = re.sub(r"<parameter=[^>]*>", "", result)
+            if result:
+                pieces.append(("text", result))
+        # IN_TOOLCALL/IN_FUNCTION – discard.
+        self.carry = ""
+        self.mode = "TEXT"
+        return pieces
+
+
+def _is_thinking_enabled(anthropic_request: AnthropicRequest) -> bool:
+    """Check if the client has requested extended thinking."""
+    thinking = getattr(anthropic_request, "thinking", None)
+    if thinking is None:
+        return False
+    if isinstance(thinking, dict):
+        return thinking.get("type") == "enabled"
+    return getattr(thinking, "type", None) == "enabled"
+
+
 async def _stream_anthropic_messages(
     engine: BaseEngine,
     openai_request: ChatCompletionRequest,
@@ -1929,19 +2091,42 @@ async def _stream_anthropic_messages(
     }
     yield f"event: message_start\ndata: {json.dumps(message_start)}\n\n"
 
-    # Emit content_block_start for text
-    content_block_start = {
-        "type": "content_block_start",
-        "index": 0,
-        "content_block": {"type": "text", "text": ""},
-    }
-    yield f"event: content_block_start\ndata: {json.dumps(content_block_start)}\n\n"
+    # Determine whether the client requested extended thinking.
+    thinking_enabled = _is_thinking_enabled(anthropic_request)
 
-    # Activate the stream scrubber to strip <think>...</think> and
-    # <tool_call>...</tool_call> markup so that clients only see clean
-    # text and structured tool_use blocks.  Always enabled because
-    # reasoning models may emit <think> tags even without tools.
-    scrubber = _AnthropicStreamScrubber()
+    # Content block index tracking.  When thinking is enabled the
+    # thinking block is emitted first (index 0) and the text block
+    # follows (index 1).  Otherwise only the text block exists (index 0).
+    # These values are updated dynamically as blocks are opened.
+    next_block_index = 0
+    thinking_block_index: int | None = None
+    thinking_block_open = False
+    text_block_index: int | None = None
+    text_block_open = False
+
+    if thinking_enabled:
+        # Use the stream router which yields typed (kind, text) pieces
+        # that separate thinking content from user-facing text.
+        router: _AnthropicStreamRouter | None = _AnthropicStreamRouter()
+        scrubber: _AnthropicStreamScrubber | None = None
+    else:
+        # Use the scrubber which simply strips all <think> content.
+        router = None
+        scrubber = _AnthropicStreamScrubber()
+
+    # Always open the text block up front when thinking is NOT enabled
+    # (preserves existing behaviour).  When thinking IS enabled the text
+    # block will be opened lazily after any thinking block.
+    if not thinking_enabled:
+        text_block_index = next_block_index
+        next_block_index += 1
+        text_block_open = True
+        content_block_start = {
+            "type": "content_block_start",
+            "index": text_block_index,
+            "content_block": {"type": "text", "text": ""},
+        }
+        yield f"event: content_block_start\ndata: {json.dumps(content_block_start)}\n\n"
 
     # Stream content deltas
     accumulated_text = ""
@@ -1963,40 +2148,132 @@ async def _stream_anthropic_messages(
                 # parsing at the end of the stream.
                 accumulated_text += content
 
-                # If the scrubber is active, run the content through it to
-                # strip <think> and <tool_call> regions before emitting.
-                if scrubber is not None:
+                if router is not None:
+                    # ---- Thinking-enabled path (stream router) ----
+                    for kind, text in router.feed(content):
+                        if kind == "thinking_start":
+                            thinking_block_index = next_block_index
+                            next_block_index += 1
+                            thinking_block_open = True
+                            ev = {
+                                "type": "content_block_start",
+                                "index": thinking_block_index,
+                                "content_block": {"type": "thinking", "thinking": ""},
+                            }
+                            yield f"event: content_block_start\ndata: {json.dumps(ev)}\n\n"
+
+                        elif kind == "thinking" and text:
+                            ev = {
+                                "type": "content_block_delta",
+                                "index": thinking_block_index,
+                                "delta": {"type": "thinking_delta", "thinking": text},
+                            }
+                            yield f"event: content_block_delta\ndata: {json.dumps(ev)}\n\n"
+
+                        elif kind == "thinking_stop":
+                            if thinking_block_open:
+                                ev = {"type": "content_block_stop", "index": thinking_block_index}
+                                yield f"event: content_block_stop\ndata: {json.dumps(ev)}\n\n"
+                                thinking_block_open = False
+
+                        elif kind == "text" and text:
+                            # Lazily open the text block on first text piece.
+                            if text_block_index is None:
+                                text_block_index = next_block_index
+                                next_block_index += 1
+                                text_block_open = True
+                                ev = {
+                                    "type": "content_block_start",
+                                    "index": text_block_index,
+                                    "content_block": {"type": "text", "text": ""},
+                                }
+                                yield f"event: content_block_start\ndata: {json.dumps(ev)}\n\n"
+                            ev = {
+                                "type": "content_block_delta",
+                                "index": text_block_index,
+                                "delta": {"type": "text_delta", "text": text},
+                            }
+                            yield f"event: content_block_delta\ndata: {json.dumps(ev)}\n\n"
+
+                elif scrubber is not None:
+                    # ---- Scrubber path (thinking suppressed) ----
                     content = scrubber.feed(content)
+                    if content:
+                        delta_event = {
+                            "type": "content_block_delta",
+                            "index": text_block_index,
+                            "delta": {"type": "text_delta", "text": content},
+                        }
+                        yield f"event: content_block_delta\ndata: {json.dumps(delta_event)}\n\n"
 
-                if content:
-                    delta_event = {
+    # Flush remaining carry buffer
+    if router is not None:
+        for kind, text in router.flush():
+            if kind == "thinking" and text:
+                if thinking_block_open:
+                    ev = {
                         "type": "content_block_delta",
-                        "index": 0,
-                        "delta": {"type": "text_delta", "text": content},
+                        "index": thinking_block_index,
+                        "delta": {"type": "thinking_delta", "thinking": text},
                     }
-                    yield f"event: content_block_delta\ndata: {json.dumps(delta_event)}\n\n"
-
-    # Flush any remaining carry buffer from the scrubber
-    if scrubber is not None:
+                    yield f"event: content_block_delta\ndata: {json.dumps(ev)}\n\n"
+            elif kind == "thinking_stop":
+                if thinking_block_open:
+                    ev = {"type": "content_block_stop", "index": thinking_block_index}
+                    yield f"event: content_block_stop\ndata: {json.dumps(ev)}\n\n"
+                    thinking_block_open = False
+            elif kind == "text" and text:
+                if text_block_index is None:
+                    text_block_index = next_block_index
+                    next_block_index += 1
+                    text_block_open = True
+                    ev = {
+                        "type": "content_block_start",
+                        "index": text_block_index,
+                        "content_block": {"type": "text", "text": ""},
+                    }
+                    yield f"event: content_block_start\ndata: {json.dumps(ev)}\n\n"
+                ev = {
+                    "type": "content_block_delta",
+                    "index": text_block_index,
+                    "delta": {"type": "text_delta", "text": text},
+                }
+                yield f"event: content_block_delta\ndata: {json.dumps(ev)}\n\n"
+    elif scrubber is not None:
         flushed = scrubber.flush()
         if flushed:
             delta_event = {
                 "type": "content_block_delta",
-                "index": 0,
+                "index": text_block_index,
                 "delta": {"type": "text_delta", "text": flushed},
             }
             yield f"event: content_block_delta\ndata: {json.dumps(delta_event)}\n\n"
 
+    # Ensure text block was opened (even if model produced no text)
+    if text_block_index is None:
+        text_block_index = next_block_index
+        next_block_index += 1
+        text_block_open = True
+        ev = {
+            "type": "content_block_start",
+            "index": text_block_index,
+            "content_block": {"type": "text", "text": ""},
+        }
+        yield f"event: content_block_start\ndata: {json.dumps(ev)}\n\n"
+
     # Check for tool calls in accumulated text
     _, tool_calls = _parse_tool_calls_with_parser(accumulated_text, openai_request)
 
-    # Emit content_block_stop for text block
-    yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': 0})}\n\n"
+    # Close any remaining open blocks
+    if thinking_block_open:
+        yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': thinking_block_index})}\n\n"
+    if text_block_open:
+        yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': text_block_index})}\n\n"
 
     # If there are tool calls, emit tool_use blocks
     if tool_calls:
         for i, tc in enumerate(tool_calls):
-            tool_index = i + 1
+            tool_index = next_block_index + i
             try:
                 tool_input = json.loads(tc.function.arguments)
             except (json.JSONDecodeError, AttributeError):
