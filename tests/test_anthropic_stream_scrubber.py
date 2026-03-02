@@ -65,10 +65,10 @@ class TestScrubberPlainText:
 
     def test_short_text(self):
         scrubber = _AnthropicStreamScrubber()
-        # Short text may be held in carry buffer
+        # Short text with no '<' should emit immediately (zero carry)
         result = scrubber.feed("Hi")
-        flushed = scrubber.flush()
-        assert result + flushed == "Hi"
+        assert result == "Hi"
+        assert scrubber.carry == ""
 
     def test_long_plain_text(self):
         """Text longer than CARRY_N should emit most of it immediately."""
@@ -567,10 +567,21 @@ class TestScrubberFlush:
 
     def test_flush_emits_remaining_text(self):
         scrubber = _AnthropicStreamScrubber()
-        # Feed text shorter than CARRY_N so it's all in carry
-        scrubber.feed("hi")
+        # "hi" has no '<' so is emitted immediately by feed().
+        result = scrubber.feed("hi")
+        assert result == "hi"
+        # flush() should return empty since carry is empty.
         flushed = scrubber.flush()
-        assert "hi" in flushed
+        assert flushed == ""
+
+    def test_flush_emits_carry_with_angle_bracket(self):
+        """Text ending with '<' is held in carry; flush emits it."""
+        scrubber = _AnthropicStreamScrubber()
+        result = scrubber.feed("text<")
+        assert scrubber.carry == "<"
+        flushed = scrubber.flush()
+        # '<' alone is not a valid tag, flush strips nothing extra
+        assert flushed == "<"
 
     def test_flush_in_think_mode_discards(self):
         """If stream ends while inside <think>, flush returns empty."""
@@ -945,3 +956,68 @@ class TestScrubberStreamingIntegration:
         r2 += scrubber.flush()
         assert "first" in r1
         assert "second" in r2
+
+
+# =============================================================================
+# Zero-Latency Carry: plain text should not be held back
+# =============================================================================
+
+
+class TestScrubberZeroLatencyCarry:
+    """Verify that the conditional carry buffer doesn't stall plain text."""
+
+    def test_plain_text_emits_immediately(self):
+        """No '<' in text → carry should be empty, all text emitted."""
+        scrubber = _AnthropicStreamScrubber()
+        result = scrubber.feed("Hello world")
+        assert result == "Hello world"
+        assert scrubber.carry == ""
+
+    def test_plain_deltas_no_carry(self):
+        """Multiple plain deltas should each emit fully."""
+        scrubber = _AnthropicStreamScrubber()
+        for word in ["The ", "quick ", "brown ", "fox."]:
+            result = scrubber.feed(word)
+            assert result == word
+            assert scrubber.carry == ""
+
+    def test_angle_bracket_at_end_triggers_carry(self):
+        """A '<' near the end should be held in carry (could be tag start)."""
+        scrubber = _AnthropicStreamScrubber()
+        result = scrubber.feed("text<")
+        assert "<" not in result
+        assert scrubber.carry == "<"
+
+    def test_angle_bracket_resolved_next_delta(self):
+        """Carry '<' is resolved when next delta shows it's not a tag."""
+        scrubber = _AnthropicStreamScrubber()
+        r1 = scrubber.feed("value < ")
+        r2 = scrubber.feed("other")
+        r2 += scrubber.flush()
+        full = r1 + r2
+        assert "value < other" in full
+
+    def test_angle_bracket_resolved_as_tag(self):
+        """Carry '<' is resolved when next delta completes a tag."""
+        scrubber = _AnthropicStreamScrubber()
+        r1 = scrubber.feed("before<")
+        r2 = scrubber.feed("think>hidden</think>after")
+        r2 += scrubber.flush()
+        full = r1 + r2
+        assert "before" in full
+        assert "after" in full
+        assert "hidden" not in full
+
+    def test_first_token_emits_immediately(self):
+        """The very first token should not be stalled by carry buffer."""
+        scrubber = _AnthropicStreamScrubber()
+        result = scrubber.feed("Hi")
+        assert result == "Hi"
+
+    def test_long_plain_text_no_carry(self):
+        """Long text with no '<' should all be emitted, carry empty."""
+        scrubber = _AnthropicStreamScrubber()
+        text = "A" * 500
+        result = scrubber.feed(text)
+        assert result == text
+        assert scrubber.carry == ""

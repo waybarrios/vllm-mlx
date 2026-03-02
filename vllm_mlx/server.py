@@ -1792,11 +1792,22 @@ class _AnthropicStreamScrubber:
                 hit = self._find_earliest_marker(s, i)
 
                 if hit is None:
-                    # No marker anywhere – emit up to carry boundary.
-                    safe_end = max(i, slen - self.CARRY_N)
-                    if safe_end > i:
-                        out.append(s[i:safe_end])
-                    self.carry = s[safe_end:]
+                    # No marker anywhere.  Only retain a carry suffix if
+                    # there is a '<' near the tail that could be the start
+                    # of a split tag.  Otherwise emit everything immediately
+                    # so plain text streams with zero latency.
+                    tail = s[max(i, slen - self.CARRY_N):]
+                    lt_pos = tail.rfind("<")
+                    if lt_pos != -1:
+                        # Keep from the '<' onward as carry.
+                        carry_start = max(i, slen - self.CARRY_N) + lt_pos
+                        if carry_start > i:
+                            out.append(s[i:carry_start])
+                        self.carry = s[carry_start:]
+                    else:
+                        # No '<' in tail – emit everything.
+                        out.append(s[i:])
+                        self.carry = ""
                     return "".join(out)
 
                 pos, marker, consume = hit
@@ -1877,9 +1888,9 @@ async def _stream_anthropic_messages(
     message_start -> content_block_start -> content_block_delta* ->
     content_block_stop -> message_delta -> message_stop
 
-    When tools are present in the request, a streaming scrubber filters
-    out <think>...</think> and <tool_call>...</tool_call> markup that
-    the model may emit, so clients only see structured tool_use blocks.
+    A streaming scrubber always filters out <think>...</think> and
+    <tool_call>...</tool_call> markup that the model may emit, so
+    clients only see clean text and structured tool_use blocks.
     """
     msg_id = f"msg_{uuid.uuid4().hex[:24]}"
     start_time = time.perf_counter()
@@ -1926,11 +1937,11 @@ async def _stream_anthropic_messages(
     }
     yield f"event: content_block_start\ndata: {json.dumps(content_block_start)}\n\n"
 
-    # When tools are present, activate the stream scrubber to strip
-    # <think>...</think> and <tool_call>...</tool_call> markup so that
-    # clients only see clean text and structured tool_use blocks.
-    has_tools = bool(getattr(anthropic_request, "tools", None))
-    scrubber = _AnthropicStreamScrubber() if has_tools else None
+    # Activate the stream scrubber to strip <think>...</think> and
+    # <tool_call>...</tool_call> markup so that clients only see clean
+    # text and structured tool_use blocks.  Always enabled because
+    # reasoning models may emit <think> tags even without tools.
+    scrubber = _AnthropicStreamScrubber()
 
     # Stream content deltas
     accumulated_text = ""
