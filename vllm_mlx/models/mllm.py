@@ -1152,12 +1152,21 @@ class MLXMultimodalLM:
             logger.info(
                 f"  Chat msg {i}: role={cm['role']}, content={content_preview}..."
             )
+        # Pass thinking and tool kwargs through to the chat template.
+        # The engine controls enable_thinking (disabled for coder models);
+        # default to True to preserve existing behavior when called directly.
+        _enable_thinking = kwargs.pop("enable_thinking", True)
+        _tools = kwargs.pop("tools", None)
+        _template_kwargs = {"enable_thinking": _enable_thinking}
+        if _tools:
+            _template_kwargs["tools"] = _tools
         try:
             # Use get_chat_template directly since messages are already properly formatted
             formatted_prompt = get_chat_template(
                 self.processor,
                 chat_messages,
                 add_generation_prompt=True,
+                **_template_kwargs,
             )
         except Exception as e:
             logger.warning(
@@ -1504,12 +1513,21 @@ class MLXMultimodalLM:
             all_images.extend(frames)
 
         # Apply chat template directly - messages are already properly structured
+        # Pass thinking and tool kwargs through to the chat template.
+        # The engine controls enable_thinking (disabled for coder models);
+        # default to True to preserve existing behavior when called directly.
+        _enable_thinking = kwargs.pop("enable_thinking", True)
+        _tools = kwargs.pop("tools", None)
+        _template_kwargs = {"enable_thinking": _enable_thinking}
+        if _tools:
+            _template_kwargs["tools"] = _tools
         try:
             # Use get_chat_template directly since messages are already properly formatted
             formatted_prompt = get_chat_template(
                 self.processor,
                 chat_messages,
                 add_generation_prompt=True,
+                **_template_kwargs,
             )
         except Exception as e:
             logger.warning(

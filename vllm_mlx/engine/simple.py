@@ -271,12 +271,21 @@ class SimpleEngine(BaseEngine):
             if self._is_mllm:
                 # For MLLM, use the chat method which handles images/videos
                 # Run in thread pool to allow asyncio timeout to work
+                mllm_kwargs = dict(kwargs)
+                if template_tools:
+                    mllm_kwargs["tools"] = template_tools
+                # Match LLM path: disable thinking for coder models since
+                # it interferes with tool call parsing.
+                if "enable_thinking" not in mllm_kwargs:
+                    mllm_kwargs["enable_thinking"] = (
+                        "coder" not in self._model_name.lower()
+                    )
                 output = await asyncio.to_thread(
                     self._model.chat,
                     messages=messages,
                     max_tokens=max_tokens,
                     temperature=temperature,
-                    **kwargs,
+                    **mllm_kwargs,
                 )
                 text = clean_output_text(output.text)
                 return GenerationOutput(
@@ -344,6 +353,17 @@ class SimpleEngine(BaseEngine):
             accumulated_text = ""
             token_count = 0
 
+            # Pass tools and thinking control through to MLLM stream_chat
+            mllm_kwargs = dict(kwargs)
+            if template_tools:
+                mllm_kwargs["tools"] = template_tools
+            # Match LLM path: disable thinking for coder models since
+            # it interferes with tool call parsing.
+            if "enable_thinking" not in mllm_kwargs:
+                mllm_kwargs["enable_thinking"] = (
+                    "coder" not in self._model_name.lower()
+                )
+
             # Run stream_chat in thread pool since it's synchronous
             def run_stream():
                 return list(
@@ -351,7 +371,7 @@ class SimpleEngine(BaseEngine):
                         messages=messages,
                         max_tokens=max_tokens,
                         temperature=temperature,
-                        **kwargs,
+                        **mllm_kwargs,
                     )
                 )
 
