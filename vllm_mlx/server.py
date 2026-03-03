@@ -2027,7 +2027,7 @@ async def stream_chat_completion(
             yield f"data: {chunk.model_dump_json()}\n\n"
 
     # Fallback: if tool parser accumulated text but never emitted tool_calls
-    # (e.g., </tool_call> never arrived - incomplete tool call)
+    # (e.g., </tool_call> never arrived, or parser format mismatch)
     if (
         tool_parser
         and tool_accumulated_text
@@ -2035,7 +2035,34 @@ async def stream_chat_completion(
         and "<tool_call>" in tool_accumulated_text
     ):
         result = tool_parser.extract_tool_calls(tool_accumulated_text)
-        if result.tools_called:
+
+        # If the specific parser fails, fall back to the generic parser
+        # which handles more formats (Nemotron parameter-style, Llama, etc.)
+        generic_cleaned = None
+        generic_tool_calls = None
+        if not result.tools_called:
+            generic_cleaned, generic_tool_calls = parse_tool_calls(
+                tool_accumulated_text, request
+            )
+
+        if result.tools_called or generic_tool_calls:
+            # Determine tool calls to emit
+            if result.tools_called:
+                final_tool_calls = result.tool_calls
+            else:
+                final_tool_calls = [
+                    {
+                        "id": tc.id,
+                        "name": tc.function.name,
+                        "arguments": tc.function.arguments,
+                    }
+                    for tc in generic_tool_calls
+                ]
+
+            # Note: we skip re-emitting content here because any
+            # pre-tool-call text was already streamed before <tool_call>
+            # was detected.  Re-emitting would duplicate it.
+
             tool_chunk = ChatCompletionChunk(
                 id=response_id,
                 model=request.model,
@@ -2052,7 +2079,7 @@ async def stream_chat_completion(
                                         "arguments": tc["arguments"],
                                     },
                                 }
-                                for i, tc in enumerate(result.tool_calls)
+                                for i, tc in enumerate(final_tool_calls)
                             ]
                         ),
                         finish_reason="tool_calls",
