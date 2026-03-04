@@ -1055,8 +1055,6 @@ class MLXMultimodalLM:
         videos = []
         chat_messages = []  # List of properly formatted messages for chat template
 
-        logger.info(f"MLLM.chat() called with {len(messages)} messages")
-
         for msg in messages:
             role = msg.get("role", "user")
             content = msg.get("content", "")
@@ -1147,17 +1145,18 @@ class MLXMultimodalLM:
         logger.info(
             f"Applying chat template with {len(chat_messages)} messages, {len(all_images)} images"
         )
-        for i, cm in enumerate(chat_messages):
-            content_preview = str(cm.get("content", ""))[:80]
-            logger.info(
-                f"  Chat msg {i}: role={cm['role']}, content={content_preview}..."
-            )
         try:
             # Use get_chat_template directly since messages are already properly formatted
+            # Pass tools through if provided (for function calling support)
+            template_kwargs = {}
+            tools = kwargs.get("tools")
+            if tools:
+                template_kwargs["tools"] = tools
             formatted_prompt = get_chat_template(
                 self.processor,
                 chat_messages,
                 add_generation_prompt=True,
+                **template_kwargs,
             )
         except Exception as e:
             logger.warning(
@@ -1506,10 +1505,16 @@ class MLXMultimodalLM:
         # Apply chat template directly - messages are already properly structured
         try:
             # Use get_chat_template directly since messages are already properly formatted
+            # Pass tools through if provided (for function calling support)
+            template_kwargs = {}
+            tools = kwargs.get("tools")
+            if tools:
+                template_kwargs["tools"] = tools
             formatted_prompt = get_chat_template(
                 self.processor,
                 chat_messages,
                 add_generation_prompt=True,
+                **template_kwargs,
             )
         except Exception as e:
             logger.warning(
