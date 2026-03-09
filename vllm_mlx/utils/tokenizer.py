@@ -28,6 +28,27 @@ def _needs_tokenizer_fallback(model_name: str) -> bool:
     return any(pattern.lower() in model_lower for pattern in FALLBACK_MODELS)
 
 
+def _needs_strict_false(model_name: str) -> bool:
+    """Check if model needs strict=False loading (VLM models with extra weights).
+
+    VLM models (e.g., Qwen3.5) have vision_tower weights that don't match
+    the text-only model class.  Loading with strict=True fails and wastes
+    memory by loading all weights (~100 GB) before raising ValueError.
+    Detect these models up-front to avoid the double-load penalty.
+    """
+    from mlx_lm.utils import _download, load_config
+
+    try:
+        model_path = _download(model_name)
+        config = load_config(model_path)
+    except Exception:
+        return False
+    # VLM models have vision_config or text_config with a separate model_type
+    if "vision_config" in config and "text_config" in config:
+        return True
+    return False
+
+
 def load_model_with_fallback(model_name: str, tokenizer_config: dict = None):
     """
     Load model and tokenizer with fallback for non-standard tokenizers.
@@ -50,15 +71,81 @@ def load_model_with_fallback(model_name: str, tokenizer_config: dict = None):
         )
         return _load_with_tokenizer_fallback(model_name)
 
+    # VLM models (e.g., Qwen3.5) have extra vision weights that cause
+    # strict=True to fail.  Skip the first load attempt to avoid loading
+    # ~100 GB of weights twice (which can cause OOM on 256 GB systems).
+    if _needs_strict_false(model_name):
+        logger.info(
+            f"Model {model_name} detected as VLM, loading directly with strict=False"
+        )
+        return _load_strict_false(model_name, tokenizer_config)
+
     try:
-        return load(model_name, tokenizer_config=tokenizer_config)
+        model, tokenizer = load(model_name, tokenizer_config=tokenizer_config)
     except ValueError as e:
         # Fallback for models with non-standard tokenizers
         if "TokenizersBackend" in str(e) or "Tokenizer class" in str(e):
             logger.warning(f"Standard tokenizer loading failed, using fallback: {e}")
             return _load_with_tokenizer_fallback(model_name)
+        # Fallback for models with extra weights (e.g., MTP layers, vision tower)
+        elif "parameters not in model" in str(e):
+            logger.warning(
+                "Extra parameters found (e.g., MTP/vision weights), retrying with strict=False"
+            )
+            # Clear traceback references to free memory from the failed first load.
+            # Without this, large models (200GB+) cause OOM during retry because
+            # the traceback holds references to the first load's weight tensors.
+            e.__traceback__ = None
+            del e
+            import gc
+
+            gc.collect()
+            return _load_strict_false(model_name, tokenizer_config)
         else:
             raise
+
+    return model, tokenizer
+
+
+def _load_strict_false(model_name: str, tokenizer_config: dict = None):
+    """Load model with strict=False to discard extra weights.
+
+    Handles models with extra parameters that the text-only model class
+    doesn't define (e.g., vision tower weights in VLM models like Qwen3.5,
+    or MTP layers).  The model's own sanitize() handles key remapping
+    (e.g., language_model.* prefix), and strict=False silently drops
+    unmatched keys.
+    """
+    import mlx.core as mx
+    from mlx_lm.utils import _download, load_model, load_tokenizer
+
+    model_path = _download(model_name)
+    model, config = load_model(model_path, strict=False)
+
+    # Verify weights loaded correctly
+    from mlx.utils import tree_flatten
+
+    params = tree_flatten(model.parameters())
+    total_params = len(params)
+    zero_params = sum(1 for _, v in params if mx.all(v == 0).item())
+    logger.info(
+        f"[strict=False] Loaded {total_params} parameters, "
+        f"{zero_params} all-zero tensors"
+    )
+    # Spot-check embedding weights
+    if hasattr(model, "language_model"):
+        emb = model.language_model.model.embed_tokens.weight
+        logger.info(
+            f"[strict=False] embed_tokens: shape={emb.shape}, "
+            f"dtype={emb.dtype}, mean={mx.mean(emb.astype(mx.float32)).item():.4f}"
+        )
+
+    tokenizer = load_tokenizer(
+        model_path,
+        tokenizer_config or {},
+        eos_token_ids=config.get("eos_token_id", None),
+    )
+    return model, tokenizer
 
 
 def _load_with_tokenizer_fallback(model_name: str):

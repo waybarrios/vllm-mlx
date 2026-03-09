@@ -139,17 +139,14 @@ class MLLMBatch:
         self.max_tokens.extend(other.max_tokens)
         self.requests.extend(other.requests)
 
-        # Extend cache - handle None and incompatible caches
+        # Extend cache - handle both BatchKVCache (.keys/.values) and
+        # ArraysCache (.cache list) from hybrid models like Qwen3.5
         for c, o in zip(self.cache, other.cache):
             if c is not None and o is not None and hasattr(c, "extend"):
                 try:
-                    # Only extend if both caches have valid keys
-                    if (
-                        hasattr(c, "keys")
-                        and c.keys is not None
-                        and hasattr(o, "keys")
-                        and o.keys is not None
-                    ):
+                    has_kv = hasattr(c, "keys") and c.keys is not None
+                    has_arrays = hasattr(c, "cache")
+                    if has_kv or has_arrays:
                         c.extend(o)
                 except Exception as e:
                     logger.warning(f"Failed to extend cache: {e}")
@@ -207,20 +204,26 @@ class MLLMBatchStats:
 
 def _make_batch_cache(model: nn.Module, left_padding: List[int]) -> List[Any]:
     """
-    Create batch-aware KV cache for the language model.
+    Create batch-aware cache for the language model.
+
+    Supports both KVCache (standard attention) and ArraysCache (hybrid
+    models like Qwen3.5 with GatedDeltaNet + attention layers).
 
     Args:
         model: The language model (model.language_model from VLM)
         left_padding: Padding amounts for left-padded prompts
 
     Returns:
-        List of BatchKVCache objects for each layer
+        List of batch cache objects for each layer
     """
-    from mlx_lm.models.cache import BatchKVCache, KVCache
+    from mlx_lm.models.cache import ArraysCache, BatchKVCache, KVCache
 
     def to_batch_cache(c):
         if isinstance(c, KVCache):
             return BatchKVCache(left_padding)
+        elif isinstance(c, ArraysCache):
+            # ArraysCache supports batching natively via merge/filter/extend
+            return c
         else:
             raise ValueError(f"{type(c)} does not yet support batching")
 
@@ -324,6 +327,11 @@ class MLLMBatchGenerator:
                 "MLLMBatchGenerator: Model does not have language_model, using model directly"
             )
 
+        # Patch Qwen3.5 attention for BatchKVCache compatibility
+        from .patches.qwen3_5_mllm import patch_qwen35_attention_for_batching
+
+        patch_qwen35_attention_for_batching()
+
         self.max_tokens = max_tokens
         self.stop_tokens = stop_tokens or set()
         self.sampler = sampler or (lambda x: mx.argmax(x, axis=-1))
@@ -339,6 +347,9 @@ class MLLMBatchGenerator:
 
         # Statistics
         self._stats = MLLMBatchStats()
+
+        # Error responses for requests that failed during preprocessing
+        self._pending_error_responses: List[MLLMBatchResponse] = []
 
         # Vision embedding cache for repeated images
         self.vision_cache = VisionEmbeddingCache(
@@ -613,23 +624,49 @@ class MLLMBatchGenerator:
 
         tic = time.perf_counter()
 
-        # Preprocess all requests
+        # Preprocess all requests (per-request error handling)
+        failed_requests = []
         for req in requests:
-            self._preprocess_request(req)
+            try:
+                self._preprocess_request(req)
+            except Exception as e:
+                logger.error(
+                    f"Failed to preprocess request {req.request_id}: "
+                    f"{type(e).__name__}: {e}"
+                )
+                failed_requests.append(req)
+
+        # Remove failed requests from batch and create error responses
+        if failed_requests:
+            for req in failed_requests:
+                requests.remove(req)
+                self._pending_error_responses.append(
+                    MLLMBatchResponse(
+                        uid=req.uid,
+                        request_id=req.request_id,
+                        token=0,
+                        logprobs=mx.zeros(1),
+                        finish_reason="error",
+                    )
+                )
+
+        if not requests:
+            # All requests failed
+            return None
 
         total_prompt_tokens = sum(
             req.input_ids.size if req.input_ids is not None else 1 for req in requests
         )
         self._stats.prompt_tokens += total_prompt_tokens
 
-        # Guard against excessive memory usage during cache merge.
-        # Each token in the batch requires KV entries across all layers.
+        # Log large prompts for monitoring (was previously a hard check that
+        # caused infinite retry loops when requests exceeded the limit).
         max_batch_tokens = self.prefill_step_size * len(requests)
         if total_prompt_tokens > max_batch_tokens:
-            raise ValueError(
-                f"Total prompt tokens ({total_prompt_tokens}) exceeds safe limit "
-                f"({max_batch_tokens}) for {len(requests)} requests. "
-                f"Reduce prompt length or batch size."
+            logger.warning(
+                f"Large batch prefill: {total_prompt_tokens} tokens "
+                f"(step_size={self.prefill_step_size}, requests={len(requests)}). "
+                f"Processing may be slow."
             )
 
         # Run vision encoding for each request with its own KVCache.
@@ -662,20 +699,9 @@ class MLLMBatchGenerator:
 
             per_request_caches.append(request_cache)
 
-        # Merge per-request KVCaches into a single BatchKVCache.
-        # KVCache.merge() creates a BatchKVCache with proper left-padding
-        # alignment, so all requests share a single batched cache for
-        # subsequent generation steps.
-        from mlx_lm.models.cache import KVCache
-
-        sample_cache = per_request_caches[0][0]
-        if not isinstance(sample_cache, KVCache):
-            raise ValueError(
-                f"MLLM continuous batching requires standard KVCache but got "
-                f"{type(sample_cache).__name__}. Disable --kv-cache-quantization "
-                f"when using multimodal models with --continuous-batching."
-            )
-
+        # Merge per-request caches into batched caches.
+        # Both KVCache.merge() and ArraysCache.merge() produce batch-aware
+        # caches that support filter/extend/extract for continuous batching.
         try:
             batch_cache = [
                 per_request_caches[0][layer_idx].merge(
@@ -684,8 +710,10 @@ class MLLMBatchGenerator:
                 for layer_idx in range(len(per_request_caches[0]))
             ]
         except Exception as e:
+            sample_type = type(per_request_caches[0][0]).__name__
             logger.error(
-                f"Failed to merge per-request KV caches: {type(e).__name__}: {e}"
+                f"Failed to merge per-request caches ({sample_type}): "
+                f"{type(e).__name__}: {e}"
             )
             raise
 
@@ -769,10 +797,16 @@ class MLLMBatchGenerator:
             self.active_batch = new_batch
             prompt_processing = True
 
+        # Collect any pending error responses (from failed preprocessing)
+        error_responses = []
+        if self._pending_error_responses:
+            error_responses = list(self._pending_error_responses)
+            self._pending_error_responses.clear()
+
         # Generate next token for active batch
         batch = self.active_batch
         if batch is None:
-            return []
+            return error_responses
 
         y, logprobs = batch.y, batch.logprobs
         batch.y, batch.logprobs = self._step(y[:, None], batch.cache)
@@ -841,7 +875,7 @@ class MLLMBatchGenerator:
                 self.active_batch = None
 
         self._stats.generation_tokens += len(responses)
-        return responses
+        return error_responses + responses
 
     def next(self) -> List[MLLMBatchResponse]:
         """

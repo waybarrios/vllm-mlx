@@ -28,6 +28,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, AsyncIterator, Dict, List, Optional, Set, Tuple
 
+from mlx_lm.tokenizer_utils import NaiveStreamingDetokenizer
 
 from .mllm_batch_generator import (
     MLLMBatchGenerator,
@@ -197,6 +198,9 @@ class MLLMScheduler:
         # Mapping between our request IDs and BatchGenerator UIDs
         self.request_id_to_uid: Dict[str, int] = {}
         self.uid_to_request_id: Dict[int, str] = {}
+
+        # Per-request streaming detokenizers for UTF-8-safe incremental decode
+        self._detokenizer_pool: Dict[str, Any] = {}
 
         # Output queues for async streaming
         self.output_queues: Dict[str, asyncio.Queue] = {}
@@ -442,12 +446,42 @@ class MLLMScheduler:
             if request is None:
                 continue
 
+            # Handle error responses from failed preprocessing
+            if response.finish_reason == "error":
+                output = RequestOutput(
+                    request_id=request_id,
+                    new_token_ids=[],
+                    new_text="",
+                    output_token_ids=[],
+                    prompt_tokens=0,
+                    completion_tokens=0,
+                    finished=True,
+                    finish_reason="error",
+                )
+                request.status = RequestStatus.FINISHED_ABORTED
+                request.output_text = ""
+                request.finish_reason = "error"
+                finished_ids.add(request_id)
+                self.num_requests_processed += 1
+                logger.warning(f"Request {request_id} failed during preprocessing")
+                outputs.append(output)
+                continue
+
             # Append token to request
             request.output_tokens.append(response.token)
             request.num_output_tokens = len(request.output_tokens)
 
-            # Decode the new token
-            new_text = tokenizer.decode([response.token])
+            # Decode the new token using streaming detokenizer (UTF-8 safe)
+            if request_id not in self._detokenizer_pool:
+                if hasattr(tokenizer, "detokenizer"):
+                    detok = tokenizer.detokenizer
+                else:
+                    detok = NaiveStreamingDetokenizer(tokenizer)
+                detok.reset()
+                self._detokenizer_pool[request_id] = detok
+            detok = self._detokenizer_pool[request_id]
+            detok.add_token(response.token)
+            new_text = detok.last_segment
 
             # Create output
             output = RequestOutput(
@@ -470,10 +504,16 @@ class MLLMScheduler:
                 output.finish_reason = response.finish_reason
                 finished_ids.add(request_id)
 
-                # Decode full output
-                output.output_text = tokenizer.decode(request.output_tokens)
+                # Finalize streaming detokenizer and get full output
+                detok = self._detokenizer_pool.get(request_id)
+                if detok is not None:
+                    detok.finalize()
+                    output.output_text = detok.text
+                else:
+                    output.output_text = tokenizer.decode(request.output_tokens)
                 request.output_text = output.output_text
                 request.finish_reason = response.finish_reason
+                self._detokenizer_pool.pop(request_id, None)
 
                 self.total_completion_tokens += request.num_output_tokens
                 self.num_requests_processed += 1
@@ -752,8 +792,30 @@ class MLLMScheduler:
                 self.batch_generator.get_vision_cache_stats()
             )
 
-        if self.vision_cache:
-            stats["vision_cache"] = self.vision_cache.get_stats()
+        if self.vision_cache is not None:
+            vc_stats = self.vision_cache.get_stats()
+            stats["vision_cache"] = vc_stats
+            # Expose vision cache in the same format as memory_aware_cache
+            # so the /v1/status endpoint (and monitoring UI) can display it.
+            stats["memory_aware_cache"] = {
+                "hits": vc_stats.get("hits", 0),
+                "misses": vc_stats.get("misses", 0),
+                "hit_rate": round(vc_stats.get("hit_rate", 0), 4),
+                "evictions": vc_stats.get("evictions", 0),
+                "tokens_saved": vc_stats.get("tokens_saved", 0),
+                "current_memory_mb": round(vc_stats.get("memory_used_mb", 0), 2),
+                "max_memory_mb": round(vc_stats.get("max_memory_mb", 0), 2),
+                "memory_utilization": round(
+                    (
+                        vc_stats.get("memory_used_mb", 0)
+                        / vc_stats.get("max_memory_mb", 1)
+                        if vc_stats.get("max_memory_mb", 0) > 0
+                        else 0
+                    ),
+                    4,
+                ),
+                "entry_count": vc_stats.get("entries", 0),
+            }
 
         # Include Metal memory stats
         try:

@@ -100,19 +100,19 @@ class TestQwen3Parser:
         assert "Step 3" in reasoning
         assert content == "Result: 42"
 
-    def test_no_tags_returns_content_only(self, parser):
-        """Qwen3 requires both tags - no tags means pure content."""
+    def test_no_tags_returns_reasoning(self, parser):
+        """No tags = enable_thinking injected <think> in prompt, model hit max_tokens."""
         output = "Just a regular response without thinking."
         reasoning, content = parser.extract_reasoning(output)
-        assert reasoning is None
-        assert content == output
+        assert reasoning == output
+        assert content is None
 
-    def test_only_start_tag_no_reasoning(self, parser):
-        """Qwen3 requires both tags - missing end tag means no reasoning."""
+    def test_only_start_tag_incomplete_reasoning(self, parser):
+        """Only <think> without </think> = incomplete reasoning (hit max_tokens)."""
         output = "<think>Started thinking but never finished"
         reasoning, content = parser.extract_reasoning(output)
-        assert reasoning is None
-        assert content == output
+        assert reasoning == "Started thinking but never finished"
+        assert content is None
 
     def test_only_end_tag_implicit_mode(self, parser):
         """Qwen3 supports implicit mode - when <think> is in prompt, only </think> in output."""
@@ -650,13 +650,12 @@ class TestQwen3SpecificCases:
         assert reasoning == "some text"
         assert content == "more text"
 
-        # Only start tag - no </think> means model is still generating
-        # Qwen3 requires </think> to extract reasoning (treats as pure content until then)
+        # Only start tag - no </think> means model hit max_tokens during reasoning
         output2 = "<think>incomplete reasoning"
         reasoning, content = parser.extract_reasoning(output2)
-        # No </think> = no reasoning extraction, entire output is content
-        assert reasoning is None
-        assert content == output2
+        # Incomplete reasoning: everything after <think> is reasoning, no content
+        assert reasoning == "incomplete reasoning"
+        assert content is None
 
     def test_qwen3_empty_think_tags(self, parser):
         """Test empty think tags."""

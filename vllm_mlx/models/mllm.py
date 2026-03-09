@@ -1158,6 +1158,7 @@ class MLXMultimodalLM:
                 self.processor,
                 chat_messages,
                 add_generation_prompt=True,
+                enable_thinking=True,
             )
         except Exception as e:
             logger.warning(
@@ -1510,6 +1511,7 @@ class MLXMultimodalLM:
                 self.processor,
                 chat_messages,
                 add_generation_prompt=True,
+                enable_thinking=True,
             )
         except Exception as e:
             logger.warning(

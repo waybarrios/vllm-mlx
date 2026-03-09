@@ -132,6 +132,8 @@ MLLM_PATTERNS = [
     "InternVL",  # InternVL
     "deepseek-vl",
     "DeepSeek-VL",  # DeepSeek-VL
+    "Qwen3.5-",
+    "qwen3_5",  # Qwen3.5 MoE (natively multimodal, hybrid ArraysCache+KVCache)
 ]
 
 

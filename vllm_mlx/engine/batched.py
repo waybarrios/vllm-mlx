@@ -363,9 +363,13 @@ class BatchedEngine(BaseEngine):
             if self._is_mllm and num_images > 0:
                 messages = self._prepare_mllm_messages(messages)
 
+            # Disable thinking mode for coder models since it interferes
+            # with tool call parsing (tags leak as raw text).
+            enable_thinking = "coder" not in self._model_name.lower()
             template_kwargs = {
                 "tokenize": False,
                 "add_generation_prompt": True,
+                "enable_thinking": enable_thinking,
             }
             if tools:
                 template_kwargs["tools"] = tools
@@ -375,9 +379,10 @@ class BatchedEngine(BaseEngine):
                     messages, **template_kwargs
                 )
             except TypeError as e:
-                # Some templates don't accept 'tools'; retry without them.
+                # Some templates don't accept 'tools' or 'enable_thinking';
+                # retry without them.
                 logger.debug(f"Chat template TypeError, retrying without extras: {e}")
-                for key in ["tools"]:
+                for key in ["tools", "enable_thinking"]:
                     if key in template_kwargs:
                         del template_kwargs[key]
                 return template_applicator.apply_chat_template(
@@ -768,14 +773,26 @@ class BatchedEngine(BaseEngine):
         if self._mllm_scheduler:
             mllm_stats = self._mllm_scheduler.get_stats()
             stats["mllm_scheduler"] = mllm_stats
-            # Promote Metal memory stats to top-level for /v1/status
+            # Promote stats to top-level for /v1/status and monitoring
             for key in (
+                "running",
+                "num_running",
+                "num_waiting",
+                "num_requests_processed",
+                "total_prompt_tokens",
+                "total_completion_tokens",
                 "metal_active_memory_gb",
                 "metal_peak_memory_gb",
                 "metal_cache_memory_gb",
+                "memory_aware_cache",
+                "paged_cache",
+                "prefix_cache",
             ):
                 if key in mllm_stats:
                     stats[key] = mllm_stats[key]
+            # MLLM engine is always "running" once loaded
+            if "running" not in stats:
+                stats["running"] = self._loaded
         elif self._engine:
             stats.update(self._engine.get_stats())
 

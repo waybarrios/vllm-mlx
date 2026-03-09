@@ -40,12 +40,9 @@ class BatchMambaCache(MambaCache):
 
         Args:
             left_padding: Amount of left padding for each sequence in batch
-            size: Number of state arrays (default 2 for Mamba models)
+            size: Number of arrays in the cache (default 2 for Mamba conv/ssm states)
         """
-        if HAS_MAMBA_CACHE:
-            super().__init__(left_padding=left_padding)
-        else:
-            super().__init__(size=size, left_padding=left_padding)
+        super().__init__(size=size, left_padding=left_padding)
         self._batch_size = len(left_padding) if left_padding else 0
 
     def extract(self, idx: int) -> MambaCache:
@@ -58,11 +55,7 @@ class BatchMambaCache(MambaCache):
         Returns:
             A new MambaCache with the extracted state
         """
-        size = len(self.cache)
-        if HAS_MAMBA_CACHE:
-            cache = MambaCache()
-        else:
-            cache = MambaCache(size=size)
+        cache = MambaCache(size=len(self.cache))
         # Extract the state arrays for this index
         cache.cache = [
             mx.contiguous(c[idx : idx + 1]) if c is not None else None
@@ -208,8 +201,17 @@ _patched = False
 
 
 def ensure_mamba_support():
-    """Ensure MambaCache batching support is enabled."""
+    """Ensure MambaCache batching support is enabled.
+
+    NOTE: Disabled for mlx-lm >= 0.30.6 where ArraysCache natively supports
+    all batch operations (extract, merge, filter, prepare).  The old patch
+    replaced ArraysCache with BatchMambaCache, which broke hybrid models
+    (Qwen3.5) that mix ArraysCache + KVCache layers.
+    """
     global _patched
     if not _patched:
-        patch_mlx_lm_for_mamba()
+        logger.info(
+            "[MambaCache] Skipping _make_cache patch — "
+            "mlx-lm ArraysCache has native batching support"
+        )
         _patched = True

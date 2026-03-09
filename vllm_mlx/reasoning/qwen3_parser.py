@@ -56,9 +56,12 @@ class Qwen3ReasoningParser(BaseThinkingReasoningParser):
         Returns:
             (reasoning, content) tuple.
         """
-        # If no end token at all, treat as pure content
-        if self.end_token not in model_output:
-            return None, model_output
+        # If no tags at all: enable_thinking=True injects <think> in prompt,
+        # so model output without tags = reasoning that hit max_tokens before
+        # </think>. Treat entire output as reasoning (no content).
+        # Consistent with streaming parser behavior (think_parser.py line 140).
+        if self.end_token not in model_output and self.start_token not in model_output:
+            return model_output.strip() or None, None
 
         # Use base class implementation (handles both explicit and implicit)
         return super().extract_reasoning(model_output)
