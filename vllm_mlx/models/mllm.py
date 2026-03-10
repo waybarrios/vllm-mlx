@@ -20,9 +20,9 @@ import math
 import os
 import tempfile
 import threading
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterator
 from urllib.parse import urlparse
 
 import numpy as np
@@ -729,9 +729,9 @@ class MLXMultimodalLM:
             self.config = load_config(self.model_name)
 
             self._loaded = True
-            self._video_native = hasattr(self.model.config, "video_token_id") or hasattr(
-                self.model.config, "video_token_index"
-            )
+            self._video_native = hasattr(
+                self.model.config, "video_token_id"
+            ) or hasattr(self.model.config, "video_token_index")
             logger.info(f"MLLM loaded successfully: {self.model_name}")
             if self._video_native:
                 logger.info("Native video pipeline enabled (temporal 3D conv + M-RoPE)")
@@ -919,7 +919,11 @@ class MLXMultimodalLM:
 
                 elif item_type == "image_url":
                     img_url = item.get("image_url", {})
-                    url = img_url.get("url", img_url) if isinstance(img_url, dict) else img_url
+                    url = (
+                        img_url.get("url", img_url)
+                        if isinstance(img_url, dict)
+                        else img_url
+                    )
                     # Resolve to local path for process_vision_info
                     local_path = process_image_input(url)
                     new_content.append({"type": "image", "image": local_path})
@@ -944,12 +948,14 @@ class MLXMultimodalLM:
 
                     # Resolve to local path
                     video_path = process_video_input(video_source)
-                    new_content.append({
-                        "type": "video",
-                        "video": video_path,
-                        "fps": video_fps,
-                        "max_frames": video_max_frames,
-                    })
+                    new_content.append(
+                        {
+                            "type": "video",
+                            "video": video_path,
+                            "fps": video_fps,
+                            "max_frames": video_max_frames,
+                        }
+                    )
 
                 else:
                     new_content.append(item)
@@ -1403,8 +1409,9 @@ class MLXMultimodalLM:
 
         # Prefix caching with vision embedding support
         # Following LMCache approach: cache vision embeddings to skip encoder on hit
-        from mlx_vlm.models import cache as vlm_cache
         import time
+
+        from mlx_vlm.models import cache as vlm_cache
 
         use_cache = kwargs.pop("use_cache", True)
         cache_entry = None
@@ -1523,6 +1530,7 @@ class MLXMultimodalLM:
         ):
             try:
                 import copy
+
                 import mlx.core as mx
 
                 # Get prompt token count (before generation)

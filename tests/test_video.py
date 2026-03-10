@@ -1,17 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for video support in MLLM chat/stream_chat."""
 
-import pytest
-
 from vllm_mlx.models.mllm import (
-    MLXMultimodalLM,
-    is_base64_video,
-    process_video_input,
-    smart_nframes,
     FRAME_FACTOR,
     MIN_FRAMES,
-    MAX_FRAMES,
-    DEFAULT_FPS,
+    MLXMultimodalLM,
+    is_base64_video,
+    smart_nframes,
 )
 
 
@@ -39,7 +34,9 @@ class TestSmartNframes:
     def test_result_always_even(self):
         for total in [5, 7, 11, 13, 100, 999]:
             result = smart_nframes(total, 30.0)
-            assert result % FRAME_FACTOR == 0, f"Odd frame count {result} for total={total}"
+            assert (
+                result % FRAME_FACTOR == 0
+            ), f"Odd frame count {result} for total={total}"
 
 
 class TestVideoUrlParsing:
@@ -75,7 +72,10 @@ class TestVideoUrlParsing:
             {
                 "role": "user",
                 "content": [
-                    {"type": "video_url", "video_url": {"url": "https://example.com/video.mp4"}},
+                    {
+                        "type": "video_url",
+                        "video_url": {"url": "https://example.com/video.mp4"},
+                    },
                     {"type": "text", "text": "Describe this video"},
                 ],
             }
@@ -127,8 +127,14 @@ class TestVideoUrlParsing:
             {
                 "role": "user",
                 "content": [
-                    {"type": "image_url", "image_url": {"url": "https://example.com/img.jpg"}},
-                    {"type": "video_url", "video_url": {"url": "https://example.com/vid.mp4"}},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": "https://example.com/img.jpg"},
+                    },
+                    {
+                        "type": "video_url",
+                        "video_url": {"url": "https://example.com/vid.mp4"},
+                    },
                     {"type": "text", "text": "Compare"},
                 ],
             }
@@ -155,8 +161,8 @@ class TestTranslateMessages:
         assert result[0]["content"] == "Hello"
 
     def test_video_url_translated(self):
-        import tempfile
         import os
+        import tempfile
 
         # Create a temp file to act as a "video"
         with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as f:

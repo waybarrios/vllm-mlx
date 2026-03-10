@@ -734,8 +734,7 @@ async def create_embeddings(request: EmbeddingRequest) -> EmbeddingResponse:
 
         elapsed = time.perf_counter() - start_time
         logger.info(
-            f"Embeddings: {len(texts)} inputs, {prompt_tokens} tokens "
-            f"in {elapsed:.2f}s"
+            f"Embeddings: {len(texts)} inputs, {prompt_tokens} tokens in {elapsed:.2f}s"
         )
 
         # Build OpenAI-compatible response with ordered indices
@@ -756,8 +755,7 @@ async def create_embeddings(request: EmbeddingRequest) -> EmbeddingResponse:
         raise HTTPException(
             status_code=503,
             detail=(
-                "mlx-embeddings not installed. "
-                "Install with: pip install mlx-embeddings"
+                "mlx-embeddings not installed. Install with: pip install mlx-embeddings"
             ),
         )
     except HTTPException:
@@ -1334,11 +1332,9 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
         )
 
     has_media = bool(images or videos)
-    if engine.is_mllm:
-        # MLLM extracts media from messages internally, but request-level
-        # video params still need to reach chat() via chat_kwargs
-        if request.video_fps or request.video_max_frames:
-            has_media = True
+    if engine.is_mllm and (request.video_fps or request.video_max_frames):
+        # Video params need to reach chat() via chat_kwargs
+        has_media = True
 
     # Handle response_format - inject system prompt if needed
     response_format = request.response_format
