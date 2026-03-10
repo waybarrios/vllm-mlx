@@ -1052,12 +1052,59 @@ class MLXMultimodalLM:
         # Extract text and images from messages
         # Build chat_messages for multi-turn support WITH proper image tokens per message
         all_image_urls = []  # Raw URLs/paths to process later
-        videos = []
         chat_messages = []  # List of properly formatted messages for chat template
 
         logger.info(f"MLLM.chat() called with {len(messages)} messages")
 
-        for msg in messages:
+        # Pop video params early so they're available for the first pass
+        video_fps = kwargs.pop("video_fps", DEFAULT_FPS)
+        video_max_frames = kwargs.pop("video_max_frames", MAX_FRAMES)
+
+        # First pass: collect and process video inputs per message index
+        _msg_video_inputs: dict[int, list] = {}
+        for msg_idx, msg in enumerate(messages):
+            content = msg.get("content", "")
+            if not isinstance(content, list):
+                continue
+            for item in content:
+                # Convert Pydantic models to dicts, excluding None fields
+                if hasattr(item, "model_dump"):
+                    item = item.model_dump(exclude_none=True)
+                elif hasattr(item, "dict"):
+                    item = {k: v for k, v in item.dict().items() if v is not None}
+
+                if not isinstance(item, dict):
+                    continue
+                item_type = item.get("type", "")
+                if item_type == "video":
+                    _msg_video_inputs.setdefault(msg_idx, []).append(
+                        item.get("video", item.get("url", ""))
+                    )
+                elif item_type == "video_url":
+                    vid_url = item.get("video_url", {})
+                    if isinstance(vid_url, str):
+                        _msg_video_inputs.setdefault(msg_idx, []).append(vid_url)
+                    elif isinstance(vid_url, dict):
+                        url = vid_url.get("url", "")
+                        if url:
+                            _msg_video_inputs.setdefault(msg_idx, []).append(url)
+
+        # Extract frames and record counts per message
+        _msg_video_frame_counts: dict[int, int] = {}
+        all_video_frames: list[str] = []
+        for msg_idx, vid_inputs in _msg_video_inputs.items():
+            total_frames = 0
+            for vid_input in vid_inputs:
+                frames = self._prepare_video(
+                    vid_input, fps=video_fps, max_frames=video_max_frames
+                )
+                all_video_frames.extend(frames)
+                total_frames += len(frames)
+                logger.info(f"Added {len(frames)} frames from video: {vid_input}")
+            _msg_video_frame_counts[msg_idx] = total_frames
+
+        # Second pass: build chat messages with image counts that include video frames
+        for msg_idx, msg in enumerate(messages):
             role = msg.get("role", "user")
             content = msg.get("content", "")
             msg_text = ""  # Text content for this message
@@ -1099,8 +1146,8 @@ class MLXMultimodalLM:
                             )
                             msg_image_count += 1
 
-                        elif item_type == "video":
-                            videos.append(item.get("video", item.get("url", "")))
+            # Add video frame count to image count for this message
+            msg_image_count += _msg_video_frame_counts.get(msg_idx, 0)
 
             # Build properly structured message for Qwen3-VL-MoE
             # Format: {"role": "...", "content": [{"type": "image"}, ..., {"type": "text", "text": "..."}]}
@@ -1132,16 +1179,8 @@ class MLXMultimodalLM:
         all_images = []
         if all_image_urls:
             all_images.extend(self._prepare_images(all_image_urls))
-
-        # Process videos
-        video_fps = kwargs.pop("video_fps", DEFAULT_FPS)
-        video_max_frames = kwargs.pop("video_max_frames", MAX_FRAMES)
-        for video_path in videos:
-            frames = self._prepare_video(
-                video_path, fps=video_fps, max_frames=video_max_frames
-            )
-            all_images.extend(frames)
-            logger.info(f"Added {len(frames)} frames from video: {video_path}")
+        # Append pre-processed video frames
+        all_images.extend(all_video_frames)
 
         # Apply chat template directly - messages are already properly structured
         logger.info(
@@ -1415,10 +1454,57 @@ class MLXMultimodalLM:
         # Extract text and images from messages
         # Build chat_messages for multi-turn support WITH proper image tokens per message
         all_image_urls = []  # Raw URLs/paths to process later
-        videos = []
         chat_messages = []  # List of properly formatted messages for chat template
 
-        for msg in messages:
+        # Pop video params early so they're available for the first pass
+        video_fps = kwargs.pop("video_fps", DEFAULT_FPS)
+        video_max_frames = kwargs.pop("video_max_frames", MAX_FRAMES)
+
+        # First pass: collect and process video inputs per message index
+        _msg_video_inputs: dict[int, list] = {}
+        for msg_idx, msg in enumerate(messages):
+            content = msg.get("content", "")
+            if not isinstance(content, list):
+                continue
+            for item in content:
+                # Convert Pydantic models to dicts, excluding None fields
+                if hasattr(item, "model_dump"):
+                    item = item.model_dump(exclude_none=True)
+                elif hasattr(item, "dict"):
+                    item = {k: v for k, v in item.dict().items() if v is not None}
+
+                if not isinstance(item, dict):
+                    continue
+                item_type = item.get("type", "")
+                if item_type == "video":
+                    _msg_video_inputs.setdefault(msg_idx, []).append(
+                        item.get("video", item.get("url", ""))
+                    )
+                elif item_type == "video_url":
+                    vid_url = item.get("video_url", {})
+                    if isinstance(vid_url, str):
+                        _msg_video_inputs.setdefault(msg_idx, []).append(vid_url)
+                    elif isinstance(vid_url, dict):
+                        url = vid_url.get("url", "")
+                        if url:
+                            _msg_video_inputs.setdefault(msg_idx, []).append(url)
+
+        # Extract frames and record counts per message
+        _msg_video_frame_counts: dict[int, int] = {}
+        all_video_frames: list[str] = []
+        for msg_idx, vid_inputs in _msg_video_inputs.items():
+            total_frames = 0
+            for vid_input in vid_inputs:
+                frames = self._prepare_video(
+                    vid_input, fps=video_fps, max_frames=video_max_frames
+                )
+                all_video_frames.extend(frames)
+                total_frames += len(frames)
+                logger.info(f"Added {len(frames)} frames from video: {vid_input}")
+            _msg_video_frame_counts[msg_idx] = total_frames
+
+        # Second pass: build chat messages with image counts that include video frames
+        for msg_idx, msg in enumerate(messages):
             role = msg.get("role", "user")
             content = msg.get("content", "")
             msg_text = ""  # Text content for this message
@@ -1460,8 +1546,8 @@ class MLXMultimodalLM:
                             )
                             msg_image_count += 1
 
-                        elif item_type == "video":
-                            videos.append(item.get("video", item.get("url", "")))
+            # Add video frame count to image count for this message
+            msg_image_count += _msg_video_frame_counts.get(msg_idx, 0)
 
             # Build properly structured message for Qwen3-VL-MoE
             # Format: {"role": "...", "content": [{"type": "image"}, ..., {"type": "text", "text": "..."}]}
@@ -1493,15 +1579,8 @@ class MLXMultimodalLM:
         all_images = []
         if all_image_urls:
             all_images.extend(self._prepare_images(all_image_urls))
-
-        # Process videos
-        video_fps = kwargs.pop("video_fps", DEFAULT_FPS)
-        video_max_frames = kwargs.pop("video_max_frames", MAX_FRAMES)
-        for video_path in videos:
-            frames = self._prepare_video(
-                video_path, fps=video_fps, max_frames=video_max_frames
-            )
-            all_images.extend(frames)
+        # Append pre-processed video frames
+        all_images.extend(all_video_frames)
 
         # Apply chat template directly - messages are already properly structured
         try:

@@ -1334,6 +1334,11 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
         )
 
     has_media = bool(images or videos)
+    if engine.is_mllm:
+        # MLLM extracts media from messages internally, but request-level
+        # video params still need to reach chat() via chat_kwargs
+        if request.video_fps or request.video_max_frames:
+            has_media = True
 
     # Handle response_format - inject system prompt if needed
     response_format = request.response_format
