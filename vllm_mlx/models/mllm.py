@@ -729,7 +729,12 @@ class MLXMultimodalLM:
             self.config = load_config(self.model_name)
 
             self._loaded = True
+            self._video_native = hasattr(self.model.config, "video_token_id") or hasattr(
+                self.model.config, "video_token_index"
+            )
             logger.info(f"MLLM loaded successfully: {self.model_name}")
+            if self._video_native:
+                logger.info("Native video pipeline enabled (temporal 3D conv + M-RoPE)")
 
         except ImportError:
             raise ImportError(
@@ -784,6 +789,174 @@ class MLXMultimodalLM:
             max_frames=max_frames,
         )
         return save_frames_to_temp(frames)
+
+    def _generate_native_video(
+        self,
+        messages: list[dict],
+        max_tokens: int = 256,
+        temperature: float = 0.7,
+        video_fps: float = DEFAULT_FPS,
+        video_max_frames: int = MAX_FRAMES,
+        **kwargs,
+    ) -> MLLMOutput:
+        """Generate using native video pipeline (Qwen-family models).
+
+        Uses mlx-vlm's process_vision_info + HF processor to produce proper
+        video_grid_thw, pixel_values_videos, and timestamp-interleaved prompts.
+        This activates 3D conv frame pairing, M-RoPE temporal position IDs,
+        and per-frame timestamp tokens in the model.
+        """
+        import mlx.core as mx
+        from mlx_vlm import generate
+        from mlx_vlm.video_generate import process_vision_info
+
+        # Translate OpenAI API messages into process_vision_info format
+        native_messages = self._translate_messages_for_native_video(
+            messages, video_fps, video_max_frames
+        )
+
+        # Use HF processor's chat template (handles timestamp interleaving)
+        text = self.processor.apply_chat_template(
+            native_messages, tokenize=False, add_generation_prompt=True
+        )
+
+        # Extract vision inputs via mlx-vlm's process_vision_info
+        image_inputs, video_inputs, fps_info = process_vision_info(
+            native_messages, return_video_kwargs=True
+        )
+
+        # Process through HF processor to get input_ids, pixel_values, grid_thw
+        inputs = self.processor(
+            text=[text],
+            images=image_inputs,
+            videos=video_inputs,
+            padding=True,
+            return_tensors="pt",
+        )
+
+        input_ids = mx.array(inputs["input_ids"])
+        pixel_values = inputs.get(
+            "pixel_values_videos", inputs.get("pixel_values", None)
+        )
+        if pixel_values is not None:
+            pixel_values = mx.array(pixel_values)
+        mask = mx.array(inputs["attention_mask"])
+
+        gen_kwargs = {}
+        if inputs.get("video_grid_thw", None) is not None:
+            gen_kwargs["video_grid_thw"] = mx.array(inputs["video_grid_thw"])
+        if inputs.get("image_grid_thw", None) is not None:
+            gen_kwargs["image_grid_thw"] = mx.array(inputs["image_grid_thw"])
+
+        gen_kwargs["input_ids"] = input_ids
+        gen_kwargs["pixel_values"] = pixel_values
+        gen_kwargs["mask"] = mask
+        gen_kwargs["temperature"] = temperature
+
+        grid_thw_info = gen_kwargs.get("video_grid_thw")
+        logger.info(
+            f"Native video: {input_ids.size} input tokens, "
+            f"video_grid_thw={grid_thw_info.tolist() if grid_thw_info is not None else None}"
+        )
+
+        result = generate(
+            self.model,
+            self.processor,
+            prompt=text,
+            max_tokens=max_tokens,
+            verbose=False,
+            **gen_kwargs,
+        )
+
+        if hasattr(result, "text"):
+            return MLLMOutput(
+                text=result.text,
+                finish_reason="stop",
+                prompt_tokens=getattr(result, "prompt_tokens", 0),
+                completion_tokens=getattr(result, "generation_tokens", 0),
+            )
+        return MLLMOutput(text=str(result), finish_reason="stop")
+
+    def _translate_messages_for_native_video(
+        self,
+        messages: list[dict],
+        video_fps: float,
+        video_max_frames: int,
+    ) -> list[dict]:
+        """Translate OpenAI API format messages to process_vision_info format.
+
+        Converts video_url/video types and resolves URLs/base64 to local paths.
+        Images are preserved as-is (process_vision_info handles them).
+        """
+        translated = []
+        for msg in messages:
+            role = msg.get("role", "user")
+            content = msg.get("content", "")
+
+            if isinstance(content, str):
+                translated.append({"role": role, "content": content})
+                continue
+
+            if not isinstance(content, list):
+                translated.append({"role": role, "content": str(content)})
+                continue
+
+            new_content = []
+            for item in content:
+                if hasattr(item, "model_dump"):
+                    item = item.model_dump(exclude_none=True)
+                elif hasattr(item, "dict"):
+                    item = {k: v for k, v in item.dict().items() if v is not None}
+
+                if not isinstance(item, dict):
+                    new_content.append({"type": "text", "text": str(item)})
+                    continue
+
+                item_type = item.get("type", "")
+
+                if item_type == "text":
+                    new_content.append(item)
+
+                elif item_type == "image_url":
+                    img_url = item.get("image_url", {})
+                    url = img_url.get("url", img_url) if isinstance(img_url, dict) else img_url
+                    # Resolve to local path for process_vision_info
+                    local_path = process_image_input(url)
+                    new_content.append({"type": "image", "image": local_path})
+
+                elif item_type == "image":
+                    img = item.get("image", item.get("url", ""))
+                    local_path = process_image_input(img)
+                    new_content.append({"type": "image", "image": local_path})
+
+                elif item_type in ("video", "video_url"):
+                    # Extract video path/URL from various formats
+                    if item_type == "video_url":
+                        vid_url = item.get("video_url", {})
+                        if isinstance(vid_url, str):
+                            video_source = vid_url
+                        elif isinstance(vid_url, dict):
+                            video_source = vid_url.get("url", "")
+                        else:
+                            continue
+                    else:
+                        video_source = item.get("video", item.get("url", ""))
+
+                    # Resolve to local path
+                    video_path = process_video_input(video_source)
+                    new_content.append({
+                        "type": "video",
+                        "video": video_path,
+                        "fps": video_fps,
+                        "max_frames": video_max_frames,
+                    })
+
+                else:
+                    new_content.append(item)
+
+            translated.append({"role": role, "content": new_content})
+
+        return translated
 
     def generate(
         self,
@@ -1089,7 +1262,18 @@ class MLXMultimodalLM:
                         if url:
                             _msg_video_inputs.setdefault(msg_idx, []).append(url)
 
-        # Extract frames and record counts per message
+        # Use native video pipeline for supported models
+        if self._video_native and _msg_video_inputs:
+            return self._generate_native_video(
+                messages=messages,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                video_fps=video_fps,
+                video_max_frames=video_max_frames,
+                **kwargs,
+            )
+
+        # Fallback: extract frames and treat as individual images
         _msg_video_frame_counts: dict[int, int] = {}
         all_video_frames: list[str] = []
         for msg_idx, vid_inputs in _msg_video_inputs.items():
@@ -1489,7 +1673,20 @@ class MLXMultimodalLM:
                         if url:
                             _msg_video_inputs.setdefault(msg_idx, []).append(url)
 
-        # Extract frames and record counts per message
+        # Use native video pipeline for supported models
+        if self._video_native and _msg_video_inputs:
+            output = self._generate_native_video(
+                messages=messages,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                video_fps=video_fps,
+                video_max_frames=video_max_frames,
+                **kwargs,
+            )
+            yield output
+            return
+
+        # Fallback: frames as images
         _msg_video_frame_counts: dict[int, int] = {}
         all_video_frames: list[str] = []
         for msg_idx, vid_inputs in _msg_video_inputs.items():
@@ -1503,24 +1700,20 @@ class MLXMultimodalLM:
                 logger.info(f"Added {len(frames)} frames from video: {vid_input}")
             _msg_video_frame_counts[msg_idx] = total_frames
 
-        # Second pass: build chat messages with image counts that include video frames
         for msg_idx, msg in enumerate(messages):
             role = msg.get("role", "user")
             content = msg.get("content", "")
-            msg_text = ""  # Text content for this message
-            msg_image_count = 0  # Number of images in THIS message
+            msg_text = ""
+            msg_image_count = 0
 
             if isinstance(content, str):
                 msg_text = content
             elif isinstance(content, list):
-                # OpenAI multimodal format - extract text and count images for THIS message
                 for item in content:
                     if isinstance(item, str):
                         msg_text += item
                         continue
 
-                    # Convert Pydantic models to dicts, excluding None fields
-                    # to avoid null keys like image_url: null on text parts
                     if hasattr(item, "model_dump"):
                         item = item.model_dump(exclude_none=True)
                     elif hasattr(item, "dict"):
@@ -1546,14 +1739,10 @@ class MLXMultimodalLM:
                             )
                             msg_image_count += 1
 
-            # Add video frame count to image count for this message
             msg_image_count += _msg_video_frame_counts.get(msg_idx, 0)
 
-            # Build properly structured message for Qwen3-VL-MoE
-            # Format: {"role": "...", "content": [{"type": "image"}, ..., {"type": "text", "text": "..."}]}
             if msg_text or msg_image_count > 0:
                 if role == "user" and msg_image_count > 0:
-                    # User message WITH images - build content array with image tokens FIRST
                     content_list = []
                     for _ in range(msg_image_count):
                         content_list.append({"type": "image"})
@@ -1562,10 +1751,8 @@ class MLXMultimodalLM:
                     )
                     chat_messages.append({"role": role, "content": content_list})
                 elif role == "assistant":
-                    # Assistant messages - just text content (not array)
                     chat_messages.append({"role": role, "content": msg_text})
                 else:
-                    # User/system message WITHOUT images - still use content array format
                     chat_messages.append(
                         {
                             "role": role,
@@ -1575,16 +1762,12 @@ class MLXMultimodalLM:
                         }
                     )
 
-        # Process images
         all_images = []
         if all_image_urls:
             all_images.extend(self._prepare_images(all_image_urls))
-        # Append pre-processed video frames
         all_images.extend(all_video_frames)
 
-        # Apply chat template directly - messages are already properly structured
         try:
-            # Use get_chat_template directly since messages are already properly formatted
             formatted_prompt = get_chat_template(
                 self.processor,
                 chat_messages,
