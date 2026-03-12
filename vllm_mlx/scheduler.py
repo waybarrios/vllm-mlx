@@ -200,10 +200,6 @@ def _install_chunked_prefill(
             batch.tokens,
         )
         mx.async_eval(batch.y, batch.logprobs)
-        # Evaluate accumulated tokens to prevent Metal buffer buildup
-        # from lazy mx.concatenate() chains holding AGXAllocation handles
-        if batch.tokens:
-            mx.async_eval(*batch.tokens)
 
         y = y.tolist()
         self._stats.generation_time += _time.perf_counter() - tic_gen
@@ -2239,8 +2235,9 @@ class Scheduler:
         # Adaptive interval: scale inversely with concurrency to prevent
         # Metal resource handle exhaustion under high-concurrency workloads.
         active_seqs = len(self.running)
+        min_interval = max(4, self._clear_cache_interval // 4)
         effective_interval = max(
-            8, self._clear_cache_interval // max(1, active_seqs // 8)
+            min_interval, self._clear_cache_interval // max(1, active_seqs // 8)
         )
 
         self._step_count += 1
