@@ -1703,9 +1703,12 @@ class _AnthropicStreamScrubber:
     # Exact tags to scan for in TEXT mode.  Order doesn't matter – we
     # always pick the earliest match.
     _EXACT_TAGS = [
-        THINK_OPEN, THINK_CLOSE,
-        TOOL_OPEN, TOOL_CLOSE,
-        FUNC_CLOSE, PARAM_CLOSE,
+        THINK_OPEN,
+        THINK_CLOSE,
+        TOOL_OPEN,
+        TOOL_CLOSE,
+        FUNC_CLOSE,
+        PARAM_CLOSE,
     ]
 
     # --- Prefix (variable-length) opening tags ---------------------------
@@ -1796,7 +1799,7 @@ class _AnthropicStreamScrubber:
                     # there is a '<' near the tail that could be the start
                     # of a split tag.  Otherwise emit everything immediately
                     # so plain text streams with zero latency.
-                    tail = s[max(i, slen - self.CARRY_N):]
+                    tail = s[max(i, slen - self.CARRY_N) :]
                     lt_pos = tail.rfind("<")
                     if lt_pos != -1:
                         # Keep from the '<' onward as carry.
@@ -1846,7 +1849,7 @@ class _AnthropicStreamScrubber:
                 close_pos = s.find(close_tag, i)
                 if close_pos == -1:
                     # Closing tag not yet in buffer.
-                    self.carry = s[max(i, slen - self.CARRY_N):]
+                    self.carry = s[max(i, slen - self.CARRY_N) :]
                     return "".join(out)
                 i = close_pos + len(close_tag)
                 self.mode = "TEXT"
@@ -1868,6 +1871,7 @@ class _AnthropicStreamScrubber:
                 result = result.replace(tag, "")
             # Strip any residual prefix tags (e.g. ``<function=foo>``).
             import re
+
             result = re.sub(r"<function=[^>]*>", "", result)
             result = re.sub(r"<parameter=[^>]*>", "", result)
             self.carry = ""
@@ -1939,7 +1943,7 @@ class _AnthropicStreamRouter:
 
                 if hit is None:
                     # No marker – emit text, retain carry only if '<' near tail.
-                    tail = s[max(i, slen - self.CARRY_N):]
+                    tail = s[max(i, slen - self.CARRY_N) :]
                     lt_pos = tail.rfind("<")
                     if lt_pos != -1:
                         carry_start = max(i, slen - self.CARRY_N) + lt_pos
@@ -2001,7 +2005,7 @@ class _AnthropicStreamRouter:
                 close_tag = self._CLOSE_MAP[self.mode]
                 close_pos = s.find(close_tag, i)
                 if close_pos == -1:
-                    self.carry = s[max(i, slen - self.CARRY_N):]
+                    self.carry = s[max(i, slen - self.CARRY_N) :]
                     return pieces
                 i = close_pos + len(close_tag)
                 self.mode = "TEXT"
@@ -2022,6 +2026,7 @@ class _AnthropicStreamRouter:
             for tag in self._EXACT_TAGS:
                 result = result.replace(tag, "")
             import re
+
             result = re.sub(r"<function=[^>]*>", "", result)
             result = re.sub(r"<parameter=[^>]*>", "", result)
             if result:
@@ -2111,7 +2116,9 @@ async def _stream_anthropic_messages(
     if thinking_enabled:
         # Use the stream router which yields typed (kind, text) pieces
         # that separate thinking content from user-facing text.
-        router: _AnthropicStreamRouter | None = _AnthropicStreamRouter(start_in_thinking=True)
+        router: _AnthropicStreamRouter | None = _AnthropicStreamRouter(
+            start_in_thinking=True
+        )
         scrubber: _AnthropicStreamScrubber | None = None
 
         # Open both content blocks upfront so clients know the layout:
@@ -2190,7 +2197,10 @@ async def _stream_anthropic_messages(
 
                         elif kind == "thinking_stop":
                             if thinking_block_open:
-                                ev = {"type": "content_block_stop", "index": thinking_block_index}
+                                ev = {
+                                    "type": "content_block_stop",
+                                    "index": thinking_block_index,
+                                }
                                 yield f"event: content_block_stop\ndata: {json.dumps(ev)}\n\n"
                                 thinking_block_open = False
 

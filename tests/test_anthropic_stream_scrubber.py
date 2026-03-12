@@ -10,7 +10,6 @@ These are pure logic tests with no MLX dependency.
 
 from vllm_mlx.server import _AnthropicStreamScrubber
 
-
 # =============================================================================
 # Basic Construction / Initial State
 # =============================================================================
@@ -71,7 +70,9 @@ class TestScrubberPlainText:
     def test_long_plain_text(self):
         """Text longer than CARRY_N should emit most of it immediately."""
         scrubber = _AnthropicStreamScrubber()
-        text = "Hello, this is a long sentence with no markup at all, just ordinary text."
+        text = (
+            "Hello, this is a long sentence with no markup at all, just ordinary text."
+        )
         result = scrubber.feed(text)
         flushed = scrubber.flush()
         assert result + flushed == text
@@ -206,7 +207,7 @@ class TestScrubberToolCallTags:
     def test_tool_call_close_split(self):
         scrubber = _AnthropicStreamScrubber()
         collected = ""
-        collected += scrubber.feed('<tool_call>data</tool_')
+        collected += scrubber.feed("<tool_call>data</tool_")
         collected += scrubber.feed("call>visible")
         collected += scrubber.flush()
         assert "data" not in collected
@@ -214,7 +215,7 @@ class TestScrubberToolCallTags:
 
     def test_multiple_tool_calls(self):
         scrubber = _AnthropicStreamScrubber()
-        text = 'A<tool_call>call1</tool_call>B<tool_call>call2</tool_call>C'
+        text = "A<tool_call>call1</tool_call>B<tool_call>call2</tool_call>C"
         result = scrubber.feed(text)
         result += scrubber.flush()
         assert "call1" not in result
@@ -314,7 +315,7 @@ class TestScrubberParameterTags:
     def test_parameter_inside_function_block(self):
         """Parameter tags typically appear inside function blocks."""
         scrubber = _AnthropicStreamScrubber()
-        text = '<function=search><parameter=query>test</parameter></function>done'
+        text = "<function=search><parameter=query>test</parameter></function>done"
         result = scrubber.feed(text)
         result += scrubber.flush()
         # Everything inside <function=...>...</function> should be suppressed
@@ -389,7 +390,9 @@ class TestScrubberMixedContent:
 
     def test_think_then_tool_call(self):
         scrubber = _AnthropicStreamScrubber()
-        text = 'Before<think>reasoning</think>Middle<tool_call>{"fn":"x"}</tool_call>After'
+        text = (
+            'Before<think>reasoning</think>Middle<tool_call>{"fn":"x"}</tool_call>After'
+        )
         result = scrubber.feed(text)
         result += scrubber.flush()
         assert "reasoning" not in result
@@ -400,7 +403,7 @@ class TestScrubberMixedContent:
 
     def test_tool_call_then_think(self):
         scrubber = _AnthropicStreamScrubber()
-        text = '<tool_call>data</tool_call>text<think>thought</think>end'
+        text = "<tool_call>data</tool_call>text<think>thought</think>end"
         result = scrubber.feed(text)
         result += scrubber.flush()
         assert "data" not in result
@@ -411,7 +414,7 @@ class TestScrubberMixedContent:
     def test_think_with_function_inside_tool_call(self):
         """Nested-looking tags – only outer suppression matters."""
         scrubber = _AnthropicStreamScrubber()
-        text = '<tool_call>outer<function=inner>nested</function></tool_call>visible'
+        text = "<tool_call>outer<function=inner>nested</function></tool_call>visible"
         result = scrubber.feed(text)
         result += scrubber.flush()
         assert "outer" not in result
@@ -789,13 +792,19 @@ class TestScrubberEdgeCases:
 
     def test_back_to_back_different_tags(self):
         scrubber = _AnthropicStreamScrubber()
-        text = '<think>t</think><tool_call>tc</tool_call><function=f>fc</function>end'
+        text = "<think>t</think><tool_call>tc</tool_call><function=f>fc</function>end"
         result = scrubber.feed(text)
         result += scrubber.flush()
         assert "end" in result
         # All tagged content suppressed
-        for s in ["<think>", "</think>", "<tool_call>", "</tool_call>",
-                   "<function=", "</function>"]:
+        for s in [
+            "<think>",
+            "</think>",
+            "<tool_call>",
+            "</tool_call>",
+            "<function=",
+            "</function>",
+        ]:
             assert s not in result
 
 
@@ -914,10 +923,10 @@ class TestScrubberStreamingIntegration:
             "<tool_call>",
             '{"',
             'name": "',
-            'get_weather',
+            "get_weather",
             '", "arguments',
             '": {"city": "',
-            'San Francisco',
+            "San Francisco",
             '"}}',
             "</tool_call>",
         ]
@@ -1164,7 +1173,7 @@ class TestRouterToolCallSuppression:
 
     def test_function_tag_suppressed(self):
         router = _AnthropicStreamRouter()
-        pieces = router.feed('<function=search>body</function>after')
+        pieces = router.feed("<function=search>body</function>after")
         pieces += router.flush()
 
         text = "".join(t for k, t in pieces if k == "text")
@@ -1177,7 +1186,7 @@ class TestRouterMixedContent:
 
     def test_think_then_tool_call(self):
         router = _AnthropicStreamRouter()
-        text_input = '<think>reasoning</think>visible<tool_call>data</tool_call>end'
+        text_input = "<think>reasoning</think>visible<tool_call>data</tool_call>end"
         pieces = router.feed(text_input)
         pieces += router.flush()
 
@@ -1194,10 +1203,20 @@ class TestRouterMixedContent:
         """Token-by-token streaming with thinking."""
         router = _AnthropicStreamRouter()
         tokens = [
-            "<", "think", ">",
-            "Let", " me", " check",
-            "</", "think", ">",
-            "The", " answer", " is", " 42", ".",
+            "<",
+            "think",
+            ">",
+            "Let",
+            " me",
+            " check",
+            "</",
+            "think",
+            ">",
+            "The",
+            " answer",
+            " is",
+            " 42",
+            ".",
         ]
         all_pieces = []
         for tok in tokens:
@@ -1248,42 +1267,57 @@ class TestIsThinkingEnabled:
 
     def test_none_thinking(self):
         from vllm_mlx.api.anthropic_models import AnthropicRequest, AnthropicMessage
+
         req = AnthropicRequest(
-            model="test", messages=[AnthropicMessage(role="user", content="hi")],
-            max_tokens=100, thinking=None,
+            model="test",
+            messages=[AnthropicMessage(role="user", content="hi")],
+            max_tokens=100,
+            thinking=None,
         )
         assert _is_thinking_enabled(req) is False
 
     def test_no_thinking_field(self):
         from vllm_mlx.api.anthropic_models import AnthropicRequest, AnthropicMessage
+
         req = AnthropicRequest(
-            model="test", messages=[AnthropicMessage(role="user", content="hi")],
+            model="test",
+            messages=[AnthropicMessage(role="user", content="hi")],
             max_tokens=100,
         )
         assert _is_thinking_enabled(req) is False
 
     def test_thinking_enabled_dict(self):
         from vllm_mlx.api.anthropic_models import AnthropicRequest, AnthropicMessage
+
         req = AnthropicRequest(
-            model="test", messages=[AnthropicMessage(role="user", content="hi")],
-            max_tokens=100, thinking={"type": "enabled", "budget_tokens": 5000},
+            model="test",
+            messages=[AnthropicMessage(role="user", content="hi")],
+            max_tokens=100,
+            thinking={"type": "enabled", "budget_tokens": 5000},
         )
         assert _is_thinking_enabled(req) is True
 
     def test_thinking_disabled_dict(self):
         from vllm_mlx.api.anthropic_models import AnthropicRequest, AnthropicMessage
+
         req = AnthropicRequest(
-            model="test", messages=[AnthropicMessage(role="user", content="hi")],
-            max_tokens=100, thinking={"type": "disabled"},
+            model="test",
+            messages=[AnthropicMessage(role="user", content="hi")],
+            max_tokens=100,
+            thinking={"type": "disabled"},
         )
         assert _is_thinking_enabled(req) is False
 
     def test_thinking_enabled_model(self):
         from vllm_mlx.api.anthropic_models import (
-            AnthropicRequest, AnthropicMessage, AnthropicThinkingConfig,
+            AnthropicRequest,
+            AnthropicMessage,
+            AnthropicThinkingConfig,
         )
+
         req = AnthropicRequest(
-            model="test", messages=[AnthropicMessage(role="user", content="hi")],
+            model="test",
+            messages=[AnthropicMessage(role="user", content="hi")],
             max_tokens=100,
             thinking=AnthropicThinkingConfig(type="enabled", budget_tokens=8000),
         )
@@ -1291,10 +1325,14 @@ class TestIsThinkingEnabled:
 
     def test_thinking_disabled_model(self):
         from vllm_mlx.api.anthropic_models import (
-            AnthropicRequest, AnthropicMessage, AnthropicThinkingConfig,
+            AnthropicRequest,
+            AnthropicMessage,
+            AnthropicThinkingConfig,
         )
+
         req = AnthropicRequest(
-            model="test", messages=[AnthropicMessage(role="user", content="hi")],
+            model="test",
+            messages=[AnthropicMessage(role="user", content="hi")],
             max_tokens=100,
             thinking=AnthropicThinkingConfig(type="disabled"),
         )
