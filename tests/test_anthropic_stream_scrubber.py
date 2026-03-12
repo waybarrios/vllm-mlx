@@ -8,8 +8,6 @@ Anthropic /v1/messages endpoint.
 These are pure logic tests with no MLX dependency.
 """
 
-import pytest
-
 from vllm_mlx.server import _AnthropicStreamScrubber
 
 
