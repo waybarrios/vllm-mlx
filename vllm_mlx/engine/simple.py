@@ -61,7 +61,11 @@ class SimpleEngine(BaseEngine):
 
         # LRU trie-based prompt prefix cache for KV reuse across requests
         self._prompt_cache_size = prompt_cache_size
-        self._prompt_cache = LRUPromptCache(max_size=prompt_cache_size) if prompt_cache_size > 0 else None
+        self._prompt_cache = (
+            LRUPromptCache(max_size=prompt_cache_size)
+            if prompt_cache_size > 0
+            else None
+        )
 
     @property
     def model_name(self) -> str:
@@ -220,7 +224,9 @@ class SimpleEngine(BaseEngine):
                 try:
                     cache_snapshot = copy.deepcopy(cache)
                 except Exception:
-                    logger.warning("Failed to snapshot prompt cache; skipping cache insert")
+                    logger.warning(
+                        "Failed to snapshot prompt cache; skipping cache insert"
+                    )
                     cache_snapshot = None
 
             accumulated_text = ""

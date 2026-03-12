@@ -39,8 +39,10 @@ class TestPrefixCacheIntegration:
         """First request should miss cache and create a fresh one."""
         from vllm_mlx.engine.simple import SimpleEngine
 
-        with patch("vllm_mlx.engine.simple.is_mllm_model", return_value=False), \
-             patch("vllm_mlx.engine.simple.make_prompt_cache") as mock_make_cache:
+        with (
+            patch("vllm_mlx.engine.simple.is_mllm_model", return_value=False),
+            patch("vllm_mlx.engine.simple.make_prompt_cache") as mock_make_cache,
+        ):
             mock_make_cache.return_value = [MagicMock()]
 
             engine = SimpleEngine("test-model")
@@ -74,7 +76,10 @@ class TestPrefixCacheIntegration:
             assert len(results) == 2
             # stream_generate should have been called with the raw prompt string
             call_kwargs = mock_model.stream_generate.call_args
-            assert call_kwargs.kwargs.get("prompt") == "test" or call_kwargs[1].get("prompt") == "test"
+            assert (
+                call_kwargs.kwargs.get("prompt") == "test"
+                or call_kwargs[1].get("prompt") == "test"
+            )
             # No prompt_cache kwarg should be passed
             assert "prompt_cache" not in (call_kwargs.kwargs or call_kwargs[1])
 
@@ -98,8 +103,10 @@ class TestPrefixCacheIntegration:
         """prompt_cache_size should be passed through to LRUPromptCache."""
         from vllm_mlx.engine.simple import SimpleEngine
 
-        with patch("vllm_mlx.engine.simple.is_mllm_model", return_value=False), \
-             patch("vllm_mlx.engine.simple.LRUPromptCache") as mock_lru:
+        with (
+            patch("vllm_mlx.engine.simple.is_mllm_model", return_value=False),
+            patch("vllm_mlx.engine.simple.LRUPromptCache") as mock_lru,
+        ):
             engine = SimpleEngine("test-model", prompt_cache_size=7)
             mock_lru.assert_called_once_with(max_size=7)
 
@@ -117,7 +124,10 @@ class TestBillingHeaderStripping:
             messages=[AnthropicMessage(role="user", content="hi")],
             max_tokens=100,
             system=[
-                {"type": "text", "text": "x-anthropic-billing-header: cc_version=2.1.42; cch=abc123"},
+                {
+                    "type": "text",
+                    "text": "x-anthropic-billing-header: cc_version=2.1.42; cch=abc123",
+                },
                 {"type": "text", "text": "You are a helpful assistant."},
             ],
         )
