@@ -1153,10 +1153,11 @@ class MLXMultimodalLM:
                 f"  Chat msg {i}: role={cm['role']}, content={content_preview}..."
             )
 
-        # Forward tools to chat template if provided (fix: MLLM path was dropping tools)
+        # Pop tools so they don't leak into mlx_vlm.generate()/stream_generate()
+        tools = kwargs.pop("tools", None)
         template_extra_kwargs = {}
-        if kwargs.get("tools"):
-            template_extra_kwargs["tools"] = kwargs["tools"]
+        if tools:
+            template_extra_kwargs["tools"] = tools
 
         try:
             # Use get_chat_template directly since messages are already properly formatted
@@ -1511,10 +1512,11 @@ class MLXMultimodalLM:
             all_images.extend(frames)
 
         # Apply chat template directly - messages are already properly structured
-        # Forward tools to chat template if provided (fix: MLLM path was dropping tools)
+        # Pop tools so they don't leak into mlx_vlm.generate()/stream_generate()
+        tools = kwargs.pop("tools", None)
         template_extra_kwargs = {}
-        if kwargs.get("tools"):
-            template_extra_kwargs["tools"] = kwargs["tools"]
+        if tools:
+            template_extra_kwargs["tools"] = tools
 
         try:
             # Use get_chat_template directly since messages are already properly formatted
