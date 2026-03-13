@@ -9,6 +9,7 @@ Handles translation of:
 """
 
 import json
+import re
 import uuid
 
 from .anthropic_models import (
@@ -25,6 +26,13 @@ from .models import (
     Message,
     ToolDefinition,
 )
+
+# Compiled patterns for stripping streaming artifacts from assistant message history.
+# In streaming mode, vllm-mlx emits all model output (thinking and tool-call XML) as
+# text deltas before extracting tool_use blocks. These patterns strip that leaked content
+# from text blocks when rebuilding conversation history for subsequent turns.
+_STREAMING_THINK_STRIP = re.compile(r"<think>.*?</think>\s*", re.DOTALL)
+_STREAMING_TOOL_CALL_STRIP = re.compile(r"<tool_call>.*?</tool_call>\s*", re.DOTALL)
 
 
 def anthropic_to_openai(request: AnthropicRequest) -> ChatCompletionRequest:
@@ -178,7 +186,18 @@ def _convert_message(msg: AnthropicMessage) -> list[Message]:
 
     for block in msg.content:
         if block.type == "text":
-            text_parts.append(block.text or "")
+            text = block.text or ""
+            # Strip <think> tags and <tool_call> XML that leaked from streaming mode.
+            # In streaming mode, all model output (including thinking and tool call XML)
+            # is emitted as text deltas before tool_use blocks are parsed. If not stripped
+            # here, the chat template on the next turn renders duplicate tool calls,
+            # causing an infinite reasoning loop (900+ second stalls observed with
+            # Qwen3.5 models).
+            text = _STREAMING_THINK_STRIP.sub("", text)
+            text = _STREAMING_TOOL_CALL_STRIP.sub("", text)
+            text = text.strip()
+            if text:
+                text_parts.append(text)
 
         elif block.type == "tool_use":
             # Assistant message with tool calls
