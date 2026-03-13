@@ -1735,20 +1735,27 @@ async def _stream_anthropic_messages(
             completion_tokens = output.completion_tokens
 
         if delta_text:
-            # Filter special tokens
+            # Filter special tokens but BUFFER — do NOT stream yet.
+            # Tool call XML (<tool_call>…</tool_call>) and <think> tags must not
+            # leak into text content blocks. We parse and clean the full accumulated
+            # text after the model finishes, then emit only the cleaned version.
             content = SPECIAL_TOKENS_PATTERN.sub("", delta_text)
 
             if content:
                 accumulated_text += content
-                delta_event = {
-                    "type": "content_block_delta",
-                    "index": 0,
-                    "delta": {"type": "text_delta", "text": content},
-                }
-                yield f"event: content_block_delta\ndata: {json.dumps(delta_event)}\n\n"
 
-    # Check for tool calls in accumulated text
-    _, tool_calls = _parse_tool_calls_with_parser(accumulated_text, openai_request)
+    # Parse tool calls and get cleaned text (strips <tool_call> and <think> XML).
+    # IMPORTANT: use cleaned_text here, not the raw accumulated_text.
+    cleaned_text, tool_calls = _parse_tool_calls_with_parser(accumulated_text, openai_request)
+
+    # Emit cleaned text as a single text delta (raw streaming would leak XML).
+    if cleaned_text:
+        delta_event = {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "text_delta", "text": cleaned_text},
+        }
+        yield f"event: content_block_delta\ndata: {json.dumps(delta_event)}\n\n"
 
     # Emit content_block_stop for text block
     yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': 0})}\n\n"
