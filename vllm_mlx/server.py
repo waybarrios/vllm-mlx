@@ -1837,7 +1837,9 @@ async def stream_completion(
                     {
                         "index": 0,
                         "text": output.new_text,
-                        "finish_reason": output.finish_reason if output.finished else None,
+                        "finish_reason": (
+                            output.finish_reason if output.finished else None
+                        ),
                     }
                 ],
             }
@@ -1948,7 +1950,9 @@ async def stream_chat_completion(
                                 content=delta_msg.content,
                                 reasoning=delta_msg.reasoning,
                             ),
-                            finish_reason=output.finish_reason if output.finished else None,
+                            finish_reason=(
+                                output.finish_reason if output.finished else None
+                            ),
                         )
                     ],
                     usage=get_usage(output) if output.finished else None,
