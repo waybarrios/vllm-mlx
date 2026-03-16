@@ -155,3 +155,105 @@ class TestExtractBlockTensorSlice:
         assert result is not None
         keys, values = result[0]
         assert keys.shape[2] == 36  # 100 - 64
+
+
+# ---------------------------------------------------------------------------
+# Tests: store_cache with hybrid model cache data
+# ---------------------------------------------------------------------------
+
+class TestStoreHybridCache:
+    """Test store_cache with hybrid model cache data."""
+
+    @pytest.fixture
+    def cache(self):
+        mock_model = MagicMock()
+        from vllm_mlx.paged_cache import PagedCacheManager
+        paged = PagedCacheManager(block_size=64, max_blocks=100)
+        return BlockAwarePrefixCache(mock_model, paged)
+
+    def test_stores_non_kv_states(self, cache):
+        """Hybrid cache data stores non-KV states in _non_kv_states."""
+        data = _make_hybrid_cache_data(n_total=8, attn_interval=4, seq_len=128)
+        tokens = list(range(128))
+        cache.store_cache("req-1", tokens, data)
+        assert len(cache._non_kv_states) == 1
+        non_kv = list(cache._non_kv_states.values())[0]
+        assert isinstance(non_kv, NonKVCacheData)
+        assert non_kv.total_layers == 8
+        assert len(non_kv.layer_indices) == 6  # 6 ArraysCache layers
+        assert non_kv.layer_indices == [0, 1, 2, 4, 5, 6]
+
+    def test_pure_kv_no_non_kv_states(self, cache):
+        """Pure KV model does not create non-KV states."""
+        data = _make_pure_kv_cache_data(n_layers=4, seq_len=128)
+        tokens = list(range(128))
+        cache.store_cache("req-1", tokens, data)
+        assert len(cache._non_kv_states) == 0
+
+    def test_has_non_kv_flag_on_entry(self, cache):
+        """BlockCacheEntry gets has_non_kv flag."""
+        data = _make_hybrid_cache_data(n_total=8, attn_interval=4, seq_len=128)
+        tokens = list(range(128))
+        cache.store_cache("req-1", tokens, data)
+        entry = cache._request_tables["req-1"]
+        assert entry.has_non_kv is True
+
+    def test_has_non_kv_false_for_pure_kv(self, cache):
+        """Pure KV entries have has_non_kv=False."""
+        data = _make_pure_kv_cache_data(n_layers=4, seq_len=128)
+        tokens = list(range(128))
+        cache.store_cache("req-1", tokens, data)
+        entry = cache._request_tables["req-1"]
+        assert entry.has_non_kv is False
+
+
+# ---------------------------------------------------------------------------
+# Tests: reconstruct_cache with hybrid model cache data
+# ---------------------------------------------------------------------------
+
+class TestReconstructHybridCache:
+    """Test reconstruct_cache with hybrid model cache data."""
+
+    @pytest.fixture
+    def cache(self):
+        mock_model = MagicMock()
+        from vllm_mlx.paged_cache import PagedCacheManager
+        paged = PagedCacheManager(block_size=64, max_blocks=100)
+        return BlockAwarePrefixCache(mock_model, paged)
+
+    def test_pure_kv_reconstruct_unchanged(self, cache):
+        """Pure KV model: reconstruct works as before."""
+        data = _make_pure_kv_cache_data(n_layers=4, seq_len=128)
+        tokens = list(range(128))
+        bt = cache.store_cache("req-1", tokens, data)
+        result = cache.reconstruct_cache(bt)
+        assert result is not None
+        assert len(result) == 4
+        for c in result:
+            assert hasattr(c, "keys")
+            assert hasattr(c, "values")
+
+    def test_hybrid_reconstruct_all_layers(self, cache):
+        """Hybrid model: reconstructs both KV and non-KV layers."""
+        data = _make_hybrid_cache_data(n_total=8, attn_interval=4, seq_len=128)
+        tokens = list(range(128))
+        bt = cache.store_cache("req-1", tokens, data)
+        result = cache.reconstruct_cache(bt)
+        assert result is not None
+        assert len(result) == 8  # All layers present
+        # KV layers (3, 7) should be KVCache
+        assert hasattr(result[3], "keys")
+        assert hasattr(result[7], "keys")
+        # Non-KV layers (0,1,2,4,5,6) should be ArraysCache
+        assert isinstance(result[0], ArraysCache)
+        assert isinstance(result[4], ArraysCache)
+
+    def test_hybrid_reconstruct_missing_non_kv_returns_none(self, cache):
+        """If non-KV states are missing, return None (can't reconstruct)."""
+        data = _make_hybrid_cache_data(n_total=8, attn_interval=4, seq_len=128)
+        tokens = list(range(128))
+        bt = cache.store_cache("req-1", tokens, data)
+        # Delete non-KV states to simulate missing data
+        cache._non_kv_states.clear()
+        result = cache.reconstruct_cache(bt)
+        assert result is None
