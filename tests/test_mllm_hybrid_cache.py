@@ -14,7 +14,6 @@ try:
     from mlx_lm.models.cache import (
         ArraysCache,
         BatchKVCache,
-        CacheList,
         KVCache,
         RotatingKVCache,
         BatchRotatingKVCache,
