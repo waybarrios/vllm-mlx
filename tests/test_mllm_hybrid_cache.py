@@ -476,17 +476,15 @@ class TestEmptyCacheExtend:
     def test_extend_skips_empty_caches(self):
         """Extending when one cache is empty does not crash."""
         populated = _make_populated_hybrid_cache(seq_len=10)
-        empty = _make_hybrid_cache()  # Not populated — all entries are None/empty
 
-        # Merge each into single-request batches
+        # Merge populated into single-request batch
         batch_pop = [
             populated[i].merge([populated[i]])
             for i in range(len(populated))
         ]
-        batch_empty = [
-            empty[i].merge([empty[i]])
-            for i in range(len(empty))
-        ]
+
+        # Create empty caches directly (don't merge — merge() can't handle all-None)
+        batch_empty = _make_hybrid_cache()
 
         # Extend should not crash — empty guard should skip
         for c, o in zip(batch_pop, batch_empty):
