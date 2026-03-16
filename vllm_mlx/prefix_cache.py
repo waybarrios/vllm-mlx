@@ -976,8 +976,7 @@ class BlockAwarePrefixCache:
             non_kv_pos_map = {}
             if non_kv_data is not None:
                 non_kv_pos_map = {
-                    idx: pos
-                    for pos, idx in enumerate(non_kv_data.layer_indices)
+                    idx: pos for pos, idx in enumerate(non_kv_data.layer_indices)
                 }
 
             # Reconstruct each layer
