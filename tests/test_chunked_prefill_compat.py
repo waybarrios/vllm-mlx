@@ -13,7 +13,6 @@ from unittest.mock import MagicMock
 import pytest
 
 try:
-    import mlx.core as mx
     from mlx_lm.models import cache
     from mlx_lm.generate import BatchGenerator
 
