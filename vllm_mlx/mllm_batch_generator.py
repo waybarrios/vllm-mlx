@@ -154,20 +154,17 @@ class MLLMBatch:
         self.max_tokens.extend(other.max_tokens)
         self.requests.extend(other.requests)
 
-        # Extend cache - handle None and incompatible caches
+        # Extend cache - each cache type's extend() handles its own validation.
+        # Uses empty() (universal via _BaseCache) instead of checking .keys
+        # (KVCache-specific). This supports hybrid models with ArraysCache
+        # layers that use .cache instead of .keys/.values.
         for c, o in zip(self.cache, other.cache):
             if c is not None and o is not None and hasattr(c, "extend"):
                 try:
-                    # Only extend if both caches have valid keys
-                    if (
-                        hasattr(c, "keys")
-                        and c.keys is not None
-                        and hasattr(o, "keys")
-                        and o.keys is not None
-                    ):
+                    if not c.empty() and not o.empty():
                         c.extend(o)
                 except Exception as e:
-                    logger.warning(f"Failed to extend cache: {e}")
+                    logger.warning(f"Failed to extend cache layer: {e}")
 
     def extract_cache(self, idx: int) -> List[Any]:
         """
