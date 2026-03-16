@@ -1499,11 +1499,11 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
 
 
 def _normalize_messages(messages: list[dict]) -> list[dict]:
-    """Merge consecutive same-role messages to satisfy chat template constraints.
+    """Normalize message roles and merge consecutive same-role messages.
 
-    Many chat templates (Qwen 3.5, Llama, etc.) require alternating roles.
-    Real-world clients like OpenCode and Kilo send consecutive system or user
-    messages. This function merges them before the template is applied.
+    1. Maps non-standard roles to standard ones (e.g. ``developer`` → ``system``).
+    2. Merges consecutive same-role messages to satisfy chat template constraints
+       (Qwen 3.5, Llama, etc. require alternating roles).
 
     Only merges when both messages have string content. Messages with list
     content (multimodal) are left as-is to preserve image/video attachments.
@@ -1512,33 +1512,46 @@ def _normalize_messages(messages: list[dict]) -> list[dict]:
         messages: List of message dicts with 'role' and 'content' keys.
 
     Returns:
-        New list with consecutive same-role messages merged.
+        New list with normalized roles and consecutive same-role messages merged.
     """
+    # OpenAI Responses API uses "developer" instead of "system".
+    # Map it so chat templates don't fail and fall back to raw prefill.
+    _ROLE_MAP = {"developer": "system"}
+
     if not messages:
         return messages
 
     merged = [messages[0].copy()]
+    if merged[0]["role"] in _ROLE_MAP:
+        merged[0]["role"] = _ROLE_MAP[merged[0]["role"]]
     for msg in messages[1:]:
         prev = merged[-1]
+        role = _ROLE_MAP.get(msg["role"], msg["role"])
         if (
-            msg["role"] == prev["role"]
+            role == prev["role"]
             and isinstance(prev.get("content"), str)
             and isinstance(msg.get("content"), str)
         ):
             # Merge string content with double newline separator
             prev["content"] = prev["content"] + "\n\n" + msg["content"]
             logger.debug(
-                f"Merged consecutive {msg['role']} messages "
+                f"Merged consecutive {role} messages "
                 f"({len(prev['content'])} chars total)"
             )
         else:
-            merged.append(msg.copy())
+            copy = msg.copy()
+            copy["role"] = role
+            merged.append(copy)
 
-    if len(merged) != len(messages):
-        logger.info(
-            f"Normalized messages: {len(messages)} → {len(merged)} "
-            f"(merged consecutive same-role messages)"
-        )
+    mapped_roles = sum(1 for m in messages if m["role"] in _ROLE_MAP)
+    merged_count = len(messages) - len(merged)
+    if mapped_roles or merged_count:
+        parts = []
+        if mapped_roles:
+            parts.append(f"mapped {mapped_roles} role(s)")
+        if merged_count:
+            parts.append(f"merged {len(messages)} → {len(merged)}")
+        logger.info(f"Normalized messages: {', '.join(parts)}")
 
     return merged
 
