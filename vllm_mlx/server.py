@@ -1359,8 +1359,9 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
         if request.video_max_frames:
             chat_kwargs["video_max_frames"] = request.video_max_frames
 
-    # Add tools if provided
-    if request.tools:
+    # Add tools if provided — strip when tool_choice="none" to prevent
+    # chat templates from activating tool-call tokens (fixes #162)
+    if request.tools and request.tool_choice != "none":
         chat_kwargs["tools"] = convert_tools_for_template(request.tools)
 
     if request.stream:
@@ -1536,7 +1537,7 @@ async def create_anthropic_message(
         "top_p": openai_request.top_p,
     }
 
-    if openai_request.tools:
+    if openai_request.tools and openai_request.tool_choice != "none":
         chat_kwargs["tools"] = convert_tools_for_template(openai_request.tools)
 
     start_time = time.perf_counter()
@@ -1693,7 +1694,7 @@ async def _stream_anthropic_messages(
         "top_p": openai_request.top_p,
     }
 
-    if openai_request.tools:
+    if openai_request.tools and openai_request.tool_choice != "none":
         chat_kwargs["tools"] = convert_tools_for_template(openai_request.tools)
 
     # Emit message_start
