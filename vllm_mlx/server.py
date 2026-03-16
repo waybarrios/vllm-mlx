@@ -1326,12 +1326,14 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
             messages.append(msg_dict)
         images, videos = [], []  # MLLM extracts these from messages
         logger.debug(f"MLLM: Processing {len(messages)} messages")
+        messages = _normalize_messages(messages)
     else:
         # For LLM, extract text, images, and videos separately
         messages, images, videos = extract_multimodal_content(
             request.messages,
             preserve_native_format=engine.preserve_native_tool_format,
         )
+        messages = _normalize_messages(messages)
 
     has_media = bool(images or videos)
 
@@ -1434,6 +1436,51 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
     )
 
 
+def _normalize_messages(messages: list[dict]) -> list[dict]:
+    """Merge consecutive same-role messages to satisfy chat template constraints.
+
+    Many chat templates (Qwen 3.5, Llama, etc.) require alternating roles.
+    Real-world clients like OpenCode and Kilo send consecutive system or user
+    messages. This function merges them before the template is applied.
+
+    Only merges when both messages have string content. Messages with list
+    content (multimodal) are left as-is to preserve image/video attachments.
+
+    Args:
+        messages: List of message dicts with 'role' and 'content' keys.
+
+    Returns:
+        New list with consecutive same-role messages merged.
+    """
+    if not messages:
+        return messages
+
+    merged = [messages[0].copy()]
+    for msg in messages[1:]:
+        prev = merged[-1]
+        if (
+            msg["role"] == prev["role"]
+            and isinstance(prev.get("content"), str)
+            and isinstance(msg.get("content"), str)
+        ):
+            # Merge string content with double newline separator
+            prev["content"] = prev["content"] + "\n\n" + msg["content"]
+            logger.debug(
+                f"Merged consecutive {msg['role']} messages "
+                f"({len(prev['content'])} chars total)"
+            )
+        else:
+            merged.append(msg.copy())
+
+    if len(merged) != len(messages):
+        logger.info(
+            f"Normalized messages: {len(messages)} → {len(merged)} "
+            f"(merged consecutive same-role messages)"
+        )
+
+    return merged
+
+
 def _inject_json_instruction(messages: list, instruction: str) -> list:
     """
     Inject JSON instruction into messages.
@@ -1529,6 +1576,7 @@ async def create_anthropic_message(
         openai_request.messages,
         preserve_native_format=engine.preserve_native_tool_format,
     )
+    messages = _normalize_messages(messages)
 
     chat_kwargs = {
         "max_tokens": openai_request.max_tokens or _default_max_tokens,
@@ -1686,6 +1734,7 @@ async def _stream_anthropic_messages(
         openai_request.messages,
         preserve_native_format=engine.preserve_native_tool_format,
     )
+    messages = _normalize_messages(messages)
 
     chat_kwargs = {
         "max_tokens": openai_request.max_tokens or _default_max_tokens,
