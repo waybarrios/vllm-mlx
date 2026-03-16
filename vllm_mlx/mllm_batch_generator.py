@@ -207,22 +207,52 @@ class MLLMBatchStats:
 
 def _make_batch_cache(model: nn.Module, left_padding: List[int]) -> List[Any]:
     """
-    Create batch-aware KV cache for the language model.
+    Create batch-aware cache for the language model.
+
+    Handles all cache types from hybrid models:
+    - KVCache → BatchKVCache (attention layers)
+    - ArraysCache → ArraysCache with left_padding (SSM/recurrent layers)
+    - RotatingKVCache → BatchRotatingKVCache
+    - CacheList → recursive conversion
 
     Args:
         model: The language model (model.language_model from VLM)
         left_padding: Padding amounts for left-padded prompts
 
     Returns:
-        List of BatchKVCache objects for each layer
+        List of batch-aware cache objects for each layer
     """
-    from mlx_lm.models.cache import BatchKVCache, KVCache
+    from mlx_lm.models.cache import (
+        ArraysCache,
+        BatchKVCache,
+        BatchRotatingKVCache,
+        CacheList,
+        KVCache,
+        RotatingKVCache,
+    )
 
     def to_batch_cache(c):
-        if isinstance(c, KVCache):
+        # Strict type identity for KVCache — avoid catching QuantizedKVCache
+        if type(c) is KVCache:
             return BatchKVCache(left_padding)
+        elif isinstance(c, ArraysCache):
+            # ArraysCache handles batching natively — just set left_padding
+            c.left_padding = mx.array(left_padding)
+            return c
+        elif isinstance(c, RotatingKVCache):
+            if c.keep > 0:
+                raise ValueError(
+                    "RotatingKVCache with keep tokens is not supported "
+                    "in MLLM continuous batching."
+                )
+            return BatchRotatingKVCache(c.max_size, left_padding)
+        elif isinstance(c, CacheList):
+            return CacheList(*(to_batch_cache(sub_c) for sub_c in c.caches))
         else:
-            raise ValueError(f"{type(c)} does not yet support batching")
+            raise ValueError(
+                f"MLLM continuous batching does not support {type(c).__name__}. "
+                f"Supported: KVCache, ArraysCache, RotatingKVCache, CacheList."
+            )
 
     if hasattr(model, "make_cache"):
         cache = model.make_cache()
