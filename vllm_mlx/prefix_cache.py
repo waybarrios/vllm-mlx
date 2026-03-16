@@ -317,18 +317,29 @@ class PrefixCacheManager:
                 del parent[tok]
 
     def _can_trim_cache(self, prompt_cache: List[Any]) -> bool:
-        """Check if cache can be trimmed."""
+        """Check if ALL cache layers can be trimmed.
+
+        For hybrid models (Qwen 3.5 MoE, Nemotron Mamba+Attention), the
+        prompt_cache is a mix of KVCache (trimmable) and ArraysCache
+        (not trimmable).  Trimming only KVCache while leaving ArraysCache
+        untouched creates inconsistent state — the attention layers think
+        the sequence is shorter while SSM/MoE layers retain the old state.
+
+        Previously this only checked the first cache layer, which for
+        hybrid models was always KVCache → incorrectly returned True.
+        """
         if not prompt_cache:
             return False
-        # Check if first cache layer has is_trimmable method
-        first_cache = prompt_cache[0]
-        if hasattr(first_cache, "is_trimmable"):
-            return first_cache.is_trimmable()
-        return hasattr(first_cache, "trim")
+        return all(
+            c.is_trimmable() if hasattr(c, "is_trimmable") else hasattr(c, "trim")
+            for c in prompt_cache
+        )
 
     def _trim_cache(self, prompt_cache: List[Any], num_tokens: int) -> List[Any]:
         """Trim cache by removing num_tokens from the end."""
         for cache in prompt_cache:
+            if hasattr(cache, "is_trimmable") and not cache.is_trimmable():
+                continue
             if hasattr(cache, "trim"):
                 cache.trim(num_tokens)
         return prompt_cache
