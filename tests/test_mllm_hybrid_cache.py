@@ -31,6 +31,7 @@ pytestmark = pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
 # Helpers — simulate Qwen 3.5 cache layout (12 KVCache + 36 ArraysCache)
 # ---------------------------------------------------------------------------
 
+
 def _make_hybrid_cache(n_kv=12, n_arrays=36, arrays_size=2):
     """Create a hybrid cache list like Qwen 3.5's make_cache().
 
@@ -51,7 +52,9 @@ def _make_hybrid_cache(n_kv=12, n_arrays=36, arrays_size=2):
     return cache
 
 
-def _populate_kv_cache(cache: KVCache, seq_len: int, n_kv_heads: int = 4, head_dim: int = 8):
+def _populate_kv_cache(
+    cache: KVCache, seq_len: int, n_kv_heads: int = 4, head_dim: int = 8
+):
     """Populate a KVCache with dummy data to simulate a completed prefill."""
     # KVCache.update_and_fetch expects 4D: (batch, n_kv_heads, seq_len, head_dim)
     keys = mx.random.normal((1, n_kv_heads, seq_len, head_dim))
@@ -59,13 +62,17 @@ def _populate_kv_cache(cache: KVCache, seq_len: int, n_kv_heads: int = 4, head_d
     cache.update_and_fetch(keys, values)
 
 
-def _populate_arrays_cache(cache: ArraysCache, batch_size: int = 1, state_dim: int = 16):
+def _populate_arrays_cache(
+    cache: ArraysCache, batch_size: int = 1, state_dim: int = 16
+):
     """Populate an ArraysCache with dummy SSM state."""
     for i in range(len(cache.cache)):
         cache.cache[i] = mx.random.normal((batch_size, state_dim))
 
 
-def _make_populated_hybrid_cache(seq_len: int = 10, n_kv_heads: int = 4, head_dim: int = 8, state_dim: int = 16):
+def _make_populated_hybrid_cache(
+    seq_len: int = 10, n_kv_heads: int = 4, head_dim: int = 8, state_dim: int = 16
+):
     """Create and populate a hybrid cache simulating a completed vision encoding prefill."""
     cache = _make_hybrid_cache()
     for c in cache:
@@ -79,6 +86,7 @@ def _make_populated_hybrid_cache(seq_len: int = 10, n_kv_heads: int = 4, head_di
 # ---------------------------------------------------------------------------
 # Test: _make_batch_cache handles all cache types
 # ---------------------------------------------------------------------------
+
 
 class TestMakeBatchCache:
     """Test _make_batch_cache() with hybrid model caches."""
@@ -168,6 +176,7 @@ class TestMakeBatchCache:
 # Test: Merge loop works with mixed cache types
 # ---------------------------------------------------------------------------
 
+
 class TestHybridCacheMerge:
     """Test the per-layer merge loop from _process_prompts."""
 
@@ -189,13 +198,17 @@ class TestHybridCacheMerge:
         for i, c in enumerate(batch_cache):
             is_linear = (i + 1) % 4 != 0
             if is_linear:
-                assert isinstance(c, ArraysCache), f"Layer {i}: merged ArraysCache should stay ArraysCache"
+                assert isinstance(
+                    c, ArraysCache
+                ), f"Layer {i}: merged ArraysCache should stay ArraysCache"
                 # Merged arrays should have batch dimension = 2
                 for arr in c.cache:
                     if arr is not None:
                         assert arr.shape[0] == 2, f"Layer {i}: batch dim should be 2"
             else:
-                assert isinstance(c, BatchKVCache), f"Layer {i}: merged KVCache should become BatchKVCache"
+                assert isinstance(
+                    c, BatchKVCache
+                ), f"Layer {i}: merged KVCache should become BatchKVCache"
 
     def test_merge_single_request(self):
         """Single-request merge works (degenerate case)."""
@@ -221,6 +234,7 @@ class TestHybridCacheMerge:
 # ---------------------------------------------------------------------------
 # Test: Filter on merged batch
 # ---------------------------------------------------------------------------
+
 
 class TestHybridCacheFilter:
     """Test filter() on merged hybrid batches."""
@@ -249,12 +263,15 @@ class TestHybridCacheFilter:
             if is_linear and isinstance(c, ArraysCache):
                 for arr in c.cache:
                     if arr is not None:
-                        assert arr.shape[0] == 2, f"Layer {i}: filtered batch dim should be 2"
+                        assert (
+                            arr.shape[0] == 2
+                        ), f"Layer {i}: filtered batch dim should be 2"
 
 
 # ---------------------------------------------------------------------------
 # Test: Extract from merged batch
 # ---------------------------------------------------------------------------
+
 
 class TestHybridCacheExtract:
     """Test extract() on merged hybrid batches."""
@@ -271,17 +288,23 @@ class TestHybridCacheExtract:
         ]
 
         # Extract request 0
-        extracted = [c.extract(0) if hasattr(c, "extract") else None for c in batch_cache]
+        extracted = [
+            c.extract(0) if hasattr(c, "extract") else None for c in batch_cache
+        ]
 
         for i, c in enumerate(extracted):
             is_linear = (i + 1) % 4 != 0
             if c is None:
                 continue
             if is_linear:
-                assert isinstance(c, ArraysCache), f"Layer {i}: extracted should be ArraysCache"
+                assert isinstance(
+                    c, ArraysCache
+                ), f"Layer {i}: extracted should be ArraysCache"
                 for arr in c.cache:
                     if arr is not None:
-                        assert arr.shape[0] == 1, f"Layer {i}: extracted batch dim should be 1"
+                        assert (
+                            arr.shape[0] == 1
+                        ), f"Layer {i}: extracted batch dim should be 1"
             else:
                 assert isinstance(c, KVCache), f"Layer {i}: extracted should be KVCache"
 
@@ -289,6 +312,7 @@ class TestHybridCacheExtract:
 # ---------------------------------------------------------------------------
 # Test: Extend merged batches
 # ---------------------------------------------------------------------------
+
 
 class TestHybridCacheExtend:
     """Test extend() combining two merged hybrid batches."""
@@ -323,12 +347,15 @@ class TestHybridCacheExtend:
             if is_linear and isinstance(c, ArraysCache):
                 for arr in c.cache:
                     if arr is not None:
-                        assert arr.shape[0] == 3, f"Layer {i}: extended batch dim should be 3"
+                        assert (
+                            arr.shape[0] == 3
+                        ), f"Layer {i}: extended batch dim should be 3"
 
 
 # ---------------------------------------------------------------------------
 # Test: Message normalization
 # ---------------------------------------------------------------------------
+
 
 class TestNormalizeMessages:
     """Test _normalize_messages() for handling real-world client formats."""
@@ -413,10 +440,16 @@ class TestNormalizeMessages:
 
         messages = [
             {"role": "user", "content": "Describe this:"},
-            {"role": "user", "content": [
-                {"type": "text", "text": "What is in this image?"},
-                {"type": "image_url", "image_url": {"url": "http://example.com/img.png"}},
-            ]},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "What is in this image?"},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": "http://example.com/img.png"},
+                    },
+                ],
+            },
         ]
         result = _normalize_messages(messages)
         # When one message has list content and previous has string,
@@ -470,6 +503,7 @@ class TestNormalizeMessages:
 # Test: Empty cache extend guard
 # ---------------------------------------------------------------------------
 
+
 class TestEmptyCacheExtend:
     """Test the empty() guard in extend prevents crashes on unpopulated caches."""
 
@@ -478,10 +512,7 @@ class TestEmptyCacheExtend:
         populated = _make_populated_hybrid_cache(seq_len=10)
 
         # Merge populated into single-request batch
-        batch_pop = [
-            populated[i].merge([populated[i]])
-            for i in range(len(populated))
-        ]
+        batch_pop = [populated[i].merge([populated[i]]) for i in range(len(populated))]
 
         # Create empty caches directly (don't merge — merge() can't handle all-None)
         batch_empty = _make_hybrid_cache()
