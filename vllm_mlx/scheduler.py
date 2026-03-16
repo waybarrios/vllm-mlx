@@ -392,6 +392,7 @@ def _install_chunked_prefill(
                         caches,
                         samplers,
                         logits_processors,
+                        *_extra,
                     ) = zip(*batch_prompts)
                     lengths = [len(p) for p in inputs_raw]
                     max_length = max(lengths)
