@@ -30,6 +30,21 @@ from .vision_embedding_cache import VisionEmbeddingCache
 logger = logging.getLogger(__name__)
 
 
+def _validate_caches_mergeable(per_request_caches: List[List[Any]]) -> None:
+    """Validate that all cache layers support merge() for batch creation.
+
+    Raises ValueError if any layer lacks a merge() method (e.g. QuantizedKVCache).
+    Called before the merge loop in _process_prompts().
+    """
+    for layer_idx, layer_cache in enumerate(per_request_caches[0]):
+        if not hasattr(layer_cache, "merge"):
+            raise ValueError(
+                f"MLLM continuous batching requires mergeable cache types "
+                f"but layer {layer_idx} has {type(layer_cache).__name__} "
+                f"which lacks a merge() method."
+            )
+
+
 @dataclass
 class MLLMBatchRequest:
     """
@@ -692,19 +707,11 @@ class MLLMBatchGenerator:
 
             per_request_caches.append(request_cache)
 
-        # Merge per-request KVCaches into a single BatchKVCache.
-        # KVCache.merge() creates a BatchKVCache with proper left-padding
-        # alignment, so all requests share a single batched cache for
-        # subsequent generation steps.
-        from mlx_lm.models.cache import KVCache
-
-        sample_cache = per_request_caches[0][0]
-        if not isinstance(sample_cache, KVCache):
-            raise ValueError(
-                f"MLLM continuous batching requires standard KVCache but got "
-                f"{type(sample_cache).__name__}. Disable --kv-cache-quantization "
-                f"when using multimodal models with --continuous-batching."
-            )
+        # Merge per-request caches into a single batched cache.
+        # Each cache type's merge() returns the correct batched representation:
+        # KVCache.merge() → BatchKVCache, ArraysCache.merge() → batched ArraysCache.
+        # This supports hybrid models mixing attention + SSM layers.
+        _validate_caches_mergeable(per_request_caches)
 
         try:
             batch_cache = [
