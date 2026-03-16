@@ -1406,9 +1406,7 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
             text_for_tools = output.text
 
     # Parse tool calls from content (after reasoning extraction)
-    cleaned_text, tool_calls = _parse_tool_calls_with_parser(
-        text_for_tools, request
-    )
+    cleaned_text, tool_calls = _parse_tool_calls_with_parser(text_for_tools, request)
 
     # Process response_format if specified (after reasoning parser cleaned the text)
     if response_format and not tool_calls:
@@ -1960,7 +1958,9 @@ async def stream_chat_completion(
                             delta=ChatCompletionChunkDelta(
                                 reasoning=reasoning_delta,
                             ),
-                            finish_reason=output.finish_reason if output.finished else None,
+                            finish_reason=(
+                                output.finish_reason if output.finished else None
+                            ),
                         )
                     ],
                     usage=get_usage(output) if output.finished else None,
