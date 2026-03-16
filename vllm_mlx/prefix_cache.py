@@ -518,6 +518,21 @@ class BlockAwarePrefixCache:
                     block_table.num_tokens += block.token_count
 
             num_prefix_tokens = len(tokens) - len(remaining)
+
+            # Guard: reject partial prefix match for hybrid models.
+            # If non-KV states don't exist for this exact block set,
+            # a hybrid model can't be correctly reconstructed (SSM/KV mismatch).
+            if self._non_kv_states:
+                candidate_key = tuple(block_table.block_ids)
+                if candidate_key not in self._non_kv_states:
+                    logger.debug(
+                        f"Rejecting partial prefix match for {request_id}: "
+                        f"hybrid model requires full match with non-KV states"
+                    )
+                    self.paged_cache.delete_block_table(request_id)
+                    self._misses += 1
+                    return None, tokens
+
             self._hits += 1
             self._tokens_saved += num_prefix_tokens
 
@@ -543,6 +558,19 @@ class BlockAwarePrefixCache:
                     block_table.num_tokens += block.token_count
 
             remaining = tokens[len(matched_tokens) :]
+
+            # Same hybrid guard for prefix index matches
+            if self._non_kv_states:
+                candidate_key = tuple(block_table.block_ids)
+                if candidate_key not in self._non_kv_states:
+                    logger.debug(
+                        f"Rejecting prefix index match for {request_id}: "
+                        f"hybrid model requires full match with non-KV states"
+                    )
+                    self.paged_cache.delete_block_table(request_id)
+                    self._misses += 1
+                    return None, tokens
+
             self._hits += 1
             self._tokens_saved += len(matched_tokens)
 
@@ -818,6 +846,14 @@ class BlockAwarePrefixCache:
         """
         entry = self._request_tables.pop(request_id, None)
         if entry:
+            # Clean up non-KV states if this was the last reference
+            block_key = tuple(entry.block_table.block_ids)
+            other_uses = any(
+                tuple(e.block_table.block_ids) == block_key
+                for e in self._request_tables.values()
+            )
+            if not other_uses:
+                self._non_kv_states.pop(block_key, None)
             self.paged_cache.delete_block_table(request_id)
             logger.debug(f"Released cache for {request_id}")
 
@@ -1088,6 +1124,7 @@ class BlockAwarePrefixCache:
         """Clear all cached data."""
         self._request_tables.clear()
         self._prefix_index.clear()
+        self._non_kv_states.clear()
         self.paged_cache.clear()
         self.reset_stats()
 

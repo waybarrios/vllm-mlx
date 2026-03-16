@@ -257,3 +257,88 @@ class TestReconstructHybridCache:
         cache._non_kv_states.clear()
         result = cache.reconstruct_cache(bt)
         assert result is None
+
+
+# ---------------------------------------------------------------------------
+# Tests: fetch_cache with hybrid model prefix matching
+# ---------------------------------------------------------------------------
+
+class TestFetchHybridCache:
+    """Test fetch_cache with hybrid model prefix matching."""
+
+    @pytest.fixture
+    def cache(self):
+        mock_model = MagicMock()
+        from vllm_mlx.paged_cache import PagedCacheManager
+        paged = PagedCacheManager(block_size=64, max_blocks=100)
+        return BlockAwarePrefixCache(mock_model, paged)
+
+    def test_full_match_hybrid_no_crash(self, cache):
+        """Full prefix match with non-KV states does not crash."""
+        data = _make_hybrid_cache_data(n_total=8, attn_interval=4, seq_len=128)
+        tokens = list(range(128))
+        cache.store_cache("req-1", tokens, data)
+        # Same tokens — should not crash
+        bt, remaining = cache.fetch_cache("req-2", tokens)
+
+    def test_pure_kv_partial_match_no_crash(self, cache):
+        """Pure KV model: partial prefix does not crash."""
+        data = _make_pure_kv_cache_data(n_layers=4, seq_len=192)
+        tokens = list(range(192))
+        cache.store_cache("req-1", tokens, data)
+        shorter_tokens = list(range(128))
+        bt, remaining = cache.fetch_cache("req-2", shorter_tokens)
+
+    def test_cleanup_removes_non_kv_states(self, cache):
+        """release_cache cleans up non-KV states when no other request uses same blocks."""
+        data = _make_hybrid_cache_data(n_total=8, attn_interval=4, seq_len=128)
+        tokens = list(range(128))
+        cache.store_cache("req-1", tokens, data)
+        assert len(cache._non_kv_states) == 1
+        cache.release_cache("req-1")
+        assert len(cache._non_kv_states) == 0
+
+    def test_clear_removes_all_non_kv_states(self, cache):
+        """clear() removes all non-KV states."""
+        data = _make_hybrid_cache_data(n_total=8, attn_interval=4, seq_len=128)
+        cache.store_cache("req-1", list(range(128)), data)
+        cache.store_cache("req-2", list(range(64, 192)), data)
+        cache.clear()
+        assert len(cache._non_kv_states) == 0
+
+
+# ---------------------------------------------------------------------------
+# Tests: scheduler robustness in cache reconstruction
+# ---------------------------------------------------------------------------
+
+class TestSchedulerRobustness:
+    """Test scheduler cache reconstruction with non-KV layers."""
+
+    def test_from_state_works_for_both_cache_types(self):
+        """Both ArraysCache and KVCache can be reconstructed via from_state.
+
+        KVCache.meta_state is always "" (inherits _BaseCache which has no
+        meta_state). Only subclasses like RotatingKVCache define meta_state
+        as a tuple. The scheduler guard should handle non-4D state tensors.
+        """
+        arrays_state = {
+            "state": [mx.zeros((1, 3, 128)), mx.zeros((1, 8, 64, 64))],
+            "meta_state": "",
+            "class_name": "ArraysCache",
+            "class_ref": ArraysCache,
+        }
+        # KVCache.meta_state is "" (inherits _BaseCache), NOT a tuple
+        kv_state = {
+            "state": (mx.zeros((1, 4, 100, 32)), mx.zeros((1, 4, 100, 32))),
+            "meta_state": "",
+            "class_name": "KVCache",
+            "class_ref": KVCache,
+        }
+        extracted = [arrays_state, kv_state, arrays_state, kv_state]
+
+        for layer_state in extracted:
+            cls = layer_state["class_ref"]
+            state = layer_state["state"]
+            meta = layer_state.get("meta_state", "")
+            obj = cls.from_state(state, meta)
+            assert obj is not None
