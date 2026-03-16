@@ -419,6 +419,7 @@ class BlockCacheEntry:
     block_table: BlockTable
     cache_data: List[Any]  # Actual KV cache data per block
     last_access: float
+    has_non_kv: bool = False  # True if model has non-positional cache layers
 
 
 class BlockAwarePrefixCache:
@@ -476,6 +477,10 @@ class BlockAwarePrefixCache:
         self._hits = 0
         self._misses = 0
         self._tokens_saved = 0
+
+        # Non-KV layer states for hybrid models (SSM, linear attention).
+        # Keyed by tuple(block_ids) for lookup during reconstruction.
+        self._non_kv_states: Dict[Tuple[int, ...], NonKVCacheData] = {}
 
     def fetch_cache(
         self,
@@ -657,11 +662,36 @@ class BlockAwarePrefixCache:
         # Update prefix index
         self._update_prefix_index(tokens, block_table.block_ids)
 
+        # Extract and store non-KV layer states for hybrid models
+        has_non_kv = False
+        if is_tensor_data and cache_data:
+            non_kv_indices = []
+            non_kv_states_list = []
+            non_kv_meta_list = []
+            non_kv_refs = []
+            for idx, layer_state in enumerate(cache_data):
+                if not _is_kv_layer(layer_state):
+                    non_kv_indices.append(idx)
+                    non_kv_states_list.append(layer_state.get("state"))
+                    non_kv_meta_list.append(layer_state.get("meta_state"))
+                    non_kv_refs.append(layer_state.get("class_ref"))
+            if non_kv_indices:
+                has_non_kv = True
+                block_key = tuple(block_table.block_ids)
+                self._non_kv_states[block_key] = NonKVCacheData(
+                    layer_indices=non_kv_indices,
+                    states=non_kv_states_list,
+                    meta_states=non_kv_meta_list,
+                    class_refs=non_kv_refs,
+                    total_layers=len(cache_data),
+                )
+
         # Store entry for request (for legacy compatibility)
         self._request_tables[request_id] = BlockCacheEntry(
             block_table=block_table,
             cache_data=cache_data,
             last_access=time.time(),
+            has_non_kv=has_non_kv,
         )
 
         blocks_with_data = sum(
@@ -832,16 +862,17 @@ class BlockAwarePrefixCache:
         block_table: BlockTable,
     ) -> Optional[List[Any]]:
         """
-        Reconstruct KVCache objects from stored block tensor data.
+        Reconstruct cache objects from stored block tensor data.
 
-        This method concatenates tensor slices from all blocks and
-        creates new KVCache objects that can be used for inference.
+        For pure-KV models: concatenates KV block slices into KVCache objects.
+        For hybrid models: also restores non-KV layers (ArraysCache, etc.)
+        from stored whole-sequence state via from_state().
 
         Args:
             block_table: BlockTable containing block IDs to reconstruct from
 
         Returns:
-            List of reconstructed KVCache objects (one per layer),
+            List of reconstructed cache objects (one per layer),
             or None if reconstruction fails
         """
         if not block_table or not block_table.block_ids:
@@ -852,12 +883,18 @@ class BlockAwarePrefixCache:
             return None
 
         try:
+            # Check for non-KV states (hybrid model)
+            block_key = tuple(block_table.block_ids)
+            non_kv_data = self._non_kv_states.get(block_key)
+
             # Collect cache data from all blocks
             all_block_data = []
             for block_id in block_table.block_ids:
                 block = self.paged_cache.allocated_blocks.get(block_id)
                 if not block:
-                    logger.warning(f"Block {block_id} not found in allocated blocks")
+                    logger.warning(
+                        f"Block {block_id} not found in allocated blocks"
+                    )
                     return None
 
                 if block.cache_data is None:
@@ -874,69 +911,107 @@ class BlockAwarePrefixCache:
             if num_layers == 0:
                 return None
 
-            # Concatenate tensors for each layer
+            # If hybrid model but no non-KV states, can't reconstruct
+            if non_kv_data is not None and non_kv_data.total_layers != num_layers:
+                logger.warning(
+                    f"Layer count mismatch: blocks have {num_layers}, "
+                    f"non-KV data expects {non_kv_data.total_layers}"
+                )
+                return None
+
+            # Build set of non-KV layer indices for fast lookup
+            non_kv_idx_set = set()
+            if non_kv_data is not None:
+                non_kv_idx_set = set(non_kv_data.layer_indices)
+
+            # Check if any non-KV layers exist in the data but we have
+            # no stored states — indicates hybrid model with missing data
+            if not non_kv_data:
+                for layer_idx in range(num_layers):
+                    if all_block_data[0][layer_idx] is None:
+                        logger.debug(
+                            "Hybrid model detected but no non-KV states "
+                            "stored — cannot reconstruct"
+                        )
+                        return None
+
+            # Reconstruct each layer
             reconstructed_caches = []
 
             for layer_idx in range(num_layers):
-                layer_keys = []
-                layer_values = []
+                if layer_idx in non_kv_idx_set:
+                    # Non-KV layer: restore from stored whole-sequence state
+                    pos = non_kv_data.layer_indices.index(layer_idx)
+                    state = non_kv_data.states[pos]
+                    meta = non_kv_data.meta_states[pos]
+                    cls = non_kv_data.class_refs[pos]
 
-                for block_data in all_block_data:
-                    if layer_idx < len(block_data):
-                        keys_slice, values_slice = block_data[layer_idx]
-                        layer_keys.append(keys_slice)
-                        layer_values.append(values_slice)
+                    if cls is not None and hasattr(cls, "from_state"):
+                        cache_obj = cls.from_state(state, meta)
+                    else:
+                        logger.warning(
+                            f"No class_ref for non-KV layer {layer_idx}"
+                        )
+                        return None
 
-                if not layer_keys:
-                    continue
+                    reconstructed_caches.append(cache_obj)
+                else:
+                    # KV layer: concatenate block slices
+                    layer_keys = []
+                    layer_values = []
 
-                # Concatenate along sequence dimension (axis 2)
-                # Shape: (batch, n_kv_heads, seq_len, head_dim)
-                concat_keys = mx.concatenate(layer_keys, axis=2)
-                concat_values = mx.concatenate(layer_values, axis=2)
+                    for block_data in all_block_data:
+                        if layer_idx < len(block_data):
+                            entry = block_data[layer_idx]
+                            if entry is not None:
+                                keys_slice, values_slice = entry
+                                layer_keys.append(keys_slice)
+                                layer_values.append(values_slice)
 
-                # Create KVCache object
-                # Try to use mlx_lm's KVCache.from_state if available
-                try:
-                    from mlx_lm.models.cache import KVCache
+                    if not layer_keys:
+                        logger.debug(f"No KV data for layer {layer_idx}")
+                        return None
 
-                    # Create new cache and set its state
-                    cache = KVCache()
-                    seq_len = concat_keys.shape[2]
+                    # Concatenate along sequence dimension (axis 2)
+                    concat_keys = mx.concatenate(layer_keys, axis=2)
+                    concat_values = mx.concatenate(layer_values, axis=2)
 
-                    # Set internal state directly
-                    # KVCache stores keys/values and offset
-                    cache.keys = concat_keys
-                    cache.values = concat_values
-                    cache.offset = seq_len
+                    try:
+                        from mlx_lm.models.cache import KVCache
 
-                    reconstructed_caches.append(cache)
+                        cache_obj = KVCache()
+                        cache_obj.keys = concat_keys
+                        cache_obj.values = concat_values
+                        cache_obj.offset = concat_keys.shape[2]
+                        reconstructed_caches.append(cache_obj)
 
-                except ImportError:
-                    # Fallback: create a simple cache-like object
-                    class SimpleKVCache:
-                        def __init__(self, keys, values):
-                            self.keys = keys
-                            self.values = values
-                            self.offset = keys.shape[2]
+                    except ImportError:
+                        class SimpleKVCache:
+                            def __init__(self, keys, values):
+                                self.keys = keys
+                                self.values = values
+                                self.offset = keys.shape[2]
 
-                        @property
-                        def state(self):
-                            return (self.keys, self.values)
+                            @property
+                            def state(self):
+                                return (self.keys, self.values)
 
-                        @property
-                        def meta_state(self):
-                            return (str(self.offset),)
+                            @property
+                            def meta_state(self):
+                                return (str(self.offset),)
 
-                    cache = SimpleKVCache(concat_keys, concat_values)
-                    reconstructed_caches.append(cache)
+                        reconstructed_caches.append(
+                            SimpleKVCache(concat_keys, concat_values)
+                        )
 
             if not reconstructed_caches:
                 return None
 
             logger.debug(
-                f"Reconstructed cache: {len(reconstructed_caches)} layers, "
-                f"{block_table.num_tokens} tokens from {len(block_table.block_ids)} blocks"
+                f"Reconstructed cache: {len(reconstructed_caches)} layers "
+                f"({len(non_kv_idx_set)} non-KV), "
+                f"{block_table.num_tokens} tokens from "
+                f"{len(block_table.block_ids)} blocks"
             )
 
             return reconstructed_caches
