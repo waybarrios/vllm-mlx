@@ -1985,7 +1985,9 @@ async def stream_chat_completion(
                                         reasoning=reasoning_part,
                                         tool_calls=tool_result["tool_calls"],
                                     ),
-                                    finish_reason="tool_calls" if output.finished else None,
+                                    finish_reason=(
+                                        "tool_calls" if output.finished else None
+                                    ),
                                 )
                             ],
                             usage=get_usage(output) if output.finished else None,
