@@ -1487,7 +1487,16 @@ class Scheduler:
                     # Fallback: try KVCache manual reconstruction
                     from mlx_lm.models.cache import KVCache
 
-                    if len(state) != 2:
+                    if (
+                        not isinstance(state, (tuple, list))
+                        or len(state) != 2
+                        or not hasattr(state[0], "shape")
+                        or state[0].ndim != 4
+                    ):
+                        logger.debug(
+                            f"[mid_prefill_cache] skipping non-KV layer "
+                            f"(state type={type(state).__name__})"
+                        )
                         return None
                     cache = KVCache()
                     cache.keys, cache.values = state
