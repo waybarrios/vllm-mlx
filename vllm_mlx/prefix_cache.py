@@ -366,6 +366,42 @@ class BlockCacheEntry:
     last_access: float
 
 
+def _is_kv_cache_layer(layer_state: Dict[str, Any]) -> bool:
+    """
+    Check if a layer state represents a standard KV cache (vs ArraysCache/MambaCache).
+
+    KV cache layers have a 2-element tuple state of (keys, values) tensors,
+    suitable for sequence-position slicing. Non-KV layers (ArraysCache for
+    SSM/linear-attention, MambaCache, etc.) have cumulative state that cannot
+    be split into sequence-position blocks.
+
+    Args:
+        layer_state: Dict with 'state', 'class_name', 'class_ref' from
+                     _extract_cache_states()
+
+    Returns:
+        True if the layer is a KV cache suitable for block-level slicing
+    """
+    class_name = layer_state.get("class_name", "")
+
+    # Known KV cache types
+    if class_name in ("KVCache", "BatchKVCache", "ConcatenateKVCache", "ChunkedKVCache"):
+        return True
+
+    # Known non-KV cache types (cumulative state, not sequence-indexed)
+    if class_name in ("ArraysCache", "MambaCache", "BatchMambaCache"):
+        return False
+
+    # Structural fallback: KV cache state is a tuple of exactly 2 tensors
+    state = layer_state.get("state")
+    if isinstance(state, tuple) and len(state) == 2:
+        k, v = state
+        if hasattr(k, "ndim") and hasattr(v, "ndim"):
+            return k.ndim >= 3 and v.ndim >= 3
+
+    return False
+
+
 class BlockAwarePrefixCache:
     """
     Prefix cache that uses PagedCacheManager for block-based storage.
@@ -416,6 +452,13 @@ class BlockAwarePrefixCache:
 
         # Request to block table mapping
         self._request_tables: Dict[str, BlockCacheEntry] = {}
+
+        # Non-KV layer states for hybrid models (e.g. Qwen3.5 with
+        # mixed attention + GatedDeltaNet layers). Non-KV layers (ArraysCache,
+        # MambaCache) have cumulative state that can't be split into blocks,
+        # so we store the full state per prefix for exact-match reconstruction.
+        # Key: tuple of block IDs; Value: list of (layer_idx, state_dict).
+        self._non_kv_layer_states: Dict[tuple, List[Tuple[int, Dict[str, Any]]]] = {}
 
         # Statistics
         self._hits = 0
@@ -602,6 +645,26 @@ class BlockAwarePrefixCache:
         # Update prefix index
         self._update_prefix_index(tokens, block_table.block_ids)
 
+        # Store non-KV layer states for hybrid models (ArraysCache, MambaCache, etc.)
+        # These layers have cumulative state that can't be split into blocks, so
+        # we store the full state per prefix for exact-match reconstruction.
+        # Deep-copy the state to prevent mutation by continued generation.
+        if is_tensor_data:
+            non_kv_states = []
+            for layer_idx, layer_state in enumerate(cache_data):
+                if "state" in layer_state and not _is_kv_cache_layer(layer_state):
+                    non_kv_states.append((
+                        layer_idx,
+                        {**layer_state, "state": copy.deepcopy(layer_state["state"])},
+                    ))
+            if non_kv_states:
+                block_key = tuple(block_table.block_ids)
+                self._non_kv_layer_states[block_key] = non_kv_states
+                logger.debug(
+                    f"Stored {len(non_kv_states)} non-KV layer states for "
+                    f"{request_id} (block key: {len(block_key)} blocks)"
+                )
+
         # Store entry for request (for legacy compatibility)
         self._request_tables[request_id] = BlockCacheEntry(
             block_table=block_table,
@@ -629,17 +692,23 @@ class BlockAwarePrefixCache:
         cache_data: List[Dict[str, Any]],
         start_idx: int,
         end_idx: int,
-    ) -> Optional[List[Tuple[Any, Any]]]:
+    ) -> Optional[List[Any]]:
         """
         Extract tensor slices for a single block from cache data.
 
+        For KV cache layers (standard attention), slices the key/value tensors
+        along the sequence dimension. For non-KV layers (ArraysCache, MambaCache,
+        etc.), stores None as a placeholder since their cumulative state cannot
+        be decomposed into sequence-position blocks.
+
         Args:
-            cache_data: List of layer states, each containing 'state': (keys, values)
+            cache_data: List of layer states, each containing 'state' and 'class_name'
             start_idx: Start token index in the sequence
             end_idx: End token index in the sequence
 
         Returns:
-            List of (keys_slice, values_slice) for each layer, or None on failure
+            List of (keys_slice, values_slice) or None per layer, or None on failure.
+            None entries mark non-KV layers that are stored separately.
         """
         if not HAS_MLX or not cache_data:
             return None
@@ -648,32 +717,50 @@ class BlockAwarePrefixCache:
             block_slices = []
             for layer_state in cache_data:
                 if "state" not in layer_state:
+                    block_slices.append(None)
+                    continue
+
+                # Skip non-KV layers — their state is cumulative, not
+                # sequence-indexed, so block-level slicing doesn't apply
+                if not _is_kv_cache_layer(layer_state):
+                    block_slices.append(None)
                     continue
 
                 keys, values = layer_state["state"]
 
-                # KV cache shape: (batch, n_kv_heads, seq_len, head_dim)
-                # Slice along seq_len dimension (axis 2)
-                seq_len = keys.shape[2] if hasattr(keys, "shape") else 0
+                # KV cache shape varies by model architecture:
+                #   4D: (batch, n_kv_heads, seq_len, head_dim) — most models
+                #   3D: (n_kv_heads, seq_len, head_dim)        — e.g. Qwen3.5
+                # Determine the sequence dimension dynamically
+                shape = getattr(keys, "shape", None)
+                if shape is None or len(shape) < 3:
+                    block_slices.append(None)
+                    continue
 
+                ndim = len(shape)
+                seq_axis = ndim - 2  # seq_len is always second-to-last
+                seq_len = shape[seq_axis]
+
+                actual_end = min(end_idx, seq_len)
                 if end_idx > seq_len:
-                    # Requested range extends beyond available data
                     logger.debug(
                         f"Block slice [{start_idx}:{end_idx}] exceeds seq_len {seq_len}"
                     )
-                    # Use whatever is available
-                    actual_end = min(end_idx, seq_len)
-                    if start_idx >= actual_end:
-                        continue
-                    keys_slice = keys[:, :, start_idx:actual_end, :]
-                    values_slice = values[:, :, start_idx:actual_end, :]
-                else:
-                    keys_slice = keys[:, :, start_idx:end_idx, :]
-                    values_slice = values[:, :, start_idx:end_idx, :]
+                if start_idx >= actual_end:
+                    block_slices.append(None)
+                    continue
+
+                # Build dynamic slice for any dimensionality
+                slices = tuple(
+                    slice(start_idx, actual_end) if i == seq_axis else slice(None)
+                    for i in range(ndim)
+                )
+                keys_slice = keys[slices]
+                values_slice = values[slices]
 
                 block_slices.append((keys_slice, values_slice))
 
-            return block_slices if block_slices else None
+            return block_slices if any(s is not None for s in block_slices) else None
 
         except Exception as e:
             logger.warning(f"Failed to extract block tensor slice: {e}")
@@ -714,11 +801,27 @@ class BlockAwarePrefixCache:
         """
         Release cache blocks for a completed request.
 
+        Also cleans up non-KV layer states if no other request shares
+        the same block sequence.
+
         Args:
             request_id: Request identifier
         """
         entry = self._request_tables.pop(request_id, None)
         if entry:
+            # Clean up non-KV states if blocks will be freed
+            block_key = tuple(entry.block_table.block_ids)
+            if block_key in self._non_kv_layer_states:
+                # Check if all blocks will drop to ref_count 0
+                all_freeable = all(
+                    (block := self.paged_cache.allocated_blocks.get(bid))
+                    is not None
+                    and block.ref_count <= 1
+                    for bid in entry.block_table.block_ids
+                )
+                if all_freeable:
+                    del self._non_kv_layer_states[block_key]
+
             self.paged_cache.delete_block_table(request_id)
             logger.debug(f"Released cache for {request_id}")
 
@@ -754,6 +857,13 @@ class BlockAwarePrefixCache:
             last_access=time.time(),
         )
 
+        # Propagate non-KV states if the forked block table has different IDs
+        # (COW may copy blocks, changing IDs)
+        source_key = tuple(source_entry.block_table.block_ids)
+        forked_key = tuple(forked_table.block_ids)
+        if source_key in self._non_kv_layer_states and forked_key != source_key:
+            self._non_kv_layer_states[forked_key] = self._non_kv_layer_states[source_key]
+
         logger.debug(f"Forked cache: {source_request_id} -> {new_request_id}")
 
         return forked_table
@@ -763,16 +873,23 @@ class BlockAwarePrefixCache:
         block_table: BlockTable,
     ) -> Optional[List[Any]]:
         """
-        Reconstruct KVCache objects from stored block tensor data.
+        Reconstruct cache objects from stored block tensor data.
 
-        This method concatenates tensor slices from all blocks and
-        creates new KVCache objects that can be used for inference.
+        For KV cache layers (standard attention), concatenates tensor slices
+        from all blocks and creates KVCache objects. For non-KV layers
+        (ArraysCache, MambaCache, etc.), restores the full cumulative state
+        from stored non-KV layer data.
+
+        Hybrid models (e.g. Qwen3.5 with mixed attention + GatedDeltaNet)
+        require both KV and non-KV layer states to produce correct output.
+        If non-KV states are not available for the requested block sequence,
+        the method returns None to avoid incorrect model behavior.
 
         Args:
             block_table: BlockTable containing block IDs to reconstruct from
 
         Returns:
-            List of reconstructed KVCache objects (one per layer),
+            List of reconstructed cache objects (one per layer),
             or None if reconstruction fails
         """
         if not block_table or not block_table.block_ids:
@@ -805,15 +922,64 @@ class BlockAwarePrefixCache:
             if num_layers == 0:
                 return None
 
-            # Concatenate tensors for each layer
+            # Look up non-KV layer states for this block sequence.
+            # Non-KV states are only valid for exact block-sequence matches
+            # because they represent cumulative state for a specific token
+            # sequence, not decomposable blocks.
+            block_key = tuple(block_table.block_ids)
+            non_kv_entries = self._non_kv_layer_states.get(block_key, [])
+            non_kv_by_idx = {idx: state for idx, state in non_kv_entries}
+            has_non_kv_layers = any(
+                all_block_data[0][i] is None for i in range(num_layers)
+            )
+
+            if has_non_kv_layers and not non_kv_by_idx:
+                # Hybrid model but no stored non-KV states for this exact
+                # block sequence. Non-KV (SSM) state is cumulative and only
+                # valid for the exact token sequence that produced it — we
+                # cannot reuse states from a longer/different sequence.
+                logger.debug(
+                    f"Cannot reconstruct hybrid cache: no non-KV states "
+                    f"for block key with {len(block_key)} blocks"
+                )
+                return None
+
+            # Reconstruct each layer
             reconstructed_caches = []
 
             for layer_idx in range(num_layers):
+                # Check if this is a non-KV layer (None entries in block data)
+                if all_block_data[0][layer_idx] is None:
+                    # Non-KV layer — restore from stored full state
+                    if layer_idx not in non_kv_by_idx:
+                        logger.debug(
+                            f"Missing non-KV state for layer {layer_idx}"
+                        )
+                        return None
+
+                    layer_state = non_kv_by_idx[layer_idx]
+                    state = layer_state.get("state")
+                    meta_state = layer_state.get("meta_state")
+                    cache_cls = layer_state.get("class_ref")
+
+                    if cache_cls is not None and hasattr(cache_cls, "from_state"):
+                        cache = cache_cls.from_state(state, meta_state)
+                    else:
+                        logger.debug(
+                            f"Cannot reconstruct non-KV layer {layer_idx}: "
+                            f"no from_state on {layer_state.get('class_name')}"
+                        )
+                        return None
+
+                    reconstructed_caches.append(cache)
+                    continue
+
+                # KV layer — concatenate slices from all blocks
                 layer_keys = []
                 layer_values = []
 
                 for block_data in all_block_data:
-                    if layer_idx < len(block_data):
+                    if layer_idx < len(block_data) and block_data[layer_idx] is not None:
                         keys_slice, values_slice = block_data[layer_idx]
                         layer_keys.append(keys_slice)
                         layer_values.append(values_slice)
@@ -821,35 +987,31 @@ class BlockAwarePrefixCache:
                 if not layer_keys:
                     continue
 
-                # Concatenate along sequence dimension (axis 2)
-                # Shape: (batch, n_kv_heads, seq_len, head_dim)
-                concat_keys = mx.concatenate(layer_keys, axis=2)
-                concat_values = mx.concatenate(layer_values, axis=2)
+                # Concatenate along sequence dimension
+                # Shape varies: 4D (batch, heads, seq, dim) or 3D (heads, seq, dim)
+                ndim = layer_keys[0].ndim
+                seq_axis = ndim - 2  # seq_len is always second-to-last
+                concat_keys = mx.concatenate(layer_keys, axis=seq_axis)
+                concat_values = mx.concatenate(layer_values, axis=seq_axis)
 
                 # Create KVCache object
-                # Try to use mlx_lm's KVCache.from_state if available
                 try:
                     from mlx_lm.models.cache import KVCache
 
-                    # Create new cache and set its state
                     cache = KVCache()
-                    seq_len = concat_keys.shape[2]
-
-                    # Set internal state directly
-                    # KVCache stores keys/values and offset
                     cache.keys = concat_keys
                     cache.values = concat_values
-                    cache.offset = seq_len
+                    cache.offset = concat_keys.shape[seq_axis]
 
                     reconstructed_caches.append(cache)
 
                 except ImportError:
-                    # Fallback: create a simple cache-like object
                     class SimpleKVCache:
                         def __init__(self, keys, values):
                             self.keys = keys
                             self.values = values
-                            self.offset = keys.shape[2]
+                            ndim = keys.ndim
+                            self.offset = keys.shape[ndim - 2]
 
                         @property
                         def state(self):
@@ -944,6 +1106,7 @@ class BlockAwarePrefixCache:
         """Clear all cached data."""
         self._request_tables.clear()
         self._prefix_index.clear()
+        self._non_kv_layer_states.clear()
         self.paged_cache.clear()
         self.reset_stats()
 
