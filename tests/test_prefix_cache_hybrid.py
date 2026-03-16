@@ -26,6 +26,7 @@ pytestmark = pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
 # Helpers
 # ---------------------------------------------------------------------------
 
+
 def _make_kv_state(seq_len=64, n_kv_heads=4, head_dim=32):
     """Simulate a KVCache layer_state dict (4D tensors)."""
     keys = mx.zeros((1, n_kv_heads, seq_len, head_dim))
@@ -74,6 +75,7 @@ def _make_pure_kv_cache_data(n_layers=32, seq_len=128):
 # Tests: Layer Classification
 # ---------------------------------------------------------------------------
 
+
 class TestIsKVLayer:
     def test_kvcache_is_kv(self):
         assert _is_kv_layer({"class_name": "KVCache"}) is True
@@ -107,6 +109,7 @@ class TestExtractBlockTensorSlice:
     def cache(self):
         mock_model = MagicMock()
         from vllm_mlx.paged_cache import PagedCacheManager
+
         paged = PagedCacheManager(block_size=64, max_blocks=100)
         return BlockAwarePrefixCache(mock_model, paged)
 
@@ -161,6 +164,7 @@ class TestExtractBlockTensorSlice:
 # Tests: store_cache with hybrid model cache data
 # ---------------------------------------------------------------------------
 
+
 class TestStoreHybridCache:
     """Test store_cache with hybrid model cache data."""
 
@@ -168,6 +172,7 @@ class TestStoreHybridCache:
     def cache(self):
         mock_model = MagicMock()
         from vllm_mlx.paged_cache import PagedCacheManager
+
         paged = PagedCacheManager(block_size=64, max_blocks=100)
         return BlockAwarePrefixCache(mock_model, paged)
 
@@ -211,6 +216,7 @@ class TestStoreHybridCache:
 # Tests: reconstruct_cache with hybrid model cache data
 # ---------------------------------------------------------------------------
 
+
 class TestReconstructHybridCache:
     """Test reconstruct_cache with hybrid model cache data."""
 
@@ -218,6 +224,7 @@ class TestReconstructHybridCache:
     def cache(self):
         mock_model = MagicMock()
         from vllm_mlx.paged_cache import PagedCacheManager
+
         paged = PagedCacheManager(block_size=64, max_blocks=100)
         return BlockAwarePrefixCache(mock_model, paged)
 
@@ -263,6 +270,7 @@ class TestReconstructHybridCache:
 # Tests: fetch_cache with hybrid model prefix matching
 # ---------------------------------------------------------------------------
 
+
 class TestFetchHybridCache:
     """Test fetch_cache with hybrid model prefix matching."""
 
@@ -270,6 +278,7 @@ class TestFetchHybridCache:
     def cache(self):
         mock_model = MagicMock()
         from vllm_mlx.paged_cache import PagedCacheManager
+
         paged = PagedCacheManager(block_size=64, max_blocks=100)
         return BlockAwarePrefixCache(mock_model, paged)
 
@@ -310,6 +319,7 @@ class TestFetchHybridCache:
 # ---------------------------------------------------------------------------
 # Tests: scheduler robustness in cache reconstruction
 # ---------------------------------------------------------------------------
+
 
 class TestSchedulerRobustness:
     """Test scheduler cache reconstruction with non-KV layers."""
