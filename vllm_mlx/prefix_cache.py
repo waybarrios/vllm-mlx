@@ -69,15 +69,17 @@ class PrefixCacheStats:
 # Known KV cache class names — positional caches that can be block-sliced
 # along the sequence dimension (axis=2). All produce 4D tensors:
 # (batch, n_kv_heads, seq_len, head_dim).
-_KV_CACHE_CLASSES = frozenset({
-    "KVCache",
-    "RotatingKVCache",
-    "QuantizedKVCache",
-    "ChunkedKVCache",
-    "ConcatenateKVCache",
-    "BatchKVCache",
-    "BatchRotatingKVCache",
-})
+_KV_CACHE_CLASSES = frozenset(
+    {
+        "KVCache",
+        "RotatingKVCache",
+        "QuantizedKVCache",
+        "ChunkedKVCache",
+        "ConcatenateKVCache",
+        "BatchKVCache",
+        "BatchRotatingKVCache",
+    }
+)
 
 
 def _is_kv_layer(layer_state: dict) -> bool:
@@ -928,9 +930,7 @@ class BlockAwarePrefixCache:
             for block_id in block_table.block_ids:
                 block = self.paged_cache.allocated_blocks.get(block_id)
                 if not block:
-                    logger.warning(
-                        f"Block {block_id} not found in allocated blocks"
-                    )
+                    logger.warning(f"Block {block_id} not found in allocated blocks")
                     return None
 
                 if block.cache_data is None:
@@ -985,9 +985,7 @@ class BlockAwarePrefixCache:
                     if cls is not None and hasattr(cls, "from_state"):
                         cache_obj = cls.from_state(state, meta)
                     else:
-                        logger.warning(
-                            f"No class_ref for non-KV layer {layer_idx}"
-                        )
+                        logger.warning(f"No class_ref for non-KV layer {layer_idx}")
                         return None
 
                     reconstructed_caches.append(cache_obj)
@@ -1022,6 +1020,7 @@ class BlockAwarePrefixCache:
                         reconstructed_caches.append(cache_obj)
 
                     except ImportError:
+
                         class SimpleKVCache:
                             def __init__(self, keys, values):
                                 self.keys = keys
