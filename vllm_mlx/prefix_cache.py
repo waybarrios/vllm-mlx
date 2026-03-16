@@ -889,6 +889,7 @@ class BlockAwarePrefixCache:
             block_table=forked_table,
             cache_data=source_entry.cache_data,  # Shared reference
             last_access=time.time(),
+            has_non_kv=source_entry.has_non_kv,
         )
 
         logger.debug(f"Forked cache: {source_request_id} -> {new_request_id}")
@@ -971,13 +972,21 @@ class BlockAwarePrefixCache:
                         )
                         return None
 
+            # Build layer_idx → position mapping for O(1) lookup
+            non_kv_pos_map = {}
+            if non_kv_data is not None:
+                non_kv_pos_map = {
+                    idx: pos
+                    for pos, idx in enumerate(non_kv_data.layer_indices)
+                }
+
             # Reconstruct each layer
             reconstructed_caches = []
 
             for layer_idx in range(num_layers):
                 if layer_idx in non_kv_idx_set:
                     # Non-KV layer: restore from stored whole-sequence state
-                    pos = non_kv_data.layer_indices.index(layer_idx)
+                    pos = non_kv_pos_map[layer_idx]
                     state = non_kv_data.states[pos]
                     meta = non_kv_data.meta_states[pos]
                     cls = non_kv_data.class_refs[pos]
