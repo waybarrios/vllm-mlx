@@ -66,6 +66,50 @@ class PrefixCacheStats:
         }
 
 
+# Known KV cache class names — positional caches that can be block-sliced
+# along the sequence dimension (axis=2). All produce 4D tensors:
+# (batch, n_kv_heads, seq_len, head_dim).
+_KV_CACHE_CLASSES = frozenset({
+    "KVCache",
+    "RotatingKVCache",
+    "QuantizedKVCache",
+    "ChunkedKVCache",
+    "ConcatenateKVCache",
+    "BatchKVCache",
+    "BatchRotatingKVCache",
+})
+
+
+def _is_kv_layer(layer_state: dict) -> bool:
+    """Check if a layer state dict represents a positional KV cache layer.
+
+    Args:
+        layer_state: Dict from _extract_cache_states() containing
+            'class_name', 'state', 'meta_state', 'class_ref'.
+
+    Returns:
+        True if the layer is a KV cache that can be sliced along seq_len.
+    """
+    return layer_state.get("class_name", "") in _KV_CACHE_CLASSES
+
+
+@dataclass
+class NonKVCacheData:
+    """Full state for non-positional cache layers (SSM, linear attention).
+
+    Hybrid models (Qwen 3.5, Nemotron) have layers that use ArraysCache
+    instead of KVCache. These store cumulative state (conv + recurrent)
+    that cannot be sliced into blocks. This dataclass stores the full
+    state for reconstruction alongside block-sliced KV layers.
+    """
+
+    layer_indices: List[int]  # Position in the full layer list
+    states: List[Any]  # From cache.state for each non-KV layer
+    meta_states: List[Any]  # From cache.meta_state for each non-KV layer
+    class_refs: List[Any]  # type refs for from_state() reconstruction
+    total_layers: int  # Total layer count (KV + non-KV)
+
+
 class PrefixCacheManager:
     """
     Manages prefix caching for vllm-mlx using a trie-based LRU cache.
@@ -640,25 +684,39 @@ class BlockAwarePrefixCache:
         cache_data: List[Dict[str, Any]],
         start_idx: int,
         end_idx: int,
-    ) -> Optional[List[Tuple[Any, Any]]]:
+    ) -> Optional[List[Optional[Tuple[Any, Any]]]]:
         """
         Extract tensor slices for a single block from cache data.
 
+        For KV cache layers (positional), slices keys/values along the
+        sequence dimension. For non-KV layers (ArraysCache, etc.),
+        returns None at that position — these are stored separately
+        by store_cache() as whole-sequence state.
+
         Args:
-            cache_data: List of layer states, each containing 'state': (keys, values)
+            cache_data: List of layer states from _extract_cache_states()
             start_idx: Start token index in the sequence
             end_idx: End token index in the sequence
 
         Returns:
-            List of (keys_slice, values_slice) for each layer, or None on failure
+            List with one entry per layer:
+            - (keys_slice, values_slice) for KV layers
+            - None for non-KV layers
+            Returns None only on complete failure.
         """
         if not HAS_MLX or not cache_data:
             return None
 
         try:
-            block_slices = []
+            block_slices: List[Optional[Tuple[Any, Any]]] = []
             for layer_state in cache_data:
                 if "state" not in layer_state:
+                    block_slices.append(None)
+                    continue
+
+                # Skip non-KV layers — they can't be block-sliced
+                if not _is_kv_layer(layer_state):
+                    block_slices.append(None)
                     continue
 
                 keys, values = layer_state["state"]
@@ -668,13 +726,9 @@ class BlockAwarePrefixCache:
                 seq_len = keys.shape[2] if hasattr(keys, "shape") else 0
 
                 if end_idx > seq_len:
-                    # Requested range extends beyond available data
-                    logger.debug(
-                        f"Block slice [{start_idx}:{end_idx}] exceeds seq_len {seq_len}"
-                    )
-                    # Use whatever is available
                     actual_end = min(end_idx, seq_len)
                     if start_idx >= actual_end:
+                        block_slices.append(None)
                         continue
                     keys_slice = keys[:, :, start_idx:actual_end, :]
                     values_slice = values[:, :, start_idx:actual_end, :]
@@ -684,7 +738,11 @@ class BlockAwarePrefixCache:
 
                 block_slices.append((keys_slice, values_slice))
 
-            return block_slices if block_slices else None
+            # Return None only if no layers produced data at all
+            if all(s is None for s in block_slices):
+                return None
+
+            return block_slices
 
         except Exception as e:
             logger.warning(f"Failed to extract block tensor slice: {e}")
