@@ -468,6 +468,7 @@ def load_model(
     max_tokens: int = 32768,
     force_mllm: bool = False,
     mtp: bool = False,
+    prefill_step_size: int = 2048,
 ):
     """
     Load a model (auto-detects MLLM vs LLM).
@@ -480,6 +481,7 @@ def load_model(
         max_tokens: Default max tokens for generation
         force_mllm: Force loading as MLLM even if not auto-detected
         mtp: Enable native MTP speculative decoding (SimpleEngine only)
+        prefill_step_size: Chunk size for prompt prefill processing (default: 2048)
     """
     global _engine, _model_name, _default_max_tokens, _tool_parser_instance
 
@@ -504,7 +506,12 @@ def load_model(
         logger.info(f"Model loaded (batched mode): {model_name}")
     else:
         logger.info(f"Loading model with SimpleEngine: {model_name}")
-        _engine = SimpleEngine(model_name=model_name, force_mllm=force_mllm, mtp=mtp)
+        _engine = SimpleEngine(
+            model_name=model_name,
+            force_mllm=force_mllm,
+            mtp=mtp,
+            prefill_step_size=prefill_step_size,
+        )
         # Start SimpleEngine synchronously (no background loop)
         # Use new_event_loop() for Python 3.10+ compatibility (get_event_loop() is deprecated)
         loop = asyncio.new_event_loop()

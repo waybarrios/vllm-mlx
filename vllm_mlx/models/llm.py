@@ -51,6 +51,7 @@ class MLXLanguageModel:
         tokenizer_name: str | None = None,
         trust_remote_code: bool = False,
         mtp: bool = False,
+        prefill_step_size: int = 2048,
     ):
         """
         Initialize the MLX language model.
@@ -60,11 +61,13 @@ class MLXLanguageModel:
             tokenizer_name: Optional separate tokenizer name
             trust_remote_code: Whether to trust remote code
             mtp: Enable native MTP speculative decoding (model must have MTP head)
+            prefill_step_size: Chunk size for prompt prefill processing (default: 2048)
         """
         self.model_name = model_name
         self.tokenizer_name = tokenizer_name or model_name
         self.trust_remote_code = trust_remote_code
         self._mtp = mtp
+        self._prefill_step_size = prefill_step_size
 
         self.model = None
         self.tokenizer = None
@@ -206,9 +209,9 @@ class MLXLanguageModel:
         token_count = 0
         accumulated_text = ""
 
-        mtp_kwargs = {}
+        gen_kwargs = {"prefill_step_size": self._prefill_step_size}
         if self._mtp:
-            mtp_kwargs["mtp"] = True
+            gen_kwargs["mtp"] = True
 
         for response in stream_generate(
             self.model,
@@ -216,7 +219,7 @@ class MLXLanguageModel:
             prompt=prompt,
             max_tokens=max_tokens,
             sampler=sampler,
-            **mtp_kwargs,
+            **gen_kwargs,
         ):
             token_count += 1
             # response.text is the new token text (not accumulated)

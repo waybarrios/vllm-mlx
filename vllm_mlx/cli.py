@@ -178,6 +178,8 @@ def serve_command(args):
             print(f"Prefix cache: max_entries={args.prefix_cache_size}")
     else:
         print("Mode: Simple (maximum throughput)")
+        if args.prefill_step_size != 2048:
+            print(f"Prefill step size: {args.prefill_step_size}")
         if args.enable_mtp:
             print("MTP: enabled (native speculative decoding)")
         if args.enable_mtp and getattr(args, "mllm", False):
@@ -192,6 +194,7 @@ def serve_command(args):
         max_tokens=args.max_tokens,
         force_mllm=args.mllm,
         mtp=args.enable_mtp,
+        prefill_step_size=args.prefill_step_size,
     )
 
     # Start server
@@ -732,6 +735,13 @@ Examples:
         default=False,
         help="Skip MTP acceptance check for maximum speed. "
         "~5-10%% wrong tokens. Best for chat, not for code.",
+    )
+    serve_parser.add_argument(
+        "--prefill-step-size",
+        type=int,
+        default=2048,
+        help="Chunk size for prompt prefill processing. Larger values use more memory "
+        "but can improve prefill throughput. (default: 2048)",
     )
     # MCP options
     serve_parser.add_argument(

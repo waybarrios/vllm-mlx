@@ -56,6 +56,7 @@ class SimpleEngine(BaseEngine):
         enable_cache: bool = True,
         force_mllm: bool = False,
         mtp: bool = False,
+        prefill_step_size: int = 2048,
     ):
         """
         Initialize the simple engine.
@@ -66,12 +67,14 @@ class SimpleEngine(BaseEngine):
             enable_cache: Enable VLM cache for multimodal models
             force_mllm: Force loading as MLLM even if not auto-detected
             mtp: Enable native MTP speculative decoding (model must have MTP head)
+            prefill_step_size: Chunk size for prompt prefill processing (default: 2048)
         """
         self._model_name = model_name
         self._trust_remote_code = trust_remote_code
         self._enable_cache = enable_cache
         self._is_mllm = force_mllm or is_mllm_model(model_name)
         self._mtp = mtp
+        self._prefill_step_size = prefill_step_size
 
         self._model = None
         self._loaded = False
@@ -122,6 +125,7 @@ class SimpleEngine(BaseEngine):
                 self._model_name,
                 trust_remote_code=self._trust_remote_code,
                 mtp=self._mtp,
+                prefill_step_size=self._prefill_step_size,
             )
 
         self._model.load()
@@ -571,6 +575,7 @@ class SimpleEngine(BaseEngine):
                     max_tokens=max_tokens,
                     sampler=sampler,
                     mtp=True,
+                    prefill_step_size=self._prefill_step_size,
                 ):
                     results.append(resp)
                 return results
