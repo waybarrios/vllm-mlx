@@ -371,6 +371,14 @@ def _parse_tool_calls_with_parser(
 
     request_dict = request.model_dump() if request else None
 
+    # tool_choice="none" means never return tool calls — skip all parsing
+    if request is not None:
+        tool_choice = getattr(request, "tool_choice", None)
+        if tool_choice is None and request_dict:
+            tool_choice = request_dict.get("tool_choice")
+        if tool_choice == "none":
+            return output_text, None
+
     # If auto tool choice is not enabled, use the generic parser
     if not _enable_auto_tool_choice or not _tool_call_parser:
         return parse_tool_calls(output_text, request_dict)
@@ -1422,7 +1430,7 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
         chat_kwargs["specprefill_keep_pct"] = request.specprefill_keep_pct
 
     # Add tools if provided
-    if request.tools:
+    if request.tools and request.tool_choice != "none":
         chat_kwargs["tools"] = convert_tools_for_template(request.tools)
 
     if request.stream:
@@ -1600,7 +1608,7 @@ async def create_anthropic_message(
         "top_p": openai_request.top_p,
     }
 
-    if openai_request.tools:
+    if openai_request.tools and openai_request.tool_choice != "none":
         chat_kwargs["tools"] = convert_tools_for_template(openai_request.tools)
 
     start_time = time.perf_counter()
@@ -1757,7 +1765,7 @@ async def _stream_anthropic_messages(
         "top_p": openai_request.top_p,
     }
 
-    if openai_request.tools:
+    if openai_request.tools and openai_request.tool_choice != "none":
         chat_kwargs["tools"] = convert_tools_for_template(openai_request.tools)
 
     # Emit message_start
@@ -1961,7 +1969,8 @@ async def stream_chat_completion(
     tool_accumulated_text = ""
     tool_calls_detected = False
     tool_markup_possible = False  # Fast path: skip parsing until '<' seen
-    if _enable_auto_tool_choice and _tool_call_parser:
+    tool_choice = getattr(request, "tool_choice", None)
+    if _enable_auto_tool_choice and _tool_call_parser and tool_choice != "none":
         # Initialize parser if needed (same as _parse_tool_calls_with_parser)
         if _tool_parser_instance is None:
             try:
