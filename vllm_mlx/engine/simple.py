@@ -18,6 +18,29 @@ from .base import BaseEngine, GenerationOutput
 logger = logging.getLogger(__name__)
 
 
+_MEDIA_TYPES = frozenset(
+    {
+        "image_url",
+        "video_url",
+        "audio_url",
+        "image",
+        "video",
+        "audio",
+    }
+)
+
+
+def _has_media_content(messages: list) -> bool:
+    """Check if any message contains media content (images, video, audio)."""
+    for msg in messages:
+        content = msg.get("content")
+        if isinstance(content, list):
+            for part in content:
+                if isinstance(part, dict) and part.get("type") in _MEDIA_TYPES:
+                    return True
+    return False
+
+
 class SimpleEngine(BaseEngine):
     """
     Simple engine for direct model calls.
@@ -32,6 +55,7 @@ class SimpleEngine(BaseEngine):
         trust_remote_code: bool = True,
         enable_cache: bool = True,
         force_mllm: bool = False,
+        mtp: bool = False,
     ):
         """
         Initialize the simple engine.
@@ -41,14 +65,20 @@ class SimpleEngine(BaseEngine):
             trust_remote_code: Whether to trust remote code
             enable_cache: Enable VLM cache for multimodal models
             force_mllm: Force loading as MLLM even if not auto-detected
+            mtp: Enable native MTP speculative decoding (model must have MTP head)
         """
         self._model_name = model_name
         self._trust_remote_code = trust_remote_code
         self._enable_cache = enable_cache
         self._is_mllm = force_mllm or is_mllm_model(model_name)
+        self._mtp = mtp
 
         self._model = None
         self._loaded = False
+
+        # Per-request routing state (MLLM+MTP mode)
+        self._text_model = None
+        self._text_tokenizer = None
 
         # Lock to serialize MLX operations (prevents Metal command buffer conflicts)
         self._generation_lock = asyncio.Lock()
@@ -91,11 +121,54 @@ class SimpleEngine(BaseEngine):
             self._model = MLXLanguageModel(
                 self._model_name,
                 trust_remote_code=self._trust_remote_code,
+                mtp=self._mtp,
             )
 
         self._model.load()
         self._loaded = True
-        logger.info(f"SimpleEngine loaded: {self._model_name} (MLLM={self._is_mllm})")
+
+        # Build parallel mlx_lm TextModel for text-only MTP routing
+        if self._is_mllm and self._mtp:
+            try:
+                from ..text_model_from_vlm import build_text_model
+
+                self._text_model = build_text_model(self._model.model, self._model_name)
+
+                if (
+                    self._text_model is not None
+                    and hasattr(self._text_model, "mtp")
+                    and self._text_model.mtp is not None
+                ):
+                    self._text_tokenizer = self._model.get_tokenizer()
+
+                    # Apply Qwen3.5 eos_token fix (matches MLXLanguageModel.load)
+                    if "qwen3" in self._model_name.lower():
+                        self._text_tokenizer.eos_token = "<|im_end|>"
+                        self._text_tokenizer.eos_token_id = (
+                            self._text_tokenizer.convert_tokens_to_ids("<|im_end|>")
+                        )
+
+                    logger.info(
+                        "MLLM+MTP routing: text-only → mlx_lm TextModel (MTP=True), "
+                        "media → mlx_vlm"
+                    )
+                else:
+                    logger.warning(
+                        "TextModel built but no MTP — text-only requests won't use MTP"
+                    )
+                    self._text_model = None
+
+            except Exception as e:
+                logger.error("MLLM+MTP routing setup failed: %s", e)
+                self._text_model = None
+                self._text_tokenizer = None
+
+        mtp_info = f", MTP={self._mtp}" if self._mtp else ""
+        routing = ", routing=per-request" if self._text_model is not None else ""
+        logger.info(
+            f"SimpleEngine loaded: {self._model_name} "
+            f"(MLLM={self._is_mllm}{mtp_info}{routing})"
+        )
 
     async def stop(self) -> None:
         """Stop the engine and cleanup resources."""
@@ -339,44 +412,67 @@ class SimpleEngine(BaseEngine):
         # Convert tools for template
         template_tools = convert_tools_for_template(tools) if tools else None
 
+        # Per-request routing: text-only through mlx_lm with MTP
+        if (
+            self._is_mllm
+            and self._text_model is not None
+            and not _has_media_content(messages)
+        ):
+            logger.info("Text-only request → LLM path (MTP=True)")
+            async for chunk in self._stream_generate_text(
+                messages,
+                max_tokens,
+                temperature,
+                top_p,
+                tools=template_tools,
+                **kwargs,
+            ):
+                yield chunk
+            return
+
         # Build prompt using tokenizer
         if self._is_mllm:
-            # For MLLM, use stream_chat which yields tokens incrementally
-            accumulated_text = ""
-            token_count = 0
+            if self._text_model is not None:
+                logger.info("Media request → MLLM path")
+            # For MLLM, use stream_chat which yields tokens incrementally.
+            # Must hold _generation_lock to prevent concurrent Metal access
+            # (e.g. OpenCode sends title + main request simultaneously).
+            async with self._generation_lock:
+                accumulated_text = ""
+                token_count = 0
 
-            # Run stream_chat in thread pool since it's synchronous
-            def run_stream():
-                return list(
-                    self._model.stream_chat(
-                        messages=messages,
-                        max_tokens=max_tokens,
-                        temperature=temperature,
-                        tools=template_tools,
-                        **kwargs,
+                # Run stream_chat in thread pool since it's synchronous
+                def run_stream():
+                    return list(
+                        self._model.stream_chat(
+                            messages=messages,
+                            max_tokens=max_tokens,
+                            temperature=temperature,
+                            tools=template_tools,
+                            **kwargs,
+                        )
                     )
-                )
 
-            chunks = await asyncio.to_thread(run_stream)
+                chunks = await asyncio.to_thread(run_stream)
 
-            for chunk in chunks:
-                token_count += 1
-                new_text = chunk.text if hasattr(chunk, "text") else str(chunk)
-                accumulated_text += new_text
+                for chunk in chunks:
+                    token_count += 1
+                    new_text = chunk.text if hasattr(chunk, "text") else str(chunk)
+                    accumulated_text += new_text
 
-                finished = chunk.finish_reason is not None
+                    finished = chunk.finish_reason is not None
 
-                yield GenerationOutput(
-                    text=accumulated_text,
-                    new_text=new_text,
-                    prompt_tokens=getattr(chunk, "prompt_tokens", 0),
-                    completion_tokens=token_count,
-                    finished=finished,
-                    finish_reason=chunk.finish_reason if finished else None,
-                )
+                    yield GenerationOutput(
+                        text=accumulated_text,
+                        new_text=new_text,
+                        prompt_tokens=getattr(chunk, "prompt_tokens", 0),
+                        completion_tokens=token_count,
+                        finished=finished,
+                        finish_reason=chunk.finish_reason if finished else None,
+                    )
 
-                if finished:
-                    break
+                    if finished:
+                        break
             return
 
         # For LLM, apply chat template and stream
@@ -414,6 +510,106 @@ class SimpleEngine(BaseEngine):
             **kwargs,
         ):
             yield output
+
+    async def _stream_generate_text(
+        self,
+        messages: list[dict[str, Any]],
+        max_tokens: int,
+        temperature: float,
+        top_p: float,
+        tools: list | None = None,
+        **kwargs,
+    ) -> AsyncIterator[GenerationOutput]:
+        """Text-only generation via mlx_lm TextModel with MTP.
+
+        Used when MLLM+MTP routing is active and the request has no media.
+        Runs the full generation in a single thread to maintain Metal safety.
+        """
+        import os
+
+        from mlx_lm import stream_generate as mlx_stream_generate
+        from mlx_lm.sample_utils import make_sampler
+
+        # Read enable_thinking from env (set by runtime_patches, consistent with MLLM path)
+        enable_thinking_env = os.environ.get("VLLM_MLX_ENABLE_THINKING", "true")
+        enable_thinking = enable_thinking_env.lower() in ("true", "1", "yes")
+
+        # Apply chat template
+        template_kwargs = {
+            "tokenize": False,
+            "add_generation_prompt": True,
+            "enable_thinking": enable_thinking,
+        }
+        if tools:
+            template_kwargs["tools"] = tools
+
+        try:
+            prompt = self._text_tokenizer.apply_chat_template(
+                messages, **template_kwargs
+            )
+        except TypeError:
+            # Template doesn't accept tools= or enable_thinking=
+            template_kwargs.pop("tools", None)
+            template_kwargs.pop("enable_thinking", None)
+            prompt = self._text_tokenizer.apply_chat_template(
+                messages, **template_kwargs
+            )
+
+        # Build sampler
+        sampler = make_sampler(temp=temperature, top_p=top_p)
+        max_tokens = max_tokens or 4096
+
+        # Run under generation lock, all tokens in single thread (Metal safety)
+        async with self._generation_lock:
+
+            def _run_all():
+                results = []
+                for resp in mlx_stream_generate(
+                    self._text_model,
+                    self._text_tokenizer,
+                    prompt=prompt,
+                    max_tokens=max_tokens,
+                    sampler=sampler,
+                    mtp=True,
+                ):
+                    results.append(resp)
+                return results
+
+            all_resps = await asyncio.to_thread(_run_all)
+
+        # Yield results as GenerationOutput
+        accumulated_text = ""
+        token_count = 0
+        finished = False
+        for i, resp in enumerate(all_resps):
+            token_count += 1
+            new_text = resp.text if hasattr(resp, "text") else str(resp)
+            accumulated_text += new_text
+
+            is_last = i == len(all_resps) - 1
+            finished = is_last or token_count >= max_tokens
+
+            yield GenerationOutput(
+                text=accumulated_text,
+                new_text=new_text,
+                prompt_tokens=0,
+                completion_tokens=token_count,
+                finished=finished,
+                finish_reason="stop" if finished else None,
+            )
+
+            if finished:
+                break
+
+        if not finished:
+            yield GenerationOutput(
+                text=accumulated_text,
+                new_text="",
+                prompt_tokens=0,
+                completion_tokens=token_count,
+                finished=True,
+                finish_reason="length",
+            )
 
     def get_stats(self) -> dict[str, Any]:
         """Get engine statistics."""
