@@ -1326,12 +1326,14 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
             messages.append(msg_dict)
         images, videos = [], []  # MLLM extracts these from messages
         logger.debug(f"MLLM: Processing {len(messages)} messages")
+        messages = _normalize_message_roles(messages)
     else:
         # For LLM, extract text, images, and videos separately
         messages, images, videos = extract_multimodal_content(
             request.messages,
             preserve_native_format=engine.preserve_native_tool_format,
         )
+        messages = _normalize_message_roles(messages)
 
     has_media = bool(images or videos)
 
@@ -1466,6 +1468,32 @@ def _inject_json_instruction(messages: list, instruction: str) -> list:
     return messages
 
 
+# Standard OpenAI roles. Roles outside this set get mapped.
+_ROLE_MAP = {"developer": "system"}
+
+
+def _normalize_message_roles(messages: list[dict]) -> list[dict]:
+    """Map non-standard message roles to standard ones.
+
+    The OpenAI Responses API uses ``developer`` instead of ``system``.
+    Chat templates only recognize system/user/assistant/tool, so unmapped
+    roles cause template failures and potential crashes.
+
+    Returns a new list with shallow-copied dicts where roles are remapped.
+    Does not mutate the input.
+    """
+    if not messages:
+        return messages
+    out = []
+    for msg in messages:
+        role = msg.get("role", "")
+        mapped = _ROLE_MAP.get(role)
+        if mapped is not None:
+            msg = {**msg, "role": mapped}
+        out.append(msg)
+    return out
+
+
 # =============================================================================
 # Anthropic Messages API Endpoints
 # =============================================================================
@@ -1529,6 +1557,7 @@ async def create_anthropic_message(
         openai_request.messages,
         preserve_native_format=engine.preserve_native_tool_format,
     )
+    messages = _normalize_message_roles(messages)
 
     chat_kwargs = {
         "max_tokens": openai_request.max_tokens or _default_max_tokens,
@@ -1686,6 +1715,7 @@ async def _stream_anthropic_messages(
         openai_request.messages,
         preserve_native_format=engine.preserve_native_tool_format,
     )
+    messages = _normalize_message_roles(messages)
 
     chat_kwargs = {
         "max_tokens": openai_request.max_tokens or _default_max_tokens,
