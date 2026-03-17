@@ -32,6 +32,7 @@ class SimpleEngine(BaseEngine):
         trust_remote_code: bool = True,
         enable_cache: bool = True,
         force_mllm: bool = False,
+        mtp: bool = False,
     ):
         """
         Initialize the simple engine.
@@ -41,11 +42,13 @@ class SimpleEngine(BaseEngine):
             trust_remote_code: Whether to trust remote code
             enable_cache: Enable VLM cache for multimodal models
             force_mllm: Force loading as MLLM even if not auto-detected
+            mtp: Enable native MTP speculative decoding (model must have MTP head)
         """
         self._model_name = model_name
         self._trust_remote_code = trust_remote_code
         self._enable_cache = enable_cache
         self._is_mllm = force_mllm or is_mllm_model(model_name)
+        self._mtp = mtp
 
         self._model = None
         self._loaded = False
@@ -91,11 +94,15 @@ class SimpleEngine(BaseEngine):
             self._model = MLXLanguageModel(
                 self._model_name,
                 trust_remote_code=self._trust_remote_code,
+                mtp=self._mtp,
             )
 
         self._model.load()
         self._loaded = True
-        logger.info(f"SimpleEngine loaded: {self._model_name} (MLLM={self._is_mllm})")
+        mtp_info = f", MTP={self._mtp}" if self._mtp else ""
+        logger.info(
+            f"SimpleEngine loaded: {self._model_name} (MLLM={self._is_mllm}{mtp_info})"
+        )
 
     async def stop(self) -> None:
         """Stop the engine and cleanup resources."""

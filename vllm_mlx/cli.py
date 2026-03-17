@@ -178,6 +178,8 @@ def serve_command(args):
             print(f"Prefix cache: max_entries={args.prefix_cache_size}")
     else:
         print("Mode: Simple (maximum throughput)")
+        if args.enable_mtp:
+            print("MTP: enabled (native speculative decoding)")
 
     # Load model with unified server
     load_model(
@@ -187,6 +189,7 @@ def serve_command(args):
         stream_interval=args.stream_interval if args.continuous_batching else 1,
         max_tokens=args.max_tokens,
         force_mllm=args.mllm,
+        mtp=args.enable_mtp,
     )
 
     # Start server
