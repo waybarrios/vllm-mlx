@@ -54,55 +54,103 @@ class _AttentionCapture:
     """Wrapper that captures post-RoPE query vectors and delegates to original.
 
     Installed on attention layers during lookahead decode to capture query
-    vectors for importance scoring.
+    vectors for importance scoring. Supports multiple architectures via
+    query_extractor callback.
     """
 
-    def __init__(self, original, buf_idx, query_buffer):
+    def __init__(self, original, buf_idx, query_buffer, query_extractor=None):
         self._original = original
         self._buf_idx = buf_idx
         self._query_buffer = query_buffer
+        self._query_extractor = query_extractor or _qwen35_extract_queries
 
     def __call__(self, x, mask=None, cache=None):
-        B, L, D = x.shape
-        attn = self._original
-        q_out = attn.q_proj(x)
-        queries, _gate = mx.split(
-            q_out.reshape(B, L, attn.num_attention_heads, -1), 2, axis=-1
-        )
-        queries = attn.q_norm(queries).transpose(0, 2, 1, 3)
-        if cache is not None:
-            queries = attn.rope(queries, offset=cache.offset)
-        else:
-            queries = attn.rope(queries)
+        queries = self._query_extractor(self._original, x, cache)
         self._query_buffer[self._buf_idx].append(queries)
-        return attn(x, mask=mask, cache=cache)
+        return self._original(x, mask=mask, cache=cache)
 
     def __getattr__(self, name):
         return getattr(self._original, name)
 
 
-def _patch_attention_for_capture(model, query_buffer):
-    """Replace self_attn on full-attention layers with capture wrappers.
+def _qwen35_extract_queries(attn, x, cache=None):
+    """Extract post-RoPE queries from Qwen3.5 attention (gate split + q_norm).
+
+    Qwen3.5 q_proj output is 2x wider: [queries, gate]. We split, normalize,
+    then apply RoPE.
+    """
+    B, L, D = x.shape
+    q_out = attn.q_proj(x)
+    queries, _gate = mx.split(
+        q_out.reshape(B, L, attn.num_attention_heads, -1), 2, axis=-1
+    )
+    queries = attn.q_norm(queries).transpose(0, 2, 1, 3)
+    if cache is not None:
+        queries = attn.rope(queries, offset=cache.offset)
+    else:
+        queries = attn.rope(queries)
+    return queries
+
+
+def _llama_extract_queries(attn, x, cache=None):
+    """Extract post-RoPE queries from standard transformer attention.
+
+    Standard architecture: q_proj → reshape → RoPE. No gate, no q_norm.
+    Works for Llama 3.x, Mistral, Gemma, GPT-OSS, and other GQA models.
+    """
+    B, L, D = x.shape
+    n_heads = getattr(
+        attn, "n_heads", getattr(attn, "num_attention_heads", attn.num_heads)
+    )
+    queries = attn.q_proj(x)
+    queries = queries.reshape(B, L, n_heads, -1).transpose(0, 2, 1, 3)
+    if cache is not None:
+        queries = attn.rope(queries, offset=cache.offset)
+    else:
+        queries = attn.rope(queries)
+    return queries
+
+
+def _nemotron_h_extract_queries(attn, x, cache=None):
+    """Extract queries from Nemotron-H attention (no RoPE, no gate, no q_norm).
+
+    Nemotron-H attention layers have NO positional encoding — RoPE is absent.
+    Positional modeling comes from Mamba2 layers. Attention is content-based only.
+    """
+    B, L, D = x.shape
+    queries = attn.q_proj(x).reshape(B, L, attn.num_heads, -1).transpose(0, 2, 1, 3)
+    # No RoPE to apply — queries are used as-is for content-based scoring
+    return queries
+
+
+def _patch_attention_for_capture(model, query_buffer, query_extractor=None):
+    """Replace attention modules on full-attention layers with capture wrappers.
+
+    Supports both `self_attn` (Qwen3.5/Llama/GPT-OSS) and `mixer`
+    (Nemotron-H block_type="*") attribute conventions.
 
     Returns (originals, attn_layer_indices) for cleanup.
     """
     originals = []
     attn_indices = []
-    for layer_idx, layer in enumerate(model.layers):
-        if not hasattr(layer, "self_attn"):
-            continue
+    for layer_idx, layer in _find_attention_layers(model):
         buf_idx = len(attn_indices)
         attn_indices.append(layer_idx)
-        orig = layer.self_attn
-        layer.self_attn = _AttentionCapture(orig, buf_idx, query_buffer)
+        orig = _get_attn_module(layer)
+        _set_attn_module(
+            layer,
+            _AttentionCapture(
+                orig, buf_idx, query_buffer, query_extractor=query_extractor
+            ),
+        )
         originals.append((layer_idx, orig))
     return originals, attn_indices
 
 
 def _unpatch_attention_capture(model, originals):
-    """Restore original self_attn modules after capture."""
+    """Restore original attention modules after capture."""
     for layer_idx, orig in originals:
-        model.layers[layer_idx].self_attn = orig
+        _set_attn_module(model.layers[layer_idx], orig)
 
 
 def _prefill_draft(model, tokens, cache, step_size=2048):
@@ -208,6 +256,7 @@ def score_tokens(
     temp=0.6,
     top_p=0.95,
     prefill_step_size=2048,
+    query_extractor=None,
 ):
     """Score token importance using attention-based analysis on a draft model.
 
@@ -226,6 +275,9 @@ def score_tokens(
         temp: sampling temperature for lookahead (default 0.6)
         top_p: top-p for lookahead (default 0.95)
         prefill_step_size: chunk size for draft prefill (default 2048)
+        query_extractor: function(attn, x, cache) → queries tensor.
+            Default: _qwen35_extract_queries. Use _llama_extract_queries for
+            standard Llama/Mistral/Gemma models.
 
     Returns:
         importance: (M,) mx.array of per-token importance scores
@@ -234,12 +286,30 @@ def score_tokens(
         tokens = tokens.tolist()
     n_prompt = len(tokens)
 
-    # Model topology
+    # Model topology — detect attribute names across architectures
     attn_layers = _find_attention_layers(model)
     n_attn_layers = len(attn_layers)
-    attn_obj = attn_layers[0][1].self_attn
-    n_attn_heads = attn_obj.num_attention_heads
-    n_kv_heads = attn_obj.num_key_value_heads
+    attn_obj = _get_attn_module(attn_layers[0][1])
+    # Attribute names vary: num_attention_heads (Qwen3.5), n_heads (Llama),
+    # num_heads (Nemotron-H)
+    n_attn_heads = getattr(
+        attn_obj,
+        "num_attention_heads",
+        getattr(attn_obj, "n_heads", getattr(attn_obj, "num_heads", None)),
+    )
+    n_kv_heads = getattr(
+        attn_obj, "num_key_value_heads", getattr(attn_obj, "n_kv_heads", None)
+    )
+
+    # Auto-detect query extractor if not specified
+    if query_extractor is None:
+        if hasattr(attn_obj, "q_norm"):
+            query_extractor = _qwen35_extract_queries
+        elif not hasattr(attn_obj, "rope"):
+            # No RoPE attribute → Nemotron-H style (content-based attention)
+            query_extractor = _nemotron_h_extract_queries
+        else:
+            query_extractor = _llama_extract_queries
 
     # Phase 1: Prefill
     cache = make_prompt_cache(model)
@@ -247,7 +317,9 @@ def score_tokens(
 
     # Phase 2: Lookahead decode with query capture
     query_buffer = [[] for _ in range(n_attn_layers)]
-    patches, attn_indices = _patch_attention_for_capture(model, query_buffer)
+    patches, attn_indices = _patch_attention_for_capture(
+        model, query_buffer, query_extractor=query_extractor
+    )
     try:
         _lookahead_decode(model, logits, cache, n_lookahead, temp=temp, top_p=top_p)
         mx.eval(query_buffer)
@@ -255,7 +327,10 @@ def score_tokens(
         _unpatch_attention_capture(model, patches)
 
     # Phase 3: Compute importance
-    attn_caches = [cache[i] for i in attn_indices]
+    # Map layer indices to cache indices (identity for standard models,
+    # compacted for Nemotron-H where only M/* layers have cache entries)
+    layer_to_cache = _build_layer_to_cache_map(model)
+    attn_caches = [cache[layer_to_cache[i]] for i in attn_indices]
     importance = _compute_importance(
         query_buffer,
         attn_caches,
@@ -457,15 +532,65 @@ def _get_pre_scale(rope_module):
 
 
 def _find_attention_layers(model):
-    """Find all full-attention layers (with self_attn, not GatedDeltaNet).
+    """Find all full-attention layers across architectures.
+
+    Supports:
+      - Qwen3.5 / Llama / GPT-OSS: layers with `self_attn` attribute
+      - Nemotron-H: layers with `block_type == "*"` (attention blocks use `mixer`)
 
     Returns list of (layer_idx, layer) tuples.
     """
-    return [
-        (idx, layer)
-        for idx, layer in enumerate(model.layers)
-        if hasattr(layer, "self_attn")
-    ]
+    results = []
+    for idx, layer in enumerate(model.layers):
+        if hasattr(layer, "self_attn"):
+            results.append((idx, layer))
+        elif getattr(layer, "block_type", None) == "*":
+            results.append((idx, layer))
+    return results
+
+
+def _get_attn_module(layer):
+    """Get the attention module from a layer (self_attn or mixer)."""
+    if hasattr(layer, "self_attn"):
+        return layer.self_attn
+    if getattr(layer, "block_type", None) == "*":
+        return layer.mixer
+    return None
+
+
+def _set_attn_module(layer, module):
+    """Set the attention module on a layer (self_attn or mixer)."""
+    if hasattr(layer, "self_attn"):
+        layer.self_attn = module
+    elif getattr(layer, "block_type", None) == "*":
+        layer.mixer = module
+
+
+def _build_layer_to_cache_map(model):
+    """Build mapping from model layer index to cache index.
+
+    Standard models (Qwen3.5, Llama, GPT-OSS): one cache entry per layer,
+    so the mapping is identity (layer_idx → layer_idx).
+
+    Nemotron-H: only M (Mamba2) and * (attention) layers have cache entries.
+    MLP (-) and MoE (E) layers get no cache. The mapping is compacted.
+
+    Returns dict {layer_idx: cache_idx}.
+    """
+    has_block_type = any(hasattr(layer, "block_type") for layer in model.layers)
+    if not has_block_type:
+        # Standard model: identity mapping
+        return {i: i for i in range(len(model.layers))}
+
+    # Nemotron-H style: count cache entries for M/* layers
+    layer_to_cache = {}
+    cache_idx = 0
+    for layer_idx, layer in enumerate(model.layers):
+        bt = getattr(layer, "block_type", None)
+        if bt in ("M", "*"):
+            layer_to_cache[layer_idx] = cache_idx
+            cache_idx += 1
+    return layer_to_cache
 
 
 # ---------------------------------------------------------------------------
@@ -514,18 +639,29 @@ def sparse_prefill(
 
     # Determine initial cache offset (non-zero when system KV cache is restored)
     attn_layers = _find_attention_layers(model)
-    first_attn_idx = attn_layers[0][0]
+    layer_to_cache = _build_layer_to_cache_map(model)
+    first_attn_layer_idx = attn_layers[0][0]
+    first_attn_cache_idx = layer_to_cache[first_attn_layer_idx]
     cache_start = (
-        cache[first_attn_idx].offset if hasattr(cache[first_attn_idx], "offset") else 0
+        cache[first_attn_cache_idx].offset
+        if hasattr(cache[first_attn_cache_idx], "offset")
+        else 0
     )
 
+    # Check if attention layers use RoPE (Nemotron-H has none)
+    first_attn = _get_attn_module(attn_layers[0][1])
+    has_rope = hasattr(first_attn, "rope")
+
     # Patch RoPE on attention layers for position-mapped prefill
+    # (skipped for architectures without RoPE, e.g. Nemotron-H)
     original_ropes = {}
-    for layer_idx, layer in attn_layers:
-        original_ropes[layer_idx] = layer.self_attn.rope
-        layer.self_attn.rope = _PositionMappedRoPE(
-            layer.self_attn.rope, selected_positions, cache_start=cache_start
-        )
+    if has_rope:
+        for layer_idx, layer in attn_layers:
+            attn = _get_attn_module(layer)
+            original_ropes[layer_idx] = attn.rope
+            attn.rope = _PositionMappedRoPE(
+                attn.rope, selected_positions, cache_start=cache_start
+            )
 
     try:
         prompt = selected_tokens
@@ -545,91 +681,39 @@ def sparse_prefill(
 
     finally:
         # Replace position-mapped RoPE with offset-adjusted RoPE for decode.
+        # Skipped for architectures without RoPE (e.g. Nemotron-H).
+        #
         # Total prompt length = position_offset + M (prefix + current tokens).
         # After prefill, cache offset = cache_start + N.
         # Decode needs RoPE position = total_len + i, cache gives offset = cache_start + N + i.
         # Adjustment = total_len - (cache_start + N) = position_offset + M - cache_start - N.
         # When cache_start == position_offset (normal case): adjustment = M - N.
-        total_prompt_len = position_offset + M
-        final_cache_offset = cache_start + N
-        adjustment = int(total_prompt_len) - int(final_cache_offset)
-        for layer_idx, layer in attn_layers:
-            original = original_ropes[layer_idx]
-            if adjustment > 0:
-                layer.self_attn.rope = _OffsetAdjustedRoPE(original, adjustment)
-            else:
-                layer.self_attn.rope = original
+        if has_rope:
+            total_prompt_len = position_offset + M
+            final_cache_offset = cache_start + N
+            adjustment = int(total_prompt_len) - int(final_cache_offset)
+            for layer_idx, layer in attn_layers:
+                attn = _get_attn_module(layer)
+                original = original_ropes[layer_idx]
+                if adjustment > 0:
+                    attn.rope = _OffsetAdjustedRoPE(original, adjustment)
+                else:
+                    attn.rope = original
 
     return logits
-
-
-def score_tokens_self(
-    model,
-    tokens,
-    pool_kernel=13,
-    prefill_step_size=2048,
-):
-    """Score token importance using the target model itself (CritiPrefill).
-
-    Unlike score_tokens() which uses a small draft model, this performs a full
-    prefill on the target model to capture attention patterns, then uses those
-    to score token importance. The result feeds into select_chunks() and
-    sparse_prefill() identically to the draft-based path.
-
-    Trade-off vs draft-based scoring:
-        - No draft model needed (~3GB saved, works for any model)
-        - Slower: full target prefill + sparse target prefill (2 passes)
-          vs draft prefill + sparse target prefill
-        - Better scoring accuracy: target model's own attention patterns
-        - Use case: models without small draft variants (e.g., Nemotron)
-
-    Algorithm (CritiPrefill, arxiv.org/abs/2410.18966):
-        1. Full target prefill with attention capture (like _AttentionCapture)
-        2. Extract attention weights from the prefill pass itself
-           (no lookahead decode needed — use last-token attention over prompt)
-        3. Aggregate: avg_pool1d → max(layers×heads) → importance scores
-        4. Feed into select_chunks() → sparse_prefill() as normal
-
-    Engine integration:
-        - Config: specprefill_mode="self" (vs "draft" default)
-        - In _run_specprefill(): swap score_tokens() for score_tokens_self()
-        - No draft model loaded at startup
-        - Rest of pipeline (select_chunks, sparse_prefill, cleanup_rope) unchanged
-
-    Args:
-        model: Target model (the same model used for sparse_prefill)
-        tokens: list or mx.array of token IDs
-        pool_kernel: smoothing kernel for avg_pool1d (default 13, 0=disable)
-        prefill_step_size: chunk size for prefill (default 2048)
-
-    Returns:
-        importance: (M,) mx.array of per-token importance scores
-
-    TODO:
-        - Implement attention capture during prefill (need chunked attention
-          extraction — prefill processes tokens in step_size chunks, must
-          accumulate attention across chunks or use only last chunk's attention)
-        - Benchmark 2-pass cost on 122B: full prefill ~30s + sparse ~10s = 40s
-          vs draft 4.5s + sparse 10s = 14.5s. CritiPrefill ~2.8x slower but
-          still faster than full prefill alone (30s) when keep_pct < ~75%
-        - Consider: capture attention only from last prefill chunk (last
-          step_size tokens attend to all prior) — simpler, may be sufficient
-        - Validate: does target model's own-attention scoring outperform
-          draft scoring enough to justify the extra cost?
-    """
-    raise NotImplementedError(
-        "CritiPrefill (self-scoring) not yet implemented. "
-        "Use score_tokens() with a draft model instead."
-    )
 
 
 def cleanup_rope(model):
     """Restore original RoPE on all attention layers.
 
     Call this after generation is complete to remove _OffsetAdjustedRoPE
-    wrappers installed by sparse_prefill().
+    wrappers installed by sparse_prefill(). No-op for architectures
+    without RoPE (e.g. Nemotron-H).
     """
     for _, layer in _find_attention_layers(model):
-        rope = layer.self_attn.rope
+        attn = _get_attn_module(layer)
+        if attn is None or not hasattr(attn, "rope"):
+            continue
+        rope = attn.rope
         if isinstance(rope, (_OffsetAdjustedRoPE, _PositionMappedRoPE)):
-            layer.self_attn.rope = rope._original
+            attn.rope = rope._original
