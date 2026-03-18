@@ -83,6 +83,11 @@ class SimpleEngine(BaseEngine):
         # Lock to serialize MLX operations (prevents Metal command buffer conflicts)
         self._generation_lock = asyncio.Lock()
 
+        # System prompt KV cache (reduces repeated prefill across requests)
+        self._system_kv_snapshot = None  # List of (keys, values) per backbone layer
+        self._system_kv_hash = None  # Hash of system prefix text
+        self._system_kv_token_count = 0  # Tokens in cached prefix
+
     @property
     def model_name(self) -> str:
         """Get the model name."""
@@ -174,6 +179,9 @@ class SimpleEngine(BaseEngine):
         """Stop the engine and cleanup resources."""
         self._model = None
         self._loaded = False
+        self._system_kv_snapshot = None
+        self._system_kv_hash = None
+        self._system_kv_token_count = 0
         logger.info("SimpleEngine stopped")
 
     async def generate(
@@ -524,17 +532,24 @@ class SimpleEngine(BaseEngine):
 
         Used when MLLM+MTP routing is active and the request has no media.
         Runs the full generation in a single thread to maintain Metal safety.
+
+        System prompt KV caching: on the first request, prefills system tokens
+        and snapshots backbone KV state. Subsequent requests with the same
+        system prompt restore the snapshot and only prefill the suffix tokens.
         """
+        import hashlib
         import os
 
+        import mlx.core as mx
         from mlx_lm import stream_generate as mlx_stream_generate
+        from mlx_lm.models.cache import make_prompt_cache
         from mlx_lm.sample_utils import make_sampler
 
         # Read enable_thinking from env (set by runtime_patches, consistent with MLLM path)
         enable_thinking_env = os.environ.get("VLLM_MLX_ENABLE_THINKING", "true")
         enable_thinking = enable_thinking_env.lower() in ("true", "1", "yes")
 
-        # Apply chat template
+        # Apply chat template for full prompt
         template_kwargs = {
             "tokenize": False,
             "add_generation_prompt": True,
@@ -544,14 +559,14 @@ class SimpleEngine(BaseEngine):
             template_kwargs["tools"] = tools
 
         try:
-            prompt = self._text_tokenizer.apply_chat_template(
+            full_prompt = self._text_tokenizer.apply_chat_template(
                 messages, **template_kwargs
             )
         except TypeError:
             # Template doesn't accept tools= or enable_thinking=
             template_kwargs.pop("tools", None)
             template_kwargs.pop("enable_thinking", None)
-            prompt = self._text_tokenizer.apply_chat_template(
+            full_prompt = self._text_tokenizer.apply_chat_template(
                 messages, **template_kwargs
             )
 
@@ -559,18 +574,177 @@ class SimpleEngine(BaseEngine):
         sampler = make_sampler(temp=temperature, top_p=top_p)
         max_tokens = max_tokens or 4096
 
-        # Run under generation lock, all tokens in single thread (Metal safety)
+        # --- System prompt KV caching ---
+        prompt_cache = None
+        prompt_to_send = full_prompt  # Default: send full prompt text
+        cache_hit = False
+        system_token_count = 0
+        full_token_count = 0
+        system_hash = None
+        system_tokens = None
+        suffix_tokens = None
+
+        # Extract system messages for caching
+        has_system = any(m.get("role") == "system" for m in messages)
+
+        if has_system and self._text_model is not None:
+            # Find system prefix boundary in full prompt text.
+            # ChatML format: system section ends where first non-system message begins.
+            # Works with tools (rendered inside system section by Qwen templates).
+            system_prefix_end = -1
+            for marker in ("<|im_start|>user\n", "<|im_start|>assistant\n"):
+                idx = full_prompt.find(marker)
+                if idx > 0:
+                    system_prefix_end = idx
+                    break
+
+            if system_prefix_end > 0:
+                system_prefix_text = full_prompt[:system_prefix_end]
+                system_hash = hashlib.sha256(system_prefix_text.encode()).hexdigest()[
+                    :16
+                ]
+
+                # Tokenize both (matching stream_generate's tokenization logic)
+                tokenizer = self._text_tokenizer
+                add_special = tokenizer.bos_token is None or not full_prompt.startswith(
+                    tokenizer.bos_token
+                )
+                full_tokens_list = tokenizer.encode(
+                    full_prompt, add_special_tokens=add_special
+                )
+                full_token_count = len(full_tokens_list)
+
+                system_tokens_list = tokenizer.encode(
+                    system_prefix_text, add_special_tokens=add_special
+                )
+                system_token_count = len(system_tokens_list)
+
+                # Verify system tokens are a proper prefix of full tokens
+                prefix_valid = (
+                    len(full_tokens_list) > system_token_count
+                    and full_tokens_list[:system_token_count] == system_tokens_list
+                )
+
+                if prefix_valid:
+                    system_tokens = system_tokens_list
+                    suffix_tokens = full_tokens_list[system_token_count:]
+
+                    if (
+                        system_hash == self._system_kv_hash
+                        and self._system_kv_snapshot is not None
+                        and system_token_count == self._system_kv_token_count
+                    ):
+                        # Cache HIT — restore KV state into fresh cache objects
+                        model_cache = make_prompt_cache(self._text_model)
+                        for i, saved_state in enumerate(self._system_kv_snapshot):
+                            model_cache[i].state = saved_state
+
+                        # Fresh MTP cache (not populated during prefill)
+                        if hasattr(self._text_model, "make_mtp_cache"):
+                            mtp_cache = self._text_model.make_mtp_cache()
+                            prompt_cache = model_cache + mtp_cache
+                        else:
+                            prompt_cache = model_cache
+
+                        prompt_to_send = mx.array(suffix_tokens)
+                        cache_hit = True
+                        logger.info(
+                            "System KV cache HIT: reusing %d cached tokens, "
+                            "prefilling %d new tokens (hash=%s)",
+                            system_token_count,
+                            len(suffix_tokens),
+                            system_hash,
+                        )
+                    else:
+                        # Cache MISS — will prefill system tokens and snapshot
+                        logger.info(
+                            "System KV cache MISS: will prefill %d system tokens, "
+                            "%d suffix tokens (hash=%s)",
+                            system_token_count,
+                            len(suffix_tokens),
+                            system_hash,
+                        )
+                else:
+                    logger.debug(
+                        "System KV cache: prefix token validation failed, "
+                        "using full prompt (%d tokens)",
+                        len(full_tokens_list),
+                    )
+                    system_token_count = 0
+
+        # Run under generation lock, all Metal ops in single thread
         async with self._generation_lock:
 
             def _run_all():
+                nonlocal prompt_cache, prompt_to_send
+
+                # Cache MISS with valid prefix: prefill system tokens and snapshot
+                if (
+                    not cache_hit
+                    and system_token_count > 0
+                    and system_tokens is not None
+                    and suffix_tokens is not None
+                ):
+                    model = self._text_model
+                    mc = make_prompt_cache(model)
+                    sys_arr = mx.array(system_tokens)
+
+                    # Prefill system tokens in chunks (matching generate_step)
+                    step = (
+                        self._prefill_step_size
+                        if hasattr(self, "_prefill_step_size")
+                        else 2048
+                    )
+                    while sys_arr.size > step:
+                        model(sys_arr[:step][None], cache=mc)
+                        mx.eval([c.state for c in mc])
+                        sys_arr = sys_arr[step:]
+                        mx.clear_cache()
+                    if sys_arr.size > 0:
+                        model(sys_arr[None], cache=mc)
+                        mx.eval([c.state for c in mc])
+
+                    # Snapshot backbone cache (immutable mx.arrays, safe to reuse)
+                    snapshot = [c.state for c in mc]
+                    mx.eval([s for pair in snapshot for s in pair])
+
+                    self._system_kv_snapshot = snapshot
+                    self._system_kv_hash = system_hash
+                    self._system_kv_token_count = system_token_count
+
+                    # Build prompt_cache with MTP
+                    if hasattr(model, "make_mtp_cache"):
+                        mtp_cache = model.make_mtp_cache()
+                        prompt_cache = mc + mtp_cache
+                    else:
+                        prompt_cache = mc
+
+                    prompt_to_send = mx.array(suffix_tokens)
+                    logger.info(
+                        "System KV cache: stored %d-token snapshot (%.1f MB), "
+                        "prefilling %d remaining",
+                        system_token_count,
+                        sum(c.nbytes for c in mc) / 1e6,
+                        len(suffix_tokens),
+                    )
+
+                # Generate
                 results = []
-                for resp in mlx_stream_generate(
-                    self._text_model,
-                    self._text_tokenizer,
-                    prompt=prompt,
+                gen_kwargs = dict(
                     max_tokens=max_tokens,
                     sampler=sampler,
                     mtp=True,
+                )
+                if hasattr(self, "_prefill_step_size"):
+                    gen_kwargs["prefill_step_size"] = self._prefill_step_size
+                if prompt_cache is not None:
+                    gen_kwargs["prompt_cache"] = prompt_cache
+
+                for resp in mlx_stream_generate(
+                    self._text_model,
+                    self._text_tokenizer,
+                    prompt=prompt_to_send,
+                    **gen_kwargs,
                 ):
                     results.append(resp)
                 return results
@@ -592,7 +766,7 @@ class SimpleEngine(BaseEngine):
             yield GenerationOutput(
                 text=accumulated_text,
                 new_text=new_text,
-                prompt_tokens=0,
+                prompt_tokens=full_token_count or 0,
                 completion_tokens=token_count,
                 finished=finished,
                 finish_reason="stop" if finished else None,
@@ -605,7 +779,7 @@ class SimpleEngine(BaseEngine):
             yield GenerationOutput(
                 text=accumulated_text,
                 new_text="",
-                prompt_tokens=0,
+                prompt_tokens=full_token_count or 0,
                 completion_tokens=token_count,
                 finished=True,
                 finish_reason="length",
@@ -619,6 +793,15 @@ class SimpleEngine(BaseEngine):
             "is_mllm": self._is_mllm,
             "loaded": self._loaded,
         }
+
+        # System KV cache stats
+        if self._system_kv_snapshot is not None:
+            cache_bytes = sum(k.nbytes + v.nbytes for k, v in self._system_kv_snapshot)
+            stats["system_kv_cache"] = {
+                "tokens": self._system_kv_token_count,
+                "hash": self._system_kv_hash,
+                "memory_mb": round(cache_bytes / 1e6, 1),
+            }
 
         # Include Metal memory stats
         try:
