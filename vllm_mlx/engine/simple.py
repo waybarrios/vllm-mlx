@@ -56,6 +56,11 @@ class SimpleEngine(BaseEngine):
         enable_cache: bool = True,
         force_mllm: bool = False,
         mtp: bool = False,
+        prefill_step_size: int = 2048,
+        specprefill_enabled: bool = False,
+        specprefill_threshold: int = 8192,
+        specprefill_keep_pct: float = 0.3,
+        specprefill_draft_model: str | None = None,
     ):
         """
         Initialize the simple engine.
@@ -66,12 +71,24 @@ class SimpleEngine(BaseEngine):
             enable_cache: Enable VLM cache for multimodal models
             force_mllm: Force loading as MLLM even if not auto-detected
             mtp: Enable native MTP speculative decoding (model must have MTP head)
+            prefill_step_size: Chunk size for prompt prefill processing (default: 2048)
+            specprefill_enabled: Enable SpecPrefill (attention-based sparse prefill)
+            specprefill_threshold: Minimum suffix tokens to trigger SpecPrefill
+            specprefill_keep_pct: Fraction of tokens to keep (default: 0.3)
+            specprefill_draft_model: Path to small draft model for importance scoring
         """
         self._model_name = model_name
         self._trust_remote_code = trust_remote_code
         self._enable_cache = enable_cache
         self._is_mllm = force_mllm or is_mllm_model(model_name)
         self._mtp = mtp
+        self._prefill_step_size = prefill_step_size
+
+        # SpecPrefill config
+        self._specprefill_enabled = specprefill_enabled
+        self._specprefill_threshold = specprefill_threshold
+        self._specprefill_keep_pct = specprefill_keep_pct
+        self._specprefill_draft_model_path = specprefill_draft_model
 
         self._model = None
         self._loaded = False
@@ -79,6 +96,9 @@ class SimpleEngine(BaseEngine):
         # Per-request routing state (MLLM+MTP mode)
         self._text_model = None
         self._text_tokenizer = None
+
+        # SpecPrefill draft model (loaded at start if enabled)
+        self._draft_model = None
 
         # Lock to serialize MLX operations (prevents Metal command buffer conflicts)
         self._generation_lock = asyncio.Lock()
@@ -168,16 +188,38 @@ class SimpleEngine(BaseEngine):
                 self._text_model = None
                 self._text_tokenizer = None
 
+        # Load SpecPrefill draft model (small model for importance scoring)
+        if self._specprefill_enabled and self._specprefill_draft_model_path:
+            try:
+                from mlx_lm import load as mlx_lm_load
+
+                self._draft_model, _ = mlx_lm_load(self._specprefill_draft_model_path)
+                logger.info(
+                    "SpecPrefill: draft model loaded (%s), threshold=%d, keep=%.0f%%",
+                    self._specprefill_draft_model_path,
+                    self._specprefill_threshold,
+                    self._specprefill_keep_pct * 100,
+                )
+            except Exception as e:
+                logger.error("SpecPrefill: draft model load failed: %s", e)
+                self._draft_model = None
+
         mtp_info = f", MTP={self._mtp}" if self._mtp else ""
         routing = ", routing=per-request" if self._text_model is not None else ""
+        specprefill_info = (
+            ", SpecPrefill=active" if self._draft_model is not None else ""
+        )
         logger.info(
             f"SimpleEngine loaded: {self._model_name} "
-            f"(MLLM={self._is_mllm}{mtp_info}{routing})"
+            f"(MLLM={self._is_mllm}{mtp_info}{routing}{specprefill_info})"
         )
 
     async def stop(self) -> None:
         """Stop the engine and cleanup resources."""
         self._model = None
+        self._text_model = None
+        self._text_tokenizer = None
+        self._draft_model = None
         self._loaded = False
         self._system_kv_snapshot = None
         self._system_kv_hash = None
@@ -545,6 +587,10 @@ class SimpleEngine(BaseEngine):
         from mlx_lm.models.cache import make_prompt_cache
         from mlx_lm.sample_utils import make_sampler
 
+        # Per-request specprefill overrides (from extra_body)
+        specprefill_override = kwargs.pop("specprefill", None)
+        specprefill_keep_pct = kwargs.pop("specprefill_keep_pct", None)
+
         # Read enable_thinking from env (set by runtime_patches, consistent with MLLM path)
         enable_thinking_env = os.environ.get("VLLM_MLX_ENABLE_THINKING", "true")
         enable_thinking = enable_thinking_env.lower() in ("true", "1", "yes")
@@ -575,7 +621,7 @@ class SimpleEngine(BaseEngine):
         max_tokens = max_tokens or 4096
 
         # --- System prompt KV caching ---
-        prompt_cache = None
+        backbone_cache = None  # Backbone-only cache (no MTP), used by both paths
         prompt_to_send = full_prompt  # Default: send full prompt text
         cache_hit = False
         system_token_count = 0
@@ -583,6 +629,7 @@ class SimpleEngine(BaseEngine):
         system_hash = None
         system_tokens = None
         suffix_tokens = None
+        full_tokens_list = None
 
         # Extract system messages for caching
         has_system = any(m.get("role") == "system" for m in messages)
@@ -634,17 +681,10 @@ class SimpleEngine(BaseEngine):
                         and self._system_kv_snapshot is not None
                         and system_token_count == self._system_kv_token_count
                     ):
-                        # Cache HIT — restore KV state into fresh cache objects
-                        model_cache = make_prompt_cache(self._text_model)
+                        # Cache HIT — restore KV state into fresh backbone cache
+                        backbone_cache = make_prompt_cache(self._text_model)
                         for i, saved_state in enumerate(self._system_kv_snapshot):
-                            model_cache[i].state = saved_state
-
-                        # Fresh MTP cache (not populated during prefill)
-                        if hasattr(self._text_model, "make_mtp_cache"):
-                            mtp_cache = self._text_model.make_mtp_cache()
-                            prompt_cache = model_cache + mtp_cache
-                        else:
-                            prompt_cache = model_cache
+                            backbone_cache[i].state = saved_state
 
                         prompt_to_send = mx.array(suffix_tokens)
                         cache_hit = True
@@ -672,11 +712,67 @@ class SimpleEngine(BaseEngine):
                     )
                     system_token_count = 0
 
+        # Determine if SpecPrefill should be used
+        # Per-request boolean override: True = force enable, False = force disable
+        if specprefill_override is False:
+            use_specprefill = False
+        elif specprefill_override is True and self._draft_model is not None:
+            use_specprefill = True  # Force enable, skip threshold check
+        else:
+            use_specprefill = self._draft_model is not None
+
+        # For specprefill, ensure we have token IDs (not just prompt text)
+        if use_specprefill and suffix_tokens is None and full_tokens_list is None:
+            tokenizer = self._text_tokenizer
+            add_special = tokenizer.bos_token is None or not full_prompt.startswith(
+                tokenizer.bos_token
+            )
+            full_tokens_list = tokenizer.encode(
+                full_prompt, add_special_tokens=add_special
+            )
+            full_token_count = len(full_tokens_list)
+
+        # Tokens for specprefill: suffix (if system KV) or full prompt
+        specprefill_tokens = (
+            suffix_tokens if suffix_tokens is not None else full_tokens_list
+        )
+        specprefill_offset = system_token_count if suffix_tokens is not None else 0
+
+        # Threshold check: only use specprefill on long prompts
+        # (skipped when per-request boolean forces enable)
+        if (
+            use_specprefill
+            and specprefill_override is not True
+            and (
+                specprefill_tokens is None
+                or len(specprefill_tokens) <= self._specprefill_threshold
+            )
+        ):
+            use_specprefill = False
+
+        # Upper bound: cap specprefill to avoid draft model OOM on very long prompts
+        # 65536 tokens ~ 2GB draft KV cache on Qwen3.5-4B (32KB/token x 8 attn layers)
+        _SPECPREFILL_MAX_TOKENS = 65536
+        if (
+            use_specprefill
+            and specprefill_tokens is not None
+            and len(specprefill_tokens) > _SPECPREFILL_MAX_TOKENS
+        ):
+            logger.warning(
+                "SpecPrefill: prompt %d tokens exceeds max %d, "
+                "falling back to normal path",
+                len(specprefill_tokens),
+                _SPECPREFILL_MAX_TOKENS,
+            )
+            use_specprefill = False
+
         # Run under generation lock, all Metal ops in single thread
         async with self._generation_lock:
 
             def _run_all():
-                nonlocal prompt_cache, prompt_to_send
+                nonlocal backbone_cache, prompt_to_send
+
+                model = self._text_model
 
                 # Cache MISS with valid prefix: prefill system tokens and snapshot
                 if (
@@ -685,16 +781,11 @@ class SimpleEngine(BaseEngine):
                     and system_tokens is not None
                     and suffix_tokens is not None
                 ):
-                    model = self._text_model
                     mc = make_prompt_cache(model)
                     sys_arr = mx.array(system_tokens)
 
                     # Prefill system tokens in chunks (matching generate_step)
-                    step = (
-                        self._prefill_step_size
-                        if hasattr(self, "_prefill_step_size")
-                        else 2048
-                    )
+                    step = self._prefill_step_size
                     while sys_arr.size > step:
                         model(sys_arr[:step][None], cache=mc)
                         mx.eval([c.state for c in mc])
@@ -712,13 +803,7 @@ class SimpleEngine(BaseEngine):
                     self._system_kv_hash = system_hash
                     self._system_kv_token_count = system_token_count
 
-                    # Build prompt_cache with MTP
-                    if hasattr(model, "make_mtp_cache"):
-                        mtp_cache = model.make_mtp_cache()
-                        prompt_cache = mc + mtp_cache
-                    else:
-                        prompt_cache = mc
-
+                    backbone_cache = mc
                     prompt_to_send = mx.array(suffix_tokens)
                     logger.info(
                         "System KV cache: stored %d-token snapshot (%.1f MB), "
@@ -728,26 +813,145 @@ class SimpleEngine(BaseEngine):
                         len(suffix_tokens),
                     )
 
-                # Generate
+                # --- SpecPrefill path (with fallback to normal on failure) ---
+                if use_specprefill:
+                    try:
+                        return _run_specprefill(model, backbone_cache)
+                    except Exception as e:
+                        logger.error(
+                            "SpecPrefill failed, falling back to normal MTP path: %s",
+                            e,
+                        )
+                        # Discard potentially corrupted cache
+                        backbone_cache = None
+                        prompt_to_send = full_prompt
+
+                # --- Normal path (MTP via mlx_lm stream_generate) ---
+                prompt_cache = None
+                if backbone_cache is not None:
+                    # Add MTP cache on top of backbone
+                    if hasattr(model, "make_mtp_cache"):
+                        mtp_cache = model.make_mtp_cache()
+                        prompt_cache = backbone_cache + mtp_cache
+                    else:
+                        prompt_cache = backbone_cache
+
                 results = []
                 gen_kwargs = dict(
                     max_tokens=max_tokens,
                     sampler=sampler,
                     mtp=True,
+                    prefill_step_size=self._prefill_step_size,
                 )
-                if hasattr(self, "_prefill_step_size"):
-                    gen_kwargs["prefill_step_size"] = self._prefill_step_size
                 if prompt_cache is not None:
                     gen_kwargs["prompt_cache"] = prompt_cache
 
                 for resp in mlx_stream_generate(
-                    self._text_model,
+                    model,
                     self._text_tokenizer,
                     prompt=prompt_to_send,
                     **gen_kwargs,
                 ):
                     results.append(resp)
                 return results
+
+            def _run_specprefill(model, bc):
+                """Score tokens, sparse prefill, generate without MTP."""
+                from types import SimpleNamespace
+
+                from ..specprefill import (
+                    cleanup_rope,
+                    score_tokens,
+                    select_chunks,
+                    sparse_prefill,
+                )
+
+                # Create backbone cache if not already from system KV
+                if bc is None:
+                    bc = make_prompt_cache(model)
+
+                try:
+                    # Phase 1: Score with draft model
+                    import time
+
+                    t0 = time.monotonic()
+                    importance = score_tokens(
+                        self._draft_model,
+                        specprefill_tokens,
+                        prefill_step_size=self._prefill_step_size,
+                    )
+                    t_score = time.monotonic() - t0
+
+                    # Phase 2: Select important chunks
+                    effective_keep = specprefill_keep_pct or self._specprefill_keep_pct
+                    selected = select_chunks(importance, keep_pct=effective_keep)
+                    n_selected = selected.shape[0]
+                    n_total = len(specprefill_tokens)
+
+                    # Phase 3: Sparse prefill on target model
+                    t0 = time.monotonic()
+                    logits = sparse_prefill(
+                        model,
+                        specprefill_tokens,
+                        selected,
+                        bc,
+                        step_size=self._prefill_step_size,
+                        position_offset=specprefill_offset,
+                    )
+                    t_prefill = time.monotonic() - t0
+
+                    logger.info(
+                        "SpecPrefill: scored %d tokens in %.1fs, "
+                        "sparse prefill %d/%d (keep=%.0f%%) in %.1fs "
+                        "(offset=%d, effective_keep=%.2f)",
+                        n_total,
+                        t_score,
+                        n_selected,
+                        n_total,
+                        n_selected / n_total * 100,
+                        t_prefill,
+                        specprefill_offset,
+                        effective_keep,
+                    )
+
+                    # Phase 4: Generate (simple autoregressive, no MTP)
+                    eos_id = self._text_tokenizer.eos_token_id
+                    y = sampler(logits[:, -1, :])
+                    mx.eval(y)
+
+                    results = []
+                    generated_ids = []
+                    prev_decoded = ""
+
+                    for _ in range(max_tokens):
+                        tok_id = y.item()
+                        generated_ids.append(tok_id)
+
+                        # Incremental text decode
+                        decoded = self._text_tokenizer.decode(generated_ids)
+                        new_text = decoded[len(prev_decoded) :]
+                        prev_decoded = decoded
+
+                        is_eos = tok_id == eos_id
+                        results.append(
+                            SimpleNamespace(
+                                text=new_text,
+                                finish_reason="stop" if is_eos else None,
+                            )
+                        )
+
+                        if is_eos:
+                            break
+
+                        # Next token
+                        logits = model(y.reshape(1, -1), cache=bc)
+                        y = sampler(logits[:, -1, :])
+                        mx.eval(y)
+
+                    return results
+
+                finally:
+                    cleanup_rope(model)
 
             all_resps = await asyncio.to_thread(_run_all)
 
@@ -769,7 +973,8 @@ class SimpleEngine(BaseEngine):
                 prompt_tokens=full_token_count or 0,
                 completion_tokens=token_count,
                 finished=finished,
-                finish_reason="stop" if finished else None,
+                finish_reason=getattr(resp, "finish_reason", None)
+                or ("stop" if finished else None),
             )
 
             if finished:
@@ -794,9 +999,23 @@ class SimpleEngine(BaseEngine):
             "loaded": self._loaded,
         }
 
+        # SpecPrefill stats
+        if self._draft_model is not None:
+            stats["specprefill"] = {
+                "enabled": True,
+                "draft_model": self._specprefill_draft_model_path,
+                "threshold": self._specprefill_threshold,
+                "keep_pct": self._specprefill_keep_pct,
+            }
+
         # System KV cache stats
         if self._system_kv_snapshot is not None:
-            cache_bytes = sum(k.nbytes + v.nbytes for k, v in self._system_kv_snapshot)
+            cache_bytes = 0
+            for entry in self._system_kv_snapshot:
+                if isinstance(entry, tuple) and len(entry) == 2:
+                    cache_bytes += entry[0].nbytes + entry[1].nbytes
+                elif isinstance(entry, list):
+                    cache_bytes += sum(a.nbytes for a in entry if a is not None)
             stats["system_kv_cache"] = {
                 "tokens": self._system_kv_token_count,
                 "hash": self._system_kv_hash,
