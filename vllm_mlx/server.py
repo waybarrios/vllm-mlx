@@ -2000,16 +2000,72 @@ async def stream_chat_completion(
                 # Skip this chunk (e.g., <think> token itself)
                 continue
 
+            content = delta_msg.content
+            reasoning = delta_msg.reasoning
+
+            # Tool call parsing on the content portion (fix: was
+            # previously unreachable because tool parser was in the
+            # else branch of this if/else)
+            if tool_parser and content:
+                if not tool_markup_possible and "<" not in content:
+                    tool_accumulated_text += content
+                else:
+                    if not tool_markup_possible:
+                        tool_markup_possible = True
+                    tool_previous = tool_accumulated_text
+                    tool_accumulated_text += content
+                    tool_result = tool_parser.extract_tool_calls_streaming(
+                        tool_previous, tool_accumulated_text, content
+                    )
+
+                    if tool_result is None:
+                        # Inside tool markup — suppress content, keep reasoning
+                        content = None
+                    elif "tool_calls" in tool_result:
+                        tool_calls_detected = True
+                        chunk = ChatCompletionChunk(
+                            id=response_id,
+                            model=request.model,
+                            choices=[
+                                ChatCompletionChunkChoice(
+                                    delta=ChatCompletionChunkDelta(
+                                        reasoning=reasoning,
+                                        tool_calls=tool_result["tool_calls"],
+                                    ),
+                                    finish_reason=(
+                                        "tool_calls"
+                                        if output.finished
+                                        else None
+                                    ),
+                                )
+                            ],
+                            usage=get_usage(output) if output.finished else None,
+                        )
+                        yield f"data: {chunk.model_dump_json()}\n\n"
+                        continue
+                    else:
+                        content = tool_result.get("content", "")
+
+            # Skip if both content and reasoning are empty
+            if not content and not reasoning:
+                continue
+
             chunk = ChatCompletionChunk(
                 id=response_id,
                 model=_model_name,
                 choices=[
                     ChatCompletionChunkChoice(
                         delta=ChatCompletionChunkDelta(
-                            content=delta_msg.content,
-                            reasoning=delta_msg.reasoning,
+                            content=content if content else None,
+                            reasoning=reasoning,
                         ),
-                        finish_reason=output.finish_reason if output.finished else None,
+                        finish_reason=(
+                            "tool_calls"
+                            if (output.finished and tool_calls_detected)
+                            else (
+                                output.finish_reason if output.finished else None
+                            )
+                        ),
                     )
                 ],
                 usage=get_usage(output) if output.finished else None,
