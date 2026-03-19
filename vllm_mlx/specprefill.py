@@ -100,7 +100,9 @@ def _llama_extract_queries(attn, x, cache=None):
     """
     B, L, D = x.shape
     n_heads = getattr(
-        attn, "n_heads", getattr(attn, "num_attention_heads", attn.num_heads)
+        attn,
+        "num_attention_heads",
+        getattr(attn, "n_heads", getattr(attn, "num_heads", None)),
     )
     queries = attn.q_proj(x)
     queries = queries.reshape(B, L, n_heads, -1).transpose(0, 2, 1, 3)
@@ -226,6 +228,11 @@ def _compute_importance(
             continue
         cache = attn_caches[layer_i]
         prompt_keys = cache.keys[..., :n_prompt, :]
+        # Skip layers with windowed/rotating caches that don't span
+        # the full prompt (e.g., GPT-OSS sliding_attention with 128-token window).
+        # These lack global context and would produce mismatched score shapes.
+        if prompt_keys.shape[-2] < n_prompt:
+            continue
         head_dim = prompt_keys.shape[-1]
         q_stack = mx.concatenate(captures, axis=2)
         if heads_per_group > 1:
