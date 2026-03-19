@@ -303,6 +303,56 @@ class SimpleEngine(BaseEngine):
         if not self._loaded:
             await self.start()
 
+        # Per-request specprefill overrides (from extra_body)
+        specprefill_override = kwargs.pop("specprefill", None)
+        specprefill_keep_pct_override = kwargs.pop("specprefill_keep_pct", None)
+
+        # SpecPrefill for non-MLLM models (MLLM+MTP handles it in _stream_generate_text)
+        if not self._is_mllm and self._draft_model is not None:
+            use_specprefill = True
+            if specprefill_override is False:
+                use_specprefill = False
+
+            if use_specprefill:
+                tokenizer = self._model.tokenizer
+                add_special = tokenizer.bos_token is None or not prompt.startswith(
+                    tokenizer.bos_token
+                )
+                tokens_list = tokenizer.encode(prompt, add_special_tokens=add_special)
+                n_tokens = len(tokens_list)
+
+                # Threshold check (skip when force-enabled via per-request override)
+                if (
+                    specprefill_override is not True
+                    and n_tokens <= self._specprefill_threshold
+                ):
+                    use_specprefill = False
+
+                # Upper bound: cap to avoid draft model OOM
+                _SPECPREFILL_MAX_TOKENS = 65536
+                if use_specprefill and n_tokens > _SPECPREFILL_MAX_TOKENS:
+                    logger.warning(
+                        "SpecPrefill: prompt %d tokens exceeds max %d, "
+                        "falling back to normal path",
+                        n_tokens,
+                        _SPECPREFILL_MAX_TOKENS,
+                    )
+                    use_specprefill = False
+
+                if use_specprefill:
+                    async for output in self._stream_generate_specprefill(
+                        prompt,
+                        tokens_list,
+                        max_tokens,
+                        temperature,
+                        top_p,
+                        stop=stop,
+                        specprefill_keep_pct=specprefill_keep_pct_override,
+                        **kwargs,
+                    ):
+                        yield output
+                    return
+
         async with self._generation_lock:
             accumulated_text = ""
             prompt_tokens = 0
@@ -560,6 +610,189 @@ class SimpleEngine(BaseEngine):
             **kwargs,
         ):
             yield output
+
+    async def _stream_generate_specprefill(
+        self,
+        prompt: str,
+        tokens: list[int],
+        max_tokens: int,
+        temperature: float,
+        top_p: float,
+        stop: list[str] | None = None,
+        specprefill_keep_pct: float | None = None,
+        **kwargs,
+    ) -> AsyncIterator[GenerationOutput]:
+        """SpecPrefill path for non-MTP models (Nemotron, GPT-OSS, etc).
+
+        Scores token importance with the draft model, sparse-prefills the target
+        model, then generates autoregressively. Falls back to normal generation
+        on any error.
+        """
+        import mlx.core as mx
+        from mlx_lm.models.cache import make_prompt_cache
+        from mlx_lm.sample_utils import make_sampler
+
+        model = self._model.model
+        tokenizer = self._model.tokenizer
+        n_tokens = len(tokens)
+
+        async with self._generation_lock:
+
+            def _run_all():
+                try:
+                    return _run_specprefill()
+                except Exception as e:
+                    logger.error(
+                        "SpecPrefill failed, falling back to normal path: %s", e
+                    )
+                    return _run_normal()
+
+            def _run_specprefill():
+                """Score tokens, sparse prefill, generate autoregressively."""
+                import time
+                from types import SimpleNamespace
+
+                from ..specprefill import (
+                    cleanup_rope,
+                    score_tokens,
+                    select_chunks,
+                    sparse_prefill,
+                )
+
+                cache = make_prompt_cache(model)
+
+                try:
+                    # Phase 1: Score with draft model
+                    t0 = time.monotonic()
+                    importance = score_tokens(
+                        self._draft_model,
+                        tokens,
+                        prefill_step_size=self._prefill_step_size,
+                    )
+                    t_score = time.monotonic() - t0
+
+                    # Phase 2: Select important chunks
+                    effective_keep = specprefill_keep_pct or self._specprefill_keep_pct
+                    selected = select_chunks(importance, keep_pct=effective_keep)
+                    n_selected = selected.shape[0]
+
+                    # Phase 3: Sparse prefill on target model
+                    t0 = time.monotonic()
+                    logits = sparse_prefill(
+                        model,
+                        tokens,
+                        selected,
+                        cache,
+                        step_size=self._prefill_step_size,
+                    )
+                    t_prefill = time.monotonic() - t0
+
+                    logger.info(
+                        "SpecPrefill: scored %d tokens in %.1fs, "
+                        "sparse prefill %d/%d (keep=%.0f%%) in %.1fs",
+                        n_tokens,
+                        t_score,
+                        n_selected,
+                        n_tokens,
+                        n_selected / n_tokens * 100,
+                        t_prefill,
+                    )
+
+                    # Phase 4: Generate (simple autoregressive, no MTP)
+                    sampler = make_sampler(temp=temperature, top_p=top_p)
+                    eos_id = tokenizer.eos_token_id
+                    y = sampler(logits[:, -1, :])
+                    mx.eval(y)
+
+                    results = []
+                    generated_ids = []
+                    prev_decoded = ""
+
+                    for _ in range(max_tokens):
+                        tok_id = y.item()
+                        generated_ids.append(tok_id)
+
+                        decoded = tokenizer.decode(generated_ids)
+                        new_text = decoded[len(prev_decoded) :]
+                        prev_decoded = decoded
+
+                        is_eos = tok_id == eos_id
+                        results.append(
+                            SimpleNamespace(
+                                text=new_text,
+                                finish_reason="stop" if is_eos else None,
+                            )
+                        )
+
+                        if is_eos:
+                            break
+
+                        logits = model(y.reshape(1, -1), cache=cache)
+                        y = sampler(logits[:, -1, :])
+                        mx.eval(y)
+
+                    return results
+
+                finally:
+                    cleanup_rope(model)
+
+            def _run_normal():
+                """Fallback: normal generation without specprefill."""
+                from types import SimpleNamespace
+
+                results = []
+                for chunk in self._model.stream_generate(
+                    prompt=prompt,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    top_p=top_p,
+                    stop=stop,
+                    **kwargs,
+                ):
+                    new_text = chunk.text if hasattr(chunk, "text") else str(chunk)
+                    results.append(
+                        SimpleNamespace(
+                            text=new_text,
+                            finish_reason=getattr(chunk, "finish_reason", None),
+                        )
+                    )
+                return results
+
+            all_resps = await asyncio.to_thread(_run_all)
+
+        # Yield results as GenerationOutput
+        accumulated_text = ""
+        token_count = 0
+        finished = False
+        for i, resp in enumerate(all_resps):
+            token_count += 1
+            new_text = resp.text
+            accumulated_text += new_text
+
+            is_last = i == len(all_resps) - 1
+            finished = is_last or token_count >= max_tokens
+
+            yield GenerationOutput(
+                text=accumulated_text,
+                new_text=new_text,
+                prompt_tokens=n_tokens,
+                completion_tokens=token_count,
+                finished=finished,
+                finish_reason=resp.finish_reason or ("stop" if finished else None),
+            )
+
+            if finished:
+                break
+
+        if not finished:
+            yield GenerationOutput(
+                text=accumulated_text,
+                new_text="",
+                prompt_tokens=n_tokens,
+                completion_tokens=token_count,
+                finished=True,
+                finish_reason="length",
+            )
 
     async def _stream_generate_text(
         self,
