@@ -548,7 +548,7 @@ class MemoryAwarePrefixCache:
                     "[cache_fetch] supersequence match skipped: "
                     "non-trimmable cache layers (hybrid model)"
                 )
-            elif excess > 0:
+            if excess > 0:
                 trimmed_cache = _trim_cache_offset(best_super.cache, excess)
                 self._entries.move_to_end(best_super.tokens)
                 self._stats.hits += 1
@@ -623,35 +623,28 @@ class MemoryAwarePrefixCache:
         if best_lcp_entry is not None and best_lcp_length > 0:
             excess = len(best_lcp_entry.tokens) - best_lcp_length
 
-            has_non_trimmable = any(
-                not (hasattr(lc, "offset") and hasattr(lc, "keys"))
-                for lc in best_lcp_entry.cache
-            )
-            logger.debug(
+        logger.debug(
                 f"[cache_fetch] LCP candidate: lcp={best_lcp_length} "
                 f"entry_len={len(best_lcp_entry.tokens)} excess={excess} "
-                f"non_trimmable={has_non_trimmable} "
                 f"cache_layers={len(best_lcp_entry.cache)} "
                 f"layer_types={[type(lc).__name__ for lc in best_lcp_entry.cache[:3]]}"
-            )
-
-            if not has_non_trimmable:
-                trimmed_cache = _trim_cache_offset(best_lcp_entry.cache, excess)
-                self._entries.move_to_end(best_lcp_entry.tokens)
-                self._stats.hits += 1
-                self._stats.tokens_saved += best_lcp_length
-                remaining = tokens[best_lcp_length:]
-                logger.debug(
-                    f"[cache_fetch] LCP hit: shared={best_lcp_length} "
-                    f"trimmed={excess} remaining={len(remaining)}"
-                )
-                self._last_match_type = "lcp"
-                trimmed_cache = (
-                    _dequantize_cache(trimmed_cache)
-                    if self._config.kv_quantize
-                    else trimmed_cache
-                )
-                return trimmed_cache, remaining
+        )
+        trimmed_cache = _trim_cache_offset(best_lcp_entry.cache, excess)
+        self._entries.move_to_end(best_lcp_entry.tokens)
+        self._stats.hits += 1
+        self._stats.tokens_saved += best_lcp_length
+        remaining = tokens[best_lcp_length:]
+        logger.debug(
+            f"[cache_fetch] LCP hit: shared={best_lcp_length} "
+            f"trimmed={excess} remaining={len(remaining)}"
+        )
+        self._last_match_type = "lcp"
+        trimmed_cache = (
+            _dequantize_cache(trimmed_cache)
+            if self._config.kv_quantize
+            else trimmed_cache
+        )
+        return trimmed_cache, remaining
 
         self._stats.misses += 1
         self._last_match_type = "miss"
