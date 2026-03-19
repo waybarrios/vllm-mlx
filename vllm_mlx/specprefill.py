@@ -639,6 +639,22 @@ def sparse_prefill(
         selected_indices = mx.array(selected_indices)
 
     M = tokens.shape[0]
+
+    # Detect RotatingKVCache and ensure tail tokens are included.
+    # Models with sliding window attention (e.g., GPT-OSS) use RotatingKVCache
+    # which evicts old entries. We must include the last `max_size` positions
+    # so sliding window layers have valid recent context for decode.
+    max_rotating_size = 0
+    for c in cache:
+        if type(c).__name__ == "RotatingKVCache":
+            max_rotating_size = max(max_rotating_size, getattr(c, "max_size", 0))
+    if max_rotating_size > 0:
+        tail_start = max(0, M - max_rotating_size)
+        tail_indices = set(range(tail_start, M))
+        existing = set(selected_indices.tolist())
+        merged = sorted(existing | tail_indices)
+        selected_indices = mx.array(merged)
+
     # RoPE positions: absolute positions accounting for any prefix
     selected_positions = selected_indices.astype(mx.int32) + position_offset
     selected_tokens = tokens[selected_indices]
