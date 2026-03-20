@@ -416,6 +416,35 @@ class SimpleEngine(BaseEngine):
         # Convert tools for template if provided
         template_tools = convert_tools_for_template(tools) if tools else None
 
+        # Per-request routing: text-only through mlx_lm with MTP
+        if (
+            self._is_mllm
+            and self._text_model is not None
+            and not _has_media_content(messages)
+        ):
+            logger.info("Text-only request → LLM path (MTP=True) [non-streaming]")
+            # Collect streaming output into single response
+            accumulated_text = ""
+            last_chunk = None
+            async for chunk in self._stream_generate_text(
+                messages,
+                max_tokens,
+                temperature,
+                top_p,
+                tools=template_tools,
+                **kwargs,
+            ):
+                accumulated_text = chunk.text
+                last_chunk = chunk
+            if last_chunk is not None:
+                return GenerationOutput(
+                    text=accumulated_text,
+                    prompt_tokens=last_chunk.prompt_tokens,
+                    completion_tokens=last_chunk.completion_tokens,
+                    finish_reason=last_chunk.finish_reason,
+                )
+            return GenerationOutput(text="", finish_reason="stop")
+
         async with self._generation_lock:
             if self._is_mllm:
                 # For MLLM, use the chat method which handles images/videos
