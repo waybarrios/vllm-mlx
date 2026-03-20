@@ -41,6 +41,49 @@ def _has_media_content(messages: list) -> bool:
     return False
 
 
+def _normalize_messages(messages: list[dict]) -> list[dict]:
+    """Normalize message roles and merge consecutive same-role messages.
+
+    1. Maps non-standard roles to standard ones (e.g. ``developer`` -> ``system``).
+    2. Merges consecutive same-role messages to satisfy chat template constraints
+       (Qwen 3.5, Llama, etc. require alternating roles).
+
+    Only merges when both messages have string content. Messages with list
+    content (multimodal) are left as-is to preserve image/video attachments.
+    """
+    _ROLE_MAP = {"developer": "system"}
+
+    if not messages:
+        return messages
+
+    merged = [messages[0].copy()]
+    if merged[0]["role"] in _ROLE_MAP:
+        merged[0]["role"] = _ROLE_MAP[merged[0]["role"]]
+    for msg in messages[1:]:
+        prev = merged[-1]
+        role = _ROLE_MAP.get(msg["role"], msg["role"])
+        if (
+            role == prev["role"]
+            and isinstance(prev.get("content"), str)
+            and isinstance(msg.get("content"), str)
+        ):
+            prev["content"] = prev["content"] + "\n\n" + msg["content"]
+            logger.debug(
+                f"Merged consecutive {role} messages "
+                f"({len(prev['content'])} chars total)"
+            )
+        else:
+            copy = msg.copy()
+            copy["role"] = role
+            merged.append(copy)
+
+    merged_count = len(messages) - len(merged)
+    if merged_count:
+        logger.info(f"Normalized messages: merged {len(messages)} -> {len(merged)}")
+
+    return merged
+
+
 class SimpleEngine(BaseEngine):
     """
     Simple engine for direct model calls.
@@ -408,6 +451,9 @@ class SimpleEngine(BaseEngine):
         """
         if not self._loaded:
             await self.start()
+
+        # Normalize messages before any path (developer->system, merge consecutive)
+        messages = _normalize_messages(messages)
 
         # Convert tools for template
         template_tools = convert_tools_for_template(tools) if tools else None
