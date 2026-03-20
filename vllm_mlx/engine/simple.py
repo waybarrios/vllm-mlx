@@ -77,6 +77,37 @@ def _normalize_messages(messages: list[dict]) -> list[dict]:
             copy["role"] = role
             merged.append(copy)
 
+    # Hoist system messages to position [0] and merge them.
+    # Many CLIs (OpenCode, Qwen Code, Kilo) send system messages mid-conversation;
+    # the Qwen 3.5 chat template rejects any system message not at position [0].
+    system_msgs = [m for m in merged if m["role"] == "system"]
+    non_system = [m for m in merged if m["role"] != "system"]
+    if system_msgs and (len(system_msgs) > 1 or merged[0]["role"] != "system"):
+        # Combine all system message content (string only) into one
+        parts = []
+        for m in system_msgs:
+            c = m.get("content")
+            if isinstance(c, str):
+                parts.append(c)
+            elif isinstance(c, list):
+                # Multimodal system message — extract text parts
+                for part in c:
+                    if isinstance(part, str):
+                        parts.append(part)
+                    elif isinstance(part, dict) and part.get("type") == "text":
+                        parts.append(part.get("text", ""))
+        if parts:
+            combined_system = {"role": "system", "content": "\n\n".join(parts)}
+            merged = [combined_system] + non_system
+            logger.info(
+                f"Hoisted {len(system_msgs)} system message(s) to position [0] "
+                f"({len(combined_system['content'])} chars)"
+            )
+        else:
+            # No string content — just move the first system msg to front
+            merged = system_msgs[:1] + non_system
+            logger.info("Hoisted system message to position [0]")
+
     merged_count = len(messages) - len(merged)
     if merged_count:
         logger.info(f"Normalized messages: merged {len(messages)} -> {len(merged)}")
@@ -379,6 +410,8 @@ class SimpleEngine(BaseEngine):
         """
         if not self._loaded:
             await self.start()
+
+        messages = _normalize_messages(messages)
 
         # Convert tools for template if provided
         template_tools = convert_tools_for_template(tools) if tools else None
