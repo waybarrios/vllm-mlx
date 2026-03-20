@@ -33,6 +33,59 @@ from vllm_mlx.mllm_cache import MLLMPrefixCacheManager
 logger = logging.getLogger(__name__)
 
 
+def _hoist_system_messages(chat_messages: list[dict]) -> list[dict]:
+    """Hoist system messages to position [0] in mlx_vlm chat_messages format.
+
+    Qwen 3.5 chat template rejects system messages not at the beginning.
+    CLIs like OpenCode/Qwen Code/Kilo send system messages mid-conversation.
+    Also maps ``developer`` role to ``system`` and merges consecutive same-role.
+    """
+    if not chat_messages:
+        return chat_messages
+
+    # Map developer -> system
+    for msg in chat_messages:
+        if msg.get("role") == "developer":
+            msg["role"] = "system"
+
+    system_msgs = [m for m in chat_messages if m["role"] == "system"]
+    if not system_msgs:
+        return chat_messages
+    if len(system_msgs) == 1 and chat_messages[0]["role"] == "system":
+        return chat_messages
+
+    non_system = [m for m in chat_messages if m["role"] != "system"]
+
+    # Extract text from all system messages (handles both str and list content)
+    parts = []
+    for m in system_msgs:
+        c = m.get("content")
+        if isinstance(c, str):
+            parts.append(c)
+        elif isinstance(c, list):
+            for item in c:
+                if isinstance(item, str):
+                    parts.append(item)
+                elif isinstance(item, dict) and item.get("type") == "text":
+                    parts.append(item.get("text", ""))
+
+    if parts:
+        combined_text = "\n\n".join(parts)
+        combined = {
+            "role": "system",
+            "content": [
+                {"type": "text", "text": combined_text, "content": combined_text}
+            ],
+        }
+        logger.info(
+            f"Hoisted {len(system_msgs)} system message(s) to position [0] "
+            f"({len(combined_text)} chars)"
+        )
+        return [combined] + non_system
+
+    return system_msgs[:1] + non_system
+
+
 class TempFileManager:
     """Thread-safe manager for tracking and cleaning up temporary files."""
 
@@ -1151,6 +1204,9 @@ class MLXMultimodalLM:
             all_images.extend(frames)
             logger.info(f"Added {len(frames)} frames from video: {video_path}")
 
+        # Hoist system messages to position [0] for Qwen 3.5 template
+        chat_messages = _hoist_system_messages(chat_messages)
+
         # Apply chat template directly - messages are already properly structured
         logger.info(
             f"Applying chat template with {len(chat_messages)} messages, {len(all_images)} images"
@@ -1518,6 +1574,9 @@ class MLXMultimodalLM:
                 video_path, fps=video_fps, max_frames=video_max_frames
             )
             all_images.extend(frames)
+
+        # Hoist system messages to position [0] for Qwen 3.5 template
+        chat_messages = _hoist_system_messages(chat_messages)
 
         # Apply chat template directly - messages are already properly structured
         # Pop tools so they don't leak into mlx_vlm.generate()/stream_generate()
