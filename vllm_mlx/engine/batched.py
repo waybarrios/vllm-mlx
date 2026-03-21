@@ -194,6 +194,11 @@ class BatchedEngine(BaseEngine):
         self._text_tokenizer = None
         self._text_generation_lock = asyncio.Lock()
 
+        # System prompt KV cache (reduces repeated prefill across requests)
+        self._system_kv_snapshot = None  # List of (keys, values) per backbone layer
+        self._system_kv_hash = None  # Hash of system prefix text
+        self._system_kv_token_count = 0  # Tokens in cached prefix
+
     @property
     def model_name(self) -> str:
         """Get the model name."""
@@ -402,6 +407,9 @@ class BatchedEngine(BaseEngine):
         self._mllm_instance = None
         self._text_model = None
         self._text_tokenizer = None
+        self._system_kv_snapshot = None
+        self._system_kv_hash = None
+        self._system_kv_token_count = 0
         self._loaded = False
         logger.info("BatchedEngine stopped")
 
@@ -909,10 +917,17 @@ class BatchedEngine(BaseEngine):
 
         Used when MLLM+MTP routing is active and the request has no media.
         Runs the full generation in a single thread to maintain Metal safety.
+
+        System prompt KV caching: on the first request, prefills system tokens
+        and snapshots backbone KV state. Subsequent requests with the same
+        system prompt restore the snapshot and only prefill the suffix tokens.
         """
+        import hashlib
         import os
 
+        import mlx.core as mx
         from mlx_lm import stream_generate as mlx_stream_generate
+        from mlx_lm.models.cache import make_prompt_cache
         from mlx_lm.sample_utils import make_sampler
 
         # Convert tools for template
@@ -947,12 +962,86 @@ class BatchedEngine(BaseEngine):
         sampler = make_sampler(temp=temperature, top_p=top_p)
         max_tokens = max_tokens or 4096
 
-        logger.info("Text-only request → TextModel (MTP) [streaming]")
+        # --- System KV cache: find system prefix boundary ---
+        # ChatML (Qwen 3.5): everything before first <|im_start|>user is the system prefix
+        USER_MARKER = "<|im_start|>user"
+        marker_pos = prompt.find(USER_MARKER)
+        if marker_pos > 0:
+            system_prefix = prompt[:marker_pos]
+            suffix = prompt[marker_pos:]
+            prefix_hash = hashlib.sha256(system_prefix.encode()).hexdigest()[:16]
+        else:
+            system_prefix = None
+            suffix = prompt
+            prefix_hash = None
+
+        # Check for cache hit
+        cache_hit = (
+            prefix_hash is not None
+            and prefix_hash == self._system_kv_hash
+            and self._system_kv_snapshot is not None
+        )
+
+        if cache_hit:
+            logger.info(
+                "Text-only request → TextModel (MTP) [streaming, system KV cache HIT: "
+                "reusing %d cached tokens, hash=%s]",
+                self._system_kv_token_count,
+                prefix_hash,
+            )
+        else:
+            logger.info("Text-only request → TextModel (MTP) [streaming]")
+
+        prefill_step_size = getattr(self, "_prefill_step_size", 2048) or 2048
 
         # Run under generation lock, all tokens in single thread (Metal safety)
         async with self._text_generation_lock:
 
-            def _run_all():
+            def _run_with_cache():
+                if cache_hit:
+                    return _run_cache_hit()
+                else:
+                    return _run_cache_miss()
+
+            def _run_cache_hit():
+                """Restore system KV snapshot, prefill only suffix, generate."""
+                # Restore cached KV state into a fresh cache
+                restored_cache = make_prompt_cache(self._text_model)
+                for layer_idx, snapshot_state in enumerate(self._system_kv_snapshot):
+                    if layer_idx < len(restored_cache):
+                        restored_cache[layer_idx].state = snapshot_state
+                mx.eval([c.state for c in restored_cache if hasattr(c, "state")])
+
+                # Tokenize just the suffix and generate with the primed cache.
+                # stream_generate accepts mx.array prompt (skips tokenization)
+                # and prompt_cache is forwarded to mtp_generate_step.
+                suffix_tokens = self._text_tokenizer.encode(suffix)
+                suffix_array = mx.array(suffix_tokens)
+                n_suffix = len(suffix_tokens)
+
+                logger.info(
+                    "System KV cache HIT: prefilling %d suffix tokens "
+                    "(skipped %d cached tokens)",
+                    n_suffix,
+                    self._system_kv_token_count,
+                )
+
+                results = []
+                for resp in mlx_stream_generate(
+                    self._text_model,
+                    self._text_tokenizer,
+                    prompt=suffix_array,
+                    max_tokens=max_tokens,
+                    sampler=sampler,
+                    mtp=True,
+                    prompt_cache=restored_cache,
+                    prefill_step_size=prefill_step_size,
+                ):
+                    results.append(resp)
+                return results, self._system_kv_token_count + len(suffix_tokens)
+
+            def _run_cache_miss():
+                """Full prefill + generation, then snapshot system KV for next time."""
                 results = []
                 for resp in mlx_stream_generate(
                     self._text_model,
@@ -961,11 +1050,77 @@ class BatchedEngine(BaseEngine):
                     max_tokens=max_tokens,
                     sampler=sampler,
                     mtp=True,
+                    prefill_step_size=prefill_step_size,
                 ):
                     results.append(resp)
-                return results
 
-            all_resps = await asyncio.to_thread(_run_all)
+                # Snapshot system KV for next request (if we found a system prefix)
+                if prefix_hash is not None and system_prefix is not None:
+                    try:
+                        _snapshot_system_kv()
+                    except Exception as e:
+                        logger.warning("Failed to snapshot system KV cache: %s", e)
+
+                # Get total prompt token count from generation response
+                prompt_tokens = 0
+                if results and hasattr(results[0], "prompt_tokens"):
+                    prompt_tokens = results[0].prompt_tokens
+                return results, prompt_tokens
+
+            def _snapshot_system_kv():
+                """Prefill just the system prefix on a fresh cache and save snapshot."""
+                snapshot_cache = make_prompt_cache(self._text_model)
+                prefix_tokens = self._text_tokenizer.encode(system_prefix)
+                prefix_ids = mx.array(prefix_tokens)
+
+                # Chunked prefill of system prefix
+                for i in range(0, prefix_ids.size, prefill_step_size):
+                    chunk = prefix_ids[i : i + prefill_step_size]
+                    self._text_model(chunk[None], cache=snapshot_cache)
+                    mx.eval(
+                        [c.state for c in snapshot_cache if hasattr(c, "state")]
+                    )
+
+                # Save snapshot: deep copy of each cache layer's state
+                self._system_kv_snapshot = []
+                for c in snapshot_cache:
+                    state = c.state
+                    if isinstance(state, tuple) and len(state) == 2:
+                        # KVCache: (keys, values) — copy to detach from cache
+                        keys, values = state
+                        self._system_kv_snapshot.append(
+                            (mx.array(keys), mx.array(values))
+                        )
+                    elif isinstance(state, list):
+                        # ArraysCache: list of arrays (Mamba/hybrid)
+                        self._system_kv_snapshot.append(
+                            [mx.array(a) if a is not None else None for a in state]
+                        )
+                    else:
+                        # Unknown cache type — store as-is
+                        self._system_kv_snapshot.append(state)
+
+                self._system_kv_token_count = len(prefix_tokens)
+                self._system_kv_hash = prefix_hash
+
+                cache_bytes = 0
+                for entry in self._system_kv_snapshot:
+                    if isinstance(entry, tuple) and len(entry) == 2:
+                        cache_bytes += entry[0].nbytes + entry[1].nbytes
+                    elif isinstance(entry, list):
+                        cache_bytes += sum(
+                            a.nbytes for a in entry if a is not None
+                        )
+                logger.info(
+                    "System KV cache: stored %d-token snapshot "
+                    "(%.1f MB), hash=%s",
+                    len(prefix_tokens),
+                    cache_bytes / 1e6,
+                    prefix_hash,
+                )
+
+            result = await asyncio.to_thread(_run_with_cache)
+            all_resps, prompt_token_count = result
 
         # Yield results as GenerationOutput
         accumulated_text = ""
@@ -982,7 +1137,7 @@ class BatchedEngine(BaseEngine):
             yield GenerationOutput(
                 text=accumulated_text,
                 new_text=new_text,
-                prompt_tokens=0,
+                prompt_tokens=prompt_token_count,
                 completion_tokens=token_count,
                 finished=finished,
                 finish_reason="stop" if finished else None,
@@ -995,7 +1150,7 @@ class BatchedEngine(BaseEngine):
             yield GenerationOutput(
                 text=accumulated_text,
                 new_text="",
-                prompt_tokens=0,
+                prompt_tokens=prompt_token_count,
                 completion_tokens=token_count,
                 finished=True,
                 finish_reason="length",
@@ -1024,6 +1179,20 @@ class BatchedEngine(BaseEngine):
                     stats[key] = mllm_stats[key]
         elif self._engine:
             stats.update(self._engine.get_stats())
+
+        # System KV cache stats
+        if self._system_kv_snapshot is not None:
+            cache_bytes = 0
+            for entry in self._system_kv_snapshot:
+                if isinstance(entry, tuple) and len(entry) == 2:
+                    cache_bytes += entry[0].nbytes + entry[1].nbytes
+                elif isinstance(entry, list):
+                    cache_bytes += sum(a.nbytes for a in entry if a is not None)
+            stats["system_kv_cache"] = {
+                "tokens": self._system_kv_token_count,
+                "hash": self._system_kv_hash,
+                "memory_mb": round(cache_bytes / 1e6, 1),
+            }
 
         return stats
 
