@@ -1350,6 +1350,21 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
         "top_p": _resolve_top_p(request.top_p),
     }
 
+    # Build JSON schema logits processor for constrained decoding
+    if (
+        response_format
+        and isinstance(response_format, dict)
+        and response_format.get("type") == "json_schema"
+        and not engine.is_mllm
+    ):
+        schema = response_format.get("json_schema", {}).get("schema")
+        if schema:
+            from .json_logits_processor import build_json_logits_processor
+
+            processor = build_json_logits_processor(schema, engine.tokenizer)
+            if processor:
+                chat_kwargs["logits_processors"] = [processor]
+
     # Add multimodal content
     if has_media:
         chat_kwargs["images"] = images if images else None

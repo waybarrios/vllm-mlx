@@ -177,6 +177,7 @@ class MLXLanguageModel:
         top_p: float = 0.9,
         repetition_penalty: float = 1.0,
         stop: list[str] | None = None,
+        logits_processors: list | None = None,
     ) -> Iterator[StreamingOutput]:
         """
         Stream text generation token by token.
@@ -203,12 +204,18 @@ class MLXLanguageModel:
         token_count = 0
         accumulated_text = ""
 
-        for response in stream_generate(
-            self.model,
-            self.tokenizer,
+        gen_kwargs = dict(
             prompt=prompt,
             max_tokens=max_tokens,
             sampler=sampler,
+        )
+        if logits_processors:
+            gen_kwargs["logits_processors"] = logits_processors
+
+        for response in stream_generate(
+            self.model,
+            self.tokenizer,
+            **gen_kwargs,
         ):
             token_count += 1
             # response.text is the new token text (not accumulated)
