@@ -174,6 +174,9 @@ class ChatCompletionRequest(BaseModel):
     video_max_frames: int | None = None
     # Request timeout in seconds (None = use server default)
     timeout: float | None = None
+    # SpecPrefill per-request overrides (via extra_body)
+    specprefill: bool | None = None  # True=force, False=disable, None=use server default
+    specprefill_keep_pct: float | None = None  # Override keep percentage (0.1-1.0)
 
 
 class AssistantMessage(BaseModel):

@@ -162,6 +162,11 @@ class BatchedEngine(BaseEngine):
         stream_interval: int = 1,
         force_mllm: bool = False,
         mtp: bool = False,
+        prefill_step_size: int | None = None,
+        specprefill_enabled: bool = False,
+        specprefill_draft_model_path: str | None = None,
+        specprefill_threshold: int = 8192,
+        specprefill_keep_pct: float = 0.3,
     ):
         """
         Initialize the batched engine.
@@ -173,6 +178,11 @@ class BatchedEngine(BaseEngine):
             stream_interval: Tokens to batch before streaming (1=every token)
             force_mllm: Force loading as MLLM even if not auto-detected
             mtp: Enable MTP per-request routing (text-only → TextModel, media → MLLM)
+            prefill_step_size: Chunk size for prompt prefill (default 2048)
+            specprefill_enabled: Enable SpecPrefill sparse prefill
+            specprefill_draft_model_path: Draft model directory name under ~/ai-models/mlx_models/
+            specprefill_threshold: Minimum suffix tokens to trigger SpecPrefill (default 8192)
+            specprefill_keep_pct: Fraction of tokens to keep (default 0.3)
         """
         self._model_name = model_name
         self._trust_remote_code = trust_remote_code
@@ -180,6 +190,15 @@ class BatchedEngine(BaseEngine):
         self._stream_interval = stream_interval
         self._is_mllm = force_mllm or is_mllm_model(model_name)
         self._mtp = mtp
+        self._prefill_step_size = prefill_step_size or 2048
+
+        # SpecPrefill configuration
+        self._specprefill_enabled = specprefill_enabled
+        self._specprefill_draft_model_path = specprefill_draft_model_path
+        self._specprefill_threshold = specprefill_threshold
+        self._specprefill_keep_pct = specprefill_keep_pct
+        self._specprefill_lock = asyncio.Lock()
+        self._draft_model = None
 
         self._model = None
         self._processor = None  # For MLLM
@@ -319,6 +338,32 @@ class BatchedEngine(BaseEngine):
                 self._text_model = None
                 self._text_tokenizer = None
 
+        # Load SpecPrefill draft model (for TextModel path — sparse cache
+        # is incompatible with MTP, so specprefill generates autoregressively)
+        if self._specprefill_enabled and self._specprefill_draft_model_path:
+            try:
+                from pathlib import Path
+
+                from mlx_lm import load as mlx_lm_load
+
+                draft_path = str(
+                    Path.home()
+                    / "ai-models"
+                    / "mlx_models"
+                    / self._specprefill_draft_model_path
+                )
+                self._draft_model, _ = mlx_lm_load(draft_path)
+                logger.info(
+                    "SpecPrefill draft model loaded: %s (threshold=%d, keep=%.0f%%)",
+                    self._specprefill_draft_model_path,
+                    self._specprefill_threshold,
+                    self._specprefill_keep_pct * 100,
+                )
+            except Exception as e:
+                logger.warning("Failed to load SpecPrefill draft model: %s", e)
+                self._specprefill_enabled = False
+                self._draft_model = None
+
     async def _start_llm(self) -> None:
         """Start the LLM engine with AsyncEngineCore."""
         from ..engine_core import AsyncEngineCore, EngineConfig
@@ -407,6 +452,7 @@ class BatchedEngine(BaseEngine):
         self._mllm_instance = None
         self._text_model = None
         self._text_tokenizer = None
+        self._draft_model = None
         self._system_kv_snapshot = None
         self._system_kv_hash = None
         self._system_kv_token_count = 0
@@ -921,6 +967,11 @@ class BatchedEngine(BaseEngine):
         System prompt KV caching: on the first request, prefills system tokens
         and snapshots backbone KV state. Subsequent requests with the same
         system prompt restore the snapshot and only prefill the suffix tokens.
+
+        SpecPrefill: when a draft model is loaded and the prompt exceeds the
+        threshold, uses attention-based sparse prefill for faster TTFT.
+        Composes with system KV cache (sparse-prefill only the suffix when
+        cache hits). Falls back to normal path on any error.
         """
         import hashlib
         import os
@@ -929,6 +980,10 @@ class BatchedEngine(BaseEngine):
         from mlx_lm import stream_generate as mlx_stream_generate
         from mlx_lm.models.cache import make_prompt_cache
         from mlx_lm.sample_utils import make_sampler
+
+        # Per-request specprefill overrides (from extra_body)
+        specprefill_override = kwargs.pop("specprefill", None)
+        specprefill_keep_pct_override = kwargs.pop("specprefill_keep_pct", None)
 
         # Convert tools for template
         template_tools = convert_tools_for_template(tools) if tools else None
@@ -992,16 +1047,191 @@ class BatchedEngine(BaseEngine):
         else:
             logger.info("Text-only request → TextModel (MTP) [streaming]")
 
-        prefill_step_size = getattr(self, "_prefill_step_size", 2048) or 2048
+        prefill_step_size = self._prefill_step_size
+
+        # --- SpecPrefill decision ---
+        # Determine whether to use specprefill for this request.
+        # Must be decided before entering the generation lock so we can
+        # tokenize and check the threshold outside the critical section.
+        _SPECPREFILL_MAX_TOKENS = 196608
+        use_specprefill = False
+        if self._draft_model is not None:
+            if specprefill_override is True:
+                use_specprefill = True
+            elif specprefill_override is None and self._specprefill_enabled:
+                use_specprefill = True
+            # specprefill_override=False explicitly disables
+
+        # Tokenize to determine token count for specprefill threshold check.
+        # We need this for both specprefill and normal paths anyway.
+        sp_tokens = None  # tokens to score (suffix or full prompt)
+        sp_offset = 0  # position offset for sparse_prefill
+        sp_n_total = 0  # total prompt tokens (for logging / threshold)
+
+        if use_specprefill:
+            if cache_hit:
+                # Score only the suffix — system prefix is already cached
+                sp_tokens = self._text_tokenizer.encode(suffix)
+                sp_offset = self._system_kv_token_count
+                sp_n_total = sp_offset + len(sp_tokens)
+            else:
+                # Score the full prompt
+                sp_tokens = self._text_tokenizer.encode(prompt)
+                sp_offset = 0
+                sp_n_total = len(sp_tokens)
+
+            n_sp_tokens = len(sp_tokens)
+
+            # Threshold check (skip when force-enabled via per-request override)
+            if (
+                specprefill_override is not True
+                and n_sp_tokens <= self._specprefill_threshold
+            ):
+                use_specprefill = False
+
+            # Upper bound: cap to avoid draft model OOM
+            if use_specprefill and n_sp_tokens > _SPECPREFILL_MAX_TOKENS:
+                logger.warning(
+                    "SpecPrefill: prompt %d tokens exceeds max %d, "
+                    "falling back to normal path",
+                    n_sp_tokens,
+                    _SPECPREFILL_MAX_TOKENS,
+                )
+                use_specprefill = False
 
         # Run under generation lock, all tokens in single thread (Metal safety)
         async with self._text_generation_lock:
 
             def _run_with_cache():
+                if use_specprefill:
+                    try:
+                        return _run_specprefill()
+                    except Exception as e:
+                        logger.error(
+                            "SpecPrefill failed, falling back to normal path: %s", e
+                        )
+                        # Fall through to normal path
                 if cache_hit:
                     return _run_cache_hit()
                 else:
                     return _run_cache_miss()
+
+            def _run_specprefill():
+                """Score tokens, sparse prefill, generate autoregressively.
+
+                Composes with system KV cache: when cache_hit, restores the
+                system KV snapshot first, then sparse-prefills only the suffix
+                tokens with position_offset = system_kv_token_count.
+
+                Does NOT use MTP (sparse cache is incompatible with MTP
+                speculative decoding).
+                """
+                import time
+                from types import SimpleNamespace
+
+                from ..specprefill import (
+                    cleanup_rope,
+                    score_tokens,
+                    select_chunks,
+                    sparse_prefill,
+                )
+
+                # Build target cache (optionally restore system KV snapshot)
+                target_cache = make_prompt_cache(self._text_model)
+                if cache_hit:
+                    for layer_idx, snapshot_state in enumerate(
+                        self._system_kv_snapshot
+                    ):
+                        if layer_idx < len(target_cache):
+                            target_cache[layer_idx].state = snapshot_state
+                    mx.eval(
+                        [c.state for c in target_cache if hasattr(c, "state")]
+                    )
+
+                try:
+                    # Phase 1: Score with draft model
+                    t0 = time.monotonic()
+                    importance = score_tokens(
+                        self._draft_model,
+                        sp_tokens,
+                        prefill_step_size=prefill_step_size,
+                    )
+                    t_score = time.monotonic() - t0
+
+                    # Phase 2: Select important chunks
+                    effective_keep = (
+                        specprefill_keep_pct_override or self._specprefill_keep_pct
+                    )
+                    selected = select_chunks(importance, keep_pct=effective_keep)
+                    n_selected = selected.shape[0]
+                    n_scored = len(sp_tokens)
+
+                    # Phase 3: Sparse prefill on target model
+                    t0 = time.monotonic()
+                    logits = sparse_prefill(
+                        self._text_model,
+                        sp_tokens,
+                        selected,
+                        target_cache,
+                        step_size=prefill_step_size,
+                        position_offset=sp_offset,
+                    )
+                    t_prefill = time.monotonic() - t0
+
+                    logger.info(
+                        "SpecPrefill: scored %d tokens in %.1fs, "
+                        "sparse prefill %d/%d (keep=%.0f%%) in %.1fs "
+                        "(offset=%d, effective_keep=%.2f)",
+                        n_scored,
+                        t_score,
+                        n_selected,
+                        n_scored,
+                        n_selected / n_scored * 100,
+                        t_prefill,
+                        sp_offset,
+                        effective_keep,
+                    )
+
+                    # Phase 4: Generate (simple autoregressive, no MTP)
+                    eos_id = self._text_tokenizer.eos_token_id
+                    y = sampler(logits[:, -1, :])
+                    mx.eval(y)
+
+                    results = []
+                    generated_ids = []
+                    prev_decoded = ""
+
+                    for _ in range(max_tokens):
+                        tok_id = y.item()
+                        generated_ids.append(tok_id)
+
+                        # Incremental text decode
+                        decoded = self._text_tokenizer.decode(generated_ids)
+                        new_text = decoded[len(prev_decoded):]
+                        prev_decoded = decoded
+
+                        is_eos = tok_id == eos_id
+                        results.append(
+                            SimpleNamespace(
+                                text=new_text,
+                                finish_reason="stop" if is_eos else None,
+                            )
+                        )
+
+                        if is_eos:
+                            break
+
+                        # Next token
+                        logits = self._text_model(
+                            y.reshape(1, -1), cache=target_cache
+                        )
+                        y = sampler(logits[:, -1, :])
+                        mx.eval(y)
+
+                    return results, sp_n_total
+
+                finally:
+                    cleanup_rope(self._text_model)
 
             def _run_cache_hit():
                 """Restore system KV snapshot, prefill only suffix, generate."""
@@ -1179,6 +1409,15 @@ class BatchedEngine(BaseEngine):
                     stats[key] = mllm_stats[key]
         elif self._engine:
             stats.update(self._engine.get_stats())
+
+        # SpecPrefill stats
+        if self._draft_model is not None:
+            stats["specprefill"] = {
+                "enabled": self._specprefill_enabled,
+                "draft_model": self._specprefill_draft_model_path,
+                "threshold": self._specprefill_threshold,
+                "keep_pct": self._specprefill_keep_pct,
+            }
 
         # System KV cache stats
         if self._system_kv_snapshot is not None:
