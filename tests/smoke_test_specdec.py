@@ -7,6 +7,7 @@ Usage: python tests/smoke_test_specdec.py
 Uses Qwen3.5-35B-A3B-8bit as target, Qwen3.5-4B-4bit as draft.
 Tests the SimpleEngine path (mlx_lm.stream_generate with draft_model).
 """
+
 import os
 import sys
 import time
@@ -73,8 +74,12 @@ def test_with_draft():
     from_draft_count = 0
     t0 = time.perf_counter()
     for resp in stream_generate(
-        model, tokenizer, prompt=PROMPT, max_tokens=MAX_TOKENS,
-        draft_model=draft_model, num_draft_tokens=NUM_DRAFT,
+        model,
+        tokenizer,
+        prompt=PROMPT,
+        max_tokens=MAX_TOKENS,
+        draft_model=draft_model,
+        num_draft_tokens=NUM_DRAFT,
     ):
         tokens.append(resp.token)
         if resp.from_draft:
@@ -100,6 +105,7 @@ if __name__ == "__main__":
     # Clear model from memory
     import gc
     import mlx.core as mx
+
     gc.collect()
     mx.clear_cache()
 
@@ -110,5 +116,5 @@ if __name__ == "__main__":
     print(f"  Without draft: {n1} tokens in {t1:.2f}s ({n1/t1:.1f} tok/s)")
     print(f"  With draft:    {n2} tokens in {t2:.2f}s ({n2/t2:.1f} tok/s)")
     if t1 > 0 and t2 > 0:
-        speedup = (n1/t1) / (n2/t2) if n2/t2 > 0 else 0
+        speedup = (n1 / t1) / (n2 / t2) if n2 / t2 > 0 else 0
         print(f"  Speedup: {1/speedup:.2f}x" if speedup > 0 else "  N/A")
