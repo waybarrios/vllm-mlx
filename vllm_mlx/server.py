@@ -1938,7 +1938,7 @@ async def stream_chat_completion(
             # Some models (e.g. Qwen3-Coder) emit <tool_call> directly
             # inside reasoning without a </think> transition, so we need to
             # intercept tool call tokens regardless of which field they land in.
-            effective_text = delta_msg.content or delta_msg.reasoning or ""
+            effective_text = (delta_msg.reasoning or "") + (delta_msg.content or "")
             if tool_parser and effective_text:
                 if not tool_markup_possible and "<" not in effective_text:
                     tool_accumulated_text += effective_text
@@ -1996,7 +1996,13 @@ async def stream_chat_completion(
                             content=delta_msg.content,
                             reasoning=delta_msg.reasoning,
                         ),
-                        finish_reason=output.finish_reason if output.finished else None,
+                        finish_reason=(
+                            "tool_calls"
+                            if (output.finished and tool_calls_detected)
+                            else (
+                                output.finish_reason if output.finished else None
+                            )
+                        ),
                     )
                 ],
                 usage=get_usage(output) if output.finished else None,
