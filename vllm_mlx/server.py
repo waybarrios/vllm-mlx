@@ -479,7 +479,7 @@ def load_model(
         stream_interval: Tokens to batch before streaming (batched mode only)
         max_tokens: Default max tokens for generation
         force_mllm: Force loading as MLLM even if not auto-detected
-        mtp: Enable native MTP speculative decoding (SimpleEngine only)
+        mtp: Enable native MTP speculative decoding (per-request routing in both engines)
     """
     global _engine, _model_name, _default_max_tokens, _tool_parser_instance
 
@@ -498,6 +498,7 @@ def load_model(
             scheduler_config=scheduler_config,
             stream_interval=stream_interval,
             force_mllm=force_mllm,
+            mtp=mtp,
         )
         # BatchedEngine will be started in lifespan (uvicorn's event loop)
         # Just log for now

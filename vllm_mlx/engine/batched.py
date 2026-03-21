@@ -11,6 +11,7 @@ MLLMBatchGenerator. MLLM models only initialise the MLLM scheduler (not the
 LLM engine), so text-only requests must also be routed through it.
 """
 
+import asyncio
 import logging
 from collections.abc import AsyncIterator
 from typing import Any
@@ -21,6 +22,28 @@ from ..message_utils import _normalize_messages
 from .base import BaseEngine, GenerationOutput
 
 logger = logging.getLogger(__name__)
+
+_MEDIA_TYPES = frozenset(
+    {
+        "image_url",
+        "video_url",
+        "audio_url",
+        "image",
+        "video",
+        "audio",
+    }
+)
+
+
+def _has_media_content(messages: list) -> bool:
+    """Check if any message contains media content (images, video, audio)."""
+    for msg in messages:
+        content = msg.get("content")
+        if isinstance(content, list):
+            for part in content:
+                if isinstance(part, dict) and part.get("type") in _MEDIA_TYPES:
+                    return True
+    return False
 
 
 def _extract_media_from_messages(messages: list[dict[str, Any]]) -> tuple:
@@ -138,6 +161,7 @@ class BatchedEngine(BaseEngine):
         scheduler_config: Any | None = None,
         stream_interval: int = 1,
         force_mllm: bool = False,
+        mtp: bool = False,
     ):
         """
         Initialize the batched engine.
@@ -148,12 +172,14 @@ class BatchedEngine(BaseEngine):
             scheduler_config: Optional scheduler configuration
             stream_interval: Tokens to batch before streaming (1=every token)
             force_mllm: Force loading as MLLM even if not auto-detected
+            mtp: Enable MTP per-request routing (text-only → TextModel, media → MLLM)
         """
         self._model_name = model_name
         self._trust_remote_code = trust_remote_code
         self._scheduler_config = scheduler_config
         self._stream_interval = stream_interval
         self._is_mllm = force_mllm or is_mllm_model(model_name)
+        self._mtp = mtp
 
         self._model = None
         self._processor = None  # For MLLM
@@ -162,6 +188,11 @@ class BatchedEngine(BaseEngine):
         self._mllm_scheduler = None  # MLLMScheduler for MLLM
         self._mllm_instance = None  # MLXMultimodalLM instance
         self._loaded = False
+
+        # Per-request routing state (MLLM+MTP mode)
+        self._text_model = None
+        self._text_tokenizer = None
+        self._text_generation_lock = asyncio.Lock()
 
     @property
     def model_name(self) -> str:
@@ -241,6 +272,49 @@ class BatchedEngine(BaseEngine):
             f"max_num_seqs={max_num_seqs}, prefill_batch={prefill_batch_size}, "
             f"completion_batch={completion_batch_size}"
         )
+
+        # Build TextModel for MTP per-request routing (text-only → MTP, media → MLLM)
+        if self._mtp:
+            try:
+                from ..text_model_from_vlm import build_text_model
+
+                self._text_model = build_text_model(
+                    self._mllm_instance.model, self._model_name
+                )
+                if self._text_model is not None:
+                    # Load tokenizer for text model path
+                    from mlx_lm.tokenizer_utils import load_tokenizer
+
+                    self._text_tokenizer = load_tokenizer(self._model_name)
+
+                    # Apply Qwen3.5 eos_token fix (matches SimpleEngine pattern)
+                    if "qwen3" in self._model_name.lower():
+                        self._text_tokenizer.eos_token = "<|im_end|>"
+                        self._text_tokenizer.eos_token_id = (
+                            self._text_tokenizer.convert_tokens_to_ids("<|im_end|>")
+                        )
+
+                    # Check if TextModel actually has MTP
+                    has_mtp = (
+                        hasattr(self._text_model, "mtp")
+                        and self._text_model.mtp is not None
+                    )
+                    if has_mtp:
+                        logger.info(
+                            "BatchedEngine MLLM+MTP routing: "
+                            "text-only → TextModel (MTP), media → MLLM"
+                        )
+                    else:
+                        logger.warning(
+                            "TextModel built but no MTP head — "
+                            "text-only won't use MTP"
+                        )
+                        self._text_model = None
+                        self._text_tokenizer = None
+            except Exception as e:
+                logger.error(f"MTP TextModel build failed: {e}")
+                self._text_model = None
+                self._text_tokenizer = None
 
     async def _start_llm(self) -> None:
         """Start the LLM engine with AsyncEngineCore."""
@@ -328,6 +402,8 @@ class BatchedEngine(BaseEngine):
         self._tokenizer = None
         self._processor = None
         self._mllm_instance = None
+        self._text_model = None
+        self._text_tokenizer = None
         self._loaded = False
         logger.info("BatchedEngine stopped")
 
@@ -616,6 +692,17 @@ class BatchedEngine(BaseEngine):
         # Normalize messages before any path (developer->system, merge consecutive)
         messages = _normalize_messages(messages)
 
+        # Per-request MTP routing: text-only → TextModel, media → MLLM
+        if self._text_model is not None and not _has_media_content(messages):
+            return await self._chat_text_model(
+                messages,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                tools=tools,
+                **kwargs,
+            )
+
         # Extract images/videos from messages (OpenAI multimodal format)
         # Note: We only use extracted media here, messages are already processed by server
         _, extracted_images, extracted_videos = extract_multimodal_content(messages)
@@ -730,6 +817,19 @@ class BatchedEngine(BaseEngine):
         # Normalize messages before any path (developer->system, merge consecutive)
         messages = _normalize_messages(messages)
 
+        # Per-request MTP routing: text-only → TextModel, media → MLLM
+        if self._text_model is not None and not _has_media_content(messages):
+            async for output in self._stream_chat_text_model(
+                messages,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                tools=tools,
+                **kwargs,
+            ):
+                yield output
+            return
+
         # Extract images/videos from messages (OpenAI multimodal format)
         # Note: We only use extracted media here, messages are already processed by server
         _, extracted_images, extracted_videos = extract_multimodal_content(messages)
@@ -761,6 +861,147 @@ class BatchedEngine(BaseEngine):
             **kwargs,
         ):
             yield output
+
+    async def _chat_text_model(
+        self,
+        messages: list[dict[str, Any]],
+        max_tokens: int = 256,
+        temperature: float = 0.7,
+        top_p: float = 0.9,
+        tools: list[dict] | None = None,
+        **kwargs,
+    ) -> GenerationOutput:
+        """Non-streaming text-only generation via mlx_lm TextModel with MTP.
+
+        Collects all streaming output into a single GenerationOutput.
+        Used when MLLM+MTP routing is active and the request has no media.
+        """
+        logger.info("Text-only request → TextModel (MTP) [non-streaming]")
+        accumulated_text = ""
+        last_chunk = None
+        async for chunk in self._stream_chat_text_model(
+            messages,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            tools=tools,
+            **kwargs,
+        ):
+            accumulated_text = chunk.text
+            last_chunk = chunk
+        if last_chunk is not None:
+            return GenerationOutput(
+                text=accumulated_text,
+                prompt_tokens=last_chunk.prompt_tokens,
+                completion_tokens=last_chunk.completion_tokens,
+                finish_reason=last_chunk.finish_reason,
+            )
+        return GenerationOutput(text="", finish_reason="stop")
+
+    async def _stream_chat_text_model(
+        self,
+        messages: list[dict[str, Any]],
+        max_tokens: int = 256,
+        temperature: float = 0.7,
+        top_p: float = 0.9,
+        tools: list[dict] | None = None,
+        **kwargs,
+    ) -> AsyncIterator[GenerationOutput]:
+        """Streaming text-only generation via mlx_lm TextModel with MTP.
+
+        Used when MLLM+MTP routing is active and the request has no media.
+        Runs the full generation in a single thread to maintain Metal safety.
+        """
+        import os
+
+        from mlx_lm import stream_generate as mlx_stream_generate
+        from mlx_lm.sample_utils import make_sampler
+
+        # Convert tools for template
+        template_tools = convert_tools_for_template(tools) if tools else None
+
+        # Read enable_thinking from env (set by runtime_patches, consistent with MLLM path)
+        enable_thinking_env = os.environ.get("VLLM_MLX_ENABLE_THINKING", "true")
+        enable_thinking = enable_thinking_env.lower() in ("true", "1", "yes")
+
+        # Apply chat template
+        template_kwargs = {
+            "tokenize": False,
+            "add_generation_prompt": True,
+            "enable_thinking": enable_thinking,
+        }
+        if template_tools:
+            template_kwargs["tools"] = template_tools
+
+        try:
+            prompt = self._text_tokenizer.apply_chat_template(
+                messages, **template_kwargs
+            )
+        except TypeError:
+            # Template doesn't accept tools= or enable_thinking=
+            template_kwargs.pop("tools", None)
+            template_kwargs.pop("enable_thinking", None)
+            prompt = self._text_tokenizer.apply_chat_template(
+                messages, **template_kwargs
+            )
+
+        # Build sampler
+        sampler = make_sampler(temp=temperature, top_p=top_p)
+        max_tokens = max_tokens or 4096
+
+        logger.info("Text-only request → TextModel (MTP) [streaming]")
+
+        # Run under generation lock, all tokens in single thread (Metal safety)
+        async with self._text_generation_lock:
+
+            def _run_all():
+                results = []
+                for resp in mlx_stream_generate(
+                    self._text_model,
+                    self._text_tokenizer,
+                    prompt=prompt,
+                    max_tokens=max_tokens,
+                    sampler=sampler,
+                    mtp=True,
+                ):
+                    results.append(resp)
+                return results
+
+            all_resps = await asyncio.to_thread(_run_all)
+
+        # Yield results as GenerationOutput
+        accumulated_text = ""
+        token_count = 0
+        finished = False
+        for i, resp in enumerate(all_resps):
+            token_count += 1
+            new_text = resp.text if hasattr(resp, "text") else str(resp)
+            accumulated_text += new_text
+
+            is_last = i == len(all_resps) - 1
+            finished = is_last or token_count >= max_tokens
+
+            yield GenerationOutput(
+                text=accumulated_text,
+                new_text=new_text,
+                prompt_tokens=0,
+                completion_tokens=token_count,
+                finished=finished,
+                finish_reason="stop" if finished else None,
+            )
+
+            if finished:
+                break
+
+        if not finished:
+            yield GenerationOutput(
+                text=accumulated_text,
+                new_text="",
+                prompt_tokens=0,
+                completion_tokens=token_count,
+                finished=True,
+                finish_reason="length",
+            )
 
     def get_stats(self) -> dict[str, Any]:
         """Get engine statistics."""
