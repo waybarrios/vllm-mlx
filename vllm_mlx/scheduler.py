@@ -20,6 +20,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 import mlx.core as mx
 from mlx_lm.generate import BatchGenerator
 from mlx_lm.sample_utils import make_sampler
+from mlx_lm.tokenizer_utils import NaiveStreamingDetokenizer
 
 from .memory_cache import MemoryAwarePrefixCache, MemoryCacheConfig
 from .paged_cache import PagedCacheManager
@@ -392,6 +393,7 @@ def _install_chunked_prefill(
                         caches,
                         samplers,
                         logits_processors,
+                        _prompt_checkpoints,
                     ) = zip(*batch_prompts)
                     lengths = [len(p) for p in inputs_raw]
                     max_length = max(lengths)
@@ -1042,6 +1044,12 @@ class Scheduler:
         # Thread-safe set for deferred aborts (main thread → executor thread)
         # CPython GIL guarantees set.add() and `x in set` are atomic.
         self._pending_abort_ids: Set[str] = set()
+
+        # Per-request streaming detokenizers for UTF-8-safe incremental decode.
+        # Raw tokenizer.decode([token]) splits multi-byte codepoints (emoji)
+        # into surrogate pairs.  NaiveStreamingDetokenizer buffers incomplete
+        # byte sequences and only emits valid UTF-8 segments.
+        self._detokenizer_pool: Dict[str, Any] = {}
 
         # Statistics
         self.num_requests_processed = 0
@@ -1698,6 +1706,9 @@ class Scheduler:
             request.set_finished(RequestStatus.FINISHED_ABORTED)
         self.finished_req_ids.add(request_id)
 
+        # Clean up streaming detokenizer
+        self._detokenizer_pool.pop(request_id, None)
+
         # Flush Metal encoders after removing arrays from batch
         mx.clear_cache()
 
@@ -1857,11 +1868,24 @@ class Scheduler:
 
                 request.first_token_time = _time.time()
 
-            # Decode the new token (skip stop tokens — they are not content)
+            # Decode the new token using streaming detokenizer (UTF-8 safe).
+            # Raw tokenizer.decode([token]) splits multi-byte codepoints
+            # (emoji, CJK, etc.) into surrogate pairs — issue #130.
+            if request_id not in self._detokenizer_pool:
+                tok = self._actual_tokenizer
+                if hasattr(tok, "detokenizer"):
+                    detok = tok.detokenizer
+                else:
+                    detok = NaiveStreamingDetokenizer(tok)
+                detok.reset()
+                self._detokenizer_pool[request_id] = detok
+            detok = self._detokenizer_pool[request_id]
+
             if response.finish_reason == "stop":
                 new_text = ""
             else:
-                new_text = self._decode_tokens([response.token])
+                detok.add_token(response.token)
+                new_text = detok.last_segment
 
             # Create output
             output = RequestOutput(
@@ -1884,8 +1908,13 @@ class Scheduler:
                 output.finish_reason = response.finish_reason
                 finished_ids.add(request_id)
 
-                # Decode full output
-                output.output_text = self._decode_tokens(request.output_token_ids)
+                # Finalize streaming detokenizer and get full output
+                detok = self._detokenizer_pool.pop(request_id, None)
+                if detok is not None:
+                    detok.finalize()
+                    output.output_text = detok.text
+                else:
+                    output.output_text = self._decode_tokens(request.output_token_ids)
                 request.output_text = output.output_text
 
                 # Extract cache for future reuse (critical for agentic multi-turn)
@@ -2054,6 +2083,11 @@ class Scheduler:
                         values_attr = layer.values
                         if not callable(keys_attr) and not callable(values_attr):
                             mx.eval(keys_attr, values_attr)
+
+            # Clean up streaming detokenizer (safety net — normally popped
+            # in _process_batch_responses on finish, but guard against
+            # edge cases like error paths that skip normal finish handling)
+            self._detokenizer_pool.pop(request_id, None)
 
             # Remove from running
             if request_id in self.running:
@@ -2408,6 +2442,7 @@ class Scheduler:
         self.finished_req_ids.clear()
         self.request_id_to_uid.clear()
         self.uid_to_request_id.clear()
+        self._detokenizer_pool.clear()
         self._close_batch_generator()
         self._current_sampler_params = None
 
