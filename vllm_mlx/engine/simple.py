@@ -13,6 +13,7 @@ from typing import Any
 
 from ..api.tool_calling import convert_tools_for_template
 from ..api.utils import clean_output_text, is_mllm_model
+from ..message_utils import _normalize_messages
 from .base import BaseEngine, GenerationOutput
 
 logger = logging.getLogger(__name__)
@@ -434,6 +435,8 @@ class SimpleEngine(BaseEngine):
         Returns:
             GenerationOutput with assistant response
         """
+        messages = _normalize_messages(messages)
+
         if not self._loaded:
             await self.start()
 
@@ -506,6 +509,8 @@ class SimpleEngine(BaseEngine):
         Yields:
             GenerationOutput with incremental text
         """
+        messages = _normalize_messages(messages)
+
         if not self._loaded:
             await self.start()
 
