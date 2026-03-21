@@ -1144,9 +1144,7 @@ class BatchedEngine(BaseEngine):
                     ):
                         if layer_idx < len(target_cache):
                             target_cache[layer_idx].state = snapshot_state
-                    mx.eval(
-                        [c.state for c in target_cache if hasattr(c, "state")]
-                    )
+                    mx.eval([c.state for c in target_cache if hasattr(c, "state")])
 
                 try:
                     # Phase 1: Score with draft model
@@ -1207,7 +1205,7 @@ class BatchedEngine(BaseEngine):
 
                         # Incremental text decode
                         decoded = self._text_tokenizer.decode(generated_ids)
-                        new_text = decoded[len(prev_decoded):]
+                        new_text = decoded[len(prev_decoded) :]
                         prev_decoded = decoded
 
                         is_eos = tok_id == eos_id
@@ -1222,9 +1220,7 @@ class BatchedEngine(BaseEngine):
                             break
 
                         # Next token
-                        logits = self._text_model(
-                            y.reshape(1, -1), cache=target_cache
-                        )
+                        logits = self._text_model(y.reshape(1, -1), cache=target_cache)
                         y = sampler(logits[:, -1, :])
                         mx.eval(y)
 
@@ -1307,9 +1303,7 @@ class BatchedEngine(BaseEngine):
                 for i in range(0, prefix_ids.size, prefill_step_size):
                     chunk = prefix_ids[i : i + prefill_step_size]
                     self._text_model(chunk[None], cache=snapshot_cache)
-                    mx.eval(
-                        [c.state for c in snapshot_cache if hasattr(c, "state")]
-                    )
+                    mx.eval([c.state for c in snapshot_cache if hasattr(c, "state")])
 
                 # Save snapshot: deep copy of each cache layer's state
                 self._system_kv_snapshot = []
@@ -1338,12 +1332,9 @@ class BatchedEngine(BaseEngine):
                     if isinstance(entry, tuple) and len(entry) == 2:
                         cache_bytes += entry[0].nbytes + entry[1].nbytes
                     elif isinstance(entry, list):
-                        cache_bytes += sum(
-                            a.nbytes for a in entry if a is not None
-                        )
+                        cache_bytes += sum(a.nbytes for a in entry if a is not None)
                 logger.info(
-                    "System KV cache: stored %d-token snapshot "
-                    "(%.1f MB), hash=%s",
+                    "System KV cache: stored %d-token snapshot " "(%.1f MB), hash=%s",
                     len(prefix_tokens),
                     cache_bytes / 1e6,
                     prefix_hash,
