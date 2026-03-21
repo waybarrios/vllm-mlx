@@ -200,7 +200,7 @@ def _install_chunked_prefill(
             batch.logits_processors,
             batch.tokens,
         )
-        mx.async_eval(batch.y, batch.logprobs)
+        mx.async_eval(batch.y, batch.logprobs, batch.tokens)
 
         y = y.tolist()
         self._stats.generation_time += _time.perf_counter() - tic_gen
@@ -695,13 +695,18 @@ def _install_mtp(
             # and on reject: trim KV by 2 (remove both P and D), restore
             # RNN snapshot, then re-advance with just P so both cache
             # types end up consistent at [..., P].
+            # Snapshot recurrent state for rollback on reject.
+            # Skip in optimistic mode — it never rejects, so the copies
+            # are wasted (~147 MB/step of lazy graph nodes that prevent
+            # pre-verify Metal buffers from being freed).
             _rnn_snapshots = {}
-            for _ci, _c in enumerate(prompt_cache):
-                if not (hasattr(_c, "is_trimmable") and _c.is_trimmable()):
-                    if hasattr(_c, "state"):
-                        _rnn_snapshots[_ci] = [
-                            s.copy() if s is not None else None for s in _c.state
-                        ]
+            if not optimistic:
+                for _ci, _c in enumerate(prompt_cache):
+                    if not (hasattr(_c, "is_trimmable") and _c.is_trimmable()):
+                        if hasattr(_c, "state"):
+                            _rnn_snapshots[_ci] = [
+                                s.copy() if s is not None else None for s in _c.state
+                            ]
 
             verify_input = mx.concatenate(
                 [primary_tokens[:, None], draft_tokens[:, None]], axis=1
