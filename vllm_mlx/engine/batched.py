@@ -282,10 +282,8 @@ class BatchedEngine(BaseEngine):
                     self._mllm_instance.model, self._model_name
                 )
                 if self._text_model is not None:
-                    # Load tokenizer for text model path
-                    from mlx_lm.tokenizer_utils import load_tokenizer
-
-                    self._text_tokenizer = load_tokenizer(self._model_name)
+                    # Get tokenizer from the MLLM instance (same model, shared tokenizer)
+                    self._text_tokenizer = self._mllm_instance.get_tokenizer()
 
                     # Apply Qwen3.5 eos_token fix (matches SimpleEngine pattern)
                     if "qwen3" in self._model_name.lower():

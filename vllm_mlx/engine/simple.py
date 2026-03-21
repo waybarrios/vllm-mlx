@@ -57,6 +57,10 @@ class SimpleEngine(BaseEngine):
         enable_cache: bool = True,
         force_mllm: bool = False,
         mtp: bool = False,
+        specprefill_enabled: bool = False,
+        specprefill_draft_model_path: str | None = None,
+        specprefill_threshold: int = 8192,
+        specprefill_keep_pct: float = 0.3,
     ):
         """
         Initialize the simple engine.
@@ -67,12 +71,20 @@ class SimpleEngine(BaseEngine):
             enable_cache: Enable VLM cache for multimodal models
             force_mllm: Force loading as MLLM even if not auto-detected
             mtp: Enable native MTP speculative decoding (model must have MTP head)
+            specprefill_enabled: Enable SpecPrefill (attention-based sparse prefill)
+            specprefill_draft_model_path: Path to draft model for SpecPrefill scoring
+            specprefill_threshold: Minimum suffix tokens to trigger SpecPrefill
+            specprefill_keep_pct: Fraction of tokens to keep during sparse prefill
         """
         self._model_name = model_name
         self._trust_remote_code = trust_remote_code
         self._enable_cache = enable_cache
         self._is_mllm = force_mllm or is_mllm_model(model_name)
         self._mtp = mtp
+        self._specprefill_enabled = specprefill_enabled
+        self._specprefill_draft_model_path = specprefill_draft_model_path
+        self._specprefill_threshold = specprefill_threshold
+        self._specprefill_keep_pct = specprefill_keep_pct
 
         self._model = None
         self._loaded = False
