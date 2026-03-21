@@ -467,6 +467,7 @@ def load_model(
     stream_interval: int = 1,
     max_tokens: int = 32768,
     force_mllm: bool = False,
+    repetition_detector: bool = False,
 ):
     """
     Load a model (auto-detects MLLM vs LLM).
@@ -502,7 +503,11 @@ def load_model(
         logger.info(f"Model loaded (batched mode): {model_name}")
     else:
         logger.info(f"Loading model with SimpleEngine: {model_name}")
-        _engine = SimpleEngine(model_name=model_name, force_mllm=force_mllm)
+        _engine = SimpleEngine(
+            model_name=model_name,
+            force_mllm=force_mllm,
+            repetition_detector=repetition_detector,
+        )
         # Start SimpleEngine synchronously (no background loop)
         # Use new_event_loop() for Python 3.10+ compatibility (get_event_loop() is deprecated)
         loop = asyncio.new_event_loop()

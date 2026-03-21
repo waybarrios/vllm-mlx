@@ -32,6 +32,7 @@ class SimpleEngine(BaseEngine):
         trust_remote_code: bool = True,
         enable_cache: bool = True,
         force_mllm: bool = False,
+        repetition_detector: bool = False,
     ):
         """
         Initialize the simple engine.
@@ -41,11 +42,13 @@ class SimpleEngine(BaseEngine):
             trust_remote_code: Whether to trust remote code
             enable_cache: Enable VLM cache for multimodal models
             force_mllm: Force loading as MLLM even if not auto-detected
+            repetition_detector: Enable detection of degenerate repeat loops
         """
         self._model_name = model_name
         self._trust_remote_code = trust_remote_code
         self._enable_cache = enable_cache
         self._is_mllm = force_mllm or is_mllm_model(model_name)
+        self._use_repetition_detector = repetition_detector
 
         self._model = None
         self._loaded = False
@@ -186,6 +189,12 @@ class SimpleEngine(BaseEngine):
             completion_tokens = 0
             finished = False
 
+            rep_det = None
+            if self._use_repetition_detector:
+                from ..repetition_detector import RepetitionDetector
+
+                rep_det = RepetitionDetector()
+
             for chunk in self._model.stream_generate(
                 prompt=prompt,
                 max_tokens=max_tokens,
@@ -203,9 +212,21 @@ class SimpleEngine(BaseEngine):
                 new_text = chunk.text if hasattr(chunk, "text") else str(chunk)
                 accumulated_text += new_text
 
-                finished = (
-                    getattr(chunk, "finished", False) or completion_tokens >= max_tokens
-                )
+                # Check for degenerate repetition loops
+                if rep_det is not None:
+                    token_id = getattr(chunk, "token", hash(new_text) & 0xFFFFFFFF)
+                    if rep_det.check(token_id):
+                        logger.warning(
+                            "Repetition loop detected at token %d, stopping",
+                            completion_tokens,
+                        )
+                        finished = True
+
+                if not finished:
+                    finished = (
+                        getattr(chunk, "finished", False)
+                        or completion_tokens >= max_tokens
+                    )
                 finish_reason = None
                 if finished:
                     finish_reason = getattr(chunk, "finish_reason", "stop")

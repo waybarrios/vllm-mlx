@@ -187,6 +187,7 @@ def serve_command(args):
         stream_interval=args.stream_interval if args.continuous_batching else 1,
         max_tokens=args.max_tokens,
         force_mllm=args.mllm,
+        repetition_detector=getattr(args, "repetition_detector", False),
     )
 
     # Start server
@@ -806,6 +807,11 @@ Examples:
         "--mllm",
         action="store_true",
         help="Force load model as multimodal (vision) even if name doesn't match auto-detection patterns",
+    )
+    serve_parser.add_argument(
+        "--repetition-detector",
+        action="store_true",
+        help="Detect and stop degenerate repeating token loops during generation",
     )
     # Generation defaults
     serve_parser.add_argument(
