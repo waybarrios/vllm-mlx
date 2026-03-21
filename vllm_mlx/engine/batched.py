@@ -219,12 +219,14 @@ class BatchedEngine(BaseEngine):
             self._scheduler_config, "completion_batch_size", 16
         )
 
+        cache_memory_mb = getattr(self._scheduler_config, "cache_memory_mb", None)
         mllm_config = MLLMSchedulerConfig(
             max_num_seqs=max_num_seqs,
             prefill_batch_size=prefill_batch_size,
             completion_batch_size=completion_batch_size,
             enable_vision_cache=True,
             vision_cache_size=100,
+            cache_memory_mb=cache_memory_mb,
         )
 
         # Create and start MLLM scheduler
@@ -783,8 +785,8 @@ class BatchedEngine(BaseEngine):
 
     def get_cache_stats(self) -> dict[str, Any] | None:
         """Get cache statistics."""
-        if self._mllm_scheduler and self._mllm_scheduler.vision_cache:
-            return self._mllm_scheduler.vision_cache.get_stats()
+        if self._mllm_scheduler and self._mllm_scheduler.batch_generator:
+            return self._mllm_scheduler.batch_generator.get_vision_cache_stats()
         elif self._engine:
             return self._engine.get_cache_stats()
         return None
