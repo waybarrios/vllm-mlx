@@ -17,6 +17,7 @@ from typing import Any
 
 from ..api.tool_calling import convert_tools_for_template
 from ..api.utils import clean_output_text, extract_multimodal_content, is_mllm_model
+from ..message_utils import _normalize_messages
 from .base import BaseEngine, GenerationOutput
 
 logger = logging.getLogger(__name__)
@@ -612,6 +613,9 @@ class BatchedEngine(BaseEngine):
         if not self._loaded:
             await self.start()
 
+        # Normalize messages before any path (developer->system, merge consecutive)
+        messages = _normalize_messages(messages)
+
         # Extract images/videos from messages (OpenAI multimodal format)
         # Note: We only use extracted media here, messages are already processed by server
         _, extracted_images, extracted_videos = extract_multimodal_content(messages)
@@ -722,6 +726,9 @@ class BatchedEngine(BaseEngine):
         """
         if not self._loaded:
             await self.start()
+
+        # Normalize messages before any path (developer->system, merge consecutive)
+        messages = _normalize_messages(messages)
 
         # Extract images/videos from messages (OpenAI multimodal format)
         # Note: We only use extracted media here, messages are already processed by server
