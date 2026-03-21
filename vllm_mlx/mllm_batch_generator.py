@@ -366,6 +366,11 @@ class MLLMBatchGenerator:
                 "MLLMBatchGenerator: Model does not have language_model, using model directly"
             )
 
+        # Patch Qwen3.5 attention for BatchKVCache compatibility
+        from .patches.qwen3_5_mllm import patch_qwen35_attention_for_batching
+
+        patch_qwen35_attention_for_batching()
+
         self.max_tokens = max_tokens
         self.stop_tokens = stop_tokens or set()
         self.sampler = sampler or (lambda x: mx.argmax(x, axis=-1))
@@ -381,6 +386,9 @@ class MLLMBatchGenerator:
 
         # Statistics
         self._stats = MLLMBatchStats()
+
+        # Error responses for requests that failed during preprocessing
+        self._pending_error_responses: List[MLLMBatchResponse] = []
 
         # Vision embedding cache for repeated images
         self.vision_cache = VisionEmbeddingCache(
@@ -655,23 +663,48 @@ class MLLMBatchGenerator:
 
         tic = time.perf_counter()
 
-        # Preprocess all requests
+        # Preprocess all requests (per-request error handling)
+        failed_requests = []
         for req in requests:
-            self._preprocess_request(req)
+            try:
+                self._preprocess_request(req)
+            except Exception as e:
+                logger.error(
+                    f"Failed to preprocess request {req.request_id}: "
+                    f"{type(e).__name__}: {e}"
+                )
+                failed_requests.append(req)
+
+        # Remove failed requests and create error responses
+        if failed_requests:
+            for req in failed_requests:
+                requests.remove(req)
+                self._pending_error_responses.append(
+                    MLLMBatchResponse(
+                        uid=req.uid,
+                        request_id=req.request_id,
+                        token=0,
+                        logprobs=mx.zeros(1),
+                        finish_reason="error",
+                    )
+                )
+
+        if not requests:
+            return None
 
         total_prompt_tokens = sum(
             req.input_ids.size if req.input_ids is not None else 1 for req in requests
         )
         self._stats.prompt_tokens += total_prompt_tokens
 
-        # Guard against excessive memory usage during cache merge.
-        # Each token in the batch requires KV entries across all layers.
+        # Log large prompts for monitoring (was previously a hard error that
+        # could cause infinite retry loops).
         max_batch_tokens = self.prefill_step_size * len(requests)
         if total_prompt_tokens > max_batch_tokens:
-            raise ValueError(
-                f"Total prompt tokens ({total_prompt_tokens}) exceeds safe limit "
-                f"({max_batch_tokens}) for {len(requests)} requests. "
-                f"Reduce prompt length or batch size."
+            logger.warning(
+                f"Large batch prefill: {total_prompt_tokens} tokens "
+                f"(step_size={self.prefill_step_size}, requests={len(requests)}). "
+                f"Processing may be slow."
             )
 
         # Run vision encoding for each request with its own KVCache.
@@ -803,10 +836,16 @@ class MLLMBatchGenerator:
             self.active_batch = new_batch
             prompt_processing = True
 
+        # Collect any pending error responses (from failed preprocessing)
+        error_responses = []
+        if self._pending_error_responses:
+            error_responses = list(self._pending_error_responses)
+            self._pending_error_responses.clear()
+
         # Generate next token for active batch
         batch = self.active_batch
         if batch is None:
-            return []
+            return error_responses
 
         y, logprobs = batch.y, batch.logprobs
         batch.y, batch.logprobs = self._step(y[:, None], batch.cache)
@@ -875,7 +914,7 @@ class MLLMBatchGenerator:
                 self.active_batch = None
 
         self._stats.generation_tokens += len(responses)
-        return responses
+        return error_responses + responses
 
     def next(self) -> List[MLLMBatchResponse]:
         """

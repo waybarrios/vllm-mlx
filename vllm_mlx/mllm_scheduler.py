@@ -29,6 +29,8 @@ from dataclasses import dataclass, field
 from typing import Any, AsyncIterator, Dict, List, Optional, Set, Tuple
 
 
+from mlx_lm.tokenizer_utils import NaiveStreamingDetokenizer
+
 from .mllm_batch_generator import (
     MLLMBatchGenerator,
     MLLMBatchRequest,
@@ -197,6 +199,9 @@ class MLLMScheduler:
         # Mapping between our request IDs and BatchGenerator UIDs
         self.request_id_to_uid: Dict[str, int] = {}
         self.uid_to_request_id: Dict[int, str] = {}
+
+        # Per-request streaming detokenizers for UTF-8-safe incremental decode
+        self._detokenizer_pool: Dict[str, Any] = {}
 
         # Output queues for async streaming
         self.output_queues: Dict[str, asyncio.Queue] = {}
@@ -447,12 +452,42 @@ class MLLMScheduler:
             if request is None:
                 continue
 
+            # Handle error responses from failed preprocessing
+            if response.finish_reason == "error":
+                output = RequestOutput(
+                    request_id=request_id,
+                    new_token_ids=[],
+                    new_text="",
+                    output_token_ids=[],
+                    prompt_tokens=0,
+                    completion_tokens=0,
+                    finished=True,
+                    finish_reason="error",
+                )
+                request.status = RequestStatus.FINISHED_ABORTED
+                request.output_text = ""
+                request.finish_reason = "error"
+                finished_ids.add(request_id)
+                self.num_requests_processed += 1
+                logger.warning(f"Request {request_id} failed during preprocessing")
+                outputs.append(output)
+                continue
+
             # Append token to request
             request.output_tokens.append(response.token)
             request.num_output_tokens = len(request.output_tokens)
 
-            # Decode the new token
-            new_text = tokenizer.decode([response.token])
+            # Decode the new token using streaming detokenizer (UTF-8 safe)
+            if request_id not in self._detokenizer_pool:
+                if hasattr(tokenizer, "detokenizer"):
+                    detok = tokenizer.detokenizer
+                else:
+                    detok = NaiveStreamingDetokenizer(tokenizer)
+                detok.reset()
+                self._detokenizer_pool[request_id] = detok
+            detok = self._detokenizer_pool[request_id]
+            detok.add_token(response.token)
+            new_text = detok.last_segment
 
             # Create output
             output = RequestOutput(
@@ -475,8 +510,13 @@ class MLLMScheduler:
                 output.finish_reason = response.finish_reason
                 finished_ids.add(request_id)
 
-                # Decode full output
-                output.output_text = tokenizer.decode(request.output_tokens)
+                # Finalize streaming detokenizer and get full output
+                detok = self._detokenizer_pool.pop(request_id, None)
+                if detok is not None:
+                    detok.finalize()
+                    output.output_text = detok.text
+                else:
+                    output.output_text = tokenizer.decode(request.output_tokens)
                 request.output_text = output.output_text
                 request.finish_reason = response.finish_reason
 
