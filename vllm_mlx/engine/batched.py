@@ -168,6 +168,7 @@ class BatchedEngine(BaseEngine):
         specprefill_draft_model_path: str | None = None,
         specprefill_threshold: int = 8192,
         specprefill_keep_pct: float = 0.3,
+        specprefill_chunk_size: int = 4096,
         scheduler_policy: str = "fifo",
         scheduler_headroom_gb: float = 8.0,
     ):
@@ -186,6 +187,8 @@ class BatchedEngine(BaseEngine):
             specprefill_draft_model_path: Draft model directory name under ~/ai-models/mlx_models/
             specprefill_threshold: Minimum suffix tokens to trigger SpecPrefill (default 8192)
             specprefill_keep_pct: Fraction of tokens to keep (default 0.3)
+            specprefill_chunk_size: Draft scoring chunk size for cooperative scheduling
+                (default 4096). Set to 0 to disable cooperative mode (monolithic scoring).
             scheduler_policy: Request queue policy for admission control (default: fifo)
             scheduler_headroom_gb: Memory headroom in GB for admission control (default: 8.0)
         """
@@ -202,6 +205,7 @@ class BatchedEngine(BaseEngine):
         self._specprefill_draft_model_path = specprefill_draft_model_path
         self._specprefill_threshold = specprefill_threshold
         self._specprefill_keep_pct = specprefill_keep_pct
+        self._specprefill_chunk_size = specprefill_chunk_size
 
         # Admission controller (memory-aware scheduling)
         self._scheduler_policy = scheduler_policy
@@ -1228,11 +1232,56 @@ class BatchedEngine(BaseEngine):
                 )
                 use_specprefill = False
 
-        # Run under generation lock, all tokens in single thread (Metal safety)
+        # --- Cooperative SpecPrefill: draft scoring OUTSIDE the lock ---
+        # When chunk_size > 0, draft scoring runs outside _text_generation_lock
+        # via ChunkedDraftScorer, yielding between chunks so active requests
+        # can generate tokens. The draft model is separate from the target
+        # model — no shared mutable state.
+        # When chunk_size == 0, the old monolithic path runs entirely under lock.
+        use_cooperative = use_specprefill and self._specprefill_chunk_size > 0
+        importance = None  # Pre-computed importance for cooperative path
+
+        if use_cooperative:
+            from ..cooperative_specprefill import ChunkedDraftScorer
+
+            scorer = ChunkedDraftScorer(
+                draft_model=self._draft_model,
+                tokens=sp_tokens,
+                chunk_size=self._specprefill_chunk_size,
+                prefill_step_size=prefill_step_size,
+            )
+            try:
+                while scorer.is_scoring:
+                    await asyncio.to_thread(scorer.step)
+                    await asyncio.sleep(0)  # Yield to event loop
+                importance = await asyncio.to_thread(scorer.finalize)
+            except Exception as e:
+                scorer.cleanup()
+                logger.error(
+                    "SpecPrefill cooperative scoring failed, "
+                    "falling back to normal path: %s",
+                    e,
+                )
+                use_specprefill = False
+                use_cooperative = False
+                importance = None
+
+        # --- Selection + prefill + generation UNDER LOCK ---
         async with self._text_generation_lock:
 
             def _run_with_cache():
-                if use_specprefill:
+                if use_specprefill and use_cooperative and importance is not None:
+                    try:
+                        return _run_specprefill_with_importance(importance)
+                    except Exception as e:
+                        logger.error(
+                            "SpecPrefill failed after scoring, "
+                            "falling back to normal path: %s",
+                            e,
+                        )
+                        # Fall through to normal path
+                elif use_specprefill and not use_cooperative:
+                    # Monolithic path (chunk_size=0): score + prefill under lock
                     try:
                         return _run_specprefill()
                     except Exception as e:
@@ -1245,8 +1294,118 @@ class BatchedEngine(BaseEngine):
                 else:
                     return _run_cache_miss()
 
+            def _run_specprefill_with_importance(precomputed_importance):
+                """Select chunks, sparse prefill, generate with pre-scored importance.
+
+                Draft scoring has already been done outside the lock via
+                ChunkedDraftScorer. This function handles phases 2-4:
+                selection, sparse prefill, and autoregressive generation.
+
+                Composes with system KV cache: when cache_hit, restores the
+                system KV snapshot first, then sparse-prefills only the suffix
+                tokens with position_offset = system_kv_token_count.
+
+                Does NOT use MTP (sparse cache is incompatible with MTP
+                speculative decoding).
+                """
+                import time
+                from types import SimpleNamespace
+
+                from ..specprefill import (
+                    cleanup_rope,
+                    select_chunks,
+                    sparse_prefill,
+                )
+
+                # Build target cache (optionally restore system KV snapshot)
+                target_cache = make_prompt_cache(self._text_model)
+                if cache_hit:
+                    for layer_idx, snapshot_state in enumerate(
+                        self._system_kv_snapshot
+                    ):
+                        if layer_idx < len(target_cache):
+                            target_cache[layer_idx].state = snapshot_state
+                    mx.eval([c.state for c in target_cache if hasattr(c, "state")])
+
+                try:
+                    # Phase 2: Select important chunks
+                    effective_keep = (
+                        specprefill_keep_pct_override or self._specprefill_keep_pct
+                    )
+                    selected = select_chunks(
+                        precomputed_importance, keep_pct=effective_keep
+                    )
+                    n_selected = selected.shape[0]
+                    n_scored = len(sp_tokens)
+
+                    # Phase 3: Sparse prefill on target model
+                    t0 = time.monotonic()
+                    logits = sparse_prefill(
+                        self._text_model,
+                        sp_tokens,
+                        selected,
+                        target_cache,
+                        step_size=prefill_step_size,
+                        position_offset=sp_offset,
+                    )
+                    t_prefill = time.monotonic() - t0
+
+                    logger.info(
+                        "SpecPrefill (cooperative): "
+                        "sparse prefill %d/%d (keep=%.0f%%) in %.1fs "
+                        "(offset=%d, effective_keep=%.2f)",
+                        n_selected,
+                        n_scored,
+                        n_selected / n_scored * 100,
+                        t_prefill,
+                        sp_offset,
+                        effective_keep,
+                    )
+
+                    # Phase 4: Generate (simple autoregressive, no MTP)
+                    eos_id = self._text_tokenizer.eos_token_id
+                    y = sampler(logits[:, -1, :])
+                    mx.eval(y)
+
+                    results = []
+                    generated_ids = []
+                    prev_decoded = ""
+
+                    for _ in range(max_tokens):
+                        tok_id = y.item()
+                        generated_ids.append(tok_id)
+
+                        # Incremental text decode
+                        decoded = self._text_tokenizer.decode(generated_ids)
+                        new_text = decoded[len(prev_decoded) :]
+                        prev_decoded = decoded
+
+                        is_eos = tok_id == eos_id
+                        results.append(
+                            SimpleNamespace(
+                                text=new_text,
+                                finish_reason="stop" if is_eos else None,
+                            )
+                        )
+
+                        if is_eos:
+                            break
+
+                        # Next token
+                        logits = self._text_model(y.reshape(1, -1), cache=target_cache)
+                        y = sampler(logits[:, -1, :])
+                        mx.eval(y)
+
+                    return results, sp_n_total
+
+                finally:
+                    cleanup_rope(self._text_model)
+
             def _run_specprefill():
-                """Score tokens, sparse prefill, generate autoregressively.
+                """Monolithic: score tokens, sparse prefill, generate.
+
+                Used when cooperative mode is disabled (chunk_size=0).
+                Runs entirely under _text_generation_lock.
 
                 Composes with system KV cache: when cache_hit, restores the
                 system KV snapshot first, then sparse-prefills only the suffix
@@ -1537,6 +1696,8 @@ class BatchedEngine(BaseEngine):
                 "draft_model": self._specprefill_draft_model_path,
                 "threshold": self._specprefill_threshold,
                 "keep_pct": self._specprefill_keep_pct,
+                "chunk_size": self._specprefill_chunk_size,
+                "cooperative": self._specprefill_chunk_size > 0,
             }
 
         # System KV cache stats
