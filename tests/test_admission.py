@@ -46,10 +46,11 @@ def test_memory_monitor_free_memory():
         mock_mx.device_info.return_value = {
             "max_recommended_working_set_size": 120 * 1024**3
         }
-        mock_mx.get_active_memory.return_value = 90 * 1024**3
+        mock_mx.get_active_memory.return_value = 80 * 1024**3
+        mock_mx.get_cache_memory.return_value = 10 * 1024**3
         monitor = MemoryMonitor()
         free = monitor.free_memory()
-        assert free == 30 * 1024**3  # 120 - 90
+        assert free == 30 * 1024**3  # 120 - 80 - 10
 
 
 def test_memory_monitor_can_admit():
@@ -58,7 +59,8 @@ def test_memory_monitor_can_admit():
         mock_mx.device_info.return_value = {
             "max_recommended_working_set_size": 120 * 1024**3
         }
-        mock_mx.get_active_memory.return_value = 100 * 1024**3
+        mock_mx.get_active_memory.return_value = 95 * 1024**3
+        mock_mx.get_cache_memory.return_value = 5 * 1024**3
         monitor = MemoryMonitor(headroom_bytes=8 * 1024**3)
         # 20 GB free, 8 GB headroom, 5 GB prefill = 20 >= 13 → admit
         assert monitor.can_admit(prefill_bytes=5 * 1024**3) is True

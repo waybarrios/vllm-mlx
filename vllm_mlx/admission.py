@@ -51,7 +51,8 @@ def compute_kv_per_token(
 class MemoryMonitor:
     """Reads actual Metal memory to make admission decisions.
 
-    Uses mx.get_active_memory() — real GPU allocations, not estimates.
+    Uses mx.get_active_memory() + mx.get_cache_memory() for true GPU
+    memory usage, not just live tensors.
     """
 
     def __init__(self, headroom_bytes: int = 8 * 1024**3):
@@ -66,7 +67,7 @@ class MemoryMonitor:
         """Return bytes of free GPU-usable memory."""
         if not mx.metal.is_available():
             return 0
-        return self._device_usable - mx.get_active_memory()
+        return self._device_usable - mx.get_active_memory() - mx.get_cache_memory()
 
     def can_admit(self, prefill_bytes: int) -> bool:
         """Can we admit a request that needs prefill_bytes of KV cache?"""
@@ -84,6 +85,10 @@ class RequestQueue:
     """Request queue with configurable ordering policy."""
 
     def __init__(self, policy: str = "fifo"):
+        if policy != "fifo":
+            raise ValueError(
+                f"Unsupported policy: {policy!r}. Only 'fifo' is implemented."
+            )
         self._policy = policy
         self._queue: deque[QueuedRequest] = deque()
 
