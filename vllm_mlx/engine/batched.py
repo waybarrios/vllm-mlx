@@ -347,10 +347,19 @@ class BatchedEngine(BaseEngine):
             f"completion_batch={completion_batch_size}"
         )
 
-        # Initialize admission controller from MLLM model config
-        mllm_config = getattr(self._mllm_instance, "config", None)
-        if mllm_config is not None:
-            self._init_admission_controller(mllm_config)
+        # Initialize admission controller from config.json on disk
+        try:
+            import json
+            from pathlib import Path
+
+            config_path = Path(self._model_name) / "config.json"
+            if config_path.exists():
+                model_config = json.loads(config_path.read_text())
+                self._init_admission_controller(model_config)
+            else:
+                logger.info("[admission] No config.json found — admission disabled")
+        except Exception as e:
+            logger.warning(f"[admission] Failed to init: {e} — admission disabled")
 
         # Build TextModel for MTP per-request routing (text-only → MTP, media → MLLM)
         if self._mtp:
@@ -490,10 +499,20 @@ class BatchedEngine(BaseEngine):
 
         await self._engine.engine.start()
 
-        # Initialize admission controller from LLM model config
-        model_config = getattr(self._model, "config", None)
-        if model_config is not None:
-            self._init_admission_controller(model_config)
+        # Initialize admission controller from config.json on disk
+        # (mlx_lm models may not expose .config attribute)
+        try:
+            import json
+            from pathlib import Path
+
+            config_path = Path(self._model_name) / "config.json"
+            if config_path.exists():
+                model_config = json.loads(config_path.read_text())
+                self._init_admission_controller(model_config)
+            else:
+                logger.info("[admission] No config.json found — admission disabled")
+        except Exception as e:
+            logger.warning(f"[admission] Failed to init: {e} — admission disabled")
 
     async def stop(self) -> None:
         """Stop the engine and cleanup resources."""
