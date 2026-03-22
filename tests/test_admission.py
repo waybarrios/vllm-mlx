@@ -159,3 +159,46 @@ def test_admission_controller_drain_queue():
         assert len(ready) == 1
         assert ready[0].request_id == "req-1"
         assert controller.queue_length == 0
+
+
+def test_admission_controller_fifo_no_bypass():
+    """Small requests must queue behind large ones even if they'd fit."""
+    with patch("vllm_mlx.admission.mx") as mock_mx:
+        mock_mx.metal.is_available.return_value = True
+        mock_mx.device_info.return_value = {
+            "max_recommended_working_set_size": 120 * 1024**3
+        }
+        mock_mx.get_active_memory.return_value = 112 * 1024**3  # 8 GB free
+        mock_mx.get_cache_memory.return_value = 0
+        controller = AdmissionController(
+            kv_per_token=20_480,
+            headroom_bytes=8 * 1024**3,
+        )
+        # Large request can't fit (~3.8GB prefill + 8GB headroom > 8GB free)
+        admitted1, pos1 = controller.try_admit("req-large", prompt_tokens=200_000)
+        assert admitted1 is False
+        assert pos1 == 0
+        # Small request WOULD fit (20KB + 8GB < 8GB is false, but even if
+        # memory freed later, FIFO requires it to queue behind the large one)
+        admitted2, pos2 = controller.try_admit("req-small", prompt_tokens=1)
+        assert admitted2 is False
+        assert pos2 == 1
+
+
+def test_admission_controller_cancel():
+    with patch("vllm_mlx.admission.mx") as mock_mx:
+        mock_mx.metal.is_available.return_value = True
+        mock_mx.device_info.return_value = {
+            "max_recommended_working_set_size": 120 * 1024**3
+        }
+        mock_mx.get_active_memory.return_value = 115 * 1024**3
+        mock_mx.get_cache_memory.return_value = 0
+        controller = AdmissionController(
+            kv_per_token=20_480,
+            headroom_bytes=8 * 1024**3,
+        )
+        controller.try_admit("req-1", prompt_tokens=1000)
+        assert controller.queue_length == 1
+        assert controller.cancel("req-1") is True
+        assert controller.queue_length == 0
+        assert controller.cancel("nonexistent") is False

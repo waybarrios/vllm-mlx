@@ -144,8 +144,8 @@ class AdmissionController:
         policy: str = "fifo",
     ):
         self.kv_per_token = kv_per_token
-        self.monitor = MemoryMonitor(headroom_bytes=headroom_bytes)
-        self.queue = RequestQueue(policy=policy)
+        self._monitor = MemoryMonitor(headroom_bytes=headroom_bytes)
+        self._queue = RequestQueue(policy=policy)
 
     def try_admit(
         self, request_id: str, prompt_tokens: int
@@ -156,15 +156,19 @@ class AdmissionController:
             (True, None) if admitted.
             (False, queue_position) if queued.
         """
+        # FIFO: if anything is already waiting, join the queue regardless of memory.
+        if not self._queue.is_empty():
+            position = self._queue.enqueue(request_id, prompt_tokens)
+            return False, position
         prefill_bytes = prompt_tokens * self.kv_per_token
-        if self.monitor.can_admit(prefill_bytes):
+        if self._monitor.can_admit(prefill_bytes):
             logger.info(
                 f"[admit] {request_id} ADMITTED ({prompt_tokens} tokens, "
                 f"{prefill_bytes / 1e6:.0f} MB prefill, "
-                f"{self.monitor.free_memory() / 1e9:.1f} GB free)"
+                f"{self._monitor.free_memory() / 1e9:.1f} GB free)"
             )
             return True, None
-        position = self.queue.enqueue(request_id, prompt_tokens)
+        position = self._queue.enqueue(request_id, prompt_tokens)
         return False, position
 
     def check_queue(self) -> List[QueuedRequest]:
@@ -174,23 +178,25 @@ class AdmissionController:
         Returns list of newly-admittable requests.
         """
         ready = []
-        while not self.queue.is_empty():
-            entry = self.queue.peek()
+        while not self._queue.is_empty():
+            entry = self._queue.peek()
             prefill_bytes = entry.prompt_tokens * self.kv_per_token
-            if self.monitor.can_admit(prefill_bytes):
-                ready.append(self.queue.dequeue())
+            if self._monitor.can_admit(prefill_bytes):
+                ready.append(self._queue.dequeue())
                 logger.info(
                     f"[admit] {entry.request_id} DEQUEUED → admitted "
                     f"(waited {time.time() - entry.enqueued_at:.1f}s)"
                 )
             else:
-                break  # If front of queue can't fit, nothing behind it can either (FIFO)
+                # FIFO: do not skip the front to admit smaller requests behind it.
+                # Prevents starvation of large requests.
+                break
         return ready
 
     def cancel(self, request_id: str) -> bool:
         """Cancel a queued request."""
-        return self.queue.cancel(request_id)
+        return self._queue.cancel(request_id)
 
     @property
     def queue_length(self) -> int:
-        return len(self.queue)
+        return len(self._queue)
