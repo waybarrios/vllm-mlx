@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
-from vllm_mlx.admission import compute_kv_per_token
+from unittest.mock import patch
+
+from vllm_mlx.admission import MemoryMonitor, QueuedRequest, RequestQueue, compute_kv_per_token
 
 
 def test_kv_per_token_qwen35_35b():
@@ -36,3 +38,29 @@ def test_kv_per_token_dense_model():
         dtype_bytes=2,
     )
     assert result == 32 * 8 * 128 * 2 * 2  # 131_072
+
+
+def test_memory_monitor_free_memory():
+    with patch("vllm_mlx.admission.mx") as mock_mx:
+        mock_mx.metal.is_available.return_value = True
+        mock_mx.device_info.return_value = {
+            "max_recommended_working_set_size": 120 * 1024**3
+        }
+        mock_mx.get_active_memory.return_value = 90 * 1024**3
+        monitor = MemoryMonitor()
+        free = monitor.free_memory()
+        assert free == 30 * 1024**3  # 120 - 90
+
+
+def test_memory_monitor_can_admit():
+    with patch("vllm_mlx.admission.mx") as mock_mx:
+        mock_mx.metal.is_available.return_value = True
+        mock_mx.device_info.return_value = {
+            "max_recommended_working_set_size": 120 * 1024**3
+        }
+        mock_mx.get_active_memory.return_value = 100 * 1024**3
+        monitor = MemoryMonitor(headroom_bytes=8 * 1024**3)
+        # 20 GB free, 8 GB headroom, 5 GB prefill = 20 >= 13 → admit
+        assert monitor.can_admit(prefill_bytes=5 * 1024**3) is True
+        # 20 GB free, 8 GB headroom, 15 GB prefill = 20 < 23 → reject
+        assert monitor.can_admit(prefill_bytes=15 * 1024**3) is False

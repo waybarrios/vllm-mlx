@@ -7,6 +7,8 @@ Once a request starts generating, it runs to completion.
 The admission controller only decides WHEN to start.
 """
 
+import mlx.core as mx
+
 
 def compute_kv_per_token(
     num_hidden_layers: int,
@@ -36,3 +38,28 @@ def compute_kv_per_token(
         full_attention_interval = 1
     attention_layers = num_hidden_layers // full_attention_interval
     return attention_layers * num_kv_heads * head_dim * 2 * dtype_bytes  # 2 = K + V
+
+
+class MemoryMonitor:
+    """Reads actual Metal memory to make admission decisions.
+
+    Uses mx.get_active_memory() — real GPU allocations, not estimates.
+    """
+
+    def __init__(self, headroom_bytes: int = 8 * 1024**3):
+        self.headroom_bytes = headroom_bytes
+        if mx.metal.is_available():
+            info = mx.device_info()
+            self._device_usable = info["max_recommended_working_set_size"]
+        else:
+            self._device_usable = 0
+
+    def free_memory(self) -> int:
+        """Return bytes of free GPU-usable memory."""
+        if not mx.metal.is_available():
+            return 0
+        return self._device_usable - mx.get_active_memory()
+
+    def can_admit(self, prefill_bytes: int) -> bool:
+        """Can we admit a request that needs prefill_bytes of KV cache?"""
+        return self.free_memory() >= prefill_bytes + self.headroom_bytes
