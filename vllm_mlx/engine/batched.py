@@ -226,6 +226,7 @@ class BatchedEngine(BaseEngine):
         self._text_model = None
         self._text_tokenizer = None
         self._text_generation_lock = asyncio.Lock()
+        self._metal_lock = __import__("threading").Lock()  # Serializes all Metal GPU access
 
         # System prompt KV cache (reduces repeated prefill across requests)
         self._system_kv_snapshot = None  # List of (keys, values) per backbone layer
@@ -1275,9 +1276,15 @@ class BatchedEngine(BaseEngine):
             )
             try:
                 while scorer.is_scoring:
-                    await asyncio.to_thread(scorer.step)
+                    def _locked_step():
+                        with self._metal_lock:
+                            return scorer.step()
+                    await asyncio.to_thread(_locked_step)
                     await asyncio.sleep(0)  # Yield to event loop
-                importance = await asyncio.to_thread(scorer.finalize)
+                def _locked_finalize():
+                    with self._metal_lock:
+                        return scorer.finalize()
+                importance = await asyncio.to_thread(_locked_finalize)
             except Exception as e:
                 scorer.cleanup()
                 logger.error(
@@ -1651,7 +1658,10 @@ class BatchedEngine(BaseEngine):
                     prefix_hash,
                 )
 
-            result = await asyncio.to_thread(_run_with_cache)
+            def _locked_run_with_cache():
+                with self._metal_lock:
+                    return _run_with_cache()
+            result = await asyncio.to_thread(_locked_run_with_cache)
             all_resps, prompt_token_count = result
 
         # Yield results as GenerationOutput
