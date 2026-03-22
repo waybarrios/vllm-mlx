@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 from unittest.mock import patch
 
-from vllm_mlx.admission import MemoryMonitor, QueuedRequest, RequestQueue, compute_kv_per_token
+from vllm_mlx.admission import MemoryMonitor, RequestQueue, compute_kv_per_token
 
 
 def test_kv_per_token_qwen35_35b():
@@ -64,3 +64,33 @@ def test_memory_monitor_can_admit():
         assert monitor.can_admit(prefill_bytes=5 * 1024**3) is True
         # 20 GB free, 8 GB headroom, 15 GB prefill = 20 < 23 → reject
         assert monitor.can_admit(prefill_bytes=15 * 1024**3) is False
+
+
+def test_request_queue_fifo():
+    q = RequestQueue(policy="fifo")
+    q.enqueue("req-1", prompt_tokens=1000)
+    q.enqueue("req-2", prompt_tokens=500)
+    q.enqueue("req-3", prompt_tokens=2000)
+    # FIFO: order of insertion
+    assert q.peek().request_id == "req-1"
+    assert q.dequeue().request_id == "req-1"
+    assert q.dequeue().request_id == "req-2"
+    assert q.dequeue().request_id == "req-3"
+    assert q.is_empty()
+
+
+def test_request_queue_length():
+    q = RequestQueue(policy="fifo")
+    assert len(q) == 0
+    q.enqueue("req-1", prompt_tokens=100)
+    assert len(q) == 1
+    q.dequeue()
+    assert len(q) == 0
+
+
+def test_request_queue_cancel():
+    q = RequestQueue(policy="fifo")
+    q.enqueue("req-1", prompt_tokens=100)
+    q.enqueue("req-2", prompt_tokens=200)
+    q.cancel("req-1")
+    assert q.dequeue().request_id == "req-2"

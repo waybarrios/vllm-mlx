@@ -7,7 +7,15 @@ Once a request starts generating, it runs to completion.
 The admission controller only decides WHEN to start.
 """
 
+import logging
+import time
+from collections import deque
+from dataclasses import dataclass, field
+from typing import Optional
+
 import mlx.core as mx
+
+logger = logging.getLogger(__name__)
 
 
 def compute_kv_per_token(
@@ -63,3 +71,54 @@ class MemoryMonitor:
     def can_admit(self, prefill_bytes: int) -> bool:
         """Can we admit a request that needs prefill_bytes of KV cache?"""
         return self.free_memory() >= prefill_bytes + self.headroom_bytes
+
+
+@dataclass
+class QueuedRequest:
+    request_id: str
+    prompt_tokens: int
+    enqueued_at: float = field(default_factory=time.time)
+
+
+class RequestQueue:
+    """Request queue with configurable ordering policy."""
+
+    def __init__(self, policy: str = "fifo"):
+        self._policy = policy
+        self._queue: deque[QueuedRequest] = deque()
+
+    def enqueue(self, request_id: str, prompt_tokens: int) -> int:
+        """Add request to queue. Returns position (0-indexed)."""
+        entry = QueuedRequest(request_id=request_id, prompt_tokens=prompt_tokens)
+        self._queue.append(entry)
+        position = len(self._queue) - 1
+        logger.info(
+            f"[queue] {request_id} queued at position {position} ({prompt_tokens} tokens)"
+        )
+        return position
+
+    def peek(self) -> Optional[QueuedRequest]:
+        """Return next request without removing it."""
+        if not self._queue:
+            return None
+        return self._queue[0]
+
+    def dequeue(self) -> Optional[QueuedRequest]:
+        """Remove and return next request per policy."""
+        if not self._queue:
+            return None
+        return self._queue.popleft()
+
+    def cancel(self, request_id: str) -> bool:
+        """Remove a request from the queue. Returns True if found."""
+        for i, entry in enumerate(self._queue):
+            if entry.request_id == request_id:
+                del self._queue[i]
+                return True
+        return False
+
+    def is_empty(self) -> bool:
+        return len(self._queue) == 0
+
+    def __len__(self) -> int:
+        return len(self._queue)
