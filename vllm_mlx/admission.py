@@ -7,6 +7,7 @@ Once a request starts generating, it runs to completion.
 The admission controller only decides WHEN to start.
 """
 
+import asyncio
 import logging
 import time
 from collections import deque
@@ -146,6 +147,7 @@ class AdmissionController:
         self.kv_per_token = kv_per_token
         self._monitor = MemoryMonitor(headroom_bytes=headroom_bytes)
         self._queue = RequestQueue(policy=policy)
+        self._wait_events: dict[str, asyncio.Event] = {}
 
     def try_admit(
         self, request_id: str, prompt_tokens: int
@@ -193,9 +195,33 @@ class AdmissionController:
                 break
         return ready
 
+    async def wait_for_admission(self, request_id: str, prompt_tokens: int) -> None:
+        """Block until this request can be admitted. Returns immediately if room."""
+        admitted, position = self.try_admit(request_id, prompt_tokens)
+        if admitted:
+            return
+        event = asyncio.Event()
+        self._wait_events[request_id] = event
+        logger.info(f"[admit] {request_id} waiting for admission (position {position})")
+        await event.wait()
+        self._wait_events.pop(request_id, None)
+
+    def on_request_complete(self) -> List[QueuedRequest]:
+        """Called when a request completes. Drains queue and signals waiters."""
+        ready = self.check_queue()
+        for entry in ready:
+            event = self._wait_events.get(entry.request_id)
+            if event:
+                event.set()
+        return ready
+
     def cancel(self, request_id: str) -> bool:
-        """Cancel a queued request."""
-        return self._queue.cancel(request_id)
+        """Cancel a queued request and wake up its waiter."""
+        result = self._queue.cancel(request_id)
+        event = self._wait_events.pop(request_id, None)
+        if event:
+            event.set()  # Wake up waiter so it can clean up
+        return result
 
     @property
     def queue_length(self) -> int:

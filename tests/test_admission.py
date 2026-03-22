@@ -1,4 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
+import asyncio
+
 from unittest.mock import patch
 
 from vllm_mlx.admission import (
@@ -202,3 +204,77 @@ def test_admission_controller_cancel():
         assert controller.cancel("req-1") is True
         assert controller.queue_length == 0
         assert controller.cancel("nonexistent") is False
+
+
+def test_admission_controller_wait_for_admission():
+    """Test async wait — admitted immediately when room."""
+    with patch("vllm_mlx.admission.mx") as mock_mx:
+        mock_mx.metal.is_available.return_value = True
+        mock_mx.device_info.return_value = {
+            "max_recommended_working_set_size": 120 * 1024**3
+        }
+        mock_mx.get_active_memory.return_value = 50 * 1024**3
+        mock_mx.get_cache_memory.return_value = 0
+        controller = AdmissionController(
+            kv_per_token=20_480, headroom_bytes=8 * 1024**3
+        )
+        # Should return immediately — plenty of memory
+        asyncio.get_event_loop().run_until_complete(
+            controller.wait_for_admission("req-1", prompt_tokens=100)
+        )
+        assert controller.queue_length == 0
+
+
+def test_admission_controller_on_request_complete():
+    """Test that completing a request releases queued ones."""
+    with patch("vllm_mlx.admission.mx") as mock_mx:
+        mock_mx.metal.is_available.return_value = True
+        mock_mx.device_info.return_value = {
+            "max_recommended_working_set_size": 120 * 1024**3
+        }
+        mock_mx.get_active_memory.return_value = 115 * 1024**3
+        mock_mx.get_cache_memory.return_value = 0
+        controller = AdmissionController(
+            kv_per_token=20_480, headroom_bytes=8 * 1024**3
+        )
+
+        # Queue a request (not enough memory)
+        admitted, pos = controller.try_admit("req-1", prompt_tokens=1000)
+        assert admitted is False
+
+        # Set up wait event manually
+        event = asyncio.Event()
+        controller._wait_events["req-1"] = event
+
+        # Free memory and signal completion
+        mock_mx.get_active_memory.return_value = 50 * 1024**3
+        ready = controller.on_request_complete()
+        assert len(ready) == 1
+        assert ready[0].request_id == "req-1"
+        assert event.is_set()  # Waiter was signaled
+
+
+def test_admission_controller_cancel_wakes_waiter():
+    """Test that cancelling a queued request wakes up its waiter."""
+    with patch("vllm_mlx.admission.mx") as mock_mx:
+        mock_mx.metal.is_available.return_value = True
+        mock_mx.device_info.return_value = {
+            "max_recommended_working_set_size": 120 * 1024**3
+        }
+        mock_mx.get_active_memory.return_value = 115 * 1024**3
+        mock_mx.get_cache_memory.return_value = 0
+        controller = AdmissionController(
+            kv_per_token=20_480, headroom_bytes=8 * 1024**3
+        )
+
+        # Queue a request
+        controller.try_admit("req-1", prompt_tokens=1000)
+
+        # Set up wait event
+        event = asyncio.Event()
+        controller._wait_events["req-1"] = event
+
+        # Cancel should wake the waiter
+        assert controller.cancel("req-1") is True
+        assert event.is_set()
+        assert "req-1" not in controller._wait_events

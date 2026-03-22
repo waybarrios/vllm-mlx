@@ -13,8 +13,9 @@ LLM engine), so text-only requests must also be routed through it.
 
 import asyncio
 import logging
+import uuid
 from collections.abc import AsyncIterator
-from typing import Any
+from typing import Any, Optional
 
 from ..api.tool_calling import convert_tools_for_template
 from ..api.utils import clean_output_text, extract_multimodal_content, is_mllm_model
@@ -167,6 +168,8 @@ class BatchedEngine(BaseEngine):
         specprefill_draft_model_path: str | None = None,
         specprefill_threshold: int = 8192,
         specprefill_keep_pct: float = 0.3,
+        scheduler_policy: str = "fifo",
+        scheduler_headroom_gb: float = 8.0,
     ):
         """
         Initialize the batched engine.
@@ -183,6 +186,8 @@ class BatchedEngine(BaseEngine):
             specprefill_draft_model_path: Draft model directory name under ~/ai-models/mlx_models/
             specprefill_threshold: Minimum suffix tokens to trigger SpecPrefill (default 8192)
             specprefill_keep_pct: Fraction of tokens to keep (default 0.3)
+            scheduler_policy: Request queue policy for admission control (default: fifo)
+            scheduler_headroom_gb: Memory headroom in GB for admission control (default: 8.0)
         """
         self._model_name = model_name
         self._trust_remote_code = trust_remote_code
@@ -197,6 +202,11 @@ class BatchedEngine(BaseEngine):
         self._specprefill_draft_model_path = specprefill_draft_model_path
         self._specprefill_threshold = specprefill_threshold
         self._specprefill_keep_pct = specprefill_keep_pct
+
+        # Admission controller (memory-aware scheduling)
+        self._scheduler_policy = scheduler_policy
+        self._scheduler_headroom_gb = scheduler_headroom_gb
+        self._admission: Optional["AdmissionController"] = None  # noqa: F821
         self._specprefill_lock = asyncio.Lock()
         self._draft_model = None
 
@@ -217,6 +227,46 @@ class BatchedEngine(BaseEngine):
         self._system_kv_snapshot = None  # List of (keys, values) per backbone layer
         self._system_kv_hash = None  # Hash of system prefix text
         self._system_kv_token_count = 0  # Tokens in cached prefix
+
+    def _init_admission_controller(self, model_config) -> None:
+        """Create the admission controller from model config.
+
+        Extracts KV cache parameters from HuggingFace PretrainedConfig
+        (attribute access) or dict-style configs. VLM models nest the
+        language model config under ``text_config``.
+        """
+        from ..admission import AdmissionController, compute_kv_per_token
+
+        def _get(cfg, key, default):
+            """Read a config value from attr-based or dict-based config."""
+            if isinstance(cfg, dict):
+                return cfg.get(key, default)
+            return getattr(cfg, key, default)
+
+        # For VLM models, language model config is nested under text_config
+        text_cfg = _get(model_config, "text_config", None)
+        if text_cfg is not None:
+            cfg = text_cfg
+        else:
+            cfg = model_config
+
+        kv_per_token = compute_kv_per_token(
+            num_hidden_layers=_get(cfg, "num_hidden_layers", 32),
+            full_attention_interval=_get(cfg, "full_attention_interval", 1),
+            num_kv_heads=_get(cfg, "num_key_value_heads", 8),
+            head_dim=_get(cfg, "head_dim", 128),
+        )
+
+        self._admission = AdmissionController(
+            kv_per_token=kv_per_token,
+            headroom_bytes=int(self._scheduler_headroom_gb * 1024**3),
+            policy=self._scheduler_policy,
+        )
+        logger.info(
+            "[admission] KV per token: %s bytes, headroom: %.1fGB",
+            f"{kv_per_token:,}",
+            self._scheduler_headroom_gb,
+        )
 
     @property
     def model_name(self) -> str:
@@ -296,6 +346,11 @@ class BatchedEngine(BaseEngine):
             f"max_num_seqs={max_num_seqs}, prefill_batch={prefill_batch_size}, "
             f"completion_batch={completion_batch_size}"
         )
+
+        # Initialize admission controller from MLLM model config
+        mllm_config = getattr(self._mllm_instance, "config", None)
+        if mllm_config is not None:
+            self._init_admission_controller(mllm_config)
 
         # Build TextModel for MTP per-request routing (text-only → MTP, media → MLLM)
         if self._mtp:
@@ -435,6 +490,11 @@ class BatchedEngine(BaseEngine):
 
         await self._engine.engine.start()
 
+        # Initialize admission controller from LLM model config
+        model_config = getattr(self._model, "config", None)
+        if model_config is not None:
+            self._init_admission_controller(model_config)
+
     async def stop(self) -> None:
         """Stop the engine and cleanup resources."""
         if self._mllm_scheduler:
@@ -456,6 +516,7 @@ class BatchedEngine(BaseEngine):
         self._system_kv_snapshot = None
         self._system_kv_hash = None
         self._system_kv_token_count = 0
+        self._admission = None
         self._loaded = False
         logger.info("BatchedEngine stopped")
 
@@ -551,6 +612,35 @@ class BatchedEngine(BaseEngine):
             else:
                 prepared.append(msg)
         return prepared
+
+    def _estimate_prompt_tokens(self, messages: list[dict[str, Any]]) -> int:
+        """Estimate token count from chat messages for admission control.
+
+        Uses the tokenizer when available, falls back to character-based
+        estimate (1 token per 4 characters).
+        """
+        # Concatenate message text for a rough estimate
+        text_parts = []
+        for msg in messages:
+            content = msg.get("content", "")
+            if isinstance(content, str):
+                text_parts.append(content)
+            elif isinstance(content, list):
+                for part in content:
+                    if isinstance(part, str):
+                        text_parts.append(part)
+                    elif isinstance(part, dict) and part.get("type") == "text":
+                        text_parts.append(part.get("text", ""))
+        text = " ".join(text_parts)
+
+        tokenizer = self.tokenizer
+        if tokenizer is not None and hasattr(tokenizer, "encode"):
+            try:
+                return len(tokenizer.encode(text))
+            except Exception:
+                pass
+        # Fallback: ~4 chars per token
+        return len(text) // 4
 
     async def generate(
         self,
@@ -744,42 +834,52 @@ class BatchedEngine(BaseEngine):
         # Normalize messages before any path (developer->system, merge consecutive)
         messages = _normalize_messages(messages)
 
-        # Per-request MTP routing: text-only → TextModel, media → MLLM
-        if self._text_model is not None and not _has_media_content(messages):
-            return await self._chat_text_model(
+        # Admission control — wait if memory is tight
+        admission_id = None
+        if self._admission is not None:
+            prompt_tokens = self._estimate_prompt_tokens(messages)
+            admission_id = str(uuid.uuid4())
+            await self._admission.wait_for_admission(admission_id, prompt_tokens)
+
+        try:
+            # Per-request MTP routing: text-only → TextModel, media → MLLM
+            if self._text_model is not None and not _has_media_content(messages):
+                return await self._chat_text_model(
+                    messages,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    top_p=top_p,
+                    tools=tools,
+                    **kwargs,
+                )
+
+            # Extract images/videos from messages (OpenAI multimodal format)
+            _, extracted_images, extracted_videos = extract_multimodal_content(messages)
+            all_images = (images or []) + extracted_images
+            all_videos = (videos or []) + extracted_videos
+
+            # Convert tools for template
+            template_tools = convert_tools_for_template(tools) if tools else None
+
+            # Apply chat template
+            prompt = self._apply_chat_template(
                 messages,
+                template_tools,
+                num_images=len(all_images),
+            )
+
+            return await self.generate(
+                prompt=prompt,
                 max_tokens=max_tokens,
                 temperature=temperature,
                 top_p=top_p,
-                tools=tools,
+                images=all_images if all_images else None,
+                videos=all_videos if all_videos else None,
                 **kwargs,
             )
-
-        # Extract images/videos from messages (OpenAI multimodal format)
-        # Note: We only use extracted media here, messages are already processed by server
-        _, extracted_images, extracted_videos = extract_multimodal_content(messages)
-        all_images = (images or []) + extracted_images
-        all_videos = (videos or []) + extracted_videos
-
-        # Convert tools for template
-        template_tools = convert_tools_for_template(tools) if tools else None
-
-        # Apply chat template
-        prompt = self._apply_chat_template(
-            messages,
-            template_tools,
-            num_images=len(all_images),
-        )
-
-        return await self.generate(
-            prompt=prompt,
-            max_tokens=max_tokens,
-            temperature=temperature,
-            top_p=top_p,
-            images=all_images if all_images else None,
-            videos=all_videos if all_videos else None,
-            **kwargs,
-        )
+        finally:
+            if self._admission is not None:
+                self._admission.on_request_complete()
 
     def _compute_prefix_boundary(
         self, messages: list[dict[str, Any]], tools: list[dict] | None = None
@@ -869,50 +969,60 @@ class BatchedEngine(BaseEngine):
         # Normalize messages before any path (developer->system, merge consecutive)
         messages = _normalize_messages(messages)
 
-        # Per-request MTP routing: text-only → TextModel, media → MLLM
-        if self._text_model is not None and not _has_media_content(messages):
-            async for output in self._stream_chat_text_model(
+        # Admission control — wait if memory is tight
+        admission_id = None
+        if self._admission is not None:
+            prompt_tokens = self._estimate_prompt_tokens(messages)
+            admission_id = str(uuid.uuid4())
+            await self._admission.wait_for_admission(admission_id, prompt_tokens)
+
+        try:
+            # Per-request MTP routing: text-only → TextModel, media → MLLM
+            if self._text_model is not None and not _has_media_content(messages):
+                async for output in self._stream_chat_text_model(
+                    messages,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    top_p=top_p,
+                    tools=tools,
+                    **kwargs,
+                ):
+                    yield output
+                return
+
+            # Extract images/videos from messages (OpenAI multimodal format)
+            _, extracted_images, extracted_videos = extract_multimodal_content(messages)
+            all_images = (images or []) + extracted_images
+            all_videos = (videos or []) + extracted_videos
+
+            # Convert tools for template
+            template_tools = convert_tools_for_template(tools) if tools else None
+
+            # Apply chat template
+            prompt = self._apply_chat_template(
                 messages,
+                template_tools,
+                num_images=len(all_images),
+            )
+
+            # Compute prefix boundary for cache
+            prefix_boundary = self._compute_prefix_boundary(messages, tools)
+            if prefix_boundary > 0:
+                kwargs["prefix_boundary"] = prefix_boundary
+
+            async for output in self.stream_generate(
+                prompt=prompt,
                 max_tokens=max_tokens,
                 temperature=temperature,
                 top_p=top_p,
-                tools=tools,
+                images=all_images if all_images else None,
+                videos=all_videos if all_videos else None,
                 **kwargs,
             ):
                 yield output
-            return
-
-        # Extract images/videos from messages (OpenAI multimodal format)
-        # Note: We only use extracted media here, messages are already processed by server
-        _, extracted_images, extracted_videos = extract_multimodal_content(messages)
-        all_images = (images or []) + extracted_images
-        all_videos = (videos or []) + extracted_videos
-
-        # Convert tools for template
-        template_tools = convert_tools_for_template(tools) if tools else None
-
-        # Apply chat template
-        prompt = self._apply_chat_template(
-            messages,
-            template_tools,
-            num_images=len(all_images),
-        )
-
-        # Compute prefix boundary for cache
-        prefix_boundary = self._compute_prefix_boundary(messages, tools)
-        if prefix_boundary > 0:
-            kwargs["prefix_boundary"] = prefix_boundary
-
-        async for output in self.stream_generate(
-            prompt=prompt,
-            max_tokens=max_tokens,
-            temperature=temperature,
-            top_p=top_p,
-            images=all_images if all_images else None,
-            videos=all_videos if all_videos else None,
-            **kwargs,
-        ):
-            yield output
+        finally:
+            if self._admission is not None:
+                self._admission.on_request_complete()
 
     async def _chat_text_model(
         self,

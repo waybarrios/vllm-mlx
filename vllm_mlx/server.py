@@ -490,6 +490,8 @@ def load_model(
     specprefill_threshold: int = 8192,
     specprefill_keep_pct: float = 0.3,
     specprefill_draft_model: str = None,
+    scheduler_policy: str = "fifo",
+    scheduler_headroom_gb: float = 8.0,
 ):
     """
     Load a model (auto-detects MLLM vs LLM).
@@ -507,6 +509,8 @@ def load_model(
         specprefill_threshold: Minimum suffix tokens to trigger SpecPrefill (default: 8192)
         specprefill_keep_pct: Fraction of tokens to keep (default: 0.3)
         specprefill_draft_model: Path to small draft model for SpecPrefill scoring
+        scheduler_policy: Request queue policy for admission control (default: fifo)
+        scheduler_headroom_gb: Memory headroom in GB for admission control (default: 8.0)
     """
     global _engine, _model_name, _model_path, _default_max_tokens, _tool_parser_instance
 
@@ -526,6 +530,8 @@ def load_model(
             scheduler_config=scheduler_config,
             stream_interval=stream_interval,
             force_mllm=force_mllm,
+            scheduler_policy=scheduler_policy,
+            scheduler_headroom_gb=scheduler_headroom_gb,
         )
         # BatchedEngine will be started in lifespan (uvicorn's event loop)
         # Just log for now

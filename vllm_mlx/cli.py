@@ -204,6 +204,8 @@ def serve_command(args):
         specprefill_threshold=args.specprefill_threshold,
         specprefill_keep_pct=args.specprefill_keep_pct,
         specprefill_draft_model=args.specprefill_draft_model,
+        scheduler_policy=args.scheduler_policy,
+        scheduler_headroom_gb=args.scheduler_headroom_gb,
     )
 
     # Start server
@@ -788,6 +790,20 @@ Examples:
         default=None,
         help="Path to small draft model for SpecPrefill importance scoring. "
         "Must share the same tokenizer as the target model.",
+    )
+    # Admission controller (memory-aware scheduling)
+    serve_parser.add_argument(
+        "--scheduler-policy",
+        type=str,
+        default="fifo",
+        choices=["fifo"],
+        help="Request queue policy for admission control (default: fifo)",
+    )
+    serve_parser.add_argument(
+        "--scheduler-headroom-gb",
+        type=float,
+        default=8.0,
+        help="Memory headroom in GB for admission control (default: 8.0)",
     )
     # MCP options
     serve_parser.add_argument(
