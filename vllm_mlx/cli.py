@@ -204,6 +204,7 @@ def serve_command(args):
         specprefill_threshold=args.specprefill_threshold,
         specprefill_keep_pct=args.specprefill_keep_pct,
         specprefill_draft_model=args.specprefill_draft_model,
+        specprefill_chunk_size=args.specprefill_chunk_size,
         scheduler_policy=args.scheduler_policy,
         scheduler_headroom_gb=args.scheduler_headroom_gb,
     )
@@ -790,6 +791,13 @@ Examples:
         default=None,
         help="Path to small draft model for SpecPrefill importance scoring. "
         "Must share the same tokenizer as the target model.",
+    )
+    serve_parser.add_argument(
+        "--specprefill-chunk-size",
+        type=int,
+        default=4096,
+        help="Tokens per draft scoring chunk before yielding to active requests (default: 4096). "
+        "Larger = faster scoring, less responsive interleaving. 0 = monolithic (no yielding).",
     )
     # Admission controller (memory-aware scheduling)
     serve_parser.add_argument(

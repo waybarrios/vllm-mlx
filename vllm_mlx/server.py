@@ -490,6 +490,7 @@ def load_model(
     specprefill_threshold: int = 8192,
     specprefill_keep_pct: float = 0.3,
     specprefill_draft_model: str = None,
+    specprefill_chunk_size: int = 4096,
     scheduler_policy: str = "fifo",
     scheduler_headroom_gb: float = 8.0,
 ):
@@ -509,6 +510,7 @@ def load_model(
         specprefill_threshold: Minimum suffix tokens to trigger SpecPrefill (default: 8192)
         specprefill_keep_pct: Fraction of tokens to keep (default: 0.3)
         specprefill_draft_model: Path to small draft model for SpecPrefill scoring
+        specprefill_chunk_size: Draft scoring chunk size for cooperative scheduling (default: 4096)
         scheduler_policy: Request queue policy for admission control (default: fifo)
         scheduler_headroom_gb: Memory headroom in GB for admission control (default: 8.0)
     """
@@ -530,6 +532,11 @@ def load_model(
             scheduler_config=scheduler_config,
             stream_interval=stream_interval,
             force_mllm=force_mllm,
+            specprefill_enabled=specprefill_enabled,
+            specprefill_threshold=specprefill_threshold,
+            specprefill_keep_pct=specprefill_keep_pct,
+            specprefill_draft_model_path=specprefill_draft_model,
+            specprefill_chunk_size=specprefill_chunk_size,
             scheduler_policy=scheduler_policy,
             scheduler_headroom_gb=scheduler_headroom_gb,
         )
