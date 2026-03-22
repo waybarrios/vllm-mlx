@@ -1064,7 +1064,7 @@ class Scheduler:
         # Memory management: periodic mx.clear_cache() to free Metal command buffers
         # Lower interval = less VRAM spike during generation but slight throughput cost
         self._step_count = 0
-        self._clear_cache_interval = 32
+        self._clear_cache_interval = 256
         self._memory_log_interval = 256
 
     def _get_actual_tokenizer(self, tokenizer: Any) -> Any:
@@ -1897,7 +1897,7 @@ class Scheduler:
                 request_id=request_id,
                 new_token_ids=[response.token],
                 new_text=new_text,
-                output_token_ids=list(request.output_token_ids),
+                output_token_ids=request.output_token_ids,
                 prompt_tokens=request.num_prompt_tokens,
                 completion_tokens=request.num_output_tokens,
             )
