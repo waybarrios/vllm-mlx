@@ -203,7 +203,12 @@ class AdmissionController:
         event = asyncio.Event()
         self._wait_events[request_id] = event
         logger.info(f"[admit] {request_id} waiting for admission (position {position})")
-        await event.wait()
+        try:
+            await event.wait()
+        except asyncio.CancelledError:
+            self._queue.cancel(request_id)
+            self._wait_events.pop(request_id, None)
+            raise
         self._wait_events.pop(request_id, None)
 
     def on_request_complete(self) -> List[QueuedRequest]:

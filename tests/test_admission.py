@@ -278,3 +278,33 @@ def test_admission_controller_cancel_wakes_waiter():
         assert controller.cancel("req-1") is True
         assert event.is_set()
         assert "req-1" not in controller._wait_events
+
+
+def test_admission_wait_cleans_up_on_cancellation():
+    """Verify CancelledError during wait cleans up queue and events."""
+    with patch("vllm_mlx.admission.mx") as mock_mx:
+        mock_mx.metal.is_available.return_value = True
+        mock_mx.device_info.return_value = {
+            "max_recommended_working_set_size": 120 * 1024**3
+        }
+        mock_mx.get_active_memory.return_value = 115 * 1024**3
+        mock_mx.get_cache_memory.return_value = 0
+        controller = AdmissionController(
+            kv_per_token=20_480, headroom_bytes=8 * 1024**3
+        )
+
+        async def simulate_cancel():
+            task = asyncio.create_task(
+                controller.wait_for_admission("req-cancel", prompt_tokens=1000)
+            )
+            await asyncio.sleep(0)  # Let it reach the await event.wait()
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            # Queue and events should be cleaned up
+            assert controller.queue_length == 0
+            assert "req-cancel" not in controller._wait_events
+
+        asyncio.get_event_loop().run_until_complete(simulate_cancel())
