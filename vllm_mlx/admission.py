@@ -148,6 +148,7 @@ class AdmissionController:
         self._monitor = MemoryMonitor(headroom_bytes=headroom_bytes)
         self._queue = RequestQueue(policy=policy)
         self._wait_events: dict[str, asyncio.Event] = {}
+        self._eviction_callback: Optional[callable] = None
 
     def try_admit(
         self, request_id: str, prompt_tokens: int
@@ -173,10 +174,22 @@ class AdmissionController:
         position = self._queue.enqueue(request_id, prompt_tokens)
         return False, position
 
+    def set_eviction_callback(self, callback) -> None:
+        """Set a callback to evict prefix cache entries under memory pressure.
+
+        The callback should return True if it evicted something, False if
+        there's nothing left to evict.
+        """
+        self._eviction_callback = callback
+
     def check_queue(self) -> List[QueuedRequest]:
         """Check if queued requests can now be admitted.
 
         Called after a request completes or memory is freed.
+        If an eviction callback is registered and the front-of-queue request
+        can't fit, the callback is invoked once to free prefix cache memory,
+        then admission is re-checked. If the callback returns False (nothing
+        left to evict), the loop stops.
         Returns list of newly-admittable requests.
         """
         ready = []
@@ -192,7 +205,10 @@ class AdmissionController:
             else:
                 # FIFO: do not skip the front to admit smaller requests behind it.
                 # Prevents starvation of large requests.
-                break
+                # Try evicting prefix cache to make room.
+                if self._eviction_callback is not None and self._eviction_callback():
+                    continue  # Re-check after eviction freed memory
+                break  # No eviction possible or nothing left to evict
         return ready
 
     async def wait_for_admission(self, request_id: str, prompt_tokens: int) -> None:

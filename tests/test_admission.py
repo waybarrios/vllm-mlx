@@ -308,3 +308,77 @@ def test_admission_wait_cleans_up_on_cancellation():
             assert "req-cancel" not in controller._wait_events
 
         asyncio.get_event_loop().run_until_complete(simulate_cancel())
+
+
+def test_admission_controller_eviction_callback():
+    """When queue is non-empty and memory tight, evict prefix cache."""
+    with patch("vllm_mlx.admission.mx") as mock_mx:
+        mock_mx.metal.is_available.return_value = True
+        mock_mx.device_info.return_value = {
+            "max_recommended_working_set_size": 120 * 1024**3
+        }
+        mock_mx.get_active_memory.return_value = 115 * 1024**3
+        mock_mx.get_cache_memory.return_value = 0
+        controller = AdmissionController(
+            kv_per_token=20_480, headroom_bytes=8 * 1024**3
+        )
+
+        eviction_count = []
+
+        def mock_evict():
+            eviction_count.append(1)
+            # Simulate freeing memory by reducing active
+            mock_mx.get_active_memory.return_value = 50 * 1024**3
+            return True  # True = evicted something
+
+        controller.set_eviction_callback(mock_evict)
+
+        # Queue a request (not enough memory)
+        controller.try_admit("req-1", prompt_tokens=1000)
+        assert controller.queue_length == 1
+
+        # check_queue should call eviction, then admit
+        ready = controller.check_queue()
+        assert len(eviction_count) > 0  # Eviction was called
+        assert len(ready) == 1  # Request was admitted after eviction
+        assert ready[0].request_id == "req-1"
+
+
+def test_admission_controller_eviction_no_callback():
+    """Without eviction callback, check_queue just waits."""
+    with patch("vllm_mlx.admission.mx") as mock_mx:
+        mock_mx.metal.is_available.return_value = True
+        mock_mx.device_info.return_value = {
+            "max_recommended_working_set_size": 120 * 1024**3
+        }
+        mock_mx.get_active_memory.return_value = 115 * 1024**3
+        mock_mx.get_cache_memory.return_value = 0
+        controller = AdmissionController(
+            kv_per_token=20_480, headroom_bytes=8 * 1024**3
+        )
+        controller.try_admit("req-1", prompt_tokens=1000)
+        ready = controller.check_queue()
+        assert len(ready) == 0  # Can't admit, no eviction callback
+
+
+def test_admission_controller_eviction_exhausted():
+    """If eviction can't free enough memory, request stays queued."""
+    with patch("vllm_mlx.admission.mx") as mock_mx:
+        mock_mx.metal.is_available.return_value = True
+        mock_mx.device_info.return_value = {
+            "max_recommended_working_set_size": 120 * 1024**3
+        }
+        mock_mx.get_active_memory.return_value = 115 * 1024**3
+        mock_mx.get_cache_memory.return_value = 0
+        controller = AdmissionController(
+            kv_per_token=20_480, headroom_bytes=8 * 1024**3
+        )
+
+        def mock_evict_nothing():
+            return False  # Nothing to evict
+
+        controller.set_eviction_callback(mock_evict_nothing)
+        controller.try_admit("req-1", prompt_tokens=1000)
+        ready = controller.check_queue()
+        assert len(ready) == 0  # Still can't admit
+        assert controller.queue_length == 1
