@@ -54,6 +54,7 @@ class ChunkedDraftScorer:
 
         # State
         self._cache = None
+        self._prompt = mx.array(self._tokens)  # Create once, reuse in step()
         self._processed = 0
         self._logits = None
         self._done_scoring = False
@@ -93,14 +94,13 @@ class ChunkedDraftScorer:
         if self._cache is None:
             self._cache = make_prompt_cache(self._model)
 
-        prompt = mx.array(self._tokens)
         n = len(self._tokens)
         remaining = n - self._processed
 
         if remaining > 1:
             chunk = min(self._chunk_size, remaining - 1)
             self._model(
-                prompt[self._processed : self._processed + chunk][None],
+                self._prompt[self._processed : self._processed + chunk][None],
                 cache=self._cache,
             )
             mx.eval([c.state for c in self._cache])
@@ -110,7 +110,7 @@ class ChunkedDraftScorer:
         else:
             # Last token — get logits
             self._logits = self._model(
-                prompt[self._processed :][None], cache=self._cache
+                self._prompt[self._processed :][None], cache=self._cache
             )
             mx.eval(self._logits)
             self._processed = n
@@ -208,9 +208,10 @@ class ChunkedDraftScorer:
         )
 
         # Free draft resources
-        del self._cache, self._logits
+        del self._cache, self._logits, self._prompt
         self._cache = None
         self._logits = None
+        self._prompt = None
         mx.clear_cache()
 
         return self._importance
@@ -220,6 +221,9 @@ class ChunkedDraftScorer:
         if self._cache is not None:
             del self._cache
             self._cache = None
+        if self._prompt is not None:
+            del self._prompt
+            self._prompt = None
         if self._logits is not None:
             del self._logits
             self._logits = None

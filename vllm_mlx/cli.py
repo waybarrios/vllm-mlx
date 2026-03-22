@@ -804,8 +804,10 @@ Examples:
         "--scheduler-policy",
         type=str,
         default="fifo",
-        choices=["fifo"],
-        help="Request queue policy for admission control (default: fifo)",
+        choices=["fifo", "shortest_first", "priority"],
+        help="Request queue policy for admission control (default: fifo). "
+        "shortest_first: dequeue smallest prompt first (maximizes throughput). "
+        "priority: dequeue highest-priority request first.",
     )
     serve_parser.add_argument(
         "--scheduler-headroom-gb",

@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 import asyncio
+import time
 
 from unittest.mock import patch
 
@@ -45,6 +46,31 @@ def test_kv_per_token_dense_model():
         dtype_bytes=2,
     )
     assert result == 32 * 8 * 128 * 2 * 2  # 131_072
+
+
+def test_kv_per_token_nemotron_h_hybrid_pattern():
+    """Nemotron-H: 8 attention layers from hybrid_override_pattern, not 88."""
+    pattern = "MEMEMEM*EMEMEMEM*EMEMEMEM*EMEMEMEMEM*EMEMEMEMEM*EMEMEMEMEM*EMEMEMEMEM*EMEMEMEM*EMEMEMEME"
+    result = compute_kv_per_token(
+        num_hidden_layers=88,
+        full_attention_interval=1,  # default — would give 88 without pattern
+        num_kv_heads=2,
+        head_dim=128,
+        dtype_bytes=2,
+        hybrid_override_pattern=pattern,
+    )
+    # 8 attention layers (count of '*' in pattern), not 88
+    assert result == 8 * 2 * 128 * 2 * 2  # 8,192
+    # Without pattern, it would be 88 * 2 * 128 * 2 * 2 = 90,112 (11x overestimate)
+    wrong = compute_kv_per_token(
+        num_hidden_layers=88,
+        full_attention_interval=1,
+        num_kv_heads=2,
+        head_dim=128,
+        dtype_bytes=2,
+    )
+    assert wrong == 90_112
+    assert wrong / result == 11.0
 
 
 def test_memory_monitor_free_memory():
@@ -382,3 +408,146 @@ def test_admission_controller_eviction_exhausted():
         ready = controller.check_queue()
         assert len(ready) == 0  # Still can't admit
         assert controller.queue_length == 1
+
+
+# =====================================================================
+# Phase B3: Queue policy tests
+# =====================================================================
+
+
+def test_request_queue_shortest_first_basic():
+    """shortest_first dequeues smallest prompt first."""
+    q = RequestQueue(policy="shortest_first")
+    q.enqueue("req-large", prompt_tokens=100_000)
+    q.enqueue("req-small", prompt_tokens=1_000)
+    q.enqueue("req-medium", prompt_tokens=50_000)
+    assert q.dequeue().request_id == "req-small"
+    assert q.dequeue().request_id == "req-medium"
+    assert q.dequeue().request_id == "req-large"
+    assert q.is_empty()
+
+
+def test_request_queue_shortest_first_tiebreak_fifo():
+    """shortest_first breaks ties by enqueue order."""
+    q = RequestQueue(policy="shortest_first")
+    q.enqueue("req-a", prompt_tokens=1000)
+    q.enqueue("req-b", prompt_tokens=1000)
+    q.enqueue("req-c", prompt_tokens=1000)
+    assert q.dequeue().request_id == "req-a"
+    assert q.dequeue().request_id == "req-b"
+    assert q.dequeue().request_id == "req-c"
+
+
+def test_request_queue_shortest_first_starvation_guard():
+    """Requests waiting past starvation_timeout_s get dequeued first."""
+    q = RequestQueue(policy="shortest_first", starvation_timeout_s=60.0)
+    q.enqueue("req-large", prompt_tokens=100_000)
+    q.enqueue("req-small", prompt_tokens=1_000)
+    # Simulate req-large has been waiting 120s (past 60s timeout)
+    q._queue[0].enqueued_at = time.time() - 120.0
+    # Starved request gets effective_tokens=0, dequeued before req-small
+    assert q.dequeue().request_id == "req-large"
+    assert q.dequeue().request_id == "req-small"
+
+
+def test_request_queue_shortest_first_peek():
+    """peek() returns the same entry that dequeue() would."""
+    q = RequestQueue(policy="shortest_first")
+    q.enqueue("req-large", prompt_tokens=100_000)
+    q.enqueue("req-small", prompt_tokens=1_000)
+    peeked = q.peek()
+    assert peeked.request_id == "req-small"
+    dequeued = q.dequeue()
+    assert dequeued.request_id == "req-small"
+
+
+def test_request_queue_priority_basic():
+    """priority dequeues highest priority first."""
+    q = RequestQueue(policy="priority")
+    q.enqueue("req-low", prompt_tokens=1000, priority=0)
+    q.enqueue("req-high", prompt_tokens=1000, priority=10)
+    q.enqueue("req-mid", prompt_tokens=1000, priority=5)
+    assert q.dequeue().request_id == "req-high"
+    assert q.dequeue().request_id == "req-mid"
+    assert q.dequeue().request_id == "req-low"
+
+
+def test_request_queue_priority_tiebreak_fifo():
+    """Same-priority requests ordered FIFO."""
+    q = RequestQueue(policy="priority")
+    q.enqueue("req-a", prompt_tokens=1000, priority=5)
+    q.enqueue("req-b", prompt_tokens=1000, priority=5)
+    q.enqueue("req-c", prompt_tokens=1000, priority=5)
+    assert q.dequeue().request_id == "req-a"
+    assert q.dequeue().request_id == "req-b"
+    assert q.dequeue().request_id == "req-c"
+
+
+def test_request_queue_invalid_policy():
+    """Invalid policy raises ValueError."""
+    import pytest
+
+    with pytest.raises(ValueError, match="Unsupported policy"):
+        RequestQueue(policy="round_robin")
+
+
+def test_admission_controller_shortest_first_admits_small():
+    """shortest_first admits a small request even when a large one can't fit."""
+    with patch("vllm_mlx.admission.mx") as mock_mx:
+        mock_mx.metal.is_available.return_value = True
+        mock_mx.device_info.return_value = {
+            "max_recommended_working_set_size": 120 * 1024**3
+        }
+        # 10 GB free (just enough for small, not large)
+        mock_mx.get_active_memory.return_value = 110 * 1024**3
+        mock_mx.get_cache_memory.return_value = 0
+        controller = AdmissionController(
+            kv_per_token=20_480,
+            headroom_bytes=8 * 1024**3,
+            policy="shortest_first",
+        )
+        # Both queued (neither fits when first checked — queue is empty so
+        # try_admit checks memory directly)
+        # Large: 200K * 20KB = 4GB prefill + 8GB headroom = 12GB > 10GB free → queue
+        admitted1, _ = controller.try_admit("req-large", prompt_tokens=200_000)
+        assert admitted1 is False
+        # Small: 100 * 20KB ≈ 2MB + 8GB headroom < 10GB → would fit, but
+        # queue is non-empty so it joins the queue
+        admitted2, _ = controller.try_admit("req-small", prompt_tokens=100)
+        assert admitted2 is False
+        assert controller.queue_length == 2
+
+        # Now memory frees to 20GB — shortest_first admits small first
+        mock_mx.get_active_memory.return_value = 100 * 1024**3
+        ready = controller.on_request_complete()
+        # Both should be admittable now, but small is dequeued first
+        assert len(ready) >= 1
+        assert ready[0].request_id == "req-small"
+
+
+def test_admission_controller_priority_order():
+    """priority policy admits highest-priority request first."""
+    with patch("vllm_mlx.admission.mx") as mock_mx:
+        mock_mx.metal.is_available.return_value = True
+        mock_mx.device_info.return_value = {
+            "max_recommended_working_set_size": 120 * 1024**3
+        }
+        mock_mx.get_active_memory.return_value = 115 * 1024**3
+        mock_mx.get_cache_memory.return_value = 0
+        controller = AdmissionController(
+            kv_per_token=20_480,
+            headroom_bytes=8 * 1024**3,
+            policy="priority",
+        )
+        controller.try_admit("req-low", prompt_tokens=1000, priority=0)
+        controller.try_admit("req-high", prompt_tokens=1000, priority=10)
+        controller.try_admit("req-mid", prompt_tokens=1000, priority=5)
+        assert controller.queue_length == 3
+
+        # Free memory — highest priority dequeued first
+        mock_mx.get_active_memory.return_value = 50 * 1024**3
+        ready = controller.on_request_complete()
+        assert len(ready) == 3
+        assert ready[0].request_id == "req-high"
+        assert ready[1].request_id == "req-mid"
+        assert ready[2].request_id == "req-low"

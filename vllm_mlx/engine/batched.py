@@ -211,7 +211,6 @@ class BatchedEngine(BaseEngine):
         self._scheduler_policy = scheduler_policy
         self._scheduler_headroom_gb = scheduler_headroom_gb
         self._admission: Optional["AdmissionController"] = None  # noqa: F821
-        self._specprefill_lock = asyncio.Lock()
         self._draft_model = None
 
         self._model = None
@@ -226,7 +225,9 @@ class BatchedEngine(BaseEngine):
         self._text_model = None
         self._text_tokenizer = None
         self._text_generation_lock = asyncio.Lock()
-        self._metal_lock = __import__("threading").Lock()  # Serializes all Metal GPU access
+        self._metal_lock = __import__(
+            "threading"
+        ).Lock()  # Serializes all Metal GPU access
 
         # System prompt KV cache (reduces repeated prefill across requests)
         self._system_kv_snapshot = None  # List of (keys, values) per backbone layer
@@ -260,6 +261,7 @@ class BatchedEngine(BaseEngine):
             full_attention_interval=_get(cfg, "full_attention_interval", 1),
             num_kv_heads=_get(cfg, "num_key_value_heads", 8),
             head_dim=_get(cfg, "head_dim", 128),
+            hybrid_override_pattern=_get(cfg, "hybrid_override_pattern", None),
         )
 
         self._admission = AdmissionController(
@@ -272,6 +274,41 @@ class BatchedEngine(BaseEngine):
             f"{kv_per_token:,}",
             self._scheduler_headroom_gb,
         )
+
+    async def _metal_safe_mllm_loop(self) -> None:
+        """Process loop for MLLMScheduler that serializes with TextModel.
+
+        Replaces MLLMScheduler._process_loop when MTP routing is active.
+        Uses _metal_lock (threading.Lock) with non-blocking acquire so the
+        event loop is never blocked waiting for a background thread.
+
+        The TextModel path acquires _metal_lock in two places:
+          1. Cooperative specprefill chunks (outside _text_generation_lock)
+          2. Main generation (inside _text_generation_lock)
+        This loop tries to acquire the same lock. If the lock is held
+        (TextModel is running Metal), we yield and retry next iteration.
+        """
+        sched = self._mllm_scheduler
+        while sched._running:
+            try:
+                if sched.has_requests():
+                    acquired = self._metal_lock.acquire(blocking=False)
+                    if acquired:
+                        try:
+                            sched.step()
+                        finally:
+                            self._metal_lock.release()
+                        await asyncio.sleep(0)
+                    else:
+                        # TextModel holds the lock — yield and retry
+                        await asyncio.sleep(0.001)
+                else:
+                    await asyncio.sleep(0.01)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Error in Metal-safe MLLM loop: {e}")
+                await asyncio.sleep(0.1)
 
     @property
     def model_name(self) -> str:
@@ -345,6 +382,25 @@ class BatchedEngine(BaseEngine):
             config=mllm_config,
         )
         await self._mllm_scheduler.start()
+
+        # When MTP routing is active, both MLLMScheduler and TextModel access
+        # Metal. MLLMScheduler.step() runs synchronously on the event loop
+        # thread; TextModel runs via asyncio.to_thread. Without coordination,
+        # concurrent Metal access causes crashes (mlx#3216-class bugs).
+        # Fix: replace the scheduler's process loop with one that acquires
+        # _metal_lock around each step(), serializing with TextModel.
+        if self._mtp:
+            self._mllm_scheduler._running = False
+            if self._mllm_scheduler._processing_task:
+                self._mllm_scheduler._processing_task.cancel()
+                try:
+                    await self._mllm_scheduler._processing_task
+                except asyncio.CancelledError:
+                    pass
+            self._mllm_scheduler._running = True
+            self._mllm_scheduler._processing_task = asyncio.create_task(
+                self._metal_safe_mllm_loop()
+            )
 
         logger.info(
             f"MLLM Scheduler started with continuous batching: "
@@ -1276,14 +1332,18 @@ class BatchedEngine(BaseEngine):
             )
             try:
                 while scorer.is_scoring:
+
                     def _locked_step():
                         with self._metal_lock:
                             return scorer.step()
+
                     await asyncio.to_thread(_locked_step)
                     await asyncio.sleep(0)  # Yield to event loop
+
                 def _locked_finalize():
                     with self._metal_lock:
                         return scorer.finalize()
+
                 importance = await asyncio.to_thread(_locked_finalize)
             except Exception as e:
                 scorer.cleanup()
@@ -1661,6 +1721,7 @@ class BatchedEngine(BaseEngine):
             def _locked_run_with_cache():
                 with self._metal_lock:
                     return _run_with_cache()
+
             result = await asyncio.to_thread(_locked_run_with_cache)
             all_resps, prompt_token_count = result
 

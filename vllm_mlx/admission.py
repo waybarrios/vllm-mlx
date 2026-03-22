@@ -25,6 +25,7 @@ def compute_kv_per_token(
     num_kv_heads: int,
     head_dim: int,
     dtype_bytes: int = 2,
+    hybrid_override_pattern: Optional[str] = None,
 ) -> int:
     """Compute KV cache bytes per token for this model.
 
@@ -39,13 +40,21 @@ def compute_kv_per_token(
         num_kv_heads: Number of KV attention heads.
         head_dim: Dimension per head.
         dtype_bytes: Bytes per element (2 for bfloat16, 1 for int8 quantized).
+        hybrid_override_pattern: Layer-type string from config.json (e.g.
+            Nemotron-H "MEMEMEM*E..."). '*' = attention, 'M' = Mamba,
+            'E' = MoE, '-' = MLP.  When provided, attention layers are
+            counted directly from the pattern instead of using
+            full_attention_interval.
 
     Returns:
         Bytes of KV cache consumed per token.
     """
-    if full_attention_interval <= 0:
-        full_attention_interval = 1
-    attention_layers = num_hidden_layers // full_attention_interval
+    if hybrid_override_pattern:
+        attention_layers = hybrid_override_pattern.count("*")
+    else:
+        if full_attention_interval <= 0:
+            full_attention_interval = 1
+        attention_layers = num_hidden_layers // full_attention_interval
     return attention_layers * num_kv_heads * head_dim * 2 * dtype_bytes  # 2 = K + V
 
 
@@ -75,45 +84,127 @@ class MemoryMonitor:
         return self.free_memory() >= prefill_bytes + self.headroom_bytes
 
 
+_VALID_POLICIES = ("fifo", "shortest_first", "priority")
+
+
 @dataclass
 class QueuedRequest:
     request_id: str
     prompt_tokens: int
+    priority: int = 0  # Higher = more important (only used by "priority" policy)
     enqueued_at: float = field(default_factory=time.time)
 
 
 class RequestQueue:
-    """Request queue with configurable ordering policy."""
+    """Request queue with configurable ordering policy.
 
-    def __init__(self, policy: str = "fifo"):
-        if policy != "fifo":
+    Policies:
+        fifo: First-in-first-out. Fair, prevents starvation. Head-of-line
+            blocking: a large request at the front blocks smaller ones behind it.
+        shortest_first: Dequeue the request with the fewest prompt tokens.
+            Maximizes throughput by clearing short requests first. Starvation
+            guard: requests waiting longer than ``starvation_timeout_s`` are
+            promoted to highest priority.
+        priority: Dequeue the request with the highest ``priority`` value.
+            Same-priority requests are ordered FIFO (by enqueue time).
+    """
+
+    def __init__(self, policy: str = "fifo", starvation_timeout_s: float = 120.0):
+        if policy not in _VALID_POLICIES:
             raise ValueError(
-                f"Unsupported policy: {policy!r}. Only 'fifo' is implemented."
+                f"Unsupported policy: {policy!r}. "
+                f"Valid policies: {', '.join(_VALID_POLICIES)}"
             )
         self._policy = policy
+        self._starvation_timeout_s = starvation_timeout_s
         self._queue: deque[QueuedRequest] = deque()
 
-    def enqueue(self, request_id: str, prompt_tokens: int) -> int:
+    @property
+    def policy(self) -> str:
+        return self._policy
+
+    def enqueue(self, request_id: str, prompt_tokens: int, priority: int = 0) -> int:
         """Add request to queue. Returns position (0-indexed)."""
-        entry = QueuedRequest(request_id=request_id, prompt_tokens=prompt_tokens)
+        entry = QueuedRequest(
+            request_id=request_id, prompt_tokens=prompt_tokens, priority=priority
+        )
         self._queue.append(entry)
         position = len(self._queue) - 1
         logger.info(
-            f"[queue] {request_id} queued at position {position} ({prompt_tokens} tokens)"
+            f"[queue] {request_id} queued at position {position} "
+            f"({prompt_tokens} tokens, priority={priority})"
         )
         return position
 
     def peek(self) -> Optional[QueuedRequest]:
-        """Return next request without removing it."""
+        """Return the next request that would be dequeued, without removing it."""
         if not self._queue:
             return None
-        return self._queue[0]
+        if self._policy == "fifo":
+            return self._queue[0]
+        return self._select_next()
 
     def dequeue(self) -> Optional[QueuedRequest]:
         """Remove and return next request per policy."""
         if not self._queue:
             return None
-        return self._queue.popleft()
+        if self._policy == "fifo":
+            return self._queue.popleft()
+        entry = self._select_next()
+        if entry is not None:
+            self._queue.remove(entry)
+        return entry
+
+    def _select_next(self) -> Optional[QueuedRequest]:
+        """Select the next request to dequeue based on policy.
+
+        For shortest_first: pick the request with fewest prompt_tokens.
+        Starvation guard: any request waiting longer than starvation_timeout_s
+        is treated as having 0 tokens (highest priority to dequeue).
+
+        For priority: pick the request with highest priority value.
+        Ties broken by earliest enqueue time (FIFO within same priority).
+        """
+        if not self._queue:
+            return None
+
+        now = time.time()
+
+        if self._policy == "shortest_first":
+            best = None
+            for entry in self._queue:
+                waited = now - entry.enqueued_at
+                starved = waited >= self._starvation_timeout_s
+                # Starved requests get effective size 0 (dequeue first)
+                effective_tokens = 0 if starved else entry.prompt_tokens
+                if best is None:
+                    best = (entry, effective_tokens, entry.enqueued_at)
+                else:
+                    _, best_tokens, best_time = best
+                    # Prefer fewer tokens; break ties by earlier enqueue
+                    if effective_tokens < best_tokens or (
+                        effective_tokens == best_tokens
+                        and entry.enqueued_at < best_time
+                    ):
+                        best = (entry, effective_tokens, entry.enqueued_at)
+            return best[0] if best else None
+
+        elif self._policy == "priority":
+            best = None
+            for entry in self._queue:
+                if best is None:
+                    best = entry
+                elif entry.priority > best.priority:
+                    best = entry
+                elif (
+                    entry.priority == best.priority
+                    and entry.enqueued_at < best.enqueued_at
+                ):
+                    best = entry
+            return best
+
+        # Fallback (shouldn't reach here — FIFO handled in dequeue)
+        return self._queue[0]
 
     def cancel(self, request_id: str) -> bool:
         """Remove a request from the queue. Returns True if found."""
@@ -151,7 +242,7 @@ class AdmissionController:
         self._eviction_callback: Optional[callable] = None
 
     def try_admit(
-        self, request_id: str, prompt_tokens: int
+        self, request_id: str, prompt_tokens: int, priority: int = 0
     ) -> Tuple[bool, Optional[int]]:
         """Try to admit a request for immediate processing.
 
@@ -160,8 +251,9 @@ class AdmissionController:
             (False, queue_position) if queued.
         """
         # FIFO: if anything is already waiting, join the queue regardless of memory.
+        # (shortest_first and priority also respect queue — no cutting the line)
         if not self._queue.is_empty():
-            position = self._queue.enqueue(request_id, prompt_tokens)
+            position = self._queue.enqueue(request_id, prompt_tokens, priority)
             return False, position
         prefill_bytes = prompt_tokens * self.kv_per_token
         if self._monitor.can_admit(prefill_bytes):
@@ -171,7 +263,7 @@ class AdmissionController:
                 f"{self._monitor.free_memory() / 1e9:.1f} GB free)"
             )
             return True, None
-        position = self._queue.enqueue(request_id, prompt_tokens)
+        position = self._queue.enqueue(request_id, prompt_tokens, priority)
         return False, position
 
     def set_eviction_callback(self, callback) -> None:
@@ -186,34 +278,69 @@ class AdmissionController:
         """Check if queued requests can now be admitted.
 
         Called after a request completes or memory is freed.
-        If an eviction callback is registered and the front-of-queue request
-        can't fit, the callback is invoked once to free prefix cache memory,
-        then admission is re-checked. If the callback returns False (nothing
-        left to evict), the loop stops.
+
+        Policy behavior:
+            fifo: Only admit the front of the queue. Never skips.
+            shortest_first: Admit the smallest request that fits, even if
+                it's not at the front. Starved requests (past timeout) are
+                treated as smallest.
+            priority: Admit the highest-priority request that fits. Ties
+                broken by FIFO order.
+
+        If an eviction callback is registered and the selected request can't
+        fit, the callback is invoked to free prefix cache memory.
+
         Returns list of newly-admittable requests.
         """
         ready = []
-        while not self._queue.is_empty():
-            entry = self._queue.peek()
-            prefill_bytes = entry.prompt_tokens * self.kv_per_token
-            if self._monitor.can_admit(prefill_bytes):
-                ready.append(self._queue.dequeue())
-                logger.info(
-                    f"[admit] {entry.request_id} DEQUEUED → admitted "
-                    f"(waited {time.time() - entry.enqueued_at:.1f}s)"
-                )
-            else:
-                # FIFO: do not skip the front to admit smaller requests behind it.
-                # Prevents starvation of large requests.
-                # Try evicting prefix cache to make room.
-                if self._eviction_callback is not None and self._eviction_callback():
-                    continue  # Re-check after eviction freed memory
-                break  # No eviction possible or nothing left to evict
+
+        if self._queue._policy == "fifo":
+            # FIFO: strict head-of-line. Never skip the front.
+            while not self._queue.is_empty():
+                entry = self._queue.peek()
+                prefill_bytes = entry.prompt_tokens * self.kv_per_token
+                if self._monitor.can_admit(prefill_bytes):
+                    ready.append(self._queue.dequeue())
+                    logger.info(
+                        f"[admit] {entry.request_id} DEQUEUED → admitted "
+                        f"(waited {time.time() - entry.enqueued_at:.1f}s)"
+                    )
+                else:
+                    if (
+                        self._eviction_callback is not None
+                        and self._eviction_callback()
+                    ):
+                        continue
+                    break
+        else:
+            # shortest_first / priority: scan for best admittable request
+            while not self._queue.is_empty():
+                candidate = self._queue.peek()  # Policy-ordered best
+                prefill_bytes = candidate.prompt_tokens * self.kv_per_token
+                if self._monitor.can_admit(prefill_bytes):
+                    self._queue.dequeue()
+                    ready.append(candidate)
+                    logger.info(
+                        f"[admit] {candidate.request_id} DEQUEUED → admitted "
+                        f"(waited {time.time() - candidate.enqueued_at:.1f}s, "
+                        f"policy={self._queue._policy})"
+                    )
+                else:
+                    # Best candidate doesn't fit. Try eviction once.
+                    if (
+                        self._eviction_callback is not None
+                        and self._eviction_callback()
+                    ):
+                        continue
+                    break
+
         return ready
 
-    async def wait_for_admission(self, request_id: str, prompt_tokens: int) -> None:
+    async def wait_for_admission(
+        self, request_id: str, prompt_tokens: int, priority: int = 0
+    ) -> None:
         """Block until this request can be admitted. Returns immediately if room."""
-        admitted, position = self.try_admit(request_id, prompt_tokens)
+        admitted, position = self.try_admit(request_id, prompt_tokens, priority)
         if admitted:
             return
         event = asyncio.Event()
