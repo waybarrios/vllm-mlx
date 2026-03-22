@@ -518,6 +518,29 @@ class BatchedEngine(BaseEngine):
         except Exception as e:
             logger.warning(f"[admission] Failed to init: {e} — admission disabled")
 
+        # Load SpecPrefill draft model (for LLM path)
+        if self._specprefill_enabled and self._specprefill_draft_model_path:
+            try:
+                from pathlib import Path
+
+                from mlx_lm import load as mlx_lm_load
+
+                draft_path = str(
+                    Path.home()
+                    / "ai-models"
+                    / "mlx_models"
+                    / self._specprefill_draft_model_path
+                )
+                self._draft_model, _ = mlx_lm_load(draft_path)
+                logger.info(
+                    "SpecPrefill draft model loaded (LLM path): %s",
+                    self._specprefill_draft_model_path,
+                )
+            except Exception as e:
+                logger.warning("Failed to load SpecPrefill draft model: %s", e)
+                self._specprefill_enabled = False
+                self._draft_model = None
+
     async def stop(self) -> None:
         """Stop the engine and cleanup resources."""
         if self._mllm_scheduler:
