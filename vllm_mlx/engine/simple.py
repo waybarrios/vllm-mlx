@@ -534,28 +534,42 @@ class SimpleEngine(BaseEngine):
         if self._is_mllm:
             if self._text_model is not None:
                 logger.info("Media request → MLLM path")
-            # For MLLM, use stream_chat which yields tokens incrementally.
+            # For MLLM, stream tokens via queue so clients see output
+            # as it's generated rather than waiting for completion.
             # Must hold _generation_lock to prevent concurrent Metal access
             # (e.g. OpenCode sends title + main request simultaneously).
-            async with self._generation_lock:
-                accumulated_text = ""
-                token_count = 0
+            import queue
 
-                # Run stream_chat in thread pool since it's synchronous
+            async with self._generation_lock:
+                chunk_queue: queue.Queue = queue.Queue()
+                _DONE = object()
+
                 def run_stream():
-                    return list(
-                        self._model.stream_chat(
+                    try:
+                        for chunk in self._model.stream_chat(
                             messages=messages,
                             max_tokens=max_tokens,
                             temperature=temperature,
                             tools=template_tools,
                             **kwargs,
-                        )
-                    )
+                        ):
+                            chunk_queue.put(chunk)
+                    except Exception as e:
+                        chunk_queue.put(e)
+                    finally:
+                        chunk_queue.put(_DONE)
 
-                chunks = await asyncio.to_thread(run_stream)
+                loop = asyncio.get_event_loop()
+                loop.run_in_executor(None, run_stream)
 
-                for chunk in chunks:
+                accumulated_text = ""
+                token_count = 0
+                while True:
+                    chunk = await asyncio.to_thread(chunk_queue.get)
+                    if chunk is _DONE:
+                        break
+                    if isinstance(chunk, Exception):
+                        raise chunk
                     token_count += 1
                     new_text = chunk.text if hasattr(chunk, "text") else str(chunk)
                     accumulated_text += new_text
