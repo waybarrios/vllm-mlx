@@ -1,7 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 from unittest.mock import patch
 
-from vllm_mlx.admission import MemoryMonitor, RequestQueue, compute_kv_per_token
+from vllm_mlx.admission import (
+    AdmissionController,
+    MemoryMonitor,
+    RequestQueue,
+    compute_kv_per_token,
+)
 
 
 def test_kv_per_token_qwen35_35b():
@@ -96,3 +101,61 @@ def test_request_queue_cancel():
     q.enqueue("req-2", prompt_tokens=200)
     q.cancel("req-1")
     assert q.dequeue().request_id == "req-2"
+
+
+def test_admission_controller_admit_when_room():
+    with patch("vllm_mlx.admission.mx") as mock_mx:
+        mock_mx.metal.is_available.return_value = True
+        mock_mx.device_info.return_value = {
+            "max_recommended_working_set_size": 120 * 1024**3
+        }
+        mock_mx.get_active_memory.return_value = 50 * 1024**3  # 70 GB free
+        mock_mx.get_cache_memory.return_value = 0
+        controller = AdmissionController(
+            kv_per_token=20_480,
+            headroom_bytes=8 * 1024**3,
+        )
+        admitted, position = controller.try_admit("req-1", prompt_tokens=10_000)
+        assert admitted is True
+        assert position is None
+
+
+def test_admission_controller_queue_when_full():
+    with patch("vllm_mlx.admission.mx") as mock_mx:
+        mock_mx.metal.is_available.return_value = True
+        mock_mx.device_info.return_value = {
+            "max_recommended_working_set_size": 120 * 1024**3
+        }
+        mock_mx.get_active_memory.return_value = 115 * 1024**3  # 5 GB free
+        mock_mx.get_cache_memory.return_value = 0
+        controller = AdmissionController(
+            kv_per_token=20_480,
+            headroom_bytes=8 * 1024**3,
+        )
+        # 10K tokens * 20KB = 200MB prefill. 5GB free < 200MB + 8GB → queue
+        admitted, position = controller.try_admit("req-1", prompt_tokens=10_000)
+        assert admitted is False
+        assert position == 0
+
+
+def test_admission_controller_drain_queue():
+    with patch("vllm_mlx.admission.mx") as mock_mx:
+        mock_mx.metal.is_available.return_value = True
+        mock_mx.device_info.return_value = {
+            "max_recommended_working_set_size": 120 * 1024**3
+        }
+        # Start full
+        mock_mx.get_active_memory.return_value = 115 * 1024**3
+        mock_mx.get_cache_memory.return_value = 0
+        controller = AdmissionController(
+            kv_per_token=20_480,
+            headroom_bytes=8 * 1024**3,
+        )
+        controller.try_admit("req-1", prompt_tokens=1000)
+        assert controller.queue_length == 1
+        # Memory freed
+        mock_mx.get_active_memory.return_value = 50 * 1024**3
+        ready = controller.check_queue()
+        assert len(ready) == 1
+        assert ready[0].request_id == "req-1"
+        assert controller.queue_length == 0

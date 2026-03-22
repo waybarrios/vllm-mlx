@@ -11,7 +11,7 @@ import logging
 import time
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import List, Optional, Tuple
 
 import mlx.core as mx
 
@@ -127,3 +127,70 @@ class RequestQueue:
 
     def __len__(self) -> int:
         return len(self._queue)
+
+
+class AdmissionController:
+    """Flow control for multi-user inference.
+
+    Core principle: Load affects latency, never quality.
+    Decides WHEN to start requests. Once started, a request
+    runs to completion at full quality.
+    """
+
+    def __init__(
+        self,
+        kv_per_token: int,
+        headroom_bytes: int = 8 * 1024**3,
+        policy: str = "fifo",
+    ):
+        self.kv_per_token = kv_per_token
+        self.monitor = MemoryMonitor(headroom_bytes=headroom_bytes)
+        self.queue = RequestQueue(policy=policy)
+
+    def try_admit(
+        self, request_id: str, prompt_tokens: int
+    ) -> Tuple[bool, Optional[int]]:
+        """Try to admit a request for immediate processing.
+
+        Returns:
+            (True, None) if admitted.
+            (False, queue_position) if queued.
+        """
+        prefill_bytes = prompt_tokens * self.kv_per_token
+        if self.monitor.can_admit(prefill_bytes):
+            logger.info(
+                f"[admit] {request_id} ADMITTED ({prompt_tokens} tokens, "
+                f"{prefill_bytes / 1e6:.0f} MB prefill, "
+                f"{self.monitor.free_memory() / 1e9:.1f} GB free)"
+            )
+            return True, None
+        position = self.queue.enqueue(request_id, prompt_tokens)
+        return False, position
+
+    def check_queue(self) -> List[QueuedRequest]:
+        """Check if queued requests can now be admitted.
+
+        Called after a request completes or memory is freed.
+        Returns list of newly-admittable requests.
+        """
+        ready = []
+        while not self.queue.is_empty():
+            entry = self.queue.peek()
+            prefill_bytes = entry.prompt_tokens * self.kv_per_token
+            if self.monitor.can_admit(prefill_bytes):
+                ready.append(self.queue.dequeue())
+                logger.info(
+                    f"[admit] {entry.request_id} DEQUEUED → admitted "
+                    f"(waited {time.time() - entry.enqueued_at:.1f}s)"
+                )
+            else:
+                break  # If front of queue can't fit, nothing behind it can either (FIFO)
+        return ready
+
+    def cancel(self, request_id: str) -> bool:
+        """Cancel a queued request."""
+        return self.queue.cancel(request_id)
+
+    @property
+    def queue_length(self) -> int:
+        return len(self.queue)
