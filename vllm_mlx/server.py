@@ -1310,6 +1310,9 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
     logger.info(
         f"[REQUEST] POST /v1/completions stream={request.stream} "
         f"max_tokens={request.max_tokens} temp={request.temperature} "
+        f"top_p={request.top_p} top_k={request.top_k} min_p={request.min_p} "
+        f"presence_penalty={request.presence_penalty} "
+        f"repetition_penalty={request.repetition_penalty} "
         f"prompt_chars={prompt_len} prompt_preview={prompt_preview!r}"
     )
 
@@ -1342,6 +1345,9 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
             "max_tokens": request.max_tokens or _default_max_tokens,
             "temperature": _resolve_temperature(request.temperature),
             "top_p": _resolve_top_p(request.top_p),
+            "top_k": request.top_k or 0,
+            "min_p": request.min_p or 0.0,
+            "presence_penalty": request.presence_penalty or 0.0,
             "stop": request.stop,
         }
         if comp_rep_penalty is not None:
@@ -1447,7 +1453,11 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
     logger.info(
         f"[REQUEST] POST /v1/chat/completions stream={request.stream} "
         f"model={request.model!r} max_tokens={request.max_tokens} "
-        f"temp={request.temperature} msgs={n_msgs} roles={msg_roles} "
+        f"temp={request.temperature} top_p={request.top_p} "
+        f"top_k={request.top_k} min_p={request.min_p} "
+        f"presence_penalty={request.presence_penalty} "
+        f"repetition_penalty={request.repetition_penalty} "
+        f"msgs={n_msgs} roles={msg_roles} "
         f"total_chars={total_chars} tools={n_tools} "
         f"response_format={request.response_format}"
     )
@@ -1513,6 +1523,10 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
         "max_tokens": request.max_tokens or _default_max_tokens,
         "temperature": _resolve_temperature(request.temperature),
         "top_p": _resolve_top_p(request.top_p),
+        "top_k": request.top_k or 0,
+        "min_p": request.min_p or 0.0,
+        "presence_penalty": request.presence_penalty or 0.0,
+        "repetition_penalty": request.repetition_penalty or 1.0,
     }
     if rep_penalty is not None:
         chat_kwargs["repetition_penalty"] = rep_penalty
@@ -1795,6 +1809,10 @@ async def create_anthropic_message(
         "max_tokens": openai_request.max_tokens or _default_max_tokens,
         "temperature": openai_request.temperature,
         "top_p": openai_request.top_p,
+        "top_k": openai_request.top_k or 0,
+        "min_p": openai_request.min_p or 0.0,
+        "presence_penalty": openai_request.presence_penalty or 0.0,
+        "repetition_penalty": openai_request.repetition_penalty or 1.0,
     }
 
     if openai_request.tools and openai_request.tool_choice != "none":
@@ -2038,6 +2056,10 @@ async def _stream_anthropic_messages(
         "max_tokens": openai_request.max_tokens or _default_max_tokens,
         "temperature": openai_request.temperature,
         "top_p": openai_request.top_p,
+        "top_k": openai_request.top_k or 0,
+        "min_p": openai_request.min_p or 0.0,
+        "presence_penalty": openai_request.presence_penalty or 0.0,
+        "repetition_penalty": openai_request.repetition_penalty or 1.0,
     }
 
     if openai_request.tools and openai_request.tool_choice != "none":
@@ -2267,6 +2289,9 @@ async def stream_completion(
         "max_tokens": request.max_tokens or _default_max_tokens,
         "temperature": _resolve_temperature(request.temperature),
         "top_p": _resolve_top_p(request.top_p),
+        "top_k": request.top_k or 0,
+        "min_p": request.min_p or 0.0,
+        "presence_penalty": request.presence_penalty or 0.0,
         "stop": request.stop,
     }
     if repetition_penalty is not None:
