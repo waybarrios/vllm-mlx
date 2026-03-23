@@ -178,6 +178,16 @@ def serve_command(args):
             print(f"Prefix cache: max_entries={args.prefix_cache_size}")
     else:
         print("Mode: Simple (maximum throughput)")
+        if args.enable_mtp:
+            print("MTP: enabled (native speculative decoding)")
+        if args.enable_mtp and getattr(args, "mllm", False):
+            print("MTP + MLLM: per-request routing (text-only → MTP, media → MLLM)")
+        if args.specprefill and args.specprefill_draft_model:
+            print(
+                f"SpecPrefill: enabled (draft={args.specprefill_draft_model}, "
+                f"threshold={args.specprefill_threshold}, "
+                f"keep={args.specprefill_keep_pct*100:.0f}%)"
+            )
 
     # Load model with unified server
     load_model(
@@ -187,6 +197,16 @@ def serve_command(args):
         stream_interval=args.stream_interval if args.continuous_batching else 1,
         max_tokens=args.max_tokens,
         force_mllm=args.mllm,
+        served_model_name=args.served_model_name,
+        mtp=args.enable_mtp,
+        prefill_step_size=args.prefill_step_size,
+        specprefill_enabled=args.specprefill,
+        specprefill_threshold=args.specprefill_threshold,
+        specprefill_keep_pct=args.specprefill_keep_pct,
+        specprefill_draft_model=args.specprefill_draft_model,
+        specprefill_chunk_size=args.specprefill_chunk_size,
+        scheduler_policy=args.scheduler_policy,
+        scheduler_headroom_gb=args.scheduler_headroom_gb,
     )
 
     # Start server
@@ -592,6 +612,12 @@ Examples:
     serve_parser = subparsers.add_parser("serve", help="Start OpenAI-compatible server")
     serve_parser.add_argument("model", type=str, help="Model to serve")
     serve_parser.add_argument(
+        "--served-model-name",
+        type=str,
+        default=None,
+        help="The model name used in the API. If not specified, the model argument is used.",
+    )
+    serve_parser.add_argument(
         "--host", type=str, default="0.0.0.0", help="Host to bind"
     )
     serve_parser.add_argument("--port", type=int, default=8000, help="Port to bind")
@@ -728,6 +754,67 @@ Examples:
         help="Skip MTP acceptance check for maximum speed. "
         "~5-10%% wrong tokens. Best for chat, not for code.",
     )
+    # Prefill step size
+    serve_parser.add_argument(
+        "--prefill-step-size",
+        type=int,
+        default=2048,
+        help="Chunk size for prompt prefill processing. Larger values use more memory "
+        "but can improve prefill throughput. (default: 2048)",
+    )
+    # SpecPrefill (attention-based sparse prefill using draft model)
+    serve_parser.add_argument(
+        "--specprefill",
+        action="store_true",
+        default=False,
+        help="Enable SpecPrefill: use a small draft model to score token importance, "
+        "then sparse-prefill only the important tokens on the target model. "
+        "Reduces TTFT on long prompts. Requires --specprefill-draft-model.",
+    )
+    serve_parser.add_argument(
+        "--specprefill-threshold",
+        type=int,
+        default=8192,
+        help="Minimum suffix tokens to trigger SpecPrefill (default: 8192). "
+        "Shorter prompts use full prefill (scoring overhead > savings).",
+    )
+    serve_parser.add_argument(
+        "--specprefill-keep-pct",
+        type=float,
+        default=0.3,
+        help="Fraction of tokens to keep during sparse prefill (default: 0.3). "
+        "Lower = faster prefill but more quality loss.",
+    )
+    serve_parser.add_argument(
+        "--specprefill-draft-model",
+        type=str,
+        default=None,
+        help="Path to small draft model for SpecPrefill importance scoring. "
+        "Must share the same tokenizer as the target model.",
+    )
+    serve_parser.add_argument(
+        "--specprefill-chunk-size",
+        type=int,
+        default=4096,
+        help="Tokens per draft scoring chunk before yielding to active requests (default: 4096). "
+        "Larger = faster scoring, less responsive interleaving. 0 = monolithic (no yielding).",
+    )
+    # Admission controller (memory-aware scheduling)
+    serve_parser.add_argument(
+        "--scheduler-policy",
+        type=str,
+        default="fifo",
+        choices=["fifo", "shortest_first", "priority"],
+        help="Request queue policy for admission control (default: fifo). "
+        "shortest_first: dequeue smallest prompt first (maximizes throughput). "
+        "priority: dequeue highest-priority request first.",
+    )
+    serve_parser.add_argument(
+        "--scheduler-headroom-gb",
+        type=float,
+        default=8.0,
+        help="Memory headroom in GB for admission control (default: 8.0)",
+    )
     # MCP options
     serve_parser.add_argument(
         "--mcp-config",
@@ -769,6 +856,8 @@ Examples:
             "mistral",
             "qwen",
             "qwen3_coder",
+            "qwen3_xml",
+            "qwen3.5",
             "llama",
             "hermes",
             "deepseek",
