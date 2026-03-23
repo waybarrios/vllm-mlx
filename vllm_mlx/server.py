@@ -1421,8 +1421,11 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
     if request.specprefill_keep_pct is not None:
         chat_kwargs["specprefill_keep_pct"] = request.specprefill_keep_pct
 
-    # Add tools if provided
-    if request.tools:
+    # Add tools if provided (but skip if tool_choice="none")
+    # When tool_choice="none", models like Qwen2.5 and Llama 3.x still activate
+    # tool-calling if tools are present in the template context. To properly
+    # disable tool calling, we must not pass tools to the template at all.
+    if request.tools and request.tool_choice != "none":
         chat_kwargs["tools"] = convert_tools_for_template(request.tools)
 
     if request.stream:
