@@ -226,6 +226,24 @@ class SimpleEngine(BaseEngine):
         self._system_kv_token_count = 0
         logger.info("SimpleEngine stopped")
 
+    async def _run_blocking_serialized(self, func, /, *args, **kwargs):
+        """Run a blocking MLX operation under the generation lock.
+
+        Cancellation must not release the async lock before the worker thread
+        finishes, or a follow-up request can enter MLX/Metal concurrently and
+        corrupt the command-buffer state.
+        """
+        async with self._generation_lock:
+            task = asyncio.create_task(asyncio.to_thread(func, *args, **kwargs))
+            try:
+                return await asyncio.shield(task)
+            except asyncio.CancelledError:
+                try:
+                    await task
+                except Exception:
+                    pass
+                raise
+
     async def generate(
         self,
         prompt: str,
@@ -252,30 +270,28 @@ class SimpleEngine(BaseEngine):
         if not self._loaded:
             await self.start()
 
-        async with self._generation_lock:
-            # Run in thread pool to allow asyncio timeout to work
-            output = await asyncio.to_thread(
-                self._model.generate,
-                prompt=prompt,
-                max_tokens=max_tokens,
-                temperature=temperature,
-                top_p=top_p,
-                stop=stop,
-                **kwargs,
-            )
+        output = await self._run_blocking_serialized(
+            self._model.generate,
+            prompt=prompt,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            stop=stop,
+            **kwargs,
+        )
 
-            # Clean output text
-            text = clean_output_text(output.text)
+        # Clean output text
+        text = clean_output_text(output.text)
 
-            return GenerationOutput(
-                text=text,
-                tokens=getattr(output, "tokens", []),
-                prompt_tokens=getattr(output, "prompt_tokens", 0),
-                completion_tokens=getattr(
-                    output, "completion_tokens", len(getattr(output, "tokens", []))
-                ),
-                finish_reason=output.finish_reason,
-            )
+        return GenerationOutput(
+            text=text,
+            tokens=getattr(output, "tokens", []),
+            prompt_tokens=getattr(output, "prompt_tokens", 0),
+            completion_tokens=getattr(
+                output, "completion_tokens", len(getattr(output, "tokens", []))
+            ),
+            finish_reason=output.finish_reason,
+        )
 
     async def stream_generate(
         self,
@@ -440,55 +456,40 @@ class SimpleEngine(BaseEngine):
         # Convert tools for template if provided
         template_tools = convert_tools_for_template(tools) if tools else None
 
-        async with self._generation_lock:
-            if self._is_mllm:
-                # For MLLM, use the chat method which handles images/videos
-                # Run in thread pool to allow asyncio timeout to work
-                output = await asyncio.to_thread(
-                    self._model.chat,
-                    messages=messages,
-                    max_tokens=max_tokens,
-                    temperature=temperature,
-                    tools=template_tools,
-                    **kwargs,
-                )
-                text = clean_output_text(output.text)
-                return GenerationOutput(
-                    text=text,
-                    prompt_tokens=output.prompt_tokens,
-                    completion_tokens=output.completion_tokens,
-                    finish_reason=output.finish_reason,
-                )
-            else:
-                # For LLM, use the chat method
-                # Run in thread pool to allow asyncio timeout to work
-                output = await asyncio.to_thread(
-                    self._model.chat,
-                    messages=messages,
-                    max_tokens=max_tokens,
-                    temperature=temperature,
-                    top_p=top_p,
-                    tools=template_tools,
-                    **kwargs,
-                )
-                text = clean_output_text(output.text)
-                # Count prompt tokens from the full templated prompt
-                tokenizer = self._model.tokenizer
-                template_kwargs = {
-                    "tokenize": True,
-                    "add_generation_prompt": True,
-                }
-                if template_tools:
-                    template_kwargs["tools"] = template_tools
-                prompt_ids = tokenizer.apply_chat_template(messages, **template_kwargs)
-                prompt_token_count = len(prompt_ids)
-                return GenerationOutput(
-                    text=text,
-                    tokens=output.tokens,
-                    prompt_tokens=prompt_token_count,
-                    completion_tokens=len(output.tokens),
-                    finish_reason=output.finish_reason,
-                )
+        if self._is_mllm:
+            output = await self._run_blocking_serialized(
+                self._model.chat,
+                messages=messages,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                tools=template_tools,
+                **kwargs,
+            )
+            text = clean_output_text(output.text)
+            return GenerationOutput(
+                text=text,
+                prompt_tokens=output.prompt_tokens,
+                completion_tokens=output.completion_tokens,
+                finish_reason=output.finish_reason,
+            )
+        else:
+            output = await self._run_blocking_serialized(
+                self._model.chat,
+                messages=messages,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                tools=template_tools,
+                **kwargs,
+            )
+            text = clean_output_text(output.text)
+            return GenerationOutput(
+                text=text,
+                tokens=output.tokens,
+                prompt_tokens=prompt_token_count,
+                completion_tokens=len(output.tokens),
+                finish_reason=output.finish_reason,
+            )
 
     async def stream_chat(
         self,
@@ -548,42 +549,41 @@ class SimpleEngine(BaseEngine):
             # For MLLM, use stream_chat which yields tokens incrementally.
             # Must hold _generation_lock to prevent concurrent Metal access
             # (e.g. OpenCode sends title + main request simultaneously).
-            async with self._generation_lock:
-                accumulated_text = ""
-                token_count = 0
+            accumulated_text = ""
+            token_count = 0
 
-                # Run stream_chat in thread pool since it's synchronous
-                def run_stream():
-                    return list(
-                        self._model.stream_chat(
-                            messages=messages,
-                            max_tokens=max_tokens,
-                            temperature=temperature,
-                            tools=template_tools,
-                            **kwargs,
-                        )
+            # Run stream_chat in thread pool since it's synchronous
+            def run_stream():
+                return list(
+                    self._model.stream_chat(
+                        messages=messages,
+                        max_tokens=max_tokens,
+                        temperature=temperature,
+                        tools=template_tools,
+                        **kwargs,
                     )
+                )
 
-                chunks = await asyncio.to_thread(run_stream)
+            chunks = await self._run_blocking_serialized(run_stream)
 
-                for chunk in chunks:
-                    token_count += 1
-                    new_text = chunk.text if hasattr(chunk, "text") else str(chunk)
-                    accumulated_text += new_text
+            for chunk in chunks:
+                token_count += 1
+                new_text = chunk.text if hasattr(chunk, "text") else str(chunk)
+                accumulated_text += new_text
 
-                    finished = chunk.finish_reason is not None
+                finished = chunk.finish_reason is not None
 
-                    yield GenerationOutput(
-                        text=accumulated_text,
-                        new_text=new_text,
-                        prompt_tokens=getattr(chunk, "prompt_tokens", 0),
-                        completion_tokens=token_count,
-                        finished=finished,
-                        finish_reason=chunk.finish_reason if finished else None,
-                    )
+                yield GenerationOutput(
+                    text=accumulated_text,
+                    new_text=new_text,
+                    prompt_tokens=getattr(chunk, "prompt_tokens", 0),
+                    completion_tokens=token_count,
+                    finished=finished,
+                    finish_reason=chunk.finish_reason if finished else None,
+                )
 
-                    if finished:
-                        break
+                if finished:
+                    break
             return
 
         # For LLM, apply chat template and stream
@@ -769,7 +769,7 @@ class SimpleEngine(BaseEngine):
                     )
                 return results
 
-            all_resps = await asyncio.to_thread(_run_all)
+            all_resps = await self._run_blocking_serialized(_run_all)
 
         # Yield results as GenerationOutput
         accumulated_text = ""
@@ -1197,7 +1197,7 @@ class SimpleEngine(BaseEngine):
                 finally:
                     cleanup_rope(model)
 
-            all_resps = await asyncio.to_thread(_run_all)
+            all_resps = await self._run_blocking_serialized(_run_all)
 
         # Yield results as GenerationOutput
         accumulated_text = ""
