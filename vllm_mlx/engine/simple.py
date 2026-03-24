@@ -647,16 +647,14 @@ class SimpleEngine(BaseEngine):
         tokenizer = self._model.tokenizer
         n_tokens = len(tokens)
 
-        async with self._generation_lock:
-
-            def _run_all():
-                try:
-                    return _run_specprefill()
-                except Exception as e:
-                    logger.error(
-                        "SpecPrefill failed, falling back to normal path: %s", e
-                    )
-                    return _run_normal()
+        def _run_all():
+            try:
+                return _run_specprefill()
+            except Exception as e:
+                logger.error(
+                    "SpecPrefill failed, falling back to normal path: %s", e
+                )
+                return _run_normal()
 
             def _run_specprefill():
                 """Score tokens, sparse prefill, generate autoregressively."""
@@ -769,7 +767,7 @@ class SimpleEngine(BaseEngine):
                     )
                 return results
 
-            all_resps = await self._run_blocking_serialized(_run_all)
+        all_resps = await self._run_blocking_serialized(_run_all)
 
         # Yield results as GenerationOutput
         accumulated_text = ""
@@ -1010,96 +1008,94 @@ class SimpleEngine(BaseEngine):
             )
             use_specprefill = False
 
-        # Run under generation lock, all Metal ops in single thread
-        async with self._generation_lock:
+        # Run all Metal ops in a single serialized thread.
+        def _run_all():
+            nonlocal backbone_cache, prompt_to_send
 
-            def _run_all():
-                nonlocal backbone_cache, prompt_to_send
+            model = self._text_model
 
-                model = self._text_model
+            # Cache MISS with valid prefix: prefill system tokens and snapshot
+            if (
+                not cache_hit
+                and system_token_count > 0
+                and system_tokens is not None
+                and suffix_tokens is not None
+            ):
+                mc = make_prompt_cache(model)
+                sys_arr = mx.array(system_tokens)
 
-                # Cache MISS with valid prefix: prefill system tokens and snapshot
-                if (
-                    not cache_hit
-                    and system_token_count > 0
-                    and system_tokens is not None
-                    and suffix_tokens is not None
-                ):
-                    mc = make_prompt_cache(model)
-                    sys_arr = mx.array(system_tokens)
+                # Prefill system tokens in chunks (matching generate_step)
+                step = self._prefill_step_size
+                while sys_arr.size > step:
+                    model(sys_arr[:step][None], cache=mc)
+                    mx.eval([c.state for c in mc])
+                    sys_arr = sys_arr[step:]
+                    mx.clear_cache()
+                if sys_arr.size > 0:
+                    model(sys_arr[None], cache=mc)
+                    mx.eval([c.state for c in mc])
 
-                    # Prefill system tokens in chunks (matching generate_step)
-                    step = self._prefill_step_size
-                    while sys_arr.size > step:
-                        model(sys_arr[:step][None], cache=mc)
-                        mx.eval([c.state for c in mc])
-                        sys_arr = sys_arr[step:]
-                        mx.clear_cache()
-                    if sys_arr.size > 0:
-                        model(sys_arr[None], cache=mc)
-                        mx.eval([c.state for c in mc])
+                # Snapshot backbone cache (immutable mx.arrays, safe to reuse)
+                snapshot = [c.state for c in mc]
+                mx.eval([s for pair in snapshot for s in pair])
 
-                    # Snapshot backbone cache (immutable mx.arrays, safe to reuse)
-                    snapshot = [c.state for c in mc]
-                    mx.eval([s for pair in snapshot for s in pair])
+                self._system_kv_snapshot = snapshot
+                self._system_kv_hash = system_hash
+                self._system_kv_token_count = system_token_count
 
-                    self._system_kv_snapshot = snapshot
-                    self._system_kv_hash = system_hash
-                    self._system_kv_token_count = system_token_count
-
-                    backbone_cache = mc
-                    prompt_to_send = mx.array(suffix_tokens)
-                    logger.info(
-                        "System KV cache: stored %d-token snapshot (%.1f MB), "
-                        "prefilling %d remaining",
-                        system_token_count,
-                        sum(c.nbytes for c in mc) / 1e6,
-                        len(suffix_tokens),
-                    )
-
-                # --- SpecPrefill path (with fallback to normal on failure) ---
-                if use_specprefill:
-                    try:
-                        return _run_specprefill(model, backbone_cache)
-                    except Exception as e:
-                        logger.error(
-                            "SpecPrefill failed, falling back to normal MTP path: %s",
-                            e,
-                        )
-                        # Discard potentially corrupted cache
-                        backbone_cache = None
-                        prompt_to_send = full_prompt
-
-                # --- Normal path (MTP via mlx_lm stream_generate) ---
-                prompt_cache = None
-                if backbone_cache is not None:
-                    # Add MTP cache on top of backbone
-                    if hasattr(model, "make_mtp_cache"):
-                        mtp_cache = model.make_mtp_cache()
-                        prompt_cache = backbone_cache + mtp_cache
-                    else:
-                        prompt_cache = backbone_cache
-
-                results = []
-                gen_kwargs = dict(
-                    max_tokens=max_tokens,
-                    sampler=sampler,
-                    mtp=True,
-                    prefill_step_size=self._prefill_step_size,
+                backbone_cache = mc
+                prompt_to_send = mx.array(suffix_tokens)
+                logger.info(
+                    "System KV cache: stored %d-token snapshot (%.1f MB), "
+                    "prefilling %d remaining",
+                    system_token_count,
+                    sum(c.nbytes for c in mc) / 1e6,
+                    len(suffix_tokens),
                 )
-                if prompt_cache is not None:
-                    gen_kwargs["prompt_cache"] = prompt_cache
 
-                for resp in mlx_stream_generate(
-                    model,
-                    self._text_tokenizer,
-                    prompt=prompt_to_send,
-                    **gen_kwargs,
-                ):
-                    results.append(resp)
-                return results
+            # --- SpecPrefill path (with fallback to normal on failure) ---
+            if use_specprefill:
+                try:
+                    return _run_specprefill(model, backbone_cache)
+                except Exception as e:
+                    logger.error(
+                        "SpecPrefill failed, falling back to normal MTP path: %s",
+                        e,
+                    )
+                    # Discard potentially corrupted cache
+                    backbone_cache = None
+                    prompt_to_send = full_prompt
 
-            def _run_specprefill(model, bc):
+            # --- Normal path (MTP via mlx_lm stream_generate) ---
+            prompt_cache = None
+            if backbone_cache is not None:
+                # Add MTP cache on top of backbone
+                if hasattr(model, "make_mtp_cache"):
+                    mtp_cache = model.make_mtp_cache()
+                    prompt_cache = backbone_cache + mtp_cache
+                else:
+                    prompt_cache = backbone_cache
+
+            results = []
+            gen_kwargs = dict(
+                max_tokens=max_tokens,
+                sampler=sampler,
+                mtp=True,
+                prefill_step_size=self._prefill_step_size,
+            )
+            if prompt_cache is not None:
+                gen_kwargs["prompt_cache"] = prompt_cache
+
+            for resp in mlx_stream_generate(
+                model,
+                self._text_tokenizer,
+                prompt=prompt_to_send,
+                **gen_kwargs,
+            ):
+                results.append(resp)
+            return results
+
+        def _run_specprefill(model, bc):
                 """Score tokens, sparse prefill, generate without MTP."""
                 from types import SimpleNamespace
 
@@ -1197,7 +1193,7 @@ class SimpleEngine(BaseEngine):
                 finally:
                     cleanup_rope(model)
 
-            all_resps = await self._run_blocking_serialized(_run_all)
+        all_resps = await self._run_blocking_serialized(_run_all)
 
         # Yield results as GenerationOutput
         accumulated_text = ""
