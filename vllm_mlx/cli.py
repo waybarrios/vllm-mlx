@@ -593,7 +593,8 @@ def bench_kv_cache_command(args):
     )
 
 
-def main():
+def create_parser() -> argparse.ArgumentParser:
+    """Build the top-level CLI parser."""
     parser = argparse.ArgumentParser(
         description="vllm-mlx: Apple Silicon MLX backend for vLLM",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -832,6 +833,8 @@ Examples:
             "qwen3_coder",
             "llama",
             "hermes",
+            "harmony",
+            "gpt-oss",
             "deepseek",
             "kimi",
             "granite",
@@ -843,7 +846,8 @@ Examples:
         help=(
             "Select the tool call parser for the model. Options: "
             "auto (auto-detect), mistral, qwen, qwen3_coder, llama, hermes, "
-            "deepseek, kimi, granite, nemotron, xlam, functionary, glm47. "
+            "harmony, gpt-oss, deepseek, kimi, granite, nemotron, xlam, "
+            "functionary, glm47. "
             "Required for --enable-auto-tool-choice."
         ),
     )
@@ -1022,6 +1026,12 @@ Examples:
         default=64,
         help="Quantization group size (default: 64)",
     )
+
+    return parser
+
+
+def main():
+    parser = create_parser()
 
     args = parser.parse_args()
 

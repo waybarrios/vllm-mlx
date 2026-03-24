@@ -167,6 +167,41 @@ class TestCompletionRequest:
         assert request.max_tokens is None  # uses _default_max_tokens when None
 
 
+class TestServeCli:
+    """Test serve CLI argument parsing."""
+
+    def test_tool_call_parser_accepts_harmony_aliases(self):
+        """GPT-OSS/Harmony parsers should be selectable from the serve CLI."""
+        from vllm_mlx.cli import create_parser
+
+        parser = create_parser()
+        args = parser.parse_args(
+            [
+                "serve",
+                "lmstudio-community/gpt-oss-20b-MLX-8bit",
+                "--enable-auto-tool-choice",
+                "--tool-call-parser",
+                "harmony",
+            ]
+        )
+
+        assert args.command == "serve"
+        assert args.tool_call_parser == "harmony"
+        assert args.enable_auto_tool_choice is True
+
+        args = parser.parse_args(
+            [
+                "serve",
+                "lmstudio-community/gpt-oss-20b-MLX-8bit",
+                "--enable-auto-tool-choice",
+                "--tool-call-parser",
+                "gpt-oss",
+            ]
+        )
+
+        assert args.tool_call_parser == "gpt-oss"
+
+
 # =============================================================================
 # Helper Function Tests
 # =============================================================================
