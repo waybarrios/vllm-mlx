@@ -1420,6 +1420,8 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
         chat_kwargs["specprefill"] = request.specprefill
     if request.specprefill_keep_pct is not None:
         chat_kwargs["specprefill_keep_pct"] = request.specprefill_keep_pct
+    if request.chat_template_kwargs:
+        chat_kwargs["chat_template_kwargs"] = dict(request.chat_template_kwargs)
 
     # Add tools if provided
     if request.tools:

@@ -11,6 +11,7 @@ These models define the request and response schemas for:
 
 import time
 import uuid
+from typing import Any
 
 from pydantic import BaseModel, Field, computed_field
 
@@ -169,6 +170,8 @@ class ChatCompletionRequest(BaseModel):
     tool_choice: str | dict | None = None  # "auto", "none", or specific tool
     # Structured output
     response_format: ResponseFormat | dict | None = None
+    # Extra kwargs forwarded to tokenizer.apply_chat_template
+    chat_template_kwargs: dict[str, Any] | None = None
     # MLLM-specific parameters
     video_fps: float | None = None
     video_max_frames: int | None = None
