@@ -586,7 +586,7 @@ class BlockAwarePrefixCache:
             # Extract and store actual tensor slices for this block
             if is_tensor_data and HAS_MLX:
                 block_kv_data = self._extract_block_tensor_slice(
-                    cache_data, global_start, global_end
+                    cache_data, global_start, global_end, len(tokens)
                 )
                 if block_kv_data:
                     block.cache_data = block_kv_data
@@ -629,55 +629,119 @@ class BlockAwarePrefixCache:
         cache_data: List[Dict[str, Any]],
         start_idx: int,
         end_idx: int,
-    ) -> Optional[List[Tuple[Any, Any]]]:
+        total_tokens: int,
+    ) -> Optional[List[Optional[Dict[str, Any]]]]:
         """
-        Extract tensor slices for a single block from cache data.
+        Extract per-layer cache data for a single block.
 
         Args:
-            cache_data: List of layer states, each containing 'state': (keys, values)
+            cache_data: List of extracted layer states
             start_idx: Start token index in the sequence
             end_idx: End token index in the sequence
+            total_tokens: Total number of tokens covered by cache_data
 
         Returns:
-            List of (keys_slice, values_slice) for each layer, or None on failure
+            Per-layer block cache state, or None on failure
         """
         if not HAS_MLX or not cache_data:
             return None
 
         try:
-            block_slices = []
+            block_slices: List[Optional[Dict[str, Any]]] = []
             for layer_state in cache_data:
                 if "state" not in layer_state:
+                    block_slices.append(None)
                     continue
 
-                keys, values = layer_state["state"]
+                state = layer_state["state"]
+                meta_state = layer_state.get("meta_state")
+                class_ref = layer_state.get("class_ref")
+                class_name = layer_state.get("class_name")
 
-                # KV cache shape: (batch, n_kv_heads, seq_len, head_dim)
-                # Slice along seq_len dimension (axis 2)
-                seq_len = keys.shape[2] if hasattr(keys, "shape") else 0
-
-                if end_idx > seq_len:
-                    # Requested range extends beyond available data
-                    logger.debug(
-                        f"Block slice [{start_idx}:{end_idx}] exceeds seq_len {seq_len}"
+                if self._can_concatenate_cache_state(state):
+                    state_slice = self._slice_concat_cache_state(
+                        state, start_idx, end_idx
                     )
-                    # Use whatever is available
-                    actual_end = min(end_idx, seq_len)
-                    if start_idx >= actual_end:
-                        continue
-                    keys_slice = keys[:, :, start_idx:actual_end, :]
-                    values_slice = values[:, :, start_idx:actual_end, :]
+                    block_slices.append(
+                        {
+                            "state": state_slice,
+                            "meta_state": meta_state,
+                            "class_ref": class_ref,
+                            "class_name": class_name,
+                            "storage": "concat",
+                            "seq_axis": 2,
+                        }
+                    )
+                    continue
+
+                if end_idx == total_tokens:
+                    block_slices.append(
+                        {
+                            "state": state,
+                            "meta_state": meta_state,
+                            "class_ref": class_ref,
+                            "class_name": class_name,
+                            "storage": "latest",
+                        }
+                    )
                 else:
-                    keys_slice = keys[:, :, start_idx:end_idx, :]
-                    values_slice = values[:, :, start_idx:end_idx, :]
+                    block_slices.append(None)
 
-                block_slices.append((keys_slice, values_slice))
-
-            return block_slices if block_slices else None
+            return block_slices if any(entry is not None for entry in block_slices) else None
 
         except Exception as e:
             logger.warning(f"Failed to extract block tensor slice: {e}")
             return None
+
+    def _can_concatenate_cache_state(self, state: Any) -> bool:
+        """Return True when cache state can be concatenated block-by-block."""
+        if not isinstance(state, (list, tuple)) or not state:
+            return False
+        return all(
+            tensor is not None
+            and hasattr(tensor, "shape")
+            and len(tensor.shape) == 4
+            for tensor in state
+        )
+
+    def _slice_concat_cache_state(
+        self,
+        state: Tuple[Any, ...] | List[Any],
+        start_idx: int,
+        end_idx: int,
+    ) -> Tuple[Any, ...] | List[Any]:
+        """Slice a sequence-backed cache state across the token axis."""
+        seq_len = state[0].shape[2]
+        actual_end = min(end_idx, seq_len)
+        if start_idx >= actual_end:
+            raise ValueError(
+                f"Block slice [{start_idx}:{end_idx}] exceeds seq_len {seq_len}"
+            )
+
+        def _slice_tensor(tensor: Any) -> Any:
+            slices = [slice(None)] * len(tensor.shape)
+            slices[2] = slice(start_idx, actual_end)
+            return tensor[tuple(slices)]
+
+        sliced = [_slice_tensor(tensor) for tensor in state]
+        return tuple(sliced) if isinstance(state, tuple) else sliced
+
+    def _concat_cache_states(
+        self,
+        states: List[Tuple[Any, ...] | List[Any]],
+        seq_axis: int,
+    ) -> Optional[Tuple[Any, ...] | List[Any]]:
+        """Concatenate state fragments for a sequence-backed cache layer."""
+        if not states:
+            return None
+        arity = len(states[0])
+        concatenated = []
+        for idx in range(arity):
+            parts = [state[idx] for state in states]
+            if any(part is None for part in parts):
+                return None
+            concatenated.append(mx.concatenate(parts, axis=seq_axis))
+        return tuple(concatenated) if isinstance(states[0], tuple) else concatenated
 
     def get_cache_for_generation(
         self,
@@ -763,10 +827,11 @@ class BlockAwarePrefixCache:
         block_table: BlockTable,
     ) -> Optional[List[Any]]:
         """
-        Reconstruct KVCache objects from stored block tensor data.
+        Reconstruct cache objects from stored block tensor data.
 
-        This method concatenates tensor slices from all blocks and
-        creates new KVCache objects that can be used for inference.
+        Sequence-backed caches are concatenated block-by-block. Recurrent
+        caches such as ArraysCache are restored from the latest sequence
+        boundary snapshot that was actually stored.
 
         Args:
             block_table: BlockTable containing block IDs to reconstruct from
@@ -800,67 +865,62 @@ class BlockAwarePrefixCache:
             if not all_block_data:
                 return None
 
-            # Get number of layers from first block
-            num_layers = len(all_block_data[0])
+            # Get number of layers from the richest block
+            num_layers = max(len(block_data) for block_data in all_block_data)
             if num_layers == 0:
                 return None
 
-            # Concatenate tensors for each layer
             reconstructed_caches = []
-
             for layer_idx in range(num_layers):
-                layer_keys = []
-                layer_values = []
+                layer_entries = [
+                    block_data[layer_idx]
+                    for block_data in all_block_data
+                    if layer_idx < len(block_data)
+                ]
+                layer_entries = [entry for entry in layer_entries if entry is not None]
+                if not layer_entries:
+                    return None
 
-                for block_data in all_block_data:
-                    if layer_idx < len(block_data):
-                        keys_slice, values_slice = block_data[layer_idx]
-                        layer_keys.append(keys_slice)
-                        layer_values.append(values_slice)
+                layer_meta = layer_entries[-1]
+                state = layer_meta["state"]
+                if layer_meta["storage"] == "concat":
+                    state = self._concat_cache_states(
+                        [entry["state"] for entry in layer_entries],
+                        layer_meta["seq_axis"],
+                    )
+                elif layer_meta["storage"] == "latest":
+                    state = layer_entries[-1]["state"]
 
-                if not layer_keys:
-                    continue
+                if state is None:
+                    return None
 
-                # Concatenate along sequence dimension (axis 2)
-                # Shape: (batch, n_kv_heads, seq_len, head_dim)
-                concat_keys = mx.concatenate(layer_keys, axis=2)
-                concat_values = mx.concatenate(layer_values, axis=2)
+                cache_cls = layer_meta.get("class_ref")
+                meta_state = layer_meta.get("meta_state")
 
-                # Create KVCache object
-                # Try to use mlx_lm's KVCache.from_state if available
-                try:
+                if cache_cls is not None and hasattr(cache_cls, "from_state"):
+                    from mlx_lm.models.cache import (
+                        BatchKVCache as _BatchKVCache,
+                        KVCache as _KVCache,
+                    )
+
+                    if cache_cls is _BatchKVCache:
+                        keys, values = state[0], state[1]
+                        cache = _KVCache()
+                        cache.keys = keys
+                        cache.values = values
+                        cache.offset = keys.shape[2]
+                    else:
+                        cache = cache_cls.from_state(state, meta_state)
+                else:
                     from mlx_lm.models.cache import KVCache
 
-                    # Create new cache and set its state
+                    if len(state) != 2:
+                        return None
                     cache = KVCache()
-                    seq_len = concat_keys.shape[2]
+                    cache.keys, cache.values = state
+                    cache.offset = cache.keys.shape[2]
 
-                    # Set internal state directly
-                    # KVCache stores keys/values and offset
-                    cache.keys = concat_keys
-                    cache.values = concat_values
-                    cache.offset = seq_len
-
-                    reconstructed_caches.append(cache)
-
-                except ImportError:
-                    # Fallback: create a simple cache-like object
-                    class SimpleKVCache:
-                        def __init__(self, keys, values):
-                            self.keys = keys
-                            self.values = values
-                            self.offset = keys.shape[2]
-
-                        @property
-                        def state(self):
-                            return (self.keys, self.values)
-
-                        @property
-                        def meta_state(self):
-                            return (str(self.offset),)
-
-                    cache = SimpleKVCache(concat_keys, concat_values)
-                    reconstructed_caches.append(cache)
+                reconstructed_caches.append(cache)
 
             if not reconstructed_caches:
                 return None
