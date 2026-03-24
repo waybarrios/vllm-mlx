@@ -3235,10 +3235,10 @@ async def _acquire_default_engine_for_request(
     """Acquire the default engine inside the request guardrails."""
     if count_activity:
         acquire_coro = _acquire_default_engine()
-        cleanup = lambda _engine: _release_default_engine()
+        cleanup = lambda _result: _release_default_engine()
     else:
         acquire_coro = _acquire_default_engine(count_activity=False)
-        cleanup = lambda _engine: _release_default_engine(count_activity=False)
+        cleanup = lambda _result: _release_default_engine(count_activity=False)
 
     return await _wait_with_disconnect(
         acquire_coro,
@@ -3375,7 +3375,7 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
             completion_tokens=total_completion_tokens,
         )
         return CompletionResponse(
-            model=request.model,
+            model=_model_name,
             choices=choices,
             usage=Usage(
                 prompt_tokens=total_prompt_tokens,

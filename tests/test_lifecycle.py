@@ -5222,3 +5222,156 @@ class TestSuspendCancellationDedup:
         assert engine is not None
         await manager.shutdown()
         assert stopped == 1
+
+
+class TestResponseModelFieldUsesServedName:
+    """Verify response .model echoes _model_name (the served name), not
+    whatever the client sent in request.model.
+
+    Each test monkeypatches _validate_model_name to a no-op so the request
+    can carry a distinct model string, proving the response field is sourced
+    from the server-side served name rather than the request echo-back.
+    """
+
+    @pytest.mark.asyncio
+    async def test_completion_response_uses_served_model_name(self, monkeypatch):
+        import vllm_mlx.server as srv
+        from vllm_mlx.engine.base import GenerationOutput
+
+        class FakeEngine:
+            preserve_native_tool_format = False
+            is_mllm = False
+
+            async def generate(self, **kwargs):
+                return GenerationOutput(
+                    text="hello",
+                    completion_tokens=1,
+                    prompt_tokens=1,
+                )
+
+        served_name = "my-custom-served-name"
+
+        async def fake_acquire(raw_request, *, total_timeout=None, deadline=None, count_activity=True):
+            return FakeEngine()
+
+        async def fake_release(*, count_activity=True):
+            pass
+
+        monkeypatch.setattr(srv, "_validate_model_name", lambda _m: None)
+        monkeypatch.setattr(srv, "_acquire_default_engine_for_request", fake_acquire)
+        monkeypatch.setattr(srv, "_release_default_engine", fake_release)
+        monkeypatch.setattr(srv, "_model_name", served_name)
+        monkeypatch.setattr(srv, "_default_max_tokens", 32)
+
+        class FakeRawRequest:
+            async def is_disconnected(self):
+                return False
+
+        request = srv.CompletionRequest(
+            model="user-sent-model-name",
+            prompt="hi",
+            stream=False,
+        )
+
+        response = await srv.create_completion(request, FakeRawRequest())
+        assert response.model == served_name
+        assert response.model != "user-sent-model-name"
+
+    @pytest.mark.asyncio
+    async def test_chat_completion_response_uses_served_model_name(self, monkeypatch):
+        import vllm_mlx.server as srv
+        from vllm_mlx.engine.base import GenerationOutput
+
+        class FakeEngine:
+            preserve_native_tool_format = False
+            is_mllm = False
+            tokenizer = None
+
+            async def chat(self, **kwargs):
+                return GenerationOutput(
+                    text="hello",
+                    completion_tokens=1,
+                    prompt_tokens=1,
+                )
+
+        served_name = "my-custom-served-name"
+
+        async def fake_acquire(raw_request, *, total_timeout=None, deadline=None, count_activity=True):
+            return FakeEngine()
+
+        async def fake_release(*, count_activity=True):
+            pass
+
+        monkeypatch.setattr(srv, "_validate_model_name", lambda _m: None)
+        monkeypatch.setattr(srv, "_acquire_default_engine_for_request", fake_acquire)
+        monkeypatch.setattr(srv, "_release_default_engine", fake_release)
+        monkeypatch.setattr(srv, "_model_name", served_name)
+        monkeypatch.setattr(srv, "_default_max_tokens", 32)
+        monkeypatch.setattr(srv, "_enable_auto_tool_choice", False)
+        monkeypatch.setattr(srv, "_reasoning_parser", None)
+
+        class FakeRawRequest:
+            async def is_disconnected(self):
+                return False
+
+        request = srv.ChatCompletionRequest(
+            model="user-sent-model-name",
+            messages=[{"role": "user", "content": "hi"}],
+            stream=False,
+        )
+
+        response = await srv.create_chat_completion(request, FakeRawRequest())
+        assert response.model == served_name
+        assert response.model != "user-sent-model-name"
+
+    @pytest.mark.asyncio
+    async def test_anthropic_response_uses_served_model_name(self, monkeypatch):
+        import json
+
+        import vllm_mlx.server as srv
+        from vllm_mlx.engine.base import GenerationOutput
+
+        class FakeEngine:
+            preserve_native_tool_format = False
+            is_mllm = False
+            tokenizer = None
+
+            async def chat(self, **kwargs):
+                return GenerationOutput(
+                    text="hello",
+                    completion_tokens=1,
+                    prompt_tokens=1,
+                )
+
+        served_name = "my-custom-served-name"
+
+        async def fake_acquire(raw_request, *, total_timeout=None, deadline=None, count_activity=True):
+            return FakeEngine()
+
+        async def fake_release(*, count_activity=True):
+            pass
+
+        monkeypatch.setattr(srv, "_validate_model_name", lambda _m: None)
+        monkeypatch.setattr(srv, "_acquire_default_engine_for_request", fake_acquire)
+        monkeypatch.setattr(srv, "_release_default_engine", fake_release)
+        monkeypatch.setattr(srv, "_model_name", served_name)
+        monkeypatch.setattr(srv, "_default_max_tokens", 32)
+        monkeypatch.setattr(srv, "_enable_auto_tool_choice", False)
+        monkeypatch.setattr(srv, "_reasoning_parser", None)
+
+        class FakeRawRequest:
+            async def json(self):
+                return {
+                    "model": "user-sent-model-name",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "max_tokens": 16,
+                    "stream": False,
+                }
+
+            async def is_disconnected(self):
+                return False
+
+        response = await srv.create_anthropic_message(FakeRawRequest())
+        body = json.loads(response.body.decode())
+        assert body["model"] == served_name
+        assert body["model"] != "user-sent-model-name"
