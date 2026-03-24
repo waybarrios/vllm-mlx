@@ -902,7 +902,6 @@ class BatchedEngine(BaseEngine):
 
         import mlx.core as mx
         from mlx_lm import stream_generate as mlx_stream_generate
-        from mlx_lm.models.cache import make_prompt_cache
         from mlx_lm.sample_utils import make_sampler
 
         # Read enable_thinking from env (set by runtime_patches)
@@ -940,12 +939,7 @@ class BatchedEngine(BaseEngine):
             def _run_generation():
                 model = self._text_model
 
-                # Build MTP-aware prompt cache
-                prompt_cache = make_prompt_cache(model)
-                if hasattr(model, "make_mtp_cache"):
-                    mtp_cache = model.make_mtp_cache()
-                    prompt_cache = prompt_cache + mtp_cache
-
+                # Let mlx_lm handle cache creation (MTP-aware in feat/mtp-native)
                 results = []
                 for response in mlx_stream_generate(
                     model=model,
@@ -953,7 +947,6 @@ class BatchedEngine(BaseEngine):
                     prompt=prompt,
                     max_tokens=max_tokens,
                     sampler=sampler,
-                    prompt_cache=prompt_cache,
                     prefill_step_size=self._prefill_step_size,
                 ):
                     results.append(response)
