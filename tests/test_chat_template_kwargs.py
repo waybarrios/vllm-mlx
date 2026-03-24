@@ -80,3 +80,25 @@ def test_chat_completion_endpoint_forwards_chat_template_kwargs():
     assert response.status_code == 200
     assert captured["kwargs"]["chat_template_kwargs"] == {"enable_thinking": False}
     assert response.json()["choices"][0]["message"]["content"] == "ORBIT"
+
+
+def test_llm_chat_applies_chat_template_kwargs_before_generate():
+    from vllm_mlx.models.llm import MLXLanguageModel
+
+    model = MLXLanguageModel.__new__(MLXLanguageModel)
+    model._loaded = True
+    model.tokenizer = MagicMock()
+    model.tokenizer.apply_chat_template.return_value = "prompt"
+    model.generate = MagicMock(return_value="ok")
+
+    result = model.chat(
+        [{"role": "user", "content": "Hello"}],
+        chat_template_kwargs={"enable_thinking": False},
+    )
+
+    assert result == "ok"
+    model.tokenizer.apply_chat_template.assert_called_once()
+    assert (
+        model.tokenizer.apply_chat_template.call_args.kwargs["enable_thinking"] is False
+    )
+    model.generate.assert_called_once()
