@@ -446,6 +446,8 @@ class SimpleEngine(BaseEngine):
             if self._is_mllm:
                 # For MLLM, use the chat method which handles images/videos
                 # Run in thread pool to allow asyncio timeout to work
+                if chat_template_kwargs:
+                    kwargs["chat_template_kwargs"] = chat_template_kwargs
                 output = await asyncio.to_thread(
                     self._model.chat,
                     messages=messages,
@@ -535,6 +537,8 @@ class SimpleEngine(BaseEngine):
             and not _has_media_content(messages)
         ):
             logger.info("Text-only request → LLM path (MTP=True)")
+            if chat_template_kwargs:
+                kwargs["chat_template_kwargs"] = chat_template_kwargs
             async for chunk in self._stream_generate_text(
                 messages,
                 max_tokens,
@@ -559,13 +563,16 @@ class SimpleEngine(BaseEngine):
 
                 # Run stream_chat in thread pool since it's synchronous
                 def run_stream():
+                    local_kwargs = dict(kwargs)
+                    if chat_template_kwargs:
+                        local_kwargs["chat_template_kwargs"] = chat_template_kwargs
                     return list(
                         self._model.stream_chat(
                             messages=messages,
                             max_tokens=max_tokens,
                             temperature=temperature,
                             tools=template_tools,
-                            **kwargs,
+                            **local_kwargs,
                         )
                     )
 
@@ -841,6 +848,7 @@ class SimpleEngine(BaseEngine):
         # Per-request specprefill overrides (from extra_body)
         specprefill_override = kwargs.pop("specprefill", None)
         specprefill_keep_pct = kwargs.pop("specprefill_keep_pct", None)
+        chat_template_kwargs = dict(kwargs.pop("chat_template_kwargs", {}) or {})
 
         # Read enable_thinking from env (set by runtime_patches, consistent with MLLM path)
         enable_thinking_env = os.environ.get("VLLM_MLX_ENABLE_THINKING", "true")
@@ -852,6 +860,7 @@ class SimpleEngine(BaseEngine):
             "add_generation_prompt": True,
             "enable_thinking": enable_thinking,
         }
+        template_kwargs.update(chat_template_kwargs)
         if tools:
             template_kwargs["tools"] = tools
 

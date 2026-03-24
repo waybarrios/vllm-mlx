@@ -1,12 +1,19 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for chat template kwargs forwarding."""
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import pytest
 from fastapi.testclient import TestClient
 
 import vllm_mlx.server as srv
 from vllm_mlx.engine.base import GenerationOutput
+
+
+@pytest.fixture
+def anyio_backend():
+    return "asyncio"
 
 
 def test_chat_completion_request_preserves_chat_template_kwargs():
@@ -102,3 +109,68 @@ def test_llm_chat_applies_chat_template_kwargs_before_generate():
         model.tokenizer.apply_chat_template.call_args.kwargs["enable_thinking"] is False
     )
     model.generate.assert_called_once()
+
+
+@pytest.mark.anyio
+async def test_simple_engine_mllm_chat_forwards_chat_template_kwargs():
+    from vllm_mlx.engine.simple import SimpleEngine
+
+    with patch("vllm_mlx.engine.simple.is_mllm_model", return_value=True):
+        engine = SimpleEngine("test-model")
+        engine._loaded = True
+        engine._is_mllm = True
+        engine._model = MagicMock()
+        engine._model.chat = MagicMock(
+            return_value=SimpleNamespace(
+                text="OK",
+                prompt_tokens=5,
+                completion_tokens=1,
+                finish_reason="stop",
+            )
+        )
+
+        await engine.chat(
+            [{"role": "user", "content": "Hello"}],
+            chat_template_kwargs={"enable_thinking": False},
+        )
+
+        assert engine._model.chat.call_args.kwargs["chat_template_kwargs"] == {
+            "enable_thinking": False
+        }
+
+
+@pytest.mark.anyio
+async def test_simple_engine_stream_generate_text_applies_chat_template_kwargs():
+    from vllm_mlx.engine.simple import SimpleEngine
+
+    with patch("vllm_mlx.engine.simple.is_mllm_model", return_value=True):
+        engine = SimpleEngine("test-model")
+        engine._loaded = True
+        engine._is_mllm = True
+        engine._text_tokenizer = MagicMock()
+        engine._text_tokenizer.apply_chat_template.return_value = "prompt"
+        engine._text_model = MagicMock()
+        engine._text_model.model = MagicMock()
+
+        with patch("mlx_lm.stream_generate", return_value=iter(())), patch(
+            "mlx_lm.models.cache.make_prompt_cache", return_value=[]
+        ), patch("mlx_lm.sample_utils.make_sampler", return_value=object()):
+            chunks = [
+                chunk
+                async for chunk in engine._stream_generate_text(
+                    [{"role": "user", "content": "Hello"}],
+                    max_tokens=8,
+                    temperature=0.7,
+                    top_p=0.9,
+                    chat_template_kwargs={"enable_thinking": False},
+                )
+            ]
+
+        assert chunks
+        engine._text_tokenizer.apply_chat_template.assert_called_once()
+        assert (
+            engine._text_tokenizer.apply_chat_template.call_args.kwargs[
+                "enable_thinking"
+            ]
+            is False
+        )
