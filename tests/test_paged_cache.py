@@ -815,3 +815,42 @@ class TestBlockAwarePrefixCache:
         )
 
         assert cache.reconstruct_cache(prefix_table) is None
+
+    def test_deduplicated_terminal_uses_correct_recurrent_snapshot(self):
+        """Deduplication must not leak recurrent state across sequences."""
+        from mlx_lm.models.cache import ArraysCache, KVCache
+        import mlx.core as mx
+
+        from vllm_mlx.paged_cache import PagedCacheManager
+        from vllm_mlx.prefix_cache import BlockAwarePrefixCache
+
+        paged_manager = PagedCacheManager(block_size=4, max_blocks=20)
+        cache = BlockAwarePrefixCache(model=None, paged_cache_manager=paged_manager)
+
+        # Request A: 8 tokens across 2 blocks. B2 is terminal.
+        kv_a = mx.arange(1 * 2 * 8 * 3).reshape(1, 2, 8, 3)
+        recurrent_a = [mx.ones((1, 3, 8)), mx.ones((1, 2, 4, 4))]
+        extracted_a = [
+            {"state": (kv_a, kv_a), "meta_state": "", "class_ref": KVCache, "class_name": "KVCache"},
+            {"state": recurrent_a, "meta_state": "", "class_ref": ArraysCache, "class_name": "ArraysCache"},
+        ]
+        bt_a = cache.store_cache("req-a", list(range(8)), extracted_a)
+
+        # Request B: 12 tokens, first 8 identical. B1/B2 deduplicated, B3 new terminal.
+        kv_b = mx.arange(1 * 2 * 12 * 3).reshape(1, 2, 12, 3)
+        recurrent_b = [mx.full((1, 3, 8), 2.0), mx.full((1, 2, 4, 4), 2.0)]
+        extracted_b = [
+            {"state": (kv_b, kv_b), "meta_state": "", "class_ref": KVCache, "class_name": "ArraysCache"},
+            {"state": recurrent_b, "meta_state": "", "class_ref": ArraysCache, "class_name": "ArraysCache"},
+        ]
+        bt_b = cache.store_cache("req-b", list(range(12)), extracted_b)
+
+        # Reconstruct A: should use A's recurrent state (ones), not B's (twos)
+        recon_a = cache.reconstruct_cache(bt_a)
+        assert recon_a is not None
+        assert recon_a[1].state[0].tolist() == recurrent_a[0].tolist()
+
+        # Reconstruct B: should use B's recurrent state (twos)
+        recon_b = cache.reconstruct_cache(bt_b)
+        assert recon_b is not None
+        assert recon_b[1].state[0].tolist() == recurrent_b[0].tolist()
