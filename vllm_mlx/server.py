@@ -1365,12 +1365,14 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
             messages.append(msg_dict)
         images, videos = [], []  # MLLM extracts these from messages
         logger.debug(f"MLLM: Processing {len(messages)} messages")
+        messages = _normalize_messages(messages)
     else:
         # For LLM, extract text, images, and videos separately
         messages, images, videos = extract_multimodal_content(
             request.messages,
             preserve_native_format=engine.preserve_native_tool_format,
         )
+        messages = _normalize_messages(messages)
 
     has_media = bool(images or videos)
     if engine.is_mllm and not has_media:
@@ -1496,6 +1498,64 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
     )
 
 
+def _normalize_messages(messages: list[dict]) -> list[dict]:
+    """Normalize message roles and merge consecutive same-role messages.
+
+    1. Maps non-standard roles to standard ones (e.g. ``developer`` → ``system``).
+    2. Merges consecutive same-role messages to satisfy chat template constraints
+       (Qwen 3.5, Llama, etc. require alternating roles).
+
+    Only merges when both messages have string content. Messages with list
+    content (multimodal) are left as-is to preserve image/video attachments.
+
+    Args:
+        messages: List of message dicts with 'role' and 'content' keys.
+
+    Returns:
+        New list with normalized roles and consecutive same-role messages merged.
+    """
+    # OpenAI Responses API uses "developer" instead of "system".
+    # Map it so chat templates don't fail and fall back to raw prefill.
+    _ROLE_MAP = {"developer": "system"}
+
+    if not messages:
+        return messages
+
+    merged = [messages[0].copy()]
+    if merged[0]["role"] in _ROLE_MAP:
+        merged[0]["role"] = _ROLE_MAP[merged[0]["role"]]
+    for msg in messages[1:]:
+        prev = merged[-1]
+        role = _ROLE_MAP.get(msg["role"], msg["role"])
+        if (
+            role == prev["role"]
+            and isinstance(prev.get("content"), str)
+            and isinstance(msg.get("content"), str)
+        ):
+            # Merge string content with double newline separator
+            prev["content"] = prev["content"] + "\n\n" + msg["content"]
+            logger.debug(
+                f"Merged consecutive {role} messages "
+                f"({len(prev['content'])} chars total)"
+            )
+        else:
+            copy = msg.copy()
+            copy["role"] = role
+            merged.append(copy)
+
+    mapped_roles = sum(1 for m in messages if m["role"] in _ROLE_MAP)
+    merged_count = len(messages) - len(merged)
+    if mapped_roles or merged_count:
+        parts = []
+        if mapped_roles:
+            parts.append(f"mapped {mapped_roles} role(s)")
+        if merged_count:
+            parts.append(f"merged {len(messages)} → {len(merged)}")
+        logger.info(f"Normalized messages: {', '.join(parts)}")
+
+    return merged
+
+
 def _inject_json_instruction(messages: list, instruction: str) -> list:
     """
     Inject JSON instruction into messages.
@@ -1593,6 +1653,7 @@ async def create_anthropic_message(
         openai_request.messages,
         preserve_native_format=engine.preserve_native_tool_format,
     )
+    messages = _normalize_messages(messages)
 
     chat_kwargs = {
         "max_tokens": openai_request.max_tokens or _default_max_tokens,
@@ -1750,6 +1811,7 @@ async def _stream_anthropic_messages(
         openai_request.messages,
         preserve_native_format=engine.preserve_native_tool_format,
     )
+    messages = _normalize_messages(messages)
 
     chat_kwargs = {
         "max_tokens": openai_request.max_tokens or _default_max_tokens,
