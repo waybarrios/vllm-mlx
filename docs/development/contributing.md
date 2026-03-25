@@ -18,8 +18,29 @@ pip install -e ".[dev]"
 ### Running Tests
 
 ```bash
-# Run all tests
-pytest tests/
+# Pure-Python test subset (matches the Ubuntu CI job)
+pip install -e ".[dev]"
+pytest \
+  tests/test_mcp_security.py \
+  tests/test_structured_output.py \
+  tests/test_reasoning_parser.py \
+  tests/test_tool_parsers.py \
+  tests/test_streaming_json_encoder.py \
+  tests/test_native_tool_format.py \
+  tests/test_memory_cache.py \
+  tests/test_prefix_cache.py \
+  tests/test_mllm_cache.py \
+  tests/test_api_models.py \
+  tests/test_api_utils.py \
+  tests/test_request.py \
+  tests/test_anthropic_models.py \
+  tests/test_anthropic_adapter.py \
+  tests/test_harmony_parsers.py \
+  -v --tb=short -m "not slow and not integration"
+
+# Full Apple Silicon suite (requires macOS on Apple Silicon with MLX)
+pip install -e ".[dev,vision]"
+pytest tests/ -v --tb=short -m "not slow and not integration"
 
 # Run specific test file
 pytest tests/test_paged_cache.py -v
@@ -27,6 +48,14 @@ pytest tests/test_paged_cache.py -v
 # Run with coverage
 pytest --cov=vllm_mlx tests/
 ```
+
+The full suite is intentionally split in CI:
+
+- The Ubuntu matrix runs the pure-Python subset only.
+- The Apple Silicon job runs MLX-dependent tests that require macOS on ARM.
+
+If you are running tests locally outside the documented `.[dev]` environment, async tests
+will fail because `pytest-asyncio` is a dev dependency rather than a runtime dependency.
 
 ### Code Style
 
