@@ -65,7 +65,7 @@ class TestSimpleEngineConcurrency:
         model.chat = MagicMock(side_effect=chat_side_effect)
         return model
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_lock_prevents_concurrent_generate(self, mock_model):
         """Test that the lock prevents concurrent generate calls."""
         from vllm_mlx.engine.simple import SimpleEngine
@@ -89,7 +89,7 @@ class TestSimpleEngineConcurrency:
                 "The lock is not working correctly."
             )
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_lock_prevents_concurrent_chat(self, mock_llm_model):
         """Test that the lock prevents concurrent chat calls."""
         from vllm_mlx.engine.simple import SimpleEngine
@@ -115,7 +115,7 @@ class TestSimpleEngineConcurrency:
                 "The lock is not working correctly."
             )
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_lock_serializes_stream_generate(self, mock_model):
         """Test that stream_generate uses the same lock as other methods."""
         from vllm_mlx.engine.simple import SimpleEngine
@@ -178,7 +178,7 @@ class TestSimpleEngineConcurrency:
             result = await stream_task
             assert len(result) == 3, f"Expected 3 chunks, got {len(result)}"
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_engine_initialization_creates_lock(self):
         """Test that SimpleEngine creates a lock on initialization."""
         from vllm_mlx.engine.simple import SimpleEngine
@@ -189,7 +189,7 @@ class TestSimpleEngineConcurrency:
             assert hasattr(engine, "_generation_lock")
             assert isinstance(engine._generation_lock, asyncio.Lock)
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_requests_complete_in_order(self, mock_model):
         """Test that concurrent requests complete (may be in any order due to lock)."""
         from vllm_mlx.engine.simple import SimpleEngine
