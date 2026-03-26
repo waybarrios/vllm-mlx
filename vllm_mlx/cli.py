@@ -701,8 +701,9 @@ Examples:
     )
     serve_parser.add_argument(
         "--continuous-batching",
-        action="store_true",
-        help="Enable continuous batching for multiple concurrent users (slower for single user)",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Continuous batching for concurrent requests (default: on, --no-continuous-batching to disable)",
     )
     # Paged cache options (experimental)
     serve_parser.add_argument(
