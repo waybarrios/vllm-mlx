@@ -1929,6 +1929,13 @@ async def stream_chat_completion(
                 current_text=accumulated_text + delta_text,
                 delta_text=delta_text,
             )
+            if delta_msg is None:
+                # Parser explicitly says to skip this token (e.g., bare </think>
+                # arriving as its own streaming chunk). Consume it into
+                # accumulated_text so state tracking stays correct, but don't
+                # emit it as content.
+                accumulated_text += delta_text
+                continue
             if delta_msg:
                 if delta_msg.reasoning:
                     chunk = ChatCompletionChunk(
