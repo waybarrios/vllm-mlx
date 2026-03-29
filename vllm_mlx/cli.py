@@ -181,6 +181,8 @@ def serve_command(args):
             mllm_prefill_step_size=(
                 args.mllm_prefill_step_size if args.mllm_prefill_step_size > 0 else None
             ),
+            # TurboQuant
+            turbo_kv_bits=args.turbo_kv_bits,
         )
 
         print("Mode: Continuous batching (for multiple concurrent users)")
@@ -200,7 +202,9 @@ def serve_command(args):
                 else f"{args.cache_memory_percent*100:.0f}% of RAM"
             )
             print(f"Memory-aware cache: {cache_info}")
-            if args.kv_cache_quantization:
+            if args.turbo_kv_bits:
+                print(f"TurboQuant: {args.turbo_kv_bits}-bit prefix cache compression")
+            elif args.kv_cache_quantization:
                 print(
                     f"KV cache quantization: {args.kv_cache_quantization_bits}-bit, "
                     f"group_size={args.kv_cache_quantization_group_size}"
@@ -297,6 +301,8 @@ def bench_command(args):
             kv_cache_quantization_bits=args.kv_cache_quantization_bits,
             kv_cache_quantization_group_size=args.kv_cache_quantization_group_size,
             kv_cache_min_quantize_tokens=args.kv_cache_min_quantize_tokens,
+            # TurboQuant
+            turbo_kv_bits=args.turbo_kv_bits,
         )
 
         engine_config = EngineConfig(
@@ -744,6 +750,16 @@ Examples:
         default=256,
         help="Minimum tokens for quantization to apply (default: 256)",
     )
+    # TurboQuant KV cache compression (arXiv 2504.19874)
+    serve_parser.add_argument(
+        "--turbo-kv-bits",
+        type=int,
+        default=None,
+        choices=[1, 2, 3, 4],
+        help="TurboQuant KV cache compression bits for prefix cache. "
+        "3-bit gives 4.6x compression vs FP16 (default: disabled). "
+        "Replaces --kv-cache-quantization when set.",
+    )
     serve_parser.add_argument(
         "--stream-interval",
         type=int,
@@ -1058,6 +1074,15 @@ Examples:
         type=int,
         default=256,
         help="Minimum tokens for quantization to apply (default: 256)",
+    )
+    # TurboQuant KV cache compression
+    bench_parser.add_argument(
+        "--turbo-kv-bits",
+        type=int,
+        default=None,
+        choices=[1, 2, 3, 4],
+        help="TurboQuant KV cache compression bits for prefix cache. "
+        "3-bit gives 4.6x compression vs FP16 (default: disabled).",
     )
     # Paged cache options (experimental)
     bench_parser.add_argument(

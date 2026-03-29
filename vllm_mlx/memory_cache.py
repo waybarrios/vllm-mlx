@@ -103,7 +103,26 @@ def estimate_kv_cache_memory(cache: list[Any]) -> int:
 
     total_bytes = 0
 
+    try:
+        from mlx_lm.models.turboquant_cache import TurboQuantKVCache as _TQ
+    except ImportError:
+        _TQ = None
+
     for layer_cache in cache:
+        if (
+            _TQ is not None
+            and hasattr(layer_cache, "layer")
+            and isinstance(layer_cache.layer, _TQ)
+        ):
+            for arr in layer_cache.layer.state:
+                total_bytes += _array_memory(arr)
+            continue
+        # Handle TurboQuantKVCache — estimate from shape+dtype (avoid lazy eval)
+        if _TQ is not None and isinstance(layer_cache, _TQ):
+            if layer_cache.k_packed is not None:
+                for arr in layer_cache.state:
+                    total_bytes += _array_memory(arr)
+            continue
         # Handle different cache object types
         # Check dict first since dicts have .keys() method that would match below
         if isinstance(layer_cache, dict) and "state" in layer_cache:
@@ -165,6 +184,7 @@ class MemoryCacheConfig:
     kv_bits: int = 8
     kv_group_size: int = 64
     kv_min_quantize_tokens: int = 256
+    turbo_kv_bits: int | None = None  # TurboQuant: 1-4 bit, 4.6x compression at 3-bit
 
     def __post_init__(self) -> None:
         if not 0.0 < self.max_memory_percent <= 1.0:
@@ -177,6 +197,15 @@ class MemoryCacheConfig:
             raise ValueError(
                 f"kv_min_quantize_tokens must be >= 0, got {self.kv_min_quantize_tokens}"
             )
+        if self.turbo_kv_bits is not None and self.turbo_kv_bits not in (1, 2, 3, 4):
+            raise ValueError(
+                f"turbo_kv_bits must be 1-4, got {self.turbo_kv_bits}"
+            )
+
+    @property
+    def needs_dequantize(self) -> bool:
+        """Whether stored caches need dequantization on fetch."""
+        return self.kv_quantize or self.turbo_kv_bits is not None
 
     def compute_memory_limit(self) -> int:
         """
@@ -254,6 +283,15 @@ class _CacheEntry:
         )
 
 
+def _capture_cache_attrs(layer: Any) -> dict[str, Any]:
+    """Capture cache-type metadata needed to reconstruct a layer."""
+    attrs = {}
+    for attr in ("max_size", "keep", "step", "_idx"):
+        if hasattr(layer, attr):
+            attrs[attr] = getattr(layer, attr)
+    return attrs
+
+
 def _trim_cache_offset(cache: list[Any], trim_by: int) -> list[Any]:
     """Create copies of cache layers with the last ``trim_by`` positions removed.
 
@@ -267,10 +305,16 @@ def _trim_cache_offset(cache: list[Any], trim_by: int) -> list[Any]:
     For RotatingKVCache: actually trims the circular buffer — reducing offset
     alone breaks ``size()`` / ``_temporal_order`` invariants.
 
-    Supports KVCache, RotatingKVCache, and _QuantizedCacheWrapper.
+    Supports KVCache, RotatingKVCache, _QuantizedCacheWrapper, and
+    _TurboQuantCacheWrapper.
     """
     import mlx.core as mx
     from mlx_lm.models.cache import RotatingKVCache
+
+    try:
+        from mlx_lm.models.turboquant_cache import TurboQuantKVCache
+    except ImportError:
+        TurboQuantKVCache = None  # noqa: N806
 
     trimmed: list[Any] = []
     eval_targets: list[Any] = []
@@ -283,6 +327,18 @@ def _trim_cache_offset(cache: list[Any], trim_by: int) -> list[Any]:
             tc.offset = max(layer_cache.offset - trim_by, 0)
             tc.bits = layer_cache.bits
             tc.group_size = layer_cache.group_size
+            tc.orig_type = layer_cache.orig_type
+            tc.orig_attrs = layer_cache.orig_attrs
+            trimmed.append(tc)
+        elif isinstance(layer_cache, _TurboQuantCacheWrapper):
+            if not layer_cache.is_trimmable():
+                trimmed.append(layer_cache)
+                continue
+            tc = _TurboQuantCacheWrapper.__new__(_TurboQuantCacheWrapper)
+            tc.layer = layer_cache.layer.copy()
+            tc.layer.offset = max(layer_cache.layer.offset - trim_by, 0)
+            tc.offset = tc.layer.offset
+            tc.bits = layer_cache.bits
             tc.orig_type = layer_cache.orig_type
             tc.orig_attrs = layer_cache.orig_attrs
             trimmed.append(tc)
@@ -378,6 +434,13 @@ def _trim_cache_offset(cache: list[Any], trim_by: int) -> list[Any]:
                 tc.keys = layer_cache.keys
                 tc.values = layer_cache.values
                 tc._idx = layer_cache._idx
+            trimmed.append(tc)
+        elif TurboQuantKVCache is not None and isinstance(layer_cache, TurboQuantKVCache):
+            if not hasattr(layer_cache, "copy"):
+                trimmed.append(layer_cache)
+                continue
+            tc = layer_cache.copy()
+            tc.offset = max(layer_cache.offset - trim_by, 0)
             trimmed.append(tc)
         elif (
             hasattr(layer_cache, "offset")
@@ -487,10 +550,23 @@ class _QuantizedCacheWrapper:
         self.group_size = group_size
         self.orig_type = type(layer)
         # Preserve RotatingKVCache-specific attrs
-        self.orig_attrs = {}
-        for attr in ("max_size", "keep", "step", "_idx"):
-            if hasattr(layer, attr):
-                self.orig_attrs[attr] = getattr(layer, attr)
+        self.orig_attrs = _capture_cache_attrs(layer)
+
+
+class _TurboQuantCacheWrapper:
+    """Lightweight wrapper storing TurboQuant cache + original cache metadata."""
+
+    __slots__ = ("layer", "offset", "bits", "orig_type", "orig_attrs")
+
+    def __init__(self, layer: Any, bits: int):
+        self.layer = layer.to_turbo_quantized(bits=bits)
+        self.offset = self.layer.offset
+        self.bits = bits
+        self.orig_type = type(layer)
+        self.orig_attrs = _capture_cache_attrs(layer)
+
+    def is_trimmable(self) -> bool:
+        return hasattr(self.layer, "copy")
 
 
 def _quantize_cache(cache: list[Any], bits: int = 8, group_size: int = 64) -> list[Any]:
@@ -512,6 +588,27 @@ def _quantize_cache(cache: list[Any], bits: int = 8, group_size: int = 64) -> li
     return quantized
 
 
+def _turbo_quantize_cache(cache: list[Any], bits: int = 3) -> list[Any]:
+    """Compress KVCache layers with TurboQuant (4.6x at 3-bit).
+
+    Uses PolarQuant: randomized Hadamard rotation + Lloyd-Max codebook
+    quantization with fused Metal kernels. See arXiv 2504.19874.
+    """
+    from mlx_lm.models.cache import KVCache
+
+    compressed = []
+    for layer in cache:
+        if (
+            type(layer) is KVCache
+            and layer.keys is not None
+            and hasattr(layer, "to_turbo_quantized")
+        ):
+            compressed.append(_TurboQuantCacheWrapper(layer, bits))
+        else:
+            compressed.append(layer)
+    return compressed
+
+
 def _dequantize_cache(cache: list[Any]) -> list[Any]:
     """Dequantize _QuantizedCacheWrapper layers and copy non-quantized layers.
 
@@ -519,6 +616,11 @@ def _dequantize_cache(cache: list[Any]) -> list[Any]:
     ``update_and_fetch`` mutations don't corrupt the stored cache entry.
     """
     import mlx.core as mx
+
+    try:
+        from mlx_lm.models.turboquant_cache import TurboQuantKVCache
+    except ImportError:
+        TurboQuantKVCache = None  # noqa: N806
 
     result = []
     for layer in cache:
@@ -537,6 +639,25 @@ def _dequantize_cache(cache: list[Any]) -> list[Any]:
             for attr, val in layer.orig_attrs.items():
                 setattr(kv, attr, val)
             result.append(kv)
+        elif isinstance(layer, _TurboQuantCacheWrapper):
+            if not hasattr(layer.layer, "dequantize"):
+                result.append(layer)
+                continue
+            dequantized = layer.layer.dequantize()
+            orig_cls = layer.orig_type
+            kv = orig_cls.__new__(orig_cls)
+            kv.keys = (
+                mx.array(dequantized.keys) if dequantized.keys is not None else None
+            )
+            kv.values = (
+                mx.array(dequantized.values)
+                if dequantized.values is not None
+                else None
+            )
+            kv.offset = layer.offset
+            for attr, val in layer.orig_attrs.items():
+                setattr(kv, attr, val)
+            result.append(kv)
         elif hasattr(layer, "keys") and hasattr(layer, "offset"):
             # Deep-copy non-quantized cache layers (e.g. RotatingKVCache)
             # so model's in-place mutations don't corrupt stored entries
@@ -549,6 +670,13 @@ def _dequantize_cache(cache: list[Any]) -> list[Any]:
                 if hasattr(layer, attr):
                     setattr(kv, attr, getattr(layer, attr))
             result.append(kv)
+        elif TurboQuantKVCache is not None and isinstance(layer, TurboQuantKVCache):
+            if hasattr(layer, "empty") and layer.empty():
+                result.append(layer)
+            elif hasattr(layer, "dequantize"):
+                result.append(layer.dequantize())
+            else:
+                result.append(layer)
         else:
             result.append(layer)
     return result
@@ -647,7 +775,7 @@ class MemoryAwarePrefixCache:
             self._last_match_type = "exact"
             cache_out = (
                 _dequantize_cache(entry.cache)
-                if self._config.kv_quantize
+                if self._config.needs_dequantize
                 else entry.cache
             )
             return cache_out, []
@@ -705,7 +833,7 @@ class MemoryAwarePrefixCache:
             excess = n_cached - n_requested
 
             has_non_trimmable = any(
-                not (hasattr(lc, "offset") and hasattr(lc, "keys"))
+                not (hasattr(lc, "is_trimmable") and lc.is_trimmable())
                 for lc in best_super.cache
             )
 
@@ -722,7 +850,7 @@ class MemoryAwarePrefixCache:
                 self._last_match_type = "supersequence"
                 trimmed_cache = (
                     _dequantize_cache(trimmed_cache)
-                    if self._config.kv_quantize
+                    if self._config.needs_dequantize
                     else trimmed_cache
                 )
                 return trimmed_cache, []
@@ -733,7 +861,7 @@ class MemoryAwarePrefixCache:
                 self._last_match_type = "supersequence"
                 cache_out = (
                     _dequantize_cache(best_super.cache)
-                    if self._config.kv_quantize
+                    if self._config.needs_dequantize
                     else best_super.cache
                 )
                 return cache_out, []
@@ -747,7 +875,7 @@ class MemoryAwarePrefixCache:
             self._last_match_type = "prefix"
             cache_out = (
                 _dequantize_cache(best_match.cache)
-                if self._config.kv_quantize
+                if self._config.needs_dequantize
                 else best_match.cache
             )
             return cache_out, remaining
@@ -790,7 +918,7 @@ class MemoryAwarePrefixCache:
             excess = len(best_lcp_entry.tokens) - best_lcp_length
 
             has_non_trimmable = any(
-                not (hasattr(lc, "offset") and hasattr(lc, "keys"))
+                not (hasattr(lc, "is_trimmable") and lc.is_trimmable())
                 for lc in best_lcp_entry.cache
             )
             logger.debug(
@@ -822,7 +950,7 @@ class MemoryAwarePrefixCache:
                 self._last_match_type = "lcp"
                 trimmed_cache = (
                     _dequantize_cache(trimmed_cache)
-                    if self._config.kv_quantize
+                    if self._config.needs_dequantize
                     else trimmed_cache
                 )
                 return trimmed_cache, remaining
@@ -867,8 +995,13 @@ class MemoryAwarePrefixCache:
         # Trim oversized KV arrays to actual used size
         cache = _trim_to_offset(cache)
 
-        # Quantize if enabled and sequence is long enough
+        # Compress KV cache for storage: TurboQuant (4.6x) or standard quantization (2x)
         if (
+            self._config.turbo_kv_bits is not None
+            and len(tokens) >= self._config.kv_min_quantize_tokens
+        ):
+            cache = _turbo_quantize_cache(cache, self._config.turbo_kv_bits)
+        elif (
             self._config.kv_quantize
             and len(tokens) >= self._config.kv_min_quantize_tokens
         ):
