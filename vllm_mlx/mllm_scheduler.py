@@ -453,6 +453,27 @@ class MLLMScheduler:
             if request is None:
                 continue
 
+            # Handle error responses from failed preprocessing
+            if response.finish_reason == "error":
+                output = RequestOutput(
+                    request_id=request_id,
+                    new_token_ids=[],
+                    new_text="",
+                    output_token_ids=[],
+                    prompt_tokens=0,
+                    completion_tokens=0,
+                    finished=True,
+                    finish_reason="error",
+                )
+                request.status = RequestStatus.FINISHED_ABORTED
+                request.output_text = ""
+                request.finish_reason = "error"
+                finished_ids.add(request_id)
+                self.num_requests_processed += 1
+                logger.warning(f"Request {request_id} failed during preprocessing")
+                outputs.append(output)
+                continue
+
             # Append token to request
             request.output_tokens.append(response.token)
             request.num_output_tokens = len(request.output_tokens)
@@ -463,11 +484,10 @@ class MLLMScheduler:
                 new_text = ""
             else:
                 if request_id not in self._detokenizer_pool:
-                    if hasattr(tokenizer, "detokenizer"):
-                        detok = tokenizer.detokenizer
-                    else:
-                        detok = NaiveStreamingDetokenizer(tokenizer)
-                    detok.reset()
+                    # Always create a new instance per request to avoid shared
+                    # state between concurrent requests (tokenizer.detokenizer
+                    # returns the same object)
+                    detok = NaiveStreamingDetokenizer(tokenizer)
                     self._detokenizer_pool[request_id] = detok
                 detok = self._detokenizer_pool[request_id]
                 detok.add_token(response.token)
@@ -495,7 +515,7 @@ class MLLMScheduler:
                 finished_ids.add(request_id)
 
                 # Finalize streaming detokenizer and get full output
-                detok = self._detokenizer_pool.get(request_id)
+                detok = self._detokenizer_pool.pop(request_id, None)
                 if detok is not None:
                     detok.finalize()
                     output.output_text = detok.text
@@ -503,7 +523,6 @@ class MLLMScheduler:
                     output.output_text = tokenizer.decode(request.output_tokens)
                 request.output_text = output.output_text
                 request.finish_reason = response.finish_reason
-                self._detokenizer_pool.pop(request_id, None)
 
                 self.total_completion_tokens += request.num_output_tokens
                 self.num_requests_processed += 1
