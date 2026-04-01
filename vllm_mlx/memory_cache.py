@@ -120,8 +120,10 @@ def estimate_kv_cache_memory(cache: list[Any]) -> int:
         # Handle TurboQuantKVCache — estimate from shape+dtype (avoid lazy eval)
         if _TQ is not None and isinstance(layer_cache, _TQ):
             if layer_cache.k_packed is not None:
-                for arr in layer_cache.state:
-                    total_bytes += _array_memory(arr)
+                for arr in (layer_cache.k_packed, layer_cache.v_packed,
+                            layer_cache.k_norms, layer_cache.v_norms):
+                    if arr is not None:
+                        total_bytes += _array_memory(arr)
             continue
         # Handle different cache object types
         # Check dict first since dicts have .keys() method that would match below
