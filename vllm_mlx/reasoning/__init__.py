@@ -25,6 +25,15 @@ Usage:
 """
 
 from .base import DeltaMessage, ReasoningParser
+from .output_parser import (
+    DEEPSEEK_R1_MARKERS,
+    QWEN3_MARKERS,
+    QWEN35_MARKERS,
+    ReasoningOutputParser,
+    create_deepseek_r1_parser,
+    create_qwen3_parser,
+    create_qwen35_parser,
+)
 from .think_parser import BaseThinkingReasoningParser
 
 # Parser registry
@@ -79,8 +88,10 @@ def _register_builtin_parsers():
     from .gpt_oss_parser import GptOssReasoningParser
     from .harmony_parser import HarmonyReasoningParser
     from .qwen3_parser import Qwen3ReasoningParser
+    from .qwen35_parser import Qwen35ReasoningParser
 
     register_parser("qwen3", Qwen3ReasoningParser)
+    register_parser("qwen3.5", Qwen35ReasoningParser)
     register_parser("deepseek_r1", DeepSeekR1ReasoningParser)
     register_parser("gpt_oss", GptOssReasoningParser)
     register_parser("harmony", HarmonyReasoningParser)
@@ -95,6 +106,15 @@ __all__ = [
     "ReasoningParser",
     "DeltaMessage",
     "BaseThinkingReasoningParser",
+    "ReasoningOutputParser",
+    # Factory functions
+    "create_qwen3_parser",
+    "create_qwen35_parser",
+    "create_deepseek_r1_parser",
+    # Marker configs
+    "QWEN3_MARKERS",
+    "QWEN35_MARKERS",
+    "DEEPSEEK_R1_MARKERS",
     # Registry functions
     "register_parser",
     "get_parser",
