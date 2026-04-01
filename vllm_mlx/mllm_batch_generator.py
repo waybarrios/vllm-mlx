@@ -244,7 +244,8 @@ def _make_batch_cache(model: nn.Module, left_padding: List[int]) -> List[Any]:
     )
 
     def to_batch_cache(c):
-        # Strict type identity for KVCache - avoid catching QuantizedKVCache
+        # Strict identity, not isinstance: QuantizedKVCache inherits KVCache
+        # but doesn't support batch operations (no slice/concat on quantized state)
         if type(c) is KVCache:
             return BatchKVCache(left_padding)
         elif isinstance(c, ArraysCache):
