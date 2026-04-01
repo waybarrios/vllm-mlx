@@ -35,7 +35,6 @@ from .mllm_batch_generator import (
     MLLMBatchRequest,
     MLLMBatchResponse,
 )
-from .mllm_cache import MLLMCacheManager
 from .multimodal_processor import MultimodalProcessor
 from .request import RequestOutput, RequestStatus, SamplingParams
 
@@ -62,8 +61,14 @@ class MLLMSchedulerConfig:
     default_max_tokens: int = 256
     # Default video FPS for frame extraction
     default_video_fps: float = 2.0
+    # KV cache memory limit (from --cache-memory-mb)
+    cache_memory_mb: Optional[int] = None
     # Maximum video frames
     max_video_frames: int = 128
+    # Enable MTP speculative decoding
+    enable_mtp: bool = False
+    # Number of draft tokens for MTP
+    mtp_num_draft_tokens: int = 1
 
 
 @dataclass
@@ -176,13 +181,6 @@ class MLLMScheduler:
             config=self.model_config,
         )
 
-        # Vision cache for repeated images
-        self.vision_cache: Optional[MLLMCacheManager] = None
-        if self.config.enable_vision_cache:
-            self.vision_cache = MLLMCacheManager(
-                max_entries=self.config.vision_cache_size
-            )
-
         # Get stop tokens from tokenizer
         self.stop_tokens = self._get_stop_tokens()
 
@@ -217,6 +215,10 @@ class MLLMScheduler:
         self.num_requests_processed = 0
         self.total_prompt_tokens = 0
         self.total_completion_tokens = 0
+
+        # Memory management: periodic mx.clear_cache() to free Metal buffers
+        self._step_count = 0
+        self._clear_cache_interval = 32
 
     def _get_stop_tokens(self) -> Set[int]:
         """Get stop token IDs from tokenizer."""
@@ -260,6 +262,18 @@ class MLLMScheduler:
                 completion_batch_size=self.config.completion_batch_size,
                 prefill_step_size=self.config.prefill_step_size,
             )
+
+            # Install MTP if enabled and language model supports it
+            if self.config.enable_mtp:
+                lm = self.batch_generator.language_model
+                if hasattr(lm, "mtp") and lm.mtp is not None:
+                    from .mllm_batch_generator import install_mtp_mllm
+
+                    install_mtp_mllm(
+                        self.batch_generator,
+                        lm,
+                        num_draft_tokens=self.config.mtp_num_draft_tokens,
+                    )
 
     # ========== Sync API (step-based) ==========
 
@@ -453,6 +467,27 @@ class MLLMScheduler:
             if request is None:
                 continue
 
+            # Handle error responses from failed preprocessing
+            if response.finish_reason == "error":
+                output = RequestOutput(
+                    request_id=request_id,
+                    new_token_ids=[],
+                    new_text="",
+                    output_token_ids=[],
+                    prompt_tokens=0,
+                    completion_tokens=0,
+                    finished=True,
+                    finish_reason="error",
+                )
+                request.status = RequestStatus.FINISHED_ABORTED
+                request.output_text = ""
+                request.finish_reason = "error"
+                finished_ids.add(request_id)
+                self.num_requests_processed += 1
+                logger.warning(f"Request {request_id} failed during preprocessing")
+                outputs.append(output)
+                continue
+
             # Append token to request
             request.output_tokens.append(response.token)
             request.num_output_tokens = len(request.output_tokens)
@@ -524,6 +559,9 @@ class MLLMScheduler:
             if request_id in self.running:
                 del self.running[request_id]
 
+            # Drain from requests dict to prevent linear memory growth
+            self.requests.pop(request_id, None)
+
             # Remove UID mappings
             if request_id in self.request_id_to_uid:
                 uid = self.request_id_to_uid[request_id]
@@ -534,6 +572,10 @@ class MLLMScheduler:
             # Track as finished
             self.finished_req_ids.add(request_id)
             self.requests.pop(request_id, None)
+
+        # Clear Metal buffer pool after cleanup to release memory
+        if finished_ids:
+            mx.clear_cache()
 
     def step(self) -> MLLMSchedulerOutput:
         """
@@ -594,6 +636,15 @@ class MLLMScheduler:
         # Clear finished tracking for next step
         self.finished_req_ids = set()
 
+        # Adaptive periodic Metal cache clearing (ported from LLM scheduler)
+        self._step_count += 1
+        active_seqs = len(self.running)
+        effective_interval = max(
+            8, self._clear_cache_interval // max(1, active_seqs // 4)
+        )
+        if self._step_count % effective_interval == 0:
+            mx.clear_cache()
+
         return output
 
     def get_request(self, request_id: str) -> Optional[MLLMRequest]:
@@ -649,7 +700,7 @@ class MLLMScheduler:
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                logger.error(f"Error in MLLM process loop: {e}")
+                logger.error(f"Error in MLLM process loop: {e}", exc_info=True)
                 await asyncio.sleep(0.1)
 
     async def add_request_async(
@@ -792,22 +843,55 @@ class MLLMScheduler:
         if self.batch_generator is not None:
             batch_stats = self.batch_generator.stats()
             stats["batch_generator"] = batch_stats.to_dict()
-            # Add vision embedding cache stats from batch generator
-            stats["vision_embedding_cache"] = (
-                self.batch_generator.get_vision_cache_stats()
-            )
-
-        if self.vision_cache:
-            stats["vision_cache"] = self.vision_cache.get_stats()
+            # Vision embedding cache stats from batch generator
+            vec_stats = self.batch_generator.get_vision_cache_stats()
+            stats["vision_embedding_cache"] = vec_stats
 
         # Include Metal memory stats
         try:
             if mx.metal.is_available():
-                stats["metal_active_memory_gb"] = round(mx.get_active_memory() / 1e9, 2)
-                stats["metal_peak_memory_gb"] = round(mx.get_peak_memory() / 1e9, 2)
-                stats["metal_cache_memory_gb"] = round(mx.get_cache_memory() / 1e9, 2)
+                active_gb = round(mx.get_active_memory() / 1e9, 2)
+                peak_gb = round(mx.get_peak_memory() / 1e9, 2)
+                cache_gb = round(mx.get_cache_memory() / 1e9, 2)
+                stats["metal_active_memory_gb"] = active_gb
+                stats["metal_peak_memory_gb"] = peak_gb
+                stats["metal_cache_memory_gb"] = cache_gb
         except Exception:
-            pass
+            active_gb = 0
+            cache_gb = 0
+
+        # Build KV cache stats for /v1/status and monitoring UI.
+        # Combine Metal KV cache memory with vision embedding cache hits.
+        max_mb = float(self.config.cache_memory_mb or 0)
+        current_mb = round(cache_gb * 1024, 2)
+        vec_stats = (
+            self.batch_generator.get_vision_cache_stats()
+            if self.batch_generator
+            else {}
+        )
+        hits = vec_stats.get("pixel_cache_hits", 0) + vec_stats.get(
+            "encoding_cache_hits", 0
+        )
+        misses = vec_stats.get("pixel_cache_misses", 0) + vec_stats.get(
+            "encoding_cache_misses", 0
+        )
+        total = hits + misses
+        entries = (
+            vec_stats.get("pixel_cache_size", 0)
+            + vec_stats.get("pixel_only_cache_size", 0)
+            + vec_stats.get("encoding_cache_size", 0)
+        )
+        stats["memory_aware_cache"] = {
+            "hits": hits,
+            "misses": misses,
+            "hit_rate": round(hits / total, 4) if total > 0 else 0.0,
+            "evictions": 0,
+            "tokens_saved": 0,
+            "current_memory_mb": current_mb,
+            "max_memory_mb": max_mb,
+            "memory_utilization": round(current_mb / max_mb, 4) if max_mb > 0 else 0.0,
+            "entry_count": entries,
+        }
 
         return stats
 

@@ -94,15 +94,27 @@ def build_text_model(vlm_model: Any, model_path: str | Path) -> Any | None:
         else:
             logger.warning("No MTP weights found in %s", model_path.name)
 
-        # Verify MTP is functional
+        # Inject MTP if TextModel doesn't have native MTP support.
+        # mlx_lm's qwen3_5.TextModel strips MTP weights in sanitize(),
+        # so we inject MTP module + methods at runtime.
+        if not hasattr(text_model, "mtp") or text_model.mtp is None:
+            num_mtp = text_config.get("mtp_num_hidden_layers", 0)
+            if num_mtp == 0:
+                num_mtp = text_config.get("num_nextn_predict_layers", 0)
+            if num_mtp > 0:
+                from .patches.qwen3_5_mtp import inject_mtp_support
+
+                inject_mtp_support(text_model, model_path, config)
+
         if hasattr(text_model, "mtp") and text_model.mtp is not None:
             mx.eval(text_model.mtp.parameters())
-            logger.info(
-                "TextModel built with MTP support (%d layers)",
-                args.mtp_num_hidden_layers,
+            num_mtp = text_config.get(
+                "mtp_num_hidden_layers",
+                text_config.get("num_nextn_predict_layers", 0),
             )
+            logger.info("TextModel built with MTP support (%d layers)", num_mtp)
         else:
-            logger.info("TextModel built without MTP (mtp_num_hidden_layers=0)")
+            logger.info("TextModel built without MTP")
 
         return text_model
 
