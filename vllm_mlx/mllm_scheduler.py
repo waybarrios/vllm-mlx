@@ -543,6 +543,9 @@ class MLLMScheduler:
             if request_id in self.running:
                 del self.running[request_id]
 
+            # Clean up detokenizer to prevent memory leak on abort/timeout
+            self._detokenizer_pool.pop(request_id, None)
+
             # Remove UID mappings
             if request_id in self.request_id_to_uid:
                 uid = self.request_id_to_uid[request_id]
