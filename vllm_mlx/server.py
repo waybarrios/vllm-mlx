@@ -1982,13 +1982,11 @@ async def stream_chat_completion(
         delta_text = output.new_text
         last_output = output
 
-        # Track token counts from output (updated each chunk)
-        if hasattr(output, "prompt_tokens") and output.prompt_tokens:
-            prompt_tokens = output.prompt_tokens
-        if hasattr(output, "completion_tokens") and output.completion_tokens:
-            completion_tokens = output.completion_tokens
+        # Track content and reasoning for this chunk
+        content = None
+        reasoning = None
 
-        # Use reasoning parser if enabled
+        # 1. Use reasoning parser if enabled
         if _reasoning_parser and delta_text:
             previous_text = accumulated_text
             accumulated_text += delta_text
@@ -1996,90 +1994,113 @@ async def stream_chat_completion(
                 previous_text, accumulated_text, delta_text
             )
 
-            if delta_msg is None:
-                # Skip this chunk (e.g., <think> token itself)
-                continue
-
-            chunk = ChatCompletionChunk(
-                id=response_id,
-                model=_model_name,
-                choices=[
-                    ChatCompletionChunkChoice(
-                        delta=ChatCompletionChunkDelta(
-                            content=delta_msg.content,
-                            reasoning=delta_msg.reasoning,
-                        ),
-                        finish_reason=output.finish_reason if output.finished else None,
-                    )
-                ],
-                usage=get_usage(output) if output.finished else None,
-            )
-            yield f"data: {chunk.model_dump_json()}\n\n"
+            if delta_msg:
+                content = delta_msg.content
+                reasoning = delta_msg.reasoning
         else:
-            # Standard path without reasoning parsing
+            # Standard path: if no reasoning parser, use delta_text as content
             content = delta_text
 
-            # Filter special tokens that may leak into streaming output
-            if content:
-                content = SPECIAL_TOKENS_PATTERN.sub("", content)
+        # 2. Filter special tokens
+        if content:
+            content = SPECIAL_TOKENS_PATTERN.sub("", content)
 
-            # Add <think> prefix on first content chunk for thinking models
-            if is_thinking_model and not think_prefix_sent and content:
-                content = "<think>" + content
-                think_prefix_sent = True
+        # 3. Add <think> prefix on first content chunk for thinking models
+        if is_thinking_model and not think_prefix_sent and content:
+            content = "<think>" + content
+            think_prefix_sent = True
 
-            # Tool call streaming parsing
-            if tool_parser and delta_text:
-                # Fast path: skip full parsing until '<' is seen in the stream,
-                # which could start tool markup (e.g. <tool_call>). This avoids
-                # per-token string scanning on the growing accumulated text.
-                if not tool_markup_possible and "<" not in delta_text:
-                    tool_accumulated_text += delta_text
-                    # No tool markup yet, fall through to normal chunk emission
-                else:
-                    if not tool_markup_possible:
-                        tool_markup_possible = True
-                    tool_previous = tool_accumulated_text
-                    tool_accumulated_text += delta_text
-                    tool_result = tool_parser.extract_tool_calls_streaming(
-                        tool_previous, tool_accumulated_text, delta_text
-                    )
+        # 4. Tool call streaming parsing
+        if tool_parser and delta_text:
+            # Fast path: skip full parsing until '<' is seen
+            if not tool_markup_possible and "<" not in delta_text:
+                tool_accumulated_text += delta_text
+                # No tool markup yet, content remains as is
+            else:
+                if not tool_markup_possible:
+                    tool_markup_possible = True
+                tool_previous = tool_accumulated_text
+                tool_accumulated_text += delta_text
+                tool_result = tool_parser.extract_tool_calls_streaming(
+                    tool_previous, tool_accumulated_text, delta_text
+                )
 
-                    if tool_result is None:
-                        # Inside tool markup - suppress output
-                        continue
-
-                    if "tool_calls" in tool_result:
-                        # Emit structured tool calls
-                        tool_calls_detected = True
+                if tool_result is None:
+                    # Inside tool markup - suppress current output
+                    # But if we have reasoning or content from step 1, we must emit it first
+                    if content or reasoning:
                         chunk = ChatCompletionChunk(
                             id=response_id,
                             model=_model_name,
                             choices=[
                                 ChatCompletionChunkChoice(
                                     delta=ChatCompletionChunkDelta(
-                                        tool_calls=tool_result["tool_calls"]
+                                        content=content if content else None,
+                                        reasoning=reasoning if reasoning else None,
                                     ),
-                                    finish_reason=(
-                                        "tool_calls" if output.finished else None
-                                    ),
+                                    finish_reason=output.finish_reason
+                                    if output.finished
+                                    else None,
                                 )
                             ],
                             usage=get_usage(output) if output.finished else None,
                         )
                         yield f"data: {chunk.model_dump_json()}\n\n"
-                        continue
+                    continue
 
-                    # Normal content from tool parser
-                    content = tool_result.get("content", "")
+                if "tool_calls" in tool_result:
+                    # Emit structured tool calls
+                    # If we had content/reasoning, emit that first as well
+                    if content or reasoning:
+                        chunk = ChatCompletionChunk(
+                            id=response_id,
+                            model=_model_name,
+                            choices=[
+                                ChatCompletionChunkChoice(
+                                    delta=ChatCompletionChunkDelta(
+                                        content=content if content else None,
+                                        reasoning=reasoning if reasoning else None,
+                                    ),
+                                    finish_reason=None,
+                                )
+                            ],
+                        )
+                        yield f"data: {chunk.model_dump_json()}\n\n"
+                        content = None
+                        reasoning = None
 
+                    tool_calls_detected = True
+                    chunk = ChatCompletionChunk(
+                        id=response_id,
+                        model=_model_name,
+                        choices=[
+                            ChatCompletionChunkChoice(
+                                delta=ChatCompletionChunkDelta(
+                                    tool_calls=tool_result["tool_calls"]
+                                ),
+                                finish_reason=(
+                                    "tool_calls" if output.finished else None
+                                ),
+                            )
+                        ],
+                        usage=get_usage(output) if output.finished else None,
+                    )
+                    yield f"data: {chunk.model_dump_json()}\n\n"
+                    continue
+
+                # Normal content from tool parser
+                content = tool_result.get("content", "")
+
+        # 5. Emit chunk if there's content or reasoning
+        if content or reasoning:
             chunk = ChatCompletionChunk(
                 id=response_id,
                 model=_model_name,
                 choices=[
                     ChatCompletionChunkChoice(
                         delta=ChatCompletionChunkDelta(
-                            content=content if content else None
+                            content=content if content else None,
+                            reasoning=reasoning if reasoning else None,
                         ),
                         finish_reason=(
                             "tool_calls"
