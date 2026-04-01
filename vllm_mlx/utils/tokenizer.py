@@ -195,8 +195,6 @@ def _try_inject_mtp_post_load(model, model_name):
                 "but model-mtp.safetensors not found, skipping MTP."
             )
 
-    return model, tokenizer
-
 
 def _load_with_tokenizer_fallback(model_name: str):
     """Load model with fallback tokenizer for non-standard models like Nemotron."""
