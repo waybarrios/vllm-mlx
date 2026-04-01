@@ -833,7 +833,10 @@ class MemoryAwarePrefixCache:
             excess = n_cached - n_requested
 
             has_non_trimmable = any(
-                not (hasattr(lc, "is_trimmable") and lc.is_trimmable())
+                not (
+                    (hasattr(lc, "is_trimmable") and lc.is_trimmable())
+                    or (hasattr(lc, "offset") and hasattr(lc, "keys"))
+                )
                 for lc in best_super.cache
             )
 
@@ -918,7 +921,10 @@ class MemoryAwarePrefixCache:
             excess = len(best_lcp_entry.tokens) - best_lcp_length
 
             has_non_trimmable = any(
-                not (hasattr(lc, "is_trimmable") and lc.is_trimmable())
+                not (
+                    (hasattr(lc, "is_trimmable") and lc.is_trimmable())
+                    or (hasattr(lc, "offset") and hasattr(lc, "keys"))
+                )
                 for lc in best_lcp_entry.cache
             )
             logger.debug(
