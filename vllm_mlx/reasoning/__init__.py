@@ -25,6 +25,7 @@ Usage:
 """
 
 from .base import DeltaMessage, ReasoningParser
+from .glm4_parser import GLM4ReasoningParser
 from .think_parser import BaseThinkingReasoningParser
 
 # Parser registry
@@ -76,10 +77,12 @@ def list_parsers() -> list[str]:
 def _register_builtin_parsers():
     """Register built-in parsers."""
     from .deepseek_r1_parser import DeepSeekR1ReasoningParser
+    from .glm4_parser import GLM4ReasoningParser
     from .gpt_oss_parser import GptOssReasoningParser
     from .harmony_parser import HarmonyReasoningParser
     from .qwen3_parser import Qwen3ReasoningParser
 
+    register_parser("glm4", GLM4ReasoningParser)
     register_parser("qwen3", Qwen3ReasoningParser)
     register_parser("deepseek_r1", DeepSeekR1ReasoningParser)
     register_parser("gpt_oss", GptOssReasoningParser)
@@ -99,4 +102,8 @@ __all__ = [
     "register_parser",
     "get_parser",
     "list_parsers",
+    # Built-in parsers
+    "GLM4ReasoningParser",
+    "Qwen3ReasoningParser",
+    "DeepSeekR1ReasoningParser",
 ]

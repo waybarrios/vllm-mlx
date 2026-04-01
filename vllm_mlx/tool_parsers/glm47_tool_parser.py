@@ -95,6 +95,9 @@ class Glm47ToolParser(ToolParser):
         for match in matches:
             func_name = match[0].strip() if match[0] else ""
             args_section = match[1] if len(match) > 1 and match[1] else ""
+            # Fix 2: Handle zero-argument tool calls - coalesce None to empty string
+            if args_section is None:
+                args_section = ""
 
             if not func_name:
                 continue
