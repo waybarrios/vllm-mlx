@@ -12,6 +12,8 @@ The scheduler follows vLLM's design with:
 """
 
 import logging
+import math
+import random
 from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum
@@ -741,12 +743,29 @@ def _install_mtp(
                     _skip_state[0] = None
                 _mtp_stats["accepted"] += 1
             else:
-                # --- VERIFIED MODE: single eval + Python comparison ---
-                verify_pred = mx.argmax(verify_logits[:, 0, :], axis=-1)
-                mx.eval(verify_pred, draft_tokens)
-                pred_list = verify_pred.tolist()
+                # --- VERIFIED MODE: probabilistic acceptance ---
+                # Accept draft d with prob min(1, p_target(d)/q_draft(d)).
+                # At temp=0 both distributions peak at the same token,
+                # so this degenerates to exact match. At temp>0 it
+                # preserves the target distribution while accepting
+                # more drafts than argmax comparison.
+                verify_lp_check = verify_logits[:, 0, :] - mx.logsumexp(
+                    verify_logits[:, 0, :], axis=-1, keepdims=True
+                )
+                verify_at_d = mx.take_along_axis(
+                    verify_lp_check, draft_tokens[:, None], axis=-1
+                ).squeeze(-1)
+                draft_at_d = mx.take_along_axis(
+                    draft_logprobs, draft_tokens[:, None], axis=-1
+                ).squeeze(-1)
+                log_accept_ratio = verify_at_d - draft_at_d
+                mx.eval(log_accept_ratio)
+                all_accepted = all(
+                    lar >= 0
+                    or math.log(random.random() or 1e-35) < lar
+                    for lar in log_accept_ratio.tolist()
+                )
                 draft_list = draft_tokens.tolist()
-                all_accepted = pred_list == draft_list
 
                 if all_accepted and verify_hidden is not None:
                     # --- ACCEPT ---
@@ -755,14 +774,11 @@ def _install_mtp(
                         "hidden": verify_hidden[:, -1:, :],
                     }
                     mx.async_eval(_skip_state[0]["logits"], _skip_state[0]["hidden"])
-                    verify_lp = verify_logits[:, 0, :] - mx.logsumexp(
-                        verify_logits[:, 0, :], axis=-1, keepdims=True
-                    )
                     for e in range(batch_size):
                         uid = current_uids[e]
                         _deferred_drafts[uid] = {
                             "token": draft_list[e],
-                            "logprobs": verify_lp[e],
+                            "logprobs": verify_lp_check[e],
                         }
                     _mtp_stats["accepted"] += 1
 
