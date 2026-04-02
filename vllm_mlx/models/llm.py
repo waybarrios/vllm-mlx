@@ -7,8 +7,12 @@ integrating with vLLM's model execution system.
 """
 
 import logging
+from collections.abc import Iterator
 from dataclasses import dataclass
-from typing import Iterator, Union
+from typing import TYPE_CHECKING, Union
+
+if TYPE_CHECKING:
+    import mlx.core as mx
 
 logger = logging.getLogger(__name__)
 
@@ -98,11 +102,10 @@ class MLXLanguageModel:
             self._loaded = True
             logger.info(f"Model loaded successfully: {self.model_name}")
 
-        except ImportError:
+        except ImportError as err:
             raise ImportError(
-                "mlx-lm is required for LLM inference. "
-                "Install with: pip install mlx-lm"
-            )
+                "mlx-lm is required for LLM inference. Install with: pip install mlx-lm"
+            ) from err
         except Exception as e:
             logger.error(f"Failed to load model: {e}")
             raise
@@ -266,7 +269,6 @@ class MLXLanguageModel:
         else:
             num_prompt_tokens = len(prompt)
 
-        token_count = 0
         accumulated_text = ""
 
         mtp_kwargs = {}
@@ -275,16 +277,18 @@ class MLXLanguageModel:
         if prompt_cache is not None:
             mtp_kwargs["prompt_cache"] = prompt_cache
 
-        for response in stream_generate(
-            self.model,
-            self.tokenizer,
-            prompt=prompt,
-            max_tokens=max_tokens,
-            sampler=sampler,
-            logits_processors=all_processors,
-            **mtp_kwargs,
+        for token_count, response in enumerate(
+            stream_generate(
+                self.model,
+                self.tokenizer,
+                prompt=prompt,
+                max_tokens=max_tokens,
+                sampler=sampler,
+                logits_processors=all_processors,
+                **mtp_kwargs,
+            ),
+            start=1,
         ):
-            token_count += 1
             # response.text is the new token text (not accumulated)
             new_text = response.text
             accumulated_text += new_text
