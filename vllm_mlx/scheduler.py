@@ -761,8 +761,7 @@ def _install_mtp(
                 log_accept_ratio = verify_at_d - draft_at_d
                 mx.eval(log_accept_ratio)
                 all_accepted = all(
-                    lar >= 0
-                    or math.log(random.random() or 1e-35) < lar
+                    lar >= 0 or math.log(random.random() or 1e-35) < lar
                     for lar in log_accept_ratio.tolist()
                 )
                 draft_list = draft_tokens.tolist()
