@@ -542,6 +542,7 @@ def _install_mtp(
     model: Any,
     num_draft_tokens: int = 1,
     optimistic: bool = False,
+    greedy: bool = False,
 ) -> None:
     """
     Monkey-patch a BatchGenerator to use MTP (Multi-Token Prediction)
@@ -743,27 +744,34 @@ def _install_mtp(
                     _skip_state[0] = None
                 _mtp_stats["accepted"] += 1
             else:
-                # --- VERIFIED MODE: probabilistic acceptance ---
-                # Accept draft d with prob min(1, p_target(d)/q_draft(d)).
-                # At temp=0 both distributions peak at the same token,
-                # so this degenerates to exact match. At temp>0 it
-                # preserves the target distribution while accepting
-                # more drafts than argmax comparison.
+                # --- VERIFIED MODE ---
                 verify_lp_check = verify_logits[:, 0, :] - mx.logsumexp(
                     verify_logits[:, 0, :], axis=-1, keepdims=True
                 )
-                verify_at_d = mx.take_along_axis(
-                    verify_lp_check, draft_tokens[:, None], axis=-1
-                ).squeeze(-1)
-                draft_at_d = mx.take_along_axis(
-                    draft_logprobs, draft_tokens[:, None], axis=-1
-                ).squeeze(-1)
-                log_accept_ratio = verify_at_d - draft_at_d
-                mx.eval(log_accept_ratio)
-                all_accepted = all(
-                    lar >= 0 or math.log(random.random() or 1e-35) < lar
-                    for lar in log_accept_ratio.tolist()
-                )
+
+                if greedy:
+                    # Greedy (temp=0): exact-match verification.
+                    # Log-prob ratio can incorrectly accept wrong tokens
+                    # on poorly-calibrated models when the distribution
+                    # is a point mass.
+                    verify_pred = mx.argmax(verify_lp_check, axis=-1)
+                    mx.eval(verify_pred, draft_tokens)
+                    all_accepted = verify_pred.tolist() == draft_tokens.tolist()
+                else:
+                    # Stochastic (temp>0): probabilistic acceptance.
+                    # Accept draft d with prob min(1, p_target(d)/q_draft(d)).
+                    verify_at_d = mx.take_along_axis(
+                        verify_lp_check, draft_tokens[:, None], axis=-1
+                    ).squeeze(-1)
+                    draft_at_d = mx.take_along_axis(
+                        draft_logprobs, draft_tokens[:, None], axis=-1
+                    ).squeeze(-1)
+                    log_accept_ratio = verify_at_d - draft_at_d
+                    mx.eval(log_accept_ratio)
+                    all_accepted = all(
+                        lar >= 0 or math.log(random.random() or 1e-35) < lar
+                        for lar in log_accept_ratio.tolist()
+                    )
                 draft_list = draft_tokens.tolist()
 
                 if all_accepted and verify_hidden is not None:
@@ -1213,6 +1221,7 @@ class Scheduler:
                     model=self.model,
                     num_draft_tokens=self.config.mtp_num_draft_tokens,
                     optimistic=self.config.mtp_optimistic,
+                    greedy=sampling_params.temperature == 0.0,
                 )
             else:
                 logger.warning(
