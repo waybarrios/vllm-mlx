@@ -85,6 +85,10 @@ def _register_builtin_parsers():
     register_parser("gpt_oss", GptOssReasoningParser)
     register_parser("harmony", HarmonyReasoningParser)
 
+    from .gemma4_parser import Gemma4ReasoningParser
+
+    register_parser("gemma4", Gemma4ReasoningParser)
+
 
 # Register built-in parsers on module load
 _register_builtin_parsers()
