@@ -92,7 +92,7 @@ class Gemma4ReasoningParser(ReasoningParser):
             prev_after_end = ""
             if END_TOKEN in previous_text:
                 _, _, prev_after_end = previous_text.partition(END_TOKEN)
-            new_content = after_end[len(prev_after_end):]
+            new_content = after_end[len(prev_after_end) :]
             if new_content:
                 return DeltaMessage(content=new_content)
             return DeltaMessage(content="")  # signal transition

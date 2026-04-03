@@ -49,40 +49,40 @@ def _parse_gemma4_params(param_str: str) -> dict:
     current = []
     pairs = []
     for ch in s:
-        if ch == PLACEHOLDER[0] and s[len(current):].startswith(PLACEHOLDER):
+        if ch == PLACEHOLDER[0] and s[len(current) :].startswith(PLACEHOLDER):
             in_string = not in_string
             current.append(ch)
-        elif ch == '{' and not in_string:
+        elif ch == "{" and not in_string:
             depth += 1
             current.append(ch)
-        elif ch == '}' and not in_string:
+        elif ch == "}" and not in_string:
             depth -= 1
             current.append(ch)
-        elif ch == ',' and depth == 0 and not in_string:
-            pairs.append(''.join(current).strip())
+        elif ch == "," and depth == 0 and not in_string:
+            pairs.append("".join(current).strip())
             current = []
         else:
             current.append(ch)
     if current:
-        pairs.append(''.join(current).strip())
+        pairs.append("".join(current).strip())
 
     for pair in pairs:
-        if ':' not in pair:
+        if ":" not in pair:
             continue
-        key, _, val = pair.partition(':')
+        key, _, val = pair.partition(":")
         key = key.strip()
         val = val.strip()
 
         # Restore escaped quotes and extract string value
-        val = val.replace(PLACEHOLDER, '')
+        val = val.replace(PLACEHOLDER, "")
         if not val:
             val = val  # empty string
         # Try numeric/bool conversion
-        elif val.lower() == 'true':
+        elif val.lower() == "true":
             val = True
-        elif val.lower() == 'false':
+        elif val.lower() == "false":
             val = False
-        elif val.lower() == 'null':
+        elif val.lower() == "null":
             val = None
         else:
             try:
@@ -99,7 +99,7 @@ def _parse_gemma4_params(param_str: str) -> dict:
 
 # Pattern: <|tool_call>call:function_name{params}<tool_call|>
 GEMMA4_TOOL_PATTERN = re.compile(
-    r'<\|tool_call>call:(\w+)\{(.*?)\}<tool_call\|>',
+    r"<\|tool_call>call:(\w+)\{(.*?)\}<tool_call\|>",
     re.DOTALL,
 )
 
@@ -129,11 +129,13 @@ class Gemma4ToolParser(ToolParser):
             param_str = match.group(2)
             arguments = _parse_gemma4_params(param_str)
 
-            tool_calls.append({
-                "id": _generate_tool_id(),
-                "name": func_name,
-                "arguments": json.dumps(arguments),
-            })
+            tool_calls.append(
+                {
+                    "id": _generate_tool_id(),
+                    "name": func_name,
+                    "arguments": json.dumps(arguments),
+                }
+            )
             cleaned_text = cleaned_text.replace(match.group(0), "").strip()
 
         return ExtractedToolCallInformation(
@@ -147,22 +149,34 @@ class Gemma4ToolParser(ToolParser):
         previous_text: str,
         current_text: str,
         delta: str,
-        previous_token_ids: Sequence[int],
-        current_token_ids: Sequence[int],
-        delta_token_ids: Sequence[int],
+        previous_token_ids: Sequence[int] | None = None,
+        current_token_ids: Sequence[int] | None = None,
+        delta_token_ids: Sequence[int] | None = None,
         request: dict[str, Any] | None = None,
-    ) -> ExtractedToolCallInformation:
-        # Check if we have a complete tool call in current_text
+    ) -> dict[str, Any] | None:
+        # Complete tool call found — extract and return formatted dict
         if "<tool_call|>" in current_text:
-            return self.extract_tool_calls(current_text, request)
+            result = self.extract_tool_calls(current_text, request)
+            if result.tools_called and result.tool_calls:
+                return {
+                    "tool_calls": [
+                        {
+                            "index": i,
+                            "id": tc["id"],
+                            "type": "function",
+                            "function": {
+                                "name": tc["name"],
+                                "arguments": tc["arguments"],
+                            },
+                        }
+                        for i, tc in enumerate(result.tool_calls)
+                    ]
+                }
+            return {"content": result.content or ""}
 
-        # If we see the start marker, signal that a tool call is in progress
+        # Start marker seen — suppress content (tool call in progress)
         if GEMMA4_TOOL_START in current_text:
-            return ExtractedToolCallInformation(
-                tools_called=False, tool_calls=None, content=None
-            )
+            return None
 
-        # No tool call markers — pass through as content
-        return ExtractedToolCallInformation(
-            tools_called=False, tool_calls=None, content=delta
-        )
+        # No markers — pass through as content
+        return {"content": delta}
