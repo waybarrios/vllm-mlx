@@ -16,6 +16,8 @@ from .abstract_tool_parser import (
     ToolParser,
     ToolParserManager,
 )
+from .gemma4_tool_parser import TOOL_CALL_PATTERN as GEMMA4_PATTERN
+from .gemma4_tool_parser import _gemma_args_to_json
 
 
 def generate_tool_id() -> str:
@@ -29,12 +31,13 @@ class AutoToolParser(ToolParser):
     Auto-detecting tool call parser.
 
     Tries multiple formats in order:
-    1. Mistral: [TOOL_CALLS] ...
-    2. Qwen bracket: [Calling tool: func_name({...})]
-    3. Qwen/Hermes XML: <tool_call>{"name": "...", "arguments": {...}}</tool_call>
-    4. Llama: <function=name>{"arg": "value"}</function>
-    5. Nemotron: <tool_call><function=name>...</function></tool_call>
-    6. Raw JSON: {"name": "...", "arguments": {...}}
+    1. Gemma 4: <|tool_call>call:name{...}<tool_call|>
+    2. Mistral: [TOOL_CALLS] ...
+    3. Qwen bracket: [Calling tool: func_name({...})]
+    4. Qwen/Hermes XML: <tool_call>{"name": "...", "arguments": {...}}</tool_call>
+    5. Llama: <function=name>{"arg": "value"}</function>
+    6. Nemotron: <tool_call><function=name>...</function></tool_call>
+    7. Raw JSON: {"name": "...", "arguments": {...}}
 
     This is the default parser when no specific parser is selected.
     """
@@ -63,7 +66,41 @@ class AutoToolParser(ToolParser):
         tool_calls: list[dict[str, Any]] = []
         cleaned_text = model_output
 
-        # 1. Try Mistral format
+        # 1. Try Gemma 4 format (most distinctive marker)
+        if "<|tool_call>" in model_output:
+            gemma_matches = GEMMA4_PATTERN.findall(model_output)
+            for name, raw_args in gemma_matches:
+                try:
+                    json_str = "{" + _gemma_args_to_json(raw_args) + "}"
+                    arguments = json.loads(json_str)
+                    tool_calls.append(
+                        {
+                            "id": generate_tool_id(),
+                            "name": name.strip(),
+                            "arguments": (
+                                json.dumps(arguments, ensure_ascii=False)
+                                if isinstance(arguments, dict)
+                                else str(arguments)
+                            ),
+                        }
+                    )
+                except (json.JSONDecodeError, ValueError):
+                    tool_calls.append(
+                        {
+                            "id": generate_tool_id(),
+                            "name": name.strip(),
+                            "arguments": raw_args,
+                        }
+                    )
+            if gemma_matches:
+                cleaned_text = GEMMA4_PATTERN.sub("", cleaned_text).strip()
+                return ExtractedToolCallInformation(
+                    tools_called=True,
+                    tool_calls=tool_calls,
+                    content=cleaned_text if cleaned_text else None,
+                )
+
+        # 2. Try Mistral format
         if self.MISTRAL_TOKEN in model_output:
             parts = model_output.split(self.MISTRAL_TOKEN)
             content = parts[0].strip()
@@ -113,7 +150,7 @@ class AutoToolParser(ToolParser):
                     content=content if content else None,
                 )
 
-        # 2. Try Qwen bracket pattern
+        # 3. Try Qwen bracket pattern
         bracket_matches = self.QWEN_BRACKET_PATTERN.findall(model_output)
         for name, args_str in bracket_matches:
             try:
@@ -141,7 +178,7 @@ class AutoToolParser(ToolParser):
         if bracket_matches:
             cleaned_text = self.QWEN_BRACKET_PATTERN.sub("", cleaned_text).strip()
 
-        # 3. Try Nemotron pattern (before Qwen XML as it's more specific)
+        # 4. Try Nemotron pattern (before Qwen XML as it's more specific)
         nemotron_matches = self.NEMOTRON_PATTERN.findall(cleaned_text)
         for name, params_block in nemotron_matches:
             params = self.NEMOTRON_PARAM_PATTERN.findall(params_block)
@@ -157,7 +194,7 @@ class AutoToolParser(ToolParser):
         if nemotron_matches:
             cleaned_text = self.NEMOTRON_PATTERN.sub("", cleaned_text).strip()
 
-        # 4. Try Qwen/Hermes XML pattern
+        # 5. Try Qwen/Hermes XML pattern
         xml_matches = self.QWEN_XML_PATTERN.findall(cleaned_text)
         for match in xml_matches:
             try:
@@ -182,7 +219,7 @@ class AutoToolParser(ToolParser):
         if xml_matches:
             cleaned_text = self.QWEN_XML_PATTERN.sub("", cleaned_text).strip()
 
-        # 5. Try Llama pattern
+        # 6. Try Llama pattern
         llama_matches = self.LLAMA_PATTERN.findall(cleaned_text)
         for name, args_str in llama_matches:
             try:
@@ -210,7 +247,7 @@ class AutoToolParser(ToolParser):
         if llama_matches:
             cleaned_text = self.LLAMA_PATTERN.sub("", cleaned_text).strip()
 
-        # 6. Fallback: Try raw JSON
+        # 7. Fallback: Try raw JSON
         if not tool_calls:
             raw_calls = self._parse_raw_json_tool_calls(cleaned_text)
             if raw_calls:
@@ -327,6 +364,7 @@ class AutoToolParser(ToolParser):
         """
         # Check for any tool call markers
         markers = [
+            "<|tool_call>",
             self.MISTRAL_TOKEN,
             "[Calling tool:",
             "<tool_call>",
@@ -339,7 +377,7 @@ class AutoToolParser(ToolParser):
             return {"content": delta_text}
 
         # Check for completion markers
-        end_markers = ["</tool_call>", "</function>", ")]"]
+        end_markers = ["<tool_call|>", "</tool_call>", "</function>", ")]"]
         if any(m in delta_text for m in end_markers):
             result = self.extract_tool_calls(current_text)
             if result.tools_called:

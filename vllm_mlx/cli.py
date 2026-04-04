@@ -838,12 +838,13 @@ Examples:
             "nemotron",
             "xlam",
             "functionary",
+            "gemma4",
             "glm47",
         ],
         help=(
             "Select the tool call parser for the model. Options: "
             "auto (auto-detect), mistral, qwen, qwen3_coder, llama, hermes, "
-            "deepseek, kimi, granite, nemotron, xlam, functionary, glm47. "
+            "deepseek, gemma4, kimi, granite, nemotron, xlam, functionary, glm47. "
             "Required for --enable-auto-tool-choice."
         ),
     )

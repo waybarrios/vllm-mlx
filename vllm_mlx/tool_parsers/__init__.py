@@ -10,6 +10,7 @@ Available parsers:
 - mistral: Mistral models ([TOOL_CALLS] format)
 - qwen/qwen3: Qwen models (<tool_call> and [Calling tool:] formats)
 - llama/llama3/llama4: Llama models (<function=name> format)
+- gemma4/gemma_4: Google Gemma 4 models (<|tool_call>call:name{} format)
 - hermes/nous: Hermes/NousResearch models
 - deepseek/deepseek_v3/deepseek_r1: DeepSeek models (unicode tokens)
 - kimi/kimi_k2/moonshot: Kimi/Moonshot models
@@ -48,6 +49,7 @@ from .auto_tool_parser import AutoToolParser
 from .deepseek_tool_parser import DeepSeekToolParser
 from .functionary_tool_parser import FunctionaryToolParser
 from .granite_tool_parser import GraniteToolParser
+from .gemma4_tool_parser import Gemma4ToolParser
 from .hermes_tool_parser import HermesToolParser
 from .kimi_tool_parser import KimiToolParser
 from .llama_tool_parser import LlamaToolParser
@@ -65,6 +67,7 @@ __all__ = [
     "ExtractedToolCallInformation",
     # Specific parsers
     "AutoToolParser",
+    "Gemma4ToolParser",
     "MistralToolParser",
     "QwenToolParser",
     "LlamaToolParser",
