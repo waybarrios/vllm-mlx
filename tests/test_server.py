@@ -1,8 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for the OpenAI-compatible API server."""
 
+import asyncio
 import platform
 import sys
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -101,6 +104,85 @@ class TestRequestModels:
             assert part.video_url["url"] == "https://example.com/video.mp4"
         else:
             assert part.video_url.url == "https://example.com/video.mp4"
+
+
+class TestChatCompletionRawOutput:
+    def test_chat_completion_requests_raw_output_for_reasoning_parser(self):
+        import vllm_mlx.server as srv
+        from vllm_mlx.engine.base import GenerationOutput
+
+        mock_engine = MagicMock()
+        mock_engine.model_name = "reasoning-test-model"
+        mock_engine.is_mllm = False
+        mock_engine.preserve_native_tool_format = False
+        mock_engine.chat = AsyncMock(
+            return_value=GenerationOutput(
+                text="<|channel>thought\nplan<channel|>Final answer",
+                prompt_tokens=7,
+                completion_tokens=3,
+                finish_reason="stop",
+            )
+        )
+
+        original_engine = srv._engine
+        original_model_name = srv._model_name
+        original_reasoning_parser = srv._reasoning_parser
+
+        class _FakeChannelParser:
+            def extract_reasoning(self, text):
+                prefix = "<|channel>thought\n"
+                end = "<channel|>"
+                if text.startswith(prefix) and end in text:
+                    reasoning_text, _, content = text[len(prefix) :].partition(end)
+                    return reasoning_text, content
+                return None, text
+
+        srv._engine = mock_engine
+        srv._model_name = "reasoning-test-model"
+        srv._reasoning_parser = _FakeChannelParser()
+        try:
+
+            class _Request(SimpleNamespace):
+                def model_dump(self):
+                    return dict(self.__dict__)
+
+            request = _Request(
+                model="reasoning-test-model",
+                messages=[srv.Message(role="user", content="hello")],
+                max_tokens=16,
+                temperature=0.7,
+                top_p=0.9,
+                top_k=0,
+                min_p=0.0,
+                presence_penalty=0.0,
+                repetition_penalty=1.0,
+                stop=None,
+                tools=None,
+                tool_choice=None,
+                stream=False,
+                stream_options=None,
+                response_format=None,
+                video_fps=None,
+                video_max_frames=None,
+                specprefill=None,
+                specprefill_keep_pct=None,
+                timeout=None,
+            )
+
+            class _RawRequest:
+                async def is_disconnected(self):
+                    return False
+
+            resp = asyncio.run(srv.create_chat_completion(request, _RawRequest()))
+        finally:
+            srv._engine = original_engine
+            srv._model_name = original_model_name
+            srv._reasoning_parser = original_reasoning_parser
+
+        msg = resp.choices[0].message
+        assert msg.content == "Final answer"
+        assert msg.reasoning == "plan"
+        assert mock_engine.chat.await_args.kwargs["raw_output"] is True
 
 
 class TestChatCompletionRequest:

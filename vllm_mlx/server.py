@@ -1426,6 +1426,7 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
     # Add tools if provided
     if request.tools:
         chat_kwargs["tools"] = convert_tools_for_template(request.tools)
+    chat_kwargs["raw_output"] = True
 
     if request.stream:
         return StreamingResponse(
@@ -2014,6 +2015,7 @@ async def stream_chat_completion(
     """Stream chat completion response."""
     response_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
     start_time = time.perf_counter()
+    kwargs["raw_output"] = True
 
     # Check if we should include usage in the final chunk
     include_usage = request.stream_options and request.stream_options.include_usage
