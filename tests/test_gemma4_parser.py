@@ -20,14 +20,14 @@ def test_args_to_json_simple_strings():
 
 
 def test_args_to_json_numbers():
-    raw = f"temperature:15,humidity:0.75"
+    raw = "temperature:15,humidity:0.75"
     result = "{" + _gemma_args_to_json(raw) + "}"
     parsed = json.loads(result)
     assert parsed == {"temperature": 15, "humidity": 0.75}
 
 
 def test_args_to_json_booleans():
-    raw = f"enabled:true,verbose:false"
+    raw = "enabled:true,verbose:false"
     result = "{" + _gemma_args_to_json(raw) + "}"
     parsed = json.loads(result)
     assert parsed == {"enabled": True, "verbose": False}
