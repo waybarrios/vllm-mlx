@@ -768,14 +768,27 @@ class BatchedEngine(BaseEngine):
         if self._mllm_scheduler:
             mllm_stats = self._mllm_scheduler.get_stats()
             stats["mllm_scheduler"] = mllm_stats
-            # Promote Metal memory stats to top-level for /v1/status
+            # Promote stats to top-level for /v1/status and monitoring
             for key in (
+                "running",
+                "num_running",
+                "num_waiting",
+                "num_requests_processed",
+                "total_prompt_tokens",
+                "total_completion_tokens",
                 "metal_active_memory_gb",
                 "metal_peak_memory_gb",
                 "metal_cache_memory_gb",
+                "memory_aware_cache",
+                "paged_cache",
+                "prefix_cache",
+                "requests",
             ):
                 if key in mllm_stats:
                     stats[key] = mllm_stats[key]
+            # MLLM engine is always "running" once loaded
+            if "running" not in stats:
+                stats["running"] = self._loaded
         elif self._engine:
             stats.update(self._engine.get_stats())
 
