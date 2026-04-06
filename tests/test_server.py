@@ -178,10 +178,67 @@ class TestChatCompletionRawOutput:
             srv._engine = original_engine
             srv._model_name = original_model_name
             srv._reasoning_parser = original_reasoning_parser
+            # asyncio.run() closes its loop and leaves the default policy with
+            # _set_called=True and _loop=None. Any downstream test that calls
+            # asyncio.get_event_loop() would then raise
+            # "There is no current event loop in thread 'MainThread'".
+            # Install a fresh loop to keep subsequent tests in this file working.
+            asyncio.set_event_loop(asyncio.new_event_loop())
 
         msg = resp.choices[0].message
         assert msg.content == "Final answer"
         assert msg.reasoning == "plan"
+        assert mock_engine.chat.await_args.kwargs["raw_output"] is True
+
+
+class TestAnthropicMessagesRawOutput:
+    def test_anthropic_messages_requests_raw_output_for_tool_parsing(self):
+        """The /v1/messages non-streaming path must request raw engine output so
+        tool-call markers reach the parser, matching /v1/chat/completions parity.
+        """
+        import vllm_mlx.server as srv
+        from vllm_mlx.engine.base import GenerationOutput
+
+        mock_engine = MagicMock()
+        mock_engine.model_name = "anthropic-test-model"
+        mock_engine.is_mllm = False
+        mock_engine.preserve_native_tool_format = False
+        mock_engine.chat = AsyncMock(
+            return_value=GenerationOutput(
+                text="Hello from the model",
+                prompt_tokens=5,
+                completion_tokens=4,
+                finish_reason="stop",
+            )
+        )
+
+        original_engine = srv._engine
+        original_model_name = srv._model_name
+
+        srv._engine = mock_engine
+        srv._model_name = "anthropic-test-model"
+        try:
+
+            class _RawRequest:
+                async def is_disconnected(self):
+                    return False
+
+                async def json(self):
+                    return {
+                        "model": "anthropic-test-model",
+                        "messages": [{"role": "user", "content": "hello"}],
+                        "max_tokens": 16,
+                    }
+
+            resp = asyncio.run(srv.create_anthropic_message(_RawRequest()))
+        finally:
+            srv._engine = original_engine
+            srv._model_name = original_model_name
+            # asyncio.run() closes its loop; install a fresh one so subsequent
+            # tests using asyncio.get_event_loop() do not fail.
+            asyncio.set_event_loop(asyncio.new_event_loop())
+
+        assert resp is not None
         assert mock_engine.chat.await_args.kwargs["raw_output"] is True
 
 
@@ -675,9 +732,7 @@ class TestAPIKeyVerification:
 
             # Should raise HTTPException with 401
             with pytest.raises(HTTPException) as exc_info:
-                asyncio.get_event_loop().run_until_complete(
-                    server.verify_api_key(credentials)
-                )
+                asyncio.run(server.verify_api_key(credentials))
 
             assert exc_info.value.status_code == 401
             assert "Invalid API key" in str(exc_info.value.detail)
@@ -703,9 +758,7 @@ class TestAPIKeyVerification:
             )
 
             # Should not raise any exception
-            result = asyncio.get_event_loop().run_until_complete(
-                server.verify_api_key(credentials)
-            )
+            result = asyncio.run(server.verify_api_key(credentials))
             # verify_api_key returns True on success (no exception raised)
             assert result is True or result is None
         finally:

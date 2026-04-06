@@ -1606,6 +1606,11 @@ async def create_anthropic_message(
     if openai_request.tools:
         chat_kwargs["tools"] = convert_tools_for_template(openai_request.tools)
 
+    # Request raw output so tool-call markers are visible to the parser, mirroring
+    # the OpenAI /v1/chat/completions path. clean_output_text() is still applied
+    # to the final visible content below.
+    chat_kwargs["raw_output"] = True
+
     start_time = time.perf_counter()
     timeout = _default_timeout
 
@@ -1815,6 +1820,11 @@ async def _stream_anthropic_messages(
 
     if openai_request.tools:
         chat_kwargs["tools"] = convert_tools_for_template(openai_request.tools)
+
+    # Request raw output so tool-call markers reach _parse_tool_calls_with_parser
+    # via accumulated_text. Streaming display still strips special tokens through
+    # SPECIAL_TOKENS_PATTERN below.
+    chat_kwargs["raw_output"] = True
 
     # Emit message_start
     message_start = {
