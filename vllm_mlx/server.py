@@ -1423,6 +1423,10 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
     if request.specprefill_keep_pct is not None:
         chat_kwargs["specprefill_keep_pct"] = request.specprefill_keep_pct
 
+    # Enable/disable thinking mode per request
+    if request.enable_thinking is not None:
+        chat_kwargs["enable_thinking"] = request.enable_thinking
+
     # Add tools if provided
     if request.tools:
         chat_kwargs["tools"] = convert_tools_for_template(request.tools)
@@ -1458,8 +1462,9 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
     cleaned_text, tool_calls = _parse_tool_calls_with_parser(output.text, request)
 
     # Extract reasoning content FIRST (strips channel tokens before JSON extraction)
+    # Skip reasoning parser when enable_thinking=False (no think tags expected)
     reasoning_text = None
-    if _reasoning_parser and not tool_calls:
+    if _reasoning_parser and not tool_calls and request.enable_thinking is not False:
         text_to_parse = cleaned_text or output.text
         reasoning_text, cleaned_text = _reasoning_parser.extract_reasoning(
             text_to_parse
@@ -2082,8 +2087,8 @@ async def stream_chat_completion(
         if hasattr(output, "completion_tokens") and output.completion_tokens:
             completion_tokens = output.completion_tokens
 
-        # Use reasoning parser if enabled
-        if _reasoning_parser and delta_text:
+        # Use reasoning parser if enabled (skip when enable_thinking=False)
+        if _reasoning_parser and delta_text and request.enable_thinking is not False:
             previous_text = accumulated_text
             accumulated_text += delta_text
             delta_msg = _reasoning_parser.extract_reasoning_streaming(

@@ -1328,6 +1328,11 @@ class MLXMultimodalLM:
         video_max_frames = kwargs.pop("video_max_frames", MAX_FRAMES)
         tools = kwargs.pop("tools", None)
         use_cache = kwargs.pop("use_cache", True)
+        enable_thinking = kwargs.pop("enable_thinking", None)
+        if enable_thinking is None:
+            enable_thinking = os.environ.get(
+                "VLLM_MLX_ENABLE_THINKING", "true"
+            ).lower() in ("true", "1", "yes")
 
         # Collect video inputs from messages
         _msg_video_inputs = self._collect_video_inputs(messages)
@@ -1458,6 +1463,7 @@ class MLXMultimodalLM:
                 self.processor,
                 chat_messages,
                 add_generation_prompt=True,
+                enable_thinking=enable_thinking,
                 **template_extra_kwargs,
             )
         except Exception as e:
@@ -1724,6 +1730,11 @@ class MLXMultimodalLM:
         video_max_frames = kwargs.pop("video_max_frames", MAX_FRAMES)
         tools = kwargs.pop("tools", None)
         use_cache = kwargs.pop("use_cache", True)
+        enable_thinking = kwargs.pop("enable_thinking", None)
+        if enable_thinking is None:
+            enable_thinking = os.environ.get(
+                "VLLM_MLX_ENABLE_THINKING", "true"
+            ).lower() in ("true", "1", "yes")
 
         # Collect video inputs from messages
         _msg_video_inputs = self._collect_video_inputs(messages)
@@ -1838,6 +1849,7 @@ class MLXMultimodalLM:
                 self.processor,
                 chat_messages,
                 add_generation_prompt=True,
+                enable_thinking=enable_thinking,
                 **template_extra_kwargs,
             )
         except Exception as e:

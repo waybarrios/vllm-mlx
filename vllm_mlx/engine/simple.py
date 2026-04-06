@@ -8,6 +8,7 @@ performance when serving a single user at a time.
 
 import asyncio
 import logging
+import os
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -589,9 +590,12 @@ class SimpleEngine(BaseEngine):
         # For LLM, apply chat template and stream
         tokenizer = self._model.tokenizer
         if hasattr(tokenizer, "apply_chat_template"):
-            # Disable thinking mode for coder models since it interferes
-            # with tool call parsing (tags leak as raw text).
-            enable_thinking = "coder" not in self._model_name.lower()
+            # Per-request enable_thinking override; fall back to env var / default True.
+            enable_thinking = kwargs.pop("enable_thinking", None)
+            if enable_thinking is None:
+                enable_thinking = os.environ.get(
+                    "VLLM_MLX_ENABLE_THINKING", "true"
+                ).lower() in ("true", "1", "yes")
             template_kwargs = {
                 "tokenize": False,
                 "add_generation_prompt": True,
@@ -835,9 +839,11 @@ class SimpleEngine(BaseEngine):
         specprefill_override = kwargs.pop("specprefill", None)
         specprefill_keep_pct = kwargs.pop("specprefill_keep_pct", None)
 
-        # Read enable_thinking from env (set by runtime_patches, consistent with MLLM path)
-        enable_thinking_env = os.environ.get("VLLM_MLX_ENABLE_THINKING", "true")
-        enable_thinking = enable_thinking_env.lower() in ("true", "1", "yes")
+        # Per-request enable_thinking override; fall back to env var / default True.
+        enable_thinking = kwargs.pop("enable_thinking", None)
+        if enable_thinking is None:
+            enable_thinking_env = os.environ.get("VLLM_MLX_ENABLE_THINKING", "true")
+            enable_thinking = enable_thinking_env.lower() in ("true", "1", "yes")
 
         # Apply chat template for full prompt
         template_kwargs = {

@@ -12,6 +12,7 @@ LLM engine), so text-only requests must also be routed through it.
 """
 
 import logging
+import os
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -335,6 +336,7 @@ class BatchedEngine(BaseEngine):
         messages: list[dict[str, Any]],
         tools: list[dict] | None = None,
         num_images: int = 0,
+        enable_thinking: bool | None = None,
     ) -> str:
         """Apply chat template to messages.
 
@@ -363,9 +365,15 @@ class BatchedEngine(BaseEngine):
             if self._is_mllm and num_images > 0:
                 messages = self._prepare_mllm_messages(messages)
 
+            # Per-request enable_thinking override; fall back to env var / default True.
+            if enable_thinking is None:
+                enable_thinking = os.environ.get(
+                    "VLLM_MLX_ENABLE_THINKING", "true"
+                ).lower() in ("true", "1", "yes")
             template_kwargs = {
                 "tokenize": False,
                 "add_generation_prompt": True,
+                "enable_thinking": enable_thinking,
             }
             if tools:
                 template_kwargs["tools"] = tools
@@ -375,9 +383,10 @@ class BatchedEngine(BaseEngine):
                     messages, **template_kwargs
                 )
             except TypeError as e:
-                # Some templates don't accept 'tools'; retry without them.
+                # Some templates don't accept 'tools' or 'enable_thinking';
+                # retry without them.
                 logger.debug(f"Chat template TypeError, retrying without extras: {e}")
-                for key in ["tools"]:
+                for key in ["tools", "enable_thinking"]:
                     if key in template_kwargs:
                         del template_kwargs[key]
                 return template_applicator.apply_chat_template(
@@ -621,11 +630,15 @@ class BatchedEngine(BaseEngine):
         # Convert tools for template
         template_tools = convert_tools_for_template(tools) if tools else None
 
+        # Per-request enable_thinking override
+        enable_thinking = kwargs.pop("enable_thinking", None)
+
         # Apply chat template
         prompt = self._apply_chat_template(
             messages,
             template_tools,
             num_images=len(all_images),
+            enable_thinking=enable_thinking,
         )
 
         return await self.generate(
@@ -732,11 +745,15 @@ class BatchedEngine(BaseEngine):
         # Convert tools for template
         template_tools = convert_tools_for_template(tools) if tools else None
 
+        # Per-request enable_thinking override
+        enable_thinking = kwargs.pop("enable_thinking", None)
+
         # Apply chat template
         prompt = self._apply_chat_template(
             messages,
             template_tools,
             num_images=len(all_images),
+            enable_thinking=enable_thinking,
         )
 
         # Compute prefix boundary for cache
