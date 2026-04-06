@@ -324,6 +324,11 @@ class MLLMBatchGenerator:
                 "MLLMBatchGenerator: Model does not have language_model, using model directly"
             )
 
+        # Patch attention for BatchKVCache compatibility
+        from .patches.gemma4_mllm import patch_gemma4_attention_for_batching
+
+        patch_gemma4_attention_for_batching()
+
         self.max_tokens = max_tokens
         self.stop_tokens = stop_tokens or set()
         self.sampler = sampler or (lambda x: mx.argmax(x, axis=-1))
@@ -339,6 +344,9 @@ class MLLMBatchGenerator:
 
         # Statistics
         self._stats = MLLMBatchStats()
+
+        # Error responses for requests that failed during preprocessing
+        self._pending_error_responses: List[MLLMBatchResponse] = []
 
         # Vision embedding cache for repeated images
         self.vision_cache = VisionEmbeddingCache(
@@ -666,7 +674,7 @@ class MLLMBatchGenerator:
         # KVCache.merge() creates a BatchKVCache with proper left-padding
         # alignment, so all requests share a single batched cache for
         # subsequent generation steps.
-        from mlx_lm.models.cache import KVCache
+        from mlx_lm.models.cache import KVCache, RotatingKVCache
 
         sample_cache = per_request_caches[0][0]
         if not isinstance(sample_cache, KVCache):
@@ -675,6 +683,26 @@ class MLLMBatchGenerator:
                 f"{type(sample_cache).__name__}. Disable --kv-cache-quantization "
                 f"when using multimodal models with --continuous-batching."
             )
+
+        # Fix: RotatingKVCache._update_concat does NOT trim on first call —
+        # if prompt length > max_size, the buffer grows beyond max_size.
+        # BatchRotatingKVCache.merge() then hits a shape mismatch when
+        # copying via _temporal_order (full buffer) into a max_size slice.
+        # Trim buffer to max_size before merging.
+        for rc in per_request_caches:
+            for layer_cache in rc:
+                if isinstance(layer_cache, RotatingKVCache):
+                    if layer_cache.keys is not None:
+                        buf_len = layer_cache.keys.shape[2]
+                        if buf_len > layer_cache.max_size:
+                            trim_size = buf_len - layer_cache.max_size
+                            layer_cache.keys = layer_cache._trim(
+                                trim_size, layer_cache.keys
+                            )
+                            layer_cache.values = layer_cache._trim(
+                                trim_size, layer_cache.values
+                            )
+                            layer_cache._idx = layer_cache.max_size
 
         try:
             batch_cache = [
@@ -764,15 +792,40 @@ class MLLMBatchGenerator:
                 self.active_batch = None
                 return []
 
-            new_batch = self._process_prompts(requests)
-            self.unprocessed_requests = self.unprocessed_requests[len(requests) :]
-            self.active_batch = new_batch
-            prompt_processing = True
+            try:
+                new_batch = self._process_prompts(requests)
+                self.unprocessed_requests = self.unprocessed_requests[len(requests) :]
+                self.active_batch = new_batch
+                prompt_processing = True
+            except Exception as e:
+                logger.error(
+                    f"Failed to process batch of {len(requests)} prompts: "
+                    f"{type(e).__name__}: {e}",
+                    exc_info=True,
+                )
+                # Remove failed requests to avoid infinite retry loop
+                self.unprocessed_requests = self.unprocessed_requests[len(requests) :]
+                for req in requests:
+                    self._pending_error_responses.append(
+                        MLLMBatchResponse(
+                            uid=req.uid,
+                            request_id=req.request_id,
+                            token=0,
+                            logprobs=mx.zeros(1),
+                            finish_reason="error",
+                        )
+                    )
+
+        # Collect any pending error responses (from failed preprocessing)
+        error_responses = []
+        if self._pending_error_responses:
+            error_responses = list(self._pending_error_responses)
+            self._pending_error_responses.clear()
 
         # Generate next token for active batch
         batch = self.active_batch
         if batch is None:
-            return []
+            return error_responses
 
         y, logprobs = batch.y, batch.logprobs
         batch.y, batch.logprobs = self._step(y[:, None], batch.cache)
@@ -841,7 +894,7 @@ class MLLMBatchGenerator:
                 self.active_batch = None
 
         self._stats.generation_tokens += len(responses)
-        return responses
+        return error_responses + responses
 
     def next(self) -> List[MLLMBatchResponse]:
         """
