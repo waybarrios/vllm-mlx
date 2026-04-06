@@ -24,6 +24,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 import mlx.core as mx
 import mlx.nn as nn
 
+from .memory_cache import MemoryAwarePrefixCache, MemoryCacheConfig, _trim_cache_offset
 from .multimodal_processor import MultimodalProcessor
 from .vision_embedding_cache import VisionEmbeddingCache
 
@@ -58,6 +59,9 @@ class MLLMBatchRequest:
     # Generation state
     num_tokens: int = 0  # Tokens generated so far
     output_tokens: List[int] = field(default_factory=list)
+
+    # Whether the request is text-only (no images/videos) — eligible for prefix cache
+    is_text_only: bool = False
 
     # Vision state (populated after initial VLM forward pass)
     vision_encoded: bool = False
@@ -289,6 +293,7 @@ class MLLMBatchGenerator:
         prefill_step_size: int = 1024,
         enable_vision_cache: bool = True,
         vision_cache_size: int = 100,
+        prefix_cache_config: Optional[MemoryCacheConfig] = None,
     ):
         """
         Initialize MLLM batch generator.
@@ -349,6 +354,14 @@ class MLLMBatchGenerator:
         if enable_vision_cache:
             logger.info(
                 f"MLLMBatchGenerator: Vision cache enabled (size={vision_cache_size})"
+            )
+
+        # KV prefix cache for text-only requests
+        self.prefix_cache: Optional[MemoryAwarePrefixCache] = None
+        if prefix_cache_config is not None:
+            self.prefix_cache = MemoryAwarePrefixCache(
+                model=self.language_model,
+                config=prefix_cache_config,
             )
 
         # Generation stream
@@ -545,6 +558,9 @@ class MLLMBatchGenerator:
         self._stats.num_images_processed += len(all_images)
         self._stats.vision_encoding_time += processing_time
 
+        # Mark text-only requests as eligible for prefix cache
+        request.is_text_only = not bool(all_images)
+
         logger.debug(
             f"Preprocessed request {request.request_id}: "
             f"{len(all_images)} images, {request.input_ids.size if request.input_ids is not None else 0} tokens "
@@ -641,26 +657,80 @@ class MLLMBatchGenerator:
         per_request_caches = []
 
         for req in requests:
-            # Create a fresh KVCache for this request's language model prefill
-            request_cache = make_prompt_cache(self.language_model)
+            # Try prefix cache for text-only requests
+            cached_kv = None
+            remaining_ids = None
+            if (
+                self.prefix_cache is not None
+                and req.is_text_only
+                and req.input_ids is not None
+            ):
+                input_ids_list = req.input_ids.reshape(-1).tolist()
+                cached_kv, remaining_ids = self.prefix_cache.fetch(input_ids_list)
 
-            with mx.stream(MLLMBatchGenerator._stream):
-                # Run VLM forward pass — cache= flows through to language_model
-                logits = self._run_vision_encoding(req, cache=request_cache)
+            if cached_kv is not None and remaining_ids:
+                # Prefix/LCP match — run language model on remaining tokens only
+                request_cache = cached_kv
+                remaining = mx.array(remaining_ids)[None, :]
 
-                # Extract last token logits and sample
-                last_logits = logits[:, -1, :]
-                logprobs = last_logits - mx.logsumexp(
-                    last_logits, axis=-1, keepdims=True
-                )
-                sampled = self.sampler(logprobs)
+                with mx.stream(MLLMBatchGenerator._stream):
+                    logits = self.language_model(remaining, cache=request_cache)
+                    if hasattr(logits, "logits"):
+                        logits = logits.logits
+                    last_logits = logits[:, -1, :]
+                    logprobs = last_logits - mx.logsumexp(
+                        last_logits, axis=-1, keepdims=True
+                    )
+                    sampled = self.sampler(logprobs)
+                    mx.eval(sampled, logprobs)
+                    first_tokens.append(sampled.item())
+                    all_logprobs.append(logprobs.squeeze(0))
 
-                mx.eval(sampled, logprobs)
+                per_request_caches.append(request_cache)
 
-                first_tokens.append(sampled.item())
-                all_logprobs.append(logprobs.squeeze(0))
+            elif cached_kv is not None and not remaining_ids:
+                # Exact/supersequence match — run on last token to get logits
+                request_cache = cached_kv
+                last_token = req.input_ids[:, -1:]
+                if last_token.ndim == 1:
+                    last_token = last_token[None, :]
 
-            per_request_caches.append(request_cache)
+                with mx.stream(MLLMBatchGenerator._stream):
+                    logits = self.language_model(last_token, cache=request_cache)
+                    if hasattr(logits, "logits"):
+                        logits = logits.logits
+                    last_logits = logits[:, -1, :]
+                    logprobs = last_logits - mx.logsumexp(
+                        last_logits, axis=-1, keepdims=True
+                    )
+                    sampled = self.sampler(logprobs)
+                    mx.eval(sampled, logprobs)
+                    first_tokens.append(sampled.item())
+                    all_logprobs.append(logprobs.squeeze(0))
+
+                per_request_caches.append(request_cache)
+
+            else:
+                # Cache miss — full VLM forward pass
+                request_cache = make_prompt_cache(self.language_model)
+
+                with mx.stream(MLLMBatchGenerator._stream):
+                    # Run VLM forward pass — cache= flows through to language_model
+                    logits = self._run_vision_encoding(req, cache=request_cache)
+
+                    # Extract last token logits and sample
+                    last_logits = logits[:, -1, :]
+                    logprobs = last_logits - mx.logsumexp(
+                        last_logits, axis=-1, keepdims=True
+                    )
+                    sampled = self.sampler(logprobs)
+
+                    mx.eval(sampled, logprobs)
+
+                    first_tokens.append(sampled.item())
+                    all_logprobs.append(logprobs.squeeze(0))
+
+                per_request_caches.append(request_cache)
 
         # Merge per-request KVCaches into a single BatchKVCache.
         # KVCache.merge() creates a BatchKVCache with proper left-padding
@@ -738,6 +808,35 @@ class MLLMBatchGenerator:
         sampled = self.sampler(logprobs)
 
         return sampled, list(logprobs)
+
+    def _maybe_store_prefix_cache(
+        self, batch: MLLMBatch, end_indices: List[int]
+    ) -> None:
+        """
+        Extract and store KV caches for finished text-only requests.
+
+        Must be called BEFORE batch.filter() since indices reference
+        the current batch layout.
+
+        Args:
+            batch: The active batch
+            end_indices: Indices of finished requests in the batch
+        """
+        if self.prefix_cache is None or not end_indices:
+            return
+        for i in end_indices:
+            req = batch.requests[i]
+            if req.is_text_only and req.input_ids is not None:
+                try:
+                    extracted = batch.extract_cache(i)
+                    input_ids_list = req.input_ids.reshape(-1).tolist()
+                    # Trim output tokens + 1 so fetch always returns at least
+                    # one remaining token (the last prompt token)
+                    output_count = batch.num_tokens[i]
+                    prompt_cache = _trim_cache_offset(extracted, output_count + 1)
+                    self.prefix_cache.store(input_ids_list, prompt_cache)
+                except Exception as e:
+                    logger.warning(f"[prefix_store] FAILED: {type(e).__name__}: {e}")
 
     def _next(self) -> List[MLLMBatchResponse]:
         """
@@ -833,6 +932,9 @@ class MLLMBatchGenerator:
                 )
             )
 
+        # Store prefix caches BEFORE filtering (indices must still be valid)
+        self._maybe_store_prefix_cache(batch, end_idx)
+
         # Remove finished requests from batch
         if end_idx:
             if keep_idx:
@@ -866,6 +968,22 @@ class MLLMBatchGenerator:
     def get_vision_cache_stats(self) -> Dict[str, Any]:
         """Get vision cache statistics."""
         return self.vision_cache.get_stats()
+
+    def get_prefix_cache_stats(self) -> Dict[str, Any]:
+        """Get prefix cache statistics."""
+        if self.prefix_cache is not None:
+            return self.prefix_cache.get_stats()
+        return {
+            "hits": 0,
+            "misses": 0,
+            "hit_rate": 0.0,
+            "evictions": 0,
+            "tokens_saved": 0,
+            "current_memory_mb": 0.0,
+            "max_memory_mb": 0.0,
+            "memory_utilization": 0.0,
+            "entry_count": 0,
+        }
 
     def has_pending(self) -> bool:
         """Check if there are pending or active requests."""

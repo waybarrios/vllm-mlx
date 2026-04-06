@@ -64,6 +64,10 @@ class MLLMSchedulerConfig:
     default_video_fps: float = 2.0
     # Maximum video frames
     max_video_frames: int = 128
+    # Enable KV prefix cache for text-only requests
+    enable_prefix_cache: bool = True
+    # Maximum memory for prefix cache (MB). None = auto-detect.
+    prefix_cache_memory_mb: Optional[int] = None
 
 
 @dataclass
@@ -246,8 +250,17 @@ class MLLMScheduler:
         if self.batch_generator is None:
             from mlx_lm.sample_utils import make_sampler
 
+            from .memory_cache import MemoryCacheConfig
+
             # Default sampler (can be overridden per-request in future)
             sampler = make_sampler(temp=0.7, top_p=0.9)
+
+            # Configure KV prefix cache for text-only requests
+            prefix_cache_config = None
+            if self.config.enable_prefix_cache:
+                prefix_cache_config = MemoryCacheConfig(
+                    max_memory_mb=self.config.prefix_cache_memory_mb,
+                )
 
             self.batch_generator = MLLMBatchGenerator(
                 model=self.model,
@@ -259,6 +272,7 @@ class MLLMScheduler:
                 prefill_batch_size=self.config.prefill_batch_size,
                 completion_batch_size=self.config.completion_batch_size,
                 prefill_step_size=self.config.prefill_step_size,
+                prefix_cache_config=prefix_cache_config,
             )
 
     # ========== Sync API (step-based) ==========
@@ -796,6 +810,8 @@ class MLLMScheduler:
             stats["vision_embedding_cache"] = (
                 self.batch_generator.get_vision_cache_stats()
             )
+            # KV prefix cache stats (text-only request reuse)
+            stats["memory_aware_cache"] = self.batch_generator.get_prefix_cache_stats()
 
         if self.vision_cache:
             stats["vision_cache"] = self.vision_cache.get_stats()
