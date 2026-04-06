@@ -757,6 +757,8 @@ class MLLMBatchGenerator:
         # merged into a single BatchKVCache. Merging into an active batch
         # mid-generation would cause shape mismatches in attention layers,
         # so queued requests wait until the current batch finishes.
+        # Exception: text-only requests can be extended into an active batch
+        # via the elif branch below (they skip vision encoding entirely).
         if num_active == 0:
             requests = self.unprocessed_requests[: self.completion_batch_size]
 
@@ -768,6 +770,23 @@ class MLLMBatchGenerator:
             self.unprocessed_requests = self.unprocessed_requests[len(requests) :]
             self.active_batch = new_batch
             prompt_processing = True
+
+        # Mid-batch extend: text-only requests can join an active batch
+        # without vision encoding (no shape mismatch risk).
+        elif self.unprocessed_requests:
+            text_only = [
+                r for r in self.unprocessed_requests if not r.images and not r.videos
+            ][: self.completion_batch_size]
+
+            if text_only:
+                new_batch = self._process_prompts(text_only)
+                processed_uids = {r.uid for r in text_only}
+                self.unprocessed_requests = [
+                    r for r in self.unprocessed_requests if r.uid not in processed_uids
+                ]
+                if new_batch is not None:
+                    batch.extend(new_batch)
+                prompt_processing = True
 
         # Generate next token for active batch
         batch = self.active_batch
