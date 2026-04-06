@@ -464,6 +464,10 @@ class BatchedEngine(BaseEngine):
                 max_tokens=max_tokens,
                 temperature=temperature,
                 top_p=top_p,
+                top_k=kwargs.pop("top_k", 0),
+                min_p=kwargs.pop("min_p", 0.0),
+                presence_penalty=kwargs.pop("presence_penalty", 0.0),
+                repetition_penalty=kwargs.pop("repetition_penalty", 1.0),
             )
 
             return GenerationOutput(
@@ -480,6 +484,10 @@ class BatchedEngine(BaseEngine):
             max_tokens=max_tokens,
             temperature=temperature,
             top_p=top_p,
+            top_k=kwargs.pop("top_k", 0),
+            min_p=kwargs.pop("min_p", 0.0),
+            presence_penalty=kwargs.pop("presence_penalty", 0.0),
+            repetition_penalty=kwargs.pop("repetition_penalty", 1.0),
             stop=stop or [],
         )
 
@@ -536,6 +544,10 @@ class BatchedEngine(BaseEngine):
                 max_tokens=max_tokens,
                 temperature=temperature,
                 top_p=top_p,
+                top_k=kwargs.pop("top_k", 0),
+                min_p=kwargs.pop("min_p", 0.0),
+                presence_penalty=kwargs.pop("presence_penalty", 0.0),
+                repetition_penalty=kwargs.pop("repetition_penalty", 1.0),
             )
 
             async for output in self._mllm_scheduler.stream_outputs(request_id):
@@ -556,6 +568,10 @@ class BatchedEngine(BaseEngine):
             max_tokens=max_tokens,
             temperature=temperature,
             top_p=top_p,
+            top_k=kwargs.pop("top_k", 0),
+            min_p=kwargs.pop("min_p", 0.0),
+            presence_penalty=kwargs.pop("presence_penalty", 0.0),
+            repetition_penalty=kwargs.pop("repetition_penalty", 1.0),
             stop=stop or [],
         )
 
