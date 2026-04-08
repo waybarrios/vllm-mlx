@@ -1330,6 +1330,13 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
             media_type="text/event-stream",
         )
 
+    # SpecPrefill: per-request overrides (mirrors /v1/chat/completions)
+    gen_kwargs = {}
+    if request.specprefill is not None:
+        gen_kwargs["specprefill"] = request.specprefill
+    if request.specprefill_keep_pct is not None:
+        gen_kwargs["specprefill_keep_pct"] = request.specprefill_keep_pct
+
     # Non-streaming response with timing and timeout
     start_time = time.perf_counter()
     timeout = request.timeout or _default_timeout
@@ -1346,6 +1353,10 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
         }
         if comp_rep_penalty is not None:
             gen_kwargs["repetition_penalty"] = comp_rep_penalty
+        if request.specprefill is not None:
+            gen_kwargs["specprefill"] = request.specprefill
+        if request.specprefill_keep_pct is not None:
+            gen_kwargs["specprefill_keep_pct"] = request.specprefill_keep_pct
         output = await _wait_with_disconnect(
             engine.generate(prompt=prompt, **gen_kwargs),
             raw_request,
@@ -2271,6 +2282,11 @@ async def stream_completion(
     }
     if repetition_penalty is not None:
         gen_kwargs["repetition_penalty"] = repetition_penalty
+    if request.specprefill is not None:
+        gen_kwargs["specprefill"] = request.specprefill
+    if request.specprefill_keep_pct is not None:
+        gen_kwargs["specprefill_keep_pct"] = request.specprefill_keep_pct
+
     async for output in engine.stream_generate(prompt=prompt, **gen_kwargs):
         data = {
             "id": f"cmpl-{uuid.uuid4().hex[:8]}",
