@@ -9,6 +9,7 @@ from vllm_mlx.tool_parsers import (
     AutoToolParser,
     DeepSeekToolParser,
     FunctionaryToolParser,
+    Gemma4ToolParser,
     GraniteToolParser,
     HermesToolParser,
     KimiToolParser,
@@ -39,6 +40,7 @@ class TestToolParserManager:
             "nemotron",
             "xlam",
             "functionary",
+            "gemma4",
         ]
         for p in expected:
             assert p in parsers, f"Parser '{p}' not found"
@@ -68,6 +70,7 @@ class TestToolParserManager:
             ("meetkai", FunctionaryToolParser),
             ("hermes", HermesToolParser),
             ("nous", HermesToolParser),
+            ("gemma4", Gemma4ToolParser),
         ]
         for name, expected_cls in test_cases:
             parser_cls = ToolParserManager.get_tool_parser(name)

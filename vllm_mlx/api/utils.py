@@ -121,6 +121,7 @@ _TOOL_CALL_TAGS = [
     ("<minimax:tool_call>", "</minimax:tool_call>"),
     ("<tool_call>", "</tool_call>"),
     ("<function=", "</function>"),
+    ("<|tool_call>", "<tool_call|>"),
     ("[TOOL_CALL]", "[/TOOL_CALL]"),
     ("[Calling tool", "]\n"),  # Qwen3 bracket-style: [Calling tool: func({...})]\n
 ]

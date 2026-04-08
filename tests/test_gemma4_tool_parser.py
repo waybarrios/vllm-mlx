@@ -143,3 +143,73 @@ class TestGemma4ToolParserExtract:
         result = self.parser.extract_tool_calls(output)
         assert result.tools_called is True
         assert len(result.tool_calls) == 1
+
+
+class TestGemma4ToolParserStreaming:
+    """Test streaming tool call extraction."""
+
+    def setup_method(self):
+        self.parser = Gemma4ToolParser()
+        self.parser.reset()
+
+    def test_streaming_no_tool_call(self):
+        """Normal text passes through as content."""
+        result = self.parser.extract_tool_calls_streaming(
+            previous_text="",
+            current_text="Hello",
+            delta_text="Hello",
+        )
+        assert result == {"content": "Hello"}
+
+    def test_streaming_suppresses_during_tool_call(self):
+        """Returns None while inside tool call block (buffering)."""
+        r1 = self.parser.extract_tool_calls_streaming(
+            previous_text="",
+            current_text="Sure. ",
+            delta_text="Sure. ",
+        )
+        assert r1 == {"content": "Sure. "}
+
+        r2 = self.parser.extract_tool_calls_streaming(
+            previous_text="Sure. ",
+            current_text="Sure. <|tool_call>call:read",
+            delta_text="<|tool_call>call:read",
+        )
+        assert r2 is None
+
+        r3 = self.parser.extract_tool_calls_streaming(
+            previous_text="Sure. <|tool_call>call:read",
+            current_text='Sure. <|tool_call>call:read_file{path:<|"|>/tmp/foo<|"|>}',
+            delta_text='_file{path:<|"|>/tmp/foo<|"|>}',
+        )
+        assert r3 is None
+
+    def test_streaming_emits_on_close(self):
+        """Emits structured tool_calls when end delimiter arrives."""
+        full_text = 'Sure. <|tool_call>call:read_file{path:<|"|>/tmp/foo<|"|>}<tool_call|>'
+        result = self.parser.extract_tool_calls_streaming(
+            previous_text='Sure. <|tool_call>call:read_file{path:<|"|>/tmp/foo<|"|>}',
+            current_text=full_text,
+            delta_text="<tool_call|>",
+        )
+        assert result is not None
+        assert "tool_calls" in result
+        assert len(result["tool_calls"]) == 1
+        tc = result["tool_calls"][0]
+        assert tc["function"]["name"] == "read_file"
+        assert tc["type"] == "function"
+        assert tc["index"] == 0
+
+
+class TestGemma4Registration:
+    """Test parser registration and flags."""
+
+    def test_registered_in_manager(self):
+        from vllm_mlx.tool_parsers import ToolParserManager
+
+        parser_cls = ToolParserManager.get_tool_parser("gemma4")
+        assert parser_cls is Gemma4ToolParser
+
+    def test_native_format_false(self):
+        assert Gemma4ToolParser.SUPPORTS_NATIVE_TOOL_FORMAT is False
+        assert Gemma4ToolParser.supports_native_format() is False

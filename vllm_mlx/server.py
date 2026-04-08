@@ -2293,7 +2293,7 @@ async def stream_chat_completion(
         tool_parser
         and tool_accumulated_text
         and not tool_calls_detected
-        and "<tool_call>" in tool_accumulated_text
+        and ("<tool_call>" in tool_accumulated_text or "<|tool_call>" in tool_accumulated_text)
     ):
         result = tool_parser.extract_tool_calls(tool_accumulated_text)
         if result.tools_called:

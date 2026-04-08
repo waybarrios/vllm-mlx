@@ -19,6 +19,7 @@ Available parsers:
 - functionary/meetkai: MeetKai Functionary models
 - glm47/glm4: GLM-4.7 and GLM-4.7-Flash models
 - harmony/gpt-oss: GPT-OSS models (Harmony format with channels)
+- gemma4: Google Gemma 4 models (<|tool_call>call:name{} format)
 
 Usage:
     from vllm_mlx.tool_parsers import ToolParserManager
@@ -57,6 +58,7 @@ from .qwen_tool_parser import QwenToolParser
 from .xlam_tool_parser import xLAMToolParser
 from .glm47_tool_parser import Glm47ToolParser
 from .harmony_tool_parser import HarmonyToolParser
+from .gemma4_tool_parser import Gemma4ToolParser
 
 __all__ = [
     # Base classes
@@ -77,4 +79,5 @@ __all__ = [
     "FunctionaryToolParser",
     "Glm47ToolParser",
     "HarmonyToolParser",
+    "Gemma4ToolParser",
 ]
