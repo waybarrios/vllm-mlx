@@ -144,6 +144,31 @@ class TestGemma4ToolParserExtract:
         assert result.tools_called is True
         assert len(result.tool_calls) == 1
 
+    def test_missing_end_delimiter(self):
+        """Unclosed tool call block still parses (server fallback path)."""
+        output = '<|tool_call>call:read_file{path:<|"|>/tmp/foo<|"|>}'
+        result = self.parser.extract_tool_calls(output)
+        assert result.tools_called is True
+        assert len(result.tool_calls) == 1
+        args = json.loads(result.tool_calls[0]["arguments"])
+        assert args == {"path": "/tmp/foo"}
+
+    def test_string_with_colon(self):
+        """String containing colon pattern must not be corrupted by bare-key quoting."""
+        output = '<|tool_call>call:connect{url:<|"|>host:8080<|"|>}<tool_call|>'
+        result = self.parser.extract_tool_calls(output)
+        assert result.tools_called is True
+        args = json.loads(result.tool_calls[0]["arguments"])
+        assert args == {"url": "host:8080"}
+
+    def test_string_with_newline_and_quote(self):
+        """Real newline and double quote inside string values are JSON-escaped."""
+        output = '<|tool_call>call:write{text:<|"|>line1\nline2 said "hello"<|"|>}<tool_call|>'
+        result = self.parser.extract_tool_calls(output)
+        assert result.tools_called is True
+        args = json.loads(result.tool_calls[0]["arguments"])
+        assert args == {"text": 'line1\nline2 said "hello"'}
+
 
 class TestGemma4ToolParserStreaming:
     """Test streaming tool call extraction."""
