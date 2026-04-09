@@ -483,6 +483,17 @@ class SimpleEngine(BaseEngine):
                 **kwargs,
             )
             text = clean_output_text(output.text)
+            # Preserve upstream prompt accounting while routing the blocking
+            # chat call through the cancellation-safe serialized runner.
+            tokenizer = self._model.tokenizer
+            template_kwargs = {
+                "tokenize": True,
+                "add_generation_prompt": True,
+            }
+            if template_tools:
+                template_kwargs["tools"] = template_tools
+            prompt_ids = tokenizer.apply_chat_template(messages, **template_kwargs)
+            prompt_token_count = len(prompt_ids)
             return GenerationOutput(
                 text=text,
                 tokens=output.tokens,
