@@ -378,6 +378,105 @@ class TestSchedulerBasic:
         assert uid == 7
         assert checkpoint == 1
 
+    def test_chunked_prefill_replays_checkpoint_tail_before_step(self, monkeypatch):
+        """checkpoint tails >1 must be replayed after finalize before _step."""
+
+        class FakeCacheEntry:
+            def empty(self):
+                return True
+
+        class FakePromptCache:
+            def __init__(self):
+                self.state = mx.array([0])
+
+            def finalize(self):
+                return None
+
+            def extract(self, idx):
+                return self
+
+        class FakeStats:
+            prompt_tokens = 0
+            prompt_time = 0.0
+            generation_time = 0.0
+            generation_tokens = 0
+
+        callback_payloads = []
+        model_calls = []
+        step_inputs = []
+
+        from collections import namedtuple
+
+        _Response = namedtuple(
+            "Response", ["uid", "token", "logprobs", "finish_reason", "cache"]
+        )
+
+        class FakeBatchGenerator:
+            Response = _Response
+
+            def __init__(self):
+                self._stats = FakeStats()
+                self._partial = None
+                self.active_batch = None
+                self.unprocessed_prompts = [
+                    (
+                        7,
+                        [1, 2, 3, 4, 5],
+                        16,
+                        [FakeCacheEntry()],
+                        None,
+                        [None],
+                        2,
+                    )
+                ]
+                self.prefill_batch_size = 1
+                self.completion_batch_size = 1
+                self.max_kv_size = None
+                self.stop_tokens = {99}
+                self.prompt_progress_callback = lambda _progress: None
+                self.prompt_checkpoint_callback = (
+                    lambda entries: callback_payloads.extend(entries)
+                )
+                self._next = lambda: []
+                self.remove = lambda _uids: None
+                self._process_prompts = lambda _prompts: None
+
+            def model(self, inputs, cache=None):
+                model_calls.append(inputs.tolist())
+
+            def _step(self, inputs, cache, samplers, logits_processors, tokens):
+                step_inputs.append(inputs.tolist())
+                return mx.array([99]), mx.array([-1.0])
+
+        monkeypatch.setattr(
+            mlx_generate,
+            "_left_pad_prompts",
+            lambda prompts, max_length=None: mx.array(prompts),
+        )
+        monkeypatch.setattr(
+            mlx_generate,
+            "_make_cache",
+            lambda _model, _padding, _max_kv_size=None: [FakePromptCache()],
+        )
+
+        batch_gen = FakeBatchGenerator()
+        _install_chunked_prefill(batch_gen, budget=2)
+
+        # First _next: process the first chunk and leave a 3-token checkpoint tail.
+        batch_gen._next()
+        assert batch_gen._partial is not None
+        assert batch_gen._partial["prompt_checkpoint"] == 3
+
+        # Second _next: finalize, fire callback, replay the checkpoint tail, step.
+        batch_gen._next()
+
+        assert model_calls == [[[1, 2]], [[3, 4]]]
+        assert step_inputs[0] == [[3, 4, 5]]
+        assert len(callback_payloads) == 1
+        uid, checkpoint, _cache_gen = callback_payloads[0]
+        assert uid == 7
+        assert checkpoint == 3
+
     def test_scheduler_creation(self, mock_model, mock_tokenizer):
         """Test scheduler creation."""
         scheduler = Scheduler(

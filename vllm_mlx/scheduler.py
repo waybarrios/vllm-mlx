@@ -319,6 +319,9 @@ def _install_chunked_prefill(
                     )
                 mx.clear_cache()
 
+                # Mirror upstream BatchGenerator semantics: after finalize() and
+                # the checkpoint callback, replay the remaining checkpoint tail
+                # except for the final token, which _step() consumes.
                 if prompt_checkpoint > 1:
                     self.model(
                         mx.contiguous(inputs[:, : prompt_checkpoint - 1]),
@@ -421,6 +424,9 @@ def _install_chunked_prefill(
                     max_length = max(lengths)
                     padding = [max_length - ln for ln in lengths]
                     tokens = [mx.array(inp) for inp in inputs_raw]
+                    # Match mlx-lm's prompt_checkpoint contract: positive values
+                    # name the checkpoint token position in the prompt, while
+                    # non-positive values already encode an offset from the end.
                     checkpoint_offsets = [
                         (ln - pc if pc > 0 else -pc)
                         for ln, pc in zip(lengths, prompt_checkpoints)
