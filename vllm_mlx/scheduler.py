@@ -148,13 +148,65 @@ def _install_chunked_prefill(
     import time as _time
 
     from mlx_lm.generate import (
-        Batch,
-        _lazy_extract_cache,
         _left_pad_prompts,
         _make_cache,
         _merge_caches,
         _right_pad_prompts,
     )
+
+    try:
+        from mlx_lm.generate import _lazy_extract_cache
+    except ImportError:
+
+        def _lazy_extract_cache(cache, idx):
+            return (c.extract(idx) for c in cache)
+
+    try:
+        from mlx_lm.generate import Batch as _batch_cls
+    except ImportError:
+
+        @dataclass
+        class _batch_cls:
+            uids: List[int]
+            y: Any
+            logprobs: List[Any]
+            max_tokens: List[int]
+            num_tokens: List[int]
+            cache: List[Any]
+            samplers: List[Any]
+            logits_processors: List[Any]
+            tokens: List[Any]
+
+            def __len__(self):
+                return len(self.uids)
+
+            def filter(self, keep_idx: List[int]):
+                self.uids = [self.uids[k] for k in keep_idx]
+                self.logprobs = [self.logprobs[k] for k in keep_idx]
+                self.max_tokens = [self.max_tokens[k] for k in keep_idx]
+                self.num_tokens = [self.num_tokens[k] for k in keep_idx]
+                self.samplers = [self.samplers[k] for k in keep_idx]
+                self.logits_processors = [self.logits_processors[k] for k in keep_idx]
+                self.tokens = [self.tokens[k] for k in keep_idx]
+                keep_idx_mx = mx.array(keep_idx, mx.int32)
+                self.y = self.y[keep_idx_mx]
+                for c in self.cache:
+                    c.filter(keep_idx_mx)
+
+            def extend(self, other):
+                self.uids.extend(other.uids)
+                self.y = mx.concatenate([self.y, other.y])
+                self.logprobs.extend(other.logprobs)
+                self.num_tokens.extend(other.num_tokens)
+                self.max_tokens.extend(other.max_tokens)
+                self.samplers.extend(other.samplers)
+                self.logits_processors.extend(other.logits_processors)
+                self.tokens.extend(other.tokens)
+                for c, o in zip(self.cache, other.cache):
+                    c.extend(o)
+
+            def extract_cache(self, idx):
+                return [c.extract(idx) for c in self.cache]
 
     # Keep references to originals
     _orig_next = batch_gen._next
@@ -343,10 +395,10 @@ def _install_chunked_prefill(
                 )
                 mx.async_eval(y, logprobs)
 
-                new_batch = Batch(
+                new_batch = _batch_cls(
                     list(partial["uids"]),
                     y,
-                    logprobs,
+                    list(logprobs),
                     list(partial["max_tokens"]),
                     [0] * len(partial["uids"]),
                     prompt_cache,
