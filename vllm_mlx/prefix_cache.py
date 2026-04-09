@@ -687,7 +687,11 @@ class BlockAwarePrefixCache:
                 else:
                     block_slices.append(None)
 
-            return block_slices if any(entry is not None for entry in block_slices) else None
+            return (
+                block_slices
+                if any(entry is not None for entry in block_slices)
+                else None
+            )
 
         except Exception as e:
             logger.warning(f"Failed to extract block tensor slice: {e}")
@@ -698,9 +702,7 @@ class BlockAwarePrefixCache:
         if not isinstance(state, (list, tuple)) or not state:
             return False
         return all(
-            tensor is not None
-            and hasattr(tensor, "shape")
-            and len(tensor.shape) == 4
+            tensor is not None and hasattr(tensor, "shape") and len(tensor.shape) == 4
             for tensor in state
         )
 

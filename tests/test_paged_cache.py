@@ -831,8 +831,18 @@ class TestBlockAwarePrefixCache:
         kv_a = mx.arange(1 * 2 * 8 * 3).reshape(1, 2, 8, 3)
         recurrent_a = [mx.ones((1, 3, 8)), mx.ones((1, 2, 4, 4))]
         extracted_a = [
-            {"state": (kv_a, kv_a), "meta_state": "", "class_ref": KVCache, "class_name": "KVCache"},
-            {"state": recurrent_a, "meta_state": "", "class_ref": ArraysCache, "class_name": "ArraysCache"},
+            {
+                "state": (kv_a, kv_a),
+                "meta_state": "",
+                "class_ref": KVCache,
+                "class_name": "KVCache",
+            },
+            {
+                "state": recurrent_a,
+                "meta_state": "",
+                "class_ref": ArraysCache,
+                "class_name": "ArraysCache",
+            },
         ]
         bt_a = cache.store_cache("req-a", list(range(8)), extracted_a)
 
@@ -840,8 +850,18 @@ class TestBlockAwarePrefixCache:
         kv_b = mx.arange(1 * 2 * 12 * 3).reshape(1, 2, 12, 3)
         recurrent_b = [mx.full((1, 3, 8), 2.0), mx.full((1, 2, 4, 4), 2.0)]
         extracted_b = [
-            {"state": (kv_b, kv_b), "meta_state": "", "class_ref": KVCache, "class_name": "ArraysCache"},
-            {"state": recurrent_b, "meta_state": "", "class_ref": ArraysCache, "class_name": "ArraysCache"},
+            {
+                "state": (kv_b, kv_b),
+                "meta_state": "",
+                "class_ref": KVCache,
+                "class_name": "ArraysCache",
+            },
+            {
+                "state": recurrent_b,
+                "meta_state": "",
+                "class_ref": ArraysCache,
+                "class_name": "ArraysCache",
+            },
         ]
         bt_b = cache.store_cache("req-b", list(range(12)), extracted_b)
 
