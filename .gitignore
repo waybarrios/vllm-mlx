@@ -101,3 +101,4 @@ uv.lock
 
 # Superpowers planning artifacts
 docs/superpowers/
+.firecrawl/
