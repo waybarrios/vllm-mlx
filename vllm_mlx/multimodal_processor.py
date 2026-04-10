@@ -147,7 +147,7 @@ class MultimodalProcessor:
                     logger.warning(f"Failed to process video: {e}")
 
         # Determine add_special_tokens based on model type
-        if self.config and self.config.model_type in ["gemma3", "gemma3n"]:
+        if self.config and self.config.model_type in ["gemma3", "gemma3n", "gemma4"]:
             add_special_tokens = not hasattr(self.processor, "chat_template")
 
         # Prepare inputs using mlx_vlm

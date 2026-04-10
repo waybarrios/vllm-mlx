@@ -219,7 +219,7 @@ class MLLMScheduler:
         self.total_completion_tokens = 0
 
     def _get_stop_tokens(self) -> Set[int]:
-        """Get stop token IDs from tokenizer."""
+        """Get stop token IDs from tokenizer and generation_config.json."""
         stop_tokens = set()
         tokenizer = (
             self.processor.tokenizer
@@ -238,6 +238,25 @@ class MLLMScheduler:
                 stop_tokens.update(tokenizer.eos_token_ids)
             else:
                 stop_tokens.add(tokenizer.eos_token_ids)
+
+        # Also read generation_config.json which may have additional EOS tokens
+        # (e.g., Gemma 4 has <turn|>=106, <|tool_response>=50 as EOS)
+        model_path = getattr(tokenizer, "name_or_path", None)
+        if model_path:
+            import json
+            from pathlib import Path
+
+            gc_path = Path(model_path) / "generation_config.json"
+            if gc_path.exists():
+                try:
+                    gc = json.loads(gc_path.read_text())
+                    gc_eos = gc.get("eos_token_id")
+                    if isinstance(gc_eos, list):
+                        stop_tokens.update(gc_eos)
+                    elif gc_eos is not None:
+                        stop_tokens.add(gc_eos)
+                except Exception:
+                    pass
 
         return stop_tokens
 
@@ -458,8 +477,8 @@ class MLLMScheduler:
             request.num_output_tokens = len(request.output_tokens)
 
             # Decode the new token using streaming detokenizer (UTF-8 safe).
-            # Skip stop tokens — they are not content.
-            if response.finish_reason == "stop":
+            # Skip stop tokens and error placeholders — they are not content.
+            if response.finish_reason in ("stop", "error"):
                 new_text = ""
             else:
                 if request_id not in self._detokenizer_pool:
@@ -489,6 +508,8 @@ class MLLMScheduler:
                     request.status = RequestStatus.FINISHED_STOPPED
                 elif response.finish_reason == "length":
                     request.status = RequestStatus.FINISHED_LENGTH_CAPPED
+                elif response.finish_reason == "error":
+                    request.status = RequestStatus.FINISHED_ABORTED
 
                 output.finished = True
                 output.finish_reason = response.finish_reason

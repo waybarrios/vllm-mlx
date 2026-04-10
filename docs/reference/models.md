@@ -12,7 +12,7 @@ Browse thousands of pre-optimized models at: **https://huggingface.co/mlx-commun
 | Mistral / Devstral | 7B, Mixtral 8x7B | 4-bit, 8-bit |
 | Qwen2/Qwen3 | 0.5B to 72B | Various |
 | DeepSeek V3, R1 | 7B, 33B, 67B | 4-bit |
-| Gemma 2, 3 | 2B, 9B, 27B | 4-bit |
+| Gemma 2, 3, 4 | 2B, 9B, 27B | 4-bit |
 | GLM-4.7 | Flash, Base | 4-bit, 8-bit |
 | Kimi K2 | Various | 4-bit |
 | Phi-3 | 3.8B, 14B | 4-bit |
@@ -35,6 +35,7 @@ Browse thousands of pre-optimized models at: **https://huggingface.co/mlx-commun
 | **Qwen-VL** | `Qwen3-VL-4B-Instruct-3bit`, `Qwen3-VL-8B-Instruct-4bit`, `Qwen2-VL-2B/7B-Instruct-4bit` |
 | **LLaVA** | `llava-1.5-7b-4bit`, `llava-v1.6-mistral-7b-4bit`, `llava-llama-3-8b-v1_1-4bit` |
 | **Idefics** | `Idefics3-8B-Llama3-4bit`, `idefics2-8b-4bit` |
+| **Gemma 4** | `gemma-4-e2b-it-mxfp4` (vision + audio) |
 | **PaliGemma** | `paligemma2-3b-mix-224-4bit`, `paligemma-3b-mix-224-8bit` |
 | **Pixtral** | `pixtral-12b-4bit`, `pixtral-12b-8bit` |
 | **Molmo** | `Molmo-7B-D-0924-4bit`, `Molmo-7B-D-0924-8bit` |
@@ -72,7 +73,7 @@ vllm-mlx auto-detects multimodal models by name patterns:
 - Contains "VL", "Vision", "vision"
 - Contains "llava", "idefics", "paligemma"
 - Contains "pixtral", "molmo", "deepseek-vl"
-- Contains "MedGemma", "Gemma-3" (vision variants)
+- Contains "MedGemma", "Gemma-3", "Gemma-4" (multimodal variants)
 
 ## Using Models
 

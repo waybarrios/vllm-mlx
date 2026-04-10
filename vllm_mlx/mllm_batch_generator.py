@@ -156,15 +156,44 @@ class MLLMBatch:
 
     def extract_cache(self, idx: int) -> List[Any]:
         """
-        Extract cache for a single request (for caching).
+        Extract cache for a single request (for prefix caching).
 
-        Args:
-            idx: Index of request in batch
-
-        Returns:
-            Cache state for that request
+        Handles BatchRotatingKVCache negative left_padding bug:
+        during generation with rotation, left_padding becomes negative,
+        causing extract() to use Python negative indexing and truncate
+        the buffer to only generation tokens instead of the full window.
         """
-        return [c.extract(idx) if hasattr(c, "extract") else None for c in self.cache]
+        from mlx_lm.models.cache import (
+            BatchRotatingKVCache,
+            RotatingKVCache,
+        )
+
+        result = []
+        for c in self.cache:
+            if not hasattr(c, "extract"):
+                result.append(None)
+            elif isinstance(c, BatchRotatingKVCache):
+                # Custom extraction: clamp left_padding to >= 0
+                cache = RotatingKVCache(c.max_size)
+                padding = max(0, c.left_padding[idx].item())
+                offset = c.offset[idx].item()
+                cache.keys = c.keys[idx : idx + 1]
+                cache.values = c.values[idx : idx + 1]
+                cache._idx = c._idx
+                if c.rotated:
+                    cache.keys = mx.roll(cache.keys, -c._idx, axis=2)
+                    cache.values = mx.roll(cache.values, -c._idx, axis=2)
+                    cache._idx = c.max_size
+                cache.keys = mx.contiguous(cache.keys[:, :, padding : cache._idx])
+                cache.values = mx.contiguous(cache.values[:, :, padding : cache._idx])
+                cache.offset = offset
+                cache._idx = cache.keys.shape[2]
+                cache.step = getattr(c, "step", c.max_size)
+                cache.keep = getattr(c, "keep", 0)
+                result.append(cache)
+            else:
+                result.append(c.extract(idx))
+        return result
 
 
 class MLLMBatchStats:
@@ -203,32 +232,6 @@ class MLLMBatchStats:
             "num_images_processed": self.num_images_processed,
             "peak_memory": self.peak_memory,
         }
-
-
-def _make_batch_cache(model: nn.Module, left_padding: List[int]) -> List[Any]:
-    """
-    Create batch-aware KV cache for the language model.
-
-    Args:
-        model: The language model (model.language_model from VLM)
-        left_padding: Padding amounts for left-padded prompts
-
-    Returns:
-        List of BatchKVCache objects for each layer
-    """
-    from mlx_lm.models.cache import BatchKVCache, KVCache
-
-    def to_batch_cache(c):
-        if isinstance(c, KVCache):
-            return BatchKVCache(left_padding)
-        else:
-            raise ValueError(f"{type(c)} does not yet support batching")
-
-    if hasattr(model, "make_cache"):
-        cache = model.make_cache()
-        return [to_batch_cache(c) for c in cache]
-    else:
-        return [BatchKVCache(left_padding) for _ in model.layers]
 
 
 def _left_pad_prompts(
@@ -324,6 +327,11 @@ class MLLMBatchGenerator:
                 "MLLMBatchGenerator: Model does not have language_model, using model directly"
             )
 
+        # Patch attention for BatchKVCache compatibility
+        from .patches.gemma4_mllm import patch_gemma4_attention_for_batching
+
+        patch_gemma4_attention_for_batching()
+
         self.max_tokens = max_tokens
         self.stop_tokens = stop_tokens or set()
         self.sampler = sampler or (lambda x: mx.argmax(x, axis=-1))
@@ -339,6 +347,9 @@ class MLLMBatchGenerator:
 
         # Statistics
         self._stats = MLLMBatchStats()
+
+        # Error responses for requests that failed during preprocessing
+        self._pending_error_responses: List[MLLMBatchResponse] = []
 
         # Vision embedding cache for repeated images
         self.vision_cache = VisionEmbeddingCache(
@@ -666,15 +677,36 @@ class MLLMBatchGenerator:
         # KVCache.merge() creates a BatchKVCache with proper left-padding
         # alignment, so all requests share a single batched cache for
         # subsequent generation steps.
-        from mlx_lm.models.cache import KVCache
+        from mlx_lm.models.cache import KVCache, RotatingKVCache
 
         sample_cache = per_request_caches[0][0]
-        if not isinstance(sample_cache, KVCache):
+        if not isinstance(sample_cache, (KVCache, RotatingKVCache)):
             raise ValueError(
-                f"MLLM continuous batching requires standard KVCache but got "
-                f"{type(sample_cache).__name__}. Disable --kv-cache-quantization "
-                f"when using multimodal models with --continuous-batching."
+                f"MLLM continuous batching requires KVCache or "
+                f"RotatingKVCache but got {type(sample_cache).__name__}. "
+                f"Disable --kv-cache-quantization when using multimodal "
+                f"models with --continuous-batching."
             )
+
+        # Fix: RotatingKVCache._update_concat does NOT trim on first call —
+        # if prompt length > max_size, the buffer grows beyond max_size.
+        # BatchRotatingKVCache.merge() then hits a shape mismatch when
+        # copying via _temporal_order (full buffer) into a max_size slice.
+        # Trim buffer to max_size before merging.
+        for rc in per_request_caches:
+            for layer_cache in rc:
+                if isinstance(layer_cache, RotatingKVCache):
+                    if layer_cache.keys is not None:
+                        buf_len = layer_cache.keys.shape[2]
+                        if buf_len > layer_cache.max_size:
+                            trim_size = buf_len - layer_cache.max_size
+                            layer_cache.keys = layer_cache._trim(
+                                trim_size, layer_cache.keys
+                            )
+                            layer_cache.values = layer_cache._trim(
+                                trim_size, layer_cache.values
+                            )
+                            layer_cache._idx = layer_cache.max_size
 
         try:
             batch_cache = [
@@ -764,15 +796,40 @@ class MLLMBatchGenerator:
                 self.active_batch = None
                 return []
 
-            new_batch = self._process_prompts(requests)
-            self.unprocessed_requests = self.unprocessed_requests[len(requests) :]
-            self.active_batch = new_batch
-            prompt_processing = True
+            try:
+                new_batch = self._process_prompts(requests)
+                self.unprocessed_requests = self.unprocessed_requests[len(requests) :]
+                self.active_batch = new_batch
+                prompt_processing = True
+            except Exception as e:
+                logger.error(
+                    f"Failed to process batch of {len(requests)} prompts: "
+                    f"{type(e).__name__}: {e}",
+                    exc_info=True,
+                )
+                # Remove failed requests to avoid infinite retry loop
+                self.unprocessed_requests = self.unprocessed_requests[len(requests) :]
+                for req in requests:
+                    self._pending_error_responses.append(
+                        MLLMBatchResponse(
+                            uid=req.uid,
+                            request_id=req.request_id,
+                            token=0,
+                            logprobs=mx.zeros(1),
+                            finish_reason="error",
+                        )
+                    )
+
+        # Collect any pending error responses (from failed preprocessing)
+        error_responses = []
+        if self._pending_error_responses:
+            error_responses = list(self._pending_error_responses)
+            self._pending_error_responses.clear()
 
         # Generate next token for active batch
         batch = self.active_batch
         if batch is None:
-            return []
+            return error_responses
 
         y, logprobs = batch.y, batch.logprobs
         batch.y, batch.logprobs = self._step(y[:, None], batch.cache)
@@ -841,7 +898,7 @@ class MLLMBatchGenerator:
                 self.active_batch = None
 
         self._stats.generation_tokens += len(responses)
-        return responses
+        return error_responses + responses
 
     def next(self) -> List[MLLMBatchResponse]:
         """

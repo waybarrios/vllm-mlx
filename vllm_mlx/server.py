@@ -42,6 +42,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import secrets
 import tempfile
 import threading
@@ -57,8 +58,13 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 # Import from new modular API
 # Re-export for backwards compatibility with tests
-from .api.anthropic_adapter import anthropic_to_openai, openai_to_anthropic
-from .api.anthropic_models import AnthropicRequest
+from .api.anthropic_adapter import anthropic_to_openai
+from .api.anthropic_models import (
+    AnthropicRequest,
+    AnthropicResponse,
+    AnthropicResponseContentBlock,
+    AnthropicUsage,
+)
 from .api.models import (
     AssistantMessage,  # noqa: F401
     ChatCompletionChoice,  # noqa: F401
@@ -1535,6 +1541,17 @@ def _inject_json_instruction(messages: list, instruction: str) -> list:
 # =============================================================================
 
 
+def _convert_anthropic_stop_reason(openai_reason: str | None) -> str:
+    """Convert OpenAI finish_reason to Anthropic stop_reason."""
+    mapping = {
+        "stop": "end_turn",
+        "tool_calls": "tool_use",
+        "length": "max_tokens",
+        "content_filter": "end_turn",
+    }
+    return mapping.get(openai_reason or "", "end_turn")
+
+
 @app.post("/v1/messages")
 async def create_anthropic_message(
     request: Request,
@@ -1549,8 +1566,19 @@ async def create_anthropic_message(
     """
     engine = get_engine()
 
-    # Parse the raw body to handle Anthropic request format
-    body = await request.json()
+    # Parse the raw body to handle Anthropic request format.
+    # Some clients (e.g. Claude Code) may send JSON with invalid escape
+    # sequences like \s, \d in regex patterns within tool definitions.
+    # Python's json.loads is strict per RFC 8259 and rejects these.
+    try:
+        body = await request.json()
+    except json.JSONDecodeError as e:
+        if "Invalid \\escape" in str(e):
+            raw = await request.body()
+            # Replace lone backslashes (not valid JSON escapes) with \\
+            body = json.loads(re.sub(rb'\\(?!["\\/bfnrtu])', rb"\\\\", raw))
+        else:
+            raise
     anthropic_request = AnthropicRequest(**body)
 
     _validate_model_name(anthropic_request.model)
@@ -1627,35 +1655,63 @@ async def create_anthropic_message(
         output.text, openai_request
     )
 
+    # Extract reasoning if parser is configured
+    reasoning_text = None
+    if _reasoning_parser and not tool_calls:
+        text_to_parse = cleaned_text or output.text
+        reasoning_text, cleaned_text = _reasoning_parser.extract_reasoning(
+            text_to_parse
+        )
+
     # Clean output text
     final_content = None
     if cleaned_text:
         final_content = clean_output_text(cleaned_text)
 
-    # Determine finish reason
-    finish_reason = "tool_calls" if tool_calls else output.finish_reason
+    # Build Anthropic content blocks directly (with thinking support)
+    content_blocks = []
 
-    # Build OpenAI response to convert
-    openai_response = ChatCompletionResponse(
-        model=_model_name,
-        choices=[
-            ChatCompletionChoice(
-                message=AssistantMessage(
-                    content=final_content,
-                    tool_calls=tool_calls,
-                ),
-                finish_reason=finish_reason,
+    if reasoning_text:
+        content_blocks.append(
+            AnthropicResponseContentBlock(type="thinking", thinking=reasoning_text)
+        )
+
+    if final_content:
+        content_blocks.append(
+            AnthropicResponseContentBlock(type="text", text=final_content)
+        )
+
+    if tool_calls:
+        for tc in tool_calls:
+            try:
+                tool_input = json.loads(tc.function.arguments)
+            except (json.JSONDecodeError, AttributeError):
+                tool_input = {}
+            content_blocks.append(
+                AnthropicResponseContentBlock(
+                    type="tool_use",
+                    id=tc.id,
+                    name=tc.function.name,
+                    input=tool_input,
+                )
             )
-        ],
-        usage=Usage(
-            prompt_tokens=output.prompt_tokens,
-            completion_tokens=output.completion_tokens,
-            total_tokens=output.prompt_tokens + output.completion_tokens,
-        ),
+
+    if not content_blocks:
+        content_blocks.append(AnthropicResponseContentBlock(type="text", text=""))
+
+    stop_reason = _convert_anthropic_stop_reason(
+        "tool_calls" if tool_calls else output.finish_reason
     )
 
-    # Convert to Anthropic response
-    anthropic_response = openai_to_anthropic(openai_response, _model_name)
+    anthropic_response = AnthropicResponse(
+        model=_model_name,
+        content=content_blocks,
+        stop_reason=stop_reason,
+        usage=AnthropicUsage(
+            input_tokens=output.prompt_tokens,
+            output_tokens=output.completion_tokens,
+        ),
+    )
     return Response(
         content=anthropic_response.model_dump_json(exclude_none=True),
         media_type="application/json",
@@ -1836,26 +1892,39 @@ async def _stream_anthropic_messages(
 
     # Stream pipeline: raw text → tool call filter → think router → emit
     # - Tool call filter strips tool call markup (emitted as structured blocks later)
-    # - Think router separates <think> content into Anthropic thinking blocks
+    # - Think router separates reasoning from content into Anthropic blocks
+    #
+    # When a reasoning parser is configured (e.g. --reasoning-parser gemma4),
+    # it replaces the generic StreamingThinkRouter to handle model-specific
+    # reasoning formats (e.g. Gemma 4 <|channel>thought...<channel|>).
     accumulated_text = ""
+    use_reasoning_parser = _reasoning_parser is not None
     tool_filter = StreamingToolCallFilter()
-    # Detect if the model's chat template injects <think> into the
-    # generation prompt. If so, the model starts in thinking mode and
-    # the opening tag never appears in the output stream.
-    _tokenizer = engine.tokenizer if hasattr(engine, "tokenizer") else None
-    _chat_template = ""
-    if _tokenizer and hasattr(_tokenizer, "chat_template"):
-        _chat_template = _tokenizer.chat_template or ""
-    _starts_thinking = (
-        "<think>" in _chat_template and "add_generation_prompt" in _chat_template
-    )
-    think_router = StreamingThinkRouter(start_in_thinking=_starts_thinking)
+
+    if use_reasoning_parser:
+        _reasoning_parser.reset_state()
+        think_router = None
+    else:
+        # Detect if the model's chat template injects <think> into the
+        # generation prompt. If so, the model starts in thinking mode and
+        # the opening tag never appears in the output stream.
+        _tokenizer = engine.tokenizer if hasattr(engine, "tokenizer") else None
+        _chat_template = ""
+        if _tokenizer and hasattr(_tokenizer, "chat_template"):
+            _chat_template = _tokenizer.chat_template or ""
+        _starts_thinking = (
+            "<think>" in _chat_template and "add_generation_prompt" in _chat_template
+        )
+        think_router = StreamingThinkRouter(start_in_thinking=_starts_thinking)
+
     prompt_tokens = 0
     completion_tokens = 0
 
     # Track which content blocks we've started
     current_block_type = None  # "thinking" or "text"
     block_index = 0
+    # For reasoning parser: track accumulated text for parser context
+    reasoning_accumulated = ""
 
     async for output in engine.stream_chat(messages=messages, **chat_kwargs):
         delta_text = output.new_text
@@ -1878,30 +1947,62 @@ async def _stream_anthropic_messages(
                 filtered = tool_filter.process(content)
                 if not filtered:
                     continue
-                # Stage 2: route thinking vs text
-                pieces = think_router.process(filtered)
+
+                if use_reasoning_parser:
+                    # Stage 2a: use reasoning parser for model-specific formats
+                    prev = reasoning_accumulated
+                    reasoning_accumulated += filtered
+                    delta_msg = _reasoning_parser.extract_reasoning_streaming(
+                        prev, reasoning_accumulated, filtered
+                    )
+                    if delta_msg is None:
+                        continue
+                    pieces = []
+                    if delta_msg.reasoning:
+                        pieces.append(("thinking", delta_msg.reasoning))
+                    if delta_msg.content:
+                        pieces.append(("text", delta_msg.content))
+                else:
+                    # Stage 2b: generic <think> tag router
+                    pieces = think_router.process(filtered)
+
                 events, current_block_type, block_index = _emit_content_pieces(
                     pieces, current_block_type, block_index
                 )
                 for event in events:
                     yield event
 
-    # Flush remaining from both filters
+    # Flush remaining from tool filter
     remaining = tool_filter.flush()
     if remaining:
+        if use_reasoning_parser:
+            prev = reasoning_accumulated
+            reasoning_accumulated += remaining
+            delta_msg = _reasoning_parser.extract_reasoning_streaming(
+                prev, reasoning_accumulated, remaining
+            )
+            pieces = []
+            if delta_msg:
+                if delta_msg.reasoning:
+                    pieces.append(("thinking", delta_msg.reasoning))
+                if delta_msg.content:
+                    pieces.append(("text", delta_msg.content))
+        else:
+            pieces = think_router.process(remaining)
         events, current_block_type, block_index = _emit_content_pieces(
-            think_router.process(remaining), current_block_type, block_index
+            pieces, current_block_type, block_index
         )
         for event in events:
             yield event
 
-    flush_pieces = think_router.flush()
-    if flush_pieces:
-        events, current_block_type, block_index = _emit_content_pieces(
-            flush_pieces, current_block_type, block_index
-        )
-        for event in events:
-            yield event
+    if not use_reasoning_parser:
+        flush_pieces = think_router.flush()
+        if flush_pieces:
+            events, current_block_type, block_index = _emit_content_pieces(
+                flush_pieces, current_block_type, block_index
+            )
+            for event in events:
+                yield event
 
     # Close final content block
     if current_block_type is not None:
