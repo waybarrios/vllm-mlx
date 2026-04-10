@@ -480,8 +480,14 @@ class SimpleEngine(BaseEngine):
                 }
                 if template_tools:
                     template_kwargs["tools"] = template_tools
-                prompt_ids = tokenizer.apply_chat_template(messages, **template_kwargs)
-                prompt_token_count = len(prompt_ids)
+                try:
+                    prompt_ids = tokenizer.apply_chat_template(messages, **template_kwargs)
+                    prompt_token_count = len(prompt_ids)
+                except (TypeError, ValueError):
+                    # No chat template (e.g., MedGemma) — estimate prompt tokens
+                    prompt_token_count = sum(
+                        len(m.get("content", "")) // 4 for m in messages
+                    )
                 return GenerationOutput(
                     text=text,
                     tokens=output.tokens,
@@ -607,7 +613,17 @@ class SimpleEngine(BaseEngine):
                 for key in ["tools", "enable_thinking"]:
                     if key in template_kwargs:
                         del template_kwargs[key]
-                prompt = tokenizer.apply_chat_template(messages, **template_kwargs)
+                try:
+                    prompt = tokenizer.apply_chat_template(messages, **template_kwargs)
+                except (TypeError, ValueError):
+                    prompt = None  # Fall through to plain-text fallback
+            except ValueError:
+                # No chat_template configured (e.g., MedGemma)
+                prompt = None
+
+            if prompt is None:
+                prompt = "\n".join(f"{m['role']}: {m['content']}" for m in messages)
+                prompt += "\nassistant:"
         else:
             prompt = "\n".join(f"{m['role']}: {m['content']}" for m in messages)
             prompt += "\nassistant:"

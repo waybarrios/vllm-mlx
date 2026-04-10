@@ -380,13 +380,19 @@ class BatchedEngine(BaseEngine):
                 for key in ["tools"]:
                     if key in template_kwargs:
                         del template_kwargs[key]
-                return template_applicator.apply_chat_template(
-                    messages, **template_kwargs
-                )
-        else:
-            # Fallback for models without apply_chat_template
-            prompt = "\n".join(f"{m['role']}: {m['content']}" for m in messages)
-            return prompt + "\nassistant:"
+                try:
+                    return template_applicator.apply_chat_template(
+                        messages, **template_kwargs
+                    )
+                except (TypeError, ValueError):
+                    pass  # Fall through to plain-text fallback below
+            except ValueError as e:
+                # No chat_template configured (e.g., MedGemma processor).
+                logger.warning(f"No chat template available: {e}, using plain-text fallback")
+
+        # Fallback for models without apply_chat_template or no template configured
+        prompt = "\n".join(f"{m['role']}: {m['content']}" for m in messages)
+        return prompt + "\nassistant:"
 
     @staticmethod
     def _prepare_mllm_messages(
