@@ -19,6 +19,7 @@ Architecture:
 """
 
 import asyncio
+import concurrent.futures
 import logging
 import time
 import uuid
@@ -634,14 +635,33 @@ class MLLMScheduler:
         logger.info("MLLM Scheduler stopped")
 
     async def _process_loop(self) -> None:
-        """Main async processing loop."""
+        """Main async processing loop.
+
+        Uses a thread pool executor for steps that involve prefill
+        (waiting requests or partial prefill in progress) so that the
+        event loop stays responsive for health checks and other HTTP
+        endpoints.  Decode-only steps are fast (<3 ms) and run inline.
+        """
+        _executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="mllm-step"
+        )
+        loop = asyncio.get_running_loop()
+
         while self._running:
             try:
                 if self.has_requests():
-                    # Run one step
-                    self.step()
-                    # Yield to other tasks
-                    await asyncio.sleep(0)
+                    has_waiting = self.get_num_waiting() > 0
+                    has_partial = (
+                        self.batch_generator is not None
+                        and getattr(self.batch_generator, "_partial", None) is not None
+                    )
+                    needs_executor = has_waiting or has_partial
+
+                    if needs_executor:
+                        await loop.run_in_executor(_executor, self.step)
+                    else:
+                        self.step()
+                        await asyncio.sleep(0)
                 else:
                     # No work, wait a bit
                     await asyncio.sleep(0.01)
