@@ -225,6 +225,53 @@ class TestMLLMBatchStats:
         assert stats.prompt_tps == 0
         assert stats.generation_tps == 0
 
+    def test_process_prompts_accepts_rotating_kv_cache(self, monkeypatch):
+        """MLLM prompt prefill should accept native sliding-window caches."""
+        import mlx_lm.models.cache as cache_mod
+        from mlx_lm.models.cache import BatchRotatingKVCache, RotatingKVCache
+        from vllm_mlx.mllm_batch_generator import MLLMBatchGenerator, MLLMBatchRequest
+
+        class DummyModel:
+            layers = [object()]
+
+        def fake_preprocess(request):
+            request.input_ids = mx.array([1, 2, 3], dtype=mx.int32)
+            request.pixel_values = None
+            request.attention_mask = None
+            request.image_grid_thw = None
+            request.extra_kwargs = {}
+
+        def fake_make_prompt_cache(_model):
+            cache = RotatingKVCache(max_size=16, keep=0)
+            cache.keys = mx.arange(8, dtype=mx.float32).reshape(1, 1, 4, 2)
+            cache.values = (mx.arange(8, dtype=mx.float32) + 1).reshape(1, 1, 4, 2)
+            cache.offset = 4
+            cache._idx = 4
+            return [cache]
+
+        generator = MLLMBatchGenerator(
+            DummyModel(),
+            MagicMock(),
+            enable_vision_cache=False,
+        )
+
+        monkeypatch.setattr(generator, "_preprocess_request", fake_preprocess)
+        monkeypatch.setattr(cache_mod, "make_prompt_cache", fake_make_prompt_cache)
+        monkeypatch.setattr(
+            generator,
+            "_run_vision_encoding",
+            lambda request, cache=None: mx.zeros((1, 3, 8), dtype=mx.float32),
+        )
+
+        req = MLLMBatchRequest(uid=0, request_id="req-rot", prompt="Describe this")
+        batch = generator._process_prompts([req])
+
+        assert len(batch.cache) == 1
+        assert isinstance(batch.cache[0], BatchRotatingKVCache)
+        assert batch.request_ids == ["req-rot"]
+
+        generator.close()
+
 
 class TestMLLMSchedulerConfig:
     """Tests for MLLMSchedulerConfig."""
