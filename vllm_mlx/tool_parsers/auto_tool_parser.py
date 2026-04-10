@@ -16,6 +16,7 @@ from .abstract_tool_parser import (
     ToolParser,
     ToolParserManager,
 )
+from .gemma4_tool_parser import Gemma4ToolParser
 
 
 def generate_tool_id() -> str:
@@ -29,12 +30,13 @@ class AutoToolParser(ToolParser):
     Auto-detecting tool call parser.
 
     Tries multiple formats in order:
-    1. Mistral: [TOOL_CALLS] ...
-    2. Qwen bracket: [Calling tool: func_name({...})]
-    3. Qwen/Hermes XML: <tool_call>{"name": "...", "arguments": {...}}</tool_call>
-    4. Llama: <function=name>{"arg": "value"}</function>
-    5. Nemotron: <tool_call><function=name>...</function></tool_call>
-    6. Raw JSON: {"name": "...", "arguments": {...}}
+    1. Gemma 4: <|tool_call>call:name{...}<tool_call|>
+    2. Mistral: [TOOL_CALLS] ...
+    3. Qwen bracket: [Calling tool: func_name({...})]
+    4. Qwen/Hermes XML: <tool_call>{"name": "...", "arguments": {...}}</tool_call>
+    5. Llama: <function=name>{"arg": "value"}</function>
+    6. Nemotron: <tool_call><function=name>...</function></tool_call>
+    7. Raw JSON: {"name": "...", "arguments": {...}}
 
     This is the default parser when no specific parser is selected.
     """
@@ -63,7 +65,14 @@ class AutoToolParser(ToolParser):
         tool_calls: list[dict[str, Any]] = []
         cleaned_text = model_output
 
-        # 1. Try Mistral format
+        # 1. Try Gemma 4 format (most distinctive marker)
+        if "<|tool_call>" in model_output:
+            gemma_parser = Gemma4ToolParser()
+            result = gemma_parser.extract_tool_calls(model_output, request)
+            if result.tools_called:
+                return result
+
+        # 2. Try Mistral format
         if self.MISTRAL_TOKEN in model_output:
             parts = model_output.split(self.MISTRAL_TOKEN)
             content = parts[0].strip()
@@ -327,6 +336,7 @@ class AutoToolParser(ToolParser):
         """
         # Check for any tool call markers
         markers = [
+            "<|tool_call>",
             self.MISTRAL_TOKEN,
             "[Calling tool:",
             "<tool_call>",
@@ -339,7 +349,7 @@ class AutoToolParser(ToolParser):
             return {"content": delta_text}
 
         # Check for completion markers
-        end_markers = ["</tool_call>", "</function>", ")]"]
+        end_markers = ["<tool_call|>", "</tool_call>", "</function>", ")]"]
         if any(m in delta_text for m in end_markers):
             result = self.extract_tool_calls(current_text)
             if result.tools_called:
