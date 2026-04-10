@@ -3,8 +3,6 @@
 
 import json
 
-import pytest
-
 from vllm_mlx.tool_parsers.gemma4_tool_parser import Gemma4ToolParser
 
 

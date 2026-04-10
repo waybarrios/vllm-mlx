@@ -14,8 +14,6 @@ not just the parser in isolation.
 
 import json
 
-import pytest
-
 from vllm_mlx.api.models import (
     AssistantMessage,
     ChatCompletionChoice,
