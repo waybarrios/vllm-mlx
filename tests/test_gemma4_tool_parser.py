@@ -209,7 +209,9 @@ class TestGemma4ToolParserStreaming:
 
     def test_streaming_emits_on_close(self):
         """Emits structured tool_calls when end delimiter arrives."""
-        full_text = 'Sure. <|tool_call>call:read_file{path:<|"|>/tmp/foo<|"|>}<tool_call|>'
+        full_text = (
+            'Sure. <|tool_call>call:read_file{path:<|"|>/tmp/foo<|"|>}<tool_call|>'
+        )
         result = self.parser.extract_tool_calls_streaming(
             previous_text='Sure. <|tool_call>call:read_file{path:<|"|>/tmp/foo<|"|>}',
             current_text=full_text,

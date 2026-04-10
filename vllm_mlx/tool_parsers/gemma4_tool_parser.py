@@ -43,7 +43,7 @@ _STRING_DELIM_RE = re.compile(r'<\|"\|>(.*?)<\|"\|>', re.DOTALL)
 _CALL_PREFIX = re.compile(r"call:(\w+)\s*\{")
 
 # Pattern to quote bare keys: word followed by : at start or after , or {
-_BARE_KEY = re.compile(r'(?<=[{,])\s*(\w+)\s*:')
+_BARE_KEY = re.compile(r"(?<=[{,])\s*(\w+)\s*:")
 
 # Max arg block length to prevent runaway parsing on malformed input (1 MB)
 _MAX_ARG_BLOCK_LEN = 1_048_576
