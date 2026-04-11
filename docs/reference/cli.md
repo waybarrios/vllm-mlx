@@ -44,6 +44,7 @@ vllm-mlx serve <model> [options]
 | `--embedding-model` | Pre-load an embedding model at startup | None |
 | `--enable-auto-tool-choice` | Enable automatic tool calling | False |
 | `--tool-call-parser` | Tool call parser (`auto`, `mistral`, `qwen`, `llama`, `hermes`, `deepseek`, `kimi`, `granite`, `nemotron`, `xlam`, `functionary`, `glm47`) | None |
+| `--compile` | Compile model forward pass with mx.compile for fused Metal kernels (experimental) | False |
 
 ### Examples
 
@@ -94,6 +95,16 @@ vllm-mlx serve mlx-community/Qwen3-4B-4bit \
   --rate-limit 60 \
   --timeout 120 \
   --continuous-batching
+```
+
+### Performance: mx.compile
+
+```bash
+# Serve with compiled model (may improve throughput 5-30%)
+vllm-mlx serve mlx-community/Qwen3-8B-4bit --compile
+
+# A/B benchmark to measure the real impact
+vllm-mlx bench-compile mlx-community/Qwen3-8B-4bit --prompts 5 --max-tokens 128
 ```
 
 ### Security

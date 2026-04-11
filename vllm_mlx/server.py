@@ -506,6 +506,7 @@ def load_model(
     specprefill_threshold: int = 8192,
     specprefill_keep_pct: float = 0.3,
     specprefill_draft_model: str = None,
+    compile: bool = False,
 ):
     """
     Load a model (auto-detects MLLM vs LLM).
@@ -543,6 +544,9 @@ def load_model(
             stream_interval=stream_interval,
             force_mllm=force_mllm,
         )
+        if compile:
+            _engine._compile_on_start = True
+
         # BatchedEngine will be started in lifespan (uvicorn's event loop)
         # Just log for now
         logger.info(f"Model loaded (batched mode): {model_name}")
@@ -563,6 +567,15 @@ def load_model(
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         loop.run_until_complete(_engine.start())
+
+        if compile:
+            from .compile import apply_compile
+
+            inner_model = getattr(_engine._model, "model", None)
+            if inner_model is not None:
+                apply_compile(inner_model)
+                logger.info("Compile: model forward pass compiled")
+
         model_type = "MLLM" if _engine.is_mllm else "LLM"
         logger.info(f"{model_type} model loaded (simple mode): {model_name}")
 

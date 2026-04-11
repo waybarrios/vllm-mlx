@@ -189,6 +189,9 @@ def serve_command(args):
                 f"keep={args.specprefill_keep_pct*100:.0f}%)"
             )
 
+    if args.compile:
+        print("  Compile: ENABLED (mx.compile with fused kernels)")
+
     # Load model with unified server
     load_model(
         args.model,
@@ -204,6 +207,7 @@ def serve_command(args):
         specprefill_threshold=args.specprefill_threshold,
         specprefill_keep_pct=args.specprefill_keep_pct,
         specprefill_draft_model=args.specprefill_draft_model,
+        compile=args.compile,
     )
 
     # Start server
@@ -330,6 +334,155 @@ def bench_command(args):
         print(f"  Throughput: {total_tokens/total_time:.2f} tok/s")
 
     asyncio.run(run_benchmark())
+
+
+def bench_compile_command(args):
+    """A/B benchmark: measure tok/s with and without mx.compile."""
+    import statistics
+
+    import mlx.core as mx
+    from mlx_lm import load, stream_generate
+
+    from .compile import apply_compile
+
+    print(f"Model: {args.model}")
+    print(f"Runs: {args.prompts}, Max tokens: {args.max_tokens}")
+    print()
+
+    # Build a prompt of approximately the right length
+    base_prompt = "Explain the theory of " + " ".join(
+        ["quantum"] * (args.prompt_tokens // 2)
+    )
+
+    def run_measurement(model, tokenizer, label, num_runs):
+        results = []
+        for i in range(num_runs):
+            mx.clear_cache()
+
+            prompt_tps = 0.0
+            gen_tps = 0.0
+            gen_tokens = 0
+
+            for response in stream_generate(
+                model,
+                tokenizer,
+                base_prompt,
+                max_tokens=args.max_tokens,
+                sampler=lambda logits: mx.argmax(logits, axis=-1),  # Greedy for determinism
+            ):
+                if response.finish_reason is not None:
+                    prompt_tps = response.prompt_tps
+                    gen_tps = response.generation_tps
+                    gen_tokens = response.generation_tokens
+                    break
+
+            results.append(
+                {
+                    "prompt_tps": prompt_tps,
+                    "gen_tps": gen_tps,
+                    "gen_tokens": gen_tokens,
+                }
+            )
+            print(
+                f"  {label} run {i+1}/{num_runs}: "
+                f"prefill={prompt_tps:.1f} tok/s, decode={gen_tps:.1f} tok/s"
+            )
+
+        return results
+
+    # Phase 1: Without compile
+    print("Loading model (without compile)...")
+    model, tokenizer = load(args.model)
+
+    print("Warmup run (discarded)...")
+    for _ in stream_generate(model, tokenizer, "Hello", max_tokens=10):
+        pass
+    mx.clear_cache()
+
+    print(f"\nMeasuring WITHOUT compile ({args.prompts} runs)...")
+    baseline_results = run_measurement(model, tokenizer, "baseline", args.prompts)
+
+    # Phase 2: With compile
+    print("\nApplying mx.compile to model...")
+    apply_compile(model)
+
+    print("Warmup run (triggers compilation, discarded)...")
+    for _ in stream_generate(model, tokenizer, "Hello", max_tokens=10):
+        pass
+    mx.clear_cache()
+
+    print(f"\nMeasuring WITH compile ({args.prompts} runs)...")
+    compiled_results = run_measurement(model, tokenizer, "compiled", args.prompts)
+
+    # Report
+    def stats(results, key):
+        values = [r[key] for r in results]
+        return {
+            "mean": statistics.mean(values),
+            "std": statistics.stdev(values) if len(values) > 1 else 0,
+            "values": values,
+        }
+
+    b_prefill = stats(baseline_results, "prompt_tps")
+    c_prefill = stats(compiled_results, "prompt_tps")
+    b_decode = stats(baseline_results, "gen_tps")
+    c_decode = stats(compiled_results, "gen_tps")
+
+    prefill_pct = (
+        ((c_prefill["mean"] - b_prefill["mean"]) / b_prefill["mean"]) * 100
+        if b_prefill["mean"] > 0
+        else 0
+    )
+    decode_pct = (
+        ((c_decode["mean"] - b_decode["mean"]) / b_decode["mean"]) * 100
+        if b_decode["mean"] > 0
+        else 0
+    )
+
+    print("\n" + "=" * 60)
+    print(f"Model: {args.model}")
+    print(f"Runs: {args.prompts}, Max tokens: {args.max_tokens}")
+    print("=" * 60)
+    print(
+        f"{'':20s} {'Without compile':>18s} {'With compile':>18s} {'Change':>10s}"
+    )
+    print("-" * 68)
+    print(
+        f"{'Prefill (tok/s)':20s} {b_prefill['mean']:>14.1f}     "
+        f"{c_prefill['mean']:>14.1f}     {prefill_pct:>+7.1f}%"
+    )
+    print(
+        f"{'Decode (tok/s)':20s} {b_decode['mean']:>14.1f}     "
+        f"{c_decode['mean']:>14.1f}     {decode_pct:>+7.1f}%"
+    )
+    print()
+    print(
+        f"Decode per-run (without): "
+        f"{', '.join(f'{v:.1f}' for v in b_decode['values'])}  "
+        f"(std={b_decode['std']:.2f})"
+    )
+    print(
+        f"Decode per-run (with):    "
+        f"{', '.join(f'{v:.1f}' for v in c_decode['values'])}  "
+        f"(std={c_decode['std']:.2f})"
+    )
+    print()
+
+    if decode_pct > 2:
+        print(
+            f"VERDICT: mx.compile gives +{decode_pct:.1f}% decode speed. "
+            f"Use --compile."
+        )
+    elif decode_pct < -2:
+        print(
+            f"VERDICT: mx.compile is {decode_pct:.1f}% SLOWER. "
+            f"Do NOT use --compile for this model."
+        )
+    else:
+        print(
+            f"VERDICT: mx.compile has no significant effect ({decode_pct:+.1f}%). "
+            f"Skip --compile for this model."
+        )
 
 
 def bench_detok_command(args):
@@ -730,6 +883,14 @@ Examples:
         help="Max prefill tokens per scheduler step (0=disabled). "
         "Prevents starvation of active requests during long prefills.",
     )
+    # Compile (mx.compile)
+    serve_parser.add_argument(
+        "--compile",
+        action="store_true",
+        default=False,
+        help="Compile model forward pass with mx.compile for fused Metal kernels. "
+        "May improve throughput 5-30%%. Experimental.",
+    )
     # MTP (Multi-Token Prediction)
     serve_parser.add_argument(
         "--enable-mtp",
@@ -1023,6 +1184,32 @@ Examples:
         help="Quantization group size (default: 64)",
     )
 
+    # Compile A/B benchmark
+    bench_compile = subparsers.add_parser(
+        "bench-compile",
+        help="A/B benchmark: measure tok/s with and without mx.compile",
+    )
+    bench_compile.add_argument("model", help="Model name or path")
+    bench_compile.add_argument(
+        "--prompts",
+        type=int,
+        default=5,
+        help="Number of measurement runs (default: 5)",
+    )
+    bench_compile.add_argument(
+        "--max-tokens",
+        type=int,
+        default=128,
+        help="Tokens to generate per run (default: 128)",
+    )
+    bench_compile.add_argument(
+        "--prompt-tokens",
+        type=int,
+        default=256,
+        help="Approximate prompt length (default: 256)",
+    )
+    bench_compile.set_defaults(func=bench_compile_command)
+
     args = parser.parse_args()
 
     if args.command == "serve":
@@ -1033,6 +1220,8 @@ Examples:
         bench_detok_command(args)
     elif args.command == "bench-kv-cache":
         bench_kv_cache_command(args)
+    elif args.command == "bench-compile":
+        bench_compile_command(args)
     else:
         parser.print_help()
         sys.exit(1)

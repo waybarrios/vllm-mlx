@@ -207,6 +207,12 @@ class BatchedEngine(BaseEngine):
         self._model = self._mllm_instance.model
         self._processor = self._mllm_instance.processor
 
+        if getattr(self, "_compile_on_start", False):
+            from ..compile import apply_compile
+
+            self._model = apply_compile(self._model)
+            logger.info("Compile: model forward pass compiled (batched MLLM)")
+
         # Create MLLM scheduler config with batch generator support
         if self._scheduler_config and hasattr(self._scheduler_config, "max_num_seqs"):
             max_num_seqs = self._scheduler_config.max_num_seqs
@@ -258,6 +264,12 @@ class BatchedEngine(BaseEngine):
             self._model_name,
             tokenizer_config=tokenizer_config,
         )
+
+        if getattr(self, "_compile_on_start", False):
+            from ..compile import apply_compile
+
+            self._model = apply_compile(self._model)
+            logger.info("Compile: model forward pass compiled (batched LLM)")
 
         # Validate MTP support if enabled
         if self._scheduler_config and self._scheduler_config.enable_mtp:
