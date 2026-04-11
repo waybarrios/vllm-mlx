@@ -74,7 +74,7 @@ vllm = [
     "vllm>=0.4.0",
 ]
 vision = [
-    "torch>=2.3.0",
+    "torch>=2.8.0",
     "torchvision>=0.21.0",
 ]
 # Audio dependencies for TTS/STT (mlx-audio)
