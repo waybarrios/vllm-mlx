@@ -31,7 +31,9 @@ class TestBatchedEngineGenerate:
         """Build a mock RequestOutput (as returned by AsyncEngineCore)."""
         mock = MagicMock()
         mock.output_text = output_text
-        mock.output_token_ids = output_token_ids if output_token_ids is not None else [3681, 374, 279]
+        mock.output_token_ids = (
+            output_token_ids if output_token_ids is not None else [3681, 374, 279]
+        )
         mock.prompt_tokens = prompt_tokens
         mock.completion_tokens = completion_tokens
         mock.finish_reason = finish_reason
@@ -48,7 +50,9 @@ class TestBatchedEngineGenerate:
         mock_engine.generate = AsyncMock(return_value=mock_output)
         engine._engine = mock_engine
 
-        result = await engine.generate(prompt="What is the capital of France?", max_tokens=10)
+        result = await engine.generate(
+            prompt="What is the capital of France?", max_tokens=10
+        )
 
         assert result.tokens == token_ids
 
