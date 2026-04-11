@@ -790,7 +790,7 @@ class TestSchedulerIntegration:
         assert len(finished) == len(prompts), f"Only {len(finished)} requests finished"
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 class TestEngineAsync:
     """Async tests for the engine."""
 

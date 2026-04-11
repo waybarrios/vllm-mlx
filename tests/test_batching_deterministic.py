@@ -37,7 +37,7 @@ def sampling_params():
 class TestDeterministicSingleRequest:
     """Test single request determinism."""
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_same_prompt_same_output(self, model_and_tokenizer, sampling_params):
         """Same prompt should produce same output with temp=0."""
         from vllm_mlx import AsyncEngineCore, EngineConfig, SchedulerConfig
@@ -68,7 +68,7 @@ class TestDeterministicSingleRequest:
         assert len(outputs) == 3
         assert outputs[0] == outputs[1] == outputs[2], f"Outputs differ: {outputs}"
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_token_streaming_order(self, model_and_tokenizer, sampling_params):
         """Tokens should stream in order."""
         from vllm_mlx import AsyncEngineCore
@@ -94,7 +94,7 @@ class TestDeterministicSingleRequest:
 class TestDeterministicConcurrentRequests:
     """Test concurrent request handling with determinism."""
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_concurrent_same_prompt(self, model_and_tokenizer):
         """Multiple concurrent requests with same prompt should get same output."""
         from vllm_mlx import (
@@ -137,7 +137,7 @@ class TestDeterministicConcurrentRequests:
             # All should be the same
             assert all(r == results[0] for r in results), f"Outputs differ: {results}"
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_concurrent_different_prompts(self, model_and_tokenizer):
         """Different prompts should get different (but deterministic) outputs."""
         from vllm_mlx import (
@@ -191,7 +191,7 @@ class TestDeterministicConcurrentRequests:
 class TestBatchingPerformance:
     """Test that batching improves throughput."""
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_batched_faster_than_sequential(self, model_and_tokenizer):
         """Batched requests should be faster than sequential."""
         from vllm_mlx import (
@@ -274,7 +274,7 @@ class TestBatchingPerformance:
 class TestRequestManagement:
     """Test request lifecycle management."""
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_abort_request(self, model_and_tokenizer):
         """Test aborting a request mid-generation."""
         from vllm_mlx import AsyncEngineCore, SamplingParams
@@ -304,7 +304,7 @@ class TestRequestManagement:
             stats = engine.get_stats()
             assert stats["active_requests"] == 0
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_engine_stats(self, model_and_tokenizer):
         """Test engine statistics tracking."""
         from vllm_mlx import (
@@ -343,7 +343,7 @@ class TestRequestManagement:
 class TestSchedulerPolicy:
     """Test scheduler policies."""
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_fcfs_ordering(self, model_and_tokenizer):
         """Test that FCFS policy processes requests in order."""
         from vllm_mlx import (
@@ -396,7 +396,7 @@ class TestSchedulerPolicy:
 class TestEdgeCases:
     """Test edge cases and error handling."""
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_empty_prompt(self, model_and_tokenizer):
         """Test handling of empty prompt."""
         from vllm_mlx import AsyncEngineCore, SamplingParams
@@ -414,7 +414,7 @@ class TestEdgeCases:
                     assert out.finished
                     break
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_very_short_max_tokens(self, model_and_tokenizer):
         """Test with max_tokens=1."""
         from vllm_mlx import AsyncEngineCore, SamplingParams
@@ -436,7 +436,7 @@ class TestEdgeCases:
             # Should generate exactly 1 token
             assert token_count == 1
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_multiple_start_stop(self, model_and_tokenizer):
         """Test starting and stopping engine multiple times."""
         from vllm_mlx import AsyncEngineCore, SamplingParams

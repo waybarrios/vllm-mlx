@@ -53,7 +53,7 @@ class TestContinuousBatchingBasic:
         assert config.completion_batch_size == 32
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 class TestContinuousBatchingIntegration:
     """Integration tests requiring actual model loading."""
 
