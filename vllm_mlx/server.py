@@ -2195,6 +2195,50 @@ async def stream_chat_completion(
                 # Skip this chunk (e.g., <think> token itself)
                 continue
 
+            # Run tool parser on content delta (post-reasoning text only).
+            # The reasoning parser suppresses <think> tokens, so tool calls
+            # only appear in delta_msg.content after </think> is emitted.
+            if tool_parser and delta_msg.content:
+                content_delta = delta_msg.content
+                if not tool_markup_possible and "<" not in content_delta:
+                    tool_accumulated_text += content_delta
+                else:
+                    if not tool_markup_possible:
+                        tool_markup_possible = True
+
+                    tool_previous = tool_accumulated_text
+                    tool_accumulated_text += content_delta
+                    tool_result = tool_parser.extract_tool_calls_streaming(
+                        tool_previous, tool_accumulated_text, content_delta
+                    )
+
+                    if tool_result is None:
+                        # Inside tool markup - suppress content
+                        continue
+
+                    if "tool_calls" in tool_result:
+                        tool_calls_detected = True
+                        tool_chunk = ChatCompletionChunk(
+                            id=response_id,
+                            model=_model_name,
+                            choices=[
+                                ChatCompletionChunkChoice(
+                                    delta=ChatCompletionChunkDelta(
+                                        tool_calls=tool_result["tool_calls"]
+                                    ),
+                                    finish_reason=(
+                                        "tool_calls" if output.finished else None
+                                    ),
+                                )
+                            ],
+                            usage=get_usage(output) if output.finished else None,
+                        )
+                        yield f"data: {tool_chunk.model_dump_json()}\n\n"
+                        continue
+
+                    # Update content with what the tool parser returned
+                    delta_msg.content = tool_result.get("content", "") or None
+
             chunk = ChatCompletionChunk(
                 id=response_id,
                 model=_model_name,
