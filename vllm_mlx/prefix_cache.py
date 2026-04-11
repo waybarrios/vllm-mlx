@@ -658,7 +658,8 @@ class BlockAwarePrefixCache:
                 class_ref = layer_state.get("class_ref")
                 class_name = layer_state.get("class_name")
 
-                if self._can_concatenate_cache_state(state):
+                seq_axis = self._cache_state_seq_axis(state)
+                if seq_axis is not None:
                     state_slice = self._slice_concat_cache_state(
                         state, start_idx, end_idx
                     )
@@ -669,7 +670,7 @@ class BlockAwarePrefixCache:
                             "class_ref": class_ref,
                             "class_name": class_name,
                             "storage": "concat",
-                            "seq_axis": 2,
+                            "seq_axis": seq_axis,
                         }
                     )
                     continue
@@ -697,14 +698,28 @@ class BlockAwarePrefixCache:
             logger.warning(f"Failed to extract block tensor slice: {e}")
             return None
 
-    def _can_concatenate_cache_state(self, state: Any) -> bool:
-        """Return True when cache state can be concatenated block-by-block."""
+    def _cache_state_seq_axis(self, state: Any) -> Optional[int]:
+        """Return the sequence axis for cache states that support block concat."""
         if not isinstance(state, (list, tuple)) or not state:
-            return False
-        return all(
-            tensor is not None and hasattr(tensor, "shape") and len(tensor.shape) == 4
+            return None
+
+        ndims = {
+            len(tensor.shape)
             for tensor in state
-        )
+            if tensor is not None and hasattr(tensor, "shape")
+        }
+        if len(ndims) != 1:
+            return None
+
+        ndim = next(iter(ndims))
+        if ndim == 4:
+            return 2
+
+        # Qwen3.5-style KV caches use (heads, seq, dim).
+        if ndim == 3 and len(state) == 2:
+            return 1
+
+        return None
 
     def _slice_concat_cache_state(
         self,
@@ -713,7 +728,11 @@ class BlockAwarePrefixCache:
         end_idx: int,
     ) -> Tuple[Any, ...] | List[Any]:
         """Slice a sequence-backed cache state across the token axis."""
-        seq_len = state[0].shape[2]
+        seq_axis = self._cache_state_seq_axis(state)
+        if seq_axis is None:
+            raise ValueError("Cache state does not support sequence concatenation")
+
+        seq_len = state[0].shape[seq_axis]
         actual_end = min(end_idx, seq_len)
         if start_idx >= actual_end:
             raise ValueError(
@@ -722,7 +741,7 @@ class BlockAwarePrefixCache:
 
         def _slice_tensor(tensor: Any) -> Any:
             slices = [slice(None)] * len(tensor.shape)
-            slices[2] = slice(start_idx, actual_end)
+            slices[seq_axis] = slice(start_idx, actual_end)
             return tensor[tuple(slices)]
 
         sliced = [_slice_tensor(tensor) for tensor in state]
@@ -910,7 +929,7 @@ class BlockAwarePrefixCache:
                         cache = _KVCache()
                         cache.keys = keys
                         cache.values = values
-                        cache.offset = keys.shape[2]
+                        cache.offset = keys.shape[self._cache_state_seq_axis(state)]
                     else:
                         cache = cache_cls.from_state(state, meta_state)
                 else:
@@ -920,7 +939,10 @@ class BlockAwarePrefixCache:
                         return None
                     cache = KVCache()
                     cache.keys, cache.values = state
-                    cache.offset = cache.keys.shape[2]
+                    seq_axis = self._cache_state_seq_axis(state)
+                    if seq_axis is None:
+                        return None
+                    cache.offset = cache.keys.shape[seq_axis]
 
                 reconstructed_caches.append(cache)
 

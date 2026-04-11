@@ -816,6 +816,42 @@ class TestBlockAwarePrefixCache:
 
         assert cache.reconstruct_cache(prefix_table) is None
 
+    def test_reconstructs_3d_kv_prefix_cache(self):
+        from mlx_lm.models.cache import KVCache
+        import mlx.core as mx
+
+        from vllm_mlx.paged_cache import BlockTable, PagedCacheManager
+        from vllm_mlx.prefix_cache import BlockAwarePrefixCache
+
+        paged_manager = PagedCacheManager(block_size=4, max_blocks=10)
+        cache = BlockAwarePrefixCache(model=None, paged_cache_manager=paged_manager)
+
+        tokens = list(range(8))
+        kv_keys = mx.arange(2 * 8 * 3).reshape(2, 8, 3)
+        kv_values = mx.arange(1000, 1000 + (2 * 8 * 3)).reshape(2, 8, 3)
+        extracted = [
+            {
+                "state": (kv_keys, kv_values),
+                "meta_state": "",
+                "class_ref": KVCache,
+                "class_name": "KVCache",
+            }
+        ]
+
+        block_table = cache.store_cache("req-1", tokens, extracted)
+        prefix_table = BlockTable(
+            request_id="req-prefix",
+            block_ids=[block_table.block_ids[0]],
+            num_tokens=4,
+        )
+
+        reconstructed = cache.reconstruct_cache(prefix_table)
+
+        assert reconstructed is not None
+        assert isinstance(reconstructed[0], KVCache)
+        assert reconstructed[0].state[0].tolist() == kv_keys[:, :4, :].tolist()
+        assert reconstructed[0].state[1].tolist() == kv_values[:, :4, :].tolist()
+
     def test_deduplicated_terminal_uses_correct_recurrent_snapshot(self):
         """Deduplication must not leak recurrent state across sequences."""
         from mlx_lm.models.cache import ArraysCache, KVCache
