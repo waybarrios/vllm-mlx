@@ -128,7 +128,7 @@ class TestSimpleEngineConcurrency:
         async def fake_stream_chat(*args, **kwargs):
             yield MagicMock(
                 text="partial",
-                tokens=[],
+                tokens=[1],
                 prompt_tokens=11,
                 completion_tokens=1,
                 finish_reason=None,
@@ -136,7 +136,7 @@ class TestSimpleEngineConcurrency:
             )
             yield MagicMock(
                 text='<|im_end|><tool_call>{"name":"bash","arguments":{"command":"pwd"}}</tool_call>',
-                tokens=[],
+                tokens=[7, 8, 9],
                 prompt_tokens=11,
                 completion_tokens=4,
                 finish_reason="stop",
@@ -163,8 +163,8 @@ class TestSimpleEngineConcurrency:
                 ],
             )
 
-            assert output.text.startswith("<tool_call>")
-            assert output.tokens == []
+            assert output.text == '{"name":"bash","arguments":{"command":"pwd"}}'
+            assert output.tokens == [7, 8, 9]
             assert output.prompt_tokens == 11
             assert output.completion_tokens == 4
             assert output.finish_reason == "stop"
