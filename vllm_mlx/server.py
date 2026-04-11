@@ -2119,7 +2119,7 @@ async def stream_chat_completion(
                         tool_calls_detected = True
                         tool_chunk = ChatCompletionChunk(
                             id=response_id,
-                            model=request.model,
+                            model=_model_name,
                             choices=[
                                 ChatCompletionChunkChoice(
                                     delta=ChatCompletionChunkDelta(
