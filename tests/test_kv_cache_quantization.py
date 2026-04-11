@@ -2,11 +2,12 @@
 """Tests for KV cache quantization in prefix cache."""
 
 import mlx.core as mx
-from mlx_lm.models.cache import KVCache, QuantizedKVCache
+from mlx_lm.models.cache import KVCache
 
 from vllm_mlx.memory_cache import (
     MemoryAwarePrefixCache,
     MemoryCacheConfig,
+    _QuantizedCacheWrapper,
     _dequantize_cache,
     _quantize_cache,
     _trim_to_offset,
@@ -37,7 +38,7 @@ class TestQuantizeDequantize:
         quantized = _quantize_cache(cache, bits=8, group_size=64)
         assert len(quantized) == len(cache)
         for layer in quantized:
-            assert isinstance(layer, QuantizedKVCache)
+            assert isinstance(layer, _QuantizedCacheWrapper)
 
     def test_dequantize_produces_kv_cache(self):
         cache = _make_kv_cache()
@@ -107,7 +108,7 @@ class TestMixedCacheLayers:
         cache = [kv, fake_mamba]
         quantized = _quantize_cache(cache, bits=8, group_size=64)
 
-        assert isinstance(quantized[0], QuantizedKVCache)
+        assert isinstance(quantized[0], _QuantizedCacheWrapper)
         assert isinstance(quantized[1], dict)  # Preserved as-is
 
         restored = _dequantize_cache(quantized)
@@ -196,7 +197,7 @@ class TestPrefixCacheIntegration:
         # Internally stored as quantized
         stored_entry = list(pc._entries.values())[0]
         for layer in stored_entry.cache:
-            assert isinstance(layer, QuantizedKVCache)
+            assert isinstance(layer, _QuantizedCacheWrapper)
 
         # Fetched as dequantized KVCache
         fetched, remaining = pc.fetch(tokens)
@@ -312,7 +313,7 @@ class TestMinQuantizeTokensThreshold:
         stored_entry = list(pc._entries.values())[0]
         for layer in stored_entry.cache:
             assert isinstance(
-                layer, QuantizedKVCache
+                layer, _QuantizedCacheWrapper
             ), "Long sequences should be quantized"
 
     def test_trim_applied_without_quantization(self):

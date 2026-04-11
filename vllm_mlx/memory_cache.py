@@ -120,8 +120,12 @@ def estimate_kv_cache_memory(cache: list[Any]) -> int:
         # Handle TurboQuantKVCache — estimate from shape+dtype (avoid lazy eval)
         if _TQ is not None and isinstance(layer_cache, _TQ):
             if layer_cache.k_packed is not None:
-                for arr in (layer_cache.k_packed, layer_cache.v_packed,
-                            layer_cache.k_norms, layer_cache.v_norms):
+                for arr in (
+                    layer_cache.k_packed,
+                    layer_cache.v_packed,
+                    layer_cache.k_norms,
+                    layer_cache.v_norms,
+                ):
                     if arr is not None:
                         total_bytes += _array_memory(arr)
             continue
@@ -200,9 +204,7 @@ class MemoryCacheConfig:
                 f"kv_min_quantize_tokens must be >= 0, got {self.kv_min_quantize_tokens}"
             )
         if self.turbo_kv_bits is not None and self.turbo_kv_bits not in (1, 2, 3, 4):
-            raise ValueError(
-                f"turbo_kv_bits must be 1-4, got {self.turbo_kv_bits}"
-            )
+            raise ValueError(f"turbo_kv_bits must be 1-4, got {self.turbo_kv_bits}")
 
     @property
     def needs_dequantize(self) -> bool:
@@ -437,7 +439,9 @@ def _trim_cache_offset(cache: list[Any], trim_by: int) -> list[Any]:
                 tc.values = layer_cache.values
                 tc._idx = layer_cache._idx
             trimmed.append(tc)
-        elif TurboQuantKVCache is not None and isinstance(layer_cache, TurboQuantKVCache):
+        elif TurboQuantKVCache is not None and isinstance(
+            layer_cache, TurboQuantKVCache
+        ):
             if not hasattr(layer_cache, "copy"):
                 trimmed.append(layer_cache)
                 continue
@@ -652,9 +656,7 @@ def _dequantize_cache(cache: list[Any]) -> list[Any]:
                 mx.array(dequantized.keys) if dequantized.keys is not None else None
             )
             kv.values = (
-                mx.array(dequantized.values)
-                if dequantized.values is not None
-                else None
+                mx.array(dequantized.values) if dequantized.values is not None else None
             )
             kv.offset = layer.offset
             for attr, val in layer.orig_attrs.items():
