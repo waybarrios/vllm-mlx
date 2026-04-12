@@ -7,13 +7,21 @@ and supports text, images, and video files.
 
 Usage:
     # First start the server with a multimodal model:
-    vllm-mlx --model mlx-community/Qwen3-VL-4B-Instruct-3bit --port 8000
+    vllm-mlx serve --served-model-name default mlx-community/Qwen3-VL-4B-Instruct-3bit --port 8000
 
-    # Then run this app:
+    # Then run the app:
     vllm-mlx-chat
 
-    # Or with custom settings:
-    vllm-mlx-chat --server-url http://localhost:8000 --port 7860
+    # Or with a different served-model name served on localhost:8000:
+    vllm-mlx-chat --served-model-name <served-model-name>  --server-url http://localhost:8000 --port 7860
+
+
+
+Note:
+    Query the /v1/models endpoint on localhost with `curl` and `jq` to see available models and their names:
+    ```bash
+    curl http://localhost:8000/v1/models | jq ".data[0].id"
+    ```
 """
 
 import argparse
@@ -268,7 +276,7 @@ Examples:
     vllm-mlx-chat --share
 
 Note: Make sure the vllm-mlx server is running with a multimodal model:
-    vllm-mlx --model mlx-community/Qwen3-VL-4B-Instruct-3bit --port 8000
+    vllm-mlx serve --served-model-name default mlx-community/Qwen3-VL-4B-Instruct-3bit --port 8000
         """,
     )
     parser.add_argument(

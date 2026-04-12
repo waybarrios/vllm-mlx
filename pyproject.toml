@@ -109,6 +109,7 @@ mlx = "vllm_mlx.plugin:mlx_platform_plugin"
 [project.scripts]
 vllm-mlx = "vllm_mlx.cli:main"
 vllm-mlx-chat = "vllm_mlx.gradio_app:main"
+vllm-mlx-chat-text = "vllm_mlx.gradio_text_app:main"
 vllm-mlx-bench = "vllm_mlx.benchmark:main"
 
 [tool.setuptools.packages.find]

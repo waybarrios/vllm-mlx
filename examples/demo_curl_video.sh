@@ -4,8 +4,8 @@
 # Shows how to use vllm-mlx with curl for video understanding.
 #
 # Usage:
-#   1. Start the server with a VLM model:
-#      vllm-mlx --model mlx-community/Qwen3-VL-4B-Instruct-3bit --port 8000
+#   1. Start the server with a VLM model with model name "video-model":
+#      vllm-mlx serve --served-model-name video-model mlx-community/Qwen3-VL-4B-Instruct-3bit --port 8000
 #
 #   2. Run this script:
 #      bash examples/demo_curl_video.sh
@@ -32,7 +32,7 @@ echo ""
 curl -s "$SERVER_URL/v1/chat/completions" \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "default",
+    "model": "video-model",
     "messages": [{
       "role": "user",
       "content": [
@@ -78,7 +78,7 @@ echo ""
 curl -s "$SERVER_URL/v1/chat/completions" \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "default",
+    "model": "video-model",
     "messages": [{
       "role": "user",
       "content": [
@@ -100,7 +100,7 @@ echo ""
 curl -s "$SERVER_URL/v1/chat/completions" \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "default",
+    "model": "video-model",
     "messages": [{
       "role": "user",
       "content": [

@@ -5,8 +5,8 @@ Demo: OpenAI API - Text Chat
 Shows how to use vllm-mlx with the OpenAI Python SDK for text-only chat.
 
 Usage:
-    1. Start the server with any model:
-       vllm-mlx --model mlx-community/Llama-3.2-3B-Instruct-4bit --port 8000
+    1. Start the server with any model (served model name is defaulted to "mlx-community/Llama-3.2-3B-Instruct-4bit"):
+       vllm-mlx serve mlx-community/Llama-3.2-3B-Instruct-4bit --port 8000
 
     2. Run this script:
        python examples/demo_openai_text.py
@@ -28,7 +28,7 @@ print("=" * 60)
 print("\n1. Simple Chat Completion")
 print("-" * 40)
 response = client.chat.completions.create(
-    model="default",
+    model="mlx-community/Llama-3.2-3B-Instruct-4bit",
     messages=[
         {"role": "user", "content": "Hello, who are you?"}
     ],
@@ -41,7 +41,7 @@ print(f"Assistant: {response.choices[0].message.content}")
 print("\n2. Chat with System Message")
 print("-" * 40)
 response = client.chat.completions.create(
-    model="default",
+    model="mlx-community/Llama-3.2-3B-Instruct-4bit",
     messages=[
         {"role": "system", "content": "You are a pirate. Respond in pirate speak."},
         {"role": "user", "content": "What is the weather like today?"}
@@ -58,7 +58,7 @@ print("-" * 40)
 print("User: Tell me a short joke")
 print("Assistant: ", end="")
 stream = client.chat.completions.create(
-    model="default",
+    model="mlx-community/Llama-3.2-3B-Instruct-4bit",
     messages=[
         {"role": "user", "content": "Tell me a short joke"}
     ],
@@ -77,7 +77,7 @@ messages = [
     {"role": "user", "content": "What is 2 + 2?"}
 ]
 response = client.chat.completions.create(
-    model="default",
+    model="mlx-community/Llama-3.2-3B-Instruct-4bit",
     messages=messages,
     max_tokens=50
 )
@@ -88,7 +88,7 @@ print(f"Assistant: {response.choices[0].message.content}")
 messages.append({"role": "assistant", "content": response.choices[0].message.content})
 messages.append({"role": "user", "content": "Now multiply that by 10"})
 response = client.chat.completions.create(
-    model="default",
+    model="mlx-community/Llama-3.2-3B-Instruct-4bit",
     messages=messages,
     max_tokens=50
 )
@@ -102,7 +102,7 @@ prompt = "Complete this sentence: The robot walked into the"
 
 # Low temperature (more deterministic)
 response_low = client.chat.completions.create(
-    model="default",
+    model="mlx-community/Llama-3.2-3B-Instruct-4bit",
     messages=[{"role": "user", "content": prompt}],
     max_tokens=30,
     temperature=0.1
@@ -111,7 +111,7 @@ print(f"Temperature 0.1: {response_low.choices[0].message.content}")
 
 # High temperature (more creative)
 response_high = client.chat.completions.create(
-    model="default",
+    model="mlx-community/Llama-3.2-3B-Instruct-4bit",
     messages=[{"role": "user", "content": prompt}],
     max_tokens=30,
     temperature=1.0
