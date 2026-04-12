@@ -640,15 +640,15 @@ def sparse_prefill(
 
     M = tokens.shape[0]
 
-    # Detect RotatingKVCache and ensure tail tokens are included.
-    # Models with sliding window attention (e.g., GPT-OSS) use RotatingKVCache
-    # which evicts old entries. We must include the last `max_size` positions
-    # so sliding window layers have valid recent context for decode.
+    # Detect RotatingKVCache and ensure tail tokens are included only when the
+    # prompt actually exceeds the live cache window. If the full prompt still
+    # fits inside ``max_size`` there is no eviction yet, so forcing the entire
+    # tail back in would collapse sparse prefill into dense work.
     max_rotating_size = 0
     for c in cache:
         if type(c).__name__ == "RotatingKVCache":
             max_rotating_size = max(max_rotating_size, getattr(c, "max_size", 0))
-    if max_rotating_size > 0:
+    if max_rotating_size > 0 and M > max_rotating_size:
         tail_start = max(0, M - max_rotating_size)
         tail_indices = set(range(tail_start, M))
         existing = set(selected_indices.tolist())
