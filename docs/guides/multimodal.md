@@ -309,7 +309,7 @@ When memory pressure occurs, least recently accessed entries are evicted first.
 For interactive multimodal chat:
 
 ```bash
-vllm-mlx-chat --model mlx-community/Qwen3-VL-4B-Instruct-3bit
+vllm-mlx-chat --served-model-name mlx-community/Qwen3-VL-4B-Instruct-3bit
 ```
 
 Supports drag-and-drop images and videos.

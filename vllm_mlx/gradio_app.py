@@ -102,7 +102,12 @@ def build_message_content(text: str, files: list[str] | None = None) -> list | s
     return content if content else text
 
 
-def create_chat_function(server_url: str, max_tokens: int, temperature: float):
+def create_chat_function(
+    server_url: str,
+    max_tokens: int,
+    temperature: float,
+    served_model_name: str = "default",
+):
     """
     Create the chat function for Gradio ChatInterface.
 
@@ -110,6 +115,7 @@ def create_chat_function(server_url: str, max_tokens: int, temperature: float):
         server_url: URL of the vllm-mlx server
         max_tokens: Maximum tokens to generate
         temperature: Sampling temperature
+        served_model_name: Model name to send in OpenAI-compatible requests
 
     Returns:
         Chat function compatible with gr.ChatInterface
@@ -224,7 +230,7 @@ def create_chat_function(server_url: str, max_tokens: int, temperature: float):
             response = requests.post(
                 f"{server_url}/v1/chat/completions",
                 json={
-                    "model": "default",
+                    "model": served_model_name,
                     "messages": messages,
                     "max_tokens": max_tokens,
                     "temperature": temperature,
@@ -295,6 +301,15 @@ Note: Make sure the vllm-mlx server is running with a multimodal model:
         help="Sampling temperature (default: 0.7)",
     )
     parser.add_argument(
+        "--served-model-name",
+        type=str,
+        default="default",
+        help=(
+            "Model name to send in /v1/chat/completions requests "
+            "(default: default)"
+        ),
+    )
+    parser.add_argument(
         "--text-only",
         action="store_true",
         help="Use text-only mode (no image/video support, faster for LLM-only models)",
@@ -330,7 +345,7 @@ Note: Make sure the vllm-mlx server is running with a multimodal model:
                 response = requests.post(
                     f"{args.server_url}/v1/chat/completions",
                     json={
-                        "model": "default",
+                        "model": args.served_model_name,
                         "messages": messages,
                         "max_tokens": args.max_tokens,
                         "temperature": args.temperature,
@@ -365,6 +380,7 @@ Note: Make sure the vllm-mlx server is running with a multimodal model:
             server_url=args.server_url,
             max_tokens=args.max_tokens,
             temperature=args.temperature,
+            served_model_name=args.served_model_name,
         )
 
         # Create ChatInterface with multimodal support

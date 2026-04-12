@@ -54,7 +54,7 @@ for chunk in model.stream_generate("Tell me a story"):
 ## Option 3: Gradio Chat UI
 
 ```bash
-vllm-mlx-chat --model mlx-community/Llama-3.2-3B-Instruct-4bit
+vllm-mlx-chat --served-model-name mlx-community/Llama-3.2-3B-Instruct-4bit
 ```
 
 Opens a web interface at http://localhost:7860

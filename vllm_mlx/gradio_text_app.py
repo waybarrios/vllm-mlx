@@ -22,7 +22,12 @@ import gradio as gr
 import requests
 
 
-def create_chat_function(server_url: str, max_tokens: int, temperature: float):
+def create_chat_function(
+    server_url: str,
+    max_tokens: int,
+    temperature: float,
+    served_model_name: str = "default",
+):
     """
     Create the chat function for Gradio ChatInterface.
 
@@ -30,6 +35,7 @@ def create_chat_function(server_url: str, max_tokens: int, temperature: float):
         server_url: URL of the vllm-mlx server
         max_tokens: Maximum tokens to generate
         temperature: Sampling temperature
+        served_model_name: Model name to send in OpenAI-compatible requests
 
     Returns:
         Chat function compatible with gr.ChatInterface
@@ -72,7 +78,7 @@ def create_chat_function(server_url: str, max_tokens: int, temperature: float):
             response = requests.post(
                 f"{server_url}/v1/chat/completions",
                 json={
-                    "model": "default",
+                    "model": served_model_name,
                     "messages": messages,
                     "max_tokens": max_tokens,
                     "temperature": temperature,
@@ -142,6 +148,15 @@ Note: Make sure the vllm-mlx server is running:
         default=0.7,
         help="Sampling temperature (default: 0.7)",
     )
+    parser.add_argument(
+        "--served-model-name",
+        type=str,
+        default="default",
+        help=(
+            "Model name to send in /v1/chat/completions requests "
+            "(default: default)"
+        ),
+    )
     args = parser.parse_args()
 
     print(f"Connecting to vllm-mlx server at: {args.server_url}")
@@ -152,6 +167,7 @@ Note: Make sure the vllm-mlx server is running:
         server_url=args.server_url,
         max_tokens=args.max_tokens,
         temperature=args.temperature,
+        served_model_name=args.served_model_name,
     )
 
     # Create simple text ChatInterface

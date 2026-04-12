@@ -165,7 +165,7 @@ Start Gradio chat interface.
 ### Usage
 
 ```bash
-vllm-mlx-chat --model <model> [options]
+vllm-mlx-chat --served-model-name <model-name> [options]
 ```
 
 ### Options
@@ -180,10 +180,10 @@ vllm-mlx-chat --model <model> [options]
 
 ```bash
 # Multimodal chat (text + images + video)
-vllm-mlx-chat --model mlx-community/Qwen3-VL-4B-Instruct-3bit
+vllm-mlx-chat --served-model-name mlx-community/Qwen3-VL-4B-Instruct-3bit
 
 # Text-only chat
-vllm-mlx-chat --model mlx-community/Llama-3.2-3B-Instruct-4bit --text-only
+vllm-mlx-chat --served-model-name mlx-community/Llama-3.2-3B-Instruct-4bit --text-only
 ```
 
 ## Environment Variables
