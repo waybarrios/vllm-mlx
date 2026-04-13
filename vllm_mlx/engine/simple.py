@@ -692,10 +692,6 @@ class SimpleEngine(BaseEngine):
         model, then generates autoregressively. Falls back to normal generation
         on any error.
         """
-        import mlx.core as mx
-        from mlx_lm.models.cache import make_prompt_cache
-        from mlx_lm.sample_utils import make_sampler
-
         model = self._model.model
         tokenizer = self._model.tokenizer
         n_tokens = len(tokens)
@@ -711,6 +707,10 @@ class SimpleEngine(BaseEngine):
             """Score tokens, sparse prefill, generate autoregressively."""
             import time
             from types import SimpleNamespace
+
+            import mlx.core as mx
+            from mlx_lm.models.cache import make_prompt_cache
+            from mlx_lm.sample_utils import make_sampler
 
             from ..specprefill import (
                 cleanup_rope,
@@ -875,11 +875,6 @@ class SimpleEngine(BaseEngine):
         import hashlib
         import os
 
-        import mlx.core as mx
-        from mlx_lm import stream_generate as mlx_stream_generate
-        from mlx_lm.models.cache import make_prompt_cache
-        from mlx_lm.sample_utils import make_sampler
-
         # Per-request specprefill overrides (from extra_body)
         specprefill_override = kwargs.pop("specprefill", None)
         specprefill_keep_pct = kwargs.pop("specprefill_keep_pct", None)
@@ -911,8 +906,6 @@ class SimpleEngine(BaseEngine):
                 messages, **template_kwargs
             )
 
-        # Build sampler
-        sampler = make_sampler(temp=temperature, top_p=top_p)
         max_tokens = max_tokens or 4096
 
         # --- System prompt KV caching ---
@@ -977,6 +970,9 @@ class SimpleEngine(BaseEngine):
                         and system_token_count == self._system_kv_token_count
                     ):
                         # Cache HIT — restore KV state into fresh backbone cache
+                        import mlx.core as mx
+                        from mlx_lm.models.cache import make_prompt_cache
+
                         backbone_cache = make_prompt_cache(self._text_model)
                         for i, saved_state in enumerate(self._system_kv_snapshot):
                             backbone_cache[i].state = saved_state
@@ -1063,8 +1059,14 @@ class SimpleEngine(BaseEngine):
 
         # Run all Metal ops in a single serialized thread.
         def _run_all():
+            import mlx.core as mx
+            from mlx_lm import stream_generate as mlx_stream_generate
+            from mlx_lm.models.cache import make_prompt_cache
+            from mlx_lm.sample_utils import make_sampler
+
             nonlocal backbone_cache, prompt_to_send
 
+            sampler = make_sampler(temp=temperature, top_p=top_p)
             model = self._text_model
 
             # Cache MISS with valid prefix: prefill system tokens and snapshot
@@ -1152,12 +1154,18 @@ class SimpleEngine(BaseEngine):
             """Score tokens, sparse prefill, generate without MTP."""
             from types import SimpleNamespace
 
+            import mlx.core as mx
+            from mlx_lm.models.cache import make_prompt_cache
+            from mlx_lm.sample_utils import make_sampler
+
             from ..specprefill import (
                 cleanup_rope,
                 score_tokens,
                 select_chunks,
                 sparse_prefill,
             )
+
+            sampler = make_sampler(temp=temperature, top_p=top_p)
 
             # Create backbone cache if not already from system KV
             if bc is None:

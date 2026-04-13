@@ -13,15 +13,24 @@ from .base import BaseEngine, GenerationOutput
 from .simple import SimpleEngine
 from .batched import BatchedEngine
 
-# Re-export from parent engine.py for backwards compatibility
-from ..engine_core import EngineCore, AsyncEngineCore, EngineConfig
+_ENGINE_CORE_NAMES = frozenset({"EngineCore", "AsyncEngineCore", "EngineConfig"})
+
+
+def __getattr__(name: str):
+    """Lazily re-export engine_core symbols to avoid importing mlx at package load time."""
+    if name in _ENGINE_CORE_NAMES:
+        from .. import engine_core
+
+        return getattr(engine_core, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
 
 __all__ = [
     "BaseEngine",
     "GenerationOutput",
     "SimpleEngine",
     "BatchedEngine",
-    # Core engine components
+    # Core engine components (lazy)
     "EngineCore",
     "AsyncEngineCore",
     "EngineConfig",
