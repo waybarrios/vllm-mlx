@@ -82,3 +82,31 @@ def test_sparse_prefill_expands_tail_when_prompt_exceeds_window():
 
     flattened = [token for chunk in calls for row in chunk for token in row]
     assert flattened == [0, 2, 3, 4, 5, 6, 7, 8, 9]
+
+
+def test_trim_rotating_caches_clamps_offset():
+    """Regression: offset > max_size after prefix restore must be clamped.
+
+    RotatingKVCache._update_in_place computes
+    ``new_size = min(step, max_size - prev)`` where prev = offset.
+    If offset > max_size the result is negative → crash.
+    _trim_rotating_caches must clamp offset after trimming buffers.
+    """
+    from mlx_lm.models.cache import RotatingKVCache
+
+    from vllm_mlx.mllm_batch_generator import MLLMBatchGenerator
+
+    max_size = 4
+    cache = RotatingKVCache(max_size=max_size, keep=0)
+    # Simulate prefix-restored state: buffer larger than window, offset past max
+    cache.keys = mx.zeros((1, 1, 8, 4), dtype=mx.float32)
+    cache.values = mx.zeros((1, 1, 8, 4), dtype=mx.float32)
+    cache.offset = 8
+    cache._idx = 8
+
+    MLLMBatchGenerator._trim_rotating_caches([cache])
+
+    assert cache.keys.shape[2] == max_size
+    assert cache.values.shape[2] == max_size
+    assert cache._idx == max_size
+    assert cache.offset <= max_size

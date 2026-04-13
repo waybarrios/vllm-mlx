@@ -311,6 +311,7 @@ def _trim_cache_offset(cache: list[Any], trim_by: int) -> list[Any]:
                 tc.keys = None
                 tc.values = None
                 tc._idx = 0
+                tc.offset = 0
             elif entries_to_keep < old_size:
                 # Reorder to temporal order, keep the oldest entries
                 ordered_k = layer_cache._temporal_order(layer_cache.keys)

@@ -1588,7 +1588,12 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
     )
 
     # Parse tool calls from output using configured parser
-    cleaned_text, tool_calls = _parse_tool_calls_with_parser(output.text, request)
+    # Skip tool parsing when request has no tools — otherwise the parser
+    # can misinterpret JSON output (e.g. response_format) as tool calls.
+    if request.tools:
+        cleaned_text, tool_calls = _parse_tool_calls_with_parser(output.text, request)
+    else:
+        cleaned_text, tool_calls = output.text, None
 
     # Extract reasoning content (strips channel tokens before JSON extraction)
     # Skip reasoning parser when enable_thinking=False (no think tags expected)
@@ -1847,10 +1852,13 @@ async def create_anthropic_message(
         f"Anthropic messages: {output.completion_tokens} tokens in {elapsed:.2f}s ({tokens_per_sec:.1f} tok/s)"
     )
 
-    # Parse tool calls
-    cleaned_text, tool_calls = _parse_tool_calls_with_parser(
-        output.text, openai_request
-    )
+    # Parse tool calls (skip when no tools to avoid misinterpreting output)
+    if openai_request.tools:
+        cleaned_text, tool_calls = _parse_tool_calls_with_parser(
+            output.text, openai_request
+        )
+    else:
+        cleaned_text, tool_calls = output.text, None
 
     # Extract reasoning if parser is configured
     reasoning_text = None
