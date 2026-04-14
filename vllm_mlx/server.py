@@ -603,7 +603,6 @@ def _parse_tool_calls_with_parser(
         logger.warning(f"Tool parser error: {e}")
         return parse_tool_calls(output_text, request_dict)
 
-
 def _new_response_item_id(prefix: str) -> str:
     """Generate stable OpenAI-style item ids."""
     return f"{prefix}_{uuid.uuid4().hex}"
@@ -1481,6 +1480,46 @@ def _responses_sse_event(event_type: str, payload: BaseModel | dict) -> str:
         else json.dumps(payload)
     )
     return f"event: {event_type}\ndata: {data}\n\n"
+
+
+def _extract_reasoning_and_tool_calls(
+    output_text: str,
+    request: ChatCompletionRequest | None = None,
+    *,
+    allow_reasoning: bool = True,
+) -> tuple[str | None, str | None, list | None]:
+    """
+    Extract reasoning first, then parse tool calls from the cleaned content.
+
+    Non-streaming responses can contain both a reasoning block and structured
+    tool calls in the same final output. If tool parsing runs first and the
+    response contains tools, the caller can no longer reliably recover the
+    reasoning segment because the usual response path skips reasoning parsing
+    once tool_calls is truthy.
+    """
+    reasoning_text = None
+    text_for_tool_parse = output_text
+
+    if _reasoning_parser and allow_reasoning:
+        reasoning_text, cleaned_reasoning_text = _reasoning_parser.extract_reasoning(
+            output_text
+        )
+        if cleaned_reasoning_text is not None:
+            text_for_tool_parse = cleaned_reasoning_text
+        elif reasoning_text is not None:
+            text_for_tool_parse = ""
+
+    # Skip tool parsing when the request defines no tools — otherwise the
+    # parser can misinterpret JSON output (e.g. response_format) as tool calls.
+    if request is not None and getattr(request, "tools", None):
+        cleaned_text, tool_calls = _parse_tool_calls_with_parser(
+            text_for_tool_parse or "",
+            request,
+        )
+    else:
+        cleaned_text, tool_calls = text_for_tool_parse, None
+
+    return reasoning_text, cleaned_text, tool_calls
 
 
 def _detect_native_tool_support() -> bool:
@@ -2797,28 +2836,11 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
         f"Chat completion: {output.completion_tokens} tokens in {elapsed:.2f}s ({tokens_per_sec:.1f} tok/s)"
     )
 
-    # Parse tool calls from output using configured parser
-    # Skip tool parsing when request has no tools — otherwise the parser
-    # can misinterpret JSON output (e.g. response_format) as tool calls.
-    if request.tools:
-        cleaned_text, tool_calls = _parse_tool_calls_with_parser(output.text, request)
-    else:
-        cleaned_text, tool_calls = output.text, None
-
-    # Extract reasoning content (strips channel tokens before JSON extraction)
-    # Skip reasoning parser when enable_thinking=False (no think tags expected)
-    reasoning_text = None
-    if _reasoning_parser and request.enable_thinking is not False:
-        # Always use original output.text for reasoning extraction so
-        # <think> content is preserved even when tool calls are present.
-        text_to_parse = output.text
-        reasoning_text, remaining_text = _reasoning_parser.extract_reasoning(
-            text_to_parse
-        )
-        # Only update cleaned_text from reasoning parser when no tool calls
-        # (tool parser already set cleaned_text appropriately)
-        if not tool_calls:
-            cleaned_text = remaining_text
+    reasoning_text, cleaned_text, tool_calls = _extract_reasoning_and_tool_calls(
+        output.text,
+        request,
+        allow_reasoning=request.enable_thinking is not False,
+    )
 
     # Process response_format if specified (after reasoning parser cleaned the text)
     if response_format and not tool_calls:
@@ -3164,22 +3186,11 @@ async def create_anthropic_message(
         f"Anthropic messages: {output.completion_tokens} tokens in {elapsed:.2f}s ({tokens_per_sec:.1f} tok/s)"
     )
 
-    # Parse tool calls (skip when no tools to avoid misinterpreting output)
-    if openai_request.tools:
-        cleaned_text, tool_calls = _parse_tool_calls_with_parser(
-            output.text, openai_request
-        )
-    else:
-        cleaned_text, tool_calls = output.text, None
-
-    # Extract reasoning if parser is configured — skip when constrained
-    # decoding was active (no <think> tags possible).
-    reasoning_text = None
-    if _reasoning_parser and not tool_calls and json_logits_processor is None:
-        text_to_parse = cleaned_text or output.text
-        reasoning_text, cleaned_text = _reasoning_parser.extract_reasoning(
-            text_to_parse
-        )
+    reasoning_text, cleaned_text, tool_calls = _extract_reasoning_and_tool_calls(
+        output.text,
+        openai_request,
+        allow_reasoning=json_logits_processor is None,
+    )
 
     # Post-hoc response_format validation / normalization (safety net even
     # when constrained decoding was active).
