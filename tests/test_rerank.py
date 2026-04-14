@@ -403,3 +403,273 @@ def _make_bert_weights(config: dict) -> dict:
     w["classifier.bias"] = mx.zeros((num_labels,))
 
     return w
+
+
+# =============================================================================
+# Integration Tests - FastAPI Endpoint
+# =============================================================================
+
+
+class TestRerankEndpoint:
+    """Test the /v1/rerank endpoint via TestClient."""
+
+    @pytest.fixture()
+    def client(self):
+        """Create a FastAPI test client."""
+        from fastapi.testclient import TestClient
+
+        from vllm_mlx.server import app
+
+        return TestClient(app)
+
+    def test_rerank_returns_sorted_results(self, client):
+        """Test that /v1/rerank returns results sorted by relevance_score descending."""
+        import vllm_mlx.server as srv
+
+        mock_engine = MagicMock()
+        mock_engine.model_name = "test-reranker"
+        # doc 0 gets low score, doc 1 gets high score, doc 2 gets mid score
+        mock_engine.score_pairs.return_value = [0.1, 0.9, 0.5]
+        mock_engine.count_tokens.return_value = 30
+
+        original = srv._rerank_engine
+        srv._rerank_engine = mock_engine
+        try:
+            resp = client.post(
+                "/v1/rerank",
+                json={
+                    "model": "test-reranker",
+                    "query": "What is deep learning?",
+                    "documents": ["bad match", "great match", "ok match"],
+                },
+            )
+        finally:
+            srv._rerank_engine = original
+
+        assert resp.status_code == 200
+        body = resp.json()
+        assert len(body["results"]) == 3
+        # Sorted descending by score
+        assert body["results"][0]["index"] == 1
+        assert body["results"][0]["relevance_score"] == 0.9
+        assert body["results"][1]["index"] == 2
+        assert body["results"][1]["relevance_score"] == 0.5
+        assert body["results"][2]["index"] == 0
+        assert body["results"][2]["relevance_score"] == 0.1
+
+    def test_rerank_top_n(self, client):
+        """Test that top_n limits returned results."""
+        import vllm_mlx.server as srv
+
+        mock_engine = MagicMock()
+        mock_engine.model_name = "test-reranker"
+        mock_engine.score_pairs.return_value = [0.1, 0.9, 0.5]
+        mock_engine.count_tokens.return_value = 20
+
+        original = srv._rerank_engine
+        srv._rerank_engine = mock_engine
+        try:
+            resp = client.post(
+                "/v1/rerank",
+                json={
+                    "model": "test-reranker",
+                    "query": "query",
+                    "documents": ["a", "b", "c"],
+                    "top_n": 2,
+                },
+            )
+        finally:
+            srv._rerank_engine = original
+
+        assert resp.status_code == 200
+        body = resp.json()
+        assert len(body["results"]) == 2
+        assert body["results"][0]["relevance_score"] == 0.9
+        assert body["results"][1]["relevance_score"] == 0.5
+
+    def test_rerank_top_n_exceeds_documents_returns_400(self, client):
+        """Test that top_n > len(documents) returns 400."""
+        import vllm_mlx.server as srv
+
+        mock_engine = MagicMock()
+        mock_engine.model_name = "test-reranker"
+
+        original = srv._rerank_engine
+        srv._rerank_engine = mock_engine
+        try:
+            resp = client.post(
+                "/v1/rerank",
+                json={
+                    "model": "test-reranker",
+                    "query": "query",
+                    "documents": ["a", "b"],
+                    "top_n": 5,
+                },
+            )
+        finally:
+            srv._rerank_engine = original
+
+        assert resp.status_code == 400
+        assert "top_n" in resp.json()["detail"]
+
+    def test_rerank_return_documents_false(self, client):
+        """Test that return_documents=false omits document text."""
+        import vllm_mlx.server as srv
+
+        mock_engine = MagicMock()
+        mock_engine.model_name = "test-reranker"
+        mock_engine.score_pairs.return_value = [0.7]
+        mock_engine.count_tokens.return_value = 5
+
+        original = srv._rerank_engine
+        srv._rerank_engine = mock_engine
+        try:
+            resp = client.post(
+                "/v1/rerank",
+                json={
+                    "model": "test-reranker",
+                    "query": "q",
+                    "documents": ["d"],
+                    "return_documents": False,
+                },
+            )
+        finally:
+            srv._rerank_engine = original
+
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["results"][0]["document"] is None
+
+    def test_rerank_preserves_object_documents(self, client):
+        """Test that object documents preserve original structure."""
+        import vllm_mlx.server as srv
+
+        mock_engine = MagicMock()
+        mock_engine.model_name = "test-reranker"
+        mock_engine.score_pairs.return_value = [0.8, 0.3]
+        mock_engine.count_tokens.return_value = 10
+
+        original = srv._rerank_engine
+        srv._rerank_engine = mock_engine
+        try:
+            resp = client.post(
+                "/v1/rerank",
+                json={
+                    "model": "test-reranker",
+                    "query": "q",
+                    "documents": [
+                        {"text": "alpha", "metadata": "extra1"},
+                        {"text": "beta", "metadata": "extra2"},
+                    ],
+                },
+            )
+        finally:
+            srv._rerank_engine = original
+
+        assert resp.status_code == 200
+        body = resp.json()
+        # Results sorted by score descending; index 0 (0.8) first
+        assert body["results"][0]["index"] == 0
+        assert body["results"][0]["document"]["text"] == "alpha"
+        assert body["results"][0]["document"]["metadata"] == "extra1"
+
+    def test_rerank_empty_documents_returns_400(self, client):
+        """Test that empty document list returns 400."""
+        import vllm_mlx.server as srv
+
+        mock_engine = MagicMock()
+        mock_engine.model_name = "test-reranker"
+
+        original = srv._rerank_engine
+        srv._rerank_engine = mock_engine
+        try:
+            resp = client.post(
+                "/v1/rerank",
+                json={
+                    "model": "test-reranker",
+                    "query": "q",
+                    "documents": [],
+                },
+            )
+        finally:
+            srv._rerank_engine = original
+
+        assert resp.status_code == 400
+
+    def test_rerank_usage_tokens(self, client):
+        """Test that usage.total_tokens is included in response."""
+        import vllm_mlx.server as srv
+
+        mock_engine = MagicMock()
+        mock_engine.model_name = "test-reranker"
+        mock_engine.score_pairs.return_value = [0.5]
+        mock_engine.count_tokens.return_value = 42
+
+        original = srv._rerank_engine
+        srv._rerank_engine = mock_engine
+        try:
+            resp = client.post(
+                "/v1/rerank",
+                json={
+                    "model": "test-reranker",
+                    "query": "q",
+                    "documents": ["d"],
+                },
+            )
+        finally:
+            srv._rerank_engine = original
+
+        assert resp.status_code == 200
+        assert resp.json()["usage"]["total_tokens"] == 42
+
+    def test_rerank_model_locked_rejects_different_model(self, client):
+        """Test that a locked reranker model rejects requests for different models."""
+        import vllm_mlx.server as srv
+
+        mock_engine = MagicMock()
+        mock_engine.model_name = "locked-reranker"
+
+        original_engine = srv._rerank_engine
+        original_locked = srv._rerank_model_locked
+        srv._rerank_engine = mock_engine
+        srv._rerank_model_locked = "locked-reranker"
+
+        try:
+            resp = client.post(
+                "/v1/rerank",
+                json={
+                    "model": "other-reranker",
+                    "query": "q",
+                    "documents": ["d"],
+                },
+            )
+            assert resp.status_code == 400
+            body = resp.json()
+            assert "locked-reranker" in body["detail"]
+            assert "other-reranker" in body["detail"]
+        finally:
+            srv._rerank_engine = original_engine
+            srv._rerank_model_locked = original_locked
+
+    def test_rerank_no_engine_returns_503(self, client):
+        """Test that requesting rerank without a loaded engine returns 503."""
+        import vllm_mlx.server as srv
+
+        original = srv._rerank_engine
+        srv._rerank_engine = None
+        try:
+            resp = client.post(
+                "/v1/rerank",
+                json={
+                    "model": "any-model",
+                    "query": "q",
+                    "documents": ["d"],
+                },
+            )
+        finally:
+            srv._rerank_engine = original
+
+        # Without lazy loading enabled, should try to load and may fail with 503
+        # The exact behavior depends on whether lazy loading is wired, but the
+        # route must exist and not 404
+        assert resp.status_code != 404

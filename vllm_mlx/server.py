@@ -92,6 +92,10 @@ from .api.models import (
     Message,  # noqa: F401
     ModelInfo,  # noqa: F401
     ModelsResponse,
+    RerankRequest,
+    RerankResponse,
+    RerankResult,
+    RerankUsage,
     ToolCall,
     Usage,  # noqa: F401
     VideoUrl,  # noqa: F401
@@ -154,6 +158,10 @@ _mcp_executor = None
 # Global embedding engine (lazy loaded)
 _embedding_engine = None
 _embedding_model_locked: str | None = None  # Set when --embedding-model is used
+
+# Global reranker engine (lazy loaded)
+_rerank_engine = None
+_rerank_model_locked: str | None = None  # Set when --rerank-model is used
 
 # API key authentication
 _api_key: str | None = None
@@ -545,6 +553,34 @@ def load_embedding_model(
     _embedding_engine.load()
 
 
+def load_reranker_model(
+    model_name: str | None,
+    *,
+    lock: bool = False,
+    reuse_existing: bool = True,
+) -> None:
+    """Load or reuse the reranker model engine when configured."""
+    global _rerank_engine, _rerank_model_locked
+
+    if not model_name:
+        return
+
+    if lock:
+        _rerank_model_locked = model_name
+
+    if (
+        reuse_existing
+        and _rerank_engine is not None
+        and _rerank_engine.model_name == model_name
+    ):
+        return
+
+    from .rerank import RerankEngine
+
+    _rerank_engine = RerankEngine(model_name)
+    _rerank_engine.load()
+
+
 def load_model(
     model_name: str,
     use_batching: bool = False,
@@ -743,6 +779,14 @@ async def list_models() -> ModelsResponse:
     models = []
     if _model_name:
         models.append(ModelInfo(id=_model_name))
+    if _embedding_engine is not None:
+        models.append(
+            ModelInfo(id=_embedding_engine.model_name, owned_by="vllm-mlx-embedding")
+        )
+    if _rerank_engine is not None:
+        models.append(
+            ModelInfo(id=_rerank_engine.model_name, owned_by="vllm-mlx-reranker")
+        )
     return ModelsResponse(data=models)
 
 
@@ -869,6 +913,127 @@ async def create_embeddings(request: EmbeddingRequest) -> EmbeddingResponse:
         raise
     except Exception as e:
         logger.error(f"Embedding generation failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# =============================================================================
+# Reranking Endpoint
+# =============================================================================
+
+
+@app.post(
+    "/v1/rerank",
+    dependencies=[Depends(verify_api_key), Depends(check_rate_limit)],
+)
+async def rerank_documents(request: RerankRequest) -> RerankResponse:
+    """
+    Rerank documents against a query using a cross-encoder model.
+
+    Jina/Cohere-compatible reranking API. Accepts a query and a list of
+    documents (strings or {text: ...} objects), returns results sorted
+    by relevance score descending.
+    """
+    global _rerank_engine
+
+    try:
+        model_name = request.model
+
+        # If a reranker model was pre-configured at startup, only allow that model
+        if _rerank_model_locked is not None and model_name != _rerank_model_locked:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Reranker model '{model_name}' is not available. "
+                    f"This server was started with --rerank-model {_rerank_model_locked}. "
+                    f"Only '{_rerank_model_locked}' can be used for reranking. "
+                    f"Restart the server with a different --rerank-model to use '{model_name}'."
+                ),
+            )
+
+        # Validate documents
+        if not request.documents:
+            raise HTTPException(
+                status_code=400, detail="Documents list must not be empty"
+            )
+
+        # Validate top_n
+        if request.top_n is not None and request.top_n > len(request.documents):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"top_n ({request.top_n}) must not exceed the number of "
+                    f"documents ({len(request.documents)})"
+                ),
+            )
+
+        # Lazy-load or swap reranker engine
+        load_reranker_model(model_name, lock=False, reuse_existing=True)
+
+        if _rerank_engine is None:
+            raise HTTPException(
+                status_code=503,
+                detail="Reranker engine failed to load. Check server logs.",
+            )
+
+        # Extract text from documents (handle both string and object formats)
+        doc_texts = []
+        original_docs = []
+        for doc in request.documents:
+            if isinstance(doc, str):
+                doc_texts.append(doc)
+                original_docs.append({"text": doc})
+            elif isinstance(doc, dict) and "text" in doc:
+                doc_texts.append(doc["text"])
+                original_docs.append(doc)
+            else:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"Each document must be a string or an object with a 'text' field. "
+                        f"Got: {type(doc).__name__}"
+                    ),
+                )
+
+        start_time = time.perf_counter()
+
+        # Count tokens for usage reporting
+        total_tokens = _rerank_engine.count_tokens(request.query, doc_texts)
+
+        # Score all pairs
+        scores = _rerank_engine.score_pairs(request.query, doc_texts)
+
+        elapsed = time.perf_counter() - start_time
+        logger.info(
+            f"Rerank: {len(doc_texts)} documents, {total_tokens} tokens in {elapsed:.2f}s"
+        )
+
+        # Build results with original index and optional document
+        results = []
+        for i, score in enumerate(scores):
+            result = RerankResult(
+                index=i,
+                relevance_score=score,
+                document=original_docs[i] if request.return_documents else None,
+            )
+            results.append(result)
+
+        # Sort by relevance score descending
+        results.sort(key=lambda r: r.relevance_score, reverse=True)
+
+        # Apply top_n limit
+        if request.top_n is not None:
+            results = results[: request.top_n]
+
+        return RerankResponse(
+            model=model_name,
+            results=results,
+            usage=RerankUsage(total_tokens=total_tokens),
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Reranking failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
