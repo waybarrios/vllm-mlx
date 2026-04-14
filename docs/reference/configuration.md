@@ -19,6 +19,7 @@
 | `--api-key` | API key for authentication | None |
 | `--rate-limit` | Requests per minute per client (0 = disabled) | `0` |
 | `--timeout` | Request timeout in seconds | `300` |
+| `--enable-metrics` | Expose Prometheus metrics on `/metrics` | `false` |
 
 ### Batching Options
 

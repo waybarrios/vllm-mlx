@@ -37,6 +37,7 @@ vllm-mlx serve mlx-community/Llama-3.2-3B-Instruct-4bit --port 8000 --continuous
 | `--api-key` | API key for authentication | None |
 | `--rate-limit` | Requests per minute per client (0 = disabled) | 0 |
 | `--timeout` | Request timeout in seconds | 300 |
+| `--enable-metrics` | Expose Prometheus metrics on `/metrics` | False |
 | `--continuous-batching` | Enable batching for multi-user | False |
 | `--use-paged-cache` | Enable paged KV cache | False |
 | `--cache-memory-mb` | Cache memory limit in MB | Auto |
@@ -127,6 +128,23 @@ GET /health
 ```
 
 Returns server status.
+
+### Metrics
+
+```bash
+GET /metrics
+```
+
+Prometheus scrape endpoint for server, cache, scheduler, and request metrics.
+The endpoint is disabled by default and is enabled with `--enable-metrics`.
+
+```bash
+vllm-mlx serve mlx-community/Llama-3.2-3B-Instruct-4bit \
+  --enable-metrics
+```
+
+`/metrics` is intentionally unauthenticated. Expose it only on a trusted
+network or behind a reverse proxy / firewall that limits who can scrape it.
 
 ### Anthropic Messages API
 

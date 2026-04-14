@@ -27,6 +27,7 @@ vllm-mlx serve <model> [options]
 | `--api-key` | API key for authentication | None |
 | `--rate-limit` | Requests per minute per client (0 = disabled) | 0 |
 | `--timeout` | Request timeout in seconds | 300 |
+| `--enable-metrics` | Expose Prometheus metrics on `/metrics` | False |
 | `--continuous-batching` | Enable batching for multi-user | False |
 | `--cache-memory-mb` | Cache memory limit in MB | Auto |
 | `--cache-memory-percent` | Fraction of RAM for cache | 0.20 |
@@ -87,6 +88,9 @@ vllm-mlx serve mlx-community/granite-4.0-tiny-preview-4bit \
 
 # With API key authentication
 vllm-mlx serve mlx-community/Llama-3.2-3B-Instruct-4bit --api-key your-secret-key
+
+# Expose Prometheus metrics
+vllm-mlx serve mlx-community/Llama-3.2-3B-Instruct-4bit --enable-metrics
 
 # Production setup with security options
 vllm-mlx serve mlx-community/Qwen3-4B-4bit \

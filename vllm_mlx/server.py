@@ -55,6 +55,7 @@ import uvicorn
 from fastapi import Depends, FastAPI, HTTPException, Request, UploadFile
 from fastapi.responses import Response, StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from starlette.routing import Match
 
 # Import from new modular API
 # Re-export for backwards compatibility with tests
@@ -109,6 +110,7 @@ from .api.utils import (
     is_mllm_model,  # noqa: F401
 )
 from .engine import BaseEngine, BatchedEngine, GenerationOutput, SimpleEngine
+from .metrics import metrics as _metrics
 from .tool_parsers import ToolParserManager
 
 logging.basicConfig(level=logging.INFO)
@@ -124,6 +126,7 @@ _default_max_tokens: int = 32768
 _default_timeout: float = 300.0  # Default request timeout in seconds (5 minutes)
 _default_temperature: float | None = None  # Set via --default-temperature
 _default_top_p: float | None = None  # Set via --default-top-p
+_metrics_enabled = False
 
 _FALLBACK_TEMPERATURE = 0.7
 _FALLBACK_TOP_P = 0.9
@@ -260,6 +263,66 @@ app = FastAPI(
 )
 
 security = HTTPBearer(auto_error=False)
+
+
+def _metrics_result_from_status(status_code: int) -> str:
+    """Map HTTP-ish status codes to low-cardinality inference results."""
+    if status_code == 499:
+        return "client_closed"
+    if status_code == 504:
+        return "timeout"
+    if status_code >= 500:
+        return "error"
+    return "success"
+
+
+def _metrics_path_for_request(request: Request) -> str:
+    """Prefer route templates over raw URLs to keep metrics cardinality bounded."""
+    route = request.scope.get("route")
+    if route is not None:
+        path = getattr(route, "path", None)
+        if path:
+            return str(path)
+    for candidate in app.router.routes:
+        match, _ = candidate.matches(request.scope)
+        if match in (Match.FULL, Match.PARTIAL):
+            path = getattr(candidate, "path", None)
+            if path:
+                return str(path)
+    return "__unmatched__"
+
+
+@app.middleware("http")
+async def _metrics_middleware(request: Request, call_next):
+    """Capture generic HTTP request metrics when enabled."""
+    if not _metrics.enabled:
+        return await call_next(request)
+
+    method = request.method
+    path = _metrics_path_for_request(request)
+    if path == "/metrics":
+        return await call_next(request)
+
+    start_time = time.perf_counter()
+    _metrics.observe_http_start(method=method, path=path)
+    try:
+        response = await call_next(request)
+    except Exception:
+        _metrics.observe_http_finish(
+            method=method,
+            path=path,
+            status_code=500,
+            duration=time.perf_counter() - start_time,
+        )
+        raise
+
+    _metrics.observe_http_finish(
+        method=method,
+        path=path,
+        status_code=response.status_code,
+        duration=time.perf_counter() - start_time,
+    )
+    return response
 
 
 class RateLimiter:
@@ -644,6 +707,19 @@ def get_usage(output: GenerationOutput) -> Usage:
     )
 
 
+@app.get("/metrics")
+async def metrics():
+    """Prometheus scrape endpoint (disabled by default)."""
+    if not _metrics.enabled:
+        raise HTTPException(status_code=404, detail="Metrics endpoint is disabled")
+
+    payload, content_type = _metrics.render_metrics(
+        engine=_engine,
+        mcp_manager=_mcp_manager,
+    )
+    return Response(content=payload, headers={"Content-Type": content_type})
+
+
 @app.get("/health")
 async def health():
     """Health check endpoint."""
@@ -802,6 +878,7 @@ async def create_embeddings(request: EmbeddingRequest) -> EmbeddingResponse:
     - Any BERT/XLM-RoBERTa/ModernBERT model from HuggingFace
     """
     global _embedding_engine
+    tracker = _metrics.track_inference("embeddings", stream=False)
 
     try:
         # Resolve model name
@@ -849,7 +926,7 @@ async def create_embeddings(request: EmbeddingRequest) -> EmbeddingResponse:
             EmbeddingData(index=i, embedding=vec) for i, vec in enumerate(embeddings)
         ]
 
-        return EmbeddingResponse(
+        response = EmbeddingResponse(
             data=data,
             model=model_name,
             usage=EmbeddingUsage(
@@ -857,17 +934,26 @@ async def create_embeddings(request: EmbeddingRequest) -> EmbeddingResponse:
                 total_tokens=prompt_tokens,
             ),
         )
+        tracker.finish(
+            result="success",
+            prompt_tokens=prompt_tokens,
+            completion_tokens=0,
+        )
+        return response
 
     except ImportError:
+        tracker.finish(result="error")
         raise HTTPException(
             status_code=503,
             detail=(
                 "mlx-embeddings not installed. Install with: pip install mlx-embeddings"
             ),
         )
-    except HTTPException:
+    except HTTPException as exc:
+        tracker.finish(result=_metrics_result_from_status(exc.status_code))
         raise
     except Exception as e:
+        tracker.finish(result="error")
         logger.error(f"Embedding generation failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -965,6 +1051,7 @@ async def create_transcription(
     - parakeet-tdt-0.6b-v2 (English, fastest)
     """
     global _stt_engine
+    tracker = _metrics.track_inference("audio_transcriptions", stream=False)
 
     try:
         from .audio.stt import STTEngine  # Lazy import - optional feature
@@ -997,8 +1084,10 @@ async def create_transcription(
             os.unlink(tmp_path)
 
         if response_format == "text":
+            tracker.finish(result="success")
             return result.text
 
+        tracker.finish(result="success")
         return {
             "text": result.text,
             "language": result.language,
@@ -1006,11 +1095,16 @@ async def create_transcription(
         }
 
     except ImportError:
+        tracker.finish(result="error")
         raise HTTPException(
             status_code=503,
             detail="mlx-audio not installed. Install with: pip install mlx-audio",
         )
+    except HTTPException as exc:
+        tracker.finish(result=_metrics_result_from_status(exc.status_code))
+        raise
     except Exception as e:
+        tracker.finish(result="error")
         logger.error(f"Transcription failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -1033,6 +1127,7 @@ async def create_speech(
     - voxcpm (Chinese/English)
     """
     global _tts_engine
+    tracker = _metrics.track_inference("audio_speech", stream=False)
 
     try:
         from .audio.tts import TTSEngine  # Lazy import - optional feature
@@ -1059,14 +1154,20 @@ async def create_speech(
         content_type = (
             "audio/wav" if response_format == "wav" else f"audio/{response_format}"
         )
+        tracker.finish(result="success")
         return Response(content=audio_bytes, media_type=content_type)
 
     except ImportError:
+        tracker.finish(result="error")
         raise HTTPException(
             status_code=503,
             detail="mlx-audio not installed. Install with: pip install mlx-audio",
         )
+    except HTTPException as exc:
+        tracker.finish(result=_metrics_result_from_status(exc.status_code))
+        raise
     except Exception as e:
+        tracker.finish(result="error")
         logger.error(f"TTS generation failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -1300,6 +1401,7 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
     """Create a text completion."""
     _validate_model_name(request.model)
     engine = get_engine()
+    tracker = _metrics.track_inference("completions", stream=request.stream)
 
     # Handle single prompt or list of prompts
     prompts = request.prompt if isinstance(request.prompt, list) else [request.prompt]
@@ -1327,6 +1429,7 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
                     prompts[0],
                     request,
                     repetition_penalty=comp_rep_penalty,
+                    metrics_tracker=tracker,
                 ),
                 raw_request,
             ),
@@ -1358,12 +1461,21 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
         if request.specprefill_keep_pct is not None:
             generate_kwargs["specprefill_keep_pct"] = request.specprefill_keep_pct
 
-        output = await _wait_with_disconnect(
-            engine.generate(**generate_kwargs),
-            raw_request,
-            timeout=timeout,
-        )
+        try:
+            output = await _wait_with_disconnect(
+                engine.generate(**generate_kwargs),
+                raw_request,
+                timeout=timeout,
+            )
+        except HTTPException as exc:
+            tracker.finish(result=_metrics_result_from_status(exc.status_code))
+            raise
         if output is None:
+            tracker.finish(
+                result="client_closed",
+                prompt_tokens=total_prompt_tokens,
+                completion_tokens=total_completion_tokens,
+            )
             return Response(status_code=499)  # Client closed request
 
         choices.append(
@@ -1384,6 +1496,11 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
         f"Completion: {total_prompt_tokens} prompt + {total_completion_tokens} completion tokens in {elapsed:.2f}s ({tokens_per_sec:.1f} tok/s)"
     )
 
+    tracker.finish(
+        result="success",
+        prompt_tokens=total_prompt_tokens,
+        completion_tokens=total_completion_tokens,
+    )
     return CompletionResponse(
         model=_model_name,
         choices=choices,
@@ -1443,6 +1560,7 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
     """
     _validate_model_name(request.model)
     engine = get_engine()
+    tracker = _metrics.track_inference("chat_completions", stream=request.stream)
 
     # --- Detailed request logging ---
     n_msgs = len(request.messages)
@@ -1563,7 +1681,13 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
     if request.stream:
         return StreamingResponse(
             _disconnect_guard(
-                stream_chat_completion(engine, messages, request, **chat_kwargs),
+                stream_chat_completion(
+                    engine,
+                    messages,
+                    request,
+                    metrics_tracker=tracker,
+                    **chat_kwargs,
+                ),
                 raw_request,
             ),
             media_type="text/event-stream",
@@ -1573,12 +1697,17 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
     start_time = time.perf_counter()
     timeout = request.timeout or _default_timeout
 
-    output = await _wait_with_disconnect(
-        engine.chat(messages=messages, **chat_kwargs),
-        raw_request,
-        timeout=timeout,
-    )
+    try:
+        output = await _wait_with_disconnect(
+            engine.chat(messages=messages, **chat_kwargs),
+            raw_request,
+            timeout=timeout,
+        )
+    except HTTPException as exc:
+        tracker.finish(result=_metrics_result_from_status(exc.status_code))
+        raise
     if output is None:
+        tracker.finish(result="client_closed")
         return Response(status_code=499)  # Client closed request
 
     elapsed = time.perf_counter() - start_time
@@ -1612,6 +1741,11 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
     # Determine finish reason
     finish_reason = "tool_calls" if tool_calls else output.finish_reason
 
+    tracker.finish(
+        result="success",
+        prompt_tokens=output.prompt_tokens,
+        completion_tokens=output.completion_tokens,
+    )
     return ChatCompletionResponse(
         model=_model_name,
         choices=[
@@ -1751,6 +1885,7 @@ async def create_anthropic_message(
     Supports both streaming and non-streaming modes.
     """
     engine = get_engine()
+    tracker = _metrics.track_inference("anthropic_messages", stream=False)
 
     # Parse the raw body to handle Anthropic request format.
     # Some clients (e.g. Claude Code) may send JSON with invalid escape
@@ -1794,7 +1929,12 @@ async def create_anthropic_message(
     if anthropic_request.stream:
         return StreamingResponse(
             _disconnect_guard(
-                _stream_anthropic_messages(engine, openai_request, anthropic_request),
+                _stream_anthropic_messages(
+                    engine,
+                    openai_request,
+                    anthropic_request,
+                    metrics_tracker=tracker,
+                ),
                 request,
             ),
             media_type="text/event-stream",
@@ -1827,12 +1967,17 @@ async def create_anthropic_message(
     start_time = time.perf_counter()
     timeout = _default_timeout
 
-    output = await _wait_with_disconnect(
-        engine.chat(messages=messages, **chat_kwargs),
-        request,
-        timeout=timeout,
-    )
+    try:
+        output = await _wait_with_disconnect(
+            engine.chat(messages=messages, **chat_kwargs),
+            request,
+            timeout=timeout,
+        )
+    except HTTPException as exc:
+        tracker.finish(result=_metrics_result_from_status(exc.status_code))
+        raise
     if output is None:
+        tracker.finish(result="client_closed")
         return Response(status_code=499)  # Client closed request
 
     elapsed = time.perf_counter() - start_time
@@ -1902,6 +2047,11 @@ async def create_anthropic_message(
             input_tokens=output.prompt_tokens,
             output_tokens=output.completion_tokens,
         ),
+    )
+    tracker.finish(
+        result="success",
+        prompt_tokens=output.prompt_tokens,
+        completion_tokens=output.completion_tokens,
     )
     return Response(
         content=anthropic_response.model_dump_json(exclude_none=True),
@@ -2036,6 +2186,7 @@ async def _stream_anthropic_messages(
     engine: BaseEngine,
     openai_request: ChatCompletionRequest,
     anthropic_request: AnthropicRequest,
+    metrics_tracker=None,
 ) -> AsyncIterator[str]:
     """
     Stream Anthropic Messages API SSE events.
@@ -2050,6 +2201,8 @@ async def _stream_anthropic_messages(
     """
     msg_id = f"msg_{uuid.uuid4().hex[:24]}"
     start_time = time.perf_counter()
+    result_label = "success"
+    prompt_tokens = 0
 
     # Extract messages for engine
     messages, images, videos = extract_multimodal_content(
@@ -2132,151 +2285,177 @@ async def _stream_anthropic_messages(
             tool_parser = _tool_parser_instance
             tool_parser.reset()
 
-    async for output in engine.stream_chat(messages=messages, **chat_kwargs):
-        delta_text = output.new_text
+    try:
+        async for output in engine.stream_chat(messages=messages, **chat_kwargs):
+            if metrics_tracker is not None:
+                metrics_tracker.observe_ttft()
+            delta_text = output.new_text
 
-        # Track token counts
-        if hasattr(output, "completion_tokens") and output.completion_tokens:
-            completion_tokens = output.completion_tokens
+            if hasattr(output, "prompt_tokens") and output.prompt_tokens:
+                prompt_tokens = output.prompt_tokens
 
-        if not delta_text:
-            continue
+            # Track token counts
+            if hasattr(output, "completion_tokens") and output.completion_tokens:
+                completion_tokens = output.completion_tokens
 
-        # Filter special tokens
-        filtered = SPECIAL_TOKENS_PATTERN.sub("", delta_text)
-        if not filtered:
-            continue
+            if not delta_text:
+                continue
 
-        if not use_reasoning:
-            # Simple path — no reasoning parsing
+            # Filter special tokens
+            filtered = SPECIAL_TOKENS_PATTERN.sub("", delta_text)
+            if not filtered:
+                continue
+
+            if not use_reasoning:
+                # Simple path — no reasoning parsing
+                accumulated_text += filtered
+                content_to_emit = filtered
+
+                # Filter tool call markup during streaming
+                if tool_parser and content_to_emit:
+                    if not tool_markup_possible and "<" not in content_to_emit:
+                        tool_accumulated_text += content_to_emit
+                    else:
+                        if not tool_markup_possible:
+                            tool_markup_possible = True
+                        tool_previous = tool_accumulated_text
+                        tool_accumulated_text += content_to_emit
+                        tool_result = tool_parser.extract_tool_calls_streaming(
+                            tool_previous, tool_accumulated_text, content_to_emit
+                        )
+                        if tool_result is None or "tool_calls" in tool_result:
+                            # Inside tool markup or tool calls detected — suppress
+                            continue
+                        content_to_emit = tool_result.get("content", "")
+                        if content_to_emit:
+                            content_to_emit = _TOOL_MARKUP_PATTERN.sub(
+                                "", content_to_emit
+                            )
+                        if not content_to_emit:
+                            continue
+
+                yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': 0, 'delta': {'type': 'text_delta', 'text': content_to_emit}})}\n\n"
+                continue
+
+            # Reasoning parser path
+            previous_text = accumulated_text
             accumulated_text += filtered
-            content_to_emit = filtered
+            delta_msg = _reasoning_parser.extract_reasoning_streaming(
+                previous_text, accumulated_text, filtered
+            )
 
-            # Filter tool call markup during streaming
-            if tool_parser and content_to_emit:
-                if not tool_markup_possible and "<" not in content_to_emit:
-                    tool_accumulated_text += content_to_emit
-                else:
-                    if not tool_markup_possible:
-                        tool_markup_possible = True
-                    tool_previous = tool_accumulated_text
-                    tool_accumulated_text += content_to_emit
-                    tool_result = tool_parser.extract_tool_calls_streaming(
-                        tool_previous, tool_accumulated_text, content_to_emit
-                    )
-                    if tool_result is None or "tool_calls" in tool_result:
-                        # Inside tool markup or tool calls detected — suppress
-                        continue
-                    content_to_emit = tool_result.get("content", "")
-                    if content_to_emit:
-                        content_to_emit = _TOOL_MARKUP_PATTERN.sub("", content_to_emit)
-                    if not content_to_emit:
-                        continue
+            if delta_msg is None:
+                continue
 
-            yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': 0, 'delta': {'type': 'text_delta', 'text': content_to_emit}})}\n\n"
-            continue
+            if delta_msg.reasoning:
+                if not thinking_block_started:
+                    yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': thinking_index, 'content_block': {'type': 'thinking', 'thinking': ''}})}\n\n"
+                    thinking_block_started = True
+                yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': thinking_index, 'delta': {'type': 'thinking_delta', 'thinking': delta_msg.reasoning}})}\n\n"
 
-        # Reasoning parser path
-        previous_text = accumulated_text
-        accumulated_text += filtered
-        delta_msg = _reasoning_parser.extract_reasoning_streaming(
-            previous_text, accumulated_text, filtered
+            if delta_msg.content:
+                content_to_emit = delta_msg.content
+
+                # Filter tool call markup during streaming
+                if tool_parser and content_to_emit:
+                    if not tool_markup_possible and "<" not in content_to_emit:
+                        tool_accumulated_text += content_to_emit
+                    else:
+                        if not tool_markup_possible:
+                            tool_markup_possible = True
+                        tool_previous = tool_accumulated_text
+                        tool_accumulated_text += content_to_emit
+                        tool_result = tool_parser.extract_tool_calls_streaming(
+                            tool_previous, tool_accumulated_text, content_to_emit
+                        )
+                        if tool_result is None or "tool_calls" in tool_result:
+                            # Inside tool markup or tool calls detected — suppress
+                            continue
+                        content_to_emit = tool_result.get("content", "")
+                        if content_to_emit:
+                            content_to_emit = _TOOL_MARKUP_PATTERN.sub(
+                                "", content_to_emit
+                            )
+                        if not content_to_emit:
+                            continue
+
+                if thinking_block_started and not text_block_started:
+                    # Close thinking block, open text block
+                    yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': thinking_index})}\n\n"
+                    yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': text_index, 'content_block': {'type': 'text', 'text': ''}})}\n\n"
+                    text_block_started = True
+                elif not text_block_started:
+                    # No thinking was emitted, start text block at index 0
+                    text_index = 0
+                    yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': text_index, 'content_block': {'type': 'text', 'text': ''}})}\n\n"
+                    text_block_started = True
+                yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': text_index, 'delta': {'type': 'text_delta', 'text': content_to_emit}})}\n\n"
+
+        # Close any open thinking block that was never followed by text
+        if thinking_block_started and not text_block_started:
+            yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': thinking_index})}\n\n"
+            # Emit empty text block so response always has text content
+            text_index = thinking_index + 1
+            yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': text_index, 'content_block': {'type': 'text', 'text': ''}})}\n\n"
+            text_block_started = True
+
+        # Check for tool calls in accumulated text
+        _, tool_calls = _parse_tool_calls_with_parser(accumulated_text, openai_request)
+
+        # Close text block
+        if text_block_started:
+            yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': text_index})}\n\n"
+
+        # If there are tool calls, emit tool_use blocks
+        next_index = (text_index + 1) if text_block_started else 0
+        if tool_calls:
+            for i, tc in enumerate(tool_calls):
+                tool_index = next_index + i
+                try:
+                    tool_input = json.loads(tc.function.arguments)
+                except (json.JSONDecodeError, AttributeError):
+                    tool_input = {}
+
+                yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': tool_index, 'content_block': {'type': 'tool_use', 'id': tc.id, 'name': tc.function.name, 'input': {}}})}\n\n"
+                yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': tool_index, 'delta': {'type': 'input_json_delta', 'partial_json': json.dumps(tool_input)}})}\n\n"
+                yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': tool_index})}\n\n"
+
+        # Determine stop reason
+        stop_reason = "tool_use" if tool_calls else "end_turn"
+
+        # Emit message_delta with stop_reason and usage
+        message_delta = {
+            "type": "message_delta",
+            "delta": {"stop_reason": stop_reason, "stop_sequence": None},
+            "usage": {"output_tokens": completion_tokens},
+        }
+        yield f"event: message_delta\ndata: {json.dumps(message_delta)}\n\n"
+
+        # Log throughput
+        elapsed = time.perf_counter() - start_time
+        tokens_per_sec = completion_tokens / elapsed if elapsed > 0 else 0
+        logger.info(
+            f"Anthropic messages (stream): {completion_tokens} tokens in {elapsed:.2f}s ({tokens_per_sec:.1f} tok/s)"
         )
 
-        if delta_msg is None:
-            continue
-
-        if delta_msg.reasoning:
-            if not thinking_block_started:
-                yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': thinking_index, 'content_block': {'type': 'thinking', 'thinking': ''}})}\n\n"
-                thinking_block_started = True
-            yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': thinking_index, 'delta': {'type': 'thinking_delta', 'thinking': delta_msg.reasoning}})}\n\n"
-
-        if delta_msg.content:
-            content_to_emit = delta_msg.content
-
-            # Filter tool call markup during streaming
-            if tool_parser and content_to_emit:
-                if not tool_markup_possible and "<" not in content_to_emit:
-                    tool_accumulated_text += content_to_emit
-                else:
-                    if not tool_markup_possible:
-                        tool_markup_possible = True
-                    tool_previous = tool_accumulated_text
-                    tool_accumulated_text += content_to_emit
-                    tool_result = tool_parser.extract_tool_calls_streaming(
-                        tool_previous, tool_accumulated_text, content_to_emit
-                    )
-                    if tool_result is None or "tool_calls" in tool_result:
-                        # Inside tool markup or tool calls detected — suppress
-                        continue
-                    content_to_emit = tool_result.get("content", "")
-                    if content_to_emit:
-                        content_to_emit = _TOOL_MARKUP_PATTERN.sub("", content_to_emit)
-                    if not content_to_emit:
-                        continue
-
-            if thinking_block_started and not text_block_started:
-                # Close thinking block, open text block
-                yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': thinking_index})}\n\n"
-                yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': text_index, 'content_block': {'type': 'text', 'text': ''}})}\n\n"
-                text_block_started = True
-            elif not text_block_started:
-                # No thinking was emitted, start text block at index 0
-                text_index = 0
-                yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': text_index, 'content_block': {'type': 'text', 'text': ''}})}\n\n"
-                text_block_started = True
-            yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': text_index, 'delta': {'type': 'text_delta', 'text': content_to_emit}})}\n\n"
-
-    # Close any open thinking block that was never followed by text
-    if thinking_block_started and not text_block_started:
-        yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': thinking_index})}\n\n"
-        # Emit empty text block so response always has text content
-        text_index = thinking_index + 1
-        yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': text_index, 'content_block': {'type': 'text', 'text': ''}})}\n\n"
-        text_block_started = True
-
-    # Check for tool calls in accumulated text
-    _, tool_calls = _parse_tool_calls_with_parser(accumulated_text, openai_request)
-
-    # Close text block
-    if text_block_started:
-        yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': text_index})}\n\n"
-
-    # If there are tool calls, emit tool_use blocks
-    next_index = (text_index + 1) if text_block_started else 0
-    if tool_calls:
-        for i, tc in enumerate(tool_calls):
-            tool_index = next_index + i
-            try:
-                tool_input = json.loads(tc.function.arguments)
-            except (json.JSONDecodeError, AttributeError):
-                tool_input = {}
-
-            yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': tool_index, 'content_block': {'type': 'tool_use', 'id': tc.id, 'name': tc.function.name, 'input': {}}})}\n\n"
-            yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': tool_index, 'delta': {'type': 'input_json_delta', 'partial_json': json.dumps(tool_input)}})}\n\n"
-            yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': tool_index})}\n\n"
-
-    # Determine stop reason
-    stop_reason = "tool_use" if tool_calls else "end_turn"
-
-    # Emit message_delta with stop_reason and usage
-    message_delta = {
-        "type": "message_delta",
-        "delta": {"stop_reason": stop_reason, "stop_sequence": None},
-        "usage": {"output_tokens": completion_tokens},
-    }
-    yield f"event: message_delta\ndata: {json.dumps(message_delta)}\n\n"
-
-    # Log throughput
-    elapsed = time.perf_counter() - start_time
-    tokens_per_sec = completion_tokens / elapsed if elapsed > 0 else 0
-    logger.info(
-        f"Anthropic messages (stream): {completion_tokens} tokens in {elapsed:.2f}s ({tokens_per_sec:.1f} tok/s)"
-    )
-
-    # Emit message_stop
-    yield f"event: message_stop\ndata: {json.dumps({'type': 'message_stop'})}\n\n"
+        # Emit message_stop
+        yield f"event: message_stop\ndata: {json.dumps({'type': 'message_stop'})}\n\n"
+    except HTTPException as exc:
+        result_label = _metrics_result_from_status(exc.status_code)
+        raise
+    except (asyncio.CancelledError, GeneratorExit):
+        result_label = "cancelled"
+        raise
+    except Exception:
+        result_label = "error"
+        raise
+    finally:
+        if metrics_tracker is not None:
+            metrics_tracker.finish(
+                result=result_label,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+            )
 
 
 # =============================================================================
@@ -2289,8 +2468,12 @@ async def stream_completion(
     prompt: str,
     request: CompletionRequest,
     repetition_penalty: float | None = None,
+    metrics_tracker=None,
 ) -> AsyncIterator[str]:
     """Stream completion response."""
+    result = "success"
+    prompt_tokens = 0
+    completion_tokens = 0
     generate_kwargs = {
         "prompt": prompt,
         "max_tokens": request.max_tokens or _default_max_tokens,
@@ -2308,36 +2491,65 @@ async def stream_completion(
     if request.specprefill_keep_pct is not None:
         generate_kwargs["specprefill_keep_pct"] = request.specprefill_keep_pct
 
-    async for output in engine.stream_generate(**generate_kwargs):
-        data = {
-            "id": f"cmpl-{uuid.uuid4().hex[:8]}",
-            "object": "text_completion",
-            "created": int(time.time()),
-            "model": _model_name,
-            "choices": [
-                {
-                    "index": 0,
-                    "text": output.new_text,
-                    "finish_reason": output.finish_reason if output.finished else None,
-                }
-            ],
-        }
-        if output.finished:
-            data["usage"] = get_usage(output).model_dump()
-        yield f"data: {json.dumps(data)}\n\n"
+    try:
+        async for output in engine.stream_generate(**generate_kwargs):
+            if metrics_tracker is not None:
+                metrics_tracker.observe_ttft()
+            prompt_tokens = (
+                output.prompt_tokens if hasattr(output, "prompt_tokens") else prompt_tokens
+            )
+            completion_tokens = (
+                output.completion_tokens
+                if hasattr(output, "completion_tokens")
+                else completion_tokens
+            )
+            data = {
+                "id": f"cmpl-{uuid.uuid4().hex[:8]}",
+                "object": "text_completion",
+                "created": int(time.time()),
+                "model": _model_name,
+                "choices": [
+                    {
+                        "index": 0,
+                        "text": output.new_text,
+                        "finish_reason": output.finish_reason if output.finished else None,
+                    }
+                ],
+            }
+            if output.finished:
+                data["usage"] = get_usage(output).model_dump()
+            yield f"data: {json.dumps(data)}\n\n"
 
-    yield "data: [DONE]\n\n"
+        yield "data: [DONE]\n\n"
+    except HTTPException as exc:
+        result = _metrics_result_from_status(exc.status_code)
+        raise
+    except (asyncio.CancelledError, GeneratorExit):
+        result = "cancelled"
+        raise
+    except Exception:
+        result = "error"
+        raise
+    finally:
+        if metrics_tracker is not None:
+            metrics_tracker.finish(
+                result=result,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+            )
 
 
 async def stream_chat_completion(
     engine: BaseEngine,
     messages: list,
     request: ChatCompletionRequest,
+    metrics_tracker=None,
     **kwargs,
 ) -> AsyncIterator[str]:
     """Stream chat completion response."""
     response_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
     start_time = time.perf_counter()
+    result_label = "success"
 
     # Check if we should include usage in the final chunk
     include_usage = request.stream_options and request.stream_options.include_usage
@@ -2396,302 +2608,323 @@ async def stream_chat_completion(
             tool_parser = _tool_parser_instance
             tool_parser.reset()
 
-    # Stream content
-    async for output in engine.stream_chat(messages=messages, **kwargs):
-        delta_text = output.new_text
-        last_output = output
+    try:
+        # Stream content
+        async for output in engine.stream_chat(messages=messages, **kwargs):
+            if metrics_tracker is not None:
+                metrics_tracker.observe_ttft()
+            delta_text = output.new_text
+            last_output = output
 
-        # Track token counts from output (updated each chunk)
-        if hasattr(output, "prompt_tokens") and output.prompt_tokens:
-            prompt_tokens = output.prompt_tokens
-        if hasattr(output, "completion_tokens") and output.completion_tokens:
-            completion_tokens = output.completion_tokens
+            # Track token counts from output (updated each chunk)
+            if hasattr(output, "prompt_tokens") and output.prompt_tokens:
+                prompt_tokens = output.prompt_tokens
+            if hasattr(output, "completion_tokens") and output.completion_tokens:
+                completion_tokens = output.completion_tokens
 
-        # Use reasoning parser if enabled (skip when enable_thinking=False)
-        if _reasoning_parser and delta_text and request.enable_thinking is not False:
-            previous_text = accumulated_text
-            accumulated_text += delta_text
-            delta_msg = _reasoning_parser.extract_reasoning_streaming(
-                previous_text, accumulated_text, delta_text
-            )
+            # Use reasoning parser if enabled (skip when enable_thinking=False)
+            if _reasoning_parser and delta_text and request.enable_thinking is not False:
+                previous_text = accumulated_text
+                accumulated_text += delta_text
+                delta_msg = _reasoning_parser.extract_reasoning_streaming(
+                    previous_text, accumulated_text, delta_text
+                )
 
-            if delta_msg is None:
-                # Skip this chunk (e.g., <think> token itself)
-                continue
+                if delta_msg is None:
+                    # Skip this chunk (e.g., <think> token itself)
+                    continue
 
-            content = delta_msg.content
-            reasoning = delta_msg.reasoning
+                content = delta_msg.content
+                reasoning = delta_msg.reasoning
 
-            # Some models (e.g. MiniMax) wrap tool calls in <think>
-            # blocks, so reasoning parser captures tool call XML as
-            # reasoning while content stays None.  Redirect reasoning
-            # to the content stream so the tool parser can handle it.
-            if tool_parser and reasoning and not content:
-                _check = tool_accumulated_text + reasoning
-                if (
-                    "<minimax:tool_call>" in _check
-                    or "<tool_call>" in _check
-                    or '<invoke name="' in _check
-                ):
-                    content = reasoning
-                    reasoning = None
+                # Some models (e.g. MiniMax) wrap tool calls in <think>
+                # blocks, so reasoning parser captures tool call XML as
+                # reasoning while content stays None.  Redirect reasoning
+                # to the content stream so the tool parser can handle it.
+                if tool_parser and reasoning and not content:
+                    _check = tool_accumulated_text + reasoning
+                    if (
+                        "<minimax:tool_call>" in _check
+                        or "<tool_call>" in _check
+                        or '<invoke name="' in _check
+                    ):
+                        content = reasoning
+                        reasoning = None
 
-            # Tool call parsing on content portion
-            if tool_parser and content:
-                if not tool_markup_possible and "<" not in content:
-                    tool_accumulated_text += content
-                    # Suppress whitespace-only content when tools are active;
-                    # avoids emitting stray newlines before tool call XML.
-                    if not content.strip():
-                        continue
-                else:
-                    if not tool_markup_possible:
-                        tool_markup_possible = True
-                    tool_previous = tool_accumulated_text
-                    tool_accumulated_text += content
-                    tool_result = tool_parser.extract_tool_calls_streaming(
-                        tool_previous, tool_accumulated_text, content
-                    )
+                # Tool call parsing on content portion
+                if tool_parser and content:
+                    if not tool_markup_possible and "<" not in content:
+                        tool_accumulated_text += content
+                        # Suppress whitespace-only content when tools are active;
+                        # avoids emitting stray newlines before tool call XML.
+                        if not content.strip():
+                            continue
+                    else:
+                        if not tool_markup_possible:
+                            tool_markup_possible = True
+                        tool_previous = tool_accumulated_text
+                        tool_accumulated_text += content
+                        tool_result = tool_parser.extract_tool_calls_streaming(
+                            tool_previous, tool_accumulated_text, content
+                        )
 
-                    if tool_result is None:
-                        # Inside tool markup - suppress content output
-                        if reasoning:
-                            # Still emit reasoning while buffering tool call
+                        if tool_result is None:
+                            # Inside tool markup - suppress content output
+                            if reasoning:
+                                # Still emit reasoning while buffering tool call
+                                chunk = ChatCompletionChunk(
+                                    id=response_id,
+                                    model=_model_name,
+                                    choices=[
+                                        ChatCompletionChunkChoice(
+                                            delta=ChatCompletionChunkDelta(
+                                                reasoning=reasoning,
+                                            ),
+                                            finish_reason=None,
+                                        )
+                                    ],
+                                    usage=None,
+                                )
+                                yield f"data: {chunk.model_dump_json()}\n\n"
+                            continue
+
+                        if "tool_calls" in tool_result:
+                            # Emit structured tool calls
+                            tool_calls_detected = True
+                            # Coerce arguments against tool schemas
+                            tools = (
+                                request.model_dump().get("tools")
+                                if request and request.tools
+                                else None
+                            )
+                            if tools:
+                                for tc in tool_result["tool_calls"]:
+                                    fn = tc.get("function", {})
+                                    if "arguments" in fn and "name" in fn:
+                                        fn["arguments"] = _coerce_tool_arguments(
+                                            fn["arguments"], fn["name"], tools
+                                        )
                             chunk = ChatCompletionChunk(
                                 id=response_id,
                                 model=_model_name,
                                 choices=[
                                     ChatCompletionChunkChoice(
                                         delta=ChatCompletionChunkDelta(
+                                            tool_calls=tool_result["tool_calls"],
                                             reasoning=reasoning,
                                         ),
-                                        finish_reason=None,
+                                        finish_reason=(
+                                            "tool_calls" if output.finished else None
+                                        ),
                                     )
                                 ],
-                                usage=None,
+                                usage=get_usage(output) if output.finished else None,
                             )
                             yield f"data: {chunk.model_dump_json()}\n\n"
-                        continue
+                            continue
 
-                    if "tool_calls" in tool_result:
-                        # Emit structured tool calls
-                        tool_calls_detected = True
-                        # Coerce arguments against tool schemas
-                        tools = (
-                            request.model_dump().get("tools")
-                            if request and request.tools
-                            else None
+                        # Normal content from tool parser
+                        content = tool_result.get("content", "")
+                        # Strip any leaked tool markup tags
+                        if content:
+                            content = _TOOL_MARKUP_PATTERN.sub("", content)
+
+                chunk = ChatCompletionChunk(
+                    id=response_id,
+                    model=_model_name,
+                    choices=[
+                        ChatCompletionChunkChoice(
+                            delta=ChatCompletionChunkDelta(
+                                content=content if content else None,
+                                reasoning=reasoning,
+                            ),
+                            finish_reason=(
+                                "tool_calls"
+                                if (output.finished and tool_calls_detected)
+                                else (output.finish_reason if output.finished else None)
+                            ),
                         )
-                        if tools:
-                            for tc in tool_result["tool_calls"]:
-                                fn = tc.get("function", {})
-                                if "arguments" in fn and "name" in fn:
-                                    fn["arguments"] = _coerce_tool_arguments(
-                                        fn["arguments"], fn["name"], tools
-                                    )
-                        chunk = ChatCompletionChunk(
-                            id=response_id,
-                            model=_model_name,
-                            choices=[
-                                ChatCompletionChunkChoice(
-                                    delta=ChatCompletionChunkDelta(
-                                        tool_calls=tool_result["tool_calls"],
-                                        reasoning=reasoning,
-                                    ),
-                                    finish_reason=(
-                                        "tool_calls" if output.finished else None
-                                    ),
-                                )
-                            ],
-                            usage=get_usage(output) if output.finished else None,
+                    ],
+                    usage=get_usage(output) if output.finished else None,
+                )
+                yield f"data: {chunk.model_dump_json()}\n\n"
+            else:
+                # Standard path without reasoning parsing
+                content = delta_text
+
+                # Filter special tokens that may leak into streaming output
+                if content:
+                    content = SPECIAL_TOKENS_PATTERN.sub("", content)
+
+                # Add <think> prefix on first content chunk for thinking models
+                if is_thinking_model and not think_prefix_sent and content:
+                    content = "<think>" + content
+                    think_prefix_sent = True
+
+                # Tool call streaming parsing
+                if tool_parser and delta_text:
+                    # Fast path: skip full parsing until '<' is seen in the stream,
+                    # which could start tool markup (e.g. <tool_call>). This avoids
+                    # per-token string scanning on the growing accumulated text.
+                    if not tool_markup_possible and "<" not in delta_text:
+                        tool_accumulated_text += delta_text
+                        # No tool markup yet, fall through to normal chunk emission
+                    else:
+                        if not tool_markup_possible:
+                            tool_markup_possible = True
+                        tool_previous = tool_accumulated_text
+                        tool_accumulated_text += delta_text
+                        tool_result = tool_parser.extract_tool_calls_streaming(
+                            tool_previous, tool_accumulated_text, delta_text
                         )
-                        yield f"data: {chunk.model_dump_json()}\n\n"
-                        continue
 
-                    # Normal content from tool parser
-                    content = tool_result.get("content", "")
-                    # Strip any leaked tool markup tags
-                    if content:
-                        content = _TOOL_MARKUP_PATTERN.sub("", content)
+                        if tool_result is None:
+                            # Inside tool markup - suppress output
+                            continue
 
-            chunk = ChatCompletionChunk(
-                id=response_id,
-                model=_model_name,
-                choices=[
-                    ChatCompletionChunkChoice(
-                        delta=ChatCompletionChunkDelta(
-                            content=content if content else None,
-                            reasoning=reasoning,
-                        ),
-                        finish_reason=(
-                            "tool_calls"
-                            if (output.finished and tool_calls_detected)
-                            else (output.finish_reason if output.finished else None)
-                        ),
-                    )
-                ],
-                usage=get_usage(output) if output.finished else None,
-            )
-            yield f"data: {chunk.model_dump_json()}\n\n"
-        else:
-            # Standard path without reasoning parsing
-            content = delta_text
-
-            # Filter special tokens that may leak into streaming output
-            if content:
-                content = SPECIAL_TOKENS_PATTERN.sub("", content)
-
-            # Add <think> prefix on first content chunk for thinking models
-            if is_thinking_model and not think_prefix_sent and content:
-                content = "<think>" + content
-                think_prefix_sent = True
-
-            # Tool call streaming parsing
-            if tool_parser and delta_text:
-                # Fast path: skip full parsing until '<' is seen in the stream,
-                # which could start tool markup (e.g. <tool_call>). This avoids
-                # per-token string scanning on the growing accumulated text.
-                if not tool_markup_possible and "<" not in delta_text:
-                    tool_accumulated_text += delta_text
-                    # No tool markup yet, fall through to normal chunk emission
-                else:
-                    if not tool_markup_possible:
-                        tool_markup_possible = True
-                    tool_previous = tool_accumulated_text
-                    tool_accumulated_text += delta_text
-                    tool_result = tool_parser.extract_tool_calls_streaming(
-                        tool_previous, tool_accumulated_text, delta_text
-                    )
-
-                    if tool_result is None:
-                        # Inside tool markup - suppress output
-                        continue
-
-                    if "tool_calls" in tool_result:
-                        # Emit structured tool calls
-                        tool_calls_detected = True
-                        # Coerce arguments against tool schemas
-                        tools = (
-                            request.model_dump().get("tools")
-                            if request and request.tools
-                            else None
-                        )
-                        if tools:
-                            for tc in tool_result["tool_calls"]:
-                                fn = tc.get("function", {})
-                                if "arguments" in fn and "name" in fn:
-                                    fn["arguments"] = _coerce_tool_arguments(
-                                        fn["arguments"], fn["name"], tools
-                                    )
-                        chunk = ChatCompletionChunk(
-                            id=response_id,
-                            model=_model_name,
-                            choices=[
-                                ChatCompletionChunkChoice(
-                                    delta=ChatCompletionChunkDelta(
-                                        tool_calls=tool_result["tool_calls"]
-                                    ),
-                                    finish_reason=(
-                                        "tool_calls" if output.finished else None
-                                    ),
-                                )
-                            ],
-                            usage=get_usage(output) if output.finished else None,
-                        )
-                        yield f"data: {chunk.model_dump_json()}\n\n"
-                        continue
-
-                    # Normal content from tool parser
-                    content = tool_result.get("content", "")
-                    # Strip any leaked tool markup tags
-                    if content:
-                        content = _TOOL_MARKUP_PATTERN.sub("", content)
-
-            chunk = ChatCompletionChunk(
-                id=response_id,
-                model=_model_name,
-                choices=[
-                    ChatCompletionChunkChoice(
-                        delta=ChatCompletionChunkDelta(
-                            content=content if content else None
-                        ),
-                        finish_reason=(
-                            "tool_calls"
-                            if (output.finished and tool_calls_detected)
-                            else (output.finish_reason if output.finished else None)
-                        ),
-                    )
-                ],
-                usage=get_usage(output) if output.finished else None,
-            )
-            yield f"data: {chunk.model_dump_json()}\n\n"
-
-    # Fallback: if tool parser accumulated text but never emitted tool_calls
-    # (e.g., </tool_call> never arrived, or <function= block still incomplete)
-    if (
-        tool_parser
-        and tool_accumulated_text
-        and not tool_calls_detected
-        and (
-            "<tool_call>" in tool_accumulated_text
-            or "<|tool_call>" in tool_accumulated_text
-            or "<function" in tool_accumulated_text
-        )
-    ):
-        result = tool_parser.extract_tool_calls(tool_accumulated_text)
-        if result.tools_called:
-            tools = (
-                request.model_dump().get("tools") if request and request.tools else None
-            )
-            tool_chunk = ChatCompletionChunk(
-                id=response_id,
-                model=_model_name,
-                choices=[
-                    ChatCompletionChunkChoice(
-                        delta=ChatCompletionChunkDelta(
-                            tool_calls=[
-                                {
-                                    "index": i,
-                                    "id": tc["id"],
-                                    "type": "function",
-                                    "function": {
-                                        "name": tc["name"],
-                                        "arguments": _coerce_tool_arguments(
-                                            tc["arguments"], tc["name"], tools
+                        if "tool_calls" in tool_result:
+                            # Emit structured tool calls
+                            tool_calls_detected = True
+                            # Coerce arguments against tool schemas
+                            tools = (
+                                request.model_dump().get("tools")
+                                if request and request.tools
+                                else None
+                            )
+                            if tools:
+                                for tc in tool_result["tool_calls"]:
+                                    fn = tc.get("function", {})
+                                    if "arguments" in fn and "name" in fn:
+                                        fn["arguments"] = _coerce_tool_arguments(
+                                            fn["arguments"], fn["name"], tools
+                                        )
+                            chunk = ChatCompletionChunk(
+                                id=response_id,
+                                model=_model_name,
+                                choices=[
+                                    ChatCompletionChunkChoice(
+                                        delta=ChatCompletionChunkDelta(
+                                            tool_calls=tool_result["tool_calls"]
                                         ),
-                                    },
-                                }
-                                for i, tc in enumerate(result.tool_calls)
-                            ]
-                        ),
-                        finish_reason="tool_calls",
-                    )
-                ],
+                                        finish_reason=(
+                                            "tool_calls" if output.finished else None
+                                        ),
+                                    )
+                                ],
+                                usage=get_usage(output) if output.finished else None,
+                            )
+                            yield f"data: {chunk.model_dump_json()}\n\n"
+                            continue
+
+                        # Normal content from tool parser
+                        content = tool_result.get("content", "")
+                        # Strip any leaked tool markup tags
+                        if content:
+                            content = _TOOL_MARKUP_PATTERN.sub("", content)
+
+                chunk = ChatCompletionChunk(
+                    id=response_id,
+                    model=_model_name,
+                    choices=[
+                        ChatCompletionChunkChoice(
+                            delta=ChatCompletionChunkDelta(
+                                content=content if content else None
+                            ),
+                            finish_reason=(
+                                "tool_calls"
+                                if (output.finished and tool_calls_detected)
+                                else (output.finish_reason if output.finished else None)
+                            ),
+                        )
+                    ],
+                    usage=get_usage(output) if output.finished else None,
+                )
+                yield f"data: {chunk.model_dump_json()}\n\n"
+
+        # Fallback: if tool parser accumulated text but never emitted tool_calls
+        # (e.g., </tool_call> never arrived, or <function= block still incomplete)
+        if (
+            tool_parser
+            and tool_accumulated_text
+            and not tool_calls_detected
+            and (
+                "<tool_call>" in tool_accumulated_text
+                or "<|tool_call>" in tool_accumulated_text
+                or "<function" in tool_accumulated_text
             )
-            yield f"data: {tool_chunk.model_dump_json()}\n\n"
+        ):
+            final_parse_result = tool_parser.extract_tool_calls(tool_accumulated_text)
+            if final_parse_result.tools_called:
+                tools = (
+                    request.model_dump().get("tools")
+                    if request and request.tools
+                    else None
+                )
+                tool_chunk = ChatCompletionChunk(
+                    id=response_id,
+                    model=_model_name,
+                    choices=[
+                        ChatCompletionChunkChoice(
+                            delta=ChatCompletionChunkDelta(
+                                tool_calls=[
+                                    {
+                                        "index": i,
+                                        "id": tc["id"],
+                                        "type": "function",
+                                        "function": {
+                                            "name": tc["name"],
+                                            "arguments": _coerce_tool_arguments(
+                                                tc["arguments"], tc["name"], tools
+                                            ),
+                                        },
+                                    }
+                                    for i, tc in enumerate(final_parse_result.tool_calls)
+                                ]
+                            ),
+                            finish_reason="tool_calls",
+                        )
+                    ],
+                )
+                yield f"data: {tool_chunk.model_dump_json()}\n\n"
 
-    # Log throughput
-    elapsed = time.perf_counter() - start_time
-    tokens_per_sec = completion_tokens / elapsed if elapsed > 0 else 0
-    logger.info(
-        f"Chat completion (stream): {completion_tokens} tokens in {elapsed:.2f}s ({tokens_per_sec:.1f} tok/s)"
-    )
+        # Log throughput
+        elapsed = time.perf_counter() - start_time
+        tokens_per_sec = completion_tokens / elapsed if elapsed > 0 else 0
+        logger.info(
+            f"Chat completion (stream): {completion_tokens} tokens in {elapsed:.2f}s ({tokens_per_sec:.1f} tok/s)"
+        )
 
-    # Send final chunk with usage if requested
-    if include_usage:
-        usage_chunk = ChatCompletionChunk(
-            id=response_id,
-            model=_model_name,
-            choices=[],  # Empty choices for usage-only chunk
-            usage=Usage(
+        # Send final chunk with usage if requested
+        if include_usage:
+            usage_chunk = ChatCompletionChunk(
+                id=response_id,
+                model=_model_name,
+                choices=[],  # Empty choices for usage-only chunk
+                usage=Usage(
+                    prompt_tokens=prompt_tokens,
+                    completion_tokens=completion_tokens,
+                    total_tokens=prompt_tokens + completion_tokens,
+                ),
+            )
+            yield f"data: {usage_chunk.model_dump_json()}\n\n"
+
+        yield "data: [DONE]\n\n"
+    except HTTPException as exc:
+        result_label = _metrics_result_from_status(exc.status_code)
+        raise
+    except (asyncio.CancelledError, GeneratorExit):
+        result_label = "cancelled"
+        raise
+    except Exception:
+        result_label = "error"
+        raise
+    finally:
+        if metrics_tracker is not None:
+            metrics_tracker.finish(
+                result=result_label,
                 prompt_tokens=prompt_tokens,
                 completion_tokens=completion_tokens,
-                total_tokens=prompt_tokens + completion_tokens,
-            ),
-        )
-        yield f"data: {usage_chunk.model_dump_json()}\n\n"
-
-    yield "data: [DONE]\n\n"
+            )
 
 
 # =============================================================================
@@ -2797,6 +3030,11 @@ Examples:
         help="Default request timeout in seconds (default: 300)",
     )
     parser.add_argument(
+        "--enable-metrics",
+        action="store_true",
+        help="Expose Prometheus metrics on /metrics (disabled by default)",
+    )
+    parser.add_argument(
         "--rate-limit",
         type=int,
         default=0,
@@ -2838,10 +3076,12 @@ Examples:
     args = parser.parse_args()
 
     # Set global configuration
-    global _api_key, _default_timeout, _rate_limiter
+    global _api_key, _default_timeout, _rate_limiter, _metrics_enabled
     global _default_temperature, _default_top_p
     _api_key = args.api_key
     _default_timeout = args.timeout
+    _metrics_enabled = args.enable_metrics
+    _metrics.configure(enabled=args.enable_metrics)
     if args.default_temperature is not None:
         _default_temperature = args.default_temperature
     if args.default_top_p is not None:
@@ -2867,6 +3107,10 @@ Examples:
     else:
         logger.warning("  Rate limiting: DISABLED - Use --rate-limit to enable")
     logger.info(f"  Request timeout: {args.timeout}s")
+    if args.enable_metrics:
+        logger.info("  Metrics: ENABLED (/metrics, unauthenticated)")
+    else:
+        logger.info("  Metrics: DISABLED - Use --enable-metrics to expose /metrics")
     logger.info("=" * 60)
 
     # Set MCP config for lifespan

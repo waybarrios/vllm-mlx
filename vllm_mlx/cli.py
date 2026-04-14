@@ -47,6 +47,8 @@ def serve_command(args):
     # Configure server security settings
     server._api_key = args.api_key
     server._default_timeout = args.timeout
+    server._metrics_enabled = args.enable_metrics
+    server._metrics.configure(enabled=args.enable_metrics)
     if args.rate_limit > 0:
         server._rate_limiter = RateLimiter(
             requests_per_minute=args.rate_limit, enabled=True
@@ -102,6 +104,10 @@ def serve_command(args):
     else:
         print("  Rate limiting: DISABLED - Use --rate-limit to enable")
     print(f"  Request timeout: {args.timeout}s")
+    if args.enable_metrics:
+        print("  Metrics: ENABLED (/metrics, unauthenticated)")
+    else:
+        print("  Metrics: DISABLED - Use --enable-metrics to expose /metrics")
     if args.enable_auto_tool_choice:
         print(f"  Tool calling: ENABLED (parser: {args.tool_call_parser})")
     else:
@@ -873,6 +879,11 @@ Examples:
         type=float,
         default=300.0,
         help="Default request timeout in seconds (default: 300)",
+    )
+    serve_parser.add_argument(
+        "--enable-metrics",
+        action="store_true",
+        help="Expose Prometheus metrics on /metrics (disabled by default)",
     )
     # Tool calling options
     serve_parser.add_argument(

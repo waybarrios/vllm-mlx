@@ -50,6 +50,7 @@ dependencies = [
     # Server
     "fastapi>=0.100.0",
     "uvicorn>=0.23.0",
+    "prometheus-client>=0.20.0",
     # MCP (Model Context Protocol) support
     "mcp>=1.0.0",
     # JSON Schema validation for structured output
