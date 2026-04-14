@@ -1487,7 +1487,7 @@ def _extract_reasoning_and_tool_calls(
     request: ChatCompletionRequest | None = None,
     *,
     allow_reasoning: bool = True,
-) -> tuple[str | None, str | None, list | None]:
+) -> tuple[str | None, str | None, list[ToolCall] | None]:
     """
     Extract reasoning first, then parse tool calls from the cleaned content.
 
