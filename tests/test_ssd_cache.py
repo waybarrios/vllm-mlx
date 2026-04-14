@@ -202,3 +202,110 @@ class TestSSDIndex:
         # Now (2,) should be the LRU entry
         lru = index.get_lru(limit=1)
         assert lru[0]["file_path"] == "b.safetensors"
+
+
+import tempfile
+import numpy as np
+
+from vllm_mlx.ssd_cache import (
+    LayerSerializer,
+    KVCacheSerializer,
+    ArraysCacheSerializer,
+    get_serializer_for_layer,
+    SERIALIZER_SUPPORT_MATRIX,
+)
+
+
+class MockMLXArray:
+    """Minimal mock for MLX array with shape, dtype, and numpy conversion."""
+
+    def __init__(self, data):
+        self._data = np.array(data)
+        self.shape = self._data.shape
+        self.dtype = type("dtype", (), {"size": self._data.dtype.itemsize})()
+
+    def __array__(self):
+        return self._data
+
+
+class MockKVCacheLayer:
+    """Mock KVCache layer with keys, values, offset."""
+
+    def __init__(self, keys, values, offset):
+        self.keys = keys
+        self.values = values
+        self.offset = offset
+
+
+class MockArraysCacheLayer:
+    """Mock ArraysCache layer with state list."""
+
+    def __init__(self, state):
+        self.state = state
+
+
+class TestLayerSerializer:
+    """Tests for per-layer serializer interface."""
+
+    def test_support_matrix_has_required_types(self):
+        assert "KVCache" in SERIALIZER_SUPPORT_MATRIX
+        assert "RotatingKVCache" in SERIALIZER_SUPPORT_MATRIX
+        assert "ArraysCache" in SERIALIZER_SUPPORT_MATRIX
+
+    def test_kv_cache_serializer_round_trip(self, tmp_path):
+        keys = MockMLXArray(np.random.randn(1, 8, 32, 64).astype(np.float16))
+        values = MockMLXArray(np.random.randn(1, 8, 32, 64).astype(np.float16))
+        layer = MockKVCacheLayer(keys=keys, values=values, offset=32)
+
+        serializer = KVCacheSerializer()
+        file_path = str(tmp_path / "layer_0.safetensors")
+        metadata = serializer.serialize_layer(layer, 0, file_path)
+
+        assert os.path.exists(file_path)
+        assert metadata["layer_type"] == "KVCache"
+        assert metadata["offset"] == 32
+
+        restored = serializer.deserialize_layer(file_path, metadata)
+        assert restored["offset"] == 32
+        np.testing.assert_array_almost_equal(
+            np.array(restored["keys"]),
+            np.array(keys),
+        )
+        np.testing.assert_array_almost_equal(
+            np.array(restored["values"]),
+            np.array(values),
+        )
+
+    def test_arrays_cache_serializer_round_trip(self, tmp_path):
+        arr0 = MockMLXArray(np.random.randn(1, 64, 128).astype(np.float16))
+        arr1 = MockMLXArray(np.random.randn(1, 64, 128).astype(np.float16))
+        layer = MockArraysCacheLayer(state=[arr0, arr1])
+
+        serializer = ArraysCacheSerializer()
+        file_path = str(tmp_path / "layer_0.safetensors")
+        metadata = serializer.serialize_layer(layer, 0, file_path)
+
+        assert os.path.exists(file_path)
+        assert metadata["layer_type"] == "ArraysCache"
+        assert metadata["num_arrays"] == 2
+
+        restored = serializer.deserialize_layer(file_path, metadata)
+        assert len(restored["state"]) == 2
+        np.testing.assert_array_almost_equal(
+            np.array(restored["state"][0]),
+            np.array(arr0),
+        )
+
+    def test_get_serializer_for_kvcache(self):
+        layer = MockKVCacheLayer(keys=None, values=None, offset=0)
+        s = get_serializer_for_layer(layer)
+        assert isinstance(s, KVCacheSerializer)
+
+    def test_get_serializer_for_arrays_cache(self):
+        layer = MockArraysCacheLayer(state=[])
+        s = get_serializer_for_layer(layer)
+        assert isinstance(s, ArraysCacheSerializer)
+
+    def test_get_serializer_unknown_raises(self):
+        with pytest.raises(ValueError, match="Unsupported"):
+            get_serializer_for_layer("not a cache layer")
