@@ -189,9 +189,8 @@ class TestTranslateMessages:
     def test_video_url_translated(self):
         import base64
 
-        video_source = (
-            f"data:video/mp4;base64,{base64.b64encode(b'\\x00' * 100).decode()}"
-        )
+        dummy_video_b64 = base64.b64encode(b"\x00" * 100).decode()
+        video_source = f"data:video/mp4;base64,{dummy_video_b64}"
 
         model = self._make_model()
         messages = [
@@ -219,9 +218,8 @@ class TestTranslateMessages:
     def test_video_url_type_translated(self):
         import base64
 
-        video_source = (
-            f"data:video/mp4;base64,{base64.b64encode(b'\\x00' * 100).decode()}"
-        )
+        dummy_video_b64 = base64.b64encode(b"\x00" * 100).decode()
+        video_source = f"data:video/mp4;base64,{dummy_video_b64}"
 
         model = self._make_model()
         messages = [
