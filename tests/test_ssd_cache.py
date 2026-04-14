@@ -794,3 +794,182 @@ class TestMemoryCacheSSDCheck:
         # check_ssd should indicate no SSD needed
         candidate = cache.check_ssd([1, 2, 3])
         assert candidate is None
+
+
+class TestIntegrationSpillAndFetch:
+    """End-to-end tests: spill from RAM -> SSD -> promote back."""
+
+    @pytest.fixture
+    def cache_with_ssd(self, tmp_path):
+        """RAM cache + SSD tier, small limits to force eviction."""
+        model = MagicMock()
+        config = MemoryCacheConfig(max_memory_mb=1, max_entries=2)
+        ram_cache = MemoryAwarePrefixCache(model, config)
+
+        ssd_config = SSDCacheConfig(
+            cache_dir=str(tmp_path / "integration_test"),
+            max_size_gb=1.0,
+        )
+        ssd_tier = SSDCacheTier(ssd_config)
+        ssd_tier.start_writer()
+        ram_cache.set_ssd_tier(ssd_tier)
+
+        yield ram_cache, ssd_tier
+        ssd_tier.close()
+
+    def _make_kv_layer(self, offset=16):
+        keys = MockMLXArray(np.random.randn(1, 8, offset, 64).astype(np.float16))
+        values = MockMLXArray(np.random.randn(1, 8, offset, 64).astype(np.float16))
+        return MockKVCacheLayer(keys=keys, values=values, offset=offset)
+
+    def test_full_round_trip(self, cache_with_ssd):
+        """Store -> evict to SSD -> fetch miss in RAM -> find in SSD."""
+        ram_cache, ssd_tier = cache_with_ssd
+
+        # Store 2 entries (fills RAM cache)
+        tokens_a = list(range(0, 10))
+        tokens_b = list(range(10, 20))
+        ram_cache.store(tokens_a, [self._make_kv_layer()])
+        ram_cache.store(tokens_b, [self._make_kv_layer()])
+        assert len(ram_cache) == 2
+
+        # Store a third entry — should evict tokens_a to SSD
+        tokens_c = list(range(20, 30))
+        ram_cache.store(tokens_c, [self._make_kv_layer()])
+
+        # Wait for SSD spill
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            if ssd_tier._stats.spill_count > 0:
+                break
+            time.sleep(0.05)
+
+        assert ssd_tier._stats.spill_count >= 1
+
+        # RAM miss for tokens_a
+        result, remaining = ram_cache.fetch(tokens_a)
+        assert result is None
+
+        # SSD should have tokens_a
+        candidate = ram_cache.check_ssd(tokens_a)
+        assert candidate is not None
+
+        # Promote from SSD
+        async def do_promote():
+            return await ssd_tier.async_promote(
+                tuple(tokens_a),
+                lambda n: True,  # Budget always available
+                lambda n: None,
+            )
+
+        promoted = asyncio.get_event_loop().run_until_complete(do_promote())
+        assert promoted is not None
+        assert len(promoted) == 1  # One layer
+        assert ssd_tier._stats.ssd_hits == 1
+
+    def test_hybrid_cache_round_trip(self, tmp_path):
+        """ArraysCache layers survive SSD round-trip."""
+        config = SSDCacheConfig(cache_dir=str(tmp_path / "hybrid_test"))
+        tier = SSDCacheTier(config)
+        tier.start_writer()
+
+        tokens = (1, 2, 3)
+        arr0 = MockMLXArray(np.random.randn(1, 64, 128).astype(np.float16))
+        arr1 = MockMLXArray(np.random.randn(1, 64, 128).astype(np.float16))
+        layer = MockArraysCacheLayer(state=[arr0, arr1])
+
+        tier.enqueue_spill(tokens, [layer], memory_bytes=2048)
+
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            if tier._stats.spill_count > 0:
+                break
+            time.sleep(0.05)
+
+        async def do_promote():
+            return await tier.async_promote(
+                tokens,
+                lambda n: True,
+                lambda n: None,
+            )
+
+        promoted = asyncio.get_event_loop().run_until_complete(do_promote())
+        assert promoted is not None
+        assert len(promoted) == 1
+        assert "state" in promoted[0]
+        assert len(promoted[0]["state"]) == 2
+
+        # Verify data integrity
+        np.testing.assert_array_almost_equal(
+            np.array(promoted[0]["state"][0]),
+            np.array(arr0),
+        )
+
+        tier.close()
+
+    def test_capacity_eviction_end_to_end(self, tmp_path):
+        """Entries beyond max_entries are evicted from SSD."""
+        config = SSDCacheConfig(
+            cache_dir=str(tmp_path / "cap_e2e"),
+            max_entries=2,
+        )
+        tier = SSDCacheTier(config)
+        tier.start_writer()
+
+        for i in range(4):
+            tokens = tuple(range(i * 10, (i + 1) * 10))
+            layer = MockKVCacheLayer(
+                keys=MockMLXArray(np.zeros((1, 1, 1, 1), dtype=np.float16)),
+                values=MockMLXArray(np.zeros((1, 1, 1, 1), dtype=np.float16)),
+                offset=1,
+            )
+            tier.enqueue_spill(tokens, [layer], memory_bytes=100)
+
+            deadline = time.monotonic() + 5.0
+            while time.monotonic() < deadline:
+                if tier._stats.spill_count > i:
+                    break
+                time.sleep(0.05)
+
+        # Only max_entries (2) should remain
+        assert tier._index.get_entry_count() <= 2
+
+        # The latest entries should still be there
+        assert tier._index.lookup_exact(tuple(range(30, 40))) is not None
+
+        tier.close()
+
+    def test_metrics_accuracy(self, cache_with_ssd):
+        """Verify all SSD metrics are updated correctly."""
+        ram_cache, ssd_tier = cache_with_ssd
+
+        # Fill RAM and force one spill
+        ram_cache.store(list(range(10)), [self._make_kv_layer()])
+        ram_cache.store(list(range(10, 20)), [self._make_kv_layer()])
+        ram_cache.store(list(range(20, 30)), [self._make_kv_layer()])
+
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            if ssd_tier._stats.spill_count > 0:
+                break
+            time.sleep(0.05)
+
+        stats = ssd_tier.get_stats()
+        assert stats["spill_count"] >= 1
+        assert stats["spill_bytes"] > 0
+
+        # Promote the spilled entry
+        evicted_tokens = tuple(range(10))  # First stored, first evicted
+        candidate = ssd_tier.lookup_ssd(evicted_tokens)
+        if candidate is not None:
+
+            async def promote():
+                return await ssd_tier.async_promote(
+                    evicted_tokens, lambda n: True, lambda n: None
+                )
+
+            asyncio.get_event_loop().run_until_complete(promote())
+            stats = ssd_tier.get_stats()
+            assert stats["ssd_hits"] >= 1
+            assert stats["reload_bytes"] > 0
+            assert stats["avg_reload_latency_ms"] > 0
