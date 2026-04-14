@@ -4,7 +4,7 @@
 import json
 import platform
 import sys
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from fastapi.testclient import TestClient
@@ -168,6 +168,98 @@ class TestCompletionRequest:
         assert request.model == "test-model"
         assert request.prompt == "Once upon a time"
         assert request.max_tokens is None  # uses _default_max_tokens when None
+
+
+class TestMCPExecuteEndpoint:
+    """Test MCP execute endpoint sandbox routing."""
+
+    @pytest.fixture()
+    def client(self):
+        from fastapi.testclient import TestClient
+
+        from vllm_mlx.server import app
+
+        return TestClient(app)
+
+    def test_execute_routes_through_executor(self, client):
+        """REST MCP execute should use ToolExecutor, not raw manager.execute_tool."""
+        import vllm_mlx.server as srv
+
+        mock_manager = MagicMock()
+        mock_manager.execute_tool = AsyncMock(
+            side_effect=AssertionError("manager.execute_tool should not be called")
+        )
+
+        mock_result = MagicMock()
+        mock_result.tool_name = "filesystem__read_file"
+        mock_result.content = "hello"
+        mock_result.is_error = False
+        mock_result.error_message = None
+
+        mock_executor = MagicMock()
+        mock_executor.execute_tool_calls = AsyncMock(
+            return_value=[(mock_result, "mcp-test")]
+        )
+
+        original_manager = srv._mcp_manager
+        original_executor = srv._mcp_executor
+        srv._mcp_manager = mock_manager
+        srv._mcp_executor = mock_executor
+        try:
+            resp = client.post(
+                "/v1/mcp/execute",
+                json={
+                    "tool_name": "filesystem__read_file",
+                    "arguments": {"path": "/tmp/test.txt"},
+                },
+            )
+        finally:
+            srv._mcp_manager = original_manager
+            srv._mcp_executor = original_executor
+
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["tool_name"] == "filesystem__read_file"
+        assert body["content"] == "hello"
+        assert body["is_error"] is False
+        mock_executor.execute_tool_calls.assert_awaited_once()
+        mock_manager.execute_tool.assert_not_awaited()
+
+    def test_execute_returns_sandbox_blocked_result(self, client):
+        """REST MCP execute should surface sandbox blocks via executor result."""
+        import vllm_mlx.server as srv
+
+        mock_result = MagicMock()
+        mock_result.tool_name = "filesystem__read_file"
+        mock_result.content = None
+        mock_result.is_error = True
+        mock_result.error_message = "Tool 'read_file' is blocked by security policy"
+
+        mock_executor = MagicMock()
+        mock_executor.execute_tool_calls = AsyncMock(
+            return_value=[(mock_result, "mcp-test")]
+        )
+
+        original_manager = srv._mcp_manager
+        original_executor = srv._mcp_executor
+        srv._mcp_manager = MagicMock()
+        srv._mcp_executor = mock_executor
+        try:
+            resp = client.post(
+                "/v1/mcp/execute",
+                json={
+                    "tool_name": "filesystem__read_file",
+                    "arguments": {"path": "../secret.txt"},
+                },
+            )
+        finally:
+            srv._mcp_manager = original_manager
+            srv._mcp_executor = original_executor
+
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["is_error"] is True
+        assert "blocked by security policy" in body["error_message"]
 
 
 class TestServeCli:
