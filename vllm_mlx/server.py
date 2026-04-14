@@ -1273,6 +1273,13 @@ async def _disconnect_guard(
                         f"{chunk_count} chunks, elapsed={_elapsed()}"
                     )
                     break
+                except Exception as exc:
+                    logger.error(
+                        f"[disconnect_guard] generator raised {type(exc).__name__}: {exc}, "
+                        f"emitting [DONE] after {chunk_count} chunks, elapsed={_elapsed()}"
+                    )
+                    yield "data: [DONE]\n\n"
+                    break
                 chunk_count += 1
                 if chunk_count == 1:
                     logger.info(
@@ -2551,8 +2558,6 @@ async def stream_completion(
             if output.finished:
                 data["usage"] = get_usage(output).model_dump()
             yield f"data: {json.dumps(data)}\n\n"
-
-        yield "data: [DONE]\n\n"
     except HTTPException as exc:
         result = _metrics_result_from_status(exc.status_code)
         raise
@@ -2563,6 +2568,7 @@ async def stream_completion(
         result = "error"
         raise
     finally:
+        yield "data: [DONE]\n\n"
         if metrics_tracker is not None:
             metrics_tracker.finish(
                 result=result,
