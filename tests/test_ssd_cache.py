@@ -710,3 +710,24 @@ class TestCapacityManagement:
         # The orphaned index entry should have been removed
         assert tier2._index.lookup_exact(tokens) is None
         tier2.close()
+
+
+class TestCLIIntegration:
+    """Tests for CLI argument parsing of SSD cache flags."""
+
+    def test_scheduler_config_has_ssd_fields(self):
+        from vllm_mlx.scheduler import SchedulerConfig
+
+        config = SchedulerConfig()
+        assert config.ssd_cache_dir is None
+        assert config.ssd_cache_max_gb == 10.0
+
+    def test_scheduler_config_custom_ssd(self):
+        from vllm_mlx.scheduler import SchedulerConfig
+
+        config = SchedulerConfig(
+            ssd_cache_dir="/tmp/test-ssd",
+            ssd_cache_max_gb=5.0,
+        )
+        assert config.ssd_cache_dir == "/tmp/test-ssd"
+        assert config.ssd_cache_max_gb == 5.0

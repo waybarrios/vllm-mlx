@@ -24,6 +24,7 @@ from mlx_lm.tokenizer_utils import NaiveStreamingDetokenizer
 
 from .memory_cache import MemoryAwarePrefixCache, MemoryCacheConfig
 from .paged_cache import PagedCacheManager
+from .ssd_cache import SSDCacheConfig, SSDCacheTier
 from .prefix_cache import BlockAwarePrefixCache, PrefixCacheManager
 from .request import Request, RequestOutput, RequestStatus, SamplingParams
 from .utils.mamba_cache import ensure_mamba_support
@@ -97,6 +98,10 @@ class SchedulerConfig:
     # saved cache is reused for the next request with the same prefix.
     # 0 = disabled. Only effective when chunked_prefill_tokens > 0.
     mid_prefill_save_interval: int = 8192
+
+    # SSD cache tiering
+    ssd_cache_dir: Optional[str] = None  # None = disabled
+    ssd_cache_max_gb: float = 10.0
 
     # MTP (Multi-Token Prediction) settings
     # Uses the model's built-in MTP head to predict multiple tokens per step
@@ -1153,6 +1158,22 @@ class Scheduler:
                     f"Memory-aware cache enabled: "
                     f"limit={self.memory_aware_cache.memory_limit_mb:.1f}MB"
                 )
+
+                # Attach SSD tier if configured
+                self._ssd_tier: Optional[SSDCacheTier] = None
+                if self.config.ssd_cache_dir is not None:
+                    ssd_config = SSDCacheConfig(
+                        cache_dir=self.config.ssd_cache_dir,
+                        max_size_gb=self.config.ssd_cache_max_gb,
+                    )
+                    self._ssd_tier = SSDCacheTier(ssd_config)
+                    self._ssd_tier.start_writer()
+                    self._ssd_tier.reconcile()
+                    self.memory_aware_cache.set_ssd_tier(self._ssd_tier)
+                    logger.info(
+                        f"SSD cache tier enabled: dir={self.config.ssd_cache_dir}, "
+                        f"max={self.config.ssd_cache_max_gb}GB"
+                    )
             else:
                 # Use legacy entry-count based prefix cache
                 self.prefix_cache = PrefixCacheManager(
@@ -2647,3 +2668,10 @@ class Scheduler:
             return self.memory_aware_cache.load_from_disk(cache_dir)
         logger.info("[cache_persist] no memory-aware cache to load into")
         return 0
+
+    def close_ssd_tier(self) -> None:
+        """Shut down the SSD cache tier if present."""
+        if hasattr(self, "_ssd_tier") and self._ssd_tier is not None:
+            self._ssd_tier.close()
+            self._ssd_tier = None
+            logger.info("SSD cache tier closed")
