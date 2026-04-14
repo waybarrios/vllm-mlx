@@ -1485,6 +1485,20 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
             messages.append(msg_dict)
         images, videos = [], []  # MLLM extracts these from messages
         logger.debug(f"MLLM: Processing {len(messages)} messages")
+        # Convert tool_call arguments from JSON string to dict so that
+        # chat templates can iterate them (e.g. GLM-4.6V calls .items()).
+        # The LLM path does this inside extract_multimodal_content(), but
+        # the MLLM path bypasses that function.
+        if engine.preserve_native_tool_format:
+            for msg_dict in messages:
+                for tc in msg_dict.get("tool_calls") or []:
+                    func = tc.get("function") or {}
+                    args = func.get("arguments")
+                    if isinstance(args, str):
+                        try:
+                            func["arguments"] = json.loads(args)
+                        except (json.JSONDecodeError, ValueError):
+                            pass
         messages = _normalize_messages(messages)
     else:
         # For LLM, extract text, images, and videos separately
