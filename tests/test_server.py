@@ -501,12 +501,13 @@ class TestHelperFunctions:
             Message(role="assistant", content="Hi there!"),
         ]
 
-        processed, images, videos = extract_multimodal_content(messages)
+        processed, images, videos, audios = extract_multimodal_content(messages)
 
         assert len(processed) == 2
         assert processed[0]["content"] == "Hello"
         assert len(images) == 0
         assert len(videos) == 0
+        assert len(audios) == 0
 
     def test_extract_multimodal_content_with_image(self):
         """Test extracting content with images."""
@@ -525,12 +526,13 @@ class TestHelperFunctions:
             )
         ]
 
-        processed, images, videos = extract_multimodal_content(messages)
+        processed, images, videos, audios = extract_multimodal_content(messages)
 
         assert len(processed) == 1
         assert processed[0]["content"] == "What's this?"
         assert len(images) == 1
         assert "https://example.com/img.jpg" in images[0]
+        assert len(audios) == 0
 
     def test_extract_multimodal_content_with_video(self):
         """Test extracting content with videos."""
@@ -546,12 +548,13 @@ class TestHelperFunctions:
             )
         ]
 
-        processed, images, videos = extract_multimodal_content(messages)
+        processed, images, videos, audios = extract_multimodal_content(messages)
 
         assert len(processed) == 1
         assert processed[0]["content"] == "Describe this video"
         assert len(videos) == 1
         assert videos[0] == "/path/to/video.mp4"
+        assert len(audios) == 0
 
     def test_extract_multimodal_content_with_video_url(self):
         """Test extracting content with video_url format."""
@@ -570,9 +573,35 @@ class TestHelperFunctions:
             )
         ]
 
-        processed, images, videos = extract_multimodal_content(messages)
+        processed, images, videos, audios = extract_multimodal_content(messages)
 
         assert len(videos) == 1
+        assert len(audios) == 0
+
+    def test_extract_multimodal_content_with_audio_url(self):
+        """Test extracting content with audio_url format."""
+        from vllm_mlx.server import extract_multimodal_content, Message
+
+        messages = [
+            Message(
+                role="user",
+                content=[
+                    {"type": "text", "text": "Transcribe this"},
+                    {
+                        "type": "audio_url",
+                        "audio_url": {"url": "data:audio/wav;base64,abc"},
+                    },
+                ],
+            )
+        ]
+
+        processed, images, videos, audios = extract_multimodal_content(messages)
+
+        assert len(processed) == 1
+        assert processed[0]["content"] == "Transcribe this"
+        assert len(images) == 0
+        assert len(videos) == 0
+        assert audios == ["data:audio/wav;base64,abc"]
 
 
 # =============================================================================

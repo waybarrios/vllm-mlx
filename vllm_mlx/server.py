@@ -3007,7 +3007,7 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
                 raw = dict(msg)
                 msg_dict = {k: v for k, v in raw.items() if v is not None}
             messages.append(msg_dict)
-        images, videos = [], []  # MLLM extracts these from messages
+        images, videos, audios = [], [], []  # MLLM extracts these from messages
         logger.debug(f"MLLM: Processing {len(messages)} messages")
         # Convert tool_call arguments from JSON string to dict so that
         # chat templates can iterate them (e.g. GLM-4.6V calls .items()).
@@ -3025,14 +3025,14 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
                             pass
         messages = _normalize_messages(messages)
     else:
-        # For LLM, extract text, images, and videos separately
-        messages, images, videos = extract_multimodal_content(
+        # For LLM, extract text and media separately
+        messages, images, videos, audios = extract_multimodal_content(
             request.messages,
             preserve_native_format=engine.preserve_native_tool_format,
         )
         messages = _normalize_messages(messages)
 
-    has_media = bool(images or videos)
+    has_media = bool(images or videos or audios)
     if engine.is_mllm and not has_media:
         # MLLM extracts media from messages directly, so images/videos are
         # always empty. Check message content for video/image types instead.
@@ -3045,7 +3045,14 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
                         if hasattr(item, "type")
                         else (item.get("type", "") if isinstance(item, dict) else "")
                     )
-                    if item_type in ("image_url", "image", "video", "video_url"):
+                    if item_type in (
+                        "image_url",
+                        "image",
+                        "video",
+                        "video_url",
+                        "audio",
+                        "audio_url",
+                    ):
                         has_media = True
                         break
             if has_media:
@@ -3461,7 +3468,7 @@ async def create_anthropic_message(
         )
 
     # Non-streaming: run inference through existing engine
-    messages, images, videos = extract_multimodal_content(
+    messages, images, videos, audios = extract_multimodal_content(
         openai_request.messages,
         preserve_native_format=engine.preserve_native_tool_format,
     )
@@ -3773,7 +3780,7 @@ async def _stream_anthropic_messages(
     prompt_tokens = 0
 
     # Extract messages for engine
-    messages, images, videos = extract_multimodal_content(
+    messages, images, videos, audios = extract_multimodal_content(
         openai_request.messages,
         preserve_native_format=engine.preserve_native_tool_format,
     )

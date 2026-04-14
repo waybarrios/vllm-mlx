@@ -201,17 +201,18 @@ class TestExtractMultimodalContent:
             Message(role="system", content="You are helpful."),
             Message(role="user", content="Hello"),
         ]
-        processed, images, videos = extract_multimodal_content(messages)
+        processed, images, videos, audios = extract_multimodal_content(messages)
 
         assert len(processed) == 2
         assert processed[0] == {"role": "system", "content": "You are helpful."}
         assert processed[1] == {"role": "user", "content": "Hello"}
         assert images == []
         assert videos == []
+        assert audios == []
 
     def test_none_content(self):
         messages = [Message(role="assistant", content=None)]
-        processed, images, videos = extract_multimodal_content(messages)
+        processed, images, videos, _ = extract_multimodal_content(messages)
         assert processed[0] == {"role": "assistant", "content": ""}
 
     def test_multimodal_with_image_url(self):
@@ -227,12 +228,13 @@ class TestExtractMultimodalContent:
                 ],
             )
         ]
-        processed, images, videos = extract_multimodal_content(messages)
+        processed, images, videos, audios = extract_multimodal_content(messages)
 
         assert len(processed) == 1
         assert processed[0]["content"] == "What is this?"
         assert images == ["https://example.com/img.png"]
         assert videos == []
+        assert audios == []
 
     def test_multimodal_with_dict_image_url(self):
         messages = [
@@ -247,7 +249,7 @@ class TestExtractMultimodalContent:
                 ],
             )
         ]
-        processed, images, videos = extract_multimodal_content(messages)
+        processed, images, videos, _ = extract_multimodal_content(messages)
         assert images == ["data:image/png;base64,abc"]
 
     def test_multimodal_with_string_image_url(self):
@@ -260,7 +262,7 @@ class TestExtractMultimodalContent:
                 ],
             )
         ]
-        processed, images, videos = extract_multimodal_content(messages)
+        processed, images, videos, _ = extract_multimodal_content(messages)
         assert images == ["https://example.com/img.png"]
 
     def test_multimodal_with_video(self):
@@ -273,7 +275,7 @@ class TestExtractMultimodalContent:
                 ],
             )
         ]
-        processed, images, videos = extract_multimodal_content(messages)
+        processed, images, videos, _ = extract_multimodal_content(messages)
         assert videos == ["/path/to/video.mp4"]
 
     def test_multimodal_with_video_url(self):
@@ -289,7 +291,7 @@ class TestExtractMultimodalContent:
                 ],
             )
         ]
-        processed, images, videos = extract_multimodal_content(messages)
+        processed, images, videos, _ = extract_multimodal_content(messages)
         assert videos == ["https://example.com/v.mp4"]
 
     def test_multimodal_with_string_video_url(self):
@@ -302,8 +304,49 @@ class TestExtractMultimodalContent:
                 ],
             )
         ]
-        processed, images, videos = extract_multimodal_content(messages)
+        processed, images, videos, _ = extract_multimodal_content(messages)
         assert videos == ["https://example.com/v.mp4"]
+
+    def test_multimodal_with_audio_url(self):
+        messages = [
+            Message(
+                role="user",
+                content=[
+                    {"type": "text", "text": "Transcribe this"},
+                    {
+                        "type": "audio_url",
+                        "audio_url": {"url": "data:audio/wav;base64,abc"},
+                    },
+                ],
+            )
+        ]
+        processed, images, videos, audios = extract_multimodal_content(messages)
+        assert processed[0]["content"] == "Transcribe this"
+        assert images == []
+        assert videos == []
+        assert audios == ["data:audio/wav;base64,abc"]
+
+    def test_multimodal_with_audio_type(self):
+        raw_messages = [
+            type(
+                "Msg",
+                (),
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "Listen"},
+                        {"type": "audio", "audio": "/tmp/example.wav"},
+                    ],
+                    "tool_calls": None,
+                    "tool_call_id": None,
+                },
+            )()
+        ]
+        processed, images, videos, audios = extract_multimodal_content(raw_messages)
+        assert processed[0]["content"] == "Listen"
+        assert images == []
+        assert videos == []
+        assert audios == ["/tmp/example.wav"]
 
     def test_multiple_images(self):
         messages = [
@@ -316,14 +359,14 @@ class TestExtractMultimodalContent:
                 ],
             )
         ]
-        processed, images, videos = extract_multimodal_content(messages)
+        processed, images, videos, _ = extract_multimodal_content(messages)
         assert len(images) == 2
 
     def test_tool_response_message(self):
         messages = [
             Message(role="tool", content="72F and sunny", tool_call_id="call_1")
         ]
-        processed, images, videos = extract_multimodal_content(messages)
+        processed, images, videos, _ = extract_multimodal_content(messages)
         assert processed[0]["role"] == "user"
         assert "Tool Result" in processed[0]["content"]
         assert "call_1" in processed[0]["content"]
@@ -332,7 +375,7 @@ class TestExtractMultimodalContent:
         messages = [
             Message(role="tool", content="72F and sunny", tool_call_id="call_1")
         ]
-        processed, images, videos = extract_multimodal_content(
+        processed, images, videos, _ = extract_multimodal_content(
             messages, preserve_native_format=True
         )
         assert processed[0]["role"] == "tool"
@@ -356,7 +399,7 @@ class TestExtractMultimodalContent:
                 ],
             )
         ]
-        processed, images, videos = extract_multimodal_content(messages)
+        processed, images, videos, _ = extract_multimodal_content(messages)
         assert processed[0]["role"] == "assistant"
         assert "get_weather" in processed[0]["content"]
 
@@ -377,7 +420,7 @@ class TestExtractMultimodalContent:
                 ],
             )
         ]
-        processed, images, videos = extract_multimodal_content(
+        processed, images, videos, _ = extract_multimodal_content(
             messages, preserve_native_format=True
         )
         assert processed[0]["role"] == "assistant"
@@ -390,7 +433,7 @@ class TestExtractMultimodalContent:
             Message(role="user", content="Hello"),
         ]
         # Also test with raw dicts (the function handles both)
-        processed, images, videos = extract_multimodal_content(messages)
+        processed, images, videos, _ = extract_multimodal_content(messages)
         assert processed[0]["content"] == "Hello"
 
     def test_image_type_content_with_raw_dicts(self):
@@ -411,18 +454,19 @@ class TestExtractMultimodalContent:
                 },
             )()
         ]
-        processed, images, videos = extract_multimodal_content(raw_messages)
+        processed, images, videos, _ = extract_multimodal_content(raw_messages)
         assert images == ["https://example.com/img.png"]
 
     def test_empty_messages(self):
-        processed, images, videos = extract_multimodal_content([])
+        processed, images, videos, audios = extract_multimodal_content([])
         assert processed == []
         assert images == []
         assert videos == []
+        assert audios == []
 
     def test_tool_response_none_content(self):
         messages = [Message(role="tool", content=None, tool_call_id="call_1")]
-        processed, images, videos = extract_multimodal_content(messages)
+        processed, images, videos, _ = extract_multimodal_content(messages)
         assert processed[0]["role"] == "user"
         assert "call_1" in processed[0]["content"]
 
@@ -436,7 +480,7 @@ class TestExtractMultimodalContent:
                 ],
             )
         ]
-        processed, images, videos = extract_multimodal_content(messages)
+        processed, images, videos, _ = extract_multimodal_content(messages)
         assert "First part." in processed[0]["content"]
         assert "Second part." in processed[0]["content"]
 
@@ -458,7 +502,7 @@ class TestExtractMultimodalContent:
                 ],
             )
         ]
-        result, images, videos = extract_multimodal_content(messages)
+        result, images, videos, _ = extract_multimodal_content(messages)
         assert isinstance(result[0]["content"], str)
         assert "Let me check." in result[0]["content"]
         assert "get_weather" in result[0]["content"]
@@ -481,7 +525,7 @@ class TestExtractMultimodalContent:
                 ],
             )
         ]
-        result, images, videos = extract_multimodal_content(
+        result, images, videos, _ = extract_multimodal_content(
             messages, preserve_native_format=True
         )
         assert isinstance(result[0]["content"], str)
