@@ -498,6 +498,8 @@ class MLLMScheduler:
             self.running[request.request_id] = request
             scheduled.append(request)
 
+            self.total_prompt_tokens += request.num_prompt_tokens
+
         # Insert into batch generator
         if batch_requests and self.batch_generator is not None:
             uids = self.batch_generator.insert(batch_requests)
