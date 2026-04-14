@@ -17,7 +17,12 @@ Key design:
 
 from __future__ import annotations
 
+import array as _array
+import hashlib
 import logging
+import os
+import sqlite3
+import time
 from dataclasses import dataclass, field
 
 logger = logging.getLogger(__name__)
@@ -106,3 +111,220 @@ class SSDCacheStats:
             "reload_bytes": self.reload_bytes,
             "promotion_failures": self.promotion_failures,
         }
+
+
+def _tokens_to_blob(tokens: tuple[int, ...]) -> bytes:
+    """Serialize token tuple to a compact binary blob for SQLite storage.
+
+    Uses the full token sequence as a binary blob for prefix matching.
+    """
+    arr = _array.array("i", tokens)
+    return arr.tobytes()
+
+
+def _blob_to_tokens(blob: bytes) -> tuple[int, ...]:
+    """Deserialize binary blob back to token tuple."""
+    arr = _array.array("i")
+    arr.frombytes(blob)
+    return tuple(arr)
+
+
+def _tokens_hash(tokens: tuple[int, ...]) -> str:
+    """Compute SHA-256 hex digest of a token sequence for use as primary key."""
+    return hashlib.sha256(_tokens_to_blob(tokens)).hexdigest()
+
+
+class SSDIndex:
+    """SQLite-backed index for SSD cache entries.
+
+    Uses SQLite for atomic metadata operations instead of mutable JSON.
+    The token sequence is stored as a binary blob for prefix-searchable
+    representation. The primary key is a SHA-256 hash of the token sequence.
+
+    Thread safety: SQLite in WAL mode with serialized threading. Individual
+    operations are atomic. Callers must not share a single SSDIndex instance
+    across threads without external synchronization.
+    """
+
+    _SCHEMA_VERSION = 1
+
+    def __init__(self, cache_dir: str) -> None:
+        self._cache_dir = cache_dir
+        db_path = os.path.join(cache_dir, "index.db")
+        self._conn = sqlite3.connect(db_path, check_same_thread=False)
+        self._conn.execute("PRAGMA journal_mode=WAL")
+        self._conn.execute("PRAGMA synchronous=NORMAL")
+        self._conn.row_factory = sqlite3.Row
+        self._create_tables()
+
+    def _create_tables(self) -> None:
+        self._conn.executescript("""
+            CREATE TABLE IF NOT EXISTS schema_version (
+                version INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS entries (
+                token_hash   TEXT PRIMARY KEY,
+                tokens_blob  BLOB NOT NULL,
+                num_tokens   INTEGER NOT NULL,
+                file_path    TEXT NOT NULL,
+                memory_bytes INTEGER NOT NULL,
+                created_at   REAL NOT NULL,
+                accessed_at  REAL NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_entries_accessed
+                ON entries(accessed_at);
+
+            CREATE INDEX IF NOT EXISTS idx_entries_num_tokens
+                ON entries(num_tokens);
+            """)
+        # Insert schema version if not present
+        cur = self._conn.execute("SELECT COUNT(*) FROM schema_version")
+        if cur.fetchone()[0] == 0:
+            self._conn.execute(
+                "INSERT INTO schema_version (version) VALUES (?)",
+                (self._SCHEMA_VERSION,),
+            )
+        self._conn.commit()
+
+    def insert_entry(
+        self,
+        tokens_key: tuple[int, ...],
+        file_path: str,
+        memory_bytes: int,
+        num_tokens: int,
+    ) -> None:
+        """Insert or replace a cache entry in the index."""
+        now = time.time()
+        token_hash = _tokens_hash(tokens_key)
+        tokens_blob = _tokens_to_blob(tokens_key)
+        self._conn.execute(
+            """
+            INSERT OR REPLACE INTO entries
+                (token_hash, tokens_blob, num_tokens, file_path,
+                 memory_bytes, created_at, accessed_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (token_hash, tokens_blob, num_tokens, file_path, memory_bytes, now, now),
+        )
+        self._conn.commit()
+
+    def lookup_exact(self, tokens_key: tuple[int, ...]) -> dict | None:
+        """Look up an exact token sequence. Returns dict or None."""
+        token_hash = _tokens_hash(tokens_key)
+        cur = self._conn.execute(
+            "SELECT file_path, memory_bytes, num_tokens FROM entries WHERE token_hash = ?",
+            (token_hash,),
+        )
+        row = cur.fetchone()
+        if row is None:
+            return None
+        return {
+            "file_path": row["file_path"],
+            "memory_bytes": row["memory_bytes"],
+            "num_tokens": row["num_tokens"],
+        }
+
+    def lookup_prefix(self, query_tokens: tuple[int, ...]) -> list[dict]:
+        """Find entries whose token sequence is a prefix of query_tokens.
+
+        Scans entries with num_tokens <= len(query_tokens) and compares the
+        full stored token blob against the corresponding prefix of query_tokens.
+
+        Returns list of dicts sorted by num_tokens descending (longest prefix first).
+        """
+        query_len = len(query_tokens)
+        query_blob = _tokens_to_blob(query_tokens)
+
+        cur = self._conn.execute(
+            "SELECT token_hash, tokens_blob, num_tokens, file_path, memory_bytes "
+            "FROM entries WHERE num_tokens <= ? ORDER BY num_tokens DESC",
+            (query_len,),
+        )
+
+        results = []
+        for row in cur:
+            stored_blob = row["tokens_blob"]
+            n = row["num_tokens"]
+            # Compare: the stored blob must equal the first n tokens of the query
+            # Each int is 4 bytes in the array('i') encoding
+            prefix_blob = query_blob[: n * 4]
+            if stored_blob == prefix_blob:
+                results.append(
+                    {
+                        "token_hash": row["token_hash"],
+                        "file_path": row["file_path"],
+                        "memory_bytes": row["memory_bytes"],
+                        "num_tokens": n,
+                    }
+                )
+        return results
+
+    def delete_entry(self, tokens_key: tuple[int, ...]) -> None:
+        """Delete an entry by token sequence."""
+        token_hash = _tokens_hash(tokens_key)
+        self._conn.execute("DELETE FROM entries WHERE token_hash = ?", (token_hash,))
+        self._conn.commit()
+
+    def get_lru(self, limit: int = 10) -> list[dict]:
+        """Get the least recently used entries, ordered oldest first."""
+        cur = self._conn.execute(
+            "SELECT token_hash, tokens_blob, num_tokens, file_path, memory_bytes "
+            "FROM entries ORDER BY accessed_at ASC LIMIT ?",
+            (limit,),
+        )
+        results = []
+        for row in cur:
+            results.append(
+                {
+                    "token_hash": row["token_hash"],
+                    "tokens_blob": row["tokens_blob"],
+                    "file_path": row["file_path"],
+                    "memory_bytes": row["memory_bytes"],
+                    "num_tokens": row["num_tokens"],
+                }
+            )
+        return results
+
+    def get_total_bytes(self) -> int:
+        """Get total memory_bytes across all entries."""
+        cur = self._conn.execute("SELECT COALESCE(SUM(memory_bytes), 0) FROM entries")
+        return cur.fetchone()[0]
+
+    def get_entry_count(self) -> int:
+        """Get number of entries in the index."""
+        cur = self._conn.execute("SELECT COUNT(*) FROM entries")
+        return cur.fetchone()[0]
+
+    def touch(self, tokens_key: tuple[int, ...]) -> None:
+        """Update accessed_at timestamp for an entry (marks as recently used)."""
+        token_hash = _tokens_hash(tokens_key)
+        self._conn.execute(
+            "UPDATE entries SET accessed_at = ? WHERE token_hash = ?",
+            (time.time(), token_hash),
+        )
+        self._conn.commit()
+
+    def all_entries(self) -> list[dict]:
+        """Return all entries (for startup reconciliation)."""
+        cur = self._conn.execute(
+            "SELECT token_hash, tokens_blob, num_tokens, file_path, memory_bytes "
+            "FROM entries ORDER BY accessed_at DESC"
+        )
+        results = []
+        for row in cur:
+            results.append(
+                {
+                    "token_hash": row["token_hash"],
+                    "tokens_blob": row["tokens_blob"],
+                    "file_path": row["file_path"],
+                    "memory_bytes": row["memory_bytes"],
+                    "num_tokens": row["num_tokens"],
+                }
+            )
+        return results
+
+    def close(self) -> None:
+        """Close the SQLite connection."""
+        self._conn.close()
