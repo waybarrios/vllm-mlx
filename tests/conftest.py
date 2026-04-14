@@ -52,7 +52,7 @@ def server_url(request):
     return request.config.getoption("--server-url")
 
 
-@pytest.fixture(params=["asyncio"])
-def anyio_backend(request):
-    """Run anyio-marked tests on asyncio only (trio is not installed)."""
-    return request.param
+@pytest.fixture(scope="session")
+def anyio_backend():
+    """Run anyio-marked tests on asyncio only."""
+    return "asyncio"
