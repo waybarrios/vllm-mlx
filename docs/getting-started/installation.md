@@ -85,5 +85,5 @@ huggingface-cli login
 
 Use a smaller quantized model:
 ```bash
-vllm-mlx serve mlx-community/Llama-3.2-1B-Instruct-4bit
+vllm-mlx serve --model mlx-community/Llama-3.2-1B-Instruct-4bit
 ```

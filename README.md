@@ -60,13 +60,13 @@ pip install -e .
 
 ```bash
 # Simple mode (single user, max throughput)
-vllm-mlx serve mlx-community/Llama-3.2-3B-Instruct-4bit --port 8000
+vllm-mlx serve --model mlx-community/Llama-3.2-3B-Instruct-4bit --port 8000
 
 # Continuous batching (multiple users)
-vllm-mlx serve mlx-community/Llama-3.2-3B-Instruct-4bit --port 8000 --continuous-batching
+vllm-mlx serve --model mlx-community/Llama-3.2-3B-Instruct-4bit --port 8000 --continuous-batching
 
 # With API key authentication
-vllm-mlx serve mlx-community/Llama-3.2-3B-Instruct-4bit --port 8000 --api-key your-secret-key
+vllm-mlx serve --model mlx-community/Llama-3.2-3B-Instruct-4bit --port 8000 --api-key your-secret-key
 ```
 
 ### Use with OpenAI SDK
@@ -117,7 +117,7 @@ See [Anthropic Messages API docs](docs/guides/server.md#anthropic-messages-api) 
 ### Multimodal (Images & Video)
 
 ```bash
-vllm-mlx serve mlx-community/Qwen3-VL-4B-Instruct-3bit --port 8000
+vllm-mlx serve --model mlx-community/Qwen3-VL-4B-Instruct-3bit --port 8000
 ```
 
 ```python
@@ -168,7 +168,7 @@ Extract the thinking process from reasoning models like Qwen3 and DeepSeek-R1:
 
 ```bash
 # Start server with reasoning parser
-vllm-mlx serve mlx-community/Qwen3-8B-4bit --reasoning-parser qwen3
+vllm-mlx serve --model mlx-community/Qwen3-8B-4bit --reasoning-parser qwen3
 ```
 
 ```python
@@ -194,7 +194,7 @@ Generate text embeddings for semantic search, RAG, and similarity:
 
 ```bash
 # Start server with an embedding model pre-loaded
-vllm-mlx serve mlx-community/Llama-3.2-3B-Instruct-4bit --embedding-model mlx-community/all-MiniLM-L6-v2-4bit
+vllm-mlx serve --model mlx-community/Llama-3.2-3B-Instruct-4bit --embedding-model mlx-community/all-MiniLM-L6-v2-4bit
 ```
 
 ```python
@@ -305,7 +305,7 @@ vllm-mlx includes native support for Gemma 3 vision models. Gemma 3 is automatic
 
 ```bash
 # Start server with Gemma 3
-vllm-mlx serve mlx-community/gemma-3-27b-it-4bit --port 8000
+vllm-mlx serve --model mlx-community/gemma-3-27b-it-4bit --port 8000
 
 # Verify it loaded as MLLM (not LLM)
 curl http://localhost:8000/health
@@ -345,13 +345,13 @@ def make_cache(self):
 
 ```bash
 # Default (~10K max context)
-vllm-mlx serve mlx-community/gemma-3-27b-it-4bit --port 8000
+vllm-mlx serve --model mlx-community/gemma-3-27b-it-4bit --port 8000
 
 # Extended context (~40K max)
-GEMMA3_SLIDING_WINDOW=8192 vllm-mlx serve mlx-community/gemma-3-27b-it-4bit --port 8000
+GEMMA3_SLIDING_WINDOW=8192 vllm-mlx serve --model mlx-community/gemma-3-27b-it-4bit --port 8000
 
 # Maximum context (~50K max)
-GEMMA3_SLIDING_WINDOW=0 vllm-mlx serve mlx-community/gemma-3-27b-it-4bit --port 8000
+GEMMA3_SLIDING_WINDOW=0 vllm-mlx serve --model mlx-community/gemma-3-27b-it-4bit --port 8000
 ```
 
 **Benchmark Results (M4 Max 128GB):**

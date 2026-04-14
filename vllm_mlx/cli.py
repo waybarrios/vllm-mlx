@@ -4,12 +4,12 @@
 CLI for vllm-mlx.
 
 Commands:
-    vllm-mlx serve <model> --port 8000    Start OpenAI-compatible server
-    vllm-mlx bench <model>                Run benchmark
+    vllm-mlx serve --model <model> --port 8000    Start OpenAI-compatible server
+    vllm-mlx bench --model <model>                Run benchmark
 
 Usage:
-    vllm-mlx serve mlx-community/Llama-3.2-3B-Instruct-4bit --port 8000
-    vllm-mlx bench mlx-community/Llama-3.2-1B-Instruct-4bit --num-prompts 10
+    vllm-mlx serve --model mlx-community/Llama-3.2-3B-Instruct-4bit --port 8000
+    vllm-mlx bench --model mlx-community/Llama-3.2-1B-Instruct-4bit --num-prompts 10
 """
 
 import argparse
@@ -630,9 +630,11 @@ def bench_kv_cache_command(args):
     )
     print()
     print("Usage:")
-    print("  vllm-mlx serve <model> --continuous-batching --kv-cache-quantization")
     print(
-        "  vllm-mlx serve <model> --continuous-batching --kv-cache-quantization "
+        "  vllm-mlx serve --model <model> --continuous-batching --kv-cache-quantization"
+    )
+    print(
+        "  vllm-mlx serve --model <model> --continuous-batching --kv-cache-quantization "
         "--kv-cache-quantization-bits 4"
     )
 
@@ -644,15 +646,15 @@ def create_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  vllm-mlx serve mlx-community/Llama-3.2-3B-Instruct-4bit --port 8000
-  vllm-mlx bench mlx-community/Llama-3.2-1B-Instruct-4bit --num-prompts 10
+  vllm-mlx serve --model mlx-community/Llama-3.2-3B-Instruct-4bit --port 8000
+  vllm-mlx bench --model mlx-community/Llama-3.2-1B-Instruct-4bit --num-prompts 10
         """,
     )
     subparsers = parser.add_subparsers(dest="command", help="Commands")
 
     # Serve command
     serve_parser = subparsers.add_parser("serve", help="Start OpenAI-compatible server")
-    serve_parser.add_argument("model", type=str, help="Model to serve")
+    serve_parser.add_argument("--model", type=str, required=True, help="Model to serve")
     serve_parser.add_argument(
         "--served-model-name",
         type=str,
@@ -972,7 +974,9 @@ Examples:
     )
     # Bench command
     bench_parser = subparsers.add_parser("bench", help="Run benchmark")
-    bench_parser.add_argument("model", type=str, help="Model to benchmark")
+    bench_parser.add_argument(
+        "--model", type=str, required=True, help="Model to benchmark"
+    )
     bench_parser.add_argument(
         "--num-prompts", type=int, default=10, help="Number of prompts"
     )
@@ -1109,7 +1113,9 @@ Examples:
     download_parser = subparsers.add_parser(
         "download", help="Download a model to local cache without starting a server"
     )
-    download_parser.add_argument("model", type=str, help="Model to download")
+    download_parser.add_argument(
+        "--model", type=str, required=True, help="Model to download"
+    )
     download_parser.add_argument(
         "--timeout",
         type=int,

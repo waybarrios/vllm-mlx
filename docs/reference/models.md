@@ -80,13 +80,13 @@ vllm-mlx auto-detects multimodal models by name patterns:
 ### From HuggingFace
 
 ```bash
-vllm-mlx serve mlx-community/Llama-3.2-3B-Instruct-4bit
+vllm-mlx serve --model mlx-community/Llama-3.2-3B-Instruct-4bit
 ```
 
 ### Local Path
 
 ```bash
-vllm-mlx serve /path/to/local/model
+vllm-mlx serve --model /path/to/local/model
 ```
 
 ## Finding Models

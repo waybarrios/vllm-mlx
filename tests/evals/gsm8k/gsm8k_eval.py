@@ -8,7 +8,7 @@ Works with both the local vllm-mlx server and any OpenAI-compatible API.
 
 Usage:
     # Start server first:
-    vllm-mlx serve mlx-community/Qwen2.5-3B-Instruct-4bit --port 8000
+    vllm-mlx serve --model mlx-community/Qwen2.5-3B-Instruct-4bit --port 8000
 
     # Run evaluation:
     python tests/evals/gsm8k/gsm8k_eval.py --port 8000 --num-questions 10

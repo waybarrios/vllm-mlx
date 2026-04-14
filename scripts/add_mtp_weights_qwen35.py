@@ -463,7 +463,7 @@ def main():
     print(f"\nMTP weight file: {mtp_file}")
     print(f"Total MTP keys: {len(mtp_weight_keys)}")
     print("\nTo use MTP, start the server with --enable-mtp:")
-    print(f"  vllm-mlx serve {args.mlx_model_path} --enable-mtp")
+    print(f"  vllm-mlx serve --model {args.mlx_model_path} --enable-mtp")
 
 
 if __name__ == "__main__":

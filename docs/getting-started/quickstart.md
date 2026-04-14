@@ -6,10 +6,10 @@ Start the server:
 
 ```bash
 # Simple mode - maximum throughput for single user
-vllm-mlx serve mlx-community/Llama-3.2-3B-Instruct-4bit --port 8000
+vllm-mlx serve --model mlx-community/Llama-3.2-3B-Instruct-4bit --port 8000
 
 # Continuous batching - for multiple concurrent users
-vllm-mlx serve mlx-community/Llama-3.2-3B-Instruct-4bit --port 8000 --continuous-batching
+vllm-mlx serve --model mlx-community/Llama-3.2-3B-Instruct-4bit --port 8000 --continuous-batching
 ```
 
 Use with OpenAI Python SDK:
@@ -64,7 +64,7 @@ Opens a web interface at http://localhost:7860
 For image/video understanding, use a VLM model:
 
 ```bash
-vllm-mlx serve mlx-community/Qwen3-VL-4B-Instruct-3bit --port 8000
+vllm-mlx serve --model mlx-community/Qwen3-VL-4B-Instruct-3bit --port 8000
 ```
 
 ```python
@@ -86,7 +86,7 @@ response = client.chat.completions.create(
 Separate the model's thinking process from the final answer:
 
 ```bash
-vllm-mlx serve mlx-community/Qwen3-8B-4bit --reasoning-parser qwen3
+vllm-mlx serve --model mlx-community/Qwen3-8B-4bit --reasoning-parser qwen3
 ```
 
 ```python
@@ -102,7 +102,7 @@ print(response.choices[0].message.content)  # Final answer
 Generate text embeddings for semantic search and RAG:
 
 ```bash
-vllm-mlx serve mlx-community/Qwen3-4B-4bit --embedding-model mlx-community/multilingual-e5-small-mlx
+vllm-mlx serve --model mlx-community/Qwen3-4B-4bit --embedding-model mlx-community/multilingual-e5-small-mlx
 ```
 
 ```python
@@ -117,7 +117,7 @@ response = client.embeddings.create(
 Enable function calling with any supported model:
 
 ```bash
-vllm-mlx serve mlx-community/Devstral-Small-2507-4bit \
+vllm-mlx serve --model mlx-community/Devstral-Small-2507-4bit \
   --enable-auto-tool-choice --tool-call-parser mistral
 ```
 

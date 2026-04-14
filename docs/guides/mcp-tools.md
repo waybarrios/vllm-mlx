@@ -52,10 +52,10 @@ Create `mcp.json`:
 
 ```bash
 # Simple mode
-vllm-mlx serve mlx-community/Qwen3-4B-4bit --mcp-config mcp.json
+vllm-mlx serve --model mlx-community/Qwen3-4B-4bit --mcp-config mcp.json
 
 # Continuous batching
-vllm-mlx serve mlx-community/Qwen3-4B-4bit --mcp-config mcp.json --continuous-batching
+vllm-mlx serve --model mlx-community/Qwen3-4B-4bit --mcp-config mcp.json --continuous-batching
 ```
 
 ### 3. Verify MCP Status

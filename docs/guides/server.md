@@ -9,7 +9,7 @@ vllm-mlx provides a FastAPI server with full OpenAI API compatibility.
 Maximum throughput for single user:
 
 ```bash
-vllm-mlx serve mlx-community/Llama-3.2-3B-Instruct-4bit --port 8000
+vllm-mlx serve --model mlx-community/Llama-3.2-3B-Instruct-4bit --port 8000
 ```
 
 ### Continuous Batching Mode
@@ -17,7 +17,7 @@ vllm-mlx serve mlx-community/Llama-3.2-3B-Instruct-4bit --port 8000
 For multiple concurrent users:
 
 ```bash
-vllm-mlx serve mlx-community/Llama-3.2-3B-Instruct-4bit --port 8000 --continuous-batching
+vllm-mlx serve --model mlx-community/Llama-3.2-3B-Instruct-4bit --port 8000 --continuous-batching
 ```
 
 ### With Paged Cache
@@ -25,7 +25,7 @@ vllm-mlx serve mlx-community/Llama-3.2-3B-Instruct-4bit --port 8000 --continuous
 Memory-efficient caching for production:
 
 ```bash
-vllm-mlx serve mlx-community/Llama-3.2-3B-Instruct-4bit --port 8000 --continuous-batching --use-paged-cache
+vllm-mlx serve --model mlx-community/Llama-3.2-3B-Instruct-4bit --port 8000 --continuous-batching --use-paged-cache
 ```
 
 ## Server Options
@@ -416,7 +416,7 @@ Point Claude Code directly at your vllm-mlx server:
 
 ```bash
 # Start the server
-vllm-mlx serve mlx-community/Qwen3-Coder-Next-235B-A22B-4bit \
+vllm-mlx serve --model mlx-community/Qwen3-Coder-Next-235B-A22B-4bit \
   --continuous-batching \
   --enable-auto-tool-choice \
   --tool-call-parser hermes
@@ -517,7 +517,7 @@ Per-request fields in `requests`:
 Enable OpenAI-compatible tool calling with `--enable-auto-tool-choice`:
 
 ```bash
-vllm-mlx serve mlx-community/Devstral-Small-2507-4bit \
+vllm-mlx serve --model mlx-community/Devstral-Small-2507-4bit \
   --enable-auto-tool-choice \
   --tool-call-parser mistral
 ```
@@ -570,10 +570,10 @@ For models that show their thinking process (Qwen3, DeepSeek-R1), use `--reasoni
 
 ```bash
 # Qwen3 models
-vllm-mlx serve mlx-community/Qwen3-8B-4bit --reasoning-parser qwen3
+vllm-mlx serve --model mlx-community/Qwen3-8B-4bit --reasoning-parser qwen3
 
 # DeepSeek-R1 models
-vllm-mlx serve mlx-community/DeepSeek-R1-Distill-Qwen-7B-4bit --reasoning-parser deepseek_r1
+vllm-mlx serve --model mlx-community/DeepSeek-R1-Distill-Qwen-7B-4bit --reasoning-parser deepseek_r1
 ```
 
 The API response includes a `reasoning` field with the model's thought process:
@@ -698,17 +698,17 @@ Control streaming behavior with `--stream-interval`:
 
 ```bash
 # Smooth streaming
-vllm-mlx serve model --continuous-batching --stream-interval 1
+vllm-mlx serve --model model --continuous-batching --stream-interval 1
 
 # Batched streaming (better for high-latency networks)
-vllm-mlx serve model --continuous-batching --stream-interval 5
+vllm-mlx serve --model model --continuous-batching --stream-interval 5
 ```
 
 ## Open WebUI Integration
 
 ```bash
 # 1. Start vllm-mlx server
-vllm-mlx serve mlx-community/Llama-3.2-3B-Instruct-4bit --port 8000
+vllm-mlx serve --model mlx-community/Llama-3.2-3B-Instruct-4bit --port 8000
 
 # 2. Start Open WebUI
 docker run -d -p 3000:8080 \
@@ -733,7 +733,7 @@ After=network.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/vllm-mlx serve mlx-community/Qwen3-0.6B-8bit \
+ExecStart=/usr/local/bin/vllm-mlx serve --model mlx-community/Qwen3-0.6B-8bit \
   --continuous-batching --use-paged-cache --port 8000
 Restart=always
 
@@ -751,7 +751,7 @@ sudo systemctl start vllm-mlx
 For production with 50+ concurrent users:
 
 ```bash
-vllm-mlx serve mlx-community/Qwen3-0.6B-8bit \
+vllm-mlx serve --model mlx-community/Qwen3-0.6B-8bit \
   --continuous-batching \
   --use-paged-cache \
   --api-key your-secret-key \

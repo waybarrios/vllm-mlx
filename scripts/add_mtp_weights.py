@@ -333,7 +333,7 @@ def main():
     print(f"\nMTP weight file: {mtp_file}")
     print(f"Total MTP keys: {len(mtp_keys)}")
     print(f"\nTo use MTP, start the server with --enable-mtp:")
-    print(f"  vllm-mlx serve mlx-community/Qwen3-Next-80B-A3B-Instruct-6bit \\")
+    print(f"  vllm-mlx serve --model mlx-community/Qwen3-Next-80B-A3B-Instruct-6bit \\")
     print(f"      --enable-mtp --port 1239")
 
 

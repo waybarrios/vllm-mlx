@@ -17,7 +17,7 @@ vllm-mlx supports vision-language models for image and video understanding.
 ## Starting a Multimodal Server
 
 ```bash
-vllm-mlx serve mlx-community/Qwen3-VL-4B-Instruct-3bit --port 8000
+vllm-mlx serve --model mlx-community/Qwen3-VL-4B-Instruct-3bit --port 8000
 ```
 
 Models with "VL", "Vision", or "mllm" in the name are auto-detected as multimodal.
@@ -252,10 +252,10 @@ The cache uses content-based hashing (similar to LMCache) to identify identical 
 
 ```bash
 # Enable with default settings (512 MB max)
-vllm-mlx serve mlx-community/Qwen3-VL-4B-Instruct-3bit --enable-mllm-cache
+vllm-mlx serve --model mlx-community/Qwen3-VL-4B-Instruct-3bit --enable-mllm-cache
 
 # With custom memory limit
-vllm-mlx serve mlx-community/Qwen3-VL-4B-Instruct-3bit \
+vllm-mlx serve --model mlx-community/Qwen3-VL-4B-Instruct-3bit \
     --enable-mllm-cache \
     --mllm-cache-max-mb 1024
 ```
