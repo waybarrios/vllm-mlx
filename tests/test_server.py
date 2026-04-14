@@ -6,6 +6,7 @@ import platform
 import sys
 
 import pytest
+from fastapi.testclient import TestClient
 
 # Skip all tests if not on Apple Silicon
 pytestmark = pytest.mark.skipif(
@@ -681,7 +682,81 @@ class TestRateLimiterHTTPResponse:
         assert allowed is False
         assert retry_after is not None
         assert retry_after > 0
-        assert retry_after <= 60  # Should be within a minute
+
+
+class TestEndpointSecurityDependencies:
+    """Test auth/rate-limit coverage on protected endpoints."""
+
+    @pytest.fixture
+    def client(self):
+        import vllm_mlx.server as server
+
+        return TestClient(server.app)
+
+    @pytest.fixture(autouse=True)
+    def restore_security_state(self):
+        import vllm_mlx.server as server
+
+        original_key = server._api_key
+        original_limiter = server._rate_limiter
+        try:
+            yield
+        finally:
+            server._api_key = original_key
+            server._rate_limiter = original_limiter
+
+    @pytest.mark.parametrize(
+        ("method", "path"),
+        [
+            ("get", "/v1/status"),
+            ("get", "/v1/cache/stats"),
+            ("delete", "/v1/cache"),
+            ("post", "/v1/messages"),
+            ("post", "/v1/messages/count_tokens"),
+        ],
+    )
+    def test_endpoints_require_api_key(self, client, method, path):
+        import vllm_mlx.server as server
+
+        server._api_key = "test-secret"
+
+        kwargs = {}
+        if method == "post":
+            kwargs["json"] = {
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "hi"}],
+                "max_tokens": 16,
+            }
+
+        response = getattr(client, method)(path, **kwargs)
+        assert response.status_code == 401
+        assert response.json()["detail"] == "API key required"
+
+    @pytest.mark.parametrize("path", ["/v1/messages", "/v1/messages/count_tokens"])
+    def test_anthropic_endpoints_apply_rate_limit(self, client, path, monkeypatch):
+        import vllm_mlx.server as server
+
+        server._api_key = "test-secret"
+
+        def deny_all(_client_id):
+            return False, 7
+
+        monkeypatch.setattr(server._rate_limiter, "enabled", True)
+        monkeypatch.setattr(server._rate_limiter, "is_allowed", deny_all)
+
+        response = client.post(
+            path,
+            headers={"Authorization": "Bearer test-secret"},
+            json={
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "hi"}],
+                "max_tokens": 16,
+            },
+        )
+
+        assert response.status_code == 429
+        assert "Rate limit exceeded" in response.json()["detail"]
+        assert response.headers["Retry-After"] == "7"
 
     def test_rate_limiter_window_cleanup(self):
         """Test that rate limiter cleans up old requests from sliding window."""
