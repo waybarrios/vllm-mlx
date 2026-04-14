@@ -19,11 +19,16 @@ from __future__ import annotations
 
 import array as _array
 import hashlib
+import json
 import logging
 import os
 import sqlite3
 import time
+from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
+from typing import Any
+
+import numpy as np
 
 logger = logging.getLogger(__name__)
 
@@ -328,3 +333,156 @@ class SSDIndex:
     def close(self) -> None:
         """Close the SQLite connection."""
         self._conn.close()
+
+
+# Support matrix: maps cache type names to their serializer status
+SERIALIZER_SUPPORT_MATRIX = {
+    "KVCache": "supported",
+    "RotatingKVCache": "supported",  # Serialized as KVCache (keys/values/offset)
+    "ArraysCache": "supported",
+    "MambaCache": "supported",  # Legacy name for ArraysCache
+    "_QuantizedCacheWrapper": "not_supported_spill_dequantized",
+}
+
+
+class LayerSerializer(ABC):
+    """Interface for per-layer cache serialization.
+
+    Each implementation handles a specific cache type's serialization
+    to/from safetensors files with metadata.
+    """
+
+    @abstractmethod
+    def serialize_layer(
+        self, layer: Any, layer_idx: int, file_path: str
+    ) -> dict[str, Any]:
+        """Serialize a single cache layer to a file.
+
+        Args:
+            layer: The cache layer object.
+            layer_idx: Index of this layer in the cache list.
+            file_path: Path to write the safetensors file.
+
+        Returns:
+            Metadata dict with at least 'layer_type' key.
+        """
+        ...
+
+    @abstractmethod
+    def deserialize_layer(self, file_path: str, metadata: dict[str, Any]) -> dict:
+        """Deserialize a single cache layer from a file.
+
+        Args:
+            file_path: Path to the safetensors file.
+            metadata: Metadata dict from serialize_layer.
+
+        Returns:
+            Dict with layer state (keys/values/offset or state list).
+        """
+        ...
+
+
+class KVCacheSerializer(LayerSerializer):
+    """Serializer for KVCache and RotatingKVCache layers.
+
+    Handles layers with .keys, .values, .offset attributes.
+    RotatingKVCache also has .max_size, .keep, .step, ._idx.
+    """
+
+    def serialize_layer(
+        self, layer: Any, layer_idx: int, file_path: str
+    ) -> dict[str, Any]:
+        from safetensors.numpy import save_file
+
+        keys_np = np.array(layer.keys)
+        values_np = np.array(layer.values)
+
+        tensors = {
+            f"layer_{layer_idx}_keys": keys_np,
+            f"layer_{layer_idx}_values": values_np,
+        }
+        save_file(tensors, file_path)
+
+        metadata = {
+            "layer_type": "KVCache",
+            "layer_idx": layer_idx,
+            "offset": layer.offset,
+        }
+        # Preserve RotatingKVCache extra attributes
+        for attr in ("max_size", "keep", "step", "_idx"):
+            if hasattr(layer, attr):
+                metadata[attr] = getattr(layer, attr)
+
+        return metadata
+
+    def deserialize_layer(self, file_path: str, metadata: dict[str, Any]) -> dict:
+        from safetensors.numpy import load_file
+
+        layer_idx = metadata["layer_idx"]
+        tensors = load_file(file_path)
+
+        result = {
+            "keys": tensors[f"layer_{layer_idx}_keys"],
+            "values": tensors[f"layer_{layer_idx}_values"],
+            "offset": metadata["offset"],
+        }
+        for attr in ("max_size", "keep", "step", "_idx"):
+            if attr in metadata:
+                result[attr] = metadata[attr]
+        return result
+
+
+class ArraysCacheSerializer(LayerSerializer):
+    """Serializer for ArraysCache (Mamba/linear attention) layers.
+
+    Handles layers with .state attribute containing a list of arrays.
+    """
+
+    def serialize_layer(
+        self, layer: Any, layer_idx: int, file_path: str
+    ) -> dict[str, Any]:
+        from safetensors.numpy import save_file
+
+        state = layer.state
+        tensors = {}
+        for i, arr in enumerate(state):
+            tensors[f"layer_{layer_idx}_state_{i}"] = np.array(arr)
+
+        save_file(tensors, file_path)
+
+        return {
+            "layer_type": "ArraysCache",
+            "layer_idx": layer_idx,
+            "num_arrays": len(state),
+        }
+
+    def deserialize_layer(self, file_path: str, metadata: dict[str, Any]) -> dict:
+        from safetensors.numpy import load_file
+
+        layer_idx = metadata["layer_idx"]
+        num_arrays = metadata["num_arrays"]
+        tensors = load_file(file_path)
+
+        state = []
+        for i in range(num_arrays):
+            state.append(tensors[f"layer_{layer_idx}_state_{i}"])
+        return {"state": state}
+
+
+def get_serializer_for_layer(layer: Any) -> LayerSerializer:
+    """Return the appropriate serializer for a cache layer.
+
+    Dispatches based on duck-typing:
+    - If layer has .keys and .values and .offset -> KVCacheSerializer
+    - If layer has .state and it's a list -> ArraysCacheSerializer
+
+    Raises ValueError for unsupported layer types.
+    """
+    if hasattr(layer, "keys") and hasattr(layer, "values") and hasattr(layer, "offset"):
+        return KVCacheSerializer()
+    if hasattr(layer, "state") and isinstance(getattr(layer, "state", None), list):
+        return ArraysCacheSerializer()
+    raise ValueError(
+        f"Unsupported cache layer type: {type(layer).__name__}. "
+        f"Supported: {list(SERIALIZER_SUPPORT_MATRIX.keys())}"
+    )
