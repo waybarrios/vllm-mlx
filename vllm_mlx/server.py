@@ -4335,8 +4335,8 @@ Examples:
     parser.add_argument(
         "--host",
         type=str,
-        default="0.0.0.0",
-        help="Host to bind to",
+        default="127.0.0.1",
+        help="Host to bind to (default: localhost; use 0.0.0.0 to expose externally)",
     )
     parser.add_argument(
         "--port",

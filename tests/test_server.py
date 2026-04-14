@@ -190,6 +190,23 @@ class TestServeCli:
         )
         assert args.trust_remote_code is True
 
+    def test_host_defaults_to_localhost(self):
+        """Serve parsers should bind only to localhost unless overridden."""
+        from vllm_mlx.cli import create_parser as create_cli_parser
+        from vllm_mlx.server import create_parser as create_server_parser
+
+        cli_parser = create_cli_parser()
+        cli_args = cli_parser.parse_args(
+            ["serve", "mlx-community/Llama-3.2-3B-Instruct-4bit"]
+        )
+        assert cli_args.host == "127.0.0.1"
+
+        server_parser = create_server_parser()
+        server_args = server_parser.parse_args(
+            ["--model", "mlx-community/Llama-3.2-3B-Instruct-4bit"]
+        )
+        assert server_args.host == "127.0.0.1"
+
     def test_tool_call_parser_accepts_harmony_aliases(self):
         """GPT-OSS/Harmony parsers should be selectable from the serve CLI."""
         from vllm_mlx.cli import create_parser

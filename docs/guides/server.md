@@ -2,6 +2,8 @@
 
 vllm-mlx provides a FastAPI server with full OpenAI API compatibility.
 
+By default the server binds only to `127.0.0.1`. Use `--host 0.0.0.0` only when you intentionally want to expose it beyond the local machine.
+
 ## Starting the Server
 
 ### Simple Mode (Default)
@@ -33,7 +35,7 @@ vllm-mlx serve mlx-community/Llama-3.2-3B-Instruct-4bit --port 8000 --continuous
 | Option | Description | Default |
 |--------|-------------|---------|
 | `--port` | Server port | 8000 |
-| `--host` | Server host | 0.0.0.0 |
+| `--host` | Server host | 127.0.0.1 |
 | `--api-key` | API key for authentication | None |
 | `--rate-limit` | Requests per minute per client (0 = disabled) | 0 |
 | `--timeout` | Request timeout in seconds | 300 |
