@@ -163,6 +163,7 @@ _model_path: str | None = (
     None  # Actual model path (for cache dir, not affected by --served-model-name)
 )
 _default_max_tokens: int = 32768
+_max_request_tokens: int = 32768
 _default_timeout: float = 300.0  # Default request timeout in seconds (5 minutes)
 _default_temperature: float | None = None  # Set via --default-temperature
 _default_top_p: float | None = None  # Set via --default-top-p
@@ -190,6 +191,18 @@ def _resolve_top_p(request_value: float | None) -> float:
     if _default_top_p is not None:
         return _default_top_p
     return _FALLBACK_TOP_P
+
+
+def _resolve_request_max_tokens(requested_value: int | None) -> int:
+    """Resolve and validate a request's max_tokens budget."""
+    if requested_value is None:
+        return _default_max_tokens
+    if requested_value > _max_request_tokens:
+        raise HTTPException(
+            status_code=400,
+            detail=f"max_tokens exceeds server limit ({_max_request_tokens})",
+        )
+    return requested_value
 
 
 # Global MCP manager
@@ -1606,6 +1619,7 @@ def load_model(
     scheduler_config=None,
     stream_interval: int = 1,
     max_tokens: int = 32768,
+    max_request_tokens: int = 32768,
     force_mllm: bool = False,
     gpu_memory_utilization: float = 0.90,
     served_model_name: str | None = None,
@@ -1626,6 +1640,7 @@ def load_model(
         scheduler_config: Scheduler config for batched mode
         stream_interval: Tokens to batch before streaming (batched mode only)
         max_tokens: Default max tokens for generation
+        max_request_tokens: Maximum max_tokens accepted from API clients
         force_mllm: Force loading as MLLM even if not auto-detected
         trust_remote_code: Allow HuggingFace remote code execution during model/tokenizer loading
         mtp: Enable native MTP speculative decoding (SimpleEngine only)
@@ -1635,9 +1650,18 @@ def load_model(
         specprefill_keep_pct: Fraction of tokens to keep (default: 0.3)
         specprefill_draft_model: Path to small draft model for SpecPrefill scoring
     """
-    global _engine, _model_name, _model_path, _default_max_tokens, _tool_parser_instance
+    global _engine, _model_name, _model_path, _default_max_tokens
+    global _max_request_tokens, _tool_parser_instance
+
+    if max_tokens < 1:
+        raise ValueError("Default max tokens must be at least 1")
+    if max_request_tokens < 1:
+        raise ValueError("Max request tokens must be at least 1")
+    if max_tokens > max_request_tokens:
+        raise ValueError("Default max tokens cannot exceed max request tokens")
 
     _default_max_tokens = max_tokens
+    _max_request_tokens = max_request_tokens
     _model_path = model_name
     _model_name = served_model_name or model_name
     # Reset tool parser instance when model is reloaded (tokenizer may change)
@@ -1686,6 +1710,7 @@ def load_model(
         logger.info(f"Native tool format enabled for parser: {_tool_call_parser}")
 
     logger.info(f"Default max tokens: {_default_max_tokens}")
+    logger.info(f"Max request tokens: {_max_request_tokens}")
 
 
 def get_usage(output: GenerationOutput) -> Usage:
@@ -2416,6 +2441,7 @@ async def _wait_with_disconnect(
 async def create_completion(request: CompletionRequest, raw_request: Request):
     """Create a text completion."""
     _validate_model_name(request.model)
+    effective_max_tokens = _resolve_request_max_tokens(request.max_tokens)
     engine = get_engine()
     tracker = _metrics.track_inference("completions", stream=request.stream)
 
@@ -2465,7 +2491,7 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
     for i, prompt in enumerate(prompts):
         generate_kwargs = {
             "prompt": prompt,
-            "max_tokens": request.max_tokens or _default_max_tokens,
+            "max_tokens": effective_max_tokens,
             "temperature": _resolve_temperature(request.temperature),
             "top_p": _resolve_top_p(request.top_p),
             "top_k": request.top_k or 0,
@@ -2578,6 +2604,7 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
     ```
     """
     _validate_model_name(request.model)
+    effective_max_tokens = _resolve_request_max_tokens(request.max_tokens)
     engine = get_engine()
     tracker = _metrics.track_inference("chat_completions", stream=request.stream)
 
@@ -2706,7 +2733,7 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
 
     # Prepare kwargs
     chat_kwargs = {
-        "max_tokens": request.max_tokens or _default_max_tokens,
+        "max_tokens": effective_max_tokens,
         "temperature": _resolve_temperature(request.temperature),
         "top_p": _resolve_top_p(request.top_p),
         "top_k": request.top_k or 0,
@@ -3039,6 +3066,8 @@ async def create_anthropic_message(
     anthropic_request = AnthropicRequest(**body)
 
     _validate_model_name(anthropic_request.model)
+    effective_max_tokens = _resolve_request_max_tokens(anthropic_request.max_tokens)
+    engine = get_engine()
 
     # --- Detailed request logging ---
     n_msgs = len(anthropic_request.messages)
@@ -3124,7 +3153,7 @@ async def create_anthropic_message(
                     )
 
     chat_kwargs = {
-        "max_tokens": openai_request.max_tokens or _default_max_tokens,
+        "max_tokens": effective_max_tokens,
         "temperature": openai_request.temperature,
         "top_p": openai_request.top_p,
         "top_k": openai_request.top_k or 0,
@@ -3390,6 +3419,7 @@ async def _stream_anthropic_messages(
     engine: BaseEngine,
     openai_request: ChatCompletionRequest,
     anthropic_request: AnthropicRequest,
+    max_tokens: int,
     metrics_tracker=None,
 ) -> AsyncIterator[str]:
     """
@@ -3416,7 +3446,7 @@ async def _stream_anthropic_messages(
     messages = _normalize_messages(messages)
 
     chat_kwargs = {
-        "max_tokens": openai_request.max_tokens or _default_max_tokens,
+        "max_tokens": max_tokens,
         "temperature": openai_request.temperature,
         "top_p": openai_request.top_p,
         "top_k": openai_request.top_k or 0,
@@ -3692,6 +3722,7 @@ async def stream_completion(
     engine: BaseEngine,
     prompt: str,
     request: CompletionRequest,
+    max_tokens: int,
     repetition_penalty: float | None = None,
     metrics_tracker=None,
 ) -> AsyncIterator[str]:
@@ -3701,7 +3732,7 @@ async def stream_completion(
     completion_tokens = 0
     generate_kwargs = {
         "prompt": prompt,
-        "max_tokens": request.max_tokens or _default_max_tokens,
+        "max_tokens": max_tokens,
         "temperature": _resolve_temperature(request.temperature),
         "top_p": _resolve_top_p(request.top_p),
         "top_k": request.top_k or 0,
@@ -4399,6 +4430,12 @@ Examples:
         type=int,
         default=32768,
         help="Default max tokens for generation",
+    )
+    parser.add_argument(
+        "--max-request-tokens",
+        type=int,
+        default=32768,
+        help="Maximum max_tokens accepted from API clients (default: 32768)",
     )
     parser.add_argument(
         "--api-key",

@@ -9,6 +9,7 @@
 | `--host` | Server host address | `127.0.0.1` |
 | `--port` | Server port | `8000` |
 | `--max-tokens` | Default max tokens | `32768` |
+| `--max-request-tokens` | Maximum `max_tokens` accepted from API clients | `32768` |
 | `--default-temperature` | Default temperature when not specified in request | None |
 | `--default-top-p` | Default top_p when not specified in request | None |
 

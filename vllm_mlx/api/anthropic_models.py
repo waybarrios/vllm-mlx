@@ -56,7 +56,7 @@ class AnthropicRequest(BaseModel):
     model: str
     messages: list[AnthropicMessage]
     system: str | list[dict] | None = None
-    max_tokens: int  # Required in Anthropic API
+    max_tokens: int = Field(gt=0)  # Required in Anthropic API
     temperature: float | None = None
     top_p: float | None = None
     stream: bool = False

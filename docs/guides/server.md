@@ -45,6 +45,7 @@ vllm-mlx serve mlx-community/Llama-3.2-3B-Instruct-4bit --port 8000 --continuous
 | `--cache-memory-mb` | Cache memory limit in MB | Auto |
 | `--cache-memory-percent` | Fraction of RAM for cache | 0.20 |
 | `--max-tokens` | Default max tokens | 32768 |
+| `--max-request-tokens` | Maximum `max_tokens` accepted from API clients | 32768 |
 | `--default-temperature` | Default temperature when not specified | None |
 | `--default-top-p` | Default top_p when not specified | None |
 | `--stream-interval` | Tokens per stream chunk | 1 |

@@ -43,12 +43,22 @@ def serve_command(args):
             "Error: --gpu-memory-utilization must be between 0.0 (exclusive) and 1.0 (inclusive)"
         )
         sys.exit(1)
+    if args.max_tokens < 1:
+        print("Error: --max-tokens must be at least 1")
+        sys.exit(1)
+    if args.max_request_tokens < 1:
+        print("Error: --max-request-tokens must be at least 1")
+        sys.exit(1)
+    if args.max_tokens > args.max_request_tokens:
+        print("Error: --max-tokens cannot exceed --max-request-tokens")
+        sys.exit(1)
 
     # Configure server security settings
     server._api_key = args.api_key
     server._default_timeout = args.timeout
     server._metrics_enabled = args.enable_metrics
     server._metrics.configure(enabled=args.enable_metrics)
+    server._max_request_tokens = args.max_request_tokens
     if args.rate_limit > 0:
         server._rate_limiter = RateLimiter(
             requests_per_minute=args.rate_limit, enabled=True
@@ -145,6 +155,7 @@ def serve_command(args):
 
     print(f"Loading model: {args.model}")
     print(f"Default max tokens: {args.max_tokens}")
+    print(f"Max request tokens: {args.max_request_tokens}")
 
     # Store MCP config path for FastAPI startup
     if args.mcp_config:
@@ -237,6 +248,7 @@ def serve_command(args):
         scheduler_config=scheduler_config,
         stream_interval=args.stream_interval if args.continuous_batching else 1,
         max_tokens=args.max_tokens,
+        max_request_tokens=args.max_request_tokens,
         force_mllm=getattr(args, "mllm", False),
         gpu_memory_utilization=args.gpu_memory_utilization,
         served_model_name=args.served_model_name,
@@ -769,6 +781,12 @@ Examples:
         type=int,
         default=32768,
         help="Default max tokens for generation (default: 32768)",
+    )
+    serve_parser.add_argument(
+        "--max-request-tokens",
+        type=int,
+        default=32768,
+        help="Maximum max_tokens accepted from API clients (default: 32768)",
     )
     serve_parser.add_argument(
         "--continuous-batching",
