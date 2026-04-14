@@ -629,3 +629,84 @@ class TestAsyncFetchPath:
         assert len(budget_reserved) == 1
         assert len(budget_released) == 1
         assert budget_released[0] == budget_reserved[0]
+
+
+class TestCapacityManagement:
+    """Tests for SSD disk capacity management."""
+
+    @pytest.fixture
+    def small_tier(self, tmp_path):
+        """SSD tier with very small capacity for testing eviction."""
+        config = SSDCacheConfig(
+            cache_dir=str(tmp_path / "capacity_test"),
+            max_size_gb=0.0001,  # ~100KB
+            max_entries=3,
+        )
+        tier = SSDCacheTier(config)
+        tier.start_writer()
+        yield tier
+        tier.close()
+
+    def _write_and_wait(self, tier, tokens, size=1024):
+        keys = MockMLXArray(np.random.randn(1, 4, 8, 32).astype(np.float16))
+        values = MockMLXArray(np.random.randn(1, 4, 8, 32).astype(np.float16))
+        layer = MockKVCacheLayer(keys=keys, values=values, offset=8)
+        tier.enqueue_spill(tokens, [layer], memory_bytes=size)
+
+        deadline = time.monotonic() + 5.0
+        initial_count = tier._stats.spill_count
+        while time.monotonic() < deadline:
+            if tier._stats.spill_count > initial_count:
+                break
+            time.sleep(0.05)
+
+    def test_disk_lru_eviction(self, small_tier):
+        """When disk capacity is exceeded, oldest entries are evicted."""
+        # Fill with 3 entries (at max_entries limit)
+        for i in range(3):
+            self._write_and_wait(small_tier, tuple(range(i * 10, (i + 1) * 10)))
+
+        assert small_tier._index.get_entry_count() == 3
+
+        # Write one more — should trigger disk LRU eviction
+        self._write_and_wait(small_tier, (100, 101, 102))
+
+        # Should still be at or below max_entries
+        assert small_tier._index.get_entry_count() <= 3
+
+    def test_startup_reconciliation(self, tmp_path):
+        """On startup, index is reconciled with files on disk."""
+        cache_dir = str(tmp_path / "reconcile_test")
+        config = SSDCacheConfig(cache_dir=cache_dir)
+        tier = SSDCacheTier(config)
+        tier.start_writer()
+
+        # Write an entry
+        tokens = (1, 2, 3)
+        keys = MockMLXArray(np.random.randn(1, 4, 8, 32).astype(np.float16))
+        values = MockMLXArray(np.random.randn(1, 4, 8, 32).astype(np.float16))
+        layer = MockKVCacheLayer(keys=keys, values=values, offset=8)
+        tier.enqueue_spill(tokens, [layer], memory_bytes=1024)
+
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            if tier._stats.spill_count > 0:
+                break
+            time.sleep(0.05)
+
+        tier.close()
+
+        # Delete the data file but leave the index entry
+        entry_hash = SSDCacheTier._entry_hash(tokens)
+        entry_dir = os.path.join(cache_dir, "data", entry_hash)
+        import shutil
+
+        shutil.rmtree(entry_dir)
+
+        # Re-open — reconciliation should detect the missing file
+        tier2 = SSDCacheTier(config)
+        tier2.reconcile()
+
+        # The orphaned index entry should have been removed
+        assert tier2._index.lookup_exact(tokens) is None
+        tier2.close()

@@ -671,6 +671,9 @@ class SSDCacheTier:
             f"{total_file_bytes} bytes on disk"
         )
 
+        # Enforce capacity after write
+        self._enforce_capacity()
+
     def lookup_ssd(self, tokens: tuple[int, ...]) -> dict | None:
         """Synchronous check whether tokens exist in SSD tier.
 
@@ -856,6 +859,93 @@ class SSDCacheTier:
             logger.warning(f"[ssd_cache] failed to quarantine {relative_path}: {e}")
 
         self._index.delete_entry(tokens)
+
+    def _enforce_capacity(self) -> None:
+        """Evict oldest SSD entries until within capacity limits.
+
+        Called after each spill write. Removes entries by LRU order
+        until both entry count and total bytes are within bounds.
+        """
+        import shutil
+
+        while True:
+            entry_count = self._index.get_entry_count()
+            total_bytes = self._index.get_total_bytes()
+
+            needs_evict = (
+                entry_count > self._config.max_entries
+                or total_bytes > self._config.max_size_bytes
+            )
+            if not needs_evict:
+                break
+
+            lru = self._index.get_lru(limit=1)
+            if not lru:
+                break
+
+            victim = lru[0]
+            victim_tokens = _blob_to_tokens(victim["tokens_blob"])
+            victim_dir = os.path.join(self._data_dir, victim["file_path"])
+
+            # Delete data files
+            if os.path.exists(victim_dir):
+                shutil.rmtree(victim_dir)
+
+            # Delete from index
+            self._index.delete_entry(victim_tokens)
+
+            logger.debug(
+                f"[ssd_cache] disk LRU evicted: {victim['num_tokens']} tokens, "
+                f"{victim['memory_bytes']} bytes"
+            )
+
+    def reconcile(self) -> int:
+        """Reconcile index with files on disk.
+
+        Removes index entries whose data files are missing.
+        Removes data directories not in the index.
+
+        Returns number of entries cleaned up.
+        """
+        import shutil
+
+        cleaned = 0
+
+        # Phase 1: Remove index entries with missing data dirs
+        all_entries = self._index.all_entries()
+        for entry in all_entries:
+            entry_dir = os.path.join(self._data_dir, entry["file_path"])
+            manifest_path = os.path.join(entry_dir, "manifest.json")
+            if not os.path.isdir(entry_dir) or not os.path.exists(manifest_path):
+                tokens = _blob_to_tokens(entry["tokens_blob"])
+                self._index.delete_entry(tokens)
+                cleaned += 1
+                logger.info(
+                    f"[ssd_cache] reconcile: removed orphaned index entry "
+                    f"({entry['num_tokens']} tokens, path={entry['file_path']})"
+                )
+
+        # Phase 2: Remove data directories not in the index
+        if os.path.isdir(self._data_dir):
+            indexed_hashes = {e["file_path"] for e in self._index.all_entries()}
+            for entry_name in os.listdir(self._data_dir):
+                entry_path = os.path.join(self._data_dir, entry_name)
+                if (
+                    os.path.isdir(entry_path)
+                    and entry_name not in indexed_hashes
+                    and not entry_name.endswith(".tmp")
+                ):
+                    shutil.rmtree(entry_path)
+                    cleaned += 1
+                    logger.info(
+                        f"[ssd_cache] reconcile: removed orphaned data dir "
+                        f"{entry_name}"
+                    )
+
+        if cleaned > 0:
+            logger.info(f"[ssd_cache] reconciliation cleaned {cleaned} entries")
+
+        return cleaned
 
     def close(self) -> None:
         """Close the SSD cache tier and release resources."""
