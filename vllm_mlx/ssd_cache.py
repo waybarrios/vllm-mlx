@@ -671,6 +671,192 @@ class SSDCacheTier:
             f"{total_file_bytes} bytes on disk"
         )
 
+    def lookup_ssd(self, tokens: tuple[int, ...]) -> dict | None:
+        """Synchronous check whether tokens exist in SSD tier.
+
+        This is fast (SQLite lookup only, no disk I/O for data).
+        Called from synchronous fetch() to report an SSD candidate.
+
+        Returns:
+            Dict with entry metadata if found, None otherwise.
+        """
+        result = self._index.lookup_exact(tokens)
+        if result is not None:
+            return result
+        return None
+
+    def lookup_ssd_prefix(self, tokens: tuple[int, ...]) -> dict | None:
+        """Find the longest prefix match in the SSD tier.
+
+        Returns the longest-prefix entry metadata or None.
+        """
+        results = self._index.lookup_prefix(tokens)
+        if results:
+            return results[0]  # Already sorted by num_tokens DESC
+        return None
+
+    async def async_promote(
+        self,
+        tokens: tuple[int, ...],
+        reserve_budget_fn,
+        release_budget_fn,
+    ) -> list | None:
+        """Promote an entry from SSD to RAM asynchronously.
+
+        CRITICAL: Reserves RAM budget BEFORE the disk read, to avoid
+        thrash when multiple promotions race.
+
+        Args:
+            tokens: Token sequence to promote.
+            reserve_budget_fn: Callable(nbytes) -> bool. Must return True
+                if budget is available and reserved, False otherwise.
+            release_budget_fn: Callable(nbytes) -> None. Called to release
+                budget on failure.
+
+        Returns:
+            List of deserialized cache layers, or None if promotion failed.
+        """
+        import asyncio
+
+        # Step 1: Look up metadata (fast, SQLite)
+        meta = self._index.lookup_exact(tokens)
+        if meta is None:
+            with self._lock:
+                self._stats.ssd_misses += 1
+            return None
+
+        memory_bytes = meta["memory_bytes"]
+
+        # Step 2: Reserve RAM budget BEFORE disk read
+        if not reserve_budget_fn(memory_bytes):
+            with self._lock:
+                self._stats.promotion_failures += 1
+            logger.warning(
+                f"[ssd_cache] promotion denied: cannot reserve "
+                f"{memory_bytes} bytes RAM budget"
+            )
+            return None
+
+        # Step 3: Read from disk (in thread pool to avoid blocking event loop)
+        t0 = time.time()
+        try:
+            cache_layers = await asyncio.to_thread(
+                self._read_entry, tokens, meta["file_path"]
+            )
+        except Exception:
+            # Release budget on read failure
+            release_budget_fn(memory_bytes)
+            with self._lock:
+                self._stats.promotion_failures += 1
+            logger.exception(
+                f"[ssd_cache] failed to read entry from disk "
+                f"({meta['num_tokens']} tokens)"
+            )
+            return None
+
+        if cache_layers is None:
+            # Corrupted entry — release budget, quarantine entry
+            release_budget_fn(memory_bytes)
+            with self._lock:
+                self._stats.promotion_failures += 1
+            return None
+
+        dt = time.time() - t0
+        total_read_bytes = sum(
+            os.path.getsize(
+                os.path.join(
+                    self._data_dir, meta["file_path"], f"layer_{i}.safetensors"
+                )
+            )
+            for i in range(len(cache_layers))
+            if os.path.exists(
+                os.path.join(
+                    self._data_dir, meta["file_path"], f"layer_{i}.safetensors"
+                )
+            )
+        )
+
+        with self._lock:
+            self._stats.ssd_hits += 1
+            self._stats.reload_latency_sum += dt
+            self._stats.reload_bytes += total_read_bytes
+
+        # Update access time in index
+        self._index.touch(tokens)
+
+        logger.info(
+            f"[ssd_cache] promoted entry: {meta['num_tokens']} tokens, "
+            f"{total_read_bytes} bytes, {dt*1000:.1f}ms"
+        )
+
+        return cache_layers
+
+    def _read_entry(self, tokens: tuple[int, ...], relative_path: str) -> list | None:
+        """Read a cache entry from disk. Called from thread pool.
+
+        Returns list of deserialized layer dicts, or None on corruption.
+        """
+        entry_dir = os.path.join(self._data_dir, relative_path)
+        manifest_path = os.path.join(entry_dir, "manifest.json")
+
+        try:
+            with open(manifest_path) as f:
+                manifest = json.load(f)
+        except (json.JSONDecodeError, OSError) as e:
+            logger.warning(f"[ssd_cache] corrupt manifest for {relative_path}: {e}")
+            self._quarantine_entry(tokens, relative_path)
+            return None
+
+        cache_layers = []
+        for layer_meta in manifest["layers"]:
+            layer_idx = layer_meta["layer_idx"]
+            layer_path = os.path.join(entry_dir, f"layer_{layer_idx}.safetensors")
+            layer_type = layer_meta["layer_type"]
+
+            try:
+                if layer_type in ("KVCache", "RotatingKVCache"):
+                    serializer = KVCacheSerializer()
+                elif layer_type in ("ArraysCache", "MambaCache"):
+                    serializer = ArraysCacheSerializer()
+                else:
+                    logger.warning(
+                        f"[ssd_cache] unknown layer type {layer_type}, skipping"
+                    )
+                    self._quarantine_entry(tokens, relative_path)
+                    return None
+
+                layer_data = serializer.deserialize_layer(layer_path, layer_meta)
+                cache_layers.append(layer_data)
+            except Exception as e:
+                logger.warning(
+                    f"[ssd_cache] corrupt layer {layer_idx} in {relative_path}: {e}"
+                )
+                self._quarantine_entry(tokens, relative_path)
+                return None
+
+        return cache_layers
+
+    def _quarantine_entry(self, tokens: tuple[int, ...], relative_path: str) -> None:
+        """Move a corrupt entry to quarantine and remove from index."""
+        entry_dir = os.path.join(self._data_dir, relative_path)
+        quarantine_dir = os.path.join(self._cache_dir, "quarantine", relative_path)
+
+        try:
+            if os.path.exists(entry_dir):
+                os.makedirs(
+                    os.path.dirname(quarantine_dir),
+                    mode=self._config.dir_permissions,
+                    exist_ok=True,
+                )
+                os.rename(entry_dir, quarantine_dir)
+                logger.warning(
+                    f"[ssd_cache] quarantined corrupt entry: {relative_path}"
+                )
+        except OSError as e:
+            logger.warning(f"[ssd_cache] failed to quarantine {relative_path}: {e}")
+
+        self._index.delete_entry(tokens)
+
     def close(self) -> None:
         """Close the SSD cache tier and release resources."""
         if self._closed:

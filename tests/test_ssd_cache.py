@@ -508,3 +508,124 @@ class TestSpillPath:
 
         # Should not raise, just discard
         assert len(cache) <= 2
+
+
+import asyncio
+
+
+class TestAsyncFetchPath:
+    """Tests for async SSD fetch with RAM budget reservation."""
+
+    @pytest.fixture
+    def populated_tier(self, tmp_path):
+        """Create an SSD tier with one pre-written entry."""
+        config = SSDCacheConfig(cache_dir=str(tmp_path / "fetch_test"))
+        tier = SSDCacheTier(config)
+        tier.start_writer()
+
+        tokens = (1, 2, 3, 4, 5)
+        keys = MockMLXArray(np.random.randn(1, 8, 16, 64).astype(np.float16))
+        values = MockMLXArray(np.random.randn(1, 8, 16, 64).astype(np.float16))
+        layer = MockKVCacheLayer(keys=keys, values=values, offset=16)
+
+        tier.enqueue_spill(tokens, [layer], memory_bytes=2048)
+
+        # Wait for write
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            if tier._stats.spill_count > 0:
+                break
+            time.sleep(0.05)
+
+        yield tier, tokens, keys, values
+        tier.close()
+
+    def test_lookup_ssd_returns_candidate(self, populated_tier):
+        tier, tokens, _, _ = populated_tier
+        candidate = tier.lookup_ssd(tokens)
+        assert candidate is not None
+        assert candidate["num_tokens"] == 5
+        assert candidate["memory_bytes"] == 2048
+
+    def test_lookup_ssd_miss(self, populated_tier):
+        tier, _, _, _ = populated_tier
+        candidate = tier.lookup_ssd((99, 98, 97))
+        assert candidate is None
+
+    def test_async_promote_reserves_budget_then_reads(self, populated_tier):
+        """RAM budget is reserved BEFORE the SSD read completes."""
+        tier, tokens, keys, values = populated_tier
+
+        budget_reserved = []
+        budget_released = []
+
+        def reserve_fn(nbytes):
+            budget_reserved.append(nbytes)
+            return True  # Budget available
+
+        def release_fn(nbytes):
+            budget_released.append(nbytes)
+
+        result = asyncio.get_event_loop().run_until_complete(
+            tier.async_promote(tokens, reserve_fn, release_fn)
+        )
+
+        # Budget was reserved
+        assert len(budget_reserved) == 1
+        assert budget_reserved[0] == 2048
+
+        # Result contains the cache layers
+        assert result is not None
+        assert len(result) == 1  # One layer
+
+        # Stats updated
+        assert tier._stats.ssd_hits == 1
+        assert tier._stats.reload_bytes > 0
+
+    def test_async_promote_budget_denied(self, populated_tier):
+        """When budget reservation fails, promote returns None."""
+        tier, tokens, _, _ = populated_tier
+
+        def reserve_fn(nbytes):
+            return False  # Budget denied
+
+        def release_fn(nbytes):
+            pass
+
+        result = asyncio.get_event_loop().run_until_complete(
+            tier.async_promote(tokens, reserve_fn, release_fn)
+        )
+
+        assert result is None
+        assert tier._stats.promotion_failures == 1
+
+    def test_async_promote_read_failure_releases_budget(self, populated_tier):
+        """If disk read fails after reservation, budget is released."""
+        tier, tokens, _, _ = populated_tier
+
+        budget_reserved = []
+        budget_released = []
+
+        def reserve_fn(nbytes):
+            budget_reserved.append(nbytes)
+            return True
+
+        def release_fn(nbytes):
+            budget_released.append(nbytes)
+
+        # Corrupt the entry on disk
+        entry_hash = tier._entry_hash(tokens)
+        entry_dir = os.path.join(tier._data_dir, entry_hash)
+        manifest_path = os.path.join(entry_dir, "manifest.json")
+        with open(manifest_path, "w") as f:
+            f.write("corrupted!")
+
+        result = asyncio.get_event_loop().run_until_complete(
+            tier.async_promote(tokens, reserve_fn, release_fn)
+        )
+
+        assert result is None
+        # Budget was reserved then released
+        assert len(budget_reserved) == 1
+        assert len(budget_released) == 1
+        assert budget_released[0] == budget_reserved[0]
