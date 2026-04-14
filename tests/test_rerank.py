@@ -652,7 +652,7 @@ class TestRerankEndpoint:
             srv._rerank_model_locked = original_locked
 
     def test_rerank_no_engine_returns_503(self, client):
-        """Test that requesting rerank without a loaded engine returns 503."""
+        """Test that requesting rerank without a loaded engine returns 404."""
         import vllm_mlx.server as srv
 
         original = srv._rerank_engine
@@ -669,10 +669,32 @@ class TestRerankEndpoint:
         finally:
             srv._rerank_engine = original
 
-        # Without lazy loading enabled, should try to load and may fail with 503
-        # The exact behavior depends on whether lazy loading is wired, but the
-        # route must exist and not 404
-        assert resp.status_code != 404
+        assert resp.status_code == 404
+        assert "--rerank-model" in resp.json()["detail"]
+
+    def test_rerank_empty_query_returns_400(self, client):
+        """Test that an empty query returns 400."""
+        import vllm_mlx.server as srv
+
+        mock_engine = MagicMock()
+        mock_engine.model_name = "test-reranker"
+
+        original = srv._rerank_engine
+        srv._rerank_engine = mock_engine
+        try:
+            resp = client.post(
+                "/v1/rerank",
+                json={
+                    "model": "test-reranker",
+                    "query": "",
+                    "documents": ["d"],
+                },
+            )
+        finally:
+            srv._rerank_engine = original
+
+        assert resp.status_code == 400
+        assert "Query" in resp.json()["detail"]
 
 
 # =============================================================================

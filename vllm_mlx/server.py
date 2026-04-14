@@ -950,6 +950,10 @@ async def rerank_documents(request: RerankRequest) -> RerankResponse:
                 ),
             )
 
+        # Validate query
+        if not request.query or not request.query.strip():
+            raise HTTPException(status_code=400, detail="Query must not be empty")
+
         # Validate documents
         if not request.documents:
             raise HTTPException(
@@ -966,13 +970,14 @@ async def rerank_documents(request: RerankRequest) -> RerankResponse:
                 ),
             )
 
-        # Lazy-load or swap reranker engine
-        load_reranker_model(model_name, lock=False, reuse_existing=True)
-
+        # Require --rerank-model at startup; no unconstrained lazy loading
         if _rerank_engine is None:
             raise HTTPException(
-                status_code=503,
-                detail="Reranker engine failed to load. Check server logs.",
+                status_code=404,
+                detail=(
+                    "No reranker model loaded. Start the server with "
+                    "--rerank-model to enable the /v1/rerank endpoint."
+                ),
             )
 
         # Extract text from documents (handle both string and object formats)
@@ -996,11 +1001,16 @@ async def rerank_documents(request: RerankRequest) -> RerankResponse:
 
         start_time = time.perf_counter()
 
-        # Count tokens for usage reporting
-        total_tokens = _rerank_engine.count_tokens(request.query, doc_texts)
+        # Run scoring off the event loop with concurrency limit
+        import asyncio
 
-        # Score all pairs
-        scores = _rerank_engine.score_pairs(request.query, doc_texts)
+        async with _rerank_engine._semaphore:
+            total_tokens = await asyncio.to_thread(
+                _rerank_engine.count_tokens, request.query, doc_texts
+            )
+            scores = await asyncio.to_thread(
+                _rerank_engine.score_pairs, request.query, doc_texts
+            )
 
         elapsed = time.perf_counter() - start_time
         logger.info(

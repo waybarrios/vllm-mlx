@@ -12,8 +12,9 @@ import math
 import time
 from abc import ABC, abstractmethod
 
+import asyncio
+
 import mlx.core as mx
-import numpy as np
 
 logger = logging.getLogger(__name__)
 
@@ -145,6 +146,7 @@ class RerankEngine:
         self.model_name = model_name
         self.token_budget = token_budget
         self.max_concurrency = max_concurrency
+        self._semaphore = asyncio.Semaphore(max_concurrency)
         self._model = None
         self._tokenizer = None
         self._adapter: RerankAdapter | None = None
