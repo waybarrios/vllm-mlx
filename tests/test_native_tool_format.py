@@ -12,6 +12,7 @@ from vllm_mlx.tool_parsers import (
     AutoToolParser,
     DeepSeekToolParser,
     FunctionaryToolParser,
+    Gemma4ToolParser,
     GraniteToolParser,
     HermesToolParser,
     KimiToolParser,
@@ -53,6 +54,7 @@ class TestNativeToolFormatCapability:
             NemotronToolParser,
             xLAMToolParser,
             AutoToolParser,
+            Gemma4ToolParser,
         ]
         for parser_cls in non_native_parsers:
             assert (

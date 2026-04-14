@@ -465,8 +465,9 @@ def save_base64_image(base64_string: str) -> str:
     """Save base64 image to temp file and return path. Caches identical images."""
     import hashlib
 
-    # Hash the base64 string to check cache
-    image_hash = hashlib.md5(base64_string.encode()).hexdigest()
+    # Hash the full base64 string to prevent collisions between images
+    # with identical headers (e.g. JPEG images sharing first 1000 chars)
+    image_hash = hashlib.sha256(base64_string.encode()).hexdigest()
 
     # Return cached path if available and file still exists
     if image_hash in _base64_image_cache:
@@ -1328,6 +1329,7 @@ class MLXMultimodalLM:
         video_max_frames = kwargs.pop("video_max_frames", MAX_FRAMES)
         tools = kwargs.pop("tools", None)
         use_cache = kwargs.pop("use_cache", True)
+        enable_thinking = kwargs.pop("enable_thinking", True)
 
         # Collect video inputs from messages
         _msg_video_inputs = self._collect_video_inputs(messages)
@@ -1453,11 +1455,11 @@ class MLXMultimodalLM:
             template_extra_kwargs["tools"] = tools
 
         try:
-            # Use get_chat_template directly since messages are already properly formatted
             formatted_prompt = get_chat_template(
                 self.processor,
                 chat_messages,
                 add_generation_prompt=True,
+                enable_thinking=enable_thinking,
                 **template_extra_kwargs,
             )
         except Exception as e:
@@ -1724,6 +1726,7 @@ class MLXMultimodalLM:
         video_max_frames = kwargs.pop("video_max_frames", MAX_FRAMES)
         tools = kwargs.pop("tools", None)
         use_cache = kwargs.pop("use_cache", True)
+        enable_thinking = kwargs.pop("enable_thinking", True)
 
         # Collect video inputs from messages
         _msg_video_inputs = self._collect_video_inputs(messages)
@@ -1838,6 +1841,7 @@ class MLXMultimodalLM:
                 self.processor,
                 chat_messages,
                 add_generation_prompt=True,
+                enable_thinking=enable_thinking,
                 **template_extra_kwargs,
             )
         except Exception as e:

@@ -111,6 +111,8 @@ class MLXLanguageModel:
         self,
         temperature: float = 0.7,
         top_p: float = 0.9,
+        top_k: int = 0,
+        min_p: float = 0.0,
     ):
         """Create a sampler for text generation."""
         from mlx_lm.sample_utils import make_sampler
@@ -118,7 +120,25 @@ class MLXLanguageModel:
         return make_sampler(
             temp=temperature,
             top_p=top_p,
+            top_k=top_k,
+            min_p=min_p,
         )
+
+    def _create_logits_processors(
+        self,
+        presence_penalty: float = 0.0,
+        repetition_penalty: float = 1.0,
+    ):
+        """Create logits processors for penalty-based sampling."""
+        from mlx_lm.sample_utils import make_logits_processors
+
+        processors = make_logits_processors(
+            repetition_penalty=(
+                repetition_penalty if repetition_penalty != 1.0 else None
+            ),
+            presence_penalty=presence_penalty if presence_penalty != 0.0 else None,
+        )
+        return processors if processors else None
 
     def generate(
         self,
@@ -126,8 +146,12 @@ class MLXLanguageModel:
         max_tokens: int = 256,
         temperature: float = 0.7,
         top_p: float = 0.9,
+        top_k: int = 0,
+        min_p: float = 0.0,
+        presence_penalty: float = 0.0,
         repetition_penalty: float = 1.0,
         stop: list[str] | None = None,
+        **kwargs,
     ) -> GenerationOutput:
         """
         Generate text from a prompt.
@@ -137,7 +161,10 @@ class MLXLanguageModel:
             max_tokens: Maximum number of tokens to generate
             temperature: Sampling temperature (0 = greedy)
             top_p: Top-p (nucleus) sampling parameter
-            repetition_penalty: Penalty for repeating tokens
+            top_k: Top-k sampling (0 = disabled)
+            min_p: Minimum probability threshold
+            presence_penalty: Additive penalty for token presence
+            repetition_penalty: Multiplicative penalty for repeating tokens
             stop: List of stop sequences
 
         Returns:
@@ -148,8 +175,11 @@ class MLXLanguageModel:
 
         from mlx_lm import generate
 
-        # Create sampler with parameters
-        sampler = self._create_sampler(temperature, top_p)
+        # Create sampler and logits processors with full Unsloth params
+        sampler = self._create_sampler(temperature, top_p, top_k, min_p)
+        logits_processors = self._create_logits_processors(
+            presence_penalty, repetition_penalty
+        )
 
         # Generate text
         output_text = generate(
@@ -158,6 +188,7 @@ class MLXLanguageModel:
             prompt=prompt,
             max_tokens=max_tokens,
             sampler=sampler,
+            logits_processors=logits_processors,
             verbose=False,
         )
 
@@ -179,8 +210,13 @@ class MLXLanguageModel:
         max_tokens: int = 256,
         temperature: float = 0.7,
         top_p: float = 0.9,
+        top_k: int = 0,
+        min_p: float = 0.0,
+        presence_penalty: float = 0.0,
         repetition_penalty: float = 1.0,
         stop: list[str] | None = None,
+        logits_processors: list | None = None,
+        **kwargs,
     ) -> Iterator[StreamingOutput]:
         """
         Stream text generation token by token.
@@ -190,7 +226,10 @@ class MLXLanguageModel:
             max_tokens: Maximum number of tokens to generate
             temperature: Sampling temperature (0 = greedy)
             top_p: Top-p (nucleus) sampling parameter
-            repetition_penalty: Penalty for repeating tokens
+            top_k: Top-k sampling (0 = disabled)
+            min_p: Minimum probability threshold
+            presence_penalty: Additive penalty for token presence
+            repetition_penalty: Multiplicative penalty for repeating tokens
             stop: List of stop sequences
 
         Yields:
@@ -201,8 +240,15 @@ class MLXLanguageModel:
 
         from mlx_lm import stream_generate
 
-        # Create sampler with parameters
-        sampler = self._create_sampler(temperature, top_p)
+        # Create sampler and logits processors with full Unsloth params
+        sampler = self._create_sampler(temperature, top_p, top_k, min_p)
+        penalty_processors = self._create_logits_processors(
+            presence_penalty, repetition_penalty
+        )
+        # Merge any externally-provided logits_processors with penalty processors
+        all_processors = None
+        if penalty_processors or logits_processors:
+            all_processors = (logits_processors or []) + (penalty_processors or [])
 
         # Count prompt tokens once upfront
         num_prompt_tokens = len(self.tokenizer.encode(prompt))
@@ -220,6 +266,7 @@ class MLXLanguageModel:
             prompt=prompt,
             max_tokens=max_tokens,
             sampler=sampler,
+            logits_processors=all_processors,
             **mtp_kwargs,
         ):
             token_count += 1

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for the OpenAI-compatible API server."""
 
+import json
 import platform
 import sys
 
@@ -167,6 +168,41 @@ class TestCompletionRequest:
         assert request.max_tokens is None  # uses _default_max_tokens when None
 
 
+class TestServeCli:
+    """Test serve CLI argument parsing."""
+
+    def test_tool_call_parser_accepts_harmony_aliases(self):
+        """GPT-OSS/Harmony parsers should be selectable from the serve CLI."""
+        from vllm_mlx.cli import create_parser
+
+        parser = create_parser()
+        args = parser.parse_args(
+            [
+                "serve",
+                "lmstudio-community/gpt-oss-20b-MLX-8bit",
+                "--enable-auto-tool-choice",
+                "--tool-call-parser",
+                "harmony",
+            ]
+        )
+
+        assert args.command == "serve"
+        assert args.tool_call_parser == "harmony"
+        assert args.enable_auto_tool_choice is True
+
+        args = parser.parse_args(
+            [
+                "serve",
+                "lmstudio-community/gpt-oss-20b-MLX-8bit",
+                "--enable-auto-tool-choice",
+                "--tool-call-parser",
+                "gpt-oss",
+            ]
+        )
+
+        assert args.tool_call_parser == "gpt-oss"
+
+
 # =============================================================================
 # Helper Function Tests
 # =============================================================================
@@ -304,7 +340,7 @@ class TestRateLimiter:
         # First 3 requests should be allowed
         for i in range(3):
             allowed, retry_after = limiter.is_allowed("client1")
-            assert allowed is True, f"Request {i+1} should be allowed"
+            assert allowed is True, f"Request {i + 1} should be allowed"
             assert retry_after == 0
 
         # 4th request should be blocked
@@ -593,9 +629,7 @@ class TestAPIKeyVerification:
 
             # Should raise HTTPException with 401
             with pytest.raises(HTTPException) as exc_info:
-                asyncio.get_event_loop().run_until_complete(
-                    server.verify_api_key(credentials)
-                )
+                asyncio.run(server.verify_api_key(credentials))
 
             assert exc_info.value.status_code == 401
             assert "Invalid API key" in str(exc_info.value.detail)
@@ -621,9 +655,7 @@ class TestAPIKeyVerification:
             )
 
             # Should not raise any exception
-            result = asyncio.get_event_loop().run_until_complete(
-                server.verify_api_key(credentials)
-            )
+            result = asyncio.run(server.verify_api_key(credentials))
             # verify_api_key returns True on success (no exception raised)
             assert result is True or result is None
         finally:
@@ -675,6 +707,225 @@ class TestRateLimiterHTTPResponse:
         # Now should be allowed again (old requests cleaned up)
         allowed, _ = limiter.is_allowed("test_client")
         assert allowed is True
+
+
+class TestStreamChatCompletion:
+    """Tests for streaming chat completion behavior."""
+
+    @pytest.mark.anyio
+    async def test_reasoning_stream_emits_structured_tool_calls(self, monkeypatch):
+        """Tool markup after </think> should emit tool_calls chunks."""
+        from vllm_mlx.engine.base import GenerationOutput
+        from vllm_mlx.reasoning import DeltaMessage
+        from vllm_mlx.server import (
+            ChatCompletionRequest,
+            Message,
+            stream_chat_completion,
+        )
+        import vllm_mlx.server as server
+
+        class FakeEngine:
+            model_name = "fake-engine"
+
+            async def stream_chat(self, messages, **kwargs):
+                chunks = [
+                    GenerationOutput(text="", new_text="<think>", finished=False),
+                    GenerationOutput(text="", new_text="reasoning", finished=False),
+                    GenerationOutput(text="", new_text="</think>", finished=False),
+                    GenerationOutput(text="", new_text="<tool_call>", finished=False),
+                    GenerationOutput(
+                        text="", new_text='{"name":"search"}', finished=False
+                    ),
+                    GenerationOutput(
+                        text="",
+                        new_text="</tool_call>",
+                        finished=True,
+                        finish_reason="stop",
+                        prompt_tokens=7,
+                        completion_tokens=3,
+                    ),
+                ]
+                for chunk in chunks:
+                    yield chunk
+
+        class FakeReasoningParser:
+            def reset_state(self):
+                self._in_reasoning = False
+
+            def extract_reasoning_streaming(
+                self, previous_text, current_text, delta_text
+            ):
+                if delta_text == "<think>":
+                    self._in_reasoning = True
+                    return None
+                if delta_text == "</think>":
+                    self._in_reasoning = False
+                    return None
+                if self._in_reasoning:
+                    return DeltaMessage(reasoning=delta_text)
+                return DeltaMessage(content=delta_text)
+
+        class FakeToolParser:
+            def reset(self):
+                pass
+
+            def extract_tool_calls_streaming(
+                self, previous_text, current_text, delta_text
+            ):
+                if "</tool_call>" in current_text:
+                    return {
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                "id": "call_123",
+                                "type": "function",
+                                "function": {
+                                    "name": "search",
+                                    "arguments": '{"q":"weather"}',
+                                },
+                            }
+                        ]
+                    }
+                return None
+
+        monkeypatch.setattr(server, "_model_name", "served-model")
+        monkeypatch.setattr(server, "_reasoning_parser", FakeReasoningParser())
+        monkeypatch.setattr(server, "_enable_auto_tool_choice", True)
+        monkeypatch.setattr(server, "_tool_call_parser", "fake")
+        monkeypatch.setattr(server, "_tool_parser_instance", FakeToolParser())
+
+        request = ChatCompletionRequest(
+            model="request-model",
+            messages=[Message(role="user", content="hi")],
+            stream=True,
+        )
+
+        chunks = [
+            chunk
+            async for chunk in stream_chat_completion(
+                FakeEngine(), request.messages, request
+            )
+        ]
+
+        payloads = [
+            json.loads(chunk.removeprefix("data: ").strip())
+            for chunk in chunks
+            if chunk != "data: [DONE]\n\n"
+        ]
+
+        tool_payloads = [
+            payload
+            for payload in payloads
+            if payload["choices"] and payload["choices"][0]["delta"].get("tool_calls")
+        ]
+
+        assert payloads[0]["choices"][0]["delta"]["role"] == "assistant"
+        assert payloads[1]["choices"][0]["delta"]["reasoning"] == "reasoning"
+        assert len(tool_payloads) == 1
+        assert (
+            tool_payloads[0]["choices"][0]["delta"]["tool_calls"][0]["function"]["name"]
+            == "search"
+        )
+        assert tool_payloads[0]["choices"][0]["finish_reason"] == "tool_calls"
+        assert tool_payloads[0]["usage"] == {
+            "prompt_tokens": 7,
+            "completion_tokens": 3,
+            "total_tokens": 10,
+        }
+
+    @pytest.mark.anyio
+    async def test_reasoning_stream_skips_tool_parser_until_markup_appears(
+        self, monkeypatch
+    ):
+        """Plain post-reasoning content should stream normally on the fast path."""
+        from vllm_mlx.engine.base import GenerationOutput
+        from vllm_mlx.reasoning import DeltaMessage
+        from vllm_mlx.server import (
+            ChatCompletionRequest,
+            Message,
+            stream_chat_completion,
+        )
+        import vllm_mlx.server as server
+
+        class FakeEngine:
+            model_name = "fake-engine"
+
+            async def stream_chat(self, messages, **kwargs):
+                chunks = [
+                    GenerationOutput(text="", new_text="<think>", finished=False),
+                    GenerationOutput(text="", new_text="reasoning", finished=False),
+                    GenerationOutput(text="", new_text="</think>", finished=False),
+                    GenerationOutput(
+                        text="",
+                        new_text="final answer",
+                        finished=True,
+                        finish_reason="stop",
+                    ),
+                ]
+                for chunk in chunks:
+                    yield chunk
+
+        class FakeReasoningParser:
+            def reset_state(self):
+                self._in_reasoning = False
+
+            def extract_reasoning_streaming(
+                self, previous_text, current_text, delta_text
+            ):
+                if delta_text == "<think>":
+                    self._in_reasoning = True
+                    return None
+                if delta_text == "</think>":
+                    self._in_reasoning = False
+                    return None
+                if self._in_reasoning:
+                    return DeltaMessage(reasoning=delta_text)
+                return DeltaMessage(content=delta_text)
+
+        class TrackingToolParser:
+            def __init__(self):
+                self.calls = []
+
+            def reset(self):
+                self.calls.clear()
+
+            def extract_tool_calls_streaming(
+                self, previous_text, current_text, delta_text
+            ):
+                self.calls.append((previous_text, current_text, delta_text))
+                return {"content": delta_text}
+
+        tool_parser = TrackingToolParser()
+
+        monkeypatch.setattr(server, "_model_name", "served-model")
+        monkeypatch.setattr(server, "_reasoning_parser", FakeReasoningParser())
+        monkeypatch.setattr(server, "_enable_auto_tool_choice", True)
+        monkeypatch.setattr(server, "_tool_call_parser", "fake")
+        monkeypatch.setattr(server, "_tool_parser_instance", tool_parser)
+
+        request = ChatCompletionRequest(
+            model="request-model",
+            messages=[Message(role="user", content="hi")],
+            stream=True,
+        )
+
+        chunks = [
+            chunk
+            async for chunk in stream_chat_completion(
+                FakeEngine(), request.messages, request
+            )
+        ]
+
+        payloads = [
+            json.loads(chunk.removeprefix("data: ").strip())
+            for chunk in chunks
+            if chunk != "data: [DONE]\n\n"
+        ]
+
+        assert tool_parser.calls == []
+        assert payloads[1]["choices"][0]["delta"]["reasoning"] == "reasoning"
+        assert payloads[2]["choices"][0]["delta"]["content"] == "final answer"
+        assert payloads[2]["choices"][0]["finish_reason"] == "stop"
 
 
 # =============================================================================

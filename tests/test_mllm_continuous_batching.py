@@ -129,6 +129,53 @@ class TestMLLMBatchResponse:
 
         assert resp.finish_reason == "stop"
 
+    def test_error_response_skips_decoding(self):
+        """Error responses must not decode token=0 as content."""
+        from unittest.mock import MagicMock
+
+        from vllm_mlx.mllm_batch_generator import MLLMBatchResponse
+        from vllm_mlx.mllm_scheduler import MLLMScheduler
+        from vllm_mlx.request import RequestStatus
+
+        # Build a minimal scheduler with mocked internals
+        scheduler = MLLMScheduler.__new__(MLLMScheduler)
+        scheduler._detokenizer_pool = {}
+        scheduler.uid_to_request_id = {0: "req-err"}
+        scheduler.total_completion_tokens = 0
+        scheduler.num_requests_processed = 0
+
+        mock_tokenizer = MagicMock()
+        mock_tokenizer.decode.return_value = ""
+        mock_processor = MagicMock()
+        mock_processor.tokenizer = mock_tokenizer
+        scheduler.processor = mock_processor
+
+        # Create a running request
+        mock_request = MagicMock()
+        mock_request.request_id = "req-err"
+        mock_request.output_tokens = []
+        mock_request.num_output_tokens = 0
+        mock_request.num_prompt_tokens = 10
+        mock_request.status = RequestStatus.RUNNING
+        scheduler.running = {"req-err": mock_request}
+
+        error_resp = MLLMBatchResponse(
+            uid=0,
+            request_id="req-err",
+            token=0,
+            logprobs=mx.array([0.0]),
+            finish_reason="error",
+        )
+
+        outputs, finished = scheduler._process_batch_responses([error_resp])
+
+        assert "req-err" in finished
+        assert mock_request.status == RequestStatus.FINISHED_ABORTED
+        # token=0 should not have been decoded through a detokenizer
+        assert "req-err" not in scheduler._detokenizer_pool
+        assert len(outputs) == 1
+        assert outputs[0].new_text == ""
+
 
 class TestMLLMBatch:
     """Tests for MLLMBatch class."""

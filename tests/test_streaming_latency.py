@@ -206,7 +206,7 @@ async def run_benchmark(
             print(f"Throughput: {throughput:.1f} tokens/sec")
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_output_collector():
     """Unit test for RequestOutputCollector."""
     import sys

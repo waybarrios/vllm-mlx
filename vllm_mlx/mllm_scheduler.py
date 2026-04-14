@@ -19,6 +19,7 @@ Architecture:
 """
 
 import asyncio
+import concurrent.futures
 import logging
 import time
 import uuid
@@ -35,7 +36,6 @@ from .mllm_batch_generator import (
     MLLMBatchRequest,
     MLLMBatchResponse,
 )
-from .mllm_cache import MLLMCacheManager
 from .multimodal_processor import MultimodalProcessor
 from .request import RequestOutput, RequestStatus, SamplingParams
 
@@ -62,8 +62,22 @@ class MLLMSchedulerConfig:
     default_max_tokens: int = 256
     # Default video FPS for frame extraction
     default_video_fps: float = 2.0
+    # KV cache memory limit (from --cache-memory-mb)
+    cache_memory_mb: Optional[int] = None
     # Maximum video frames
     max_video_frames: int = 128
+    # Enable MTP speculative decoding
+    enable_mtp: bool = False
+    # Number of draft tokens for MTP
+    mtp_num_draft_tokens: int = 1
+    # Enable KV prefix cache for text-only requests
+    enable_prefix_cache: bool = True
+    # Memory limit for prefix cache (None = auto-detect)
+    prefix_cache_memory_mb: Optional[int] = None
+    # KV cache quantization for prefix cache store/fetch
+    kv_cache_quantization: bool = False
+    kv_cache_quantization_bits: int = 8
+    kv_cache_quantization_group_size: int = 64
 
 
 @dataclass
@@ -93,6 +107,9 @@ class MLLMRequest:
     # Token counts
     num_prompt_tokens: int = 0
     num_output_tokens: int = 0
+
+    # Timing
+    first_token_time: Optional[float] = None
 
 
 @dataclass
@@ -176,13 +193,6 @@ class MLLMScheduler:
             config=self.model_config,
         )
 
-        # Vision cache for repeated images
-        self.vision_cache: Optional[MLLMCacheManager] = None
-        if self.config.enable_vision_cache:
-            self.vision_cache = MLLMCacheManager(
-                max_entries=self.config.vision_cache_size
-            )
-
         # Get stop tokens from tokenizer
         self.stop_tokens = self._get_stop_tokens()
 
@@ -218,8 +228,12 @@ class MLLMScheduler:
         self.total_prompt_tokens = 0
         self.total_completion_tokens = 0
 
+        # Memory management: periodic mx.clear_cache() to free Metal buffers
+        self._step_count = 0
+        self._clear_cache_interval = 32
+
     def _get_stop_tokens(self) -> Set[int]:
-        """Get stop token IDs from tokenizer."""
+        """Get stop token IDs from tokenizer and generation_config.json."""
         stop_tokens = set()
         tokenizer = (
             self.processor.tokenizer
@@ -239,6 +253,25 @@ class MLLMScheduler:
             else:
                 stop_tokens.add(tokenizer.eos_token_ids)
 
+        # Also read generation_config.json which may have additional EOS tokens
+        # (e.g., Gemma 4 has <turn|>=106, <|tool_response>=50 as EOS)
+        model_path = getattr(tokenizer, "name_or_path", None)
+        if model_path:
+            import json
+            from pathlib import Path
+
+            gc_path = Path(model_path) / "generation_config.json"
+            if gc_path.exists():
+                try:
+                    gc = json.loads(gc_path.read_text())
+                    gc_eos = gc.get("eos_token_id")
+                    if isinstance(gc_eos, list):
+                        stop_tokens.update(gc_eos)
+                    elif gc_eos is not None:
+                        stop_tokens.add(gc_eos)
+                except Exception:
+                    pass
+
         return stop_tokens
 
     def _ensure_batch_generator(self) -> None:
@@ -246,8 +279,23 @@ class MLLMScheduler:
         if self.batch_generator is None:
             from mlx_lm.sample_utils import make_sampler
 
+            from .memory_cache import MemoryCacheConfig
+
             # Default sampler (can be overridden per-request in future)
             sampler = make_sampler(temp=0.7, top_p=0.9)
+
+            # Configure KV prefix cache for text-only requests
+            # KV cache quantization reduces prefix cache memory ~4x (BF16→Q8).
+            # Quantization happens on store(), dequantization on fetch() —
+            # the model always receives normal KVCache with plain arrays.
+            prefix_cache_config = None
+            if self.config.enable_prefix_cache:
+                prefix_cache_config = MemoryCacheConfig(
+                    max_memory_mb=self.config.prefix_cache_memory_mb,
+                    kv_quantize=self.config.kv_cache_quantization,
+                    kv_bits=self.config.kv_cache_quantization_bits,
+                    kv_group_size=self.config.kv_cache_quantization_group_size,
+                )
 
             self.batch_generator = MLLMBatchGenerator(
                 model=self.model,
@@ -259,7 +307,20 @@ class MLLMScheduler:
                 prefill_batch_size=self.config.prefill_batch_size,
                 completion_batch_size=self.config.completion_batch_size,
                 prefill_step_size=self.config.prefill_step_size,
+                prefix_cache_config=prefix_cache_config,
             )
+
+            # Install MTP if enabled and language model supports it
+            if self.config.enable_mtp:
+                lm = self.batch_generator.language_model
+                if hasattr(lm, "mtp") and lm.mtp is not None:
+                    from .mllm_batch_generator import install_mtp_mllm
+
+                    install_mtp_mllm(
+                        self.batch_generator,
+                        lm,
+                        num_draft_tokens=self.config.mtp_num_draft_tokens,
+                    )
 
     # ========== Sync API (step-based) ==========
 
@@ -297,6 +358,10 @@ class MLLMScheduler:
             max_tokens=max_tokens,
             temperature=temperature,
             top_p=top_p,
+            top_k=kwargs.pop("top_k", 0),
+            min_p=kwargs.pop("min_p", 0.0),
+            presence_penalty=kwargs.pop("presence_penalty", 0.0),
+            repetition_penalty=kwargs.pop("repetition_penalty", 1.0),
         )
 
         request = MLLMRequest(
@@ -306,6 +371,19 @@ class MLLMScheduler:
             videos=videos,
             sampling_params=sampling_params,
         )
+
+        # Estimate prompt token count for monitoring (text tokens only;
+        # vision tokens are added during prefill but this gives a useful
+        # approximation for the status endpoint).
+        tokenizer = (
+            self.processor.tokenizer
+            if hasattr(self.processor, "tokenizer")
+            else self.processor
+        )
+        try:
+            request.num_prompt_tokens = len(tokenizer.encode(prompt))
+        except Exception:
+            pass
 
         self.requests[request_id] = request
         self.waiting.append(request)
@@ -330,6 +408,12 @@ class MLLMScheduler:
         request = self.requests.get(request_id)
         if request is None:
             return False
+
+        # Signal batch generator to abort any in-progress prefill for this
+        # request.  The prefill loop checks _aborted_request_ids between
+        # chunks and raises PrefillAbortedError to exit early.
+        if self.batch_generator is not None:
+            self.batch_generator.abort_prefill(request_id)
 
         # Remove from waiting queue
         if request.status == RequestStatus.WAITING:
@@ -403,6 +487,10 @@ class MLLMScheduler:
                 max_tokens=request.sampling_params.max_tokens,
                 temperature=request.sampling_params.temperature,
                 top_p=request.sampling_params.top_p,
+                top_k=request.sampling_params.top_k,
+                min_p=request.sampling_params.min_p,
+                presence_penalty=request.sampling_params.presence_penalty,
+                repetition_penalty=request.sampling_params.repetition_penalty,
             )
             batch_requests.append(batch_req)
 
@@ -453,9 +541,33 @@ class MLLMScheduler:
             if request is None:
                 continue
 
+            # Handle error responses from failed preprocessing
+            if response.finish_reason == "error":
+                output = RequestOutput(
+                    request_id=request_id,
+                    new_token_ids=[],
+                    new_text="",
+                    output_token_ids=[],
+                    prompt_tokens=0,
+                    completion_tokens=0,
+                    finished=True,
+                    finish_reason="error",
+                )
+                request.status = RequestStatus.FINISHED_ABORTED
+                request.output_text = ""
+                request.finish_reason = "error"
+                finished_ids.add(request_id)
+                self.num_requests_processed += 1
+                logger.warning(f"Request {request_id} failed during preprocessing")
+                outputs.append(output)
+                continue
+
             # Append token to request
             request.output_tokens.append(response.token)
             request.num_output_tokens = len(request.output_tokens)
+
+            if request.first_token_time is None and request.num_output_tokens > 0:
+                request.first_token_time = time.time()
 
             # Decode the new token using streaming detokenizer (UTF-8 safe).
             # Skip stop tokens — they are not content.
@@ -463,11 +575,7 @@ class MLLMScheduler:
                 new_text = ""
             else:
                 if request_id not in self._detokenizer_pool:
-                    if hasattr(tokenizer, "detokenizer"):
-                        detok = tokenizer.detokenizer
-                    else:
-                        detok = NaiveStreamingDetokenizer(tokenizer)
-                    detok.reset()
+                    detok = NaiveStreamingDetokenizer(tokenizer)
                     self._detokenizer_pool[request_id] = detok
                 detok = self._detokenizer_pool[request_id]
                 detok.add_token(response.token)
@@ -495,7 +603,7 @@ class MLLMScheduler:
                 finished_ids.add(request_id)
 
                 # Finalize streaming detokenizer and get full output
-                detok = self._detokenizer_pool.get(request_id)
+                detok = self._detokenizer_pool.pop(request_id, None)
                 if detok is not None:
                     detok.finalize()
                     output.output_text = detok.text
@@ -503,7 +611,6 @@ class MLLMScheduler:
                     output.output_text = tokenizer.decode(request.output_tokens)
                 request.output_text = output.output_text
                 request.finish_reason = response.finish_reason
-                self._detokenizer_pool.pop(request_id, None)
 
                 self.total_completion_tokens += request.num_output_tokens
                 self.num_requests_processed += 1
@@ -524,6 +631,9 @@ class MLLMScheduler:
             if request_id in self.running:
                 del self.running[request_id]
 
+            # Drain from requests dict to prevent linear memory growth
+            self.requests.pop(request_id, None)
+
             # Remove UID mappings
             if request_id in self.request_id_to_uid:
                 uid = self.request_id_to_uid[request_id]
@@ -531,9 +641,16 @@ class MLLMScheduler:
                     del self.uid_to_request_id[uid]
                 del self.request_id_to_uid[request_id]
 
+            # Clean up detokenizer pool (handles abort/timeout cases)
+            self._detokenizer_pool.pop(request_id, None)
+
             # Track as finished
             self.finished_req_ids.add(request_id)
             self.requests.pop(request_id, None)
+
+        # Clear Metal buffer pool after cleanup to release memory
+        if finished_ids:
+            mx.clear_cache()
 
     def step(self) -> MLLMSchedulerOutput:
         """
@@ -634,14 +751,33 @@ class MLLMScheduler:
         logger.info("MLLM Scheduler stopped")
 
     async def _process_loop(self) -> None:
-        """Main async processing loop."""
+        """Main async processing loop.
+
+        Uses a thread pool executor for steps that involve prefill
+        (waiting requests or partial prefill in progress) so that the
+        event loop stays responsive for health checks and other HTTP
+        endpoints.  Decode-only steps are fast (<3 ms) and run inline.
+        """
+        _executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="mllm-step"
+        )
+        loop = asyncio.get_running_loop()
+
         while self._running:
             try:
                 if self.has_requests():
-                    # Run one step
-                    self.step()
-                    # Yield to other tasks
-                    await asyncio.sleep(0)
+                    has_waiting = self.get_num_waiting() > 0
+                    has_partial = (
+                        self.batch_generator is not None
+                        and getattr(self.batch_generator, "_partial", None) is not None
+                    )
+                    needs_executor = has_waiting or has_partial
+
+                    if needs_executor:
+                        await loop.run_in_executor(_executor, self.step)
+                    else:
+                        self.step()
+                        await asyncio.sleep(0)
                 else:
                     # No work, wait a bit
                     await asyncio.sleep(0.01)
@@ -649,7 +785,7 @@ class MLLMScheduler:
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                logger.error(f"Error in MLLM process loop: {e}")
+                logger.error(f"Error in MLLM process loop: {e}", exc_info=True)
                 await asyncio.sleep(0.1)
 
     async def add_request_async(
@@ -778,6 +914,77 @@ class MLLMScheduler:
 
     # ========== Stats and utilities ==========
 
+    def get_running_requests_info(self) -> List[Dict[str, Any]]:
+        """Per-request details for status endpoint."""
+        now = time.time()
+        result = []
+
+        # Waiting requests
+        for req in self.waiting:
+            result.append(
+                {
+                    "request_id": req.request_id,
+                    "status": "waiting",
+                    "phase": "queued",
+                    "elapsed_s": round(now - req.arrival_time, 2),
+                    "prompt_tokens": req.num_prompt_tokens,
+                    "completion_tokens": 0,
+                    "max_tokens": req.sampling_params.max_tokens,
+                    "progress": 0.0,
+                    "tokens_per_second": None,
+                    "ttft_s": None,
+                    "cache_hit_type": None,
+                    "cached_tokens": 0,
+                }
+            )
+
+        # Running requests
+        for req in self.running.values():
+            n_out = req.num_output_tokens
+            elapsed = now - req.arrival_time
+
+            if n_out == 0:
+                phase = "prefill"
+            else:
+                phase = "generation"
+
+            tok_s = None
+            ttft = None
+            if req.first_token_time is not None:
+                ttft = round(req.first_token_time - req.arrival_time, 3)
+                gen_elapsed = now - req.first_token_time
+                if gen_elapsed > 0 and n_out > 0:
+                    tok_s = round(n_out / gen_elapsed, 1)
+
+            max_tokens = req.sampling_params.max_tokens
+            if phase == "prefill" and self.batch_generator is not None:
+                pp = self.batch_generator.get_prefill_progress(req.request_id)
+                if pp is not None:
+                    progress = round(pp[0] / pp[1], 3) if pp[1] > 0 else 0.0
+                else:
+                    progress = 0.0
+            else:
+                progress = round(n_out / max_tokens, 3) if max_tokens > 0 else 0.0
+
+            result.append(
+                {
+                    "request_id": req.request_id,
+                    "status": "running",
+                    "phase": phase,
+                    "elapsed_s": round(elapsed, 2),
+                    "prompt_tokens": req.num_prompt_tokens,
+                    "completion_tokens": n_out,
+                    "max_tokens": max_tokens,
+                    "progress": min(progress, 1.0),
+                    "tokens_per_second": tok_s,
+                    "ttft_s": ttft,
+                    "cache_hit_type": None,
+                    "cached_tokens": 0,
+                }
+            )
+
+        return result
+
     def get_stats(self) -> Dict[str, Any]:
         """Get scheduler statistics."""
         stats = {
@@ -787,27 +994,45 @@ class MLLMScheduler:
             "num_requests_processed": self.num_requests_processed,
             "total_prompt_tokens": self.total_prompt_tokens,
             "total_completion_tokens": self.total_completion_tokens,
+            "requests": self.get_running_requests_info(),
         }
 
         if self.batch_generator is not None:
             batch_stats = self.batch_generator.stats()
             stats["batch_generator"] = batch_stats.to_dict()
-            # Add vision embedding cache stats from batch generator
-            stats["vision_embedding_cache"] = (
-                self.batch_generator.get_vision_cache_stats()
-            )
-
-        if self.vision_cache:
-            stats["vision_cache"] = self.vision_cache.get_stats()
+            # Vision embedding cache stats from batch generator
+            vec_stats = self.batch_generator.get_vision_cache_stats()
+            stats["vision_embedding_cache"] = vec_stats
 
         # Include Metal memory stats
         try:
             if mx.metal.is_available():
-                stats["metal_active_memory_gb"] = round(mx.get_active_memory() / 1e9, 2)
-                stats["metal_peak_memory_gb"] = round(mx.get_peak_memory() / 1e9, 2)
-                stats["metal_cache_memory_gb"] = round(mx.get_cache_memory() / 1e9, 2)
+                active_gb = round(mx.get_active_memory() / 1e9, 2)
+                peak_gb = round(mx.get_peak_memory() / 1e9, 2)
+                cache_gb = round(mx.get_cache_memory() / 1e9, 2)
+                stats["metal_active_memory_gb"] = active_gb
+                stats["metal_peak_memory_gb"] = peak_gb
+                stats["metal_cache_memory_gb"] = cache_gb
         except Exception:
-            pass
+            active_gb = 0
+            cache_gb = 0
+
+        # KV prefix cache stats for /v1/status and monitoring UI.
+        if self.batch_generator is not None:
+            prefix_stats = self.batch_generator.get_prefix_cache_stats()
+        else:
+            prefix_stats = {
+                "hits": 0,
+                "misses": 0,
+                "hit_rate": 0.0,
+                "evictions": 0,
+                "tokens_saved": 0,
+                "current_memory_mb": 0.0,
+                "max_memory_mb": 0.0,
+                "memory_utilization": 0.0,
+                "entry_count": 0,
+            }
+        stats["memory_aware_cache"] = prefix_stats
 
         return stats
 

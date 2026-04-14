@@ -159,6 +159,10 @@ class ChatCompletionRequest(BaseModel):
     messages: list[Message]
     temperature: float | None = None
     top_p: float | None = None
+    top_k: int | None = None
+    min_p: float | None = None
+    presence_penalty: float | None = None
+    repetition_penalty: float | None = None
     max_tokens: int | None = None
     stream: bool = False
     stream_options: StreamOptions | None = (
@@ -175,12 +179,16 @@ class ChatCompletionRequest(BaseModel):
     # MLLM-specific parameters
     video_fps: float | None = None
     video_max_frames: int | None = None
+    # Sampling penalties
+    repetition_penalty: float | None = None  # mlx-lm style (>1.0 penalizes)
     # Request timeout in seconds (None = use server default)
     timeout: float | None = None
     # SpecPrefill: per-request enable/disable (None = server decides)
     specprefill: bool | None = None
     # SpecPrefill: per-request keep percentage (0.0-1.0, None = use server default)
     specprefill_keep_pct: float | None = None
+    # Enable/disable thinking mode (None = server default, typically True)
+    enable_thinking: bool | None = None
 
 
 class AssistantMessage(BaseModel):
@@ -239,11 +247,21 @@ class CompletionRequest(BaseModel):
     prompt: str | list[str]
     temperature: float | None = None
     top_p: float | None = None
+    top_k: int | None = None
+    min_p: float | None = None
+    presence_penalty: float | None = None
+    repetition_penalty: float | None = None
     max_tokens: int | None = None
     stream: bool = False
     stop: list[str] | None = None
+    # Sampling penalties
+    repetition_penalty: float | None = None  # mlx-lm style (>1.0 penalizes)
     # Request timeout in seconds (None = use server default)
     timeout: float | None = None
+    # SpecPrefill: per-request enable/disable (None = server decides)
+    specprefill: bool | None = None
+    # SpecPrefill: per-request keep percentage (0.0-1.0, None = use server default)
+    specprefill_keep_pct: float | None = None
 
 
 class CompletionChoice(BaseModel):

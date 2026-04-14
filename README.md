@@ -398,4 +398,5 @@ If you use vLLM-MLX in your research or project, please cite:
 - [mlx-vlm](https://github.com/Blaizzy/mlx-vlm) - Vision-language models
 - [mlx-audio](https://github.com/Blaizzy/mlx-audio) - Text-to-Speech and Speech-to-Text
 - [mlx-embeddings](https://github.com/Blaizzy/mlx-embeddings) - Text embeddings
+- [Rapid-MLX](https://github.com/raullenchai/Rapid-MLX) - Community fork of vllm-mlx
 - [vLLM](https://github.com/vllm-project/vllm) - High-throughput LLM serving

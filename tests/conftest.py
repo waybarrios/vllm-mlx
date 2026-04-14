@@ -50,3 +50,9 @@ def pytest_collection_modifyitems(config, items):
 def server_url(request):
     """Get server URL from command line."""
     return request.config.getoption("--server-url")
+
+
+@pytest.fixture(params=["asyncio"])
+def anyio_backend(request):
+    """Run anyio-marked tests on asyncio only (trio is not installed)."""
+    return request.param

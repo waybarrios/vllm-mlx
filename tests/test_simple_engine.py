@@ -6,9 +6,15 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+pytestmark = pytest.mark.anyio
+
 
 class TestSimpleEngineConcurrency:
     """Test SimpleEngine lock behavior with concurrent requests."""
+
+    @pytest.fixture
+    def anyio_backend(self):
+        return "asyncio"
 
     @pytest.fixture
     def mock_model(self):
@@ -36,6 +42,27 @@ class TestSimpleEngineConcurrency:
             return result
 
         model.generate = MagicMock(side_effect=generate_side_effect)
+
+        # stream_generate tracks concurrency the same way so tests that
+        # exercise SimpleEngine.generate() (which is now an accumulator
+        # over stream_generate) see the same serialization behavior.
+        def stream_generate_side_effect(**kwargs):
+            model._concurrent_count += 1
+            model._max_concurrent = max(model._max_concurrent, model._concurrent_count)
+            import time
+
+            time.sleep(0.05)
+            model._concurrent_count -= 1
+            chunk = MagicMock()
+            chunk.text = "test response"
+            chunk.tokens = [1, 2, 3]
+            chunk.finished = True
+            chunk.finish_reason = "stop"
+            chunk.prompt_tokens = 3
+            chunk.completion_tokens = 3
+            yield chunk
+
+        model.stream_generate = MagicMock(side_effect=stream_generate_side_effect)
         return model
 
     @pytest.fixture
@@ -65,7 +92,7 @@ class TestSimpleEngineConcurrency:
         model.chat = MagicMock(side_effect=chat_side_effect)
         return model
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_lock_prevents_concurrent_generate(self, mock_model):
         """Test that the lock prevents concurrent generate calls."""
         from vllm_mlx.engine.simple import SimpleEngine
@@ -89,7 +116,7 @@ class TestSimpleEngineConcurrency:
                 "The lock is not working correctly."
             )
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_lock_prevents_concurrent_chat(self, mock_llm_model):
         """Test that the lock prevents concurrent chat calls."""
         from vllm_mlx.engine.simple import SimpleEngine
@@ -115,7 +142,56 @@ class TestSimpleEngineConcurrency:
                 "The lock is not working correctly."
             )
 
-    @pytest.mark.asyncio
+    async def test_chat_with_tools_aggregates_streaming_path(self, mock_llm_model):
+        """Tool-enabled non-stream chat should use the streaming path."""
+        from vllm_mlx.engine.simple import SimpleEngine
+
+        async def fake_stream_chat(*args, **kwargs):
+            yield MagicMock(
+                text="partial",
+                tokens=[1],
+                prompt_tokens=11,
+                completion_tokens=1,
+                finish_reason=None,
+                finished=False,
+            )
+            yield MagicMock(
+                text='<|im_end|><tool_call>{"name":"bash","arguments":{"command":"pwd"}}</tool_call>',
+                tokens=[7, 8, 9],
+                prompt_tokens=11,
+                completion_tokens=4,
+                finish_reason="stop",
+                finished=True,
+            )
+
+        with patch("vllm_mlx.engine.simple.is_mllm_model", return_value=False):
+            engine = SimpleEngine("test-model")
+            engine._model = mock_llm_model
+            engine._loaded = True
+            engine.stream_chat = fake_stream_chat  # type: ignore[method-assign]
+
+            output = await engine.chat(
+                messages=[{"role": "user", "content": "run pwd"}],
+                max_tokens=16,
+                tools=[
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "bash",
+                            "parameters": {"type": "object", "properties": {}},
+                        },
+                    }
+                ],
+            )
+
+            assert output.text == '{"name":"bash","arguments":{"command":"pwd"}}'
+            assert output.tokens == [7, 8, 9]
+            assert output.prompt_tokens == 11
+            assert output.completion_tokens == 4
+            assert output.finish_reason == "stop"
+            mock_llm_model.chat.assert_not_called()
+
+    @pytest.mark.anyio
     async def test_lock_serializes_stream_generate(self, mock_model):
         """Test that stream_generate uses the same lock as other methods."""
         from vllm_mlx.engine.simple import SimpleEngine
@@ -178,7 +254,7 @@ class TestSimpleEngineConcurrency:
             result = await stream_task
             assert len(result) == 3, f"Expected 3 chunks, got {len(result)}"
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_engine_initialization_creates_lock(self):
         """Test that SimpleEngine creates a lock on initialization."""
         from vllm_mlx.engine.simple import SimpleEngine
@@ -189,7 +265,7 @@ class TestSimpleEngineConcurrency:
             assert hasattr(engine, "_generation_lock")
             assert isinstance(engine._generation_lock, asyncio.Lock)
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_requests_complete_in_order(self, mock_model):
         """Test that concurrent requests complete (may be in any order due to lock)."""
         from vllm_mlx.engine.simple import SimpleEngine
@@ -211,3 +287,86 @@ class TestSimpleEngineConcurrency:
             assert len(results) == 3
             for result in results:
                 assert result.text == "test response"
+
+    @pytest.mark.asyncio
+    async def test_generate_accumulates_over_stream_generate(self):
+        """generate() should iterate stream_generate() and return the last
+        yielded GenerationOutput, forwarding per-request kwargs (including
+        SpecPrefill overrides) through so they reach _stream_generate_specprefill.
+        """
+        from vllm_mlx.engine.base import GenerationOutput
+        from vllm_mlx.engine.simple import SimpleEngine
+
+        captured_kwargs = {}
+
+        async def fake_stream_generate(**kwargs):
+            captured_kwargs.update(kwargs)
+            # First chunk: mid-generation
+            yield GenerationOutput(
+                text="partial",
+                new_text="partial",
+                tokens=[1, 2],
+                prompt_tokens=11,
+                completion_tokens=2,
+                finished=False,
+                finish_reason=None,
+            )
+            # Final chunk: finished
+            yield GenerationOutput(
+                text="partial final",
+                new_text=" final",
+                tokens=[1, 2, 3],
+                prompt_tokens=11,
+                completion_tokens=3,
+                finished=True,
+                finish_reason="stop",
+            )
+
+        with patch("vllm_mlx.engine.simple.is_mllm_model", return_value=False):
+            engine = SimpleEngine("test-model")
+            engine._loaded = True
+            engine.stream_generate = fake_stream_generate  # type: ignore[method-assign]
+
+            output = await engine.generate(
+                prompt="say hi",
+                max_tokens=16,
+                temperature=0.6,
+                top_p=0.95,
+                specprefill=True,
+                specprefill_keep_pct=0.2,
+            )
+
+        # Accumulator returns the last GenerationOutput's fields
+        assert output.text == "partial final"
+        assert output.tokens == [1, 2, 3]
+        assert output.prompt_tokens == 11
+        assert output.completion_tokens == 3
+        assert output.finish_reason == "stop"
+        assert output.finished is True
+
+        # Per-request SpecPrefill overrides reach stream_generate
+        assert captured_kwargs.get("prompt") == "say hi"
+        assert captured_kwargs.get("max_tokens") == 16
+        assert captured_kwargs.get("specprefill") is True
+        assert captured_kwargs.get("specprefill_keep_pct") == 0.2
+
+    @pytest.mark.asyncio
+    async def test_generate_empty_stream_returns_safe_default(self):
+        """If stream_generate yields nothing, generate() returns an empty
+        stop-reason GenerationOutput rather than raising.
+        """
+        from vllm_mlx.engine.simple import SimpleEngine
+
+        async def empty_stream_generate(**kwargs):
+            return
+            yield  # unreachable; makes this a generator
+
+        with patch("vllm_mlx.engine.simple.is_mllm_model", return_value=False):
+            engine = SimpleEngine("test-model")
+            engine._loaded = True
+            engine.stream_generate = empty_stream_generate  # type: ignore[method-assign]
+
+            output = await engine.generate(prompt="anything", max_tokens=5)
+
+        assert output.text == ""
+        assert output.finish_reason == "stop"

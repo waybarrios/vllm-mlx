@@ -20,7 +20,9 @@ SPECIAL_TOKENS_PATTERN = re.compile(
     r"<\|im_end\|>|<\|im_start\|>|<\|endoftext\|>|"
     r"<\|end\|>|<\|eot_id\|>|<\|start_header_id\|>|<\|end_header_id\|>|"
     r"<\|channel\|>|<\|message\|>|<\|start\|>|<\|return\|>|<\|call\|>|<\|constrain\|>|"
-    r"</s>|<s>|<pad>|\[PAD\]|\[SEP\]|\[CLS\]"
+    r"</s>|<s>|<pad>|\[PAD\]|\[SEP\]|\[CLS\]|"
+    r"\[e~\[|\]~b\][a-z]*|\]~!b\[|"
+    r"</?tool_call>|</?tool_call_reasoning>"
 )
 
 
@@ -121,6 +123,7 @@ _TOOL_CALL_TAGS = [
     ("<minimax:tool_call>", "</minimax:tool_call>"),
     ("<tool_call>", "</tool_call>"),
     ("<function=", "</function>"),
+    ("<|tool_call>", "<tool_call|>"),
     ("[TOOL_CALL]", "[/TOOL_CALL]"),
     ("[Calling tool", "]\n"),  # Qwen3 bracket-style: [Calling tool: func({...})]\n
 ]
@@ -339,6 +342,8 @@ MLLM_PATTERNS = [
     "PaliGemma",  # PaliGemma
     "gemma-3",
     "gemma3",  # Gemma 3 (multimodal)
+    "gemma-4",
+    "gemma4",  # Gemma 4 (multimodal: vision + audio)
     "medgemma",
     "MedGemma",  # MedGemma (medical multimodal with SigLIP vision encoder)
     "pixtral",
@@ -353,6 +358,8 @@ MLLM_PATTERNS = [
     "InternVL",  # InternVL
     "deepseek-vl",
     "DeepSeek-VL",  # DeepSeek-VL
+    "Qwen3.5-",
+    "qwen3_5",  # Qwen3.5 MoE (natively multimodal, hybrid ArraysCache+KVCache)
 ]
 
 

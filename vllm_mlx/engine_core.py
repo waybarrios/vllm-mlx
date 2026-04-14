@@ -36,6 +36,7 @@ class EngineConfig:
     scheduler_config: Optional[SchedulerConfig] = None
     step_interval: float = 0.001  # 1ms between steps
     stream_interval: int = 1  # Tokens to batch before streaming (1=every token)
+    gpu_memory_utilization: float = 0.90  # Fraction of device memory for allocation
 
 
 class EngineCore:
@@ -150,18 +151,12 @@ class EngineCore:
         stream_interval = self.config.stream_interval
         use_simple_streaming = stream_interval == 1
 
-        # Emergency memory pressure threshold — use 85% of Metal's
-        # max recommended working set so this scales with system RAM.
+        # Emergency memory pressure threshold — dynamic based on gpu_memory_utilization
+        _gpu_mem_util = self.config.gpu_memory_utilization
         try:
-            _device_info = mx.device_info()
-            _max_recommended = _device_info.get(
-                "max_recommended_working_set_size",
-                _device_info.get("memory_size", 0),
-            )
-            _memory_pressure_threshold = (
-                int(_max_recommended * 0.85)
-                if _max_recommended > 0
-                else 200 * 1024 * 1024 * 1024
+            _device_mem = mx.device_info().get("memory_size", 200 * 1024 * 1024 * 1024)
+            _memory_pressure_threshold = int(
+                _device_mem * min(_gpu_mem_util + 0.05, 0.99)
             )
         except Exception:
             _memory_pressure_threshold = 200 * 1024 * 1024 * 1024

@@ -9,6 +9,7 @@ from vllm_mlx.tool_parsers import (
     AutoToolParser,
     DeepSeekToolParser,
     FunctionaryToolParser,
+    Gemma4ToolParser,
     GraniteToolParser,
     HermesToolParser,
     KimiToolParser,
@@ -39,6 +40,7 @@ class TestToolParserManager:
             "nemotron",
             "xlam",
             "functionary",
+            "gemma4",
         ]
         for p in expected:
             assert p in parsers, f"Parser '{p}' not found"
@@ -68,6 +70,7 @@ class TestToolParserManager:
             ("meetkai", FunctionaryToolParser),
             ("hermes", HermesToolParser),
             ("nous", HermesToolParser),
+            ("gemma4", Gemma4ToolParser),
         ]
         for name, expected_cls in test_cases:
             parser_cls = ToolParserManager.get_tool_parser(name)
@@ -1157,6 +1160,180 @@ class TestHermesStreamingFixes:
             if r is not None and "tool_calls" in r:
                 emitted_calls.extend(r["tool_calls"])
 
+        assert len(emitted_calls) == 2
+        assert emitted_calls[0]["function"]["name"] == "func1"
+        assert emitted_calls[1]["function"]["name"] == "func2"
+
+
+class TestQwenFunctionFormat:
+    """Test Qwen parser's <function=name> format support."""
+
+    @pytest.fixture
+    def parser(self):
+        return QwenToolParser()
+
+    def test_function_format_with_parameters(self, parser):
+        """Test <function=name><parameter=key>value</parameter></function>."""
+        text = "<function=get_weather><parameter=city>Prague</parameter></function>"
+        result = parser.extract_tool_calls(text)
+        assert result.tools_called
+        assert result.tool_calls[0]["name"] == "get_weather"
+        args = json.loads(result.tool_calls[0]["arguments"])
+        assert args["city"] == "Prague"
+
+    def test_function_format_with_json(self, parser):
+        """Test <function=name>{"key": "val"}</function>."""
+        text = '<function=get_weather>{"city": "Prague"}</function>'
+        result = parser.extract_tool_calls(text)
+        assert result.tools_called
+        assert result.tool_calls[0]["name"] == "get_weather"
+        args = json.loads(result.tool_calls[0]["arguments"])
+        assert args["city"] == "Prague"
+
+    def test_function_format_multiple(self, parser):
+        """Test multiple <function=...> blocks."""
+        text = (
+            '<function=read_file>{"path": "/a.py"}</function>'
+            '<function=write_file>{"path": "/b.py", "content": "hello"}</function>'
+        )
+        result = parser.extract_tool_calls(text)
+        assert result.tools_called
+        assert len(result.tool_calls) == 2
+        assert result.tool_calls[0]["name"] == "read_file"
+        assert result.tool_calls[1]["name"] == "write_file"
+
+    def test_function_format_with_think_tags(self, parser):
+        """Test <function=...> with think tags."""
+        text = (
+            "<think>I need to check the weather.</think>\n"
+            '<function=get_weather>{"city": "Prague"}</function>'
+        )
+        result = parser.extract_tool_calls(text)
+        assert result.tools_called
+        assert result.tool_calls[0]["name"] == "get_weather"
+
+
+class TestQwenStreamingBuffering:
+    """Test Qwen parser streaming with partial-marker buffering."""
+
+    @pytest.fixture
+    def parser(self):
+        return QwenToolParser()
+
+    def test_streaming_function_format_complete(self, parser):
+        """Test streaming with <function=name>...</function> format."""
+        chunks = [
+            "<function=get_weather>",
+            "<parameter=city>Prague</parameter>",
+            "</function>",
+        ]
+        accumulated = ""
+        tool_calls_found = False
+        for chunk in chunks:
+            prev = accumulated
+            accumulated += chunk
+            r = parser.extract_tool_calls_streaming(
+                previous_text=prev,
+                current_text=accumulated,
+                delta_text=chunk,
+            )
+            if r is not None and "tool_calls" in r:
+                tool_calls_found = True
+                assert r["tool_calls"][0]["function"]["name"] == "get_weather"
+                break
+        assert tool_calls_found
+
+    def test_streaming_partial_marker_buffered(self, parser):
+        """Test that partial '<function' is buffered (not leaked as content)."""
+        r = parser.extract_tool_calls_streaming(
+            previous_text="",
+            current_text="Sure.",
+            delta_text="Sure.",
+        )
+        assert r == {"content": "Sure."}
+
+        # Partial marker "<function" — should be buffered
+        r = parser.extract_tool_calls_streaming(
+            previous_text="Sure.",
+            current_text="Sure.<function",
+            delta_text="<function",
+        )
+        assert r is None  # Buffered, not emitted
+
+        # "=" confirms tool call marker
+        r = parser.extract_tool_calls_streaming(
+            previous_text="Sure.<function",
+            current_text="Sure.<function=get_weather>",
+            delta_text="=get_weather>",
+        )
+        assert r is None  # Inside incomplete function block
+
+    def test_streaming_false_positive_functional(self, parser):
+        """Regression: '<functional' across chunk boundary must NOT be suppressed.
+
+        When a delta contains 'Look at <function', the content before the
+        partial marker ('Look at ') must be emitted immediately. Only the
+        marker suffix is buffered. On recovery, the marker prefix is
+        re-emitted with the next delta so no text is lost.
+        """
+        # Token 1: "Look at <function" — emit "Look at ", buffer "<function"
+        r = parser.extract_tool_calls_streaming(
+            previous_text="",
+            current_text="Look at <function",
+            delta_text="Look at <function",
+        )
+        assert r == {"content": "Look at "}
+
+        # Token 2: "al interface" — confirms it's NOT a tool call
+        r = parser.extract_tool_calls_streaming(
+            previous_text="Look at <function",
+            current_text="Look at <functional interface",
+            delta_text="al interface",
+        )
+        assert r == {"content": "<functional interface"}
+
+    def test_streaming_false_positive_single_angle_bracket(self, parser):
+        """Test that a single '<' followed by non-marker text is recovered."""
+        # "<" alone — partial marker
+        r = parser.extract_tool_calls_streaming(
+            previous_text="Hello",
+            current_text="Hello<",
+            delta_text="<",
+        )
+        assert r is None  # Buffered
+
+        # "div>" — not a tool marker
+        r = parser.extract_tool_calls_streaming(
+            previous_text="Hello<",
+            current_text="Hello<div>",
+            delta_text="div>",
+        )
+        assert r is not None
+        assert "content" in r
+        assert "<" in r["content"]
+        assert "div>" in r["content"]
+
+    def test_streaming_multiple_function_blocks(self, parser):
+        """Test streaming with multiple <function= blocks."""
+        chunks = [
+            '<function=func1>{"a": 1}</function>',
+            "\n",
+            "<function=func2>",
+            "<parameter=b>2</parameter>",
+            "</function>",
+        ]
+        accumulated = ""
+        emitted_calls = []
+        for chunk in chunks:
+            prev = accumulated
+            accumulated += chunk
+            r = parser.extract_tool_calls_streaming(
+                previous_text=prev,
+                current_text=accumulated,
+                delta_text=chunk,
+            )
+            if r is not None and "tool_calls" in r:
+                emitted_calls.extend(r["tool_calls"])
         assert len(emitted_calls) == 2
         assert emitted_calls[0]["function"]["name"] == "func1"
         assert emitted_calls[1]["function"]["name"] == "func2"

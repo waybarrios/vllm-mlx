@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "vllm-mlx"
-version = "0.2.7"
+version = "0.2.8"
 description = "vLLM-like inference for Apple Silicon - GPU-accelerated Text, Image, Video & Audio on Mac"
 readme = "README.md"
 license = {text = "Apache-2.0"}
@@ -30,7 +30,7 @@ classifiers = [
 dependencies = [
     "mlx>=0.29.0",
     "mlx-lm>=0.31.0",  # 0.31+ required for ArraysCache native batching (hybrid models)
-    "mlx-vlm>=0.1.0",  # VLM support
+    "mlx-vlm>=0.4.3",  # 0.4.3+ required for Gemma 4 support
     "transformers>=5.0.0",  # mlx-lm 0.30.5+ requires transformers 5.0 (rc3 bug fixed in stable)
     "tokenizers>=0.19.0",
     "huggingface-hub>=0.23.0",
@@ -44,7 +44,7 @@ dependencies = [
     # Video processing for VLM
     "opencv-python>=4.8.0",
     # Vision processor (required for transformers AutoProcessor)
-    "torchvision>=0.18.0",
+    "torchvision>=0.21.0",
     # Resource monitoring
     "psutil>=5.9.0",
     # Server
@@ -75,7 +75,7 @@ vllm = [
 ]
 vision = [
     "torch>=2.3.0",
-    "torchvision>=0.18.0",
+    "torchvision>=0.21.0",
 ]
 # Audio dependencies for TTS/STT (mlx-audio)
 audio = [

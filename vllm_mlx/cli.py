@@ -37,6 +37,13 @@ def serve_command(args):
         print("Example: --enable-auto-tool-choice --tool-call-parser mistral")
         sys.exit(1)
 
+    # Validate gpu-memory-utilization range
+    if not (0.0 < args.gpu_memory_utilization <= 1.0):
+        print(
+            "Error: --gpu-memory-utilization must be between 0.0 (exclusive) and 1.0 (inclusive)"
+        )
+        sys.exit(1)
+
     # Configure server security settings
     server._api_key = args.api_key
     server._default_timeout = args.timeout
@@ -105,6 +112,21 @@ def serve_command(args):
         print("  Reasoning: Use --reasoning-parser to enable")
     print("=" * 60)
 
+    # Pre-download model with retry/timeout
+    from .api.utils import is_mllm_model
+    from .utils.download import DownloadConfig, ensure_model_downloaded
+
+    download_config = DownloadConfig(
+        download_timeout=args.download_timeout,
+        max_retries=args.download_retries,
+        offline=getattr(args, "offline", False),
+    )
+    ensure_model_downloaded(
+        args.model,
+        config=download_config,
+        is_mllm=is_mllm_model(args.model),
+    )
+
     print(f"Loading model: {args.model}")
     print(f"Default max tokens: {args.max_tokens}")
 
@@ -150,6 +172,9 @@ def serve_command(args):
             kv_cache_quantization_bits=args.kv_cache_quantization_bits,
             kv_cache_quantization_group_size=args.kv_cache_quantization_group_size,
             kv_cache_min_quantize_tokens=args.kv_cache_min_quantize_tokens,
+            mllm_prefill_step_size=(
+                args.mllm_prefill_step_size if args.mllm_prefill_step_size > 0 else None
+            ),
         )
 
         print("Mode: Continuous batching (for multiple concurrent users)")
@@ -196,7 +221,8 @@ def serve_command(args):
         scheduler_config=scheduler_config,
         stream_interval=args.stream_interval if args.continuous_batching else 1,
         max_tokens=args.max_tokens,
-        force_mllm=args.mllm,
+        force_mllm=getattr(args, "mllm", False),
+        gpu_memory_utilization=args.gpu_memory_utilization,
         served_model_name=args.served_model_name,
         mtp=args.enable_mtp,
         prefill_step_size=args.prefill_step_size,
@@ -209,6 +235,23 @@ def serve_command(args):
     # Start server
     print(f"Starting server at http://{args.host}:{args.port}")
     uvicorn.run(app, host=args.host, port=args.port, log_level="info")
+
+
+def download_command(args):
+    """Download a model to local cache without starting a server."""
+    from .utils.download import DownloadConfig, ensure_model_downloaded
+
+    config = DownloadConfig(
+        download_timeout=args.timeout,
+        max_retries=args.retries,
+    )
+    print(f"Downloading model: {args.model}")
+    path = ensure_model_downloaded(
+        args.model,
+        config=config,
+        is_mllm=args.mllm,
+    )
+    print(f"Model ready at: {path}")
 
 
 def bench_command(args):
@@ -249,6 +292,7 @@ def bench_command(args):
             kv_cache_quantization_group_size=args.kv_cache_quantization_group_size,
             kv_cache_min_quantize_tokens=args.kv_cache_min_quantize_tokens,
         )
+
         engine_config = EngineConfig(
             model_name=args.model,
             scheduler_config=scheduler_config,
@@ -593,7 +637,8 @@ def bench_kv_cache_command(args):
     )
 
 
-def main():
+def create_parser() -> argparse.ArgumentParser:
+    """Build the top-level CLI parser."""
     parser = argparse.ArgumentParser(
         description="vllm-mlx: Apple Silicon MLX backend for vLLM",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -626,6 +671,12 @@ Examples:
     )
     serve_parser.add_argument(
         "--completion-batch-size", type=int, default=32, help="Completion batch size"
+    )
+    serve_parser.add_argument(
+        "--mllm-prefill-step-size",
+        type=int,
+        default=0,
+        help="Override MLLM prefill-step guard (0=use MLLM default: 1024)",
     )
     serve_parser.add_argument(
         "--enable-prefix-cache",
@@ -703,6 +754,14 @@ Examples:
         "--continuous-batching",
         action="store_true",
         help="Enable continuous batching for multiple concurrent users (slower for single user)",
+    )
+    serve_parser.add_argument(
+        "--gpu-memory-utilization",
+        type=float,
+        default=0.90,
+        help="Fraction of device memory for Metal allocation limit and emergency "
+        "cache clear threshold (0.0-1.0, default: 0.90). Increase to 0.95 for "
+        "large models (200GB+) that need more memory headroom.",
     )
     # Paged cache options (experimental)
     serve_parser.add_argument(
@@ -832,18 +891,23 @@ Examples:
             "qwen3_coder",
             "llama",
             "hermes",
+            "harmony",
+            "gpt-oss",
             "deepseek",
             "kimi",
             "granite",
             "nemotron",
             "xlam",
             "functionary",
+            "gemma4",
             "glm47",
+            "minimax",
         ],
         help=(
             "Select the tool call parser for the model. Options: "
             "auto (auto-detect), mistral, qwen, qwen3_coder, llama, hermes, "
-            "deepseek, kimi, granite, nemotron, xlam, functionary, glm47. "
+            "harmony, gpt-oss, deepseek, gemma4, kimi, granite, nemotron, "
+            "xlam, functionary, glm47, minimax. "
             "Required for --enable-auto-tool-choice."
         ),
     )
@@ -887,6 +951,24 @@ Examples:
         type=str,
         default=None,
         help="Pre-load an embedding model at startup (e.g. mlx-community/embeddinggemma-300m-6bit)",
+    )
+    # Download options
+    serve_parser.add_argument(
+        "--download-timeout",
+        type=int,
+        default=300,
+        help="Per-file download timeout in seconds (default: 300)",
+    )
+    serve_parser.add_argument(
+        "--download-retries",
+        type=int,
+        default=3,
+        help="Number of download retry attempts (default: 3)",
+    )
+    serve_parser.add_argument(
+        "--offline",
+        action="store_true",
+        help="Offline mode — only use locally cached models",
     )
     # Bench command
     bench_parser = subparsers.add_parser("bench", help="Run benchmark")
@@ -1023,6 +1105,34 @@ Examples:
         help="Quantization group size (default: 64)",
     )
 
+    # Download command
+    download_parser = subparsers.add_parser(
+        "download", help="Download a model to local cache without starting a server"
+    )
+    download_parser.add_argument("model", type=str, help="Model to download")
+    download_parser.add_argument(
+        "--timeout",
+        type=int,
+        default=300,
+        help="Per-file download timeout in seconds (default: 300)",
+    )
+    download_parser.add_argument(
+        "--retries",
+        type=int,
+        default=3,
+        help="Number of retry attempts (default: 3)",
+    )
+    download_parser.add_argument(
+        "--mllm",
+        action="store_true",
+        help="Download as multimodal model (broader file patterns)",
+    )
+
+    return parser
+
+
+def main():
+    parser = create_parser()
     args = parser.parse_args()
 
     if args.command == "serve":
@@ -1033,6 +1143,8 @@ Examples:
         bench_detok_command(args)
     elif args.command == "bench-kv-cache":
         bench_kv_cache_command(args)
+    elif args.command == "download":
+        download_command(args)
     else:
         parser.print_help()
         sys.exit(1)

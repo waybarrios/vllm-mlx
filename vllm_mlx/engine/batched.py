@@ -137,6 +137,7 @@ class BatchedEngine(BaseEngine):
         scheduler_config: Any | None = None,
         stream_interval: int = 1,
         force_mllm: bool = False,
+        gpu_memory_utilization: float = 0.90,
     ):
         """
         Initialize the batched engine.
@@ -147,11 +148,14 @@ class BatchedEngine(BaseEngine):
             scheduler_config: Optional scheduler configuration
             stream_interval: Tokens to batch before streaming (1=every token)
             force_mllm: Force loading as MLLM even if not auto-detected
+            gpu_memory_utilization: Fraction of device memory for Metal allocation
+                limit and emergency threshold (0.0-1.0, default 0.90)
         """
         self._model_name = model_name
         self._trust_remote_code = trust_remote_code
         self._scheduler_config = scheduler_config
         self._stream_interval = stream_interval
+        self._gpu_memory_utilization = gpu_memory_utilization
         self._is_mllm = force_mllm or is_mllm_model(model_name)
 
         self._model = None
@@ -207,6 +211,10 @@ class BatchedEngine(BaseEngine):
         self._model = self._mllm_instance.model
         self._processor = self._mllm_instance.processor
 
+        # Inject MTP support if enabled
+        if self._scheduler_config and self._scheduler_config.enable_mtp:
+            self._inject_mtp_mllm()
+
         # Create MLLM scheduler config with batch generator support
         if self._scheduler_config and hasattr(self._scheduler_config, "max_num_seqs"):
             max_num_seqs = self._scheduler_config.max_num_seqs
@@ -219,12 +227,38 @@ class BatchedEngine(BaseEngine):
             self._scheduler_config, "completion_batch_size", 16
         )
 
+        cache_memory_mb = getattr(self._scheduler_config, "cache_memory_mb", None)
+        enable_mtp = (
+            self._scheduler_config.enable_mtp if self._scheduler_config else False
+        )
+        mtp_num_draft = getattr(self._scheduler_config, "mtp_num_draft_tokens", 1)
+        kv_quant = getattr(self._scheduler_config, "kv_cache_quantization", False)
+        kv_bits = getattr(self._scheduler_config, "kv_cache_quantization_bits", 8)
+        kv_group_size = getattr(
+            self._scheduler_config, "kv_cache_quantization_group_size", 64
+        )
+
+        # Forward MLLM prefill-step override only when explicitly configured.
+        # This keeps default behavior unchanged for MLLM (1024) unless set.
+        prefill_step_size = getattr(
+            self._scheduler_config, "mllm_prefill_step_size", None
+        )
+        mllm_extra = {}
+        if prefill_step_size is not None:
+            mllm_extra["prefill_step_size"] = prefill_step_size
         mllm_config = MLLMSchedulerConfig(
             max_num_seqs=max_num_seqs,
             prefill_batch_size=prefill_batch_size,
             completion_batch_size=completion_batch_size,
             enable_vision_cache=True,
             vision_cache_size=100,
+            cache_memory_mb=cache_memory_mb,
+            enable_mtp=enable_mtp,
+            mtp_num_draft_tokens=mtp_num_draft,
+            kv_cache_quantization=kv_quant,
+            kv_cache_quantization_bits=kv_bits,
+            kv_cache_quantization_group_size=kv_group_size,
+            **mllm_extra,
         )
 
         # Create and start MLLM scheduler
@@ -238,8 +272,57 @@ class BatchedEngine(BaseEngine):
         logger.info(
             f"MLLM Scheduler started with continuous batching: "
             f"max_num_seqs={max_num_seqs}, prefill_batch={prefill_batch_size}, "
-            f"completion_batch={completion_batch_size}"
+            f"completion_batch={completion_batch_size}, "
+            f"prefill_step_size={mllm_config.prefill_step_size}"
         )
+
+    def _inject_mtp_mllm(self) -> None:
+        """Inject MTP weights into the MLLM model's language_model."""
+        import json
+        from pathlib import Path
+
+        from mlx_lm.utils import _download
+
+        model = self._model
+        model_path = Path(_download(self._model_name))
+        config_path = model_path / "config.json"
+        if not config_path.exists():
+            logger.warning("[MTP-MLLM] No config.json found, skipping MTP")
+            return
+
+        with open(config_path) as f:
+            config = json.load(f)
+
+        text_config = config.get("text_config", config)
+        num_mtp = text_config.get("mtp_num_hidden_layers", 0)
+        if num_mtp == 0:
+            num_mtp = text_config.get(
+                "num_nextn_predict_layers",
+                config.get("num_nextn_predict_layers", 0),
+            )
+        if num_mtp == 0:
+            logger.info("[MTP-MLLM] No MTP layers in config, skipping")
+            return
+
+        # Navigate to text model
+        text_model = model
+        if hasattr(model, "language_model"):
+            text_model = model.language_model
+        if getattr(text_model, "mtp", None) is not None:
+            logger.info("[MTP-MLLM] Model already has MTP, skipping injection")
+            return
+
+        model_type = text_config.get("model_type", config.get("model_type", ""))
+        if "qwen3_5" in model_type:
+            from ..patches.qwen3_5_mtp import inject_mtp_support
+
+            ok = inject_mtp_support(model, model_path, config)
+            if ok:
+                logger.info("[MTP-MLLM] Qwen3.5 MTP injected successfully")
+            else:
+                logger.warning("[MTP-MLLM] Qwen3.5 MTP injection failed")
+        else:
+            logger.info(f"[MTP-MLLM] MTP not supported for model_type={model_type}")
 
     async def _start_llm(self) -> None:
         """Start the LLM engine with AsyncEngineCore."""
@@ -261,9 +344,10 @@ class BatchedEngine(BaseEngine):
 
         # Validate MTP support if enabled
         if self._scheduler_config and self._scheduler_config.enable_mtp:
+            from ..patches.qwen3_5_mtp import validate_mtp_support as validate_35
             from ..patches.qwen3_next_mtp import validate_mtp_support
 
-            if validate_mtp_support(self._model):
+            if validate_mtp_support(self._model) or validate_35(self._model):
                 logger.info("[MTP] Model validated for MTP speculative decoding")
             else:
                 logger.warning(
@@ -283,13 +367,14 @@ class BatchedEngine(BaseEngine):
                     device_info.get("memory_size", 0),
                 )
                 if max_recommended > 0:
-                    soft_limit = int(max_recommended * 0.90)
+                    soft_limit = int(max_recommended * self._gpu_memory_utilization)
                     mx.set_memory_limit(soft_limit)
                     mx.set_cache_limit(32 * 1024 * 1024 * 1024)  # 32GB
+                    pct = self._gpu_memory_utilization * 100
                     logger.info(
                         f"Metal memory limits set: "
                         f"allocation_limit={soft_limit / 1e9:.1f}GB "
-                        f"(90% of {max_recommended / 1e9:.1f}GB), "
+                        f"({pct:.0f}% of {max_recommended / 1e9:.1f}GB), "
                         f"cache_limit=32GB"
                     )
         except Exception as e:
@@ -301,6 +386,7 @@ class BatchedEngine(BaseEngine):
             model_name=self._model_name,
             scheduler_config=scheduler_config,
             stream_interval=self._stream_interval,
+            gpu_memory_utilization=self._gpu_memory_utilization,
         )
 
         # Create async engine
@@ -336,6 +422,7 @@ class BatchedEngine(BaseEngine):
         tools: list[dict] | None = None,
         num_images: int = 0,
         chat_template_kwargs: dict[str, Any] | None = None,
+        enable_thinking: bool | None = None,
     ) -> str:
         """Apply chat template to messages.
 
@@ -364,9 +451,13 @@ class BatchedEngine(BaseEngine):
             if self._is_mllm and num_images > 0:
                 messages = self._prepare_mllm_messages(messages)
 
+            # Per-request enable_thinking override; default: True unless coder model.
+            if enable_thinking is None:
+                enable_thinking = "coder" not in self._model_name.lower()
             template_kwargs = {
                 "tokenize": False,
                 "add_generation_prompt": True,
+                "enable_thinking": enable_thinking,
             }
             if chat_template_kwargs:
                 template_kwargs.update(chat_template_kwargs)
@@ -380,7 +471,7 @@ class BatchedEngine(BaseEngine):
             except TypeError as e:
                 # Some templates don't accept extra kwargs; retry without them.
                 logger.debug(f"Chat template TypeError, retrying without extras: {e}")
-                for key in ["tools", *(chat_template_kwargs or {}).keys()]:
+                for key in ["tools", "enable_thinking", *(chat_template_kwargs or {}).keys()]:
                     template_kwargs.pop(key, None)
                 return template_applicator.apply_chat_template(
                     messages, **template_kwargs
@@ -466,10 +557,15 @@ class BatchedEngine(BaseEngine):
                 max_tokens=max_tokens,
                 temperature=temperature,
                 top_p=top_p,
+                top_k=kwargs.pop("top_k", 0),
+                min_p=kwargs.pop("min_p", 0.0),
+                presence_penalty=kwargs.pop("presence_penalty", 0.0),
+                repetition_penalty=kwargs.pop("repetition_penalty", 1.0),
             )
 
             return GenerationOutput(
                 text=clean_output_text(output.output_text),
+                tokens=output.output_token_ids,
                 prompt_tokens=output.prompt_tokens,
                 completion_tokens=output.completion_tokens,
                 finish_reason=output.finish_reason,
@@ -482,6 +578,10 @@ class BatchedEngine(BaseEngine):
             max_tokens=max_tokens,
             temperature=temperature,
             top_p=top_p,
+            top_k=kwargs.pop("top_k", 0),
+            min_p=kwargs.pop("min_p", 0.0),
+            presence_penalty=kwargs.pop("presence_penalty", 0.0),
+            repetition_penalty=kwargs.pop("repetition_penalty", 1.0),
             stop=stop or [],
         )
 
@@ -494,6 +594,7 @@ class BatchedEngine(BaseEngine):
 
         return GenerationOutput(
             text=text,
+            tokens=output.output_token_ids,
             prompt_tokens=output.prompt_tokens,
             completion_tokens=output.completion_tokens,
             finish_reason=output.finish_reason,
@@ -538,6 +639,10 @@ class BatchedEngine(BaseEngine):
                 max_tokens=max_tokens,
                 temperature=temperature,
                 top_p=top_p,
+                top_k=kwargs.pop("top_k", 0),
+                min_p=kwargs.pop("min_p", 0.0),
+                presence_penalty=kwargs.pop("presence_penalty", 0.0),
+                repetition_penalty=kwargs.pop("repetition_penalty", 1.0),
             )
 
             async for output in self._mllm_scheduler.stream_outputs(request_id):
@@ -558,6 +663,10 @@ class BatchedEngine(BaseEngine):
             max_tokens=max_tokens,
             temperature=temperature,
             top_p=top_p,
+            top_k=kwargs.pop("top_k", 0),
+            min_p=kwargs.pop("min_p", 0.0),
+            presence_penalty=kwargs.pop("presence_penalty", 0.0),
+            repetition_penalty=kwargs.pop("repetition_penalty", 1.0),
             stop=stop or [],
         )
 
@@ -624,12 +733,16 @@ class BatchedEngine(BaseEngine):
         template_tools = convert_tools_for_template(tools) if tools else None
         chat_template_kwargs = dict(kwargs.pop("chat_template_kwargs", {}) or {})
 
+        # Per-request enable_thinking override
+        enable_thinking = kwargs.pop("enable_thinking", None)
+
         # Apply chat template
         prompt = self._apply_chat_template(
             messages,
             template_tools,
             num_images=len(all_images),
             chat_template_kwargs=chat_template_kwargs,
+            enable_thinking=enable_thinking,
         )
 
         return await self.generate(
@@ -748,12 +861,16 @@ class BatchedEngine(BaseEngine):
         template_tools = convert_tools_for_template(tools) if tools else None
         chat_template_kwargs = dict(kwargs.pop("chat_template_kwargs", {}) or {})
 
+        # Per-request enable_thinking override
+        enable_thinking = kwargs.pop("enable_thinking", None)
+
         # Apply chat template
         prompt = self._apply_chat_template(
             messages,
             template_tools,
             num_images=len(all_images),
             chat_template_kwargs=chat_template_kwargs,
+            enable_thinking=enable_thinking,
         )
 
         # Compute prefix boundary for cache
@@ -789,14 +906,27 @@ class BatchedEngine(BaseEngine):
         if self._mllm_scheduler:
             mllm_stats = self._mllm_scheduler.get_stats()
             stats["mllm_scheduler"] = mllm_stats
-            # Promote Metal memory stats to top-level for /v1/status
+            # Promote stats to top-level for /v1/status and monitoring
             for key in (
+                "running",
+                "num_running",
+                "num_waiting",
+                "num_requests_processed",
+                "total_prompt_tokens",
+                "total_completion_tokens",
                 "metal_active_memory_gb",
                 "metal_peak_memory_gb",
                 "metal_cache_memory_gb",
+                "memory_aware_cache",
+                "paged_cache",
+                "prefix_cache",
+                "requests",
             ):
                 if key in mllm_stats:
                     stats[key] = mllm_stats[key]
+            # MLLM engine is always "running" once loaded
+            if "running" not in stats:
+                stats["running"] = self._loaded
         elif self._engine:
             stats.update(self._engine.get_stats())
 
@@ -804,20 +934,28 @@ class BatchedEngine(BaseEngine):
 
     def get_cache_stats(self) -> dict[str, Any] | None:
         """Get cache statistics."""
-        if self._mllm_scheduler and self._mllm_scheduler.vision_cache:
-            return self._mllm_scheduler.vision_cache.get_stats()
+        if self._mllm_scheduler and self._mllm_scheduler.batch_generator:
+            return self._mllm_scheduler.batch_generator.get_vision_cache_stats()
         elif self._engine:
             return self._engine.get_cache_stats()
         return None
 
     def save_cache_to_disk(self, cache_dir: str) -> bool:
         """Save prefix cache to disk for persistence across restarts."""
+        if self._mllm_scheduler and self._mllm_scheduler.batch_generator:
+            pc = self._mllm_scheduler.batch_generator.prefix_cache
+            if pc is not None:
+                return pc.save_to_disk(cache_dir)
         if self._engine:
             return self._engine.save_cache_to_disk(cache_dir)
         return False
 
     def load_cache_from_disk(self, cache_dir: str) -> int:
         """Load prefix cache from disk. Returns number of entries loaded."""
+        if self._mllm_scheduler and self._mllm_scheduler.batch_generator:
+            pc = self._mllm_scheduler.batch_generator.prefix_cache
+            if pc is not None:
+                return pc.load_from_disk(cache_dir)
         if self._engine:
             return self._engine.load_cache_from_disk(cache_dir)
         return 0

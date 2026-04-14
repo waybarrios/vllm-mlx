@@ -89,6 +89,7 @@ def parse_tool_calls(
     Parse tool calls from model output.
 
     Supports multiple formats:
+    - MiniMax: <minimax:tool_call><invoke name="..."><parameter name="p">v</parameter></invoke></minimax:tool_call>
     - Qwen3 bracket: [Calling tool: function_name({"arg": "value"})]
     - Qwen: <tool_call>{"name": "...", "arguments": {...}}</tool_call>
     - Llama: <function=name>{"arg": "value"}</function>
@@ -105,6 +106,47 @@ def parse_tool_calls(
     """
     tool_calls = []
     cleaned_text = text
+
+    # Pattern for MiniMax-style: <minimax:tool_call><invoke name="fn"><parameter name="p">v</parameter></invoke></minimax:tool_call>
+    minimax_pattern = r"<minimax:tool_call>\s*(.*?)\s*</minimax:tool_call>"
+    minimax_matches = re.findall(minimax_pattern, text, re.DOTALL)
+
+    for invoke_block in minimax_matches:
+        # Parse <invoke name="..."> blocks within the tool_call
+        invoke_pattern = r'<invoke\s+name="([^"]+)">(.*?)</invoke>'
+        invoke_matches = re.findall(invoke_pattern, invoke_block, re.DOTALL)
+
+        for name, params_block in invoke_matches:
+            # Parse <parameter name="...">value</parameter> pairs
+            param_pattern = r'<parameter\s+name="([^"]+)">\s*(.*?)\s*</parameter>'
+            params = re.findall(param_pattern, params_block, re.DOTALL)
+            arguments = {}
+            for p_name, p_value in params:
+                # Try to parse value as JSON (for nested objects/arrays/numbers)
+                try:
+                    arguments[p_name] = json.loads(p_value)
+                except (json.JSONDecodeError, ValueError):
+                    arguments[p_name] = p_value
+
+            tool_calls.append(
+                ToolCall(
+                    id=f"call_{uuid.uuid4().hex[:8]}",
+                    type="function",
+                    function=FunctionCall(
+                        name=name.strip(),
+                        arguments=json.dumps(arguments),
+                    ),
+                )
+            )
+
+    # Remove MiniMax tool call tags from cleaned text
+    if minimax_matches:
+        cleaned_text = re.sub(
+            r"<minimax:tool_call>\s*.*?\s*</minimax:tool_call>",
+            "",
+            cleaned_text,
+            flags=re.DOTALL,
+        ).strip()
 
     # Pattern for Qwen3 bracket-style: [Calling tool: function_name({...})]
     bracket_pattern = r"\[Calling tool:\s*(\w+)\((\{.*?\})\)\]"

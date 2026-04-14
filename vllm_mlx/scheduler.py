@@ -19,7 +19,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 import mlx.core as mx
 from mlx_lm.generate import BatchGenerator
-from mlx_lm.sample_utils import make_sampler
+from mlx_lm.sample_utils import make_logits_processors, make_sampler
 from mlx_lm.tokenizer_utils import NaiveStreamingDetokenizer
 
 from .memory_cache import MemoryAwarePrefixCache, MemoryCacheConfig
@@ -62,6 +62,8 @@ class SchedulerConfig:
     prefill_batch_size: int = 8
     completion_batch_size: int = 32
     prefill_step_size: int = 2048
+    # Optional override for MLLM prefill guard (None = use MLLM default).
+    mllm_prefill_step_size: Optional[int] = None
 
     # Prefix cache settings
     enable_prefix_cache: bool = True
@@ -101,6 +103,10 @@ class SchedulerConfig:
     enable_mtp: bool = False
     mtp_num_draft_tokens: int = 1  # Number of draft tokens from MTP head
     mtp_optimistic: bool = False  # Skip acceptance check for max speed
+
+    def __post_init__(self) -> None:
+        if self.mllm_prefill_step_size is not None and self.mllm_prefill_step_size <= 0:
+            raise ValueError("mllm_prefill_step_size must be > 0 when provided")
 
 
 @dataclass
@@ -148,12 +154,65 @@ def _install_chunked_prefill(
     import time as _time
 
     from mlx_lm.generate import (
-        Batch,
         _left_pad_prompts,
         _make_cache,
         _merge_caches,
         _right_pad_prompts,
     )
+
+    try:
+        from mlx_lm.generate import _lazy_extract_cache
+    except ImportError:
+
+        def _lazy_extract_cache(cache, idx):
+            return (c.extract(idx) for c in cache)
+
+    try:
+        from mlx_lm.generate import Batch as _batch_cls
+    except ImportError:
+
+        @dataclass
+        class _batch_cls:
+            uids: List[int]
+            y: Any
+            logprobs: List[Any]
+            max_tokens: List[int]
+            num_tokens: List[int]
+            cache: List[Any]
+            samplers: List[Any]
+            logits_processors: List[Any]
+            tokens: List[Any]
+
+            def __len__(self):
+                return len(self.uids)
+
+            def filter(self, keep_idx: List[int]):
+                self.uids = [self.uids[k] for k in keep_idx]
+                self.logprobs = [self.logprobs[k] for k in keep_idx]
+                self.max_tokens = [self.max_tokens[k] for k in keep_idx]
+                self.num_tokens = [self.num_tokens[k] for k in keep_idx]
+                self.samplers = [self.samplers[k] for k in keep_idx]
+                self.logits_processors = [self.logits_processors[k] for k in keep_idx]
+                self.tokens = [self.tokens[k] for k in keep_idx]
+                keep_idx_mx = mx.array(keep_idx, mx.int32)
+                self.y = self.y[keep_idx_mx]
+                for c in self.cache:
+                    c.filter(keep_idx_mx)
+
+            def extend(self, other):
+                self.uids.extend(other.uids)
+                self.y = mx.concatenate([self.y, other.y])
+                self.logprobs.extend(other.logprobs)
+                self.num_tokens.extend(other.num_tokens)
+                self.max_tokens.extend(other.max_tokens)
+                self.samplers.extend(other.samplers)
+                self.logits_processors.extend(other.logits_processors)
+                self.tokens.extend(other.tokens)
+                for c, o in zip(self.cache, other.cache):
+                    c.extend(o)
+
+            def extract_cache(self, idx):
+                return [c.extract(idx) for c in self.cache]
 
     # Keep references to originals
     _orig_next = batch_gen._next
@@ -201,6 +260,10 @@ def _install_chunked_prefill(
             batch.tokens,
         )
         mx.async_eval(batch.y, batch.logprobs)
+        # Evaluate accumulated tokens to prevent Metal buffer buildup
+        # from lazy mx.concatenate() chains holding AGXAllocation handles
+        if batch.tokens:
+            mx.async_eval(*batch.tokens)
 
         y = y.tolist()
         self._stats.generation_time += _time.perf_counter() - tic_gen
@@ -268,8 +331,13 @@ def _install_chunked_prefill(
             inputs = partial["inputs"]
             prompt_cache = partial["cache"]
             remaining = inputs.shape[1]
+            prompt_checkpoint = max(1, int(partial.get("prompt_checkpoint", 1)))
 
-            n_to_process = min(budget, remaining - 1) if remaining > 1 else 0
+            n_to_process = (
+                min(budget, remaining - prompt_checkpoint)
+                if remaining > prompt_checkpoint
+                else 0
+            )
 
             if n_to_process > 0:
                 self.model(mx.contiguous(inputs[:, :n_to_process]), cache=prompt_cache)
@@ -294,8 +362,8 @@ def _install_chunked_prefill(
                 if partial.get("is_cached"):
                     mx.clear_cache()
 
-            # Check if prefill is done (only 1 token left or 0)
-            if inputs.shape[1] <= 1:
+            # Check if prefill is done once only the checkpoint tail remains.
+            if inputs.shape[1] <= prompt_checkpoint:
                 # Finalize
                 if partial.get("is_cached"):
                     mx.eval([c.state for c in prompt_cache])
@@ -303,7 +371,30 @@ def _install_chunked_prefill(
 
                 for c in prompt_cache:
                     c.finalize()
+
+                if self.prompt_checkpoint_callback is not None:
+                    self.prompt_checkpoint_callback(
+                        [
+                            (
+                                uid,
+                                prompt_checkpoint,
+                                _lazy_extract_cache(prompt_cache, i),
+                            )
+                            for i, uid in enumerate(partial["uids"])
+                        ]
+                    )
                 mx.clear_cache()
+
+                # Mirror upstream BatchGenerator semantics: after finalize() and
+                # the checkpoint callback, replay the remaining checkpoint tail
+                # except for the final token, which _step() consumes.
+                if prompt_checkpoint > 1:
+                    self.model(
+                        mx.contiguous(inputs[:, : prompt_checkpoint - 1]),
+                        cache=prompt_cache,
+                    )
+                    mx.eval([c.state for c in prompt_cache])
+                    mx.clear_cache()
 
                 y, logprobs = self._step(
                     inputs,
@@ -314,10 +405,10 @@ def _install_chunked_prefill(
                 )
                 mx.async_eval(y, logprobs)
 
-                new_batch = Batch(
+                new_batch = _batch_cls(
                     list(partial["uids"]),
                     y,
-                    logprobs,
+                    list(logprobs),
                     list(partial["max_tokens"]),
                     [0] * len(partial["uids"]),
                     prompt_cache,
@@ -393,12 +484,20 @@ def _install_chunked_prefill(
                         caches,
                         samplers,
                         logits_processors,
-                        _prompt_checkpoints,
+                        prompt_checkpoints,
                     ) = zip(*batch_prompts)
                     lengths = [len(p) for p in inputs_raw]
                     max_length = max(lengths)
                     padding = [max_length - ln for ln in lengths]
                     tokens = [mx.array(inp) for inp in inputs_raw]
+                    # Match mlx-lm's prompt_checkpoint contract: positive values
+                    # name the checkpoint token position in the prompt, while
+                    # non-positive values already encode an offset from the end.
+                    checkpoint_offsets = [
+                        (ln - pc if pc > 0 else -pc)
+                        for ln, pc in zip(lengths, prompt_checkpoints)
+                    ]
+                    prompt_checkpoint = max(1, max(checkpoint_offsets))
                     is_cached = not all(c[0].empty() for c in caches)
 
                     self._stats.prompt_tokens += sum(lengths)
@@ -409,12 +508,14 @@ def _install_chunked_prefill(
                             self.model, padding, self.max_kv_size
                         )
                     else:
-                        last_inputs = mx.array([p[-1:] for p in inputs_raw])
+                        last_inputs = mx.array(
+                            [p[-prompt_checkpoint:] for p in inputs_raw]
+                        )
                         padded = _right_pad_prompts(inputs_raw, max_length=max_length)
                         prompt_cache = _merge_caches(caches)
                         for c in prompt_cache:
                             c.prepare(
-                                lengths=[ln - 1 for ln in lengths],
+                                lengths=[ln - prompt_checkpoint for ln in lengths],
                                 right_padding=padding,
                             )
 
@@ -437,9 +538,11 @@ def _install_chunked_prefill(
                         _pb = getattr(_req0, "prefix_boundary", 0) if _req0 else 0
                         _cached = getattr(_req0, "cached_tokens", 0) if _req0 else 0
                         _adjusted_pb = _pb - _cached
-                        if 0 < _adjusted_pb < padded.shape[1]:
+                        if 0 < _adjusted_pb < padded.shape[1] - prompt_checkpoint + 1:
                             _first_chunk = _adjusted_pb
-                    n_to_process = min(_first_chunk, padded.shape[1] - 1)
+                    n_to_process = min(
+                        _first_chunk, padded.shape[1] - prompt_checkpoint
+                    )
                     if n_to_process > 0:
                         self.model(
                             mx.contiguous(padded[:, :n_to_process]),
@@ -458,6 +561,7 @@ def _install_chunked_prefill(
                         "max_tokens": list(max_tokens_list),
                         "samplers": list(samplers),
                         "logits_processors": list(logits_processors),
+                        "prompt_checkpoint": prompt_checkpoint,
                         "processed": n_to_process,
                         "total": max_length,
                         "is_cached": is_cached,
@@ -648,6 +752,10 @@ def _install_mtp(
 
         # --- Apply logits processors + sample primary ---
         if any(logits_processors):
+            logger.debug(
+                f"[logits_proc] applying {sum(len(lp) for lp in logits_processors)} "
+                f"processors to batch_size={batch_size}"
+            )
             processed_logits = []
             for e in range(batch_size):
                 sample_logits = logits[e : e + 1]
@@ -698,12 +806,13 @@ def _install_mtp(
             # RNN snapshot, then re-advance with just P so both cache
             # types end up consistent at [..., P].
             _rnn_snapshots = {}
-            for _ci, _c in enumerate(prompt_cache):
-                if not (hasattr(_c, "is_trimmable") and _c.is_trimmable()):
-                    if hasattr(_c, "state"):
-                        _rnn_snapshots[_ci] = [
-                            s.copy() if s is not None else None for s in _c.state
-                        ]
+            if not optimistic:
+                for _ci, _c in enumerate(prompt_cache):
+                    if not (hasattr(_c, "is_trimmable") and _c.is_trimmable()):
+                        if hasattr(_c, "state"):
+                            _rnn_snapshots[_ci] = [
+                                s.copy() if s is not None else None for s in _c.state
+                            ]
 
             verify_input = mx.concatenate(
                 [primary_tokens[:, None], draft_tokens[:, None]], axis=1
@@ -1094,11 +1203,7 @@ class Scheduler:
     def _get_detokenizer(self, request_id: str) -> Any:
         """Get or create a streaming detokenizer for a request."""
         if request_id not in self._detokenizer_pool:
-            if hasattr(self.tokenizer, "detokenizer"):
-                detok = self.tokenizer.detokenizer
-            else:
-                detok = NaiveStreamingDetokenizer(self._actual_tokenizer)
-            detok.reset()
+            detok = NaiveStreamingDetokenizer(self._actual_tokenizer)
             self._detokenizer_pool[request_id] = detok
         return self._detokenizer_pool[request_id]
 
@@ -1158,15 +1263,25 @@ class Scheduler:
             prefill_batch_size=self.config.prefill_batch_size,
             completion_batch_size=self.config.completion_batch_size,
             prefill_step_size=self.config.prefill_step_size,
-            prompt_progress_callback=_prefill_progress,
         )
+        # Set callback as attribute — used by _install_chunked_prefill
+        # monkey-patch. Not a BatchGenerator constructor parameter.
+        bg.prompt_progress_callback = _prefill_progress
 
         # Install chunked prefill when explicitly configured OR when
         # memory-aware cache is active (needed for prefix_boundary saves
         # in agentic multi-turn workloads with hybrid Mamba+Transformer models).
         chunked_budget = self.config.chunked_prefill_tokens
         need_chunked = chunked_budget > 0 or self.memory_aware_cache is not None
-        if need_chunked:
+
+        # The chunked prefill monkey-patch relies on BatchGenerator internals
+        # (_process_prompts, active_batch, _step, etc.) that were refactored
+        # in mlx-lm 0.31.x.  Skip gracefully when the required API is absent.
+        chunked_compatible = hasattr(bg, "_process_prompts") and hasattr(
+            bg, "active_batch"
+        )
+
+        if need_chunked and chunked_compatible:
             if chunked_budget <= 0:
                 # No explicit budget — use a very large value so normal
                 # prompts pass through unchanged.  Prefix boundary splits
@@ -1188,6 +1303,12 @@ class Scheduler:
                 pending_abort_ids=self._pending_abort_ids,
                 uid_to_request_id=self.uid_to_request_id,
                 requests=self.requests,
+            )
+        elif need_chunked and not chunked_compatible:
+            logger.warning(
+                "Chunked prefill disabled: mlx-lm BatchGenerator lacks required "
+                "internals (_process_prompts, active_batch). Upgrade mlx-lm or "
+                "check compatibility."
             )
 
         # Install MTP if the model supports it
@@ -1791,15 +1912,30 @@ class Scheduler:
                 request.remaining_tokens = request.prompt_token_ids
                 tokens_to_process = request.prompt_token_ids
 
+            # Build per-request logits_processors from repetition_penalty
+            rep_penalty = request.sampling_params.repetition_penalty
+            lp = None
+            if rep_penalty and rep_penalty != 1.0:
+                lp = make_logits_processors(repetition_penalty=rep_penalty)
+                logger.info(
+                    f"[rep_penalty] request={request.request_id[:12]} "
+                    f"penalty={rep_penalty} processors={len(lp)}"
+                )
+
             # Insert into BatchGenerator with optional cache.
             # Wrap in try/except: if cache shapes are incompatible
             # (e.g. stale entry after BatchGenerator recreation),
             # fall back to no-cache insert instead of crashing.
+            insert_kwargs = {
+                "max_tokens": [request.sampling_params.max_tokens],
+                "caches": [cache_to_use] if cache_to_use else None,
+            }
+            if lp:
+                insert_kwargs["logits_processors"] = [lp]
             try:
                 uids = self.batch_generator.insert(
                     [tokens_to_process],
-                    max_tokens=[request.sampling_params.max_tokens],
-                    caches=[cache_to_use] if cache_to_use else None,
+                    **insert_kwargs,
                 )
             except Exception as e:
                 if cache_to_use is not None:
@@ -1812,10 +1948,10 @@ class Scheduler:
                     request.cached_tokens = 0
                     request.remaining_tokens = request.prompt_token_ids
                     tokens_to_process = request.prompt_token_ids
+                    insert_kwargs["caches"] = None
                     uids = self.batch_generator.insert(
                         [tokens_to_process],
-                        max_tokens=[request.sampling_params.max_tokens],
-                        caches=None,
+                        **insert_kwargs,
                     )
                 else:
                     raise
@@ -1836,11 +1972,16 @@ class Scheduler:
                     else ""
                 )
                 tokens_to_prefill = len(tokens_to_process)
+                rep_info = (
+                    f" rep_penalty={rep_penalty}"
+                    if rep_penalty and rep_penalty != 1.0
+                    else ""
+                )
                 logger.info(
                     f"[schedule] request={request.request_id[:12]} uid={uid} "
                     f"prompt_tokens={request.num_prompt_tokens} "
                     f"tokens_to_prefill={tokens_to_prefill}{cache_info} "
-                    f"max_tokens={request.sampling_params.max_tokens} "
+                    f"max_tokens={request.sampling_params.max_tokens}{rep_info} "
                     f"running={len(self.running)} waiting={len(self.waiting)}"
                 )
 
@@ -2216,8 +2357,15 @@ class Scheduler:
 
                 # Run generation step if we have running requests
                 if self.batch_generator is not None and self.running:
-                    responses = self.batch_generator.next()
+                    result = self.batch_generator.next()
                     output.has_work = True
+
+                    # mlx-lm >=0.31.x returns (prompt_responses, generation_responses);
+                    # older versions returned a flat list.
+                    if isinstance(result, tuple):
+                        responses = result[1]  # generation_responses only
+                    else:
+                        responses = result
 
                     if responses:
                         outputs, finished_ids = self._process_batch_responses(responses)
@@ -2285,6 +2433,7 @@ class Scheduler:
             # Evaluate batch tokens to collapse lazy concatenation chains
             if (
                 self.batch_generator is not None
+                and hasattr(self.batch_generator, "active_batch")
                 and self.batch_generator.active_batch is not None
                 and hasattr(self.batch_generator.active_batch, "tokens")
             ):
