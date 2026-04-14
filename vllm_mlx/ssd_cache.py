@@ -148,15 +148,15 @@ class SSDIndex:
     The token sequence is stored as a binary blob for prefix-searchable
     representation. The primary key is a SHA-256 hash of the token sequence.
 
-    Thread safety: SQLite in WAL mode with serialized threading. Individual
-    operations are atomic. Callers must not share a single SSDIndex instance
-    across threads without external synchronization.
+    Thread safety: All operations are serialized through a threading.Lock.
+    The SQLite connection uses WAL mode for concurrent read/write safety.
     """
 
     _SCHEMA_VERSION = 1
 
     def __init__(self, cache_dir: str) -> None:
         self._cache_dir = cache_dir
+        self._db_lock = threading.Lock()
         db_path = os.path.join(cache_dir, "index.db")
         self._conn = sqlite3.connect(db_path, check_same_thread=False)
         self._conn.execute("PRAGMA journal_mode=WAL")
@@ -206,25 +206,35 @@ class SSDIndex:
         now = time.time()
         token_hash = _tokens_hash(tokens_key)
         tokens_blob = _tokens_to_blob(tokens_key)
-        self._conn.execute(
-            """
-            INSERT OR REPLACE INTO entries
-                (token_hash, tokens_blob, num_tokens, file_path,
-                 memory_bytes, created_at, accessed_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            """,
-            (token_hash, tokens_blob, num_tokens, file_path, memory_bytes, now, now),
-        )
-        self._conn.commit()
+        with self._db_lock:
+            self._conn.execute(
+                """
+                INSERT OR REPLACE INTO entries
+                    (token_hash, tokens_blob, num_tokens, file_path,
+                     memory_bytes, created_at, accessed_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    token_hash,
+                    tokens_blob,
+                    num_tokens,
+                    file_path,
+                    memory_bytes,
+                    now,
+                    now,
+                ),
+            )
+            self._conn.commit()
 
     def lookup_exact(self, tokens_key: tuple[int, ...]) -> dict | None:
         """Look up an exact token sequence. Returns dict or None."""
         token_hash = _tokens_hash(tokens_key)
-        cur = self._conn.execute(
-            "SELECT file_path, memory_bytes, num_tokens FROM entries WHERE token_hash = ?",
-            (token_hash,),
-        )
-        row = cur.fetchone()
+        with self._db_lock:
+            cur = self._conn.execute(
+                "SELECT file_path, memory_bytes, num_tokens FROM entries WHERE token_hash = ?",
+                (token_hash,),
+            )
+            row = cur.fetchone()
         if row is None:
             return None
         return {
@@ -244,18 +254,18 @@ class SSDIndex:
         query_len = len(query_tokens)
         query_blob = _tokens_to_blob(query_tokens)
 
-        cur = self._conn.execute(
-            "SELECT token_hash, tokens_blob, num_tokens, file_path, memory_bytes "
-            "FROM entries WHERE num_tokens <= ? ORDER BY num_tokens DESC",
-            (query_len,),
-        )
+        with self._db_lock:
+            cur = self._conn.execute(
+                "SELECT token_hash, tokens_blob, num_tokens, file_path, memory_bytes "
+                "FROM entries WHERE num_tokens <= ? ORDER BY num_tokens DESC",
+                (query_len,),
+            )
+            rows = cur.fetchall()
 
         results = []
-        for row in cur:
+        for row in rows:
             stored_blob = row["tokens_blob"]
             n = row["num_tokens"]
-            # Compare: the stored blob must equal the first n tokens of the query
-            # Each int is 4 bytes in the array('i') encoding
             prefix_blob = query_blob[: n * 4]
             if stored_blob == prefix_blob:
                 results.append(
@@ -271,18 +281,23 @@ class SSDIndex:
     def delete_entry(self, tokens_key: tuple[int, ...]) -> None:
         """Delete an entry by token sequence."""
         token_hash = _tokens_hash(tokens_key)
-        self._conn.execute("DELETE FROM entries WHERE token_hash = ?", (token_hash,))
-        self._conn.commit()
+        with self._db_lock:
+            self._conn.execute(
+                "DELETE FROM entries WHERE token_hash = ?", (token_hash,)
+            )
+            self._conn.commit()
 
     def get_lru(self, limit: int = 10) -> list[dict]:
         """Get the least recently used entries, ordered oldest first."""
-        cur = self._conn.execute(
-            "SELECT token_hash, tokens_blob, num_tokens, file_path, memory_bytes "
-            "FROM entries ORDER BY accessed_at ASC LIMIT ?",
-            (limit,),
-        )
+        with self._db_lock:
+            cur = self._conn.execute(
+                "SELECT token_hash, tokens_blob, num_tokens, file_path, memory_bytes "
+                "FROM entries ORDER BY accessed_at ASC LIMIT ?",
+                (limit,),
+            )
+            rows = cur.fetchall()
         results = []
-        for row in cur:
+        for row in rows:
             results.append(
                 {
                     "token_hash": row["token_hash"],
@@ -296,31 +311,38 @@ class SSDIndex:
 
     def get_total_bytes(self) -> int:
         """Get total memory_bytes across all entries."""
-        cur = self._conn.execute("SELECT COALESCE(SUM(memory_bytes), 0) FROM entries")
-        return cur.fetchone()[0]
+        with self._db_lock:
+            cur = self._conn.execute(
+                "SELECT COALESCE(SUM(memory_bytes), 0) FROM entries"
+            )
+            return cur.fetchone()[0]
 
     def get_entry_count(self) -> int:
         """Get number of entries in the index."""
-        cur = self._conn.execute("SELECT COUNT(*) FROM entries")
-        return cur.fetchone()[0]
+        with self._db_lock:
+            cur = self._conn.execute("SELECT COUNT(*) FROM entries")
+            return cur.fetchone()[0]
 
     def touch(self, tokens_key: tuple[int, ...]) -> None:
         """Update accessed_at timestamp for an entry (marks as recently used)."""
         token_hash = _tokens_hash(tokens_key)
-        self._conn.execute(
-            "UPDATE entries SET accessed_at = ? WHERE token_hash = ?",
-            (time.time(), token_hash),
-        )
-        self._conn.commit()
+        with self._db_lock:
+            self._conn.execute(
+                "UPDATE entries SET accessed_at = ? WHERE token_hash = ?",
+                (time.time(), token_hash),
+            )
+            self._conn.commit()
 
     def all_entries(self) -> list[dict]:
         """Return all entries (for startup reconciliation)."""
-        cur = self._conn.execute(
-            "SELECT token_hash, tokens_blob, num_tokens, file_path, memory_bytes "
-            "FROM entries ORDER BY accessed_at DESC"
-        )
+        with self._db_lock:
+            cur = self._conn.execute(
+                "SELECT token_hash, tokens_blob, num_tokens, file_path, memory_bytes "
+                "FROM entries ORDER BY accessed_at DESC"
+            )
+            rows = cur.fetchall()
         results = []
-        for row in cur:
+        for row in rows:
             results.append(
                 {
                     "token_hash": row["token_hash"],
@@ -334,7 +356,8 @@ class SSDIndex:
 
     def close(self) -> None:
         """Close the SQLite connection."""
-        self._conn.close()
+        with self._db_lock:
+            self._conn.close()
 
 
 # Support matrix: maps cache type names to their serializer status
@@ -741,11 +764,23 @@ class SSDCacheTier:
             return None
 
         # Step 3: Read from disk (in thread pool to avoid blocking event loop)
+        # Use shield-and-await-on-cancel per CLAUDE.md Golden Rule #4:
+        # budget must be released even if the calling task is cancelled.
         t0 = time.time()
+        worker = asyncio.ensure_future(
+            asyncio.to_thread(self._read_entry, tokens, meta["file_path"])
+        )
         try:
-            cache_layers = await asyncio.to_thread(
-                self._read_entry, tokens, meta["file_path"]
-            )
+            cache_layers = await asyncio.shield(worker)
+        except asyncio.CancelledError:
+            # Caller cancelled — still need to wait for the disk read
+            # to finish, then release the budget
+            try:
+                await worker
+            except Exception:
+                pass
+            release_budget_fn(memory_bytes)
+            raise
         except Exception:
             # Release budget on read failure
             release_budget_fn(memory_bytes)
