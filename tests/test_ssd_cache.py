@@ -446,3 +446,65 @@ class TestAsyncSpillWriter:
         # Queue should be at capacity, not have raised
         assert tier._spill_queue.qsize() <= 2
         tier.close()
+
+
+from unittest.mock import MagicMock
+from vllm_mlx.memory_cache import MemoryAwarePrefixCache, MemoryCacheConfig
+
+
+class MockKVCacheForSpill:
+    """Mock KVCache with keys, values, offset for memory estimation."""
+
+    def __init__(self, size_bytes: int):
+        # Use real numpy arrays so serialization works
+        self.keys = MockMLXArray(np.zeros((1, 4, 8, 16), dtype=np.float16))
+        self.values = MockMLXArray(np.zeros((1, 4, 8, 16), dtype=np.float16))
+        self.offset = 8
+
+
+class TestSpillPath:
+    """Tests for eviction -> SSD spill integration."""
+
+    def test_evict_lru_calls_ssd_spill(self, tmp_path):
+        model = MagicMock()
+        config = MemoryCacheConfig(max_memory_mb=1, max_entries=3)
+        cache = MemoryAwarePrefixCache(model, config)
+
+        ssd_config = SSDCacheConfig(cache_dir=str(tmp_path / "spill_test"))
+        ssd_tier = SSDCacheTier(ssd_config)
+        ssd_tier.start_writer()
+        cache.set_ssd_tier(ssd_tier)
+
+        # Fill cache to capacity (3 entries)
+        for i in range(3):
+            kv = [MockKVCacheForSpill(1000)]
+            cache.store(list(range(i * 10, (i + 1) * 10)), kv)
+
+        assert len(cache) == 3
+
+        # Store one more to trigger eviction
+        kv = [MockKVCacheForSpill(1000)]
+        cache.store(list(range(100, 110)), kv)
+
+        # Wait for spill
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            if ssd_tier._stats.spill_count > 0:
+                break
+            time.sleep(0.05)
+
+        assert ssd_tier._stats.spill_count >= 1
+        ssd_tier.close()
+
+    def test_evict_without_ssd_tier_still_works(self):
+        """Eviction without SSD tier should work as before (discard)."""
+        model = MagicMock()
+        config = MemoryCacheConfig(max_memory_mb=1, max_entries=2)
+        cache = MemoryAwarePrefixCache(model, config)
+
+        for i in range(5):
+            kv = [MockKVCacheForSpill(1000)]
+            cache.store(list(range(i * 10, (i + 1) * 10)), kv)
+
+        # Should not raise, just discard
+        assert len(cache) <= 2
