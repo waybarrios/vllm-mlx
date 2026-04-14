@@ -731,3 +731,66 @@ class TestCLIIntegration:
         )
         assert config.ssd_cache_dir == "/tmp/test-ssd"
         assert config.ssd_cache_max_gb == 5.0
+
+
+class TestMemoryCacheSSDCheck:
+    """Tests for MemoryAwarePrefixCache.check_ssd() method."""
+
+    def test_check_ssd_returns_candidate_on_miss(self, tmp_path):
+        model = MagicMock()
+        config = MemoryCacheConfig(max_memory_mb=1, max_entries=2)
+        cache = MemoryAwarePrefixCache(model, config)
+
+        ssd_config = SSDCacheConfig(cache_dir=str(tmp_path / "check_ssd_test"))
+        ssd_tier = SSDCacheTier(ssd_config)
+        ssd_tier.start_writer()
+        cache.set_ssd_tier(ssd_tier)
+
+        # Write an entry to SSD directly
+        tokens = (1, 2, 3, 4, 5)
+        keys = MockMLXArray(np.random.randn(1, 4, 8, 32).astype(np.float16))
+        values = MockMLXArray(np.random.randn(1, 4, 8, 32).astype(np.float16))
+        layer = MockKVCacheLayer(keys=keys, values=values, offset=8)
+        ssd_tier.enqueue_spill(tokens, [layer], memory_bytes=1024)
+
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            if ssd_tier._stats.spill_count > 0:
+                break
+            time.sleep(0.05)
+
+        # RAM fetch should miss
+        result, remaining = cache.fetch(list(tokens))
+        assert result is None
+
+        # But SSD check should find it
+        candidate = cache.check_ssd(list(tokens))
+        assert candidate is not None
+        assert candidate["num_tokens"] == 5
+
+        ssd_tier.close()
+
+    def test_check_ssd_returns_none_without_tier(self):
+        model = MagicMock()
+        config = MemoryCacheConfig(max_memory_mb=1)
+        cache = MemoryAwarePrefixCache(model, config)
+
+        candidate = cache.check_ssd([1, 2, 3])
+        assert candidate is None
+
+    def test_check_ssd_returns_none_on_ram_hit(self, tmp_path):
+        """When RAM has a hit, check_ssd should return None (not needed)."""
+        model = MagicMock()
+        config = MemoryCacheConfig(max_memory_mb=1)
+        cache = MemoryAwarePrefixCache(model, config)
+
+        kv = [MockKVCacheForSpill(1000)]
+        cache.store([1, 2, 3], kv)
+
+        # RAM hit exists
+        result, _ = cache.fetch([1, 2, 3])
+        assert result is not None
+
+        # check_ssd should indicate no SSD needed
+        candidate = cache.check_ssd([1, 2, 3])
+        assert candidate is None

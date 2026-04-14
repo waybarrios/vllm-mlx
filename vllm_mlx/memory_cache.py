@@ -1015,6 +1015,33 @@ class MemoryAwarePrefixCache:
         if ssd_tier is not None:
             logger.info("[memory_cache] SSD tier attached for eviction spilling")
 
+    def check_ssd(self, tokens: list[int]) -> dict | None:
+        """Check if tokens have an SSD cache hit (without reading data).
+
+        Returns metadata dict if found in SSD tier, None if:
+        - No SSD tier attached
+        - Tokens are already in RAM cache
+        - Not found in SSD tier
+
+        This is a fast synchronous call (SQLite lookup only).
+        The actual data read happens via the scheduler's async handoff.
+        """
+        if self._ssd_tier is None:
+            return None
+
+        tokens_key = tuple(tokens)
+
+        # If already in RAM, no SSD needed
+        if tokens_key in self._entries:
+            return None
+
+        # Check SSD tier — exact match first, then prefix
+        candidate = self._ssd_tier.lookup_ssd(tokens_key)
+        if candidate is not None:
+            return candidate
+
+        return self._ssd_tier.lookup_ssd_prefix(tokens_key)
+
     # -----------------------------------------------------------------
     # Disk persistence — survives server restarts
     # -----------------------------------------------------------------

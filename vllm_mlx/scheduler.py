@@ -1764,6 +1764,17 @@ class Scheduler:
                     f"prompt_tokens={len(request.prompt_token_ids)} "
                     f"time={_fetch_dt:.3f}s entries={len(self.memory_aware_cache._entries)}"
                 )
+                # Check SSD tier for cold-tier hit
+                if (
+                    hasattr(self, "_ssd_tier")
+                    and self._ssd_tier is not None
+                    and self.memory_aware_cache.check_ssd(request.prompt_token_ids)
+                    is not None
+                ):
+                    request.cache_hit_type = "ssd_pending"
+                    request._ssd_candidate = self.memory_aware_cache.check_ssd(
+                        request.prompt_token_ids
+                    )
         elif self.prefix_cache is not None:
             # Use legacy prefix cache
             cache, remaining = self.prefix_cache.fetch_cache(request.prompt_token_ids)
@@ -2675,3 +2686,96 @@ class Scheduler:
             self._ssd_tier.close()
             self._ssd_tier = None
             logger.info("SSD cache tier closed")
+
+    async def promote_from_ssd(self, request) -> bool:
+        """Promote a cold-tier cache entry for a request.
+
+        Called by the engine's scheduling loop when request.cache_hit_type
+        is 'ssd_pending'. This runs the async SSD read with RAM budget
+        reservation.
+
+        Returns True if promotion succeeded and request was updated.
+        """
+        if not hasattr(self, "_ssd_tier") or self._ssd_tier is None:
+            return False
+
+        candidate = getattr(request, "_ssd_candidate", None)
+        if candidate is None:
+            return False
+
+        def reserve_budget(nbytes: int) -> bool:
+            """Check if RAM cache has room for the promoted entry."""
+            if self.memory_aware_cache is None:
+                return False
+            return (
+                self.memory_aware_cache._current_memory + nbytes
+                <= self.memory_aware_cache._max_memory
+            )
+
+        def release_budget(nbytes: int) -> None:
+            """No-op: budget was never actually allocated to an entry."""
+            pass
+
+        tokens = tuple(request.prompt_token_ids)
+        cache_layers = await self._ssd_tier.async_promote(
+            tokens, reserve_budget, release_budget
+        )
+
+        if cache_layers is None:
+            request.cache_hit_type = "miss"
+            return False
+
+        # Reconstruct cache objects from deserialized layer dicts
+        reconstructed = self._reconstruct_ssd_layers(cache_layers)
+        if reconstructed is None:
+            request.cache_hit_type = "miss"
+            return False
+
+        # Store in RAM cache for future hits
+        self.memory_aware_cache.store(list(tokens), reconstructed, evict_prefixes=False)
+
+        request.prompt_cache = reconstructed
+        request.cached_tokens = len(tokens)
+        request.remaining_tokens = []
+        request.cache_hit_type = "ssd_hit"
+
+        logger.info(
+            f"[ssd_promote] request={request.request_id[:12]} "
+            f"promoted {len(tokens)} tokens from SSD"
+        )
+        return True
+
+    def _reconstruct_ssd_layers(self, layer_dicts: list[dict]) -> list | None:
+        """Reconstruct cache objects from deserialized layer dicts.
+
+        Converts numpy arrays back to MLX arrays and creates KVCache objects.
+        """
+        try:
+            from mlx_lm.models.cache import KVCache
+
+            result = []
+            for ld in layer_dicts:
+                if "keys" in ld and "values" in ld:
+                    kv = KVCache()
+                    kv.keys = mx.array(ld["keys"])
+                    kv.values = mx.array(ld["values"])
+                    kv.offset = ld["offset"]
+                    for attr in ("max_size", "keep", "step", "_idx"):
+                        if attr in ld:
+                            setattr(kv, attr, ld[attr])
+                    result.append(kv)
+                elif "state" in ld:
+                    # ArraysCache — need to wrap in a compatible object
+                    state_arrays = [mx.array(a) for a in ld["state"]]
+                    # Create a simple namespace-like object
+                    layer_obj = type("ArraysCacheLayer", (), {"state": state_arrays})()
+                    result.append(layer_obj)
+                else:
+                    logger.warning(
+                        f"[ssd_promote] unknown layer dict format: {list(ld.keys())}"
+                    )
+                    return None
+            return result
+        except Exception as e:
+            logger.warning(f"[ssd_promote] reconstruction failed: {e}")
+            return None
