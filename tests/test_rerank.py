@@ -96,3 +96,66 @@ class TestRerankModels:
         assert d["results"][0]["index"] == 1
         assert d["results"][0]["relevance_score"] == 0.9
         assert d["usage"]["total_tokens"] == 42
+
+
+# =============================================================================
+# Unit Tests - Reranker Adapter Contract
+# =============================================================================
+
+
+class TestRerankAdapterContract:
+    """Test the base adapter interface and default sigmoid adapter."""
+
+    def test_base_adapter_is_abstract(self):
+        """Test that RerankAdapter cannot be instantiated directly."""
+        from vllm_mlx.rerank import RerankAdapter
+
+        with pytest.raises(TypeError):
+            RerankAdapter()
+
+    def test_sigmoid_adapter_normalize_maps_to_zero_one(self):
+        """Test that SigmoidAdapter.normalize applies sigmoid correctly."""
+        import math
+
+        from vllm_mlx.rerank import SigmoidAdapter
+
+        adapter = SigmoidAdapter()
+        # sigmoid(0) = 0.5
+        assert abs(adapter.normalize(0.0) - 0.5) < 1e-6
+        # sigmoid(large positive) -> ~1.0
+        assert adapter.normalize(10.0) > 0.999
+        # sigmoid(large negative) -> ~0.0
+        assert adapter.normalize(-10.0) < 0.001
+
+    def test_sigmoid_adapter_extract_score_takes_first_logit(self):
+        """Test that SigmoidAdapter.extract_score returns logits[0]."""
+        from vllm_mlx.rerank import SigmoidAdapter
+
+        adapter = SigmoidAdapter()
+        # Simulate a logits array with shape (num_labels,)
+        logits = [2.5, -1.0, 0.3]
+        assert adapter.extract_score(logits) == 2.5
+
+    def test_sigmoid_adapter_tokenize_pair_returns_dict(self):
+        """Test that SigmoidAdapter.tokenize_pair produces a token dict."""
+        from unittest.mock import MagicMock
+
+        from vllm_mlx.rerank import SigmoidAdapter
+
+        adapter = SigmoidAdapter()
+        mock_tokenizer = MagicMock()
+        mock_tokenizer.return_value = {
+            "input_ids": [[101, 2054, 102, 3793, 102]],
+            "attention_mask": [[1, 1, 1, 1, 1]],
+        }
+        result = adapter.tokenize_pair(mock_tokenizer, "query", "document")
+        mock_tokenizer.assert_called_once_with(
+            "query",
+            "document",
+            padding=True,
+            truncation=True,
+            max_length=512,
+            return_tensors="np",
+        )
+        assert "input_ids" in result
+        assert "attention_mask" in result
