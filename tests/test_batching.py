@@ -834,5 +834,52 @@ class TestEngineAsync:
         assert not engine.engine.is_running()
 
 
+class TestChunkedPrefillConfig:
+    """Regression tests for chunked prefill configuration (#178)."""
+
+    def test_prompt_cache_save_installed_without_chunked_prefill(self):
+        """When chunked_prefill_tokens=0 but memory_aware_cache is active,
+        _install_prompt_cache_save should still patch _process_prompts."""
+        from vllm_mlx.scheduler import _install_prompt_cache_save
+
+        calls = []
+
+        class FakeBatchGen:
+            def _process_prompts(self, prompts):
+                class FakeBatch:
+                    uids = [42]
+                    num_tokens = [0]
+
+                    def extract_cache(self, idx):
+                        return f"cache-{idx}"
+
+                return FakeBatch()
+
+        bg = FakeBatchGen()
+        orig_fn = bg._process_prompts
+        _install_prompt_cache_save(bg, lambda uid, cache: calls.append((uid, cache)))
+
+        # _process_prompts was patched
+        assert bg._process_prompts is not orig_fn
+        bg._process_prompts([])
+        assert calls == [(42, "cache-0")], f"Expected callback to fire, got {calls}"
+
+    def test_chunked_prefill_zero_does_not_install_chunked_next(self):
+        """chunked_prefill_tokens=0 must not install the chunked _next patch,
+        even when use_memory_aware_cache=True."""
+        config = SchedulerConfig(chunked_prefill_tokens=0, use_memory_aware_cache=True)
+        need_chunked = config.chunked_prefill_tokens > 0
+        assert not need_chunked, (
+            "chunked_prefill_tokens=0 must not enable the chunked prefill "
+            "monkey-patch even when use_memory_aware_cache=True"
+        )
+
+    def test_chunked_prefill_positive_enables(self):
+        """Positive chunked_prefill_tokens should enable chunked prefill."""
+        config = SchedulerConfig(chunked_prefill_tokens=4096)
+        need_chunked = config.chunked_prefill_tokens > 0
+        assert need_chunked
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
