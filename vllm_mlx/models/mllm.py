@@ -690,7 +690,7 @@ class MLXMultimodalLM:
     def __init__(
         self,
         model_name: str,
-        trust_remote_code: bool = True,
+        trust_remote_code: bool = False,
         enable_cache: bool = True,
         cache_size: int = 50,
     ):
