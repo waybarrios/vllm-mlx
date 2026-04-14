@@ -204,11 +204,9 @@ class TestSSDIndex:
         assert lru[0]["file_path"] == "b.safetensors"
 
 
-import tempfile
 import numpy as np
 
 from vllm_mlx.ssd_cache import (
-    LayerSerializer,
     KVCacheSerializer,
     ArraysCacheSerializer,
     get_serializer_for_layer,
