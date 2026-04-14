@@ -1001,14 +1001,13 @@ async def rerank_documents(request: RerankRequest) -> RerankResponse:
 
         start_time = time.perf_counter()
 
-        # Run scoring off the event loop with concurrency limit
+        # Run scoring off the event loop with concurrency limit.
+        # score_pairs returns (scores, total_tokens) from the same
+        # tokenization pass used for scoring — no double tokenization.
         import asyncio
 
         async with _rerank_engine._semaphore:
-            total_tokens = await asyncio.to_thread(
-                _rerank_engine.count_tokens, request.query, doc_texts
-            )
-            scores = await asyncio.to_thread(
+            scores, total_tokens = await asyncio.to_thread(
                 _rerank_engine.score_pairs, request.query, doc_texts
             )
 

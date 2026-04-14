@@ -224,12 +224,14 @@ class RerankEngine:
         if not self.is_loaded:
             self.load()
 
-    def score_pairs(self, query: str, documents: list[str]) -> list[float]:
+    def score_pairs(self, query: str, documents: list[str]) -> tuple[list[float], int]:
         """
         Score each (query, document) pair and return normalized relevance scores.
 
         Pairs are batched by token budget to control memory usage. Each batch
         is tokenized together and scored in a single forward pass.
+        Returns (scores, total_tokens) where total_tokens reflects the
+        actual tokenization used for scoring (consistent with adapter).
 
         Args:
             query: The query string.
@@ -318,28 +320,8 @@ class RerankEngine:
 
         # Sort by original index to restore input order
         all_scores.sort(key=lambda x: x[0])
-        return [score for _, score in all_scores]
-
-    def count_tokens(self, query: str, documents: list[str]) -> int:
-        """
-        Count total tokens across all (query, document) pairs.
-
-        Used for usage reporting in the API response.
-        """
-        self._ensure_loaded()
-        total = 0
-        for doc in documents:
-            enc = self._tokenizer(query, doc)
-            ids = enc.get("input_ids", enc.get("input_ids", []))
-            if isinstance(ids, list) and ids and isinstance(ids[0], list):
-                total += len(ids[0])
-            elif isinstance(ids, list):
-                total += len(ids)
-            elif hasattr(ids, "shape"):
-                total += ids.shape[-1]
-            else:
-                total += max(1, (len(query) + len(doc)) // 4)
-        return total
+        total_tokens = sum(pair_token_counts)
+        return [score for _, score in all_scores], total_tokens
 
 
 def _build_classifier_model(model_type, config, weights, num_labels):

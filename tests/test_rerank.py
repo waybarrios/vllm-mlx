@@ -208,8 +208,9 @@ class TestRerankEngine:
         engine._tokenizer = mock_tokenizer
         engine._adapter = SigmoidAdapter()
 
-        scores = engine.score_pairs("test query", ["doc one", "doc two"])
+        scores, total_tokens = engine.score_pairs("test query", ["doc one", "doc two"])
         assert len(scores) == 2
+        assert total_tokens == 6  # 3 tokens per pair
         expected_0 = 1.0 / (1.0 + math.exp(-2.0))
         expected_1 = 1.0 / (1.0 + math.exp(1.0))
         assert abs(scores[0] - expected_0) < 1e-6
@@ -253,24 +254,40 @@ class TestRerankEngine:
         engine._tokenizer = mock_tokenizer
         engine._adapter = SigmoidAdapter()
 
-        scores = engine.score_pairs("q", ["d1", "d2", "d3"])
+        scores, total_tokens = engine.score_pairs("q", ["d1", "d2", "d3"])
         assert len(scores) == 3
+        assert total_tokens == 15  # 3 docs * 5 tokens each
         # tokenizer called once per document (for budget estimation + scoring)
         assert call_count == 3
 
-    def test_count_tokens_pair(self):
-        """Test token counting for a query-document pair."""
-        from vllm_mlx.rerank import RerankEngine
+    def test_score_pairs_returns_token_count(self):
+        """Test that score_pairs returns total_tokens consistent with scoring."""
+        import numpy as np
+
+        from vllm_mlx.rerank import RerankEngine, SigmoidAdapter
 
         engine = RerankEngine("test-model")
-        mock_tokenizer = MagicMock()
-        mock_tokenizer.return_value = {"input_ids": [[1, 2, 3, 4, 5, 6, 7]]}
-        engine._tokenizer = mock_tokenizer
-        engine._model = MagicMock()  # mark as loaded
 
-        count = engine.count_tokens("query text", ["doc one", "doc two"])
-        # tokenizer called twice (once per doc), 7 tokens each = 14
-        assert count == 14
+        mock_model = MagicMock()
+        mock_logits = MagicMock()
+        mock_logits.tolist.return_value = [[0.5], [0.3]]
+        mock_model.return_value = MagicMock(logits=mock_logits)
+
+        mock_tokenizer = MagicMock()
+        # Each pair tokenizes to 7 tokens
+        mock_tokenizer.return_value = {
+            "input_ids": np.array([[1, 2, 3, 4, 5, 6, 7]]),
+            "attention_mask": np.array([[1, 1, 1, 1, 1, 1, 1]]),
+        }
+
+        engine._model = mock_model
+        engine._tokenizer = mock_tokenizer
+        engine._adapter = SigmoidAdapter()
+
+        scores, total_tokens = engine.score_pairs("query", ["doc1", "doc2"])
+        assert len(scores) == 2
+        # 2 docs * 7 tokens each = 14
+        assert total_tokens == 14
 
 
 # =============================================================================
@@ -427,8 +444,7 @@ class TestRerankEndpoint:
         mock_engine = MagicMock()
         mock_engine.model_name = "test-reranker"
         # doc 0 gets low score, doc 1 gets high score, doc 2 gets mid score
-        mock_engine.score_pairs.return_value = [0.1, 0.9, 0.5]
-        mock_engine.count_tokens.return_value = 30
+        mock_engine.score_pairs.return_value = ([0.1, 0.9, 0.5], 30)
 
         original = srv._rerank_engine
         srv._rerank_engine = mock_engine
@@ -461,8 +477,7 @@ class TestRerankEndpoint:
 
         mock_engine = MagicMock()
         mock_engine.model_name = "test-reranker"
-        mock_engine.score_pairs.return_value = [0.1, 0.9, 0.5]
-        mock_engine.count_tokens.return_value = 20
+        mock_engine.score_pairs.return_value = ([0.1, 0.9, 0.5], 20)
 
         original = srv._rerank_engine
         srv._rerank_engine = mock_engine
@@ -516,8 +531,7 @@ class TestRerankEndpoint:
 
         mock_engine = MagicMock()
         mock_engine.model_name = "test-reranker"
-        mock_engine.score_pairs.return_value = [0.7]
-        mock_engine.count_tokens.return_value = 5
+        mock_engine.score_pairs.return_value = ([0.7], 5)
 
         original = srv._rerank_engine
         srv._rerank_engine = mock_engine
@@ -544,8 +558,7 @@ class TestRerankEndpoint:
 
         mock_engine = MagicMock()
         mock_engine.model_name = "test-reranker"
-        mock_engine.score_pairs.return_value = [0.8, 0.3]
-        mock_engine.count_tokens.return_value = 10
+        mock_engine.score_pairs.return_value = ([0.8, 0.3], 10)
 
         original = srv._rerank_engine
         srv._rerank_engine = mock_engine
@@ -600,8 +613,7 @@ class TestRerankEndpoint:
 
         mock_engine = MagicMock()
         mock_engine.model_name = "test-reranker"
-        mock_engine.score_pairs.return_value = [0.5]
-        mock_engine.count_tokens.return_value = 42
+        mock_engine.score_pairs.return_value = ([0.5], 42)
 
         original = srv._rerank_engine
         srv._rerank_engine = mock_engine
@@ -750,8 +762,7 @@ class TestRerankIntegration:
 
         mock_engine = MagicMock()
         mock_engine.model_name = "test-reranker"
-        mock_engine.score_pairs.return_value = [0.2, 0.8, 0.5]
-        mock_engine.count_tokens.return_value = 45
+        mock_engine.score_pairs.return_value = ([0.2, 0.8, 0.5], 45)
 
         original = srv._rerank_engine
         srv._rerank_engine = mock_engine
@@ -808,8 +819,7 @@ class TestRerankIntegration:
 
         mock_engine = MagicMock()
         mock_engine.model_name = "test-reranker"
-        mock_engine.score_pairs.return_value = [0.9, 0.1]
-        mock_engine.count_tokens.return_value = 20
+        mock_engine.score_pairs.return_value = ([0.9, 0.1], 20)
 
         original = srv._rerank_engine
         srv._rerank_engine = mock_engine
