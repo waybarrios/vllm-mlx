@@ -1018,13 +1018,13 @@ class MemoryAwarePrefixCache:
     def check_ssd(self, tokens: list[int]) -> dict | None:
         """Check if tokens have an SSD cache hit (without reading data).
 
-        Returns metadata dict if found in SSD tier, None if:
-        - No SSD tier attached
-        - Tokens are already in RAM cache
-        - Not found in SSD tier
+        Returns metadata dict with 'match_type' ('exact' or 'prefix') if
+        found in SSD tier, None if not found. For prefix matches, the dict
+        also includes 'matched_tokens' (the count of tokens the SSD entry
+        covers).
 
         This is a fast synchronous call (SQLite lookup only).
-        The actual data read happens via the scheduler's async handoff.
+        The actual data read happens via the scheduler handoff.
         """
         if self._ssd_tier is None:
             return None
@@ -1038,9 +1038,17 @@ class MemoryAwarePrefixCache:
         # Check SSD tier — exact match first, then prefix
         candidate = self._ssd_tier.lookup_ssd(tokens_key)
         if candidate is not None:
+            candidate["match_type"] = "exact"
+            candidate["matched_tokens"] = len(tokens)
             return candidate
 
-        return self._ssd_tier.lookup_ssd_prefix(tokens_key)
+        prefix = self._ssd_tier.lookup_ssd_prefix(tokens_key)
+        if prefix is not None:
+            prefix["match_type"] = "prefix"
+            prefix["matched_tokens"] = prefix["num_tokens"]
+            return prefix
+
+        return None
 
     # -----------------------------------------------------------------
     # Disk persistence — survives server restarts

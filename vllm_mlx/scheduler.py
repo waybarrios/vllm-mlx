@@ -2729,13 +2729,16 @@ class Scheduler:
             # Tentatively reserve budget
             self.memory_aware_cache._current_memory += memory_bytes
 
-            tokens = tuple(request.prompt_token_ids)
+            # Use the SSD entry's actual token count for read and store,
+            # NOT the full prompt tokens. For prefix hits these differ.
+            matched_count = candidate["matched_tokens"]
+            matched_tokens = tuple(request.prompt_token_ids[:matched_count])
+
             try:
                 cache_layers = self._ssd_tier._read_entry(
-                    tokens, candidate["file_path"]
+                    matched_tokens, candidate["file_path"]
                 )
             except Exception:
-                # Release tentative budget on read failure
                 self.memory_aware_cache._current_memory -= memory_bytes
                 self._ssd_tier._stats.promotion_failures += 1
                 request.cache_hit_type = "miss"
@@ -2754,27 +2757,28 @@ class Scheduler:
             # Release tentative budget (store() will account properly)
             self.memory_aware_cache._current_memory -= memory_bytes
 
-            # Reconstruct and store
+            # Reconstruct and store under the matched prefix tokens
             reconstructed = self._reconstruct_ssd_layers(cache_layers)
             if reconstructed is None:
                 request.cache_hit_type = "miss"
                 continue
 
             self.memory_aware_cache.store(
-                list(tokens), reconstructed, evict_prefixes=False
+                list(matched_tokens), reconstructed, evict_prefixes=False
             )
 
             request.prompt_cache = reconstructed
-            request.cached_tokens = len(tokens)
-            request.remaining_tokens = []
+            request.cached_tokens = matched_count
+            request.remaining_tokens = request.prompt_token_ids[matched_count:]
             request.cache_hit_type = "ssd_hit"
 
             self._ssd_tier._stats.ssd_hits += 1
-            self._ssd_tier._index.touch(tokens)
+            self._ssd_tier._index.touch(matched_tokens)
 
             logger.info(
                 f"[ssd_promote] request={request.request_id[:12]} "
-                f"promoted {len(tokens)} tokens from SSD"
+                f"{candidate['match_type']} promote: {matched_count}/{len(request.prompt_token_ids)} tokens from SSD, "
+                f"{len(request.remaining_tokens)} remaining"
             )
 
     async def promote_from_ssd(self, request) -> bool:
@@ -2809,9 +2813,12 @@ class Scheduler:
             if self.memory_aware_cache is not None:
                 self.memory_aware_cache._current_memory -= nbytes
 
-        tokens = tuple(request.prompt_token_ids)
+        # Use matched token count, not full prompt, for prefix hits
+        matched_count = candidate.get("matched_tokens", len(request.prompt_token_ids))
+        matched_tokens = tuple(request.prompt_token_ids[:matched_count])
+
         cache_layers = await self._ssd_tier.async_promote(
-            tokens, reserve_budget, release_budget
+            matched_tokens, reserve_budget, release_budget
         )
 
         if cache_layers is None:
@@ -2827,17 +2834,21 @@ class Scheduler:
             request.cache_hit_type = "miss"
             return False
 
-        # Store in RAM cache for future hits
-        self.memory_aware_cache.store(list(tokens), reconstructed, evict_prefixes=False)
+        # Store in RAM cache under the matched prefix tokens
+        self.memory_aware_cache.store(
+            list(matched_tokens), reconstructed, evict_prefixes=False
+        )
 
         request.prompt_cache = reconstructed
-        request.cached_tokens = len(tokens)
-        request.remaining_tokens = []
+        request.cached_tokens = matched_count
+        request.remaining_tokens = request.prompt_token_ids[matched_count:]
         request.cache_hit_type = "ssd_hit"
 
         logger.info(
             f"[ssd_promote] request={request.request_id[:12]} "
-            f"promoted {len(tokens)} tokens from SSD"
+            f"{candidate.get('match_type', 'exact')} promote: "
+            f"{matched_count}/{len(request.prompt_token_ids)} tokens from SSD, "
+            f"{len(request.remaining_tokens)} remaining"
         )
         return True
 
