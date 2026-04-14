@@ -1435,7 +1435,9 @@ class TestReasoningAndToolCallsNonStreaming:
             server.RateLimiter(requests_per_minute=60, enabled=False),
         )
         monkeypatch.setattr(server, "_reasoning_parser", FakeReasoningParser())
-        monkeypatch.setattr(server, "_parse_tool_calls_with_parser", fake_parse_tool_calls)
+        monkeypatch.setattr(
+            server, "_parse_tool_calls_with_parser", fake_parse_tool_calls
+        )
 
         response = client.post(
             "/v1/chat/completions",
@@ -1523,7 +1525,9 @@ class TestReasoningAndToolCallsNonStreaming:
             server.RateLimiter(requests_per_minute=60, enabled=False),
         )
         monkeypatch.setattr(server, "_reasoning_parser", FakeReasoningParser())
-        monkeypatch.setattr(server, "_parse_tool_calls_with_parser", fake_parse_tool_calls)
+        monkeypatch.setattr(
+            server, "_parse_tool_calls_with_parser", fake_parse_tool_calls
+        )
 
         response = client.post(
             "/v1/messages",
