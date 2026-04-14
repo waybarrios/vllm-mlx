@@ -273,3 +273,133 @@ class TestRerankEngine:
         count = engine.count_tokens("query text", ["doc one", "doc two"])
         # tokenizer called twice (once per doc), 7 tokens each = 14
         assert count == 14
+
+
+# =============================================================================
+# Unit Tests - Classifier Forward Pass
+# =============================================================================
+
+
+class TestClassifierForward:
+    """Test the MLX classifier forward pass for cross-encoder models."""
+
+    def test_classifier_forward_returns_logits_shape(self):
+        """Test that classifier_forward returns logits with (batch, num_labels) shape."""
+        import mlx.core as mx
+
+        from vllm_mlx.rerank_forward import classifier_forward
+
+        # Build minimal BERT-like weights
+        vocab_size = 30
+        hidden_size = 16
+        num_heads = 2
+        intermediate_size = 32
+        num_labels = 1
+
+        config = {
+            "hidden_size": hidden_size,
+            "num_attention_heads": num_heads,
+            "intermediate_size": intermediate_size,
+            "num_hidden_layers": 1,
+            "num_labels": num_labels,
+            "vocab_size": vocab_size,
+            "max_position_embeddings": 64,
+            "type_vocab_size": 2,
+            "layer_norm_eps": 1e-12,
+            "hidden_act": "gelu",
+        }
+
+        weights = _make_bert_weights(config)
+
+        input_ids = mx.array([[1, 2, 3, 0, 0], [4, 5, 6, 7, 0]])
+        attention_mask = mx.array([[1, 1, 1, 0, 0], [1, 1, 1, 1, 0]])
+
+        logits = classifier_forward(input_ids, attention_mask, weights, config)
+        mx.eval(logits)
+
+        assert logits.shape == (2, num_labels)
+
+    def test_classifier_forward_different_num_labels(self):
+        """Test forward pass with num_labels=3 (multi-class)."""
+        import mlx.core as mx
+
+        from vllm_mlx.rerank_forward import classifier_forward
+
+        hidden_size = 8
+        config = {
+            "hidden_size": hidden_size,
+            "num_attention_heads": 2,
+            "intermediate_size": 16,
+            "num_hidden_layers": 1,
+            "num_labels": 3,
+            "vocab_size": 20,
+            "max_position_embeddings": 32,
+            "type_vocab_size": 2,
+            "layer_norm_eps": 1e-12,
+            "hidden_act": "gelu",
+        }
+
+        weights = _make_bert_weights(config)
+
+        input_ids = mx.array([[1, 2, 3]])
+        attention_mask = mx.array([[1, 1, 1]])
+
+        logits = classifier_forward(input_ids, attention_mask, weights, config)
+        mx.eval(logits)
+
+        assert logits.shape == (1, 3)
+
+
+def _make_bert_weights(config: dict) -> dict:
+    """Build minimal random BERT-style weights for testing."""
+    import mlx.core as mx
+
+    h = config["hidden_size"]
+    inter = config["intermediate_size"]
+    vocab = config["vocab_size"]
+    max_pos = config["max_position_embeddings"]
+    type_vocab = config["type_vocab_size"]
+    num_labels = config["num_labels"]
+    n_layers = config["num_hidden_layers"]
+
+    w = {}
+    # Embeddings
+    w["bert.embeddings.word_embeddings.weight"] = mx.random.normal((vocab, h)) * 0.02
+    w["bert.embeddings.position_embeddings.weight"] = (
+        mx.random.normal((max_pos, h)) * 0.02
+    )
+    w["bert.embeddings.token_type_embeddings.weight"] = (
+        mx.random.normal((type_vocab, h)) * 0.02
+    )
+    w["bert.embeddings.LayerNorm.weight"] = mx.ones((h,))
+    w["bert.embeddings.LayerNorm.bias"] = mx.zeros((h,))
+
+    for i in range(n_layers):
+        prefix = f"bert.encoder.layer.{i}"
+        # Self-attention
+        for proj in ["query", "key", "value"]:
+            w[f"{prefix}.attention.self.{proj}.weight"] = (
+                mx.random.normal((h, h)) * 0.02
+            )
+            w[f"{prefix}.attention.self.{proj}.bias"] = mx.zeros((h,))
+        w[f"{prefix}.attention.output.dense.weight"] = mx.random.normal((h, h)) * 0.02
+        w[f"{prefix}.attention.output.dense.bias"] = mx.zeros((h,))
+        w[f"{prefix}.attention.output.LayerNorm.weight"] = mx.ones((h,))
+        w[f"{prefix}.attention.output.LayerNorm.bias"] = mx.zeros((h,))
+        # FFN
+        w[f"{prefix}.intermediate.dense.weight"] = mx.random.normal((inter, h)) * 0.02
+        w[f"{prefix}.intermediate.dense.bias"] = mx.zeros((inter,))
+        w[f"{prefix}.output.dense.weight"] = mx.random.normal((h, inter)) * 0.02
+        w[f"{prefix}.output.dense.bias"] = mx.zeros((h,))
+        w[f"{prefix}.output.LayerNorm.weight"] = mx.ones((h,))
+        w[f"{prefix}.output.LayerNorm.bias"] = mx.zeros((h,))
+
+    # Pooler
+    w["bert.pooler.dense.weight"] = mx.random.normal((h, h)) * 0.02
+    w["bert.pooler.dense.bias"] = mx.zeros((h,))
+
+    # Classifier
+    w["classifier.weight"] = mx.random.normal((num_labels, h)) * 0.02
+    w["classifier.bias"] = mx.zeros((num_labels,))
+
+    return w
