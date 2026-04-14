@@ -14,6 +14,11 @@ from vllm_mlx.api.tool_calling import (
     build_json_system_prompt,
 )
 from vllm_mlx.api.models import ResponseFormat, ResponseFormatJsonSchema
+from vllm_mlx.guided_decoding import (
+    normalize_response_format,
+    response_format_to_schema,
+    uses_guided_decoding,
+)
 
 
 class TestValidateJsonSchema:
@@ -231,6 +236,33 @@ class TestParseJsonOutput:
         cleaned, parsed, is_valid, error = parse_json_output(text, response_format)
         assert parsed == {"colors": ["red", "blue"]}
         assert is_valid is True
+
+
+class TestGuidedDecodingHelpers:
+    """Tests for response-format normalization and schema selection."""
+
+    def test_normalize_response_format_model(self):
+        response_format = ResponseFormat(type="json_object")
+        assert normalize_response_format(response_format) == {
+            "type": "json_object",
+            "json_schema": None,
+        }
+
+    def test_response_format_to_schema_json_object(self):
+        assert response_format_to_schema({"type": "json_object"}) == {
+            "type": "object",
+            "additionalProperties": True,
+        }
+
+    def test_response_format_to_schema_json_schema_requires_schema(self):
+        with pytest.raises(ValueError, match="requires a non-empty schema"):
+            response_format_to_schema(
+                {"type": "json_schema", "json_schema": {"name": "broken"}}
+            )
+
+    def test_uses_guided_decoding(self):
+        assert uses_guided_decoding({"type": "json_object"}) is True
+        assert uses_guided_decoding({"type": "text"}) is False
 
 
 class TestBuildJsonSystemPrompt:

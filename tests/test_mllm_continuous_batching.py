@@ -16,6 +16,7 @@ Test Cases:
 import base64
 import os
 import tempfile
+from collections import deque
 from unittest.mock import MagicMock
 
 import pytest
@@ -91,6 +92,19 @@ class TestMLLMBatchRequest:
         assert req.temperature == 0.7
         assert req.top_p == 0.9
         assert req.output_tokens == []
+
+    def test_request_guided_processors(self):
+        """Guided-decoding processors should be stored per request."""
+        from vllm_mlx.mllm_batch_generator import MLLMBatchRequest
+
+        req = MLLMBatchRequest(
+            uid=2,
+            request_id="guided-req",
+            prompt="json please",
+            logits_processors=["guided_proc"],
+        )
+
+        assert req.logits_processors == ["guided_proc"]
 
 
 class TestMLLMBatchResponse:
@@ -233,6 +247,45 @@ class TestMLLMBatch:
         assert len(batch) == 2
         assert batch.uids == [1, 3]
         assert batch.request_ids == ["req-1", "req-3"]
+
+
+class TestMLLMSchedulerGuidedDecoding:
+    """Tests for MLLM guided-decoding wiring."""
+
+    def test_schedule_waiting_attaches_guided_processors(self):
+        """Scheduler must carry guided processors into MLLM batch requests."""
+        from vllm_mlx.mllm_scheduler import MLLMRequest, MLLMScheduler
+        from vllm_mlx.request import SamplingParams
+
+        captured = {}
+
+        class FakeBatchGenerator:
+            def insert(self, requests):
+                captured["requests"] = requests
+                return [77]
+
+        scheduler = MLLMScheduler.__new__(MLLMScheduler)
+        scheduler.waiting = deque()
+        scheduler.running = {}
+        scheduler.requests = {}
+        scheduler.request_id_to_uid = {}
+        scheduler.uid_to_request_id = {}
+        scheduler.config = type("Cfg", (), {"max_num_seqs": 16})()
+        scheduler.batch_generator = FakeBatchGenerator()
+        scheduler._ensure_batch_generator = lambda: None
+        scheduler._build_request_logits_processors = lambda params: ["guided_proc"]
+
+        request = MLLMRequest(
+            request_id="mllm-guided",
+            prompt="return json",
+            sampling_params=SamplingParams(response_format={"type": "json_object"}),
+        )
+        scheduler.waiting.append(request)
+
+        scheduled = scheduler._schedule_waiting()
+
+        assert len(scheduled) == 1
+        assert captured["requests"][0].logits_processors == ["guided_proc"]
 
 
 class TestMLLMBatchStats:

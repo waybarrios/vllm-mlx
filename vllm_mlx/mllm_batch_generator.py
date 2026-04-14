@@ -60,6 +60,7 @@ class MLLMBatchRequest:
     min_p: float = 0.0
     presence_penalty: float = 0.0
     repetition_penalty: float = 1.0
+    logits_processors: Optional[List[Callable]] = None
 
     # Processed inputs (set after vision preprocessing)
     input_ids: Optional[mx.array] = None
@@ -1221,12 +1222,13 @@ class MLLMBatchGenerator:
         # Create initial y (first generated tokens)
         y = mx.array(first_tokens)
 
-        # Build per-request logits processors (repetition_penalty, presence_penalty)
+        # Build per-request logits processors (guided decoding + penalties)
         from mlx_lm.sample_utils import make_logits_processors, make_sampler
 
         batch_logits_processors = []
         has_any_lp = False
         for req in requests:
+            combined_lp = list(req.logits_processors or [])
             need_rep = req.repetition_penalty and req.repetition_penalty != 1.0
             need_pres = req.presence_penalty and req.presence_penalty != 0.0
             if need_rep or need_pres:
@@ -1236,13 +1238,16 @@ class MLLMBatchGenerator:
                 if need_pres:
                     lp_kwargs["presence_penalty"] = req.presence_penalty
                 lp = make_logits_processors(**lp_kwargs)
-                batch_logits_processors.append(lp)
-                has_any_lp = True
+                if lp:
+                    combined_lp.extend(lp)
                 logger.info(
                     f"[sampling] request={req.request_id[:12]} "
                     f"rep_penalty={req.repetition_penalty} "
                     f"pres_penalty={req.presence_penalty}"
                 )
+            if combined_lp:
+                batch_logits_processors.append(combined_lp)
+                has_any_lp = True
             else:
                 batch_logits_processors.append(None)
 

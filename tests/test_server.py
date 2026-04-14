@@ -709,6 +709,188 @@ class TestRateLimiterHTTPResponse:
         assert allowed is True
 
 
+class TestStructuredOutputServerPath:
+    """Tests for structured-output server integration."""
+
+    @pytest.mark.anyio
+    async def test_guided_decoding_skips_prompt_injection_and_passes_response_format(
+        self, monkeypatch
+    ):
+        """Structured output should use guided decoding instead of prompt injection."""
+        import vllm_mlx.server as server
+        from vllm_mlx.engine.base import GenerationOutput
+        from vllm_mlx.server import (
+            ChatCompletionRequest,
+            Message,
+            create_chat_completion,
+        )
+
+        captured = {}
+
+        class FakeEngine:
+            is_mllm = False
+            model_name = "fake-engine"
+            preserve_native_tool_format = False
+
+            async def chat(self, messages, **kwargs):
+                captured["messages"] = messages
+                captured["kwargs"] = kwargs
+                return GenerationOutput(
+                    text='{"status":"ok"}',
+                    prompt_tokens=4,
+                    completion_tokens=3,
+                    finish_reason="stop",
+                )
+
+        class FakeRequest:
+            async def is_disconnected(self):
+                return False
+
+        async def passthrough(coro, raw_request, timeout=None):
+            return await coro
+
+        monkeypatch.setattr(server, "_engine", FakeEngine())
+        monkeypatch.setattr(server, "_model_name", "served-model")
+        monkeypatch.setattr(server, "_reasoning_parser", None)
+        monkeypatch.setattr(server, "_enable_auto_tool_choice", False)
+        monkeypatch.setattr(server, "_tool_call_parser", None)
+        monkeypatch.setattr(server, "_tool_parser_instance", None)
+        monkeypatch.setattr(server, "_wait_with_disconnect", passthrough)
+
+        def fail_prompt_injection(_response_format):
+            raise AssertionError("guided decoding should skip prompt injection")
+
+        monkeypatch.setattr(server, "build_json_system_prompt", fail_prompt_injection)
+
+        request = ChatCompletionRequest(
+            model="served-model",
+            messages=[Message(role="user", content="Return JSON.")],
+            response_format={"type": "json_object"},
+        )
+
+        response = await create_chat_completion(request, FakeRequest())
+
+        assert captured["messages"] == [{"role": "user", "content": "Return JSON."}]
+        assert captured["kwargs"]["response_format"].type == "json_object"
+        assert response.choices[0].message.content == '{"status": "ok"}'
+
+    @pytest.mark.anyio
+    async def test_tools_keep_prompt_injection_path(self, monkeypatch):
+        """Tools should keep the legacy JSON instruction path, not guided decoding."""
+        import vllm_mlx.server as server
+        from vllm_mlx.api.models import ToolDefinition
+        from vllm_mlx.engine.base import GenerationOutput
+        from vllm_mlx.server import (
+            ChatCompletionRequest,
+            Message,
+            create_chat_completion,
+        )
+
+        captured = {}
+
+        class FakeEngine:
+            is_mllm = False
+            model_name = "fake-engine"
+            preserve_native_tool_format = False
+
+            async def chat(self, messages, **kwargs):
+                captured["messages"] = messages
+                captured["kwargs"] = kwargs
+                return GenerationOutput(
+                    text='{"status":"ok"}',
+                    prompt_tokens=4,
+                    completion_tokens=3,
+                    finish_reason="stop",
+                )
+
+        class FakeRequest:
+            async def is_disconnected(self):
+                return False
+
+        async def passthrough(coro, raw_request, timeout=None):
+            return await coro
+
+        monkeypatch.setattr(server, "_engine", FakeEngine())
+        monkeypatch.setattr(server, "_model_name", "served-model")
+        monkeypatch.setattr(server, "_reasoning_parser", None)
+        monkeypatch.setattr(server, "_enable_auto_tool_choice", False)
+        monkeypatch.setattr(server, "_tool_call_parser", None)
+        monkeypatch.setattr(server, "_tool_parser_instance", None)
+        monkeypatch.setattr(server, "_wait_with_disconnect", passthrough)
+
+        injected_messages = [{"role": "system", "content": "Return JSON only."}]
+
+        def fake_prompt_injection(response_format):
+            captured["response_format_for_prompt"] = response_format
+            return "Return JSON only."
+
+        def fake_inject(messages, instruction):
+            captured["pre_injection_messages"] = messages
+            captured["instruction"] = instruction
+            return injected_messages
+
+        monkeypatch.setattr(server, "build_json_system_prompt", fake_prompt_injection)
+        monkeypatch.setattr(server, "_inject_json_instruction", fake_inject)
+
+        request = ChatCompletionRequest(
+            model="served-model",
+            messages=[Message(role="user", content="Return JSON.")],
+            response_format={"type": "json_object"},
+            tools=[
+                ToolDefinition(
+                    function={
+                        "name": "lookup",
+                        "description": "Lookup a value",
+                        "parameters": {"type": "object", "properties": {}},
+                    }
+                )
+            ],
+        )
+
+        await create_chat_completion(request, FakeRequest())
+
+        assert captured["response_format_for_prompt"].type == "json_object"
+        assert captured["instruction"] == "Return JSON only."
+        assert captured["messages"] == injected_messages
+        assert "response_format" not in captured["kwargs"]
+
+    @pytest.mark.anyio
+    async def test_invalid_guided_decoding_schema_returns_400(self):
+        """Malformed json_schema requests should fail as bad requests."""
+        from fastapi import HTTPException
+
+        import vllm_mlx.server as server
+        from vllm_mlx.server import (
+            ChatCompletionRequest,
+            Message,
+            create_chat_completion,
+        )
+
+        class FakeEngine:
+            is_mllm = False
+            model_name = "fake-engine"
+            preserve_native_tool_format = False
+
+        class FakeRequest:
+            async def is_disconnected(self):
+                return False
+
+        request = ChatCompletionRequest(
+            model="test-model",
+            messages=[Message(role="user", content="Return JSON.")],
+            response_format={"type": "json_schema", "json_schema": {"name": "broken"}},
+        )
+
+        monkeypatch = pytest.MonkeyPatch()
+        try:
+            monkeypatch.setattr(server, "_engine", FakeEngine())
+            with pytest.raises(HTTPException) as exc_info:
+                await create_chat_completion(request, FakeRequest())
+            assert exc_info.value.status_code == 400
+        finally:
+            monkeypatch.undo()
+
+
 class TestStreamChatCompletion:
     """Tests for streaming chat completion behavior."""
 

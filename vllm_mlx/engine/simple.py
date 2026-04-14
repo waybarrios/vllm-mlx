@@ -581,6 +581,7 @@ class SimpleEngine(BaseEngine):
             self._is_mllm
             and self._text_model is not None
             and not _has_media_content(messages)
+            and kwargs.get("response_format") is None
         ):
             logger.info("Text-only request → LLM path (MTP=True)")
             async for chunk in self._stream_generate_text(

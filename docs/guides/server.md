@@ -605,6 +605,11 @@ See [Reasoning Models Guide](reasoning.md) for full details.
 
 Force the model to return valid JSON using `response_format`:
 
+For `json_object` and `json_schema`, vLLM-MLX uses token-level guided
+decoding when tools are not active. Tool-calling requests keep the legacy
+prompt-instruction fallback so structured output and tool parsing do not
+compete for the same generation surface.
+
 ### JSON Object Mode
 
 Returns any valid JSON:

@@ -8,7 +8,7 @@ integrating with vLLM's model execution system.
 
 import logging
 from dataclasses import dataclass
-from typing import Iterator
+from typing import Any, Iterator
 
 logger = logging.getLogger(__name__)
 
@@ -70,6 +70,7 @@ class MLXLanguageModel:
         self.model = None
         self.tokenizer = None
         self._loaded = False
+        self._guided_decoding_factory = None
 
     def load(self) -> None:
         """Load the model and tokenizer."""
@@ -140,6 +141,20 @@ class MLXLanguageModel:
         )
         return processors if processors else None
 
+    def _build_guided_logits_processors(self, response_format: Any = None):
+        """Build fresh guided-decoding processors for a request."""
+        if response_format is None:
+            return None
+
+        if self._guided_decoding_factory is None:
+            from ..guided_decoding import GuidedDecodingFactory
+
+            self._guided_decoding_factory = GuidedDecodingFactory(
+                self.model, self.tokenizer
+            )
+
+        return self._guided_decoding_factory.build_processors(response_format)
+
     def generate(
         self,
         prompt: str,
@@ -151,6 +166,8 @@ class MLXLanguageModel:
         presence_penalty: float = 0.0,
         repetition_penalty: float = 1.0,
         stop: list[str] | None = None,
+        logits_processors: list | None = None,
+        response_format: Any = None,
         **kwargs,
     ) -> GenerationOutput:
         """
@@ -177,9 +194,17 @@ class MLXLanguageModel:
 
         # Create sampler and logits processors with full Unsloth params
         sampler = self._create_sampler(temperature, top_p, top_k, min_p)
-        logits_processors = self._create_logits_processors(
+        penalty_processors = self._create_logits_processors(
             presence_penalty, repetition_penalty
         )
+        guided_processors = self._build_guided_logits_processors(response_format)
+        all_processors = None
+        if penalty_processors or logits_processors or guided_processors:
+            all_processors = (
+                (logits_processors or [])
+                + (penalty_processors or [])
+                + (guided_processors or [])
+            )
 
         # Generate text
         output_text = generate(
@@ -188,7 +213,7 @@ class MLXLanguageModel:
             prompt=prompt,
             max_tokens=max_tokens,
             sampler=sampler,
-            logits_processors=logits_processors,
+            logits_processors=all_processors,
             verbose=False,
         )
 
@@ -216,6 +241,7 @@ class MLXLanguageModel:
         repetition_penalty: float = 1.0,
         stop: list[str] | None = None,
         logits_processors: list | None = None,
+        response_format: Any = None,
         **kwargs,
     ) -> Iterator[StreamingOutput]:
         """
@@ -245,10 +271,15 @@ class MLXLanguageModel:
         penalty_processors = self._create_logits_processors(
             presence_penalty, repetition_penalty
         )
+        guided_processors = self._build_guided_logits_processors(response_format)
         # Merge any externally-provided logits_processors with penalty processors
         all_processors = None
-        if penalty_processors or logits_processors:
-            all_processors = (logits_processors or []) + (penalty_processors or [])
+        if penalty_processors or logits_processors or guided_processors:
+            all_processors = (
+                (logits_processors or [])
+                + (penalty_processors or [])
+                + (guided_processors or [])
+            )
 
         # Count prompt tokens once upfront
         num_prompt_tokens = len(self.tokenizer.encode(prompt))

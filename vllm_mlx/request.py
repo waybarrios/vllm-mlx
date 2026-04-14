@@ -61,6 +61,7 @@ class SamplingParams:
     repetition_penalty: float = 1.0
     stop: Optional[List[str]] = None
     stop_token_ids: Optional[List[int]] = None
+    response_format: Any | None = None
 
     def __post_init__(self):
         if self.stop is None:

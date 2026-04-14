@@ -54,6 +54,8 @@ dependencies = [
     "mcp>=1.0.0",
     # JSON Schema validation for structured output
     "jsonschema>=4.0.0",
+    # Token-level guided decoding for structured output
+    "outlines>=1.2.12",
     # pytz is required by gradio but not declared as a dependency
     # See: https://github.com/waybarrios/vllm-mlx/issues/23
     "pytz>=2024.1",

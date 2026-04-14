@@ -22,6 +22,7 @@ from mlx_lm.generate import BatchGenerator
 from mlx_lm.sample_utils import make_logits_processors, make_sampler
 from mlx_lm.tokenizer_utils import NaiveStreamingDetokenizer
 
+from .guided_decoding import GuidedDecodingFactory
 from .memory_cache import MemoryAwarePrefixCache, MemoryCacheConfig
 from .paged_cache import PagedCacheManager
 from .prefix_cache import BlockAwarePrefixCache, PrefixCacheManager
@@ -1113,6 +1114,7 @@ class Scheduler:
         # BatchGenerator - the actual batching engine
         self.batch_generator: Optional[BatchGenerator] = None
         self._current_sampler_params: Optional[Tuple] = None
+        self._guided_decoding_factory: Optional[GuidedDecodingFactory] = None
 
         # Prefix cache for KV state reuse
         self.prefix_cache: Optional[PrefixCacheManager] = None
@@ -1490,6 +1492,35 @@ class Scheduler:
             self._close_batch_generator()
             self.batch_generator = self._create_batch_generator(sampling_params)
             self._current_sampler_params = sampler_params
+
+    def _get_guided_decoding_factory(self) -> GuidedDecodingFactory:
+        """Lazily initialize the guided-decoding factory for this scheduler."""
+        if self._guided_decoding_factory is None:
+            self._guided_decoding_factory = GuidedDecodingFactory(
+                self.model, self._actual_tokenizer
+            )
+        return self._guided_decoding_factory
+
+    def _build_request_logits_processors(
+        self, sampling_params: SamplingParams
+    ) -> Optional[List[Any]]:
+        """Build per-request logits processors for penalties and JSON guidance."""
+        processors: List[Any] = []
+
+        rep_penalty = sampling_params.repetition_penalty
+        if rep_penalty and rep_penalty != 1.0:
+            rep_processors = make_logits_processors(repetition_penalty=rep_penalty)
+            if rep_processors:
+                processors.extend(rep_processors)
+
+        if sampling_params.response_format is not None:
+            guided_processors = self._get_guided_decoding_factory().build_processors(
+                sampling_params.response_format
+            )
+            if guided_processors:
+                processors.extend(guided_processors)
+
+        return processors or None
 
     def _validate_cache(self, cache: Any) -> bool:
         """
@@ -1912,15 +1943,7 @@ class Scheduler:
                 request.remaining_tokens = request.prompt_token_ids
                 tokens_to_process = request.prompt_token_ids
 
-            # Build per-request logits_processors from repetition_penalty
-            rep_penalty = request.sampling_params.repetition_penalty
-            lp = None
-            if rep_penalty and rep_penalty != 1.0:
-                lp = make_logits_processors(repetition_penalty=rep_penalty)
-                logger.info(
-                    f"[rep_penalty] request={request.request_id[:12]} "
-                    f"penalty={rep_penalty} processors={len(lp)}"
-                )
+            lp = self._build_request_logits_processors(request.sampling_params)
 
             # Insert into BatchGenerator with optional cache.
             # Wrap in try/except: if cache shapes are incompatible
@@ -1972,6 +1995,7 @@ class Scheduler:
                     else ""
                 )
                 tokens_to_prefill = len(tokens_to_process)
+                rep_penalty = request.sampling_params.repetition_penalty
                 rep_info = (
                     f" rep_penalty={rep_penalty}"
                     if rep_penalty and rep_penalty != 1.0

@@ -109,6 +109,7 @@ from .api.utils import (
     is_mllm_model,  # noqa: F401
 )
 from .engine import BaseEngine, BatchedEngine, GenerationOutput, SimpleEngine
+from .guided_decoding import uses_guided_decoding
 from .tool_parsers import ToolParserManager
 
 logging.basicConfig(level=logging.INFO)
@@ -218,6 +219,15 @@ def _get_cache_dir() -> str:
     )
     logger.info(f"[_get_cache_dir] cache_dir={cache_dir!r}")
     return cache_dir
+
+
+def _should_use_guided_decoding(request: ChatCompletionRequest) -> bool:
+    """Return True when structured output should use token-level guidance."""
+    if request.response_format is None:
+        return False
+    if request.tools and request.tool_choice != "none":
+        return False
+    return uses_guided_decoding(request.response_format)
 
 
 async def lifespan(app: FastAPI):
@@ -1513,9 +1523,14 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
             if has_media:
                 break
 
-    # Handle response_format - inject system prompt if needed
+    # Handle response_format. Use true token-level guided decoding when
+    # tools are not active; otherwise keep the prompt-instruction fallback.
     response_format = request.response_format
-    if response_format:
+    try:
+        guided_decoding = _should_use_guided_decoding(request)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    if response_format and not guided_decoding:
         json_instruction = build_json_system_prompt(response_format)
         if json_instruction:
             # Inject JSON instruction into messages
@@ -1555,6 +1570,8 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
     # Enable/disable thinking mode per request
     if request.enable_thinking is not None:
         chat_kwargs["enable_thinking"] = request.enable_thinking
+    if guided_decoding:
+        chat_kwargs["response_format"] = response_format
 
     # Add tools if provided
     if request.tools and request.tool_choice != "none":

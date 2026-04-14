@@ -145,6 +145,11 @@ class TestSamplingParams:
         assert params.stop == ["END"]
         assert params.stop_token_ids == [1, 2]
 
+    def test_response_format_field(self):
+        """Structured-output requests must carry response_format through batching."""
+        params = SamplingParams(response_format={"type": "json_object"})
+        assert params.response_format == {"type": "json_object"}
+
 
 class TestRequestOutput:
     """Tests for RequestOutput."""
@@ -215,6 +220,42 @@ class TestSchedulerBasic:
     def mock_model(self):
         """Create a mock model."""
         return MagicMock()
+
+    def test_scheduler_passes_guided_processors_to_batch_generator(
+        self, mock_model, mock_tokenizer
+    ):
+        """Guided decoding must reach BatchGenerator.insert on text batching."""
+        from vllm_mlx.scheduler import Scheduler, SchedulerConfig
+
+        captured = {}
+
+        class FakeBatchGenerator:
+            def insert(self, prompts, **kwargs):
+                captured["prompts"] = prompts
+                captured["kwargs"] = kwargs
+                return [123]
+
+        scheduler = Scheduler(
+            mock_model,
+            mock_tokenizer,
+            SchedulerConfig(enable_prefix_cache=False),
+        )
+        scheduler.batch_generator = FakeBatchGenerator()
+        scheduler._current_sampler_params = (0.7, 0.9, 0.0)
+        scheduler._guided_decoding_factory = MagicMock()
+        scheduler._guided_decoding_factory.build_processors.return_value = [
+            "guided_proc"
+        ]
+
+        request = Request(
+            request_id="guided-1",
+            prompt="return json",
+            sampling_params=SamplingParams(response_format={"type": "json_object"}),
+        )
+        scheduler.add_request(request)
+        scheduler._schedule_waiting()
+
+        assert captured["kwargs"]["logits_processors"] == [["guided_proc"]]
 
     def test_chunked_prefill_accepts_prompt_checkpoints(self, monkeypatch):
         """Chunked prefill must match mlx-lm's 7-field prompt tuples."""

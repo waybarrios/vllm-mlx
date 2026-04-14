@@ -18,6 +18,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 from jsonschema import validate, ValidationError
 
+from ..guided_decoding import normalize_response_format
 from .models import FunctionCall, ResponseFormat, ToolCall
 
 
@@ -483,18 +484,7 @@ def parse_json_output(
     if response_format is None:
         return text, None, True, None
 
-    # Normalize response_format to dict
-    if isinstance(response_format, ResponseFormat):
-        rf_dict = {"type": response_format.type, "json_schema": None}
-        if response_format.json_schema:
-            rf_dict["json_schema"] = {
-                "name": response_format.json_schema.name,
-                "description": response_format.json_schema.description,
-                "schema": response_format.json_schema.schema_,
-                "strict": response_format.json_schema.strict,
-            }
-    else:
-        rf_dict = response_format
+    rf_dict = normalize_response_format(response_format)
 
     format_type = rf_dict.get("type", "text")
 
@@ -546,18 +536,7 @@ def build_json_system_prompt(
     if response_format is None:
         return None
 
-    # Normalize to dict
-    if isinstance(response_format, ResponseFormat):
-        rf_dict = {"type": response_format.type, "json_schema": None}
-        if response_format.json_schema:
-            rf_dict["json_schema"] = {
-                "name": response_format.json_schema.name,
-                "description": response_format.json_schema.description,
-                "schema": response_format.json_schema.schema_,
-                "strict": response_format.json_schema.strict,
-            }
-    else:
-        rf_dict = response_format
+    rf_dict = normalize_response_format(response_format)
 
     format_type = rf_dict.get("type", "text")
 
