@@ -108,8 +108,8 @@ class MultimodalProcessor:
 
         Args:
             prompt: Text prompt (already formatted with chat template)
-            images: List of image paths, URLs, or base64 strings
-            videos: List of video inputs
+            images: List of image URLs or base64 strings
+            videos: List of video URLs or base64 inputs
             video_fps: FPS for video frame extraction
             video_max_frames: Max frames per video
             add_special_tokens: Whether to add special tokens
