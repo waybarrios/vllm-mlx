@@ -994,6 +994,115 @@ class TestServerIntegration:
         assert data["choices"][0]["message"]["content"]
 
 
+class TestSseDoneTermination:
+    """Regression tests for SSE data: [DONE] termination signal.
+
+    Covers #101: streaming responses must always emit exactly one
+    data: [DONE] event, even when the engine raises mid-stream.
+    """
+
+    @pytest.mark.asyncio
+    async def test_stream_completion_normal_emits_done(self, monkeypatch):
+        """Normal stream_completion yields exactly one [DONE] at the end."""
+        from vllm_mlx.api.models import CompletionRequest
+        from vllm_mlx.engine.base import GenerationOutput
+        from vllm_mlx.server import stream_completion
+
+        import vllm_mlx.server as server
+
+        class FakeEngine:
+            model_name = "fake-engine"
+
+            async def stream_generate(self, **kwargs):
+                yield GenerationOutput(text="Hello", new_text="Hello", finished=False)
+                yield GenerationOutput(
+                    text="Hello world",
+                    new_text=" world",
+                    finished=True,
+                    finish_reason="stop",
+                    prompt_tokens=5,
+                    completion_tokens=2,
+                )
+
+        monkeypatch.setattr(server, "_model_name", "test-model")
+        monkeypatch.setattr(server, "_default_max_tokens", 100)
+
+        request = CompletionRequest(model="test-model", prompt="Say hello")
+        chunks = [
+            chunk
+            async for chunk in stream_completion(FakeEngine(), "Say hello", request)
+        ]
+
+        done_chunks = [c for c in chunks if c == "data: [DONE]\n\n"]
+        assert (
+            len(done_chunks) == 1
+        ), f"Expected exactly 1 [DONE], got {len(done_chunks)}"
+        assert chunks[-1] == "data: [DONE]\n\n", "[DONE] must be the last chunk"
+
+    @pytest.mark.asyncio
+    async def test_stream_completion_exception_still_emits_done(self, monkeypatch):
+        """When engine raises mid-stream, [DONE] is still emitted."""
+        from vllm_mlx.api.models import CompletionRequest
+        from vllm_mlx.engine.base import GenerationOutput
+        from vllm_mlx.server import stream_completion
+
+        import vllm_mlx.server as server
+
+        class ExplodingEngine:
+            model_name = "exploding-engine"
+
+            async def stream_generate(self, **kwargs):
+                yield GenerationOutput(
+                    text="partial", new_text="partial", finished=False
+                )
+                raise RuntimeError("Metal command buffer SIGABRT")
+
+        monkeypatch.setattr(server, "_model_name", "test-model")
+        monkeypatch.setattr(server, "_default_max_tokens", 100)
+
+        request = CompletionRequest(model="test-model", prompt="Say hello")
+        chunks = [
+            chunk
+            async for chunk in stream_completion(
+                ExplodingEngine(), "Say hello", request
+            )
+        ]
+
+        done_chunks = [c for c in chunks if c == "data: [DONE]\n\n"]
+        assert (
+            len(done_chunks) == 1
+        ), f"Expected exactly 1 [DONE], got {len(done_chunks)}"
+        assert chunks[-1] == "data: [DONE]\n\n", "[DONE] must be the last chunk"
+
+    @pytest.mark.asyncio
+    async def test_disconnect_guard_exception_emits_done(self):
+        """_disconnect_guard emits [DONE] when inner generator raises."""
+        from vllm_mlx.server import _disconnect_guard
+
+        async def exploding_generator():
+            yield "data: {}\n\n"
+            raise RuntimeError("engine crashed")
+
+        class FakeRequest:
+            async def is_disconnected(self):
+                return False
+
+        chunks = [
+            chunk
+            async for chunk in _disconnect_guard(
+                exploding_generator(),
+                FakeRequest(),
+                poll_interval=0.1,
+                heartbeat_interval=5.0,
+            )
+        ]
+
+        done_chunks = [c for c in chunks if c == "data: [DONE]\n\n"]
+        assert (
+            len(done_chunks) == 1
+        ), f"Expected exactly 1 [DONE], got {len(done_chunks)}"
+
+
 def pytest_addoption(parser):
     """Add custom command line options."""
     parser.addoption(
