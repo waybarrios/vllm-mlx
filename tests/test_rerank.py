@@ -706,3 +706,137 @@ class TestRerankCLI:
         parser = build_parser()
         args = parser.parse_args(["serve", "test-model"])
         assert args.rerank_model is None
+
+
+# =============================================================================
+# Integration Tests - Full Round-Trip
+# =============================================================================
+
+
+class TestRerankIntegration:
+    """Full round-trip tests exercising the endpoint with mocked RerankEngine."""
+
+    @pytest.fixture()
+    def client(self):
+        from fastapi.testclient import TestClient
+
+        from vllm_mlx.server import app
+
+        return TestClient(app)
+
+    def test_full_roundtrip_string_documents(self, client):
+        """Test full request/response cycle with string documents."""
+        import vllm_mlx.server as srv
+
+        mock_engine = MagicMock()
+        mock_engine.model_name = "test-reranker"
+        mock_engine.score_pairs.return_value = [0.2, 0.8, 0.5]
+        mock_engine.count_tokens.return_value = 45
+
+        original = srv._rerank_engine
+        srv._rerank_engine = mock_engine
+        try:
+            resp = client.post(
+                "/v1/rerank",
+                json={
+                    "model": "test-reranker",
+                    "query": "machine learning",
+                    "documents": [
+                        "Cooking recipes for beginners",
+                        "Introduction to neural networks",
+                        "History of computer science",
+                    ],
+                    "top_n": 2,
+                    "return_documents": True,
+                },
+            )
+        finally:
+            srv._rerank_engine = original
+
+        assert resp.status_code == 200
+        body = resp.json()
+
+        # Verify structure
+        assert "model" in body
+        assert body["model"] == "test-reranker"
+        assert "results" in body
+        assert "usage" in body
+        assert body["usage"]["total_tokens"] == 45
+
+        # Verify top_n
+        assert len(body["results"]) == 2
+
+        # Verify sorting (descending by score)
+        assert (
+            body["results"][0]["relevance_score"]
+            >= body["results"][1]["relevance_score"]
+        )
+
+        # Verify index preservation
+        assert body["results"][0]["index"] == 1  # "Introduction to neural networks"
+        assert body["results"][1]["index"] == 2  # "History of computer science"
+
+        # Verify documents included
+        assert (
+            body["results"][0]["document"]["text"] == "Introduction to neural networks"
+        )
+        assert body["results"][1]["document"]["text"] == "History of computer science"
+
+    def test_full_roundtrip_object_documents(self, client):
+        """Test full request/response cycle with object documents preserving metadata."""
+        import vllm_mlx.server as srv
+
+        mock_engine = MagicMock()
+        mock_engine.model_name = "test-reranker"
+        mock_engine.score_pairs.return_value = [0.9, 0.1]
+        mock_engine.count_tokens.return_value = 20
+
+        original = srv._rerank_engine
+        srv._rerank_engine = mock_engine
+        try:
+            resp = client.post(
+                "/v1/rerank",
+                json={
+                    "model": "test-reranker",
+                    "query": "q",
+                    "documents": [
+                        {"text": "relevant doc", "id": "doc-001", "source": "arxiv"},
+                        {"text": "irrelevant doc", "id": "doc-002", "source": "wiki"},
+                    ],
+                },
+            )
+        finally:
+            srv._rerank_engine = original
+
+        assert resp.status_code == 200
+        body = resp.json()
+        assert len(body["results"]) == 2
+
+        # First result should be index 0 (score 0.9)
+        top = body["results"][0]
+        assert top["index"] == 0
+        assert top["document"]["text"] == "relevant doc"
+        assert top["document"]["id"] == "doc-001"
+        assert top["document"]["source"] == "arxiv"
+
+    def test_rerank_model_appears_in_v1_models(self, client):
+        """Test that a loaded reranker model appears in /v1/models."""
+        import vllm_mlx.server as srv
+
+        mock_engine = MagicMock()
+        mock_engine.model_name = "test-reranker"
+
+        original = srv._rerank_engine
+        srv._rerank_engine = mock_engine
+        try:
+            resp = client.get("/v1/models")
+        finally:
+            srv._rerank_engine = original
+
+        assert resp.status_code == 200
+        body = resp.json()
+        reranker_models = [
+            m for m in body["data"] if m.get("owned_by") == "vllm-mlx-reranker"
+        ]
+        assert len(reranker_models) == 1
+        assert reranker_models[0]["id"] == "test-reranker"
