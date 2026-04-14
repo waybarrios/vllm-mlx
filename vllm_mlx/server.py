@@ -1190,6 +1190,30 @@ async def list_voices(model: str = "kokoro"):
 # =============================================================================
 
 
+async def _ensure_sse_terminal(
+    generator: AsyncIterator[str],
+    terminal_frame: str,
+) -> AsyncIterator[str]:
+    """Guarantee that *terminal_frame* is emitted exactly once at the end of
+    *generator*, even if the generator raises mid-stream.
+
+    If the inner generator already yields the terminal frame on its happy path,
+    the wrapper detects it and avoids double-emission.  If the generator raises
+    before reaching the terminal, the wrapper emits it in the ``finally`` block.
+    """
+    emitted = False
+    try:
+        async for chunk in generator:
+            if chunk == terminal_frame:
+                emitted = True
+            yield chunk
+    except Exception as e:
+        logger.error(f"Streaming error, ensuring terminal frame: {e}")
+    finally:
+        if not emitted:
+            yield terminal_frame
+
+
 async def _disconnect_guard(
     generator: AsyncIterator[str],
     raw_request: Request,
@@ -1276,9 +1300,8 @@ async def _disconnect_guard(
                 except Exception as exc:
                     logger.error(
                         f"[disconnect_guard] generator raised {type(exc).__name__}: {exc}, "
-                        f"emitting [DONE] after {chunk_count} chunks, elapsed={_elapsed()}"
+                        f"after {chunk_count} chunks, elapsed={_elapsed()}"
                     )
-                    yield "data: [DONE]\n\n"
                     break
                 chunk_count += 1
                 if chunk_count == 1:
@@ -1431,12 +1454,15 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
     if request.stream:
         return StreamingResponse(
             _disconnect_guard(
-                stream_completion(
-                    engine,
-                    prompts[0],
-                    request,
-                    repetition_penalty=comp_rep_penalty,
-                    metrics_tracker=tracker,
+                _ensure_sse_terminal(
+                    stream_completion(
+                        engine,
+                        prompts[0],
+                        request,
+                        repetition_penalty=comp_rep_penalty,
+                        metrics_tracker=tracker,
+                    ),
+                    "data: [DONE]\n\n",
                 ),
                 raw_request,
             ),
@@ -1702,12 +1728,15 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
     if request.stream:
         return StreamingResponse(
             _disconnect_guard(
-                stream_chat_completion(
-                    engine,
-                    messages,
-                    request,
-                    metrics_tracker=tracker,
-                    **chat_kwargs,
+                _ensure_sse_terminal(
+                    stream_chat_completion(
+                        engine,
+                        messages,
+                        request,
+                        metrics_tracker=tracker,
+                        **chat_kwargs,
+                    ),
+                    "data: [DONE]\n\n",
                 ),
                 raw_request,
             ),
@@ -1959,13 +1988,19 @@ async def create_anthropic_message(
     openai_request = anthropic_to_openai(anthropic_request)
 
     if anthropic_request.stream:
+        _anthropic_terminal = (
+            f"event: message_stop\ndata: {json.dumps({'type': 'message_stop'})}\n\n"
+        )
         return StreamingResponse(
             _disconnect_guard(
-                _stream_anthropic_messages(
-                    engine,
-                    openai_request,
-                    anthropic_request,
-                    metrics_tracker=tracker,
+                _ensure_sse_terminal(
+                    _stream_anthropic_messages(
+                        engine,
+                        openai_request,
+                        anthropic_request,
+                        metrics_tracker=tracker,
+                    ),
+                    _anthropic_terminal,
                 ),
                 request,
             ),

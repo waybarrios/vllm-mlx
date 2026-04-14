@@ -1075,25 +1075,18 @@ class TestSseDoneTermination:
         assert chunks[-1] == "data: [DONE]\n\n", "[DONE] must be the last chunk"
 
     @pytest.mark.asyncio
-    async def test_disconnect_guard_exception_emits_done(self):
-        """_disconnect_guard emits [DONE] when inner generator raises."""
-        from vllm_mlx.server import _disconnect_guard
+    async def test_ensure_sse_terminal_normal_no_duplicate(self):
+        """Wrapper passes through the generator's own [DONE] without duplicating."""
+        from vllm_mlx.server import _ensure_sse_terminal
 
-        async def exploding_generator():
+        async def happy_generator():
             yield "data: {}\n\n"
-            raise RuntimeError("engine crashed")
-
-        class FakeRequest:
-            async def is_disconnected(self):
-                return False
+            yield "data: [DONE]\n\n"
 
         chunks = [
             chunk
-            async for chunk in _disconnect_guard(
-                exploding_generator(),
-                FakeRequest(),
-                poll_interval=0.1,
-                heartbeat_interval=5.0,
+            async for chunk in _ensure_sse_terminal(
+                happy_generator(), "data: [DONE]\n\n"
             )
         ]
 
@@ -1101,6 +1094,57 @@ class TestSseDoneTermination:
         assert (
             len(done_chunks) == 1
         ), f"Expected exactly 1 [DONE], got {len(done_chunks)}"
+
+    @pytest.mark.asyncio
+    async def test_ensure_sse_terminal_exception_emits_done(self):
+        """Wrapper emits [DONE] when inner generator raises before reaching it."""
+        from vllm_mlx.server import _ensure_sse_terminal
+
+        async def exploding_generator():
+            yield "data: {}\n\n"
+            raise RuntimeError("engine crashed")
+
+        chunks = [
+            chunk
+            async for chunk in _ensure_sse_terminal(
+                exploding_generator(), "data: [DONE]\n\n"
+            )
+        ]
+
+        done_chunks = [c for c in chunks if c == "data: [DONE]\n\n"]
+        assert (
+            len(done_chunks) == 1
+        ), f"Expected exactly 1 [DONE], got {len(done_chunks)}"
+        assert chunks[-1] == "data: [DONE]\n\n", "[DONE] must be the last chunk"
+
+    @pytest.mark.asyncio
+    async def test_ensure_sse_terminal_anthropic_protocol(self):
+        """Wrapper emits Anthropic message_stop, not OpenAI [DONE], on exception."""
+        import json
+
+        from vllm_mlx.server import _ensure_sse_terminal
+
+        anthropic_terminal = (
+            f"event: message_stop\ndata: {json.dumps({'type': 'message_stop'})}\n\n"
+        )
+
+        async def exploding_anthropic_stream():
+            yield "event: content_block_delta\ndata: {}\n\n"
+            raise RuntimeError("engine crashed")
+
+        chunks = [
+            chunk
+            async for chunk in _ensure_sse_terminal(
+                exploding_anthropic_stream(), anthropic_terminal
+            )
+        ]
+
+        # Must emit Anthropic terminal, NOT OpenAI [DONE]
+        assert chunks[-1] == anthropic_terminal
+        openai_done = [c for c in chunks if c == "data: [DONE]\n\n"]
+        assert (
+            len(openai_done) == 0
+        ), "Must not emit OpenAI [DONE] for Anthropic streams"
 
 
 def pytest_addoption(parser):
