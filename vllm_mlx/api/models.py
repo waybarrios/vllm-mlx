@@ -433,6 +433,43 @@ class EmbeddingResponse(BaseModel):
 
 
 # =============================================================================
+# Reranking
+# =============================================================================
+
+
+class RerankRequest(BaseModel):
+    """Request for reranking documents against a query (Jina/Cohere convention)."""
+
+    model: str
+    query: str
+    documents: list[str | dict]
+    top_n: int | None = None
+    return_documents: bool = True
+
+
+class RerankResult(BaseModel):
+    """A single reranked document result."""
+
+    index: int
+    relevance_score: float
+    document: dict | None = None
+
+
+class RerankUsage(BaseModel):
+    """Token usage for rerank requests."""
+
+    total_tokens: int = 0
+
+
+class RerankResponse(BaseModel):
+    """Response for reranking endpoint (Jina/Cohere convention)."""
+
+    model: str
+    results: list[RerankResult]
+    usage: RerankUsage = Field(default_factory=RerankUsage)
+
+
+# =============================================================================
 # Streaming (for SSE responses)
 # =============================================================================
 
