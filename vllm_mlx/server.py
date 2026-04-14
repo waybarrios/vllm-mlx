@@ -45,7 +45,6 @@ import logging
 import os
 import re
 import secrets
-import tempfile
 import threading
 import time
 import uuid
@@ -138,6 +137,13 @@ from .api.utils import (
     extract_multimodal_content,
     is_mllm_model,  # noqa: F401
 )
+from .audio_limits import (
+    DEFAULT_MAX_AUDIO_UPLOAD_BYTES,
+    DEFAULT_MAX_AUDIO_UPLOAD_MB,
+    DEFAULT_MAX_TTS_INPUT_CHARS,
+    save_upload_with_limit,
+    validate_tts_input_length,
+)
 from .engine import BaseEngine, BatchedEngine, GenerationOutput, SimpleEngine
 from .endpoint_model_policies import (
     resolve_embedding_model_name,
@@ -161,6 +167,8 @@ _default_timeout: float = 300.0  # Default request timeout in seconds (5 minutes
 _default_temperature: float | None = None  # Set via --default-temperature
 _default_top_p: float | None = None  # Set via --default-top-p
 _metrics_enabled = False
+_max_audio_upload_bytes: int = DEFAULT_MAX_AUDIO_UPLOAD_BYTES
+_max_tts_input_chars: int = DEFAULT_MAX_TTS_INPUT_CHARS
 
 _FALLBACK_TEMPERATURE = 0.7
 _FALLBACK_TOP_P = 0.9
@@ -2045,11 +2053,12 @@ async def create_transcription(
             _stt_engine = STTEngine(model_name)
             _stt_engine.load()
 
-        # Save uploaded file temporarily
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
-            content = await file.read()
-            tmp.write(content)
-            tmp_path = tmp.name
+        # Stream uploaded file to disk under a hard size cap.
+        tmp_path = await save_upload_with_limit(
+            file,
+            max_bytes=_max_audio_upload_bytes,
+            default_suffix=".wav",
+        )
 
         try:
             result = _stt_engine.transcribe(tmp_path, language=language)
@@ -2106,6 +2115,7 @@ async def create_speech(
         from .audio.tts import TTSEngine  # Lazy import - optional feature
 
         model_name = resolve_tts_model_name(model)
+        validate_tts_input_length(input, max_chars=_max_tts_input_chars)
 
         # Load engine if needed
         if _tts_engine is None or _tts_engine.model_name != model_name:
@@ -4241,6 +4251,7 @@ def main():
     # Set global configuration
     global _api_key, _default_timeout, _rate_limiter, _metrics_enabled
     global _default_temperature, _default_top_p
+    global _max_audio_upload_bytes, _max_tts_input_chars
     _api_key = args.api_key
     _default_timeout = args.timeout
     _metrics_enabled = args.enable_metrics
@@ -4249,6 +4260,8 @@ def main():
         _default_temperature = args.default_temperature
     if args.default_top_p is not None:
         _default_top_p = args.default_top_p
+    _max_audio_upload_bytes = args.max_audio_upload_mb * 1024 * 1024
+    _max_tts_input_chars = args.max_tts_input_chars
 
     # Configure rate limiter
     if args.rate_limit > 0:
@@ -4278,6 +4291,10 @@ def main():
         logger.warning("  Remote code loading: ENABLED (--trust-remote-code)")
     else:
         logger.info("  Remote code loading: DISABLED (default)")
+    logger.info(
+        f"  Audio upload limit: {args.max_audio_upload_mb} MiB, "
+        f"TTS input limit: {args.max_tts_input_chars} chars"
+    )
     logger.info("=" * 60)
 
     # Set MCP config for lifespan
@@ -4425,6 +4442,18 @@ Examples:
         type=float,
         default=None,
         help="Default top_p for generation when not specified in request",
+    )
+    parser.add_argument(
+        "--max-audio-upload-mb",
+        type=int,
+        default=DEFAULT_MAX_AUDIO_UPLOAD_MB,
+        help="Maximum size of uploaded audio files in MiB (default: 25)",
+    )
+    parser.add_argument(
+        "--max-tts-input-chars",
+        type=int,
+        default=DEFAULT_MAX_TTS_INPUT_CHARS,
+        help="Maximum number of characters accepted by /v1/audio/speech (default: 4096)",
     )
     return parser
 

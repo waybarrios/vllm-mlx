@@ -67,6 +67,8 @@ def serve_command(args):
         server._default_temperature = args.default_temperature
     if args.default_top_p is not None:
         server._default_top_p = args.default_top_p
+    server._max_audio_upload_bytes = args.max_audio_upload_mb * 1024 * 1024
+    server._max_tts_input_chars = args.max_tts_input_chars
 
     # Configure reasoning parser
     if args.reasoning_parser:
@@ -120,6 +122,10 @@ def serve_command(args):
         print(f"  Reasoning: ENABLED (parser: {args.reasoning_parser})")
     else:
         print("  Reasoning: Use --reasoning-parser to enable")
+    print(
+        f"  Audio upload limit: {args.max_audio_upload_mb} MiB, "
+        f"TTS input limit: {args.max_tts_input_chars} chars"
+    )
     print("=" * 60)
 
     # Pre-download model with retry/timeout
@@ -889,6 +895,18 @@ Examples:
         "--enable-metrics",
         action="store_true",
         help="Expose Prometheus metrics on /metrics (disabled by default)",
+    )
+    serve_parser.add_argument(
+        "--max-audio-upload-mb",
+        type=int,
+        default=25,
+        help="Maximum size of uploaded audio files in MiB (default: 25)",
+    )
+    serve_parser.add_argument(
+        "--max-tts-input-chars",
+        type=int,
+        default=4096,
+        help="Maximum number of characters accepted by /v1/audio/speech (default: 4096)",
     )
     # Tool calling options
     serve_parser.add_argument(

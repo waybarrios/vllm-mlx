@@ -20,6 +20,8 @@
 | `--rate-limit` | Requests per minute per client (0 = disabled) | `0` |
 | `--timeout` | Request timeout in seconds | `300` |
 | `--enable-metrics` | Expose Prometheus metrics on `/metrics` | `false` |
+| `--max-audio-upload-mb` | Maximum uploaded audio size for `/v1/audio/transcriptions` | `25` |
+| `--max-tts-input-chars` | Maximum text length accepted by `/v1/audio/speech` | `4096` |
 
 ### Batching Options
 

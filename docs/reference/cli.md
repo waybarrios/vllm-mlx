@@ -42,6 +42,8 @@ vllm-mlx serve <model> [options]
 | `--max-num-seqs` | Max concurrent sequences | 256 |
 | `--default-temperature` | Default temperature when not specified in request | None |
 | `--default-top-p` | Default top_p when not specified in request | None |
+| `--max-audio-upload-mb` | Maximum uploaded audio size for `/v1/audio/transcriptions` | 25 |
+| `--max-tts-input-chars` | Maximum text length accepted by `/v1/audio/speech` | 4096 |
 | `--reasoning-parser` | Parser for reasoning models (`qwen3`, `deepseek_r1`) | None |
 | `--embedding-model` | Pre-load an embedding model at startup | None |
 | `--enable-auto-tool-choice` | Enable automatic tool calling | False |
