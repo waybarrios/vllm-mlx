@@ -3,7 +3,7 @@
 
 import platform
 import sys
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -115,8 +115,6 @@ class TestRerankAdapterContract:
 
     def test_sigmoid_adapter_normalize_maps_to_zero_one(self):
         """Test that SigmoidAdapter.normalize applies sigmoid correctly."""
-        import math
-
         from vllm_mlx.rerank import SigmoidAdapter
 
         adapter = SigmoidAdapter()
