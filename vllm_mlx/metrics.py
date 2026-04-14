@@ -365,7 +365,9 @@ class MetricsCollector:
         stats = engine.get_stats() if engine is not None else {}
 
         self._prom["model_loaded"].set(1 if engine is not None else 0)
-        current_engine_type = stats.get("engine_type", "unknown") if engine else "unknown"
+        current_engine_type = (
+            stats.get("engine_type", "unknown") if engine else "unknown"
+        )
         for engine_type in ("simple", "batched", "unknown"):
             self._prom["engine_type"].labels(engine_type=engine_type).set(
                 1 if current_engine_type == engine_type else 0
@@ -411,7 +413,9 @@ class MetricsCollector:
         if isinstance(cache_stats, dict):
             self._prom["cache_entry_count"].set(
                 _coerce_float(
-                    cache_stats.get("entry_count", cache_stats.get("allocated_blocks", 0))
+                    cache_stats.get(
+                        "entry_count", cache_stats.get("allocated_blocks", 0)
+                    )
                 )
             )
             self._prom["cache_hits"].set(
@@ -431,7 +435,11 @@ class MetricsCollector:
                 )
             )
             self._prom["cache_utilization_ratio"].set(
-                _coerce_float(cache_stats.get("memory_utilization", cache_stats.get("utilization", 0.0)))
+                _coerce_float(
+                    cache_stats.get(
+                        "memory_utilization", cache_stats.get("utilization", 0.0)
+                    )
+                )
             )
             self._prom["cache_tokens_saved"].set(
                 _coerce_float(cache_stats.get("tokens_saved", 0))

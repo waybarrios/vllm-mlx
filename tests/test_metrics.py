@@ -164,10 +164,12 @@ class TestMetricsEndpoint:
         assert response.status_code == 200
         assert response.headers["content-type"].startswith("text/plain; version=")
         assert "charset=utf-8" in response.headers["content-type"]
-        assert 'vllm_mlx_model_loaded 1.0' in response.text
+        assert "vllm_mlx_model_loaded 1.0" in response.text
         assert 'vllm_mlx_engine_type{engine_type="simple"} 1.0' in response.text
         assert "vllm_mlx_scheduler_waiting_requests 2.0" in response.text
-        assert 'vllm_mlx_cache_type{cache_type="memory_aware_cache"} 1.0' in response.text
+        assert (
+            'vllm_mlx_cache_type{cache_type="memory_aware_cache"} 1.0' in response.text
+        )
 
     def test_metrics_collapse_unmatched_paths(self, metrics_client, monkeypatch):
         client, server, collector = metrics_client

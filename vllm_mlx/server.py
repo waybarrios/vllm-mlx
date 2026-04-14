@@ -2496,7 +2496,9 @@ async def stream_completion(
             if metrics_tracker is not None:
                 metrics_tracker.observe_ttft()
             prompt_tokens = (
-                output.prompt_tokens if hasattr(output, "prompt_tokens") else prompt_tokens
+                output.prompt_tokens
+                if hasattr(output, "prompt_tokens")
+                else prompt_tokens
             )
             completion_tokens = (
                 output.completion_tokens
@@ -2512,7 +2514,9 @@ async def stream_completion(
                     {
                         "index": 0,
                         "text": output.new_text,
-                        "finish_reason": output.finish_reason if output.finished else None,
+                        "finish_reason": (
+                            output.finish_reason if output.finished else None
+                        ),
                     }
                 ],
             }
@@ -2623,7 +2627,11 @@ async def stream_chat_completion(
                 completion_tokens = output.completion_tokens
 
             # Use reasoning parser if enabled (skip when enable_thinking=False)
-            if _reasoning_parser and delta_text and request.enable_thinking is not False:
+            if (
+                _reasoning_parser
+                and delta_text
+                and request.enable_thinking is not False
+            ):
                 previous_text = accumulated_text
                 accumulated_text += delta_text
                 delta_msg = _reasoning_parser.extract_reasoning_streaming(
@@ -2878,7 +2886,9 @@ async def stream_chat_completion(
                                             ),
                                         },
                                     }
-                                    for i, tc in enumerate(final_parse_result.tool_calls)
+                                    for i, tc in enumerate(
+                                        final_parse_result.tool_calls
+                                    )
                                 ]
                             ),
                             finish_reason="tool_calls",
