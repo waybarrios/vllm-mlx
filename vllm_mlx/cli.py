@@ -141,6 +141,12 @@ def serve_command(args):
         server.load_embedding_model(args.embedding_model, lock=True)
         print(f"Embedding model loaded: {args.embedding_model}")
 
+    # Pre-load reranker model if specified
+    if args.rerank_model:
+        print(f"Pre-loading reranker model: {args.rerank_model}")
+        server.load_reranker_model(args.rerank_model, lock=True)
+        print(f"Reranker model loaded: {args.rerank_model}")
+
     # Build scheduler config for batched mode
     scheduler_config = None
     if args.continuous_batching:
@@ -952,6 +958,13 @@ Examples:
         default=None,
         help="Pre-load an embedding model at startup (e.g. mlx-community/embeddinggemma-300m-6bit)",
     )
+    # Reranker model option
+    serve_parser.add_argument(
+        "--rerank-model",
+        type=str,
+        default=None,
+        help="Pre-load a reranker model at startup (e.g. mlx-community/jina-reranker-v2-base-multilingual)",
+    )
     # Download options
     serve_parser.add_argument(
         "--download-timeout",
@@ -1129,6 +1142,10 @@ Examples:
     )
 
     return parser
+
+
+# Alias for test compatibility
+build_parser = create_parser
 
 
 def main():

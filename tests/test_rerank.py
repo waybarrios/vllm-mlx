@@ -673,3 +673,36 @@ class TestRerankEndpoint:
         # The exact behavior depends on whether lazy loading is wired, but the
         # route must exist and not 404
         assert resp.status_code != 404
+
+
+# =============================================================================
+# Unit Tests - CLI Argument
+# =============================================================================
+
+
+class TestRerankCLI:
+    """Test that --rerank-model CLI arg is registered."""
+
+    def test_rerank_model_arg_exists(self):
+        """Test that the serve subcommand accepts --rerank-model."""
+        from vllm_mlx.cli import build_parser
+
+        parser = build_parser()
+        # Parse with --rerank-model; should not raise
+        args = parser.parse_args(
+            [
+                "serve",
+                "test-model",
+                "--rerank-model",
+                "mlx-community/jina-reranker-v2-base-multilingual",
+            ]
+        )
+        assert args.rerank_model == "mlx-community/jina-reranker-v2-base-multilingual"
+
+    def test_rerank_model_arg_default_none(self):
+        """Test that --rerank-model defaults to None."""
+        from vllm_mlx.cli import build_parser
+
+        parser = build_parser()
+        args = parser.parse_args(["serve", "test-model"])
+        assert args.rerank_model is None
