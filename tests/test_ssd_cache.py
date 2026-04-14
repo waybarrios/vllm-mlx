@@ -366,3 +366,83 @@ class TestSSDCacheTierCore:
         tier = SSDCacheTier(config)
         tier.close()
         tier.close()  # Should not raise
+
+
+import time
+
+
+class TestAsyncSpillWriter:
+    """Tests for the async spill writer thread."""
+
+    @pytest.fixture
+    def tier_with_writer(self, tmp_path):
+        config = SSDCacheConfig(cache_dir=str(tmp_path / "writer_test"))
+        tier = SSDCacheTier(config)
+        tier.start_writer()
+        yield tier
+        tier.close()
+
+    def test_spill_writes_entry_to_disk(self, tier_with_writer):
+        tokens = (1, 2, 3, 4, 5)
+        keys = MockMLXArray(np.random.randn(1, 8, 16, 64).astype(np.float16))
+        values = MockMLXArray(np.random.randn(1, 8, 16, 64).astype(np.float16))
+        layer = MockKVCacheLayer(keys=keys, values=values, offset=16)
+        cache = [layer]
+
+        tier_with_writer.enqueue_spill(tokens, cache, memory_bytes=2048)
+
+        # Wait for async write to complete (with timeout)
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            if tier_with_writer._stats.spill_count > 0:
+                break
+            time.sleep(0.05)
+
+        assert tier_with_writer._stats.spill_count == 1
+        assert tier_with_writer._stats.spill_bytes > 0
+
+        # Verify entry in index
+        result = tier_with_writer._index.lookup_exact(tokens)
+        assert result is not None
+        assert result["num_tokens"] == 5
+
+    def test_spill_atomic_write(self, tier_with_writer):
+        """Verify no partial files exist after spill."""
+        tokens = (10, 20, 30)
+        keys = MockMLXArray(np.random.randn(1, 4, 8, 32).astype(np.float16))
+        values = MockMLXArray(np.random.randn(1, 4, 8, 32).astype(np.float16))
+        layer = MockKVCacheLayer(keys=keys, values=values, offset=8)
+
+        tier_with_writer.enqueue_spill(tokens, [layer], memory_bytes=1024)
+
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            if tier_with_writer._stats.spill_count > 0:
+                break
+            time.sleep(0.05)
+
+        # Check that no .tmp files remain
+        data_dir = tier_with_writer._data_dir
+        for root, dirs, files in os.walk(data_dir):
+            for f in files:
+                assert not f.endswith(".tmp"), f"Temp file left behind: {f}"
+
+    def test_spill_queue_full_drops(self, tmp_path):
+        """When queue is full, new spills are dropped (not blocking)."""
+        config = SSDCacheConfig(
+            cache_dir=str(tmp_path / "queue_full_test"),
+            spill_queue_size=2,
+        )
+        tier = SSDCacheTier(config)
+        # Don't start writer — queue will fill up
+        keys = MockMLXArray(np.zeros((1, 1, 1, 1), dtype=np.float16))
+        values = MockMLXArray(np.zeros((1, 1, 1, 1), dtype=np.float16))
+        layer = MockKVCacheLayer(keys=keys, values=values, offset=1)
+
+        # Enqueue more than capacity
+        for i in range(5):
+            tier.enqueue_spill((i,), [layer], memory_bytes=100)
+
+        # Queue should be at capacity, not have raised
+        assert tier._spill_queue.qsize() <= 2
+        tier.close()

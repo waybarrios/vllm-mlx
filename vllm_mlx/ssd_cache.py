@@ -22,6 +22,7 @@ import hashlib
 import json
 import logging
 import os
+import queue
 import sqlite3
 import threading
 import time
@@ -528,6 +529,11 @@ class SSDCacheTier:
         self._lock = threading.Lock()
         self._closed = False
 
+        # Spill queue and writer thread
+        self._spill_queue: queue.Queue = queue.Queue(maxsize=config.spill_queue_size)
+        self._writer_thread: threading.Thread | None = None
+        self._writer_stop = threading.Event()
+
     @staticmethod
     def _entry_hash(tokens: tuple[int, ...]) -> str:
         """Compute deterministic hash for a token sequence."""
@@ -537,10 +543,149 @@ class SSDCacheTier:
         """Return current SSD cache statistics."""
         return self._stats.to_dict()
 
+    def start_writer(self) -> None:
+        """Start the background spill writer thread."""
+        if self._writer_thread is not None:
+            return
+        self._writer_stop.clear()
+        self._writer_thread = threading.Thread(
+            target=self._writer_loop, daemon=True, name="ssd-cache-writer"
+        )
+        self._writer_thread.start()
+        logger.info("[ssd_cache] writer thread started")
+
+    def _writer_loop(self) -> None:
+        """Background loop: drain spill queue and write to disk."""
+        while not self._writer_stop.is_set():
+            try:
+                item = self._spill_queue.get(timeout=0.5)
+            except queue.Empty:
+                continue
+
+            if item is None:  # Poison pill for shutdown
+                break
+
+            tokens_key, cache_layers, memory_bytes = item
+            try:
+                self._write_entry(tokens_key, cache_layers, memory_bytes)
+            except Exception:
+                logger.exception(
+                    f"[ssd_cache] failed to write entry " f"({len(tokens_key)} tokens)"
+                )
+
+    def enqueue_spill(
+        self,
+        tokens: tuple[int, ...],
+        cache: list[Any],
+        memory_bytes: int,
+    ) -> bool:
+        """Enqueue a cache entry for async spill to SSD.
+
+        Returns True if enqueued, False if queue is full (entry dropped).
+        """
+        try:
+            self._spill_queue.put_nowait((tokens, cache, memory_bytes))
+            return True
+        except queue.Full:
+            logger.warning(
+                f"[ssd_cache] spill queue full, dropping entry "
+                f"({len(tokens)} tokens, {memory_bytes} bytes)"
+            )
+            return False
+
+    def _write_entry(
+        self,
+        tokens_key: tuple[int, ...],
+        cache_layers: list[Any],
+        memory_bytes: int,
+    ) -> None:
+        """Write a single cache entry to disk atomically.
+
+        Uses temp-file + rename for crash consistency.
+        """
+        import shutil
+
+        entry_hash = self._entry_hash(tokens_key)
+        entry_dir = os.path.join(self._data_dir, entry_hash)
+        tmp_dir = entry_dir + ".tmp"
+
+        # Clean up any leftover tmp dir from a previous crash
+        if os.path.exists(tmp_dir):
+            shutil.rmtree(tmp_dir)
+
+        os.makedirs(tmp_dir, mode=self._config.dir_permissions, exist_ok=True)
+
+        layer_manifests = []
+        total_file_bytes = 0
+
+        for i, layer in enumerate(cache_layers):
+            serializer = get_serializer_for_layer(layer)
+            layer_path = os.path.join(tmp_dir, f"layer_{i}.safetensors")
+            metadata = serializer.serialize_layer(layer, i, layer_path)
+            layer_manifests.append(metadata)
+
+            # Set file permissions
+            os.chmod(layer_path, self._config.file_permissions)
+            total_file_bytes += os.path.getsize(layer_path)
+
+        # Write manifest
+        manifest = {
+            "num_layers": len(cache_layers),
+            "layers": layer_manifests,
+            "memory_bytes": memory_bytes,
+            "num_tokens": len(tokens_key),
+        }
+        manifest_path = os.path.join(tmp_dir, "manifest.json")
+        with open(manifest_path, "w") as f:
+            json.dump(manifest, f)
+        os.chmod(manifest_path, self._config.file_permissions)
+
+        # Save tokens binary
+        tokens_path = os.path.join(tmp_dir, "tokens.bin")
+        arr = _array.array("i", tokens_key)
+        with open(tokens_path, "wb") as f:
+            arr.tofile(f)
+        os.chmod(tokens_path, self._config.file_permissions)
+
+        # Atomic rename: tmp_dir -> entry_dir
+        if os.path.exists(entry_dir):
+            shutil.rmtree(entry_dir)
+        os.rename(tmp_dir, entry_dir)
+
+        # Update index
+        relative_path = entry_hash
+        self._index.insert_entry(
+            tokens_key=tokens_key,
+            file_path=relative_path,
+            memory_bytes=memory_bytes,
+            num_tokens=len(tokens_key),
+        )
+
+        # Update stats
+        with self._lock:
+            self._stats.spill_count += 1
+            self._stats.spill_bytes += total_file_bytes
+
+        logger.debug(
+            f"[ssd_cache] spilled entry: {len(tokens_key)} tokens, "
+            f"{total_file_bytes} bytes on disk"
+        )
+
     def close(self) -> None:
         """Close the SSD cache tier and release resources."""
         if self._closed:
             return
         self._closed = True
+
+        # Stop writer thread
+        self._writer_stop.set()
+        if self._writer_thread is not None:
+            try:
+                self._spill_queue.put_nowait(None)  # Poison pill
+            except queue.Full:
+                pass
+            self._writer_thread.join(timeout=5.0)
+            self._writer_thread = None
+
         self._index.close()
         logger.info("[ssd_cache] SSDCacheTier closed")
