@@ -297,6 +297,136 @@ class TestSchedulerIntegration:
         assert default_config.prefix_cache_size == 100
 
 
+class TestTrimRotatingCaches:
+    """Regression tests for _trim_rotating_caches offset clamp."""
+
+    def test_offset_clamped_to_max_size(self):
+        """Restored cache with offset > max_size must be clamped.
+
+        Without clamping, RotatingKVCache._update_in_place computes
+        ``new_size = min(step, max_size - prev)`` which goes negative
+        when ``prev = offset % max_size`` exceeds max_size after trim.
+        """
+        mx = pytest.importorskip("mlx.core")
+        mlx_lm_cache = pytest.importorskip("mlx_lm.models.cache")
+        KVCache = mlx_lm_cache.KVCache
+        RotatingKVCache = mlx_lm_cache.RotatingKVCache
+
+        from vllm_mlx.mllm_batch_generator import MLLMBatchGenerator
+
+        # Simulate a RotatingKVCache with offset far beyond max_size
+        # (happens when prefix cache stores long-generation state)
+        rc = RotatingKVCache(max_size=128, keep=0)
+        rc.offset = 500  # Way beyond max_size
+        rc.keys = mx.zeros((1, 4, 128, 64))  # Full buffer at max_size
+        rc.values = mx.zeros((1, 4, 128, 64))
+        rc._idx = 128
+
+        # Also include a regular KVCache (should be unaffected)
+        kv = KVCache()
+        kv.offset = 200
+        kv.keys = mx.zeros((1, 4, 200, 64))
+        kv.values = mx.zeros((1, 4, 200, 64))
+
+        cache_list = [rc, kv]
+        MLLMBatchGenerator._trim_rotating_caches(cache_list)
+
+        # RotatingKVCache offset must be clamped to max_size
+        assert rc.offset <= rc.max_size
+        assert rc.offset == 128
+
+        # KVCache should be untouched
+        assert kv.offset == 200
+
+    def test_empty_rotating_cache_offset_reset(self):
+        """RotatingKVCache with keys=None should get offset reset to 0."""
+        mlx_lm_cache = pytest.importorskip("mlx_lm.models.cache")
+        RotatingKVCache = mlx_lm_cache.RotatingKVCache
+
+        from vllm_mlx.mllm_batch_generator import MLLMBatchGenerator
+
+        rc = RotatingKVCache(max_size=128, keep=0)
+        rc.offset = 500
+        rc.keys = None
+        rc.values = None
+
+        MLLMBatchGenerator._trim_rotating_caches([rc])
+        assert rc.offset == 0
+
+
+class TestCopyPrefixCache:
+    """Tests for _copy_prefix_cache preventing mutation of stored entries."""
+
+    def test_copy_prevents_offset_mutation(self):
+        """Modifying copied cache offset should not affect original."""
+        mlx_lm_cache = pytest.importorskip("mlx_lm.models.cache")
+        KVCache = mlx_lm_cache.KVCache
+
+        from vllm_mlx.mllm_batch_generator import MLLMBatchGenerator
+
+        original = KVCache()
+        original.offset = 100
+
+        copies = MLLMBatchGenerator._copy_prefix_cache([original])
+        copies[0].offset = 999
+
+        assert original.offset == 100
+
+    def test_copy_rotating_prevents_idx_mutation(self):
+        """Modifying copied RotatingKVCache _idx should not affect original."""
+        mx = pytest.importorskip("mlx.core")
+        mlx_lm_cache = pytest.importorskip("mlx_lm.models.cache")
+        RotatingKVCache = mlx_lm_cache.RotatingKVCache
+
+        from vllm_mlx.mllm_batch_generator import MLLMBatchGenerator
+
+        original = RotatingKVCache(max_size=128, keep=0)
+        original.offset = 50
+        original._idx = 50
+        original.keys = mx.zeros((1, 4, 50, 64))
+        original.values = mx.zeros((1, 4, 50, 64))
+
+        copies = MLLMBatchGenerator._copy_prefix_cache([original])
+        copies[0].offset = 999
+        copies[0]._idx = 999
+
+        assert original.offset == 50
+        assert original._idx == 50
+
+
+class TestHasEmptyRotatingCache:
+    """Tests for _has_empty_rotating_cache detection."""
+
+    def test_detects_empty_rotating_cache(self):
+        """Should return True when any RotatingKVCache has keys=None."""
+        mlx_lm_cache = pytest.importorskip("mlx_lm.models.cache")
+        KVCache = mlx_lm_cache.KVCache
+        RotatingKVCache = mlx_lm_cache.RotatingKVCache
+
+        from vllm_mlx.mllm_batch_generator import MLLMBatchGenerator
+
+        kv = KVCache()
+        rc = RotatingKVCache(max_size=128, keep=0)
+        rc.keys = None
+
+        assert MLLMBatchGenerator._has_empty_rotating_cache([kv, rc]) is True
+
+    def test_returns_false_when_all_populated(self):
+        """Should return False when all caches have data."""
+        mx = pytest.importorskip("mlx.core")
+        mlx_lm_cache = pytest.importorskip("mlx_lm.models.cache")
+        KVCache = mlx_lm_cache.KVCache
+        RotatingKVCache = mlx_lm_cache.RotatingKVCache
+
+        from vllm_mlx.mllm_batch_generator import MLLMBatchGenerator
+
+        kv = KVCache()
+        rc = RotatingKVCache(max_size=128, keep=0)
+        rc.keys = mx.zeros((1, 4, 50, 64))
+
+        assert MLLMBatchGenerator._has_empty_rotating_cache([kv, rc]) is False
+
+
 if __name__ == "__main__":
     # Verbose standalone test with real model
     import argparse

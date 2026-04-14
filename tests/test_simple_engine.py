@@ -184,7 +184,10 @@ class TestSimpleEngineConcurrency:
                 ],
             )
 
-            assert output.text == '{"name":"bash","arguments":{"command":"pwd"}}'
+            assert (
+                output.text
+                == '<tool_call>{"name":"bash","arguments":{"command":"pwd"}}</tool_call>'
+            )
             assert output.tokens == [7, 8, 9]
             assert output.prompt_tokens == 11
             assert output.completion_tokens == 4

@@ -84,11 +84,16 @@ class BaseThinkingReasoningParser(ReasoningParser):
         if self.start_token in text and self.end_token in text:
             _, _, after_start = text.partition(self.start_token)
             reasoning, _, content = after_start.partition(self.end_token)
+            # Strip duplicate end tokens (some models generate <think></think></think>)
+            while content.lstrip().startswith(self.end_token):
+                content = content.lstrip()[len(self.end_token) :]
             return reasoning.strip() or None, content.strip() or None
 
         # Case 2: Only closing tag (think was injected in prompt)
         if self.end_token in text:
             reasoning, _, content = text.partition(self.end_token)
+            while content.lstrip().startswith(self.end_token):
+                content = content.lstrip()[len(self.end_token) :]
             return reasoning.strip() or None, content.strip() or None
 
         # Case 3: Only start tag (incomplete reasoning, no end yet)

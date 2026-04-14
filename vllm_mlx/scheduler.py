@@ -805,6 +805,9 @@ def _install_mtp(
             # and on reject: trim KV by 2 (remove both P and D), restore
             # RNN snapshot, then re-advance with just P so both cache
             # types end up consistent at [..., P].
+            # Skip RNN snapshots in optimistic mode — it never rejects,
+            # so the copies are wasted (~147 MB/step of lazy graph nodes
+            # that prevent pre-verify Metal buffers from being freed).
             _rnn_snapshots = {}
             if not optimistic:
                 for _ci, _c in enumerate(prompt_cache):
@@ -1350,12 +1353,19 @@ class Scheduler:
                 return
 
             prompt_tokens = list(request.prompt_token_ids)
+            # Trim cache by 1 so the stored KV has offset = N-1.
+            # On exact fetch the scheduler sends the last prompt token
+            # for reprocessing (lines 1872-1877).  Without this trim
+            # the last token would be placed at position N instead of N-1.
+            from .memory_cache import _trim_cache_offset
+
+            trimmed_cache = _trim_cache_offset(extracted_cache, 1)
             _t0 = _time.monotonic()
             # evict_prefixes=False: keep mid-prefill boundary entries so
             # that future requests with the same prefix but different
             # suffix get a prefix cache hit (critical for agentic multi-turn).
             stored = self.memory_aware_cache.store(
-                prompt_tokens, extracted_cache, evict_prefixes=False
+                prompt_tokens, trimmed_cache, evict_prefixes=False
             )
             _dt = _time.monotonic() - _t0
             if stored:

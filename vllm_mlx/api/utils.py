@@ -22,7 +22,7 @@ SPECIAL_TOKENS_PATTERN = re.compile(
     r"<\|channel\|>|<\|message\|>|<\|start\|>|<\|return\|>|<\|call\|>|<\|constrain\|>|"
     r"</s>|<s>|<pad>|\[PAD\]|\[SEP\]|\[CLS\]|"
     r"\[e~\[|\]~b\][a-z]*|\]~!b\[|"
-    r"</?tool_call>|</?tool_call_reasoning>"
+    r"</?tool_call_reasoning>"
 )
 
 

@@ -1590,14 +1590,20 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
     # Parse tool calls from output using configured parser
     cleaned_text, tool_calls = _parse_tool_calls_with_parser(output.text, request)
 
-    # Extract reasoning content FIRST (strips channel tokens before JSON extraction)
+    # Extract reasoning content (strips channel tokens before JSON extraction)
     # Skip reasoning parser when enable_thinking=False (no think tags expected)
     reasoning_text = None
-    if _reasoning_parser and not tool_calls and request.enable_thinking is not False:
-        text_to_parse = cleaned_text or output.text
-        reasoning_text, cleaned_text = _reasoning_parser.extract_reasoning(
+    if _reasoning_parser and request.enable_thinking is not False:
+        # Always use original output.text for reasoning extraction so
+        # <think> content is preserved even when tool calls are present.
+        text_to_parse = output.text
+        reasoning_text, remaining_text = _reasoning_parser.extract_reasoning(
             text_to_parse
         )
+        # Only update cleaned_text from reasoning parser when no tool calls
+        # (tool parser already set cleaned_text appropriately)
+        if not tool_calls:
+            cleaned_text = remaining_text
 
     # Process response_format if specified (after reasoning parser cleaned the text)
     if response_format and not tool_calls:

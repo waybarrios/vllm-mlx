@@ -775,6 +775,79 @@ class MLLMBatchGenerator:
             f"({processing_time:.2f}s)"
         )
 
+    @staticmethod
+    def _copy_prefix_cache(cache_list):
+        """Create shallow copies of cache objects to prevent mutation of stored prefix cache.
+
+        MLX arrays are immutable and safe to share, but cache objects have mutable
+        Python attributes (offset, _idx) that get modified by update_and_fetch().
+        Without copying, the stored prefix cache entry is corrupted after each use.
+        """
+        from mlx_lm.models.cache import KVCache, RotatingKVCache
+
+        copies = []
+        for c in cache_list:
+            if isinstance(c, RotatingKVCache):
+                new_c = RotatingKVCache(c.max_size, c.keep)
+                new_c.step = c.step
+                new_c.keys = c.keys
+                new_c.values = c.values
+                new_c.offset = c.offset
+                new_c._idx = c._idx
+                copies.append(new_c)
+            elif isinstance(c, KVCache):
+                new_c = KVCache()
+                new_c.step = c.step
+                new_c.keys = c.keys
+                new_c.values = c.values
+                new_c.offset = c.offset
+                copies.append(new_c)
+            else:
+                copies.append(c)
+        return copies
+
+    @staticmethod
+    def _has_empty_rotating_cache(cache_list):
+        """Check if any RotatingKVCache layer has no data (keys=None).
+
+        This happens when prefix cache stores a long response where all
+        sliding-window entries were trimmed (entries_to_keep=0).
+        Using such a cache produces garbage — fall through to full prefill.
+        """
+        from mlx_lm.models.cache import RotatingKVCache
+
+        for c in cache_list:
+            if isinstance(c, RotatingKVCache) and c.keys is None:
+                return True
+        return False
+
+    @staticmethod
+    def _trim_rotating_caches(cache_list):
+        """Trim RotatingKVCache buffers restored from prefix cache.
+
+        Prefix cache stores the full KV state (offset may exceed max_size for
+        sliding-window layers).  RotatingKVCache._update_in_place computes
+        ``new_size = min(step, max_size - prev)`` which goes negative when
+        ``prev > max_size``, crashing with "Negative dimensions not allowed".
+
+        Trimming the buffer to max_size and clamping offset/idx prevents this.
+        """
+        from mlx_lm.models.cache import RotatingKVCache
+
+        for layer_cache in cache_list:
+            if not isinstance(layer_cache, RotatingKVCache):
+                continue
+            if layer_cache.keys is None:
+                layer_cache.offset = 0
+                continue
+            buf_len = layer_cache.keys.shape[2]
+            if buf_len > layer_cache.max_size:
+                trim_size = buf_len - layer_cache.max_size
+                layer_cache.keys = layer_cache._trim(trim_size, layer_cache.keys)
+                layer_cache.values = layer_cache._trim(trim_size, layer_cache.values)
+                layer_cache._idx = layer_cache.max_size
+            layer_cache.offset = min(layer_cache.offset, layer_cache.max_size)
+
     def _run_chunked_text_prefill(
         self, request: MLLMBatchRequest, cache: List[Any]
     ) -> mx.array:
@@ -1001,9 +1074,22 @@ class MLLMBatchGenerator:
                             cached_kv = None
                             remaining_ids = None
 
+                # Detect empty RotatingKVCache in cached entry — if any sliding-window
+                # layer has keys=None (all entries trimmed), the cache is unusable.
+                # Fall through to full prefill instead of producing garbage.
+                if cached_kv is not None and self._has_empty_rotating_cache(cached_kv):
+                    logger.warning(
+                        f"Prefix cache hit for {req.request_id} has empty "
+                        f"RotatingKVCache layers — falling through to full prefill"
+                    )
+                    cached_kv = None
+                    remaining_ids = None
+
                 if cached_kv is not None and remaining_ids:
-                    # Prefix/LCP match — run language model on remaining tokens
-                    request_cache = cached_kv
+                    # Prefix/LCP match — run language model on remaining tokens.
+                    # Copy cache to prevent mutation of stored prefix cache entry.
+                    request_cache = self._copy_prefix_cache(cached_kv)
+                    self._trim_rotating_caches(request_cache)
                     remaining = mx.array(remaining_ids)[None, :]
                     cached_count = len(input_ids_list) - len(remaining_ids)
                     total_tokens = len(input_ids_list)
@@ -1081,7 +1167,9 @@ class MLLMBatchGenerator:
                     # but we still need logits for the last token.
                     # fetch() with trim-by-1 store always returns remaining=[last_token].
                     # If we get here (empty remaining), re-run on last token.
-                    request_cache = cached_kv
+                    # Copy cache to prevent mutation of stored prefix cache entry.
+                    request_cache = self._copy_prefix_cache(cached_kv)
+                    self._trim_rotating_caches(request_cache)
                     last_token = req.input_ids[:, -1:]
                     total_tokens = len(input_ids_list)
                     self._prefill_progress[req.request_id] = (
@@ -1173,19 +1261,10 @@ class MLLMBatchGenerator:
         from mlx_lm.models.cache import RotatingKVCache
 
         for rc in per_request_caches:
+            self._trim_rotating_caches(rc)
             for layer_cache in rc:
                 if isinstance(layer_cache, RotatingKVCache):
                     if layer_cache.keys is not None:
-                        buf_len = layer_cache.keys.shape[2]
-                        if buf_len > layer_cache.max_size:
-                            trim_size = buf_len - layer_cache.max_size
-                            layer_cache.keys = layer_cache._trim(
-                                trim_size, layer_cache.keys
-                            )
-                            layer_cache.values = layer_cache._trim(
-                                trim_size, layer_cache.values
-                            )
-                            layer_cache._idx = layer_cache.max_size
                         # Normalize wrapped rotating cache for merge:
                         # after rotation _idx wraps around but merge()
                         # expects _idx == actual buffer size.
