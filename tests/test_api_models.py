@@ -631,7 +631,7 @@ class TestModelSerialization:
         msg = AssistantMessage(content="Answer", reasoning="Thought")
         data = msg.model_dump()
         assert data["reasoning_content"] == "Thought"
-        assert data["reasoning"] == "Thought"
+        assert "reasoning" not in data
 
     def test_chat_completion_response_json(self):
         resp = ChatCompletionResponse(
@@ -650,6 +650,35 @@ class TestModelSerialization:
         delta = ChatCompletionChunkDelta(reasoning="thinking")
         data = delta.model_dump()
         assert data["reasoning_content"] == "thinking"
+        assert "reasoning" not in data
+
+    def test_chat_completion_response_serializes_reasoning_content_only(self):
+        resp = ChatCompletionResponse(
+            model="test-model",
+            choices=[
+                ChatCompletionChoice(
+                    message=AssistantMessage(content="Answer", reasoning="Thought")
+                )
+            ],
+        )
+        data = resp.model_dump()
+        message = data["choices"][0]["message"]
+        assert message["reasoning_content"] == "Thought"
+        assert "reasoning" not in message
+
+    def test_chat_completion_chunk_serializes_reasoning_content_only(self):
+        chunk = ChatCompletionChunk(
+            model="test-model",
+            choices=[
+                ChatCompletionChunkChoice(
+                    delta=ChatCompletionChunkDelta(reasoning="thinking"),
+                )
+            ],
+        )
+        data = chunk.model_dump()
+        delta = data["choices"][0]["delta"]
+        assert delta["reasoning_content"] == "thinking"
+        assert "reasoning" not in delta
 
     def test_response_format_json_schema_alias(self):
         schema = ResponseFormatJsonSchema(

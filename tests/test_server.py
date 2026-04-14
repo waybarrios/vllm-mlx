@@ -820,7 +820,8 @@ class TestStreamChatCompletion:
         ]
 
         assert payloads[0]["choices"][0]["delta"]["role"] == "assistant"
-        assert payloads[1]["choices"][0]["delta"]["reasoning"] == "reasoning"
+        assert payloads[1]["choices"][0]["delta"]["reasoning_content"] == "reasoning"
+        assert "reasoning" not in payloads[1]["choices"][0]["delta"]
         assert len(tool_payloads) == 1
         assert (
             tool_payloads[0]["choices"][0]["delta"]["tool_calls"][0]["function"]["name"]
@@ -923,7 +924,8 @@ class TestStreamChatCompletion:
         ]
 
         assert tool_parser.calls == []
-        assert payloads[1]["choices"][0]["delta"]["reasoning"] == "reasoning"
+        assert payloads[1]["choices"][0]["delta"]["reasoning_content"] == "reasoning"
+        assert "reasoning" not in payloads[1]["choices"][0]["delta"]
         assert payloads[2]["choices"][0]["delta"]["content"] == "final answer"
         assert payloads[2]["choices"][0]["finish_reason"] == "stop"
 

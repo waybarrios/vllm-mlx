@@ -12,7 +12,7 @@ These models define the request and response schemas for:
 import time
 import uuid
 
-from pydantic import BaseModel, Field, computed_field
+from pydantic import AliasChoices, BaseModel, Field
 
 # =============================================================================
 # Content Types (for multimodal messages)
@@ -193,16 +193,15 @@ class AssistantMessage(BaseModel):
 
     role: str = "assistant"
     content: str | None = None
-    reasoning: str | None = (
-        None  # Reasoning/thinking content (when --reasoning-parser is used)
+    reasoning_content: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("reasoning_content", "reasoning"),
     )
     tool_calls: list[ToolCall] | None = None
 
-    @computed_field
     @property
-    def reasoning_content(self) -> str | None:
-        """Alias for reasoning field. Serialized for backwards compatibility with clients expecting reasoning_content."""
-        return self.reasoning
+    def reasoning(self) -> str | None:
+        return self.reasoning_content
 
 
 class ChatCompletionChoice(BaseModel):
@@ -442,16 +441,15 @@ class ChatCompletionChunkDelta(BaseModel):
 
     role: str | None = None
     content: str | None = None
-    reasoning: str | None = (
-        None  # Reasoning/thinking content (when --reasoning-parser is used)
+    reasoning_content: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("reasoning_content", "reasoning"),
     )
     tool_calls: list[dict] | None = None
 
-    @computed_field
     @property
-    def reasoning_content(self) -> str | None:
-        """Alias for reasoning field. Serialized for backwards compatibility with clients expecting reasoning_content."""
-        return self.reasoning
+    def reasoning(self) -> str | None:
+        return self.reasoning_content
 
 
 class ChatCompletionChunkChoice(BaseModel):
