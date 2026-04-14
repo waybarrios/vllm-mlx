@@ -8,10 +8,13 @@ command injection attacks and other security vulnerabilities.
 
 import re
 import pytest
+from vllm_mlx.mcp import security as mcp_security
+from vllm_mlx.mcp.config import validate_config
 from vllm_mlx.mcp.security import (
     MCPCommandValidator,
     MCPSecurityError,
     ALLOWED_COMMANDS,
+    ALLOW_UNSAFE_ENV_VAR,
     ToolSandbox,
     ToolExecutionAudit,
 )
@@ -250,6 +253,15 @@ class TestUnsafeMode:
         # These should not raise
         validator.validate_args(["; rm -rf /"], "test")
 
+    def test_env_var_enables_global_unsafe_validator(self, monkeypatch):
+        """Test that unsafe mode can only be enabled via environment."""
+        monkeypatch.setenv(ALLOW_UNSAFE_ENV_VAR, "1")
+        monkeypatch.setattr(mcp_security, "_validator", None)
+
+        validator = mcp_security.get_validator()
+
+        validator.validate_command("bash", "test")
+
 
 class TestCustomWhitelist:
     """Tests for custom command whitelist."""
@@ -328,17 +340,24 @@ class TestMCPServerConfigSecurity:
         )
         assert config.url == "https://api.example.com/mcp"
 
-    def test_skip_security_validation(self):
-        """Test that skip_security_validation allows any command (with warning)."""
-        # This should not raise even with dangerous command
-        config = MCPServerConfig(
-            name="unsafe-server",
-            transport=MCPTransport.STDIO,
-            command="bash",
-            args=["-c", "echo hello"],
-            skip_security_validation=True,
-        )
-        assert config.command == "bash"
+    def test_skip_security_validation_field_rejected(self):
+        """Test that config-file security bypass is rejected explicitly."""
+        with pytest.raises(ValueError) as exc_info:
+            validate_config(
+                {
+                    "servers": {
+                        "unsafe-server": {
+                            "transport": "stdio",
+                            "command": "bash",
+                            "args": ["-c", "echo hello"],
+                            "skip_security_validation": True,
+                        }
+                    }
+                }
+            )
+
+        assert "skip_security_validation" in str(exc_info.value)
+        assert ALLOW_UNSAFE_ENV_VAR in str(exc_info.value)
 
 
 class TestDefaultWhitelist:

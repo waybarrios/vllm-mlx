@@ -128,6 +128,11 @@ def validate_config(data: Dict[str, Any]) -> MCPConfig:
             # Ensure name is set
             if isinstance(server_data, dict):
                 server_data = server_data.copy()
+                if "skip_security_validation" in server_data:
+                    raise ValueError(
+                        f"Server '{name}' uses removed field 'skip_security_validation'. "
+                        "Use environment variable VLLM_MCP_ALLOW_UNSAFE=1 for explicit local development bypasses."
+                    )
                 server_data["name"] = name
                 servers[name] = MCPServerConfig(**server_data)
             else:

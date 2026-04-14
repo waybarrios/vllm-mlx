@@ -19,6 +19,8 @@ from typing import Any, Callable, Dict, List, Optional, Set
 
 logger = logging.getLogger(__name__)
 
+ALLOW_UNSAFE_ENV_VAR = "VLLM_MCP_ALLOW_UNSAFE"
+
 # Whitelist of allowed MCP server commands
 # These are well-known, trusted MCP server executables
 ALLOWED_COMMANDS: Set[str] = {
@@ -299,7 +301,9 @@ def get_validator() -> MCPCommandValidator:
     """Get the global command validator instance."""
     global _validator
     if _validator is None:
-        _validator = MCPCommandValidator()
+        _validator = MCPCommandValidator(
+            allow_unsafe=os.environ.get(ALLOW_UNSAFE_ENV_VAR) == "1"
+        )
     return _validator
 
 
