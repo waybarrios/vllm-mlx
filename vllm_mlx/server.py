@@ -229,6 +229,37 @@ _STREAMING_TOOL_MARKERS = (
 )
 
 
+def _sanitize_log_text(value: object, limit: int | None = None) -> str:
+    """Escape control characters before logging untrusted text."""
+    text = str(value)
+    escaped: list[str] = []
+    for ch in text:
+        if ch == "\n":
+            escaped.append("\\n")
+        elif ch == "\r":
+            escaped.append("\\r")
+        elif ch == "\t":
+            escaped.append("\\t")
+        elif ch.isprintable():
+            escaped.append(ch)
+        else:
+            code = ord(ch)
+            if code <= 0xFF:
+                escaped.append(f"\\x{code:02x}")
+            else:
+                escaped.append(f"\\u{code:04x}")
+    sanitized = "".join(escaped)
+    if limit is not None and len(sanitized) > limit:
+        return sanitized[:limit] + "..."
+    return sanitized
+
+
+def _log_and_raise_internal_error(log_prefix: str, exc: Exception, detail: str) -> None:
+    """Log a sanitized exception string and raise a generic 500 response."""
+    logger.error("%s: %s", log_prefix, _sanitize_log_text(exc, limit=500))
+    raise HTTPException(status_code=500, detail=detail)
+
+
 def _load_prefix_cache_from_disk() -> None:
     """Load prefix cache from disk during startup."""
     try:
@@ -240,7 +271,10 @@ def _load_prefix_cache_from_disk() -> None:
         else:
             logger.info("[lifespan] No prefix cache entries found on disk")
     except Exception as e:
-        logger.warning(f"[lifespan] Failed to load cache from disk: {e}", exc_info=True)
+        logger.warning(
+            "[lifespan] Failed to load cache from disk: %s",
+            _sanitize_log_text(e, limit=500),
+        )
 
 
 def _save_prefix_cache_to_disk() -> None:
@@ -254,7 +288,10 @@ def _save_prefix_cache_to_disk() -> None:
         else:
             logger.info("[lifespan] No cache to save")
     except Exception as e:
-        logger.warning(f"[lifespan] Failed to save cache to disk: {e}", exc_info=True)
+        logger.warning(
+            "[lifespan] Failed to save cache to disk: %s",
+            _sanitize_log_text(e, limit=500),
+        )
 
 
 def _get_cache_dir() -> str:
@@ -569,7 +606,9 @@ def _parse_tool_calls_with_parser(
             logger.info(f"Initialized tool call parser: {_tool_call_parser}")
         except Exception as e:
             logger.warning(
-                f"Failed to initialize tool parser '{_tool_call_parser}': {e}"
+                "Failed to initialize tool parser '%s': %s",
+                _tool_call_parser,
+                _sanitize_log_text(e, limit=500),
             )
             logger.warning("Falling back to generic parser")
             return parse_tool_calls(output_text, request_dict)
@@ -600,7 +639,7 @@ def _parse_tool_calls_with_parser(
             # try generic parser which handles more formats (e.g. Nemotron XML)
             return parse_tool_calls(output_text, request_dict)
     except Exception as e:
-        logger.warning(f"Tool parser error: {e}")
+        logger.warning("Tool parser error: %s", _sanitize_log_text(e, limit=500))
         return parse_tool_calls(output_text, request_dict)
 
 
@@ -1508,7 +1547,10 @@ def _detect_native_tool_support() -> bool:
         return False
     except Exception as e:
         # Unexpected error during detection
-        logger.warning(f"Failed to detect native tool support: {e}")
+        logger.warning(
+            "Failed to detect native tool support: %s",
+            _sanitize_log_text(e, limit=500),
+        )
         return False
 
 
@@ -1944,8 +1986,11 @@ async def create_embeddings(request: EmbeddingRequest) -> EmbeddingResponse:
         raise
     except Exception as e:
         tracker.finish(result="error")
-        logger.error(f"Embedding generation failed: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        _log_and_raise_internal_error(
+            "Embedding generation failed",
+            e,
+            "Embedding generation failed",
+        )
 
 
 # =============================================================================
@@ -2099,8 +2144,11 @@ async def create_transcription(
         raise
     except Exception as e:
         tracker.finish(result="error")
-        logger.error(f"Transcription failed: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        _log_and_raise_internal_error(
+            "Transcription failed",
+            e,
+            "Transcription failed",
+        )
 
 
 @app.post("/v1/audio/speech", dependencies=[Depends(verify_api_key)])
@@ -2154,8 +2202,11 @@ async def create_speech(
         raise
     except Exception as e:
         tracker.finish(result="error")
-        logger.error(f"TTS generation failed: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        _log_and_raise_internal_error(
+            "TTS generation failed",
+            e,
+            "Speech generation failed",
+        )
 
 
 @app.get("/v1/audio/voices", dependencies=[Depends(verify_api_key)])
@@ -2431,7 +2482,8 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
         f"top_p={request.top_p} top_k={request.top_k} min_p={request.min_p} "
         f"presence_penalty={request.presence_penalty} "
         f"repetition_penalty={request.repetition_penalty} "
-        f"prompt_chars={prompt_len} prompt_preview={prompt_preview!r}"
+        f"prompt_chars={prompt_len} "
+        f"prompt_preview={_sanitize_log_text(prompt_preview, limit=200)}"
     )
 
     # Resolve repetition penalty for completions
@@ -2604,7 +2656,10 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
         f"total_chars={total_chars} tools={n_tools} "
         f"response_format={request.response_format}"
     )
-    logger.info(f"[REQUEST] last user message preview: {last_user_preview!r}")
+    logger.info(
+        "[REQUEST] last user message preview: %s",
+        _sanitize_log_text(last_user_preview, limit=300),
+    )
 
     # For MLLM models, keep original messages with embedded images
     # (MLLM.chat() extracts images from message content internally)
@@ -3057,7 +3112,10 @@ async def create_anthropic_message(
         f"msgs={n_msgs} total_chars={total_chars} system_chars={sys_chars} "
         f"tools={n_tools}"
     )
-    logger.info(f"[REQUEST] last user message preview: {last_user_preview!r}")
+    logger.info(
+        "[REQUEST] last user message preview: %s",
+        _sanitize_log_text(last_user_preview, limit=300),
+    )
 
     # Convert Anthropic request -> OpenAI request
     openai_request = anthropic_to_openai(anthropic_request)
@@ -4246,7 +4304,7 @@ async def init_mcp(config_path: str):
         logger.error("MCP SDK not installed. Install with: pip install mcp")
         raise
     except Exception as e:
-        logger.error(f"Failed to initialize MCP: {e}")
+        logger.error("Failed to initialize MCP: %s", _sanitize_log_text(e, limit=500))
         raise
 
 
