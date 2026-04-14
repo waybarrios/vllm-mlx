@@ -159,3 +159,117 @@ class TestRerankAdapterContract:
         )
         assert "input_ids" in result
         assert "attention_mask" in result
+
+
+# =============================================================================
+# Unit Tests - RerankEngine
+# =============================================================================
+
+
+class TestRerankEngine:
+    """Test the RerankEngine model loading and scoring."""
+
+    def test_engine_not_loaded_initially(self):
+        """Test that a new engine reports is_loaded=False."""
+        from vllm_mlx.rerank import RerankEngine
+
+        engine = RerankEngine("test-model")
+        assert engine.is_loaded is False
+
+    def test_engine_model_name_stored(self):
+        """Test that model_name is stored on construction."""
+        from vllm_mlx.rerank import RerankEngine
+
+        engine = RerankEngine("mlx-community/jina-reranker-v2-base-multilingual")
+        assert engine.model_name == "mlx-community/jina-reranker-v2-base-multilingual"
+
+    def test_score_pairs_returns_normalized_scores(self):
+        """Test score_pairs returns sigmoid-normalized scores for each pair."""
+        import math
+
+        import numpy as np
+
+        from vllm_mlx.rerank import RerankEngine, SigmoidAdapter
+
+        engine = RerankEngine("test-model")
+
+        # Mock model: returns logits with shape (batch, num_labels)
+        mock_model = MagicMock()
+        # Simulate two pairs scored: logits [2.0, ...] and [-1.0, ...]
+        mock_logits = MagicMock()
+        mock_logits.tolist.return_value = [[2.0, 0.5], [-1.0, 0.3]]
+        mock_model.return_value = MagicMock(logits=mock_logits)
+
+        mock_tokenizer = MagicMock()
+        mock_tokenizer.return_value = {
+            "input_ids": np.array([[1, 2, 3], [4, 5, 6]]),
+            "attention_mask": np.array([[1, 1, 1], [1, 1, 1]]),
+        }
+
+        engine._model = mock_model
+        engine._tokenizer = mock_tokenizer
+        engine._adapter = SigmoidAdapter()
+
+        scores = engine.score_pairs("test query", ["doc one", "doc two"])
+        assert len(scores) == 2
+        expected_0 = 1.0 / (1.0 + math.exp(-2.0))
+        expected_1 = 1.0 / (1.0 + math.exp(1.0))
+        assert abs(scores[0] - expected_0) < 1e-6
+        assert abs(scores[1] - expected_1) < 1e-6
+
+    def test_score_pairs_token_budget_batching(self):
+        """Test that score_pairs splits work into batches by token budget."""
+        import numpy as np
+
+        from vllm_mlx.rerank import RerankEngine, SigmoidAdapter
+
+        engine = RerankEngine("test-model", token_budget=10)
+
+        mock_model = MagicMock()
+        mock_tokenizer = MagicMock()
+
+        # Each call returns 1 pair. We have 3 documents.
+        # With token_budget=10 and each pair using 5 tokens, we get batches of 2 then 1.
+        call_count = 0
+
+        def mock_tokenize(query, doc, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            return {
+                "input_ids": np.array([[1, 2, 3, 4, 5]]),
+                "attention_mask": np.array([[1, 1, 1, 1, 1]]),
+            }
+
+        mock_tokenizer.side_effect = mock_tokenize
+
+        def mock_forward(input_ids, **kwargs):
+            # Return logits matching the batch dimension of input_ids
+            batch_size = input_ids.shape[0]
+            mock_logits = MagicMock()
+            mock_logits.tolist.return_value = [[0.5]] * batch_size
+            return MagicMock(logits=mock_logits)
+
+        mock_model.side_effect = mock_forward
+
+        engine._model = mock_model
+        engine._tokenizer = mock_tokenizer
+        engine._adapter = SigmoidAdapter()
+
+        scores = engine.score_pairs("q", ["d1", "d2", "d3"])
+        assert len(scores) == 3
+        # tokenizer called once per document (for budget estimation + scoring)
+        assert call_count == 3
+
+    def test_count_tokens_pair(self):
+        """Test token counting for a query-document pair."""
+        from vllm_mlx.rerank import RerankEngine
+
+        engine = RerankEngine("test-model")
+        mock_tokenizer = MagicMock()
+        mock_tokenizer.return_value = {"input_ids": [[1, 2, 3, 4, 5, 6, 7]]}
+        engine._tokenizer = mock_tokenizer
+        engine._model = MagicMock()  # mark as loaded
+
+        count = engine.count_tokens("query text", ["doc one", "doc two"])
+        # tokenizer called twice (once per doc), 7 tokens each = 14
+        assert count == 14
