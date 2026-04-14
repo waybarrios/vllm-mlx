@@ -309,3 +309,60 @@ class TestLayerSerializer:
     def test_get_serializer_unknown_raises(self):
         with pytest.raises(ValueError, match="Unsupported"):
             get_serializer_for_layer("not a cache layer")
+
+
+from vllm_mlx.ssd_cache import SSDCacheTier
+
+
+class TestSSDCacheTierCore:
+    """Tests for SSDCacheTier initialization and directory setup."""
+
+    def test_init_creates_directory(self, tmp_path):
+        cache_dir = str(tmp_path / "ssd_tier_test")
+        config = SSDCacheConfig(cache_dir=cache_dir)
+        tier = SSDCacheTier(config)
+        try:
+            assert os.path.isdir(cache_dir)
+            assert os.path.exists(os.path.join(cache_dir, "data"))
+            assert os.path.exists(os.path.join(cache_dir, "index.db"))
+        finally:
+            tier.close()
+
+    def test_dir_permissions(self, tmp_path):
+        cache_dir = str(tmp_path / "ssd_tier_perms")
+        config = SSDCacheConfig(cache_dir=cache_dir, dir_permissions=0o700)
+        tier = SSDCacheTier(config)
+        try:
+            stat = os.stat(os.path.join(cache_dir, "data"))
+            # Check owner permissions (at least rwx for owner)
+            assert stat.st_mode & 0o700 == 0o700
+        finally:
+            tier.close()
+
+    def test_entry_hash_deterministic(self):
+        tokens = (1, 2, 3, 4, 5)
+        h1 = SSDCacheTier._entry_hash(tokens)
+        h2 = SSDCacheTier._entry_hash(tokens)
+        assert h1 == h2
+        assert len(h1) == 64  # SHA-256 hex digest
+
+    def test_entry_hash_different_for_different_tokens(self):
+        h1 = SSDCacheTier._entry_hash((1, 2, 3))
+        h2 = SSDCacheTier._entry_hash((1, 2, 4))
+        assert h1 != h2
+
+    def test_stats_initial(self, tmp_path):
+        config = SSDCacheConfig(cache_dir=str(tmp_path / "stats_test"))
+        tier = SSDCacheTier(config)
+        try:
+            stats = tier.get_stats()
+            assert stats["spill_count"] == 0
+            assert stats["ssd_hits"] == 0
+        finally:
+            tier.close()
+
+    def test_close_idempotent(self, tmp_path):
+        config = SSDCacheConfig(cache_dir=str(tmp_path / "close_test"))
+        tier = SSDCacheTier(config)
+        tier.close()
+        tier.close()  # Should not raise

@@ -23,6 +23,7 @@ import json
 import logging
 import os
 import sqlite3
+import threading
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
@@ -486,3 +487,60 @@ def get_serializer_for_layer(layer: Any) -> LayerSerializer:
         f"Unsupported cache layer type: {type(layer).__name__}. "
         f"Supported: {list(SERIALIZER_SUPPORT_MATRIX.keys())}"
     )
+
+
+class SSDCacheTier:
+    """Cold-tier disk cache for KV cache entries.
+
+    Manages a SQLite-indexed on-disk cache directory. Evicted RAM entries
+    are spilled here via an async writer thread. Cold-tier fetches reload
+    from disk asynchronously with RAM budget reservation.
+
+    Directory layout::
+
+        cache_dir/
+          index.db           # SQLite metadata index
+          data/              # safetensors files per entry
+            {hash}/          # one directory per entry
+              layer_0.safetensors
+              layer_1.safetensors
+              manifest.json  # per-entry layer metadata
+    """
+
+    def __init__(self, config: SSDCacheConfig) -> None:
+        self._config = config
+
+        if config.cache_dir is None:
+            raise ValueError("SSDCacheConfig.cache_dir must be set")
+
+        self._cache_dir = config.cache_dir
+        self._data_dir = os.path.join(self._cache_dir, "data")
+
+        # Create directory structure
+        os.makedirs(self._cache_dir, mode=config.dir_permissions, exist_ok=True)
+        os.makedirs(self._data_dir, mode=config.dir_permissions, exist_ok=True)
+
+        # Open SQLite index
+        self._index = SSDIndex(self._cache_dir)
+
+        # Stats
+        self._stats = SSDCacheStats()
+        self._lock = threading.Lock()
+        self._closed = False
+
+    @staticmethod
+    def _entry_hash(tokens: tuple[int, ...]) -> str:
+        """Compute deterministic hash for a token sequence."""
+        return _tokens_hash(tokens)
+
+    def get_stats(self) -> dict:
+        """Return current SSD cache statistics."""
+        return self._stats.to_dict()
+
+    def close(self) -> None:
+        """Close the SSD cache tier and release resources."""
+        if self._closed:
+            return
+        self._closed = True
+        self._index.close()
+        logger.info("[ssd_cache] SSDCacheTier closed")
