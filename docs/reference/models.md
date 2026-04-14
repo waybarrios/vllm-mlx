@@ -55,7 +55,7 @@ Browse thousands of pre-optimized models at: **https://huggingface.co/mlx-commun
 | Model Family | Example Models |
 |--------------|----------------|
 | **BERT** | `mlx-community/bert-base-uncased-mlx` |
-| **XLM-RoBERTa** | `mlx-community/multilingual-e5-small-mlx`, `multilingual-e5-large-mlx` |
+| **XLM-RoBERTa** | `mlx-community/multilingual-e5-small-mlx`, `mlx-community/multilingual-e5-large-mlx` |
 | **ModernBERT** | `mlx-community/ModernBERT-base-mlx` |
 
 ## Audio Models (via mlx-audio)

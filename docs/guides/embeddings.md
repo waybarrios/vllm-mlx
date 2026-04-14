@@ -17,7 +17,7 @@ pip install mlx-embeddings>=0.0.5
 vllm-mlx serve my-llm-model --embedding-model mlx-community/all-MiniLM-L6-v2-4bit
 ```
 
-If you don't use `--embedding-model`, the embedding model is loaded lazily on the first request.
+If you don't use `--embedding-model`, the embedding model is loaded lazily on the first request, but only from the built-in request-time allowlist.
 
 ### Generate embeddings with the OpenAI SDK
 
@@ -59,19 +59,25 @@ curl http://localhost:8000/v1/embeddings \
 
 ## Supported Models
 
-Any BERT, XLM-RoBERTa, or ModernBERT model from HuggingFace that is compatible with mlx-embeddings:
+Supported request-time models:
 
 | Model | Use Case | Size |
 |-------|----------|------|
 | `mlx-community/all-MiniLM-L6-v2-4bit` | Fast, compact | Small |
 | `mlx-community/embeddinggemma-300m-6bit` | High quality | 300M |
 | `mlx-community/bge-large-en-v1.5-4bit` | Best for English | Large |
+| `mlx-community/multilingual-e5-small-mlx` | Multilingual retrieval | Small |
+| `mlx-community/multilingual-e5-large-mlx` | Multilingual retrieval | Large |
+| `mlx-community/bert-base-uncased-mlx` | General BERT baseline | Base |
+| `mlx-community/ModernBERT-base-mlx` | ModernBERT baseline | Base |
+
+Other embedding models require `--embedding-model` at server startup.
 
 ## Model Management
 
 ### Lazy loading
 
-By default, the embedding model is loaded on the first `/v1/embeddings` request. You can switch models between requests and the previous model will be unloaded automatically.
+By default, the embedding model is loaded on the first `/v1/embeddings` request. You can switch between the supported request-time models above, and the previous model will be unloaded automatically.
 
 ### Pre-loading at startup
 
@@ -93,7 +99,7 @@ Create embeddings for the given input text(s).
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `model` | string | Yes | Model name from HuggingFace |
+| `model` | string | Yes | Supported embedding model ID, or the startup-pinned model when `--embedding-model` is used |
 | `input` | string or list[string] | Yes | Text(s) to embed |
 
 **Response:**
@@ -137,7 +143,7 @@ pip install mlx-embeddings>=0.0.5
 
 ### Model not found
 
-Make sure the model name matches a HuggingFace repository compatible with mlx-embeddings. You can pre-download models:
+Make sure the model name matches one of the supported request-time IDs above, or start the server with `--embedding-model` to pin a custom model. You can pre-download supported models:
 
 ```bash
 huggingface-cli download mlx-community/all-MiniLM-L6-v2-4bit
