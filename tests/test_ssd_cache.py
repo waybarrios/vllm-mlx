@@ -87,7 +87,6 @@ class TestSSDCacheStats:
 
 
 import os
-import tempfile
 
 from vllm_mlx.ssd_cache import SSDIndex
 
