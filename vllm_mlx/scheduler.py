@@ -1765,16 +1765,13 @@ class Scheduler:
                     f"time={_fetch_dt:.3f}s entries={len(self.memory_aware_cache._entries)}"
                 )
                 # Check SSD tier for cold-tier hit
-                if (
-                    hasattr(self, "_ssd_tier")
-                    and self._ssd_tier is not None
-                    and self.memory_aware_cache.check_ssd(request.prompt_token_ids)
-                    is not None
-                ):
-                    request.cache_hit_type = "ssd_pending"
-                    request._ssd_candidate = self.memory_aware_cache.check_ssd(
+                if hasattr(self, "_ssd_tier") and self._ssd_tier is not None:
+                    ssd_candidate = self.memory_aware_cache.check_ssd(
                         request.prompt_token_ids
                     )
+                    if ssd_candidate is not None:
+                        request.cache_hit_type = "ssd_pending"
+                        request._ssd_candidate = ssd_candidate
         elif self.prefix_cache is not None:
             # Use legacy prefix cache
             cache, remaining = self.prefix_cache.fetch_cache(request.prompt_token_ids)
@@ -1903,6 +1900,12 @@ class Scheduler:
         Returns:
             List of requests that were scheduled
         """
+        # Attempt synchronous SSD promotion for any ssd_pending requests
+        # before scheduling. This keeps SSD I/O out of fetch() while
+        # avoiding engine modifications.
+        if hasattr(self, "_ssd_tier") and self._ssd_tier is not None:
+            self._try_promote_ssd_pending()
+
         scheduled = []
 
         while self.waiting and len(self.running) < self.config.max_num_seqs:
@@ -2632,6 +2635,9 @@ class Scheduler:
         if self.prefix_cache is not None:
             self.prefix_cache.clear()
 
+        # Close SSD tier on reset
+        self.close_ssd_tier()
+
     def deep_reset(self) -> None:
         """
         Deep reset that clears ALL cache state including model-level caches.
@@ -2687,12 +2693,95 @@ class Scheduler:
             self._ssd_tier = None
             logger.info("SSD cache tier closed")
 
-    async def promote_from_ssd(self, request) -> bool:
-        """Promote a cold-tier cache entry for a request.
+    def _try_promote_ssd_pending(self) -> None:
+        """Attempt synchronous SSD promotion for waiting requests tagged ssd_pending.
 
-        Called by the engine's scheduling loop when request.cache_hit_type
-        is 'ssd_pending'. This runs the async SSD read with RAM budget
-        reservation.
+        Called from _schedule_waiting() before requests are moved to running.
+        Reads SSD entries synchronously (disk I/O stays out of fetch() per spec).
+        """
+        for request in self.waiting:
+            if getattr(request, "cache_hit_type", None) != "ssd_pending":
+                continue
+
+            candidate = getattr(request, "_ssd_candidate", None)
+            if candidate is None:
+                continue
+
+            memory_bytes = candidate["memory_bytes"]
+
+            # Check RAM budget availability
+            if self.memory_aware_cache is None:
+                request.cache_hit_type = "miss"
+                continue
+
+            if (
+                self.memory_aware_cache._current_memory + memory_bytes
+                > self.memory_aware_cache._max_memory
+            ):
+                self._ssd_tier._stats.promotion_failures += 1
+                request.cache_hit_type = "miss"
+                logger.info(
+                    f"[ssd_promote] request={request.request_id[:12]} "
+                    f"budget denied ({memory_bytes} bytes)"
+                )
+                continue
+
+            # Tentatively reserve budget
+            self.memory_aware_cache._current_memory += memory_bytes
+
+            tokens = tuple(request.prompt_token_ids)
+            try:
+                cache_layers = self._ssd_tier._read_entry(
+                    tokens, candidate["file_path"]
+                )
+            except Exception:
+                # Release tentative budget on read failure
+                self.memory_aware_cache._current_memory -= memory_bytes
+                self._ssd_tier._stats.promotion_failures += 1
+                request.cache_hit_type = "miss"
+                logger.exception(
+                    f"[ssd_promote] request={request.request_id[:12]} "
+                    f"disk read failed"
+                )
+                continue
+
+            if cache_layers is None:
+                self.memory_aware_cache._current_memory -= memory_bytes
+                self._ssd_tier._stats.promotion_failures += 1
+                request.cache_hit_type = "miss"
+                continue
+
+            # Release tentative budget (store() will account properly)
+            self.memory_aware_cache._current_memory -= memory_bytes
+
+            # Reconstruct and store
+            reconstructed = self._reconstruct_ssd_layers(cache_layers)
+            if reconstructed is None:
+                request.cache_hit_type = "miss"
+                continue
+
+            self.memory_aware_cache.store(
+                list(tokens), reconstructed, evict_prefixes=False
+            )
+
+            request.prompt_cache = reconstructed
+            request.cached_tokens = len(tokens)
+            request.remaining_tokens = []
+            request.cache_hit_type = "ssd_hit"
+
+            self._ssd_tier._stats.ssd_hits += 1
+            self._ssd_tier._index.touch(tokens)
+
+            logger.info(
+                f"[ssd_promote] request={request.request_id[:12]} "
+                f"promoted {len(tokens)} tokens from SSD"
+            )
+
+    async def promote_from_ssd(self, request) -> bool:
+        """Promote a cold-tier cache entry for a request (async version).
+
+        Alternative to _try_promote_ssd_pending() for callers with an
+        async event loop. Uses asyncio.to_thread for non-blocking disk I/O.
 
         Returns True if promotion succeeded and request was updated.
         """
@@ -2704,17 +2793,21 @@ class Scheduler:
             return False
 
         def reserve_budget(nbytes: int) -> bool:
-            """Check if RAM cache has room for the promoted entry."""
+            """Tentatively reserve RAM budget for promotion."""
             if self.memory_aware_cache is None:
                 return False
-            return (
+            if (
                 self.memory_aware_cache._current_memory + nbytes
-                <= self.memory_aware_cache._max_memory
-            )
+                > self.memory_aware_cache._max_memory
+            ):
+                return False
+            self.memory_aware_cache._current_memory += nbytes
+            return True
 
         def release_budget(nbytes: int) -> None:
-            """No-op: budget was never actually allocated to an entry."""
-            pass
+            """Release tentatively reserved budget on failure."""
+            if self.memory_aware_cache is not None:
+                self.memory_aware_cache._current_memory -= nbytes
 
         tokens = tuple(request.prompt_token_ids)
         cache_layers = await self._ssd_tier.async_promote(
@@ -2724,6 +2817,9 @@ class Scheduler:
         if cache_layers is None:
             request.cache_hit_type = "miss"
             return False
+
+        # Release tentative budget — store() will account properly
+        release_budget(candidate["memory_bytes"])
 
         # Reconstruct cache objects from deserialized layer dicts
         reconstructed = self._reconstruct_ssd_layers(cache_layers)
