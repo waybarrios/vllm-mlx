@@ -8,6 +8,7 @@ performance when serving a single user at a time.
 
 import asyncio
 import logging
+import time
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -78,6 +79,7 @@ class SimpleEngine(BaseEngine):
             specprefill_draft_model: Path to small draft model for importance scoring
         """
         self._model_name = model_name
+        self._created_at = time.time()
         self._trust_remote_code = trust_remote_code
         self._enable_cache = enable_cache
         self._is_mllm = force_mllm or is_mllm_model(model_name)
@@ -1288,6 +1290,7 @@ class SimpleEngine(BaseEngine):
         stats = {
             "engine_type": "simple",
             "model_name": self._model_name,
+            "uptime_seconds": time.time() - self._created_at,
             "is_mllm": self._is_mllm,
             "loaded": self._loaded,
         }

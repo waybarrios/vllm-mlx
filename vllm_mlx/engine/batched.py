@@ -12,6 +12,7 @@ LLM engine), so text-only requests must also be routed through it.
 """
 
 import logging
+import time
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -152,6 +153,7 @@ class BatchedEngine(BaseEngine):
                 limit and emergency threshold (0.0-1.0, default 0.90)
         """
         self._model_name = model_name
+        self._created_at = time.time()
         self._trust_remote_code = trust_remote_code
         self._scheduler_config = scheduler_config
         self._stream_interval = stream_interval
@@ -878,6 +880,7 @@ class BatchedEngine(BaseEngine):
         stats = {
             "engine_type": "batched",
             "model_name": self._model_name,
+            "uptime_seconds": time.time() - self._created_at,
             "is_mllm": self._is_mllm,
             "loaded": self._loaded,
             "stream_interval": self._stream_interval,
