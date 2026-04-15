@@ -84,6 +84,24 @@ class GuidedDecodingFactory:
                 "Structured output guided decoding requires the 'outlines' package"
             ) from exc
 
+        # Outlines TransformerTokenizer reads eos_token_id, eos_token, and
+        # all_special_tokens from tokenizer._tokenizer (the raw backend).
+        # Modern transformers keeps these on the wrapper only. Patch them
+        # onto the raw backend so Outlines can find them.
+        inner = getattr(tokenizer, "_tokenizer", None)
+        if inner is not None:
+            for attr in (
+                "eos_token_id",
+                "eos_token",
+                "pad_token_id",
+                "pad_token",
+                "all_special_tokens",
+            ):
+                if not hasattr(inner, attr):
+                    val = getattr(tokenizer, attr, None)
+                    if val is not None:
+                        setattr(inner, attr, val)
+
         self._outlines_model = from_mlxlm(model, tokenizer)
 
     def build_processors(
@@ -102,4 +120,74 @@ class GuidedDecodingFactory:
             self._outlines_model,
             json.dumps(schema, separators=(",", ":"), ensure_ascii=False),
         )
+        # Wrap: BatchGenerator passes (tokens: list, logits: mx.array) but
+        # Outlines expects (input_ids: mx.array, logits: mx.array).
+        return [_wrap_outlines_processor(processor)]
+
+    def build_raw_processors(
+        self,
+        response_format: Any | dict[str, Any] | None,
+    ) -> list[Any] | None:
+        """Build raw Outlines processors for serial stream_generate path.
+
+        The serial path in mlx-lm already handles token tracking and passes
+        (tokens: mx.array, logits: mx.array) — no wrapping needed.
+        """
+        schema = response_format_to_schema(response_format)
+        if schema is None:
+            return None
+
+        from outlines.backends import get_json_schema_logits_processor
+
+        processor = get_json_schema_logits_processor(
+            None,
+            self._outlines_model,
+            json.dumps(schema, separators=(",", ":"), ensure_ascii=False),
+        )
         return [processor]
+
+
+def _wrap_outlines_processor(processor):
+    """Adapt Outlines processor to BatchGenerator's (list, mx.array) interface.
+
+    BatchGenerator passes the full token history (prompt + generated) but
+    Outlines' FSM expects only generated tokens. Track the prompt length
+    on the first call and slice subsequent calls to generated-only.
+    """
+    import mlx.core as mx
+
+    prompt_len = None
+
+    def wrapped(token_ids, logits):
+        nonlocal prompt_len
+        import logging
+
+        _log = logging.getLogger("vllm_mlx.guided_decoding")
+        if isinstance(token_ids, list):
+            if prompt_len is None:
+                prompt_len = len(token_ids)
+                _log.info("Guided wrapper: prompt_len=%d", prompt_len)
+            generated = token_ids[prompt_len:]
+            _log.info(
+                "Guided wrapper: generated=%d tokens, first_few=%s",
+                len(generated),
+                generated[:5],
+            )
+            token_ids = (
+                mx.array(generated, dtype=mx.int32)
+                if generated
+                else mx.zeros((0,), dtype=mx.int32)
+            )
+        result = processor(token_ids, logits)
+        # Debug: check if masking is effective
+        if _log.isEnabledFor(logging.DEBUG):
+            import numpy as np
+
+            r = np.array(
+                result.tolist()[0] if len(result.shape) == 2 else result.tolist()
+            )
+            finite = np.isfinite(r)
+            _log.debug("Guided: %d/%d tokens allowed (non-inf)", finite.sum(), len(r))
+        return result
+
+    return wrapped
