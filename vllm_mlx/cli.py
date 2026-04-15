@@ -68,6 +68,9 @@ def serve_command(args):
     if args.default_top_p is not None:
         server._default_top_p = args.default_top_p
 
+    # Configure audio extraction from video
+    server._extract_audio_from_video = args.extract_audio_from_video
+
     # Configure reasoning parser
     if args.reasoning_parser:
         try:
@@ -942,6 +945,12 @@ Examples:
         "--mllm",
         action="store_true",
         help="Force load model as multimodal (vision) even if name doesn't match auto-detection patterns",
+    )
+    serve_parser.add_argument(
+        "--extract-audio-from-video",
+        action="store_true",
+        help="Extract audio track from video inputs and pass to the model. "
+        "Requires ffmpeg. Only useful for models with audio support (e.g. Gemma 4).",
     )
     # Generation defaults
     serve_parser.add_argument(

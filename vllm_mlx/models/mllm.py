@@ -1363,6 +1363,7 @@ class MLXMultimodalLM:
         # Pop params early so they don't leak into mlx_vlm.generate()
         video_fps = kwargs.pop("video_fps", DEFAULT_FPS)
         video_max_frames = kwargs.pop("video_max_frames", MAX_FRAMES)
+        extract_audio_from_video = kwargs.pop("extract_audio_from_video", False)
         tools = kwargs.pop("tools", None)
         use_cache = kwargs.pop("use_cache", True)
         enable_thinking = kwargs.pop("enable_thinking", True)
@@ -1395,13 +1396,14 @@ class MLXMultimodalLM:
                 total_frames += len(frames)
                 logger.info(f"Added {len(frames)} frames from video: {vid_input}")
 
-                # Extract audio track from video if present
-                video_path = vid_input if isinstance(vid_input, str) else vid_input.get("url", vid_input.get("video_url", {}).get("url", ""))
-                if video_path and not video_path.startswith("data:"):
-                    audio_path = self._extract_audio_from_video(video_path)
-                    if audio_path:
-                        all_audio_urls.append(audio_path)
-                        logger.info(f"Extracted audio from video: {video_path}")
+                # Extract audio track from video if explicitly requested
+                if extract_audio_from_video:
+                    video_path = vid_input if isinstance(vid_input, str) else vid_input.get("url", vid_input.get("video_url", {}).get("url", ""))
+                    if video_path and not video_path.startswith("data:"):
+                        audio_path = self._extract_audio_from_video(video_path)
+                        if audio_path:
+                            all_audio_urls.append(audio_path)
+                            logger.info(f"Extracted audio from video: {video_path}")
 
             _msg_video_frame_counts[msg_idx] = total_frames
 
