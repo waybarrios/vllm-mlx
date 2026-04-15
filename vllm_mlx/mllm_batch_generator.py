@@ -366,9 +366,11 @@ class MLLMBatchGenerator:
         # Patch attention for BatchKVCache compatibility
         from .patches.qwen3_5_mllm import patch_qwen35_attention_for_batching
         from .patches.gemma4_mllm import patch_gemma4_attention_for_batching
+        from .patches.glm4v_moe_mllm import patch_glm4v_moe_for_batching
 
         patch_qwen35_attention_for_batching()
         patch_gemma4_attention_for_batching()
+        patch_glm4v_moe_for_batching()
 
         self.max_tokens = max_tokens
         self.stop_tokens = stop_tokens or set()
