@@ -802,6 +802,39 @@ class MLXMultimodalLM:
         )
         return save_frames_to_temp(frames)
 
+    @staticmethod
+    def _extract_audio_from_video(video_path: str) -> str | None:
+        """Extract audio track from a video file as a temporary WAV file.
+
+        Returns the path to the extracted WAV, or None if the video has no
+        audio track or ffmpeg is not available.
+        """
+        import subprocess
+        import tempfile
+
+        try:
+            tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+            tmp.close()
+            result = subprocess.run(
+                [
+                    "ffmpeg", "-y", "-i", video_path,
+                    "-vn", "-ar", "16000", "-ac", "1", "-f", "wav",
+                    tmp.name,
+                ],
+                capture_output=True,
+                timeout=30,
+            )
+            if result.returncode == 0:
+                import os
+                if os.path.getsize(tmp.name) > 44:  # WAV header is 44 bytes
+                    return tmp.name
+            # Clean up on failure
+            import os
+            os.unlink(tmp.name)
+        except Exception as e:
+            logger.debug(f"Could not extract audio from video: {e}")
+        return None
+
     def _collect_video_inputs(self, messages: list[dict]) -> dict[int, list]:
         """Collect video inputs from messages, keyed by message index.
 
@@ -1361,6 +1394,15 @@ class MLXMultimodalLM:
                 all_video_frames.extend(frames)
                 total_frames += len(frames)
                 logger.info(f"Added {len(frames)} frames from video: {vid_input}")
+
+                # Extract audio track from video if present
+                video_path = vid_input if isinstance(vid_input, str) else vid_input.get("url", vid_input.get("video_url", {}).get("url", ""))
+                if video_path and not video_path.startswith("data:"):
+                    audio_path = self._extract_audio_from_video(video_path)
+                    if audio_path:
+                        all_audio_urls.append(audio_path)
+                        logger.info(f"Extracted audio from video: {video_path}")
+
             _msg_video_frame_counts[msg_idx] = total_frames
 
         # Second pass: build chat messages with image counts that include video frames
