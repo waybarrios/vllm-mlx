@@ -98,6 +98,7 @@ from .api.models import (
     VideoUrl,  # noqa: F401
 )
 from .api.tool_calling import (
+    StreamingJsonFenceStripper,
     build_json_system_prompt,
     convert_tools_for_template,
     parse_json_output,
@@ -2617,6 +2618,21 @@ async def stream_chat_completion(
     completion_tokens = 0
     last_output = None
 
+    # Response-format streaming filter — strip markdown code fences from
+    # content when client asked for JSON. Non-streaming path strips fences
+    # via ``parse_json_output``; without this, streaming clients see
+    # ``"```json{...}```"`` instead of ``"{...}"`` for models that wrap
+    # their structured output in markdown (e.g. Gemma 4).
+    fence_stripper: StreamingJsonFenceStripper | None = None
+    _rf = getattr(request, "response_format", None)
+    _rf_type = None
+    if _rf is not None:
+        _rf_type = getattr(_rf, "type", None)
+        if _rf_type is None and isinstance(_rf, dict):
+            _rf_type = _rf.get("type")
+    if _rf_type in ("json_object", "json_schema"):
+        fence_stripper = StreamingJsonFenceStripper()
+
     # Tool call streaming state
     global _tool_parser_instance
     tool_parser = None
@@ -2765,6 +2781,14 @@ async def stream_chat_completion(
                         if content:
                             content = _TOOL_MARKUP_PATTERN.sub("", content)
 
+                # Strip markdown code fences when response_format is set.
+                if fence_stripper is not None and not tool_calls_detected:
+                    content = fence_stripper.feed(content) if content else ""
+                    if output.finished:
+                        flush = fence_stripper.finalize()
+                        if flush:
+                            content = content + flush
+
                 chunk = ChatCompletionChunk(
                     id=response_id,
                     model=_model_name,
@@ -2857,6 +2881,14 @@ async def stream_chat_completion(
                         # Strip any leaked tool markup tags
                         if content:
                             content = _TOOL_MARKUP_PATTERN.sub("", content)
+
+                # Strip markdown code fences when response_format is set.
+                if fence_stripper is not None and not tool_calls_detected:
+                    content = fence_stripper.feed(content) if content else ""
+                    if output.finished:
+                        flush = fence_stripper.finalize()
+                        if flush:
+                            content = content + flush
 
                 chunk = ChatCompletionChunk(
                     id=response_id,
