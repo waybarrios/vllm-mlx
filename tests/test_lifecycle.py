@@ -2261,7 +2261,7 @@ class TestStatusEndpointEngineRace:
     """Verify status/health endpoints handle concurrent engine unload."""
 
     @pytest.mark.asyncio
-    async def test_status_endpoint_handles_engine_unloaded_during_call(self, monkeypatch):
+    async def test_status_endpoint_returns_not_loaded_when_engine_is_none(self, monkeypatch):
         """/v1/status should not 500 if engine is unloaded between check and use."""
         import vllm_mlx.server as srv
 
@@ -2324,8 +2324,8 @@ class TestToolParserUsesLocalEngine:
     """Tool parser should use the request-local engine, not the global."""
 
     @pytest.mark.asyncio
-    async def test_parse_tool_calls_uses_local_engine_not_global(self, monkeypatch):
-        """_parse_tool_calls_with_parser should use the locally-acquired engine."""
+    async def test_parse_tool_calls_survives_none_global_engine(self, monkeypatch):
+        """_parse_tool_calls_with_parser should not crash when global engine is None."""
         import vllm_mlx.server as srv
 
         # Global engine is None (model unloaded between acquire and parser init)
@@ -2349,7 +2349,7 @@ class TestLifecycleFailureHandling:
     """Regression coverage for lifecycle failure paths."""
 
     @pytest.mark.asyncio
-    async def test_anthropic_validation_error_releases_resident(self, monkeypatch):
+    async def test_anthropic_validation_error_does_not_acquire_resident(self, monkeypatch):
         """Malformed Anthropic payloads should not touch residency at all."""
         from pydantic import ValidationError
 
