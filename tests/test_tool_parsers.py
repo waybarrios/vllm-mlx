@@ -555,6 +555,16 @@ class TestAutoToolParser:
         assert result.tools_called
         assert result.tool_calls[0]["name"] == "add"
 
+    def test_detects_bare_bracket(self, parser):
+        """Test auto detection of bare bracket format."""
+        text = '[read({"file_path": "/tmp/test.py"})]'
+        result = parser.extract_tool_calls(text)
+
+        assert result.tools_called
+        assert result.tool_calls[0]["name"] == "read"
+        args = json.loads(result.tool_calls[0]["arguments"])
+        assert args["file_path"] == "/tmp/test.py"
+
     def test_detects_llama(self, parser):
         """Test auto detection of Llama format."""
         text = '<function=multiply>{"x": 2}</function>'
@@ -649,6 +659,39 @@ class TestEdgeCases:
         assert result.tools_called
         ids = [tc["id"] for tc in result.tool_calls]
         assert len(ids) == len(set(ids)), "Tool call IDs should be unique"
+
+
+class TestBareBracketStreaming:
+    """Test streaming for bare bracket tool calls."""
+
+    def test_auto_streaming_bare_bracket(self):
+        """Auto parser should emit structured tool calls for bare bracket streaming."""
+        parser = AutoToolParser()
+
+        chunks = [
+            "[read(",
+            '{"file_path": "/tmp/test.py"}',
+            ")]",
+        ]
+        accumulated = ""
+        tool_calls_found = False
+
+        for chunk in chunks:
+            prev = accumulated
+            accumulated += chunk
+            r = parser.extract_tool_calls_streaming(
+                previous_text=prev,
+                current_text=accumulated,
+                delta_text=chunk,
+            )
+            if r is not None and "tool_calls" in r:
+                tool_calls_found = True
+                assert r["tool_calls"][0]["function"]["name"] == "read"
+                args = json.loads(r["tool_calls"][0]["function"]["arguments"])
+                assert args["file_path"] == "/tmp/test.py"
+                break
+
+        assert tool_calls_found
 
 
 class TestStreamingParsing:

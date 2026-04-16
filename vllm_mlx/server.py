@@ -219,6 +219,8 @@ _STREAMING_TOOL_MARKERS = (
     "<minimax:tool_call>",
     '<invoke name="',
 )
+_STREAMING_BARE_BRACKET_MARKER = re.compile(r"\[\w+\(\{")
+_STREAMING_BARE_BRACKET_PARTIAL = re.compile(r"\[\w+\($")
 
 
 def _load_prefix_cache_from_disk() -> None:
@@ -1561,7 +1563,11 @@ def _get_streaming_tool_parser(request: ChatCompletionRequest | None):
 
 def _streaming_tool_markup_possible(text: str) -> bool:
     """Heuristic marker check to avoid parser work on ordinary text chunks."""
-    return any(marker in text for marker in _STREAMING_TOOL_MARKERS)
+    return (
+        any(marker in text for marker in _STREAMING_TOOL_MARKERS)
+        or _STREAMING_BARE_BRACKET_MARKER.search(text) is not None
+        or _STREAMING_BARE_BRACKET_PARTIAL.search(text) is not None
+    )
 
 
 def load_embedding_model(
