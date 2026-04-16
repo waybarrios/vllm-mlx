@@ -1001,7 +1001,7 @@ class TestSseDoneTermination:
     data: [DONE] event, even when the engine raises mid-stream.
     """
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_stream_completion_normal_emits_done(self, monkeypatch):
         """Normal stream_completion yields exactly one [DONE] at the end."""
         from vllm_mlx.api.models import CompletionRequest
@@ -1039,7 +1039,7 @@ class TestSseDoneTermination:
         ), f"Expected exactly 1 [DONE], got {len(done_chunks)}"
         assert chunks[-1] == "data: [DONE]\n\n", "[DONE] must be the last chunk"
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_stream_completion_exception_still_emits_done(self, monkeypatch):
         """When engine raises mid-stream, [DONE] is still emitted."""
         from vllm_mlx.api.models import CompletionRequest
@@ -1074,7 +1074,7 @@ class TestSseDoneTermination:
         ), f"Expected exactly 1 [DONE], got {len(done_chunks)}"
         assert chunks[-1] == "data: [DONE]\n\n", "[DONE] must be the last chunk"
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_ensure_sse_terminal_normal_no_duplicate(self):
         """Wrapper passes through the generator's own [DONE] without duplicating."""
         from vllm_mlx.server import _ensure_sse_terminal
@@ -1095,7 +1095,7 @@ class TestSseDoneTermination:
             len(done_chunks) == 1
         ), f"Expected exactly 1 [DONE], got {len(done_chunks)}"
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_ensure_sse_terminal_exception_emits_done(self):
         """Wrapper emits [DONE] when inner generator raises before reaching it."""
         from vllm_mlx.server import _ensure_sse_terminal
@@ -1117,7 +1117,7 @@ class TestSseDoneTermination:
         ), f"Expected exactly 1 [DONE], got {len(done_chunks)}"
         assert chunks[-1] == "data: [DONE]\n\n", "[DONE] must be the last chunk"
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_ensure_sse_terminal_anthropic_protocol(self):
         """Wrapper emits Anthropic message_stop, not OpenAI [DONE], on exception."""
         import json
