@@ -297,11 +297,22 @@ def _log_and_raise_internal_error(log_prefix: str, exc: Exception, detail: str) 
 # Lifecycle startup coordination — an Event lets the lifecycle loop block
 # efficiently instead of polling with short sleeps.  Created lazily so
 # it binds to the correct event loop at runtime rather than import time.
+#
+# Important: the Event is bound to the loop that was running when
+# _get_idle_unload_event() is first called.  In production this is always
+# the single uvicorn event loop, but test fixtures must reset this to None
+# between tests to avoid cross-loop contamination when pytest creates
+# fresh loops per test.
 _idle_unload_enabled: asyncio.Event | None = None
 
 
 def _get_idle_unload_event() -> asyncio.Event:
-    """Return the idle-unload gate event, creating it on first use."""
+    """Return the idle-unload gate event, creating it on first use.
+
+    The returned Event is bound to the running loop at creation time.
+    Reset ``_idle_unload_enabled`` to ``None`` when tearing down the
+    server or switching event loops (e.g. in test fixtures).
+    """
     global _idle_unload_enabled
     if _idle_unload_enabled is None:
         _idle_unload_enabled = asyncio.Event()
