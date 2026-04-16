@@ -108,3 +108,19 @@ class ReasoningParser(ABC):
         This is intentionally a default no-op implementation.
         """
         pass
+
+    def finalize_stream(self) -> DeltaMessage | None:  # noqa: B027
+        """
+        Finalize streaming state at end of stream.
+
+        Called after the last delta is processed but before the stream
+        closes. Parsers that buffer partial markers internally should
+        flush any remaining text here.
+
+        Default implementation is a no-op (returns None).
+
+        Returns:
+            DeltaMessage with any pending reasoning/content to emit,
+            or None if nothing to flush.
+        """
+        return None
