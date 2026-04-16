@@ -126,6 +126,172 @@ class TestExtractJsonFromText:
         result = extract_json_from_text(text)
         assert result == {"outer": {"inner": {"deep": "value"}}}
 
+    def test_chatty_preamble_with_json(self):
+        """
+        Test the classic Minimax / chain-of-thought failure mode:
+        the model explains itself before emitting JSON.
+        """
+        text = (
+            "Let me format this as JSON:\n" '```json\n{"name": "John", "age": 25}\n```'
+        )
+        result = extract_json_from_text(text)
+        assert result == {"name": "John", "age": 25}
+
+    def test_unterminated_markdown_fence(self):
+        """
+        Test truncation: model started ```json fence but ran out of
+        tokens before closing it. Previously returned None.
+        """
+        text = 'Let me format this as JSON:\n```json\n{"name": "John", "age": 25}'
+        result = extract_json_from_text(text)
+        assert result == {"name": "John", "age": 25}
+
+    def test_truncated_json_unclosed_object(self):
+        """Test repair of JSON truncated mid-object (max_tokens hit)."""
+        text = '{"name": "John", "age": 25, "city": "Prague"'
+        result = extract_json_from_text(text)
+        assert result == {"name": "John", "age": 25, "city": "Prague"}
+
+    def test_truncated_json_unclosed_string(self):
+        """Test repair of JSON truncated mid-string."""
+        text = '{"name": "John", "city": "Pra'
+        result = extract_json_from_text(text)
+        assert result == {"name": "John", "city": "Pra"}
+
+    def test_truncated_json_unclosed_nested(self):
+        """Test repair of JSON truncated deep inside nested structures."""
+        text = '{"user": {"name": "John", "items": [1, 2, 3'
+        result = extract_json_from_text(text)
+        assert result == {"user": {"name": "John", "items": [1, 2, 3]}}
+
+    def test_truncated_json_dangling_key(self):
+        """Test repair when truncation leaves a dangling key."""
+        text = '{"name": "John", "age":'
+        result = extract_json_from_text(text)
+        # Dangling "age": should get repaired to null or dropped.
+        assert result is not None
+        assert result.get("name") == "John"
+
+    def test_balanced_scan_prefers_valid_json(self):
+        """
+        Test that balanced-brace scanning picks the first balanced JSON,
+        not a greedy region between first { and last }.
+        """
+        text = 'First: {"a": 1}. Garbage: {broken}'
+        result = extract_json_from_text(text)
+        assert result == {"a": 1}
+
+    def test_json_with_escaped_braces_in_string(self):
+        """Test balanced scanner respects strings containing braces."""
+        text = '{"template": "Hello {user}!", "count": 5}'
+        result = extract_json_from_text(text)
+        assert result == {"template": "Hello {user}!", "count": 5}
+
+    def test_json_with_escaped_quotes(self):
+        """Test balanced scanner respects escaped quotes inside strings."""
+        text = '{"text": "He said \\"hi\\"", "ok": true}'
+        result = extract_json_from_text(text)
+        assert result == {"text": 'He said "hi"', "ok": True}
+
+
+class TestRawJsonToolCallHijackPrevention:
+    """
+    Regression tests for the MiniMax-M2 bug where ``response_format`` with a
+    schema that contained ``"name"`` (e.g. person name) was hijacked into a
+    fake ``function.name`` tool call by the raw-JSON tool-call fallback.
+    """
+
+    def test_response_format_not_hijacked_no_tools(self):
+        """JSON data with 'name' field must not become a tool call."""
+        from vllm_mlx.api.tool_calling import parse_tool_calls
+
+        # Simulate Minimax emitting user-schema JSON after response_format.
+        text = '{"name": "John", "age": 25}'
+        # Request has NO tools — any parse_tool_calls output is a hijack.
+        cleaned, tool_calls = parse_tool_calls(text, request={"tools": None})
+        assert tool_calls is None, f"Hijacked JSON into tool_calls: {tool_calls}"
+
+    def test_response_format_with_response_format_no_tools(self):
+        """
+        Even when the request has ``response_format`` set and no tools,
+        a JSON object with 'name' must not become a tool call.
+        """
+        from vllm_mlx.api.tool_calling import parse_tool_calls
+
+        text = '{"name": "Alice", "age": 30, "city": "Prague"}'
+        cleaned, tool_calls = parse_tool_calls(
+            text,
+            request={
+                "tools": None,
+                "response_format": {"type": "json_object"},
+            },
+        )
+        assert tool_calls is None
+
+    def test_genuine_tool_call_still_detected(self):
+        """
+        Regression guard: a genuine tool call (``name`` + ``arguments``)
+        MUST still be detected when the caller passed ``tools``.
+        """
+        from vllm_mlx.api.tool_calling import parse_tool_calls
+
+        text = '{"name": "get_weather", "arguments": {"city": "Prague"}}'
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"city": {"type": "string"}},
+                    },
+                },
+            }
+        ]
+        cleaned, tool_calls = parse_tool_calls(text, request={"tools": tools})
+        assert tool_calls is not None
+        assert len(tool_calls) == 1
+        assert tool_calls[0].function.name == "get_weather"
+
+    def test_no_name_no_arguments_not_tool_call(self):
+        """Plain JSON without 'name' stays as content."""
+        from vllm_mlx.api.tool_calling import parse_tool_calls
+
+        text = '{"result": 42, "status": "ok"}'
+        cleaned, tool_calls = parse_tool_calls(
+            text, request={"tools": [{"type": "function"}]}
+        )
+        assert tool_calls is None
+
+    def test_name_only_not_tool_call(self):
+        """
+        ``{"name": "x"}`` without ``"arguments"`` must NOT be a tool call.
+        This is the specific shape that hijacked MiniMax-M2 output.
+        """
+        from vllm_mlx.api.tool_calling import _parse_raw_json_tool_calls
+
+        assert _parse_raw_json_tool_calls('{"name": "John"}') is None
+        assert _parse_raw_json_tool_calls('{"name": "John", "age": 25}') is None
+
+    def test_looks_like_tool_call_helper(self):
+        """Direct coverage for the _looks_like_tool_call heuristic."""
+        from vllm_mlx.api.tool_calling import _looks_like_tool_call
+
+        # Genuine tool calls.
+        assert _looks_like_tool_call({"name": "f", "arguments": {}})
+        assert _looks_like_tool_call({"name": "f", "arguments": '{"a":1}'})
+        assert _looks_like_tool_call(
+            {"name": "get_weather", "arguments": {"city": "Prague"}}
+        )
+        # Not tool calls.
+        assert not _looks_like_tool_call({"name": "John", "age": 25})
+        assert not _looks_like_tool_call({"name": "", "arguments": {}})
+        assert not _looks_like_tool_call({"arguments": {}})
+        assert not _looks_like_tool_call({"name": 123, "arguments": {}})
+        assert not _looks_like_tool_call({"name": "f", "arguments": 42})
+        assert not _looks_like_tool_call("not a dict")
+        assert not _looks_like_tool_call(None)
+
 
 class TestParseJsonOutput:
     """Tests for parse_json_output function."""
@@ -253,6 +419,17 @@ class TestBuildJsonSystemPrompt:
         assert "valid JSON" in result
         assert "only" in result.lower()
 
+    def test_json_object_has_strict_rules(self):
+        """
+        Test that json_object prompt contains explicit no-markdown /
+        no-preamble rules (added to prevent chatty model failures).
+        """
+        result = build_json_system_prompt({"type": "json_object"})
+        assert result is not None
+        assert "STRICT" in result
+        assert "markdown" in result.lower()
+        assert "preamble" in result.lower() or "Preamble" in result
+
     def test_json_schema(self):
         """Test prompt for json_schema mode."""
         response_format = {
@@ -271,6 +448,20 @@ class TestBuildJsonSystemPrompt:
         assert "person" in result
         assert "A person object" in result
         assert "JSON Schema" in result
+
+    def test_json_schema_has_strict_rules(self):
+        """Test json_schema prompt also carries the strict output rules."""
+        response_format = {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "person",
+                "schema": {"type": "object"},
+            },
+        }
+        result = build_json_system_prompt(response_format)
+        assert result is not None
+        assert "STRICT" in result
+        assert "markdown" in result.lower()
 
     def test_json_schema_model(self):
         """Test prompt with ResponseFormat model."""
