@@ -44,6 +44,22 @@ def serve_command(args):
         )
         sys.exit(1)
 
+    # Validate --turbo-kv-bits capability before spinning up model/server
+    if args.turbo_kv_bits is not None:
+        if args.kv_cache_quantization:
+            print(
+                "Error: --turbo-kv-bits and --kv-cache-quantization are mutually "
+                "exclusive; pick one compression path"
+            )
+            sys.exit(1)
+
+        from .memory_cache import _check_turboquant_capability
+
+        missing = _check_turboquant_capability()
+        if missing is not None:
+            print(f"Error: --turbo-kv-bits requires TurboQuant support: {missing}")
+            sys.exit(1)
+
     # Configure server security settings
     server._api_key = args.api_key
     server._default_timeout = args.timeout
@@ -277,6 +293,22 @@ def bench_command(args):
 
     # Handle prefix cache flags
     enable_prefix_cache = args.enable_prefix_cache and not args.disable_prefix_cache
+
+    # Validate --turbo-kv-bits capability before loading the model
+    if args.turbo_kv_bits is not None:
+        if args.kv_cache_quantization:
+            print(
+                "Error: --turbo-kv-bits and --kv-cache-quantization are mutually "
+                "exclusive; pick one compression path"
+            )
+            sys.exit(1)
+
+        from .memory_cache import _check_turboquant_capability
+
+        missing = _check_turboquant_capability()
+        if missing is not None:
+            print(f"Error: --turbo-kv-bits requires TurboQuant support: {missing}")
+            sys.exit(1)
 
     async def run_benchmark():
         print(f"Loading model: {args.model}")
@@ -758,7 +790,7 @@ Examples:
         choices=[1, 2, 3, 4],
         help="TurboQuant KV cache compression bits for prefix cache. "
         "3-bit gives 4.6x compression vs FP16 (default: disabled). "
-        "Replaces --kv-cache-quantization when set.",
+        "Mutually exclusive with --kv-cache-quantization.",
     )
     serve_parser.add_argument(
         "--stream-interval",
@@ -1082,7 +1114,8 @@ Examples:
         default=None,
         choices=[1, 2, 3, 4],
         help="TurboQuant KV cache compression bits for prefix cache. "
-        "3-bit gives 4.6x compression vs FP16 (default: disabled).",
+        "3-bit gives 4.6x compression vs FP16 (default: disabled). "
+        "Mutually exclusive with --kv-cache-quantization.",
     )
     # Paged cache options (experimental)
     bench_parser.add_argument(

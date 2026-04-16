@@ -59,6 +59,44 @@ def _get_available_memory() -> int:
         return 0
 
 
+_TURBOQUANT_UPSTREAM_PR = "https://github.com/ml-explore/mlx-lm/pull/1067"
+
+
+def _check_turboquant_capability() -> str | None:
+    """Verify the installed mlx-lm exposes TurboQuant KV cache support.
+
+    Returns None if capability is available, otherwise a human-readable
+    description of what is missing. Callers can use the return value to
+    fail fast with an actionable error message.
+
+    TurboQuant support requires two pieces, both provided by the upstream
+    mlx-lm PR 1067:
+      1. the ``mlx_lm.models.turboquant_cache`` module (the cache class), and
+      2. the ``to_turbo_quantized`` method bolted onto ``KVCache`` (the entry
+         point used to compress stored prefix-cache entries).
+    """
+    try:
+        from mlx_lm.models.turboquant_cache import TurboQuantKVCache  # noqa: F401
+    except ImportError:
+        return (
+            "mlx_lm.models.turboquant_cache is not available. "
+            f"Install an mlx-lm build with TurboQuant support (see {_TURBOQUANT_UPSTREAM_PR})."
+        )
+
+    try:
+        from mlx_lm.models.cache import KVCache
+    except ImportError as e:
+        return f"mlx_lm.models.cache.KVCache is not importable: {e}"
+
+    if not hasattr(KVCache, "to_turbo_quantized"):
+        return (
+            "mlx_lm.models.cache.KVCache lacks to_turbo_quantized(). "
+            f"Upgrade to an mlx-lm build with TurboQuant support (see {_TURBOQUANT_UPSTREAM_PR})."
+        )
+
+    return None
+
+
 def _array_memory(arr) -> int:
     """
     Estimate array memory from shape+dtype without triggering lazy eval.
@@ -108,6 +146,12 @@ def estimate_kv_cache_memory(cache: list[Any]) -> int:
     except ImportError:
         _TQ = None
 
+    # Two TurboQuant paths exist because stored prefix entries use
+    # _TurboQuantCacheWrapper (carries orig_type/orig_attrs metadata), while
+    # ad-hoc callers can pass a bare TurboQuantKVCache (e.g. tests, direct API).
+    # The wrapper path iterates .state (a flat tuple of arrays exposed by the
+    # upstream class); the bare path reads the packed arrays directly so we do
+    # not rely on the public .state tuple layout for unwrapped instances.
     for layer_cache in cache:
         if (
             _TQ is not None
@@ -117,7 +161,6 @@ def estimate_kv_cache_memory(cache: list[Any]) -> int:
             for arr in layer_cache.layer.state:
                 total_bytes += _array_memory(arr)
             continue
-        # Handle TurboQuantKVCache — estimate from shape+dtype (avoid lazy eval)
         if _TQ is not None and isinstance(layer_cache, _TQ):
             if layer_cache.k_packed is not None:
                 for arr in (
@@ -203,8 +246,24 @@ class MemoryCacheConfig:
             raise ValueError(
                 f"kv_min_quantize_tokens must be >= 0, got {self.kv_min_quantize_tokens}"
             )
-        if self.turbo_kv_bits is not None and self.turbo_kv_bits not in (1, 2, 3, 4):
-            raise ValueError(f"turbo_kv_bits must be 1-4, got {self.turbo_kv_bits}")
+        if self.turbo_kv_bits is not None:
+            if self.turbo_kv_bits not in (1, 2, 3, 4):
+                raise ValueError(f"turbo_kv_bits must be 1-4, got {self.turbo_kv_bits}")
+            if self.kv_quantize:
+                # TurboQuant and standard group-wise quantization are two
+                # different storage formats for prefix-cache entries; only one
+                # path runs in _apply_quantization. Rejecting the combination
+                # avoids masking user intent (which one did they actually want?).
+                raise ValueError(
+                    "turbo_kv_bits and kv_quantize are mutually exclusive; "
+                    "pick one compression path"
+                )
+            missing = _check_turboquant_capability()
+            if missing is not None:
+                raise RuntimeError(
+                    f"turbo_kv_bits={self.turbo_kv_bits} requested but TurboQuant "
+                    f"support is unavailable: {missing}"
+                )
 
     @property
     def needs_dequantize(self) -> bool:
@@ -338,6 +397,12 @@ def _trim_cache_offset(cache: list[Any], trim_by: int) -> list[Any]:
             if not layer_cache.is_trimmable():
                 trimmed.append(layer_cache)
                 continue
+            # We rely on upstream TurboQuantKVCache.copy() returning a copy
+            # whose offset can be mutated independently of the stored layer.
+            # The packed k/v arrays are shared (MLX arrays are immutable, so
+            # sharing is safe), but mutable scalar state like offset and the
+            # dequant buffers must be per-copy. If upstream ever changes copy()
+            # semantics to share these too, this will corrupt stored entries.
             tc = _TurboQuantCacheWrapper.__new__(_TurboQuantCacheWrapper)
             tc.layer = layer_cache.layer.copy()
             tc.layer.offset = max(layer_cache.layer.offset - trim_by, 0)
@@ -559,6 +624,9 @@ class _QuantizedCacheWrapper:
         self.orig_attrs = _capture_cache_attrs(layer)
 
 
+_TURBOQUANT_TRIM_WARNED = False
+
+
 class _TurboQuantCacheWrapper:
     """Lightweight wrapper storing TurboQuant cache + original cache metadata."""
 
@@ -572,7 +640,22 @@ class _TurboQuantCacheWrapper:
         self.orig_attrs = _capture_cache_attrs(layer)
 
     def is_trimmable(self) -> bool:
-        return hasattr(self.layer, "copy")
+        # Trimming requires a public copy() on the underlying TurboQuant cache
+        # so we can adjust offset without mutating the stored entry. Older
+        # mlx-lm builds may ship TurboQuantKVCache without copy(); in that case
+        # the scheduler treats this layer as non-trimmable and falls back to
+        # full-prefix matching (correct, just less efficient).
+        trimmable = hasattr(self.layer, "copy")
+        if not trimmable:
+            global _TURBOQUANT_TRIM_WARNED
+            if not _TURBOQUANT_TRIM_WARNED:
+                logger.warning(
+                    "TurboQuant cache layer has no copy() method; prefix cache "
+                    "trimming (supersequence / LCP reuse) is disabled. "
+                    f"Upgrade mlx-lm for full trim support (see {_TURBOQUANT_UPSTREAM_PR})."
+                )
+                _TURBOQUANT_TRIM_WARNED = True
+        return trimmable
 
 
 def _quantize_cache(cache: list[Any], bits: int = 8, group_size: int = 64) -> list[Any]:
