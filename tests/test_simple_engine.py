@@ -292,7 +292,7 @@ class TestSimpleEngineConcurrency:
             for result in results:
                 assert result.text == "test response"
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_generate_accumulates_over_stream_generate(self):
         """generate() should iterate stream_generate() and return the last
         yielded GenerationOutput, forwarding per-request kwargs (including
@@ -354,7 +354,7 @@ class TestSimpleEngineConcurrency:
         assert captured_kwargs.get("specprefill") is True
         assert captured_kwargs.get("specprefill_keep_pct") == 0.2
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_generate_empty_stream_returns_safe_default(self):
         """If stream_generate yields nothing, generate() returns an empty
         stop-reason GenerationOutput rather than raising.
