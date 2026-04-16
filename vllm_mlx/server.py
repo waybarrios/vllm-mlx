@@ -885,11 +885,29 @@ def _get_engine_tokenizer(engine: BaseEngine | None) -> object | None:
     """Return tokenizer-like parser state from the active engine."""
     if engine is None:
         return None
-    return getattr(engine, "tokenizer", None)
+    tokenizer = getattr(engine, "tokenizer", None)
+    if tokenizer is not None:
+        return tokenizer
+    return getattr(engine, "_tokenizer", None)
+
+
+def _get_or_init_tool_parser(engine: BaseEngine | None = None):
+    """Return the cached tool parser, initializing it from the given engine."""
+    global _tool_parser_instance
+
+    if _tool_parser_instance is None:
+        parser_cls = ToolParserManager.get_tool_parser(_tool_call_parser)
+        tokenizer = _get_engine_tokenizer(engine if engine is not None else _engine)
+        _tool_parser_instance = parser_cls(tokenizer)
+        logger.info(f"Initialized tool call parser: {_tool_call_parser}")
+
+    return _tool_parser_instance
 
 
 def _parse_tool_calls_with_parser(
-    output_text: str, request: ChatCompletionRequest | None = None
+    output_text: str,
+    request: ChatCompletionRequest | None = None,
+    engine: BaseEngine | None = None,
 ) -> tuple[str, list | None]:
     """
     Parse tool calls from model output using the configured parser.
@@ -900,6 +918,7 @@ def _parse_tool_calls_with_parser(
     Args:
         output_text: The model output text
         request: The original request (for context)
+        engine: The request-local engine to use for parser initialization
 
     Returns:
         Tuple of (cleaned_text, tool_calls)
@@ -923,11 +942,7 @@ def _parse_tool_calls_with_parser(
     # Initialize parser if needed
     if _tool_parser_instance is None:
         try:
-            parser_cls = ToolParserManager.get_tool_parser(_tool_call_parser)
-            # Get tokenizer from engine if available
-            tokenizer = _get_engine_tokenizer(_engine)
-            _tool_parser_instance = parser_cls(tokenizer)
-            logger.info(f"Initialized tool call parser: {_tool_call_parser}")
+            _get_or_init_tool_parser(engine)
         except Exception as e:
             logger.warning(
                 "Failed to initialize tool parser '%s': %s",
@@ -1930,7 +1945,10 @@ def _tool_choice_disabled(request: ChatCompletionRequest | None) -> bool:
     return tool_choice == "none"
 
 
-def _get_streaming_tool_parser(request: ChatCompletionRequest | None):
+def _get_streaming_tool_parser(
+    request: ChatCompletionRequest | None,
+    engine: BaseEngine | None = None,
+):
     """Get a streaming-capable tool parser for this request.
 
     Uses the configured parser when auto tool choice is enabled, otherwise falls
@@ -1944,18 +1962,17 @@ def _get_streaming_tool_parser(request: ChatCompletionRequest | None):
     if _tool_choice_disabled(request):
         return None
 
-    tokenizer = None
-    if _engine is not None and hasattr(_engine, "_tokenizer"):
-        tokenizer = _engine._tokenizer
+    tokenizer = _get_engine_tokenizer(engine if engine is not None else _engine)
 
     if _enable_auto_tool_choice and _tool_call_parser:
         if _tool_parser_instance is None:
             try:
-                parser_cls = ToolParserManager.get_tool_parser(_tool_call_parser)
-                _tool_parser_instance = parser_cls(tokenizer)
-                logger.info(f"Initialized tool call parser: {_tool_call_parser}")
+                _get_or_init_tool_parser(engine)
             except Exception as e:
-                logger.warning(f"Failed to init tool parser for streaming: {e}")
+                logger.warning(
+                    "Failed to init tool parser for streaming: %s",
+                    _sanitize_log_text(e, limit=500),
+                )
                 return None
         _tool_parser_instance.reset()
         return _tool_parser_instance
@@ -3667,7 +3684,11 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
         # Skip tool parsing when request has no tools — otherwise the parser
         # can misinterpret JSON output (e.g. response_format) as tool calls.
         if request.tools:
-            cleaned_text, tool_calls = _parse_tool_calls_with_parser(output.text, request)
+            cleaned_text, tool_calls = _parse_tool_calls_with_parser(
+                output.text,
+                request,
+                engine=engine,
+            )
         else:
             cleaned_text, tool_calls = output.text, None
 
@@ -4049,7 +4070,9 @@ async def create_anthropic_message(
         # Parse tool calls (skip when no tools to avoid misinterpreting output)
         if openai_request.tools:
             cleaned_text, tool_calls = _parse_tool_calls_with_parser(
-                output.text, openai_request
+                output.text,
+                openai_request,
+                engine=engine,
             )
         else:
             cleaned_text, tool_calls = output.text, None
@@ -4401,7 +4424,7 @@ async def _stream_anthropic_messages(
     tool_parser = None
     tool_accumulated_text = ""
     tool_markup_possible = False
-    tool_parser = _get_streaming_tool_parser(openai_request)
+    tool_parser = _get_streaming_tool_parser(openai_request, engine)
 
     try:
         async for output in engine.stream_chat(messages=messages, **chat_kwargs):
@@ -4528,7 +4551,11 @@ async def _stream_anthropic_messages(
             text_block_started = True
 
         # Check for tool calls in accumulated text
-        _, tool_calls = _parse_tool_calls_with_parser(accumulated_text, openai_request)
+        _, tool_calls = _parse_tool_calls_with_parser(
+            accumulated_text,
+            openai_request,
+            engine=engine,
+        )
 
         # Close text block
         if text_block_started:
@@ -4737,7 +4764,7 @@ async def stream_chat_completion(
     tool_accumulated_text = ""
     tool_calls_detected = False
     tool_markup_possible = False  # Fast path: skip parsing until markers appear
-    tool_parser = _get_streaming_tool_parser(request)
+    tool_parser = _get_streaming_tool_parser(request, engine)
 
     try:
         # Stream content

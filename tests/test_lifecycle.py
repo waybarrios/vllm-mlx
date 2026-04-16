@@ -2213,28 +2213,98 @@ class TestStatusEndpointEngineRace:
 
 
 class TestToolParserUsesLocalEngine:
-    """Tool parser should not crash when the global engine is None."""
+    """Tool parser should initialize from the request-local engine."""
 
     @pytest.mark.anyio
-    async def test_parse_tool_calls_survives_none_global_engine(self, monkeypatch):
-        """_parse_tool_calls_with_parser should not crash when global engine is None."""
+    async def test_chat_completion_initializes_parser_from_acquired_engine(
+        self, monkeypatch
+    ):
+        """Chat completion should seed parser state from the acquired engine."""
+        from vllm_mlx.engine.base import GenerationOutput
         import vllm_mlx.server as srv
 
-        # Global engine is None (model unloaded between acquire and parser init)
-        monkeypatch.setattr(srv, "_engine", None)
-        monkeypatch.setattr(srv, "_enable_auto_tool_choice", True)
-        monkeypatch.setattr(srv, "_tool_call_parser", "hermes")
-        monkeypatch.setattr(srv, "_tool_parser_instance", None)
+        parser_tokenizers = []
 
-        # The parser init reads _engine — with a None global, it should
-        # either use the local engine or fail gracefully (not AttributeError)
-        try:
-            text, tools = srv._parse_tool_calls_with_parser("hello", None)
-        except AttributeError:
-            pytest.fail(
-                "_parse_tool_calls_with_parser crashed because it read "
-                "the global _engine (None) instead of using the local engine"
-            )
+        class FakeParser:
+            def __init__(self, tokenizer=None):
+                parser_tokenizers.append(tokenizer)
+
+            def reset(self):
+                return None
+
+            def extract_tool_calls(self, output_text, request_dict=None):
+                return SimpleNamespace(
+                    tools_called=False,
+                    tool_calls=[],
+                    content=output_text,
+                )
+
+        class FakeEngine:
+            preserve_native_tool_format = False
+            is_mllm = False
+
+            def __init__(self, tokenizer):
+                self.tokenizer = tokenizer
+
+            async def chat(self, **kwargs):
+                return GenerationOutput(
+                    text="hello",
+                    completion_tokens=1,
+                    prompt_tokens=1,
+                )
+
+        local_engine = FakeEngine("tok-local")
+
+        async def fake_acquire(
+            raw_request, *, total_timeout=None, deadline=None, count_activity=True
+        ):
+            return local_engine
+
+        async def fake_release(*, count_activity=True):
+            return None
+
+        monkeypatch.setattr(srv, "_validate_model_name", lambda _m: None)
+        monkeypatch.setattr(srv, "_acquire_default_engine_for_request", fake_acquire)
+        monkeypatch.setattr(srv, "_release_default_engine", fake_release)
+        monkeypatch.setattr(srv, "_model_name", "served-model")
+        monkeypatch.setattr(srv, "_default_max_tokens", 32)
+        monkeypatch.setattr(srv, "_engine", None)
+        monkeypatch.setattr(srv, "_reasoning_parser", None)
+        monkeypatch.setattr(srv, "_enable_auto_tool_choice", True)
+        monkeypatch.setattr(srv, "_tool_call_parser", "fake")
+        monkeypatch.setattr(srv, "_tool_parser_instance", None)
+        monkeypatch.setattr(
+            srv.ToolParserManager,
+            "get_tool_parser",
+            lambda name: FakeParser,
+        )
+
+        class FakeRawRequest:
+            async def is_disconnected(self):
+                return False
+
+        request = srv.ChatCompletionRequest(
+            model="user-sent-model-name",
+            messages=[{"role": "user", "content": "hi"}],
+            stream=False,
+            tool_choice="auto",
+            tools=[
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "lookup_weather",
+                        "parameters": {"type": "object", "properties": {}},
+                    },
+                }
+            ],
+        )
+
+        await srv.create_chat_completion(request, FakeRawRequest())
+
+        assert parser_tokenizers == ["tok-local"], (
+            "Parser init should use the request-local engine acquired for "
+            "this request, not the stale global _engine"
+        )
 
 
 class TestLifecycleFailureHandling:
