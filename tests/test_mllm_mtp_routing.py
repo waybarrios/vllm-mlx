@@ -26,6 +26,20 @@ def test_has_media_content_with_image():
     assert _has_media_content(messages) is True
 
 
+def test_has_media_content_with_local_image_part():
+    from vllm_mlx.api.utils import has_media_content as _has_media_content
+
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "image", "image": "/tmp/frame.png"},
+            ],
+        }
+    ]
+    assert _has_media_content(messages) is True
+
+
 def test_has_media_content_with_video():
     from vllm_mlx.api.utils import has_media_content as _has_media_content
 
@@ -34,6 +48,20 @@ def test_has_media_content_with_video():
             "role": "user",
             "content": [
                 {"type": "video_url", "video_url": {"url": "file:///tmp/v.mp4"}}
+            ],
+        }
+    ]
+    assert _has_media_content(messages) is True
+
+
+def test_has_media_content_with_local_video_part():
+    from vllm_mlx.api.utils import has_media_content as _has_media_content
+
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "video", "video": "/tmp/v.mp4"},
             ],
         }
     ]
