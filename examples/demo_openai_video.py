@@ -5,8 +5,8 @@ Demo: OpenAI API - Video Analysis
 Shows how to use vllm-mlx with the OpenAI Python SDK for video understanding.
 
 Usage:
-    1. Start the server with a VLM model:
-       vllm-mlx --model mlx-community/Qwen3-VL-4B-Instruct-3bit --port 8000
+    1. Start the server with a VLM model ("video-model" is the name used in the OpenAI API):
+       vllm-mlx serve --served-model-name video-model mlx-community/Qwen3-VL-4B-Instruct-3bit --port 8000
 
     2. Run this script:
        python examples/demo_openai_video.py
@@ -33,7 +33,7 @@ print(f"Video URL: Big Buck Bunny (10 seconds)")
 print("Question: What is happening in this video?")
 
 response = client.chat.completions.create(
-    model="default",
+    model="video-model",
     messages=[{
         "role": "user",
         "content": [
@@ -73,7 +73,7 @@ print("Using Big Buck Bunny video")
 print("Question: How many characters appear in the video?")
 
 response = client.chat.completions.create(
-    model="default",
+    model="video-model",
     messages=[{
         "role": "user",
         "content": [
@@ -100,7 +100,7 @@ try:
         print("Question: Describe this video")
 
         response = client.chat.completions.create(
-            model="default",
+            model="video-model",
             messages=[{
                 "role": "user",
                 "content": [
@@ -132,7 +132,7 @@ messages = [{
 }]
 
 response = client.chat.completions.create(
-    model="default",
+    model="video-model",
     messages=messages,
     max_tokens=100
 )
@@ -144,7 +144,7 @@ messages.append({"role": "assistant", "content": response.choices[0].message.con
 messages.append({"role": "user", "content": "Is this an animated or live-action video?"})
 
 response = client.chat.completions.create(
-    model="default",
+    model="video-model",
     messages=messages,
     max_tokens=100
 )

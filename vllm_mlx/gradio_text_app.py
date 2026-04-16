@@ -7,13 +7,22 @@ Use this for text conversations without image/video overhead.
 
 Usage:
     # First start the server with a model:
-    vllm-mlx --model mlx-community/Llama-3.2-3B-Instruct-4bit --port 8000
+    # Without a custom API model name (model path is the name used in the OpenAI API):
+    vllm-mlx serve mlx-community/Llama-3.2-3B-Instruct-4bit --port 8000
+    # With a custom API model name ("default" is the name used in the OpenAI API):
+    vllm-mlx serve --served-model-name default mlx-community/Llama-3.2-3B-Instruct-4bit --port 8000
 
     # Then run this app:
-    vllm-mlx-text-chat
+    vllm-mlx-text-chat --served-model-name mlx-community/Llama-3.2-3B-Instruct-4bit
 
-    # Or with custom settings:
+    # Or with vllm-mlx started with served model name is 'default', there is no need to use --served-model-name:
     vllm-mlx-text-chat --server-url http://localhost:8000 --port 7861
+
+Note:
+    Query the /v1/models endpoint with `curl` and `jq` to see available models and their names:
+    ```bash
+    curl http://localhost:8000/v1/models | jq ".data[0].id"
+    ```
 """
 
 import argparse
@@ -22,7 +31,12 @@ import gradio as gr
 import requests
 
 
-def create_chat_function(server_url: str, max_tokens: int, temperature: float):
+def create_chat_function(
+    server_url: str,
+    max_tokens: int,
+    temperature: float,
+    served_model_name: str = "default",
+):
     """
     Create the chat function for Gradio ChatInterface.
 
@@ -30,6 +44,7 @@ def create_chat_function(server_url: str, max_tokens: int, temperature: float):
         server_url: URL of the vllm-mlx server
         max_tokens: Maximum tokens to generate
         temperature: Sampling temperature
+        served_model_name: Model name to send in OpenAI-compatible requests
 
     Returns:
         Chat function compatible with gr.ChatInterface
@@ -72,7 +87,7 @@ def create_chat_function(server_url: str, max_tokens: int, temperature: float):
             response = requests.post(
                 f"{server_url}/v1/chat/completions",
                 json={
-                    "model": "default",
+                    "model": served_model_name,
                     "messages": messages,
                     "max_tokens": max_tokens,
                     "temperature": temperature,
@@ -101,7 +116,12 @@ def main():
         epilog="""
 Examples:
     # Start with default settings
-    vllm-mlx-text-chat
+    vllm-mlx-text-chat --served-model-name <served-model name>
+
+    # name OpenAI returns from /v1/models can be set with --served-model-name, for example:
+    vllm-mlx-text-chat --served-model-name <served-model name>
+    # example starting chat on the first model served on localhost:8000:
+    vllm-mlx-text-chat --served-model-name $(curl http://localhost:8000/v1/models | jq ".data[0].id")
 
     # Connect to a different server
     vllm-mlx-text-chat --server-url http://localhost:9000
@@ -110,7 +130,7 @@ Examples:
     vllm-mlx-text-chat --share
 
 Note: Make sure the vllm-mlx server is running:
-    vllm-mlx --model mlx-community/Llama-3.2-3B-Instruct-4bit --port 8000
+    vllm-mlx serve --served-model-name default mlx-community/Llama-3.2-3B-Instruct-4bit --port 8000
         """,
     )
     parser.add_argument(
@@ -142,6 +162,14 @@ Note: Make sure the vllm-mlx server is running:
         default=0.7,
         help="Sampling temperature (default: 0.7)",
     )
+    parser.add_argument(
+        "--served-model-name",
+        type=str,
+        default="default",
+        help=(
+            "Model name to send in /v1/chat/completions requests " "(default: default)"
+        ),
+    )
     args = parser.parse_args()
 
     print(f"Connecting to vllm-mlx server at: {args.server_url}")
@@ -152,6 +180,7 @@ Note: Make sure the vllm-mlx server is running:
         server_url=args.server_url,
         max_tokens=args.max_tokens,
         temperature=args.temperature,
+        served_model_name=args.served_model_name,
     )
 
     # Create simple text ChatInterface
