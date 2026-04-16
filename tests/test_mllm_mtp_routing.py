@@ -67,6 +67,15 @@ def test_has_media_content_audio():
     assert _has_media_content(messages) is True
 
 
+def test_has_media_content_audio_part_type():
+    """The shared helper should also detect the plain audio part type."""
+    from vllm_mlx.api.utils import has_media_content as _has_media_content
+
+    messages = [{"role": "user", "content": [{"type": "audio"}]}]
+
+    assert _has_media_content(messages) is True
+
+
 def test_has_media_content_multi_turn():
     """Media in earlier turns should still be detected."""
     from vllm_mlx.api.utils import has_media_content as _has_media_content
@@ -101,6 +110,32 @@ def test_has_media_content_text_list():
             ],
         }
     ]
+    assert _has_media_content(messages) is False
+
+
+def test_has_media_content_with_pydantic_style_messages():
+    """Duck-typed message objects should use the getattr() content path."""
+    from vllm_mlx.api.utils import has_media_content as _has_media_content
+
+    class FakePart:
+        def __init__(self, type_):
+            self.type = type_
+
+    class FakeMsg:
+        def __init__(self, content):
+            self.content = content
+
+    messages = [FakeMsg([FakePart("text"), FakePart("video_url")])]
+
+    assert _has_media_content(messages) is True
+
+
+def test_has_media_content_none_content():
+    """None content should be ignored rather than treated as media."""
+    from vllm_mlx.api.utils import has_media_content as _has_media_content
+
+    messages = [{"role": "system", "content": None}]
+
     assert _has_media_content(messages) is False
 
 
