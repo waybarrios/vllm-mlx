@@ -3047,7 +3047,6 @@ async def create_anthropic_message(
 
     Supports both streaming and non-streaming modes.
     """
-    engine = get_engine()
     tracker = _metrics.track_inference("anthropic_messages", stream=False)
 
     # Parse the raw body to handle Anthropic request format.
