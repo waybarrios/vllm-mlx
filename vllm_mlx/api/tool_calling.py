@@ -658,6 +658,127 @@ def extract_json_from_text(text: str) -> Optional[Dict[str, Any]]:
     return None
 
 
+class StreamingJsonFenceStripper:
+    """Strip markdown code fences from streamed content when response_format is set.
+
+    Without guided decoding, chat models often wrap their JSON output in markdown
+    fences (```json ... ```) even when the system prompt says not to. The non-
+    streaming path strips those via ``extract_json_from_text`` / ``parse_json_output``,
+    but the streaming path used to emit the raw deltas, so clients got
+    ``"```json{...}```"`` instead of ``"{...}"``.
+
+    This filter buffers just enough text to detect:
+      * a leading fence like ``"```"``, ``"```json"``, ``"```\\n"`` or
+        ``"```json\\n"`` (with optional leading whitespace), possibly split
+        across SSE deltas, and
+      * a trailing fence like ``"```"`` or ``"\\n```\\n"`` on stream end.
+
+    Leading-whitespace and leading fences are consumed; trailing fences are
+    dropped in :meth:`finalize`. Non-fenced content passes through with at most
+    a ``_TAIL_HOLDBACK``-char delay.
+    """
+
+    # Opening fence forms to strip, longest first (longest match wins).
+    _OPENINGS = ("```json\n", "```json", "```\n", "```")
+    # Characters held back at the tail to detect a trailing fence across deltas.
+    # 5 covers ``"\n```\n"``.
+    _TAIL_HOLDBACK = 5
+
+    def __init__(self) -> None:
+        self._buf: str = ""
+        self._past_opening: bool = False
+
+    def feed(self, delta: str) -> str:
+        """Append a content delta and return the portion safe to emit now."""
+        if not delta:
+            return ""
+
+        self._buf += delta
+
+        if not self._past_opening:
+            ls = self._buf.lstrip()
+            if not ls:
+                # Still only whitespace — wait for content.
+                return ""
+
+            # If ``ls`` is a strict prefix of any opening (shorter than the
+            # opening), the rest of the fence might still arrive in the next
+            # delta — keep buffering.
+            for opening in self._OPENINGS:
+                if len(ls) < len(opening) and opening.startswith(ls):
+                    return ""
+
+            # Try to match a complete opening fence (longest first).
+            matched: Optional[str] = None
+            for opening in self._OPENINGS:
+                if ls.startswith(opening):
+                    matched = opening
+                    break
+
+            if matched is not None:
+                # Drop the fence and any immediate whitespace that followed.
+                self._buf = ls[len(matched) :].lstrip()
+            else:
+                # Not a fence — keep the stripped text.
+                self._buf = ls
+            self._past_opening = True
+
+        # Dynamic holdback: walk backwards across any trailing whitespace and
+        # backticks so a closing fence cannot straddle the emit boundary, and
+        # additionally keep at least ``_TAIL_HOLDBACK`` chars to absorb fences
+        # that span delta boundaries.
+        buf = self._buf
+        i = len(buf)
+        while i > 0 and (buf[i - 1] == "`" or buf[i - 1].isspace()):
+            i -= 1
+        safe_end = min(i, len(buf) - self._TAIL_HOLDBACK)
+        if safe_end <= 0:
+            return ""
+
+        to_emit = buf[:safe_end]
+        self._buf = buf[safe_end:]
+        return to_emit
+
+    def finalize(self) -> str:
+        """Flush the remaining buffer, dropping any trailing fence."""
+        tail = self._buf
+        self._buf = ""
+        if not tail:
+            return ""
+
+        if not self._past_opening:
+            # Stream ended before we ever transitioned past the (potential)
+            # opening — either drop a strict-prefix fence that never finished
+            # arriving, or strip a complete leading fence.
+            ls = tail.lstrip()
+            # Check strict-prefix FIRST: ``"```js"`` is a prefix of
+            # ``"```json\n"`` and should be dropped entirely rather than
+            # partially matched by the bare ``"```"`` opening.
+            is_partial_prefix = False
+            for opening in self._OPENINGS:
+                if len(ls) < len(opening) and opening.startswith(ls):
+                    is_partial_prefix = True
+                    break
+            if is_partial_prefix:
+                ls = ""
+            else:
+                matched: Optional[str] = None
+                for opening in self._OPENINGS:
+                    if ls.startswith(opening):
+                        matched = opening
+                        break
+                if matched is not None:
+                    ls = ls[len(matched) :].lstrip()
+            tail = ls
+            self._past_opening = True
+
+        stripped = tail.rstrip()
+        for closing in ("\n```", "```"):
+            if stripped.endswith(closing):
+                return stripped[: -len(closing)].rstrip()
+        return tail
+
+
 def parse_json_output(
     text: str, response_format: Optional[Union[ResponseFormat, Dict[str, Any]]] = None
 ) -> Tuple[str, Optional[Dict[str, Any]], bool, Optional[str]]:
