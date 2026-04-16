@@ -2778,6 +2778,10 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
     start_time = time.perf_counter()
     timeout = request.timeout or _default_timeout
 
+    # Request raw output so reasoning/tool parsers see unstripped text.
+    # The server applies clean_output_text() itself after parsing.
+    chat_kwargs["raw_output"] = True
+
     try:
         output = await _wait_with_disconnect(
             engine.chat(messages=messages, **chat_kwargs),
@@ -3141,6 +3145,9 @@ async def create_anthropic_message(
         chat_kwargs["logits_processors"] = list(existing) + [json_logits_processor]
         # Suppress thinking: constrained decoding prevents <think> tags.
         chat_kwargs["enable_thinking"] = False
+
+    # Request raw output so reasoning/tool parsers see unstripped text.
+    chat_kwargs["raw_output"] = True
 
     start_time = time.perf_counter()
     timeout = _default_timeout
