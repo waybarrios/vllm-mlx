@@ -1637,7 +1637,12 @@ class TestSseDoneTermination:
         request = CompletionRequest(model="test-model", prompt="Say hello")
         chunks = [
             chunk
-            async for chunk in stream_completion(FakeEngine(), "Say hello", request)
+            async for chunk in stream_completion(
+                FakeEngine(),
+                "Say hello",
+                request,
+                max_tokens=server._default_max_tokens,
+            )
         ]
 
         done_chunks = [c for c in chunks if c == "data: [DONE]\n\n"]
@@ -1672,7 +1677,12 @@ class TestSseDoneTermination:
         chunks = [
             chunk
             async for chunk in _ensure_sse_terminal(
-                stream_completion(ExplodingEngine(), "Say hello", request),
+                stream_completion(
+                    ExplodingEngine(),
+                    "Say hello",
+                    request,
+                    max_tokens=server._default_max_tokens,
+                ),
                 "data: [DONE]\n\n",
             )
         ]
