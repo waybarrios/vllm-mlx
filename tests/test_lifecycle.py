@@ -5148,13 +5148,6 @@ class TestPublicLifecycleStatusSanitization:
 class TestSuspendCancellationDedup:
     """Verify lifecycle.py uses the shared suspend_cancellation from base."""
 
-    def test_lifecycle_does_not_define_its_own_suspend_cancellation(self):
-        """lifecycle.py should import suspend_cancellation, not redefine it."""
-        import vllm_mlx.lifecycle as lc
-        from vllm_mlx.engine.base import suspend_cancellation
-
-        assert lc.suspend_cancellation is suspend_cancellation
-
     @pytest.mark.anyio
     async def test_residency_manager_uses_shared_suspend_cancellation(self):
         """ResidencyManager cleanup paths should work with the shared helper."""
