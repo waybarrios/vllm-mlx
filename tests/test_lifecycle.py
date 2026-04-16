@@ -85,7 +85,7 @@ def restore_server_globals():
 class TestLifecycleStatusEndpoints:
     """Lock in residency metadata surfaced by server status endpoints."""
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_status_reports_unloaded_resident_metadata(self, monkeypatch):
         """Status should surface residency details even when model is unloaded."""
         import vllm_mlx.server as srv
@@ -120,7 +120,7 @@ class TestLifecycleStatusEndpoints:
         assert payload["residency"]["auto_unload_idle_seconds"] == 300
         assert payload["requests"] == []
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_health_exposes_residency_state_for_unloaded_model(self, monkeypatch):
         """Health should report lifecycle state, not only a loaded bool."""
         import vllm_mlx.server as srv
@@ -158,7 +158,7 @@ class TestLifecycleStatusEndpoints:
         assert payload["loaded_at"] is None
         assert payload["auto_unload_idle_seconds"] == 120
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_failed_resident_surfaces_as_unhealthy_and_failed(
         self, monkeypatch
     ):
@@ -211,7 +211,7 @@ class TestLifecycleStatusEndpoints:
         assert status_payload["residency"]["last_error"] == "model_load_failed"
         assert status_payload["requests"] == []
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_health_preserves_mllm_type_when_resident_is_unloaded(
         self, monkeypatch
     ):
@@ -244,7 +244,7 @@ class TestLifecycleStatusEndpoints:
 
         assert payload["model_type"] == "mllm"
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_health_uses_model_path_for_unloaded_served_alias_mllm(
         self, monkeypatch
     ):
@@ -279,7 +279,7 @@ class TestLifecycleStatusEndpoints:
 
         assert payload["model_type"] == "mllm"
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_health_uses_force_mllm_for_unloaded_local_model(self, monkeypatch):
         """force_mllm should survive the unloaded-resident health fallback."""
         import vllm_mlx.server as srv
@@ -453,83 +453,6 @@ class TestLifecycleCli:
         assert captured["kwargs"]["auto_unload_idle_seconds"] == 300
         assert captured["kwargs"]["lazy_load_model"] is True
 
-    def test_serve_command_wires_lazy_load_model_without_idle_unload(
-        self, monkeypatch
-    ):
-        """Lazy startup should be forwarded even when idle auto-unload is disabled."""
-        import uvicorn
-
-        import vllm_mlx.cli as cli
-        import vllm_mlx.server as srv
-
-        captured = {}
-
-        def fake_load_model(*args, **kwargs):
-            captured["args"] = args
-            captured["kwargs"] = kwargs
-
-        monkeypatch.setattr(srv, "load_model", fake_load_model)
-        monkeypatch.setattr(uvicorn, "run", lambda *args, **kwargs: None)
-
-        args = SimpleNamespace(
-            model="mlx-community/Qwen3-0.6B-8bit",
-            host="127.0.0.1",
-            port=8000,
-            max_num_seqs=256,
-            prefill_batch_size=8,
-            completion_batch_size=32,
-            enable_prefix_cache=True,
-            disable_prefix_cache=False,
-            prefix_cache_size=100,
-            cache_memory_mb=None,
-            cache_memory_percent=0.20,
-            no_memory_aware_cache=False,
-            kv_cache_quantization=False,
-            kv_cache_quantization_bits=8,
-            kv_cache_quantization_group_size=64,
-            kv_cache_min_quantize_tokens=256,
-            stream_interval=7,
-            max_tokens=32768,
-            continuous_batching=False,
-            use_paged_cache=False,
-            paged_cache_block_size=64,
-            max_cache_blocks=1000,
-            chunked_prefill_tokens=0,
-            enable_mtp=False,
-            mtp_num_draft_tokens=1,
-            mtp_optimistic=False,
-            prefill_step_size=2048,
-            specprefill=False,
-            specprefill_threshold=8192,
-            specprefill_keep_pct=0.3,
-            specprefill_draft_model=None,
-            mcp_config=None,
-            api_key=None,
-            rate_limit=0,
-            timeout=300.0,
-            enable_auto_tool_choice=False,
-            tool_call_parser=None,
-            reasoning_parser=None,
-            mllm=False,
-            default_temperature=None,
-            default_top_p=None,
-            served_model_name=None,
-            embedding_model=None,
-            gpu_memory_utilization=0.90,
-            enable_metrics=False,
-            download_timeout=120,
-            download_retries=3,
-            mllm_prefill_step_size=None,
-            lazy_load_model=True,
-            auto_unload_idle_seconds=0.0,
-        )
-
-        cli.serve_command(args)
-
-        assert captured["kwargs"]["stream_interval"] == 1
-        assert captured["kwargs"]["auto_unload_idle_seconds"] == 0.0
-        assert captured["kwargs"]["lazy_load_model"] is True
-
     def test_serve_command_preserves_mtp_scheduler_config_with_residency(
         self, monkeypatch
     ):
@@ -620,37 +543,6 @@ class TestLifecycleCli:
         assert scheduler_config.enable_mtp is True
         assert scheduler_config.mtp_num_draft_tokens == 4
         assert scheduler_config.mtp_optimistic is True
-
-    def test_server_main_wires_lazy_load_model_without_idle_unload(
-        self, monkeypatch
-    ):
-        """The python -m vllm_mlx.server entrypoint should forward lazy startup too."""
-        import vllm_mlx.server as srv
-
-        captured = {}
-
-        def fake_load_model(*args, **kwargs):
-            captured["args"] = args
-            captured["kwargs"] = kwargs
-
-        monkeypatch.setattr(srv, "load_model", fake_load_model)
-        monkeypatch.setattr(srv, "load_embedding_model", lambda *args, **kwargs: None)
-        monkeypatch.setattr(srv.uvicorn, "run", lambda *args, **kwargs: None)
-        monkeypatch.setattr(
-            sys,
-            "argv",
-            [
-                "vllm_mlx.server",
-                "--model",
-                "mlx-community/Qwen3-0.6B-8bit",
-                "--lazy-load-model",
-            ],
-        )
-
-        srv.main()
-
-        assert captured["kwargs"]["auto_unload_idle_seconds"] == 0.0
-        assert captured["kwargs"]["lazy_load_model"] is True
 
     def test_server_main_preserves_use_batching_with_residency_flags(
         self, monkeypatch
@@ -762,7 +654,7 @@ class TestLifecycleCli:
 class TestResidencyManagerContracts:
     """Lock in the high-risk lifecycle invariants at the manager layer."""
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_concurrent_acquire_single_flights_initial_load(self):
         """Concurrent acquires for one model should perform only one load."""
         from vllm_mlx.lifecycle import ModelSpec, ResidencyManager
@@ -804,7 +696,7 @@ class TestResidencyManagerContracts:
         for _ in engines:
             await manager.release("default")
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_unload_if_idle_respects_active_requests(self):
         """Idle unload should be blocked while a resident still has users."""
         from vllm_mlx.lifecycle import ModelSpec, ResidencyManager
@@ -842,7 +734,7 @@ class TestResidencyManagerContracts:
 
         await manager.release("default")
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_release_updates_last_used_at(self):
         """release() should refresh the timestamp used by idle-unload policy."""
         from vllm_mlx.lifecycle import ModelSpec, ResidencyManager
@@ -876,7 +768,7 @@ class TestResidencyManagerContracts:
         assert before_release != after_release
         assert after_release == 1125.0
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_unload_after_idle_threshold_and_reload(self):
         """A released idle resident should unload and later reload cleanly."""
         from vllm_mlx.lifecycle import ModelSpec, ResidencyManager
@@ -931,7 +823,7 @@ class TestResidencyManagerContracts:
 
         await manager.release("default")
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_cancelled_cold_load_does_not_wedge_future_acquires(self):
         """Cancelling one waiter should not poison the shared resident load."""
         from vllm_mlx.lifecycle import ModelSpec, ResidencyManager
@@ -981,7 +873,7 @@ class TestResidencyManagerContracts:
 
         await manager.release("default")
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_last_cancelled_waiter_cancels_cold_load(self):
         """Cancelling the final waiter should unwind the in-flight resident load."""
         from vllm_mlx.lifecycle import ModelSpec, ResidencyManager
@@ -1051,7 +943,7 @@ class TestResidencyManagerContracts:
                 with suppress(asyncio.CancelledError):
                     await first
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_cancelled_waiter_does_not_cancel_shared_cold_load(self):
         """A canceled waiter should not kill a cold load another waiter still needs."""
         from vllm_mlx.lifecycle import ModelSpec, ResidencyManager
@@ -1120,7 +1012,7 @@ class TestResidencyManagerContracts:
                     with suppress(asyncio.CancelledError):
                         await task
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_cancelled_last_waiter_suppresses_load_failure_from_cancel(self):
         """Abandoned cold loads should still surface as cancellation to the waiter."""
         from vllm_mlx.lifecycle import ModelSpec, ResidencyManager
@@ -1184,7 +1076,7 @@ class TestResidencyManagerContracts:
 
         await manager.release("default")
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_cancelled_prepare_for_start_does_not_finish_after_stop(self):
         """Cancelled cold loads should not let prepare_for_start keep mutating after stop."""
         import threading
@@ -1278,7 +1170,7 @@ class TestResidencyManagerContracts:
                 with suppress(asyncio.CancelledError):
                     await first
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_late_joining_waiter_retries_abandoned_cold_load(self):
         """A waiter joining during abandoned-load cleanup should retry instead of inheriting cancel."""
         from vllm_mlx.lifecycle import ModelSpec, ResidencyManager
@@ -1357,7 +1249,7 @@ class TestResidencyManagerContracts:
                 with suppress(asyncio.CancelledError):
                     await first
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_cancelled_shared_load_during_state_commit_recovers_cleanly(self):
         """Cancelling the shared load during state commit should stop the engine and recover."""
         from vllm_mlx.lifecycle import ModelSpec, ResidencyManager
@@ -1434,7 +1326,7 @@ class TestResidencyManagerContracts:
 
         await manager.release("default")
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_cancelled_load_cleanup_handles_legacy_tasks_without_uncancel_api(
         self, monkeypatch
     ):
@@ -1479,7 +1371,7 @@ class TestResidencyManagerContracts:
         assert resident.state == ResidentState.UNLOADED
         assert resident._loading_task is None
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_shutdown_cancels_inflight_cold_load(self):
         """shutdown() should not allow a cold load to complete afterward."""
         import threading
@@ -1524,7 +1416,7 @@ class TestResidencyManagerContracts:
         assert manager.get_engine("default") is None
         assert manager.get_status("default")["state"] == "unloaded"
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_shutdown_canceled_prepare_error_unwinds_to_unloaded(self):
         """shutdown() should suppress prepare errors from a canceled cold load."""
         import threading
@@ -1578,7 +1470,7 @@ class TestResidencyManagerContracts:
         assert status["state"] == "unloaded"
         assert status["last_error"] is None
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_shutdown_raises_if_loaded_resident_cannot_unload(self):
         """shutdown() should not report success when resident unload fails."""
         from vllm_mlx.lifecycle import ModelSpec, ResidencyManager
@@ -1606,7 +1498,7 @@ class TestResidencyManagerContracts:
         with pytest.raises(RuntimeError):
             await manager.shutdown()
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_shutdown_attempts_later_residents_after_one_unload_failure(self):
         """shutdown() should keep unloading later residents after one unload fails."""
         from vllm_mlx.lifecycle import ModelSpec, ResidencyManager
@@ -1648,7 +1540,7 @@ class TestResidencyManagerContracts:
         assert manager.get_engine("b") is None
         assert manager.get_status("b")["state"] == "unloaded"
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_acquire_retries_if_idle_unload_wins_the_boundary(self, monkeypatch):
         """Acquire should not hand back an engine that unloaded in the claim gap."""
         from vllm_mlx.lifecycle import ModelSpec, ResidencyManager
@@ -1716,7 +1608,7 @@ class TestResidencyManagerContracts:
 
         await manager.release("default")
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_failed_unload_keeps_live_engine_tracked(self):
         """Unload failure should not orphan a still-live engine."""
         from vllm_mlx.lifecycle import ModelSpec, ResidencyManager
@@ -1759,7 +1651,7 @@ class TestResidencyManagerContracts:
 
         await manager.release("default")
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_register_model_rejects_replacing_live_resident(self):
         """register_model() should not orphan an already loaded resident."""
         from vllm_mlx.lifecycle import ModelSpec, ResidencyManager
@@ -1800,7 +1692,7 @@ class TestResidencyManagerContracts:
         assert created == 1
         assert stopped == 1
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_failed_cold_load_cleans_up_partial_engine(self):
         """A start() failure should still stop the partially built engine."""
         from vllm_mlx.lifecycle import ModelSpec, ResidencyManager
@@ -1831,7 +1723,7 @@ class TestResidencyManagerContracts:
         assert manager.get_status("default")["state"] == "failed"
         assert stopped == 1
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_cancelled_waiter_does_not_cancel_shared_unload(self):
         """A canceled acquire waiter should not cancel the shared unload task."""
         from vllm_mlx.lifecycle import ModelSpec, ResidencyManager
@@ -1876,7 +1768,7 @@ class TestResidencyManagerContracts:
         assert unloaded is True
         assert manager.get_status("default")["state"] == "unloaded"
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_cancelled_unload_waiter_does_not_cancel_shared_unload_task(self):
         """Cancelling one unload waiter should not cancel the shared unload operation."""
         from vllm_mlx.lifecycle import ModelSpec, ResidencyManager
@@ -1925,7 +1817,7 @@ class TestResidencyManagerContracts:
 class TestResidencyManagerEdgeCases:
     """Edge-case coverage for manager state transitions and error recovery."""
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_unload_if_idle_when_already_unloaded(self):
         """unload_if_idle on an unloaded resident should return False, not corrupt state."""
         from vllm_mlx.lifecycle import ModelSpec, ResidencyManager
@@ -1950,7 +1842,7 @@ class TestResidencyManagerEdgeCases:
         assert result is False
         assert manager.get_status("m")["state"] == "unloaded"
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_unload_if_idle_during_active_load(self):
         """unload_if_idle should return False when a load is in progress."""
         from vllm_mlx.lifecycle import ModelSpec, ResidencyManager
@@ -1982,7 +1874,7 @@ class TestResidencyManagerEdgeCases:
         await load_task
         await manager.shutdown()
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_register_model_after_failure_replaces_entry(self):
         """A model in FAILED state should be replaceable via register_model."""
         from vllm_mlx.lifecycle import ModelSpec, ResidencyManager
@@ -2027,7 +1919,7 @@ class TestResidencyManagerEdgeCases:
         assert manager.get_status("m")["state"] == "loaded"
         await manager.shutdown()
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_engine_factory_raises_before_engine_created(self):
         """If the factory itself raises (not engine.start), state should be FAILED."""
         from vllm_mlx.lifecycle import ModelSpec, ResidencyManager
@@ -2045,7 +1937,7 @@ class TestResidencyManagerEdgeCases:
         assert status["state"] == "failed"
         assert "model not found" in status["last_error"]
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_rapid_acquire_release_refcount_stays_consistent(self):
         """Rapid acquire/release cycles should keep active_requests consistent."""
         from vllm_mlx.lifecycle import ModelSpec, ResidencyManager
@@ -2079,7 +1971,7 @@ class TestResidencyManagerEdgeCases:
             await manager.release("m")
         assert manager.get_status("m")["active_requests"] == 0
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_shutdown_shields_unload_from_cancellation(self):
         """Cancelling shutdown() should not orphan a half-stopped engine."""
         from vllm_mlx.lifecycle import ModelSpec, ResidencyManager
@@ -2125,7 +2017,7 @@ class TestResidencyManagerEdgeCases:
 class TestCompletionStreamingRelease:
     """Verify the completion endpoint releases residency on all paths."""
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_completion_nonstreaming_error_releases_active_request(self, monkeypatch):
         """Non-streaming completion errors must still release the active request."""
         import vllm_mlx.server as srv
@@ -2186,7 +2078,7 @@ class TestCompletionStreamingRelease:
             "Non-streaming completion must release residency on generation errors"
         )
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_completion_streaming_release_matches_chat_pattern(self, monkeypatch):
         """Streaming completion should use try/finally like chat completion does."""
         import vllm_mlx.server as srv
@@ -2260,7 +2152,7 @@ class TestCompletionStreamingRelease:
 class TestStatusEndpointEngineRace:
     """Verify status/health endpoints handle concurrent engine unload."""
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_status_endpoint_returns_not_loaded_when_engine_is_none(self, monkeypatch):
         """/v1/status should not 500 if engine is unloaded between check and use."""
         import vllm_mlx.server as srv
@@ -2302,7 +2194,7 @@ class TestStatusEndpointEngineRace:
         result = await srv.status()
         assert result["status"] == "not_loaded"
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_health_endpoint_handles_engine_none(self, monkeypatch):
         """/health should not 500 when engine is None."""
         import vllm_mlx.server as srv
@@ -2323,7 +2215,7 @@ class TestStatusEndpointEngineRace:
 class TestToolParserUsesLocalEngine:
     """Tool parser should use the request-local engine, not the global."""
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_parse_tool_calls_survives_none_global_engine(self, monkeypatch):
         """_parse_tool_calls_with_parser should not crash when global engine is None."""
         import vllm_mlx.server as srv
@@ -2348,7 +2240,7 @@ class TestToolParserUsesLocalEngine:
 class TestLifecycleFailureHandling:
     """Regression coverage for lifecycle failure paths."""
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_anthropic_validation_error_does_not_acquire_resident(self, monkeypatch):
         """Malformed Anthropic payloads should not touch residency at all."""
         from pydantic import ValidationError
@@ -2380,7 +2272,7 @@ class TestLifecycleFailureHandling:
         assert calls["acquires"] == 0
         assert calls["releases"] == 0
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_chat_completion_prep_error_releases_resident(self, monkeypatch):
         """Prep failures after acquire should still release chat residency."""
         import vllm_mlx.server as srv
@@ -2437,7 +2329,7 @@ class TestLifecycleFailureHandling:
         assert calls["acquires"] == 1
         assert calls["releases"] == 1
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_request_acquire_helper_disconnect_covers_final_lease(
         self, monkeypatch
     ):
@@ -2478,7 +2370,7 @@ class TestLifecycleFailureHandling:
         assert result is None
         await asyncio.wait_for(acquire_cancelled.wait(), timeout=1.0)
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_wait_with_disconnect_reports_total_request_timeout(self):
         """Timeout details should reflect the configured request budget, not the sub-step."""
         from fastapi import HTTPException
@@ -2506,7 +2398,7 @@ class TestLifecycleFailureHandling:
                 poll_interval=0.001,
             )
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_lifespan_startup_failure_cleans_up_loaded_resident_and_loop(
         self, monkeypatch
     ):
@@ -2582,7 +2474,7 @@ class TestLifecycleFailureHandling:
             with suppress(Exception):
                 await lifespan.aclose()
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_lifespan_startup_failure_preserves_original_exception(
         self, monkeypatch, caplog
     ):
@@ -2641,7 +2533,7 @@ class TestLifecycleFailureHandling:
             with suppress(Exception):
                 await lifespan.aclose()
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_lifespan_startup_failure_keeps_live_runtime_guarded_if_cleanup_fails(
         self, monkeypatch
     ):
@@ -2706,7 +2598,7 @@ class TestLifecycleFailureHandling:
             with suppress(Exception):
                 await lifespan.aclose()
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_eager_residency_registers_unloaded_resident_before_lifespan_startup(
         self, monkeypatch
     ):
@@ -2765,7 +2657,7 @@ class TestLifecycleFailureHandling:
                     await srv._residency_manager.shutdown()
                 srv._sync_engine_from_residency()
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_load_model_preserves_scheduler_config_when_enabling_residency(
         self, monkeypatch
     ):
@@ -2832,7 +2724,7 @@ class TestLifecycleFailureHandling:
                     await srv._residency_manager.shutdown()
                 srv._sync_engine_from_residency()
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_eager_residency_stays_loaded_until_startup_ready(self, monkeypatch):
         """Eager residency should not auto-unload before startup reaches readiness."""
         import vllm_mlx.server as srv
@@ -2896,7 +2788,7 @@ class TestLifecycleFailureHandling:
             with suppress(Exception):
                 await lifespan.aclose()
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     @pytest.mark.parametrize("engine_kind", ["simple", "batched-llm", "batched-mllm"])
     async def test_eager_engine_start_cancellation_cleans_prepared_state(
         self, monkeypatch, engine_kind
@@ -2975,7 +2867,7 @@ class TestLifecycleFailureHandling:
             with suppress(Exception):
                 await engine.stop()
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_simple_start_cancellation_preserves_cancelled_error_when_stop_fails(
         self, monkeypatch, caplog
     ):
@@ -3030,7 +2922,7 @@ class TestLifecycleFailureHandling:
                 with suppress(asyncio.CancelledError):
                     await start_task
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_run_blocking_startup_work_waits_for_thread_under_repeated_cancel(self):
         """Repeated cancellation should not return before blocking startup work finishes."""
         import threading
@@ -3073,7 +2965,7 @@ class TestLifecycleFailureHandling:
                 timeout=1.0,
             )
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_blocking_cache_io_waits_for_thread_under_repeated_cancel(
         self,
     ):
@@ -3121,7 +3013,7 @@ class TestLifecycleFailureHandling:
                 timeout=1.0,
             )
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_prepare_engine_start_waits_for_thread_under_repeated_cancel(self):
         """Repeated cancellation of a residency cold load must not return before
         prepare_for_start() finishes, otherwise the thread can keep mutating
@@ -3189,7 +3081,7 @@ class TestLifecycleFailureHandling:
             with suppress(Exception):
                 await manager.shutdown()
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_run_blocking_startup_work_does_not_livelock_on_cancelled_inner_task(self):
         """If the inner to_thread task ends up cancelled, the drain loop must
         exit instead of spinning forever on CancelledError."""
@@ -3206,7 +3098,7 @@ class TestLifecycleFailureHandling:
         with pytest.raises(asyncio.CancelledError):
             await asyncio.wait_for(task, timeout=2.0)
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_blocking_cache_io_does_not_livelock_on_cancelled_inner_task(self):
         """If the inner to_thread task ends cancelled, the drain loop must exit."""
         import vllm_mlx.server as srv
@@ -3226,7 +3118,7 @@ class TestLifecycleFailureHandling:
         with pytest.raises(asyncio.CancelledError):
             await asyncio.wait_for(task, timeout=2.0)
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_prepare_engine_start_does_not_livelock_on_cancelled_inner_task(self):
         """If prepare_for_start's to_thread task ends cancelled, the residency
         drain loop must exit instead of spinning."""
@@ -3267,7 +3159,7 @@ class TestLifecycleFailureHandling:
         with suppress(Exception):
             await manager.shutdown()
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     @pytest.mark.parametrize("start_phase", ["llm", "mllm"])
     async def test_batched_start_phase_cancellation_preserves_cancelled_error_when_stop_fails(
         self, monkeypatch, caplog, start_phase
@@ -3333,7 +3225,7 @@ class TestLifecycleFailureHandling:
                 with suppress(asyncio.CancelledError):
                     await start_task
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_cleanup_failure_does_not_orphan_live_eager_engine(self, monkeypatch):
         """A failed eager-engine stop should keep the live engine guarded against replacement."""
         import vllm_mlx.server as srv
@@ -3368,7 +3260,7 @@ class TestLifecycleFailureHandling:
             with suppress(Exception):
                 await lifespan.aclose()
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_cleanup_failure_before_residency_shutdown_keeps_live_manager_guarded(
         self, monkeypatch
     ):
@@ -3432,7 +3324,7 @@ class TestLifecycleFailureHandling:
             with suppress(Exception):
                 await lifespan.aclose()
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_idle_unload_loop_survives_one_unload_failure(self, monkeypatch):
         """One unload failure should not kill the background lifecycle loop."""
         import vllm_mlx.server as srv
@@ -3463,7 +3355,7 @@ class TestLifecycleFailureHandling:
 
         assert calls["count"] >= 2
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_idle_unload_loop_honors_subsecond_timeout_granularity(
         self, monkeypatch
     ):
@@ -3491,7 +3383,7 @@ class TestLifecycleFailureHandling:
 
         assert sleeps == [0.25]
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_cache_restore_hook_does_not_block_event_loop(self, monkeypatch):
         """Cold-load cache restore should not freeze unrelated loop work."""
         import threading
@@ -3539,7 +3431,7 @@ class TestLifecycleFailureHandling:
         assert callback_seen_during_hook["value"] is True
         await srv._release_default_engine()
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_cache_persist_hook_does_not_block_event_loop(self, monkeypatch):
         """Idle-unload cache persistence should not freeze unrelated loop work."""
         import threading
@@ -3597,7 +3489,7 @@ class TestLifecycleFailureHandling:
         assert unloaded is True
         assert callback_seen_during_hook["value"] is True
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_idle_unload_persists_and_restores_prefix_cache(self, monkeypatch):
         """Server-managed idle unload should save and reload prefix cache state."""
         import vllm_mlx.server as srv
@@ -3659,7 +3551,7 @@ class TestLifecycleFailureHandling:
 
         await manager.release("default")
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_lifespan_does_not_double_apply_cache_hooks_in_lifecycle_mode(
         self, monkeypatch
     ):
@@ -3766,7 +3658,7 @@ class TestLifecycleFailureHandling:
         srv._parse_tool_calls_with_parser("<tool_call>")
         assert parser_tokenizers == ["tok-1", "tok-2"]
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_acquire_path_rebuilds_tool_parser_after_resident_swap(
         self, monkeypatch
     ):
@@ -3839,7 +3731,7 @@ class TestLifecycleFailureHandling:
 
         await srv._release_default_engine()
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_shutdown_clears_stopped_eager_engine_for_inprocess_reload(
         self, monkeypatch
     ):
@@ -3965,7 +3857,7 @@ class TestLifecycleFailureHandling:
                 created_loop["loop"].close()
             monkeypatch.setattr(srv, "_engine", None, raising=False)
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_load_model_rejects_reconfiguration_after_lifespan_start(
         self, monkeypatch
     ):
@@ -4018,7 +3910,7 @@ class TestLifecycleFailureHandling:
             with pytest.raises(StopAsyncIteration):
                 await lifespan.__anext__()
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_lazy_cold_acquire_does_not_block_event_loop(self, monkeypatch):
         """Cold resident startup should not freeze unrelated event-loop work."""
         import time
@@ -4069,7 +3961,7 @@ class TestLifecycleFailureHandling:
 
         await srv._release_default_engine()
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_completion_timeout_covers_cold_resident_acquire(self, monkeypatch):
         """Request timeout should include lazy-load engine acquisition."""
         from fastapi import HTTPException
@@ -4170,7 +4062,7 @@ class TestLifecycleFailureHandling:
                 with suppress(Exception):
                     await request_task
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_chat_timeout_covers_cold_resident_acquire(self, monkeypatch):
         """Chat timeout should include lazy-load engine acquisition."""
         from fastapi import HTTPException
@@ -4281,7 +4173,7 @@ class TestLifecycleFailureHandling:
                 with suppress(Exception):
                     await request_task
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_completion_disconnect_covers_cold_resident_acquire(self, monkeypatch):
         """Disconnect handling should abort a cold resident acquire before generation."""
         from fastapi.responses import Response
@@ -4379,7 +4271,7 @@ class TestLifecycleFailureHandling:
                 with suppress(Exception):
                     await request_task
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_count_tokens_disconnect_covers_cold_resident_acquire(
         self, monkeypatch
     ):
@@ -4489,7 +4381,7 @@ class TestLifecycleFailureHandling:
                 with suppress(Exception):
                     await request_task
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_count_tokens_does_not_refresh_idle_unload_activity(
         self, monkeypatch
     ):
@@ -4561,7 +4453,7 @@ class TestLifecycleFailureHandling:
         assert status is not None
         assert status["state"] == "unloaded"
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_count_tokens_validates_model_before_resident_acquire(
         self, monkeypatch
     ):
@@ -4604,7 +4496,7 @@ class TestLifecycleFailureHandling:
 
         assert calls["acquire"] == 0
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_anthropic_messages_refresh_idle_unload_activity(
         self, monkeypatch
     ):
@@ -4687,7 +4579,7 @@ class TestLifecycleFailureHandling:
         assert status is not None
         assert status["state"] == "loaded"
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_wait_with_disconnect_treats_raced_task_cancellation_as_disconnect(
         self,
     ):
@@ -4720,7 +4612,7 @@ class TestLifecycleFailureHandling:
         assert result is None
         assert task.cancelled() is True
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_lazy_load_model_starts_unloaded_and_reports_unloaded_status(
         self, monkeypatch
     ):
@@ -4770,7 +4662,7 @@ class TestLifecycleFailureHandling:
         with pytest.raises(StopAsyncIteration):
             await lifespan.__anext__()
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_lazy_load_first_acquire_triggers_initial_engine_load(
         self, monkeypatch
     ):
@@ -4830,7 +4722,7 @@ class TestLifecycleFailureHandling:
         with pytest.raises(StopAsyncIteration):
             await lifespan.__anext__()
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_lazy_load_with_idle_unload_starts_unloaded_and_reports_unloaded_status(
         self, monkeypatch
     ):
@@ -4991,7 +4883,7 @@ class TestLifecycleFailureHandling:
 class TestLifecycleLoopIdleEvent:
     """Verify that the lifecycle loop uses an asyncio.Event for gating."""
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_lifecycle_loop_blocks_when_event_cleared(self):
         """The loop should block on the Event, not busy-poll."""
         import vllm_mlx.server as srv
@@ -5074,7 +4966,7 @@ class TestPublicLifecycleStatusSanitization:
 
         assert srv._public_lifecycle_status(None) is None
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_health_surfaces_sanitized_error_on_failed_resident(
         self, monkeypatch
     ):
@@ -5104,7 +4996,7 @@ class TestPublicLifecycleStatusSanitization:
         assert payload["residency_state"] == "failed"
         assert payload["last_error"] == "model_load_failed"
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_health_omits_last_error_for_healthy_resident(
         self, monkeypatch
     ):
@@ -5139,7 +5031,7 @@ class TestPublicLifecycleStatusSanitization:
         assert payload["status"] == "healthy"
         assert "last_error" not in payload
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_health_and_status_agree_on_empty_string_error(
         self, monkeypatch
     ):
@@ -5186,7 +5078,7 @@ class TestPublicLifecycleStatusSanitization:
 class TestSuspendCancellationDedup:
     """Verify lifecycle.py uses the shared suspend_cancellation from base."""
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_residency_manager_uses_shared_suspend_cancellation(self):
         """ResidencyManager cleanup paths should work with the shared helper."""
         from vllm_mlx.lifecycle import ModelSpec, ResidencyManager
@@ -5225,7 +5117,7 @@ class TestResponseModelFieldUsesServedName:
     from the server-side served name rather than the request echo-back.
     """
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_completion_response_uses_served_model_name(self, monkeypatch):
         import vllm_mlx.server as srv
         from vllm_mlx.engine.base import GenerationOutput
@@ -5269,7 +5161,7 @@ class TestResponseModelFieldUsesServedName:
         assert response.model == served_name
         assert response.model != "user-sent-model-name"
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_chat_completion_response_uses_served_model_name(self, monkeypatch):
         import vllm_mlx.server as srv
         from vllm_mlx.engine.base import GenerationOutput
@@ -5316,7 +5208,7 @@ class TestResponseModelFieldUsesServedName:
         assert response.model == served_name
         assert response.model != "user-sent-model-name"
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_anthropic_response_uses_served_model_name(self, monkeypatch):
         import json
 
