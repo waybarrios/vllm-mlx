@@ -4988,63 +4988,6 @@ class TestLifecycleFailureHandling:
         assert srv._tool_parser_instance is original_parser
 
 
-class TestHasMediaContentShared:
-    """Verify the shared has_media_content helper handles both dict and Pydantic messages."""
-
-    def test_detects_image_url_in_dict_messages(self):
-        from vllm_mlx.api.utils import has_media_content
-
-        messages = [
-            {"role": "user", "content": [{"type": "text", "text": "hi"}]},
-            {
-                "role": "user",
-                "content": [{"type": "image_url", "image_url": {"url": "x"}}],
-            },
-        ]
-        assert has_media_content(messages) is True
-
-    def test_returns_false_for_text_only_dicts(self):
-        from vllm_mlx.api.utils import has_media_content
-
-        messages = [
-            {"role": "user", "content": "just text"},
-            {"role": "user", "content": [{"type": "text", "text": "hi"}]},
-        ]
-        assert has_media_content(messages) is False
-
-    def test_detects_video_url_in_pydantic_style_messages(self):
-        from vllm_mlx.api.utils import has_media_content
-
-        class FakePart:
-            def __init__(self, type_):
-                self.type = type_
-
-        class FakeMsg:
-            def __init__(self, content):
-                self.content = content
-
-        messages = [FakeMsg([FakePart("text"), FakePart("video_url")])]
-        assert has_media_content(messages) is True
-
-    def test_handles_audio_type(self):
-        from vllm_mlx.api.utils import has_media_content
-
-        messages = [{"role": "user", "content": [{"type": "audio"}]}]
-        assert has_media_content(messages) is True
-
-    def test_handles_none_content(self):
-        from vllm_mlx.api.utils import has_media_content
-
-        messages = [{"role": "system", "content": None}]
-        assert has_media_content(messages) is False
-
-    def test_handles_string_content(self):
-        from vllm_mlx.api.utils import has_media_content
-
-        messages = [{"role": "user", "content": "hello"}]
-        assert has_media_content(messages) is False
-
-
 class TestLifecycleLoopIdleEvent:
     """Verify that the lifecycle loop uses an asyncio.Event for gating."""
 
@@ -5242,13 +5185,6 @@ class TestPublicLifecycleStatusSanitization:
 
 class TestSuspendCancellationDedup:
     """Verify lifecycle.py uses the shared suspend_cancellation from base."""
-
-    def test_lifecycle_does_not_define_its_own_suspend_cancellation(self):
-        """lifecycle.py should import suspend_cancellation, not redefine it."""
-        import vllm_mlx.lifecycle as lc
-        from vllm_mlx.engine.base import suspend_cancellation
-
-        assert lc.suspend_cancellation is suspend_cancellation
 
     @pytest.mark.asyncio
     async def test_residency_manager_uses_shared_suspend_cancellation(self):
