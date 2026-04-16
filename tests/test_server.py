@@ -1041,10 +1041,10 @@ class TestSseDoneTermination:
 
     @pytest.mark.anyio
     async def test_stream_completion_exception_still_emits_done(self, monkeypatch):
-        """When engine raises mid-stream, [DONE] is still emitted."""
+        """When engine raises mid-stream, [DONE] is still emitted via _ensure_sse_terminal."""
         from vllm_mlx.api.models import CompletionRequest
         from vllm_mlx.engine.base import GenerationOutput
-        from vllm_mlx.server import stream_completion
+        from vllm_mlx.server import _ensure_sse_terminal, stream_completion
 
         import vllm_mlx.server as server
 
@@ -1061,10 +1061,12 @@ class TestSseDoneTermination:
         monkeypatch.setattr(server, "_default_max_tokens", 100)
 
         request = CompletionRequest(model="test-model", prompt="Say hello")
+        # Wrap with _ensure_sse_terminal, matching server routing
         chunks = [
             chunk
-            async for chunk in stream_completion(
-                ExplodingEngine(), "Say hello", request
+            async for chunk in _ensure_sse_terminal(
+                stream_completion(ExplodingEngine(), "Say hello", request),
+                "data: [DONE]\n\n",
             )
         ]
 
