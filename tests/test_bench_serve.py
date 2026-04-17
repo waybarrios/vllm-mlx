@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for vllm_mlx.bench_serve — prompt loading and sweep expansion."""
 
+import csv
 import json
 import time
 from pathlib import Path
@@ -9,12 +10,17 @@ from typing import Optional
 import pytest
 
 from vllm_mlx.bench_serve import (
+    RESULT_COLUMNS,
     BenchServeResult,
     SweepConfig,
     compute_request_metrics,
     compute_summary_stats,
     detect_hardware_fingerprint,
     expand_sweep,
+    format_csv,
+    format_json,
+    format_sql,
+    format_table,
     load_prompt_set,
     parse_health_response,
     parse_metrics_text,
@@ -606,3 +612,103 @@ class TestSummaryStats:
             compute_summary_stats([])
 
 
+# ---------------------------------------------------------------------------
+# Formatter helpers  (Task 6)
+# ---------------------------------------------------------------------------
+
+
+def _make_sample_result(**overrides) -> BenchServeResult:
+    """Return a BenchServeResult with realistic defaults, accepting overrides."""
+    defaults = dict(
+        run_id="run-abc123",
+        timestamp="2026-04-17T10:00:00Z",
+        tag="ci",
+        chip="Apple M3 Max",
+        gpu_cores=40,
+        memory_gb=128.0,
+        bandwidth_gbs=400.0,
+        os_version="macOS 15.4",
+        model_id="mlx-community/gemma-3-4b-it-4bit",
+        model_type="llm",
+        engine_type="vllm-mlx",
+        mtp_enabled=False,
+        specprefill=False,
+        kv_quant="",
+        cache_type="paged",
+        prompt_set="short",
+        concurrency=4,
+        max_tokens=256,
+        enable_thinking=None,
+        extra_body="",
+        repetition=0,
+        prompt_tokens=32,
+        ttft_ms=85.3,
+        tpot_ms=12.4,
+        e2e_latency_ms=420.7,
+        gen_tps=80.6,
+        prompt_tps=310.2,
+        throughput_tps=75.1,
+        requests_per_s=2.4,
+        metal_active_gb=12.5,
+        metal_peak_gb=14.0,
+        metal_cache_gb=2.0,
+        cache_hits=10,
+        cache_misses=2,
+        cache_hit_rate=0.833,
+        tokens_saved=320,
+        validated=True,
+    )
+    defaults.update(overrides)
+    return BenchServeResult(**defaults)
+
+
+# ---------------------------------------------------------------------------
+# TestFormatters  (Task 6)
+# ---------------------------------------------------------------------------
+
+
+class TestFormatters:
+    """Unit tests for output formatter functions."""
+
+    def test_format_table_not_empty(self):
+        r = _make_sample_result()
+        output = format_table([r])
+        assert len(output) > 0
+        assert r.model_id in output or str(r.ttft_ms) in output or "85" in output
+
+    def test_format_json_roundtrip(self):
+        r1 = _make_sample_result(run_id="r1")
+        r2 = _make_sample_result(run_id="r2", concurrency=8)
+        output = format_json([r1, r2])
+        parsed = json.loads(output)
+        assert len(parsed) == 2
+        assert parsed[0]["run_id"] == "r1"
+        assert parsed[1]["run_id"] == "r2"
+
+    def test_format_csv_parseable(self):
+        r = _make_sample_result()
+        output = format_csv([r])
+        reader = csv.DictReader(output.splitlines())
+        rows = list(reader)
+        assert len(rows) == 1
+        assert "model_id" in rows[0]
+        assert "ttft_ms" in rows[0]
+        assert rows[0]["model_id"] == r.model_id
+
+    def test_format_sql_valid(self):
+        r = _make_sample_result()
+        output = format_sql([r])
+        assert "CREATE TABLE" in output
+        assert "INSERT" in output
+        assert "bench_serve" in output
+
+    def test_format_sql_escapes_quotes(self):
+        r = _make_sample_result(tag="it's a test")
+        output = format_sql([r])
+        assert "it''s a test" in output
+
+    def test_result_columns_match_dataclass(self):
+        import dataclasses
+
+        field_names = {f.name for f in dataclasses.fields(BenchServeResult)}
+        assert set(RESULT_COLUMNS) == field_names

@@ -16,6 +16,8 @@ It is a pure HTTP client that talks to a running OpenAI-compatible server.
 """
 
 import asyncio
+import csv as csv_mod
+import io
 import itertools
 import json
 import platform
@@ -27,6 +29,7 @@ from pathlib import Path
 from typing import Optional
 
 import httpx
+from tabulate import tabulate as _tabulate
 
 # ---------------------------------------------------------------------------
 # Prompt set loading
@@ -774,3 +777,146 @@ async def run_concurrent_requests(
     results = await asyncio.gather(*[_single(msg) for msg in selected])
     return list(results)
 
+
+# ---------------------------------------------------------------------------
+# Task 6: Output formatters
+# ---------------------------------------------------------------------------
+
+import dataclasses as _dataclasses  # noqa: E402 — local alias avoids shadowing
+
+RESULT_COLUMNS: list[str] = [f.name for f in _dataclasses.fields(BenchServeResult)]
+
+_TABLE_COLUMNS = [
+    "prompt_set",
+    "concurrency",
+    "prompt_tokens",
+    "ttft_ms",
+    "tpot_ms",
+    "gen_tps",
+    "prompt_tps",
+    "e2e_latency_ms",
+    "validated",
+]
+
+
+def _result_to_dict(r: BenchServeResult) -> dict:
+    """Convert a :class:`BenchServeResult` to an ordered dict.
+
+    Returns an ``OrderedDict``-style plain ``dict`` whose keys follow the
+    dataclass field declaration order (as listed in :data:`RESULT_COLUMNS`).
+    """
+    return {f.name: getattr(r, f.name) for f in _dataclasses.fields(r)}
+
+
+def format_table(results: list[BenchServeResult]) -> str:
+    """Render a human-readable terminal table of benchmark results.
+
+    Only the columns in :data:`_TABLE_COLUMNS` are shown.  Float values are
+    rounded to one decimal place.
+
+    Args:
+        results: List of :class:`BenchServeResult` instances.
+
+    Returns:
+        Formatted string using ``tabulate`` with ``tablefmt="simple"``.
+    """
+    rows = []
+    for r in results:
+        d = _result_to_dict(r)
+        row = []
+        for col in _TABLE_COLUMNS:
+            val = d.get(col)
+            if isinstance(val, float):
+                val = round(val, 1)
+            row.append(val)
+        rows.append(row)
+    return _tabulate(rows, headers=_TABLE_COLUMNS, tablefmt="simple")
+
+
+def format_json(results: list[BenchServeResult]) -> str:
+    """Serialize benchmark results as a JSON array.
+
+    All fields from :data:`RESULT_COLUMNS` are included.
+
+    Args:
+        results: List of :class:`BenchServeResult` instances.
+
+    Returns:
+        JSON string with ``indent=2``.
+    """
+    return json.dumps([_result_to_dict(r) for r in results], indent=2)
+
+
+def format_csv(results: list[BenchServeResult]) -> str:
+    """Serialize benchmark results as CSV with a header row.
+
+    All columns are included.
+
+    Args:
+        results: List of :class:`BenchServeResult` instances.
+
+    Returns:
+        CSV string (header + one row per result).
+    """
+    buf = io.StringIO()
+    writer = csv_mod.DictWriter(buf, fieldnames=RESULT_COLUMNS)
+    writer.writeheader()
+    for r in results:
+        writer.writerow(_result_to_dict(r))
+    return buf.getvalue()
+
+
+def _sql_escape(value) -> str:
+    """Escape a Python value for use as a SQL literal.
+
+    - ``None`` -> ``"NULL"``
+    - ``bool`` -> ``"1"`` or ``"0"``
+    - ``int`` / ``float`` -> string representation
+    - ``str`` -> single-quoted with internal single-quotes doubled
+    """
+    if value is None:
+        return "NULL"
+    if isinstance(value, bool):
+        return "1" if value else "0"
+    if isinstance(value, (int, float)):
+        return str(value)
+    # str
+    escaped = str(value).replace("'", "''")
+    return f"'{escaped}'"
+
+
+_SQL_SCHEMA = (
+    "run_id TEXT, timestamp TEXT, tag TEXT, "
+    "chip TEXT, gpu_cores INTEGER, memory_gb REAL, bandwidth_gbs REAL, os_version TEXT, "
+    "model_id TEXT, model_type TEXT, engine_type TEXT, mtp_enabled BOOLEAN, "
+    "specprefill BOOLEAN, kv_quant TEXT, cache_type TEXT, "
+    "prompt_set TEXT, concurrency INTEGER, max_tokens INTEGER, enable_thinking BOOLEAN, "
+    "extra_body TEXT, repetition INTEGER, prompt_tokens INTEGER, "
+    "ttft_ms REAL, tpot_ms REAL, e2e_latency_ms REAL, "
+    "gen_tps REAL, prompt_tps REAL, throughput_tps REAL, requests_per_s REAL, "
+    "metal_active_gb REAL, metal_peak_gb REAL, metal_cache_gb REAL, "
+    "cache_hits INTEGER, cache_misses INTEGER, cache_hit_rate REAL, tokens_saved INTEGER, "
+    "validated BOOLEAN"
+)
+
+
+def format_sql(results: list[BenchServeResult]) -> str:
+    """Emit a SQL ``CREATE TABLE IF NOT EXISTS`` statement and INSERT rows.
+
+    The schema follows the exact column order defined in the bench-serve spec.
+
+    Args:
+        results: List of :class:`BenchServeResult` instances.
+
+    Returns:
+        SQL string containing the CREATE TABLE statement followed by one
+        INSERT statement per result.
+    """
+    lines = [
+        f"CREATE TABLE IF NOT EXISTS bench_serve ({_SQL_SCHEMA});",
+    ]
+    for r in results:
+        d = _result_to_dict(r)
+        values = ", ".join(_sql_escape(d[col]) for col in RESULT_COLUMNS)
+        lines.append(f"INSERT INTO bench_serve VALUES ({values});")
+    return "\n".join(lines)
