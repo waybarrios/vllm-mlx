@@ -92,6 +92,9 @@ def anthropic_to_openai(request: AnthropicRequest) -> ChatCompletionRequest:
         stop=request.stop_sequences,
         tools=tools,
         tool_choice=tool_choice,
+        # Forward response_format as-is; ChatCompletionRequest coerces raw
+        # dicts into the strict ResponseFormat model via pydantic.
+        response_format=request.response_format,
     )
 
 

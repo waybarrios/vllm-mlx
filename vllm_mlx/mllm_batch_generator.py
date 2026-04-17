@@ -60,6 +60,10 @@ class MLLMBatchRequest:
     min_p: float = 0.0
     presence_penalty: float = 0.0
     repetition_penalty: float = 1.0
+    # Extra logits processors (e.g. JSON schema constrained decoding).
+    # Merged with built-in repetition/presence penalty processors in
+    # ``_prefill_batch``.
+    logits_processors: Optional[List[Callable]] = None
 
     # Processed inputs (set after vision preprocessing)
     input_ids: Optional[mx.array] = None
@@ -1198,6 +1202,14 @@ class MLLMBatchGenerator:
                             logits = logits.logits
 
                         last_logits = logits[:, -1, :]
+
+                        # Apply per-request logits processors BEFORE sampler
+                        # for first-token sampling (prefix cache hit path).
+                        if getattr(req, "logits_processors", None):
+                            empty_tokens = mx.array([], dtype=mx.int32)
+                            for processor in req.logits_processors:
+                                last_logits = processor(empty_tokens, last_logits)
+
                         logprobs = last_logits - mx.logsumexp(
                             last_logits, axis=-1, keepdims=True
                         )
@@ -1236,6 +1248,14 @@ class MLLMBatchGenerator:
                             logits = logits.logits
 
                         last_logits = logits[:, -1, :]
+
+                        # Apply per-request logits processors BEFORE sampler
+                        # for first-token sampling (prefix cache exact hit).
+                        if getattr(req, "logits_processors", None):
+                            empty_tokens = mx.array([], dtype=mx.int32)
+                            for processor in req.logits_processors:
+                                last_logits = processor(empty_tokens, last_logits)
+
                         logprobs = last_logits - mx.logsumexp(
                             last_logits, axis=-1, keepdims=True
                         )
@@ -1266,8 +1286,22 @@ class MLLMBatchGenerator:
                         else:
                             logits = self._run_vision_encoding(req, cache=request_cache)
 
-                        # Extract last token logits and sample
+                        # Extract last token logits
                         last_logits = logits[:, -1, :]
+
+                        # Apply per-request logits processors BEFORE sampler
+                        # (e.g. JSON schema constrained decoding).  Without
+                        # this, the first generated token is unconstrained —
+                        # the model can emit special tokens like <|channel>
+                        # that the schema disallows.  Subsequent tokens are
+                        # masked in ``_step``; this mirrors that behavior for
+                        # the first token sampled from prefill output.
+                        # ``output_tokens`` is empty at prefill time.
+                        if getattr(req, "logits_processors", None):
+                            empty_tokens = mx.array([], dtype=mx.int32)
+                            for processor in req.logits_processors:
+                                last_logits = processor(empty_tokens, last_logits)
+
                         logprobs = last_logits - mx.logsumexp(
                             last_logits, axis=-1, keepdims=True
                         )
@@ -1353,7 +1387,10 @@ class MLLMBatchGenerator:
         # Create initial y (first generated tokens)
         y = mx.array(first_tokens)
 
-        # Build per-request logits processors (repetition_penalty, presence_penalty)
+        # Build per-request logits processors.  Combines built-in
+        # (repetition_penalty, presence_penalty) with any caller-supplied
+        # processors (e.g. JSON schema constrained decoding via
+        # ``lm-format-enforcer``).
         from mlx_lm.sample_utils import make_logits_processors, make_sampler
 
         batch_logits_processors = []
@@ -1361,20 +1398,28 @@ class MLLMBatchGenerator:
         for req in requests:
             need_rep = req.repetition_penalty and req.repetition_penalty != 1.0
             need_pres = req.presence_penalty and req.presence_penalty != 0.0
+            combined: List[Callable] = []
             if need_rep or need_pres:
                 lp_kwargs = {}
                 if need_rep:
                     lp_kwargs["repetition_penalty"] = req.repetition_penalty
                 if need_pres:
                     lp_kwargs["presence_penalty"] = req.presence_penalty
-                lp = make_logits_processors(**lp_kwargs)
-                batch_logits_processors.append(lp)
-                has_any_lp = True
+                combined.extend(make_logits_processors(**lp_kwargs))
                 logger.info(
                     f"[sampling] request={req.request_id[:12]} "
                     f"rep_penalty={req.repetition_penalty} "
                     f"pres_penalty={req.presence_penalty}"
                 )
+            if req.logits_processors:
+                combined.extend(req.logits_processors)
+                logger.info(
+                    f"[sampling] request={req.request_id[:12]} "
+                    f"extra_logits_processors={len(req.logits_processors)}"
+                )
+            if combined:
+                batch_logits_processors.append(combined)
+                has_any_lp = True
             else:
                 batch_logits_processors.append(None)
 
@@ -1455,10 +1500,15 @@ class MLLMBatchGenerator:
             for e in range(logits.shape[0]):
                 sample_logits = logits[e : e + 1]
                 if logits_processors[e]:
+                    # Build full context: output_tokens + current input token.
+                    # ``output_tokens[e]`` lacks the current step's input token
+                    # because it hasn't been appended yet; adding it here gives
+                    # logits processors (e.g. JSON schema enforcer) accurate
+                    # context about what has been generated so far.
+                    cur_tok = int(input_tokens[e, 0])
+                    full_context = output_tokens[e] + [cur_tok]
                     for processor in logits_processors[e]:
-                        sample_logits = processor(
-                            mx.array(output_tokens[e]), sample_logits
-                        )
+                        sample_logits = processor(mx.array(full_context), sample_logits)
                 processed_logits.append(sample_logits)
             logits = mx.concatenate(processed_logits, axis=0)
 

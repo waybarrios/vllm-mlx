@@ -55,6 +55,8 @@ dependencies = [
     "mcp>=1.0.0",
     # JSON Schema validation for structured output
     "jsonschema>=4.0.0",
+    # Constrained decoding (grammar-guided generation for response_format)
+    "lm-format-enforcer>=0.10.9",
     # pytz is required by gradio but not declared as a dependency
     # See: https://github.com/waybarrios/vllm-mlx/issues/23
     "pytz>=2024.1",

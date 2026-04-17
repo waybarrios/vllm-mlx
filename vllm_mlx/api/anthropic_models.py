@@ -65,6 +65,10 @@ class AnthropicRequest(BaseModel):
     tool_choice: dict | None = None
     metadata: dict | None = None
     top_k: int | None = None
+    # OpenAI-compatible extension (not in the official Anthropic spec, but
+    # clients commonly forward it via extra_body or top-level for structured
+    # output / constrained decoding on this endpoint).
+    response_format: dict | None = None
 
 
 # =============================================================================
