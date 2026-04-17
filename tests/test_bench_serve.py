@@ -12,6 +12,7 @@ from vllm_mlx.bench_serve import (
     BenchServeResult,
     SweepConfig,
     compute_request_metrics,
+    compute_summary_stats,
     detect_hardware_fingerprint,
     expand_sweep,
     load_prompt_set,
@@ -19,6 +20,7 @@ from vllm_mlx.bench_serve import (
     parse_metrics_text,
     parse_sse_line,
     parse_status_response,
+    validate_response,
 )
 
 # ---------------------------------------------------------------------------
@@ -528,3 +530,79 @@ class TestRequestMetrics:
         )
         # Single token → no inter-token interval → TPOT = 0.0
         assert metrics["tpot_ms"] == pytest.approx(0.0)
+
+
+# ---------------------------------------------------------------------------
+# TestValidation  (Task 5)
+# ---------------------------------------------------------------------------
+
+
+class TestValidation:
+    """Unit tests for validate_response()."""
+
+    def test_valid_response(self):
+        is_valid, msg = validate_response(
+            finish_reason="stop", content="Hello world", status_code=200
+        )
+        assert is_valid is True
+        assert msg == ""
+
+    def test_empty_content(self):
+        is_valid, msg = validate_response(
+            finish_reason="stop", content="", status_code=200
+        )
+        assert is_valid is False
+        assert "empty" in msg.lower()
+
+    def test_length_truncation(self):
+        is_valid, msg = validate_response(
+            finish_reason="length", content="partial text", status_code=200
+        )
+        assert is_valid is False
+        assert "length" in msg.lower()
+
+    def test_missing_finish_reason(self):
+        is_valid, msg = validate_response(
+            finish_reason=None, content="some text", status_code=200
+        )
+        assert is_valid is False
+        assert msg != ""
+
+    def test_http_error(self):
+        is_valid, msg = validate_response(
+            finish_reason="stop", content="error body", status_code=500
+        )
+        assert is_valid is False
+        assert "500" in msg
+
+
+# ---------------------------------------------------------------------------
+# TestSummaryStats  (Task 5)
+# ---------------------------------------------------------------------------
+
+
+class TestSummaryStats:
+    """Unit tests for compute_summary_stats()."""
+
+    def test_basic_summary(self):
+        stats = compute_summary_stats([10.0, 20.0, 30.0, 40.0, 50.0])
+        assert stats["mean"] == pytest.approx(30.0)
+        assert stats["min"] == pytest.approx(10.0)
+        assert stats["max"] == pytest.approx(50.0)
+        assert stats["p50"] == pytest.approx(30.0)
+
+    def test_single_value(self):
+        stats = compute_summary_stats([42.0])
+        assert stats["mean"] == pytest.approx(42.0)
+        assert stats["stddev"] == pytest.approx(0.0)
+        assert stats["min"] == pytest.approx(42.0)
+        assert stats["max"] == pytest.approx(42.0)
+        assert stats["p50"] == pytest.approx(42.0)
+        assert stats["p95"] == pytest.approx(42.0)
+        assert stats["p99"] == pytest.approx(42.0)
+
+    def test_empty_raises(self):
+        with pytest.raises(ValueError):
+            compute_summary_stats([])
+
+

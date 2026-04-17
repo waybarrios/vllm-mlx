@@ -15,6 +15,7 @@ This module has no MLX dependency and can be imported on any platform.
 It is a pure HTTP client that talks to a running OpenAI-compatible server.
 """
 
+import asyncio
 import itertools
 import json
 import platform
@@ -626,3 +627,150 @@ async def stream_chat_completion(
         "finish_reason": finish_reason,
         "content": "".join(content_parts),
     }
+
+
+# ---------------------------------------------------------------------------
+# Task 5: Concurrent execution + validation + summary statistics
+# ---------------------------------------------------------------------------
+
+
+def validate_response(
+    finish_reason: Optional[str],
+    content: str,
+    status_code: int,
+) -> tuple[bool, str]:
+    """Validate a single streaming response result.
+
+    Args:
+        finish_reason: The ``finish_reason`` from the final SSE chunk, or
+            ``None`` if not received.
+        content: The accumulated text content of the response.
+        status_code: The HTTP status code of the response (use ``200`` for
+            successful streaming requests).
+
+    Returns:
+        ``(is_valid, message)`` — ``is_valid`` is ``True`` when the response
+        passes all checks; ``message`` is an empty string on success or a
+        human-readable description of the first failure.
+    """
+    if status_code >= 400:
+        return (False, f"HTTP error {status_code}")
+    if finish_reason is None:
+        return (False, "Missing finish_reason")
+    if finish_reason == "length":
+        return (False, "Truncated (finish_reason=length)")
+    if not content:
+        return (False, "Empty response content")
+    return (True, "")
+
+
+def compute_summary_stats(values: list[float]) -> dict:
+    """Compute summary statistics over a list of floats.
+
+    Args:
+        values: Non-empty list of floats to summarise.
+
+    Returns:
+        Dict with keys ``mean``, ``stddev``, ``min``, ``max``, ``p50``,
+        ``p95``, ``p99``.  Percentiles use linear interpolation on sorted
+        values.
+
+    Raises:
+        ValueError: If ``values`` is empty.
+    """
+    if not values:
+        raise ValueError("Cannot compute summary stats on empty list")
+
+    n = len(values)
+    mean = statistics.mean(values)
+    stddev = 0.0 if n == 1 else statistics.stdev(values)
+    sorted_vals = sorted(values)
+
+    def _percentile(p: float) -> float:
+        if n == 1:
+            return sorted_vals[0]
+        # Linear interpolation: index = p/100 * (n-1)
+        idx = p / 100.0 * (n - 1)
+        lo = int(idx)
+        hi = lo + 1
+        if hi >= n:
+            return sorted_vals[-1]
+        frac = idx - lo
+        return sorted_vals[lo] + frac * (sorted_vals[hi] - sorted_vals[lo])
+
+    return {
+        "mean": mean,
+        "stddev": stddev,
+        "min": sorted_vals[0],
+        "max": sorted_vals[-1],
+        "p50": _percentile(50),
+        "p95": _percentile(95),
+        "p99": _percentile(99),
+    }
+
+
+async def run_concurrent_requests(
+    client: httpx.AsyncClient,
+    base_url: str,
+    prompts: list[dict],
+    model: str,
+    concurrency: int,
+    max_tokens: int = 256,
+    enable_thinking: Optional[bool] = None,
+    extra_body: Optional[dict] = None,
+    do_validate: bool = True,
+) -> list[dict]:
+    """Fire ``concurrency`` concurrent streaming requests and collect results.
+
+    Prompts are selected round-robin from ``prompts``.  All requests are
+    launched simultaneously with :func:`asyncio.gather`.  Exceptions are
+    caught per-task and wrapped in an error dict rather than propagated.
+
+    Args:
+        client: An open :class:`httpx.AsyncClient`.
+        base_url: Base URL of the server.
+        prompts: List of message dicts to cycle through.
+        model: Model ID to target.
+        concurrency: Number of simultaneous requests to fire.
+        max_tokens: Maximum tokens to generate per request (default ``256``).
+        enable_thinking: Passed through to :func:`stream_chat_completion`.
+        extra_body: Passed through to :func:`stream_chat_completion`.
+        do_validate: When ``True``, call :func:`validate_response` on each
+            result and add a ``"validated"`` key.
+
+    Returns:
+        List of result dicts (one per request).  Each dict contains at minimum
+        a ``"validated"`` key when ``do_validate`` is ``True``.
+    """
+    prompt_cycle = itertools.cycle(prompts)
+    selected = [next(prompt_cycle) for _ in range(concurrency)]
+
+    async def _single(messages: dict) -> dict:
+        try:
+            result = await stream_chat_completion(
+                client=client,
+                base_url=base_url,
+                messages=[messages],
+                model=model,
+                max_tokens=max_tokens,
+                enable_thinking=enable_thinking,
+                extra_body=extra_body,
+            )
+            if do_validate:
+                is_valid, _ = validate_response(
+                    finish_reason=result.get("finish_reason"),
+                    content=result.get("content", ""),
+                    status_code=200,
+                )
+                result["validated"] = is_valid
+            return result
+        except Exception as exc:
+            err: dict = {
+                "error": str(exc),
+                "validated": False,
+            }
+            return err
+
+    results = await asyncio.gather(*[_single(msg) for msg in selected])
+    return list(results)
+
