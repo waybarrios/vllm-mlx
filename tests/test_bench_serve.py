@@ -1,8 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for vllm_mlx.bench_serve — prompt loading and sweep expansion."""
 
+import asyncio
 import csv
 import json
+import os
 import time
 from pathlib import Path
 from typing import Optional
@@ -712,3 +714,62 @@ class TestFormatters:
 
         field_names = {f.name for f in dataclasses.fields(BenchServeResult)}
         assert set(RESULT_COLUMNS) == field_names
+
+
+# ---------------------------------------------------------------------------
+# TestBenchServeIntegration  (Task 8)
+# ---------------------------------------------------------------------------
+
+
+BENCH_SERVE_URL = os.environ.get("BENCH_SERVE_TEST_URL")
+
+
+@pytest.mark.skipif(
+    BENCH_SERVE_URL is None,
+    reason="Set BENCH_SERVE_TEST_URL to run integration tests",
+)
+class TestBenchServeIntegration:
+    """Integration tests requiring a running vllm-mlx server."""
+
+    def test_smoke_run(self):
+        """End-to-end: run bench-serve with minimal config against a real server."""
+        from vllm_mlx.bench_serve import run_bench_serve
+
+        results = asyncio.run(
+            run_bench_serve(
+                url=BENCH_SERVE_URL,
+                prompt_sets=["short"],
+                concurrencies=[1],
+                repetitions=1,
+                warmup=0,
+                max_tokens=32,
+                fmt="json",
+                scrape=False,
+            )
+        )
+        assert len(results) == 1
+        r = results[0]
+        assert r.ttft_ms > 0
+        assert r.gen_tps > 0
+        assert r.model_id != ""
+        assert r.validated is True
+
+    def test_sql_output_is_valid(self):
+        """Verify SQL output contains CREATE TABLE and INSERT."""
+        from vllm_mlx.bench_serve import run_bench_serve, format_sql
+
+        results = asyncio.run(
+            run_bench_serve(
+                url=BENCH_SERVE_URL,
+                prompt_sets=["short"],
+                concurrencies=[1],
+                repetitions=1,
+                warmup=0,
+                max_tokens=16,
+                fmt="table",
+                scrape=False,
+            )
+        )
+        sql = format_sql(results)
+        assert "CREATE TABLE IF NOT EXISTS bench_serve" in sql
+        assert "INSERT INTO bench_serve" in sql
