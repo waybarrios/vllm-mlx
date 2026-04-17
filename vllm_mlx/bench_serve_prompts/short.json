@@ -1,0 +1,7 @@
+[
+  {"role": "user", "content": "What are the three laws of thermodynamics? Explain each one briefly."},
+  {"role": "user", "content": "Write a Python function that checks if a string is a palindrome. Include type hints."},
+  {"role": "user", "content": "Compare and contrast TCP and UDP protocols. When would you use each?"},
+  {"role": "user", "content": "Explain the difference between a stack and a queue data structure with examples."},
+  {"role": "user", "content": "What causes tides on Earth? Describe the role of the Moon and Sun."}
+]
