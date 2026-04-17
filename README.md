@@ -69,6 +69,14 @@ vllm-mlx serve mlx-community/Llama-3.2-3B-Instruct-4bit --port 8000 --continuous
 vllm-mlx serve mlx-community/Llama-3.2-3B-Instruct-4bit --port 8000 --api-key your-secret-key
 ```
 
+### Multi-Model Serving
+
+```bash
+vllm-mlx serve --models-config /etc/vllm-mlx/models.yaml --port 8000
+```
+
+This mode uses a YAML registry of named models with lazy loading, memory-budget eviction, and configurable wait/fail/preempt behavior. See [Multi-Model Serving](docs/guides/model-registry.md) for the registry format and ops rollout guidance.
+
 ### Use with OpenAI SDK
 
 ```python
@@ -226,6 +234,7 @@ For full documentation, see the [docs](docs/) directory:
   - [Reasoning Models](docs/guides/reasoning.md)
   - [MCP & Tool Calling](docs/guides/mcp-tools.md)
   - [Continuous Batching](docs/guides/continuous-batching.md)
+  - [Multi-Model Serving](docs/guides/model-registry.md)
 
 - **Reference**
   - [CLI Commands](docs/reference/cli.md)

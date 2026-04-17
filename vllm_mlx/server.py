@@ -50,6 +50,7 @@ import time
 import uuid
 from collections import OrderedDict, defaultdict
 from collections.abc import AsyncIterator
+from dataclasses import dataclass
 
 import uvicorn
 from fastapi import Depends, FastAPI, HTTPException, Request, UploadFile
@@ -154,7 +155,14 @@ from .endpoint_model_policies import (
     resolve_stt_model_name,
     resolve_tts_model_name,
 )
+from .model_registry import (
+    ModelLease,
+    ModelManager,
+    RegistryServeDefaults,
+    load_registry_config,
+)
 from .metrics import metrics as _metrics
+from .reasoning import get_parser as get_reasoning_parser
 from .tool_parsers import ToolParserManager
 
 logging.basicConfig(level=logging.INFO)
@@ -162,6 +170,7 @@ logger = logging.getLogger(__name__)
 
 # Global engine instance
 _engine: BaseEngine | None = None
+_model_manager: ModelManager | None = None
 _model_name: str | None = None
 _model_path: str | None = (
     None  # Actual model path (for cache dir, not affected by --served-model-name)
@@ -228,11 +237,12 @@ _auth_warning_logged: bool = False
 
 # Reasoning parser (for models like Qwen3, DeepSeek-R1)
 _reasoning_parser = None  # ReasoningParser instance when enabled
+_reasoning_parser_name: str | None = None
 
 # Tool calling configuration
 _enable_auto_tool_choice: bool = False
 _tool_call_parser: str | None = None  # Parser name: auto, mistral, qwen, llama, hermes
-_tool_parser_instance = None  # Instantiated parser
+_tool_parser_instance = None  # Test override hook; production builds fresh parsers
 _responses_store: OrderedDict[str, dict] = OrderedDict()
 _RESPONSES_STORE_MAX_SIZE: int = 1000
 
@@ -282,6 +292,21 @@ def _log_and_raise_internal_error(log_prefix: str, exc: Exception, detail: str) 
     """Log a sanitized exception string and raise a generic 500 response."""
     logger.error("%s: %s", log_prefix, _sanitize_log_text(exc, limit=500))
     raise HTTPException(status_code=500, detail=detail)
+
+
+@dataclass
+class RequestModelContext:
+    """Request-scoped engine/lease context."""
+
+    model_name: str
+    engine: BaseEngine
+    lease: ModelLease | None = None
+
+    async def release(self) -> None:
+        if self.lease is not None:
+            lease = self.lease
+            self.lease = None
+            await lease.release()
 
 
 def _load_prefix_cache_from_disk() -> None:
@@ -339,11 +364,13 @@ def _get_cache_dir() -> str:
 
 async def lifespan(app: FastAPI):
     """FastAPI lifespan for startup/shutdown events."""
-    global _engine, _mcp_manager
+    global _engine, _mcp_manager, _model_manager
 
     # Startup: Start engine if loaded (needed for BatchedEngine in uvicorn's event loop)
     if _engine is not None and hasattr(_engine, "_loaded") and not _engine._loaded:
         await _engine.start()
+    if _model_manager is not None:
+        await _model_manager.preload()
 
     # Load persisted cache from disk (AFTER engine start — AsyncEngineCore must exist)
     if _engine is not None and hasattr(_engine, "load_cache_from_disk"):
@@ -394,6 +421,9 @@ async def lifespan(app: FastAPI):
     if _engine is not None:
         await _engine.stop()
         logger.info("Engine stopped")
+    if _model_manager is not None:
+        await _model_manager.shutdown()
+        logger.info("Model manager stopped")
 
 
 app = FastAPI(
@@ -556,6 +586,12 @@ def get_engine() -> BaseEngine:
     return _engine
 
 
+def _list_available_model_names() -> list[str]:
+    if _model_manager is not None:
+        return sorted(_model_manager._registry.keys())
+    return [_model_name] if _model_name else []
+
+
 def _coerce_tool_arguments(
     arguments_json: str, tool_name: str, tools: list[dict] | None
 ) -> str:
@@ -605,6 +641,18 @@ def _coerce_tool_arguments(
 
 def _validate_model_name(request_model: str) -> None:
     """Validate that the request model name matches the served model."""
+    if _model_manager is not None:
+        if not _model_manager.has_model(request_model):
+            available = ", ".join(f"`{name}`" for name in _list_available_model_names())
+            raise HTTPException(
+                status_code=404,
+                detail=(
+                    f"The model `{request_model}` does not exist. "
+                    f"Available models: {available}"
+                ),
+            )
+        return
+
     if _model_name and request_model != _model_name:
         raise HTTPException(
             status_code=404,
@@ -613,8 +661,79 @@ def _validate_model_name(request_model: str) -> None:
         )
 
 
+async def _acquire_request_model(request_model: str) -> RequestModelContext:
+    """Acquire the model/engine that should serve this request."""
+    _validate_model_name(request_model)
+
+    if _model_manager is None:
+        engine = get_engine()
+        engine.preserve_native_tool_format = _detect_native_tool_support()
+        return RequestModelContext(
+            model_name=_model_name or request_model, engine=engine
+        )
+
+    try:
+        lease = await _model_manager.acquire(request_model)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+    lease.engine.preserve_native_tool_format = _detect_native_tool_support()
+    return RequestModelContext(
+        model_name=request_model,
+        engine=lease.engine,
+        lease=lease,
+    )
+
+
+async def _stream_with_model_context(
+    context: RequestModelContext,
+    stream: AsyncIterator[str],
+) -> AsyncIterator[str]:
+    """Ensure model leases survive for the full streaming response."""
+    try:
+        async for chunk in stream:
+            yield chunk
+    finally:
+        await context.release()
+
+
+def _build_tool_parser(engine: BaseEngine | None):
+    """Create a fresh tool parser instance for a single request/stream."""
+    if not _enable_auto_tool_choice or not _tool_call_parser:
+        return None
+
+    if _tool_parser_instance is not None:
+        if hasattr(_tool_parser_instance, "reset"):
+            _tool_parser_instance.reset()
+        return _tool_parser_instance
+
+    parser_cls = ToolParserManager.get_tool_parser(_tool_call_parser)
+    tokenizer = getattr(engine, "tokenizer", None) if engine is not None else None
+    return parser_cls(tokenizer)
+
+
+def _build_reasoning_parser(engine: BaseEngine | None = None):
+    """Create a fresh reasoning parser instance for a single request/stream."""
+    tokenizer = getattr(engine, "tokenizer", None) if engine is not None else None
+    if _reasoning_parser_name is not None:
+        parser_cls = get_reasoning_parser(_reasoning_parser_name)
+        try:
+            return parser_cls(tokenizer)
+        except TypeError:
+            return parser_cls()
+    if _reasoning_parser is None:
+        return None
+    try:
+        return type(_reasoning_parser)(tokenizer)
+    except TypeError:
+        return type(_reasoning_parser)()
+
+
 def _parse_tool_calls_with_parser(
-    output_text: str, request: ChatCompletionRequest | None = None
+    output_text: str,
+    request: ChatCompletionRequest | None = None,
+    *,
+    engine: BaseEngine | None = None,
 ) -> tuple[str, list | None]:
     """
     Parse tool calls from model output using the configured parser.
@@ -629,8 +748,6 @@ def _parse_tool_calls_with_parser(
     Returns:
         Tuple of (cleaned_text, tool_calls)
     """
-    global _tool_parser_instance
-
     request_dict = request.model_dump() if request else None
 
     # tool_choice="none" means never return tool calls — skip all parsing
@@ -645,30 +762,11 @@ def _parse_tool_calls_with_parser(
     if not _enable_auto_tool_choice or not _tool_call_parser:
         return parse_tool_calls(output_text, request_dict)
 
-    # Initialize parser if needed
-    if _tool_parser_instance is None:
-        try:
-            parser_cls = ToolParserManager.get_tool_parser(_tool_call_parser)
-            # Get tokenizer from engine if available
-            tokenizer = None
-            if _engine is not None and hasattr(_engine, "_tokenizer"):
-                tokenizer = _engine._tokenizer
-            _tool_parser_instance = parser_cls(tokenizer)
-            logger.info(f"Initialized tool call parser: {_tool_call_parser}")
-        except Exception as e:
-            logger.warning(
-                "Failed to initialize tool parser '%s': %s",
-                _tool_call_parser,
-                _sanitize_log_text(e, limit=500),
-            )
-            logger.warning("Falling back to generic parser")
-            return parse_tool_calls(output_text, request_dict)
-
-    # Use the configured parser
     try:
-        # Reset parser state between requests
-        _tool_parser_instance.reset()
-        result = _tool_parser_instance.extract_tool_calls(output_text, request_dict)
+        parser = _build_tool_parser(engine)
+        if parser is None:
+            return parse_tool_calls(output_text, request_dict)
+        result = parser.extract_tool_calls(output_text, request_dict)
         if result.tools_called:
             tools = request_dict.get("tools") if request_dict else None
             tool_calls = [
@@ -1803,7 +1901,7 @@ def load_model(
         specprefill_keep_pct: Fraction of tokens to keep (default: 0.3)
         specprefill_draft_model: Path to small draft model for SpecPrefill scoring
     """
-    global _engine, _model_name, _model_path, _default_max_tokens
+    global _engine, _model_manager, _model_name, _model_path, _default_max_tokens
     global _max_request_tokens, _tool_parser_instance, _warm_prompts_path
 
     _warm_prompts_path = warm_prompts_path
@@ -1817,10 +1915,9 @@ def load_model(
 
     _default_max_tokens = max_tokens
     _max_request_tokens = max_request_tokens
+    _model_manager = None
     _model_path = model_name
     _model_name = served_model_name or model_name
-    # Reset tool parser instance when model is reloaded (tokenizer may change)
-    _tool_parser_instance = None
 
     if force_mllm:
         logger.info("Force MLLM mode enabled via --mllm flag")
@@ -1866,6 +1963,29 @@ def load_model(
 
     logger.info(f"Default max tokens: {_default_max_tokens}")
     logger.info(f"Max request tokens: {_max_request_tokens}")
+
+
+def load_model_registry(
+    config_path: str,
+    *,
+    defaults: RegistryServeDefaults,
+) -> None:
+    """Load a registry-backed model manager from YAML configuration."""
+    global _engine, _model_manager, _model_name, _model_path, _default_max_tokens
+
+    manager_config, registry = load_registry_config(config_path, defaults)
+    _engine = None
+    _model_path = None
+    _model_name = None
+    _default_max_tokens = defaults.max_tokens
+    _model_manager = ModelManager(manager_config, registry, defaults)
+
+    logger.info(
+        "Loaded models config: %s (%d models, %.1f GB budget)",
+        config_path,
+        len(registry),
+        manager_config.memory_budget_bytes / (1024**3),
+    )
 
 
 def get_usage(output: GenerationOutput) -> Usage:
@@ -1914,8 +2034,9 @@ async def health():
 
     return {
         "status": "healthy",
-        "model_loaded": _engine is not None,
+        "model_loaded": _engine is not None or _model_manager is not None,
         "model_name": _model_name,
+        "available_models": _list_available_model_names(),
         "model_type": "mllm" if (_engine and _engine.is_mllm) else "llm",
         "mcp": mcp_info,
     }
@@ -1924,6 +2045,16 @@ async def health():
 @app.get("/v1/status", dependencies=[Depends(verify_api_key)])
 async def status():
     """Real-time status with per-request details for debugging and monitoring."""
+    if _model_manager is not None:
+        return {
+            "status": "running",
+            "model_manager": {
+                "memory_budget_gb": round(
+                    _model_manager.memory_budget_bytes / (1024**3), 2
+                ),
+                "models": _model_manager.list_models(),
+            },
+        }
     if _engine is None:
         return {"status": "not_loaded", "model": None, "requests": []}
 
@@ -2047,7 +2178,9 @@ async def clear_prefix_cache():
 async def list_models() -> ModelsResponse:
     """List available models."""
     models = []
-    if _model_name:
+    if _model_manager is not None:
+        models.extend(ModelInfo(id=item["id"]) for item in _model_manager.list_models())
+    elif _model_name:
         models.append(ModelInfo(id=_model_name))
     if _embedding_engine is not None:
         models.append(
@@ -2796,9 +2929,9 @@ async def _wait_with_disconnect(
 )
 async def create_completion(request: CompletionRequest, raw_request: Request):
     """Create a text completion."""
-    _validate_model_name(request.model)
+    model_ctx = await _acquire_request_model(request.model)
+    engine = model_ctx.engine
     effective_max_tokens = _resolve_request_max_tokens(request.max_tokens)
-    engine = get_engine()
     tracker = _metrics.track_inference("completions", stream=request.stream)
 
     # Handle single prompt or list of prompts
@@ -2822,18 +2955,21 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
 
     if request.stream:
         return StreamingResponse(
-            _disconnect_guard(
-                _ensure_sse_terminal(
-                    stream_completion(
-                        engine,
-                        prompts[0],
-                        request,
-                        repetition_penalty=comp_rep_penalty,
-                        metrics_tracker=tracker,
+            _stream_with_model_context(
+                model_ctx,
+                _disconnect_guard(
+                    _ensure_sse_terminal(
+                        stream_completion(
+                            engine,
+                            prompts[0],
+                            request,
+                            repetition_penalty=comp_rep_penalty,
+                            metrics_tracker=tracker,
+                        ),
+                        "data: [DONE]\n\n",
                     ),
-                    "data: [DONE]\n\n",
+                    raw_request,
                 ),
-                raw_request,
             ),
             media_type="text/event-stream",
         )
@@ -2845,52 +2981,55 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
     total_completion_tokens = 0
     total_prompt_tokens = 0
 
-    for i, prompt in enumerate(prompts):
-        generate_kwargs = {
-            "prompt": prompt,
-            "max_tokens": effective_max_tokens,
-            "temperature": _resolve_temperature(request.temperature),
-            "top_p": _resolve_top_p(request.top_p),
-            "top_k": request.top_k or 0,
-            "min_p": request.min_p or 0.0,
-            "presence_penalty": request.presence_penalty or 0.0,
-            "stop": request.stop,
-        }
-        if comp_rep_penalty is not None:
-            generate_kwargs["repetition_penalty"] = comp_rep_penalty
-        if request.specprefill is not None:
-            generate_kwargs["specprefill"] = request.specprefill
-        if request.specprefill_keep_pct is not None:
-            generate_kwargs["specprefill_keep_pct"] = request.specprefill_keep_pct
+    try:
+        for i, prompt in enumerate(prompts):
+            generate_kwargs = {
+                "prompt": prompt,
+                "max_tokens": effective_max_tokens,
+                "temperature": _resolve_temperature(request.temperature),
+                "top_p": _resolve_top_p(request.top_p),
+                "top_k": request.top_k or 0,
+                "min_p": request.min_p or 0.0,
+                "presence_penalty": request.presence_penalty or 0.0,
+                "stop": request.stop,
+            }
+            if comp_rep_penalty is not None:
+                generate_kwargs["repetition_penalty"] = comp_rep_penalty
+            if request.specprefill is not None:
+                generate_kwargs["specprefill"] = request.specprefill
+            if request.specprefill_keep_pct is not None:
+                generate_kwargs["specprefill_keep_pct"] = request.specprefill_keep_pct
 
-        try:
-            output = await _wait_with_disconnect(
-                engine.generate(**generate_kwargs),
-                raw_request,
-                timeout=timeout,
-            )
-        except HTTPException as exc:
-            tracker.finish(result=_metrics_result_from_status(exc.status_code))
-            raise
-        if output is None:
-            tracker.finish(
-                result="client_closed",
-                prompt_tokens=total_prompt_tokens,
-                completion_tokens=total_completion_tokens,
-            )
-            return Response(status_code=499)  # Client closed request
+            try:
+                output = await _wait_with_disconnect(
+                    engine.generate(**generate_kwargs),
+                    raw_request,
+                    timeout=timeout,
+                )
+            except HTTPException as exc:
+                tracker.finish(result=_metrics_result_from_status(exc.status_code))
+                raise
+            if output is None:
+                tracker.finish(
+                    result="client_closed",
+                    prompt_tokens=total_prompt_tokens,
+                    completion_tokens=total_completion_tokens,
+                )
+                return Response(status_code=499)  # Client closed request
 
-        choices.append(
-            CompletionChoice(
-                index=i,
-                text=output.text,
-                finish_reason=output.finish_reason,
+            choices.append(
+                CompletionChoice(
+                    index=i,
+                    text=output.text,
+                    finish_reason=output.finish_reason,
+                )
             )
-        )
-        total_completion_tokens += output.completion_tokens
-        total_prompt_tokens += (
-            output.prompt_tokens if hasattr(output, "prompt_tokens") else 0
-        )
+            total_completion_tokens += output.completion_tokens
+            total_prompt_tokens += (
+                output.prompt_tokens if hasattr(output, "prompt_tokens") else 0
+            )
+    finally:
+        await model_ctx.release()
 
     elapsed = time.perf_counter() - start_time
     tokens_per_sec = total_completion_tokens / elapsed if elapsed > 0 else 0
@@ -2904,7 +3043,7 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
         completion_tokens=total_completion_tokens,
     )
     return CompletionResponse(
-        model=_model_name,
+        model=model_ctx.model_name,
         choices=choices,
         usage=Usage(
             prompt_tokens=total_prompt_tokens,
@@ -2960,9 +3099,9 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
     }
     ```
     """
-    _validate_model_name(request.model)
+    model_ctx = await _acquire_request_model(request.model)
+    engine = model_ctx.engine
     effective_max_tokens = _resolve_request_max_tokens(request.max_tokens)
-    engine = get_engine()
     tracker = _metrics.track_inference("chat_completions", stream=request.stream)
 
     # --- Detailed request logging ---
@@ -3145,18 +3284,21 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
 
     if request.stream:
         return StreamingResponse(
-            _disconnect_guard(
-                _ensure_sse_terminal(
-                    stream_chat_completion(
-                        engine,
-                        messages,
-                        request,
-                        metrics_tracker=tracker,
-                        **chat_kwargs,
+            _stream_with_model_context(
+                model_ctx,
+                _disconnect_guard(
+                    _ensure_sse_terminal(
+                        stream_chat_completion(
+                            engine,
+                            messages,
+                            request,
+                            metrics_tracker=tracker,
+                            **chat_kwargs,
+                        ),
+                        "data: [DONE]\n\n",
                     ),
-                    "data: [DONE]\n\n",
+                    raw_request,
                 ),
-                raw_request,
             ),
             media_type="text/event-stream",
         )
@@ -3174,6 +3316,8 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
     except HTTPException as exc:
         tracker.finish(result=_metrics_result_from_status(exc.status_code))
         raise
+    finally:
+        await model_ctx.release()
     if output is None:
         tracker.finish(result="client_closed")
         return Response(status_code=499)  # Client closed request
@@ -3215,7 +3359,7 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
         completion_tokens=output.completion_tokens,
     )
     return ChatCompletionResponse(
-        model=_model_name,
+        model=model_ctx.model_name,
         choices=[
             ChatCompletionChoice(
                 message=AssistantMessage(
@@ -3407,9 +3551,9 @@ async def create_anthropic_message(
             raise
     anthropic_request = AnthropicRequest(**body)
 
-    _validate_model_name(anthropic_request.model)
+    model_ctx = await _acquire_request_model(anthropic_request.model)
+    engine = model_ctx.engine
     effective_max_tokens = _resolve_request_max_tokens(anthropic_request.max_tokens)
-    engine = get_engine()
 
     # --- Detailed request logging ---
     n_msgs = len(anthropic_request.messages)
@@ -3441,17 +3585,20 @@ async def create_anthropic_message(
             f"event: message_stop\ndata: {json.dumps({'type': 'message_stop'})}\n\n"
         )
         return StreamingResponse(
-            _disconnect_guard(
-                _ensure_sse_terminal(
-                    _stream_anthropic_messages(
-                        engine,
-                        openai_request,
-                        anthropic_request,
-                        metrics_tracker=tracker,
+            _stream_with_model_context(
+                model_ctx,
+                _disconnect_guard(
+                    _ensure_sse_terminal(
+                        _stream_anthropic_messages(
+                            engine,
+                            openai_request,
+                            anthropic_request,
+                            metrics_tracker=tracker,
+                        ),
+                        _anthropic_terminal,
                     ),
-                    _anthropic_terminal,
+                    request,
                 ),
-                request,
             ),
             media_type="text/event-stream",
             headers={
@@ -3528,6 +3675,8 @@ async def create_anthropic_message(
     except HTTPException as exc:
         tracker.finish(result=_metrics_result_from_status(exc.status_code))
         raise
+    finally:
+        await model_ctx.release()
     if output is None:
         tracker.finish(result="client_closed")
         return Response(status_code=499)  # Client closed request
@@ -3604,7 +3753,7 @@ async def create_anthropic_message(
     )
 
     anthropic_response = AnthropicResponse(
-        model=_model_name,
+        model=model_ctx.model_name,
         content=content_blocks,
         stop_reason=stop_reason,
         usage=AnthropicUsage(
@@ -3638,60 +3787,67 @@ async def count_anthropic_tokens(request: Request):
     """
     body = await request.json()
 
-    engine = get_engine()
-    tokenizer = engine.tokenizer
+    requested_model = body.get("model")
+    if not requested_model:
+        available = _list_available_model_names()
+        requested_model = available[0] if len(available) == 1 else ""
+    model_ctx = await _acquire_request_model(requested_model)
+    tokenizer = model_ctx.engine.tokenizer
 
     total_tokens = 0
 
-    # System message
-    system = body.get("system", "")
-    if isinstance(system, str) and system:
-        total_tokens += len(tokenizer.encode(system))
-    elif isinstance(system, list):
-        for block in system:
-            if isinstance(block, dict):
-                text = block.get("text", "")
-                if text:
-                    total_tokens += len(tokenizer.encode(text))
-
-    # Messages
-    for msg in body.get("messages", []):
-        content = msg.get("content", "")
-        if isinstance(content, str):
-            if content:
-                total_tokens += len(tokenizer.encode(content))
-        elif isinstance(content, list):
-            for block in content:
+    try:
+        # System message
+        system = body.get("system", "")
+        if isinstance(system, str) and system:
+            total_tokens += len(tokenizer.encode(system))
+        elif isinstance(system, list):
+            for block in system:
                 if isinstance(block, dict):
                     text = block.get("text", "")
                     if text:
                         total_tokens += len(tokenizer.encode(text))
-                    # tool_use input
-                    if block.get("input"):
-                        total_tokens += len(
-                            tokenizer.encode(json.dumps(block["input"]))
-                        )
-                    # tool_result content
-                    sub_content = block.get("content", "")
-                    if isinstance(sub_content, str) and sub_content:
-                        total_tokens += len(tokenizer.encode(sub_content))
-                    elif isinstance(sub_content, list):
-                        for item in sub_content:
-                            if isinstance(item, dict):
-                                item_text = item.get("text", "")
-                                if item_text:
-                                    total_tokens += len(tokenizer.encode(item_text))
 
-    # Tools
-    for tool in body.get("tools", []):
-        name = tool.get("name", "")
-        if name:
-            total_tokens += len(tokenizer.encode(name))
-        desc = tool.get("description", "")
-        if desc:
-            total_tokens += len(tokenizer.encode(desc))
-        if tool.get("input_schema"):
-            total_tokens += len(tokenizer.encode(json.dumps(tool["input_schema"])))
+        # Messages
+        for msg in body.get("messages", []):
+            content = msg.get("content", "")
+            if isinstance(content, str):
+                if content:
+                    total_tokens += len(tokenizer.encode(content))
+            elif isinstance(content, list):
+                for block in content:
+                    if isinstance(block, dict):
+                        text = block.get("text", "")
+                        if text:
+                            total_tokens += len(tokenizer.encode(text))
+                        # tool_use input
+                        if block.get("input"):
+                            total_tokens += len(
+                                tokenizer.encode(json.dumps(block["input"]))
+                            )
+                        # tool_result content
+                        sub_content = block.get("content", "")
+                        if isinstance(sub_content, str) and sub_content:
+                            total_tokens += len(tokenizer.encode(sub_content))
+                        elif isinstance(sub_content, list):
+                            for item in sub_content:
+                                if isinstance(item, dict):
+                                    item_text = item.get("text", "")
+                                    if item_text:
+                                        total_tokens += len(tokenizer.encode(item_text))
+
+        # Tools
+        for tool in body.get("tools", []):
+            name = tool.get("name", "")
+            if name:
+                total_tokens += len(tokenizer.encode(name))
+            desc = tool.get("description", "")
+            if desc:
+                total_tokens += len(tokenizer.encode(desc))
+            if tool.get("input_schema"):
+                total_tokens += len(tokenizer.encode(json.dumps(tool["input_schema"])))
+    finally:
+        await model_ctx.release()
 
     return {"input_tokens": total_tokens}
 
@@ -3822,7 +3978,7 @@ async def _stream_anthropic_messages(
             "id": msg_id,
             "type": "message",
             "role": "assistant",
-            "model": _model_name,
+            "model": anthropic_request.model,
             "content": [],
             "stop_reason": None,
             "stop_sequence": None,
@@ -3834,12 +3990,13 @@ async def _stream_anthropic_messages(
     }
     yield f"event: message_start\ndata: {json.dumps(message_start)}\n\n"
 
-    use_reasoning = _reasoning_parser is not None and not chat_kwargs.get(
+    reasoning_parser = _build_reasoning_parser(engine)
+    use_reasoning = reasoning_parser is not None and not chat_kwargs.get(
         "logits_processors"
     )
 
-    if use_reasoning:
-        _reasoning_parser.reset_state()
+    if reasoning_parser:
+        reasoning_parser.reset_state()
 
     # Block index tracking: with reasoning parser we use index 0 for
     # thinking and index 1 for text; without parser, index 0 for text.
@@ -3924,7 +4081,7 @@ async def _stream_anthropic_messages(
             # Reasoning parser path
             previous_text = accumulated_text
             accumulated_text += filtered
-            delta_msg = _reasoning_parser.extract_reasoning_streaming(
+            delta_msg = reasoning_parser.extract_reasoning_streaming(
                 previous_text, accumulated_text, filtered
             )
 
@@ -3989,7 +4146,9 @@ async def _stream_anthropic_messages(
             text_block_started = True
 
         # Check for tool calls in accumulated text
-        _, tool_calls = _parse_tool_calls_with_parser(accumulated_text, openai_request)
+        _, tool_calls = _parse_tool_calls_with_parser(
+            accumulated_text, openai_request, engine=engine
+        )
 
         # Close text block
         if text_block_started:
@@ -4099,7 +4258,7 @@ async def stream_completion(
                 "id": f"cmpl-{uuid.uuid4().hex[:8]}",
                 "object": "text_completion",
                 "created": int(time.time()),
-                "model": _model_name,
+                "model": request.model,
                 "choices": [
                     {
                         "index": 0,
@@ -4150,7 +4309,7 @@ async def stream_chat_completion(
     # First chunk with role
     first_chunk = ChatCompletionChunk(
         id=response_id,
-        model=_model_name,
+        model=request.model,
         choices=[
             ChatCompletionChunkChoice(
                 delta=ChatCompletionChunkDelta(role="assistant"),
@@ -4161,14 +4320,15 @@ async def stream_chat_completion(
 
     # Track if we need to add <think> prefix for thinking models (when no reasoning parser)
     # The template adds <think> to the prompt, so the model output starts inside the think block
+    reasoning_parser = _build_reasoning_parser(engine)
     is_thinking_model = (
-        "nemotron" in (engine.model_name or "").lower() and not _reasoning_parser
+        "nemotron" in (engine.model_name or "").lower() and not reasoning_parser
     )
     think_prefix_sent = False
 
     # Reset reasoning parser state for this stream
-    if _reasoning_parser:
-        _reasoning_parser.reset_state()
+    if reasoning_parser:
+        reasoning_parser.reset_state()
 
     # Track accumulated text for reasoning parser
     accumulated_text = ""
@@ -4215,14 +4375,10 @@ async def stream_chat_completion(
                 completion_tokens = output.completion_tokens
 
             # Use reasoning parser if enabled (skip when enable_thinking=False)
-            if (
-                _reasoning_parser
-                and delta_text
-                and request.enable_thinking is not False
-            ):
+            if reasoning_parser and delta_text and request.enable_thinking is not False:
                 previous_text = accumulated_text
                 accumulated_text += delta_text
-                delta_msg = _reasoning_parser.extract_reasoning_streaming(
+                delta_msg = reasoning_parser.extract_reasoning_streaming(
                     previous_text, accumulated_text, delta_text
                 )
 
@@ -4275,7 +4431,7 @@ async def stream_chat_completion(
                                 # Still emit reasoning while buffering tool call
                                 chunk = ChatCompletionChunk(
                                     id=response_id,
-                                    model=_model_name,
+                                    model=request.model,
                                     choices=[
                                         ChatCompletionChunkChoice(
                                             delta=ChatCompletionChunkDelta(
@@ -4307,7 +4463,7 @@ async def stream_chat_completion(
                                         )
                             chunk = ChatCompletionChunk(
                                 id=response_id,
-                                model=_model_name,
+                                model=request.model,
                                 choices=[
                                     ChatCompletionChunkChoice(
                                         delta=ChatCompletionChunkDelta(
@@ -4340,7 +4496,7 @@ async def stream_chat_completion(
 
                 chunk = ChatCompletionChunk(
                     id=response_id,
-                    model=_model_name,
+                    model=request.model,
                     choices=[
                         ChatCompletionChunkChoice(
                             delta=ChatCompletionChunkDelta(
@@ -4415,7 +4571,7 @@ async def stream_chat_completion(
                                         )
                             chunk = ChatCompletionChunk(
                                 id=response_id,
-                                model=_model_name,
+                                model=request.model,
                                 choices=[
                                     ChatCompletionChunkChoice(
                                         delta=ChatCompletionChunkDelta(
@@ -4447,7 +4603,7 @@ async def stream_chat_completion(
 
                 chunk = ChatCompletionChunk(
                     id=response_id,
-                    model=_model_name,
+                    model=request.model,
                     choices=[
                         ChatCompletionChunkChoice(
                             delta=ChatCompletionChunkDelta(
@@ -4481,7 +4637,7 @@ async def stream_chat_completion(
                 )
                 tool_chunk = ChatCompletionChunk(
                     id=response_id,
-                    model=_model_name,
+                    model=request.model,
                     choices=[
                         ChatCompletionChunkChoice(
                             delta=ChatCompletionChunkDelta(
@@ -4552,7 +4708,7 @@ async def stream_chat_completion(
         if include_usage:
             usage_chunk = ChatCompletionChunk(
                 id=response_id,
-                model=_model_name,
+                model=request.model,
                 choices=[],  # Empty choices for usage-only chunk
                 usage=Usage(
                     prompt_tokens=prompt_tokens,
