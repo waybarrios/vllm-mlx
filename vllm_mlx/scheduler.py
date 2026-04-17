@@ -1922,15 +1922,27 @@ class Scheduler:
                 request.remaining_tokens = request.prompt_token_ids
                 tokens_to_process = request.prompt_token_ids
 
-            # Build per-request logits_processors from repetition_penalty
+            # Build per-request logits_processors from repetition_penalty and
+            # any caller-supplied extras (e.g. JSON schema constrained
+            # decoding).
             rep_penalty = request.sampling_params.repetition_penalty
-            lp = None
+            extra_lp = request.sampling_params.logits_processors or []
+            combined_lp: list = []
             if rep_penalty and rep_penalty != 1.0:
-                lp = make_logits_processors(repetition_penalty=rep_penalty)
+                combined_lp.extend(
+                    make_logits_processors(repetition_penalty=rep_penalty)
+                )
                 logger.info(
                     f"[rep_penalty] request={request.request_id[:12]} "
-                    f"penalty={rep_penalty} processors={len(lp)}"
+                    f"penalty={rep_penalty}"
                 )
+            if extra_lp:
+                combined_lp.extend(extra_lp)
+                logger.info(
+                    f"[logits_proc] request={request.request_id[:12]} "
+                    f"extra_processors={len(extra_lp)}"
+                )
+            lp = combined_lp
 
             # Insert into BatchGenerator with optional cache.
             # Wrap in try/except: if cache shapes are incompatible
@@ -1939,9 +1951,10 @@ class Scheduler:
             insert_kwargs = {
                 "max_tokens": [request.sampling_params.max_tokens],
                 "caches": [cache_to_use] if cache_to_use else None,
+                # Always pass logits_processors (even empty list) so that
+                # mlx_lm BatchGenerator never stores None per-sequence.
+                "logits_processors": [lp] if lp else [[]],
             }
-            if lp:
-                insert_kwargs["logits_processors"] = [lp]
             try:
                 uids = self.batch_generator.insert(
                     [tokens_to_process],

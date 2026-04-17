@@ -151,6 +151,7 @@ class MLXLanguageModel:
         presence_penalty: float = 0.0,
         repetition_penalty: float = 1.0,
         stop: list[str] | None = None,
+        logits_processors: list | None = None,
         **kwargs,
     ) -> GenerationOutput:
         """
@@ -166,6 +167,9 @@ class MLXLanguageModel:
             presence_penalty: Additive penalty for token presence
             repetition_penalty: Multiplicative penalty for repeating tokens
             stop: List of stop sequences
+            logits_processors: Optional externally-supplied logits processors
+                (e.g. JSON schema constrained decoding).  Merged with built-in
+                penalty processors.
 
         Returns:
             GenerationOutput with generated text and tokens
@@ -177,9 +181,13 @@ class MLXLanguageModel:
 
         # Create sampler and logits processors with full Unsloth params
         sampler = self._create_sampler(temperature, top_p, top_k, min_p)
-        logits_processors = self._create_logits_processors(
+        penalty_processors = self._create_logits_processors(
             presence_penalty, repetition_penalty
         )
+        # Merge any externally-provided logits_processors with penalty processors
+        all_processors = penalty_processors or []
+        if logits_processors:
+            all_processors = list(logits_processors) + all_processors
 
         # Generate text
         output_text = generate(
@@ -188,7 +196,7 @@ class MLXLanguageModel:
             prompt=prompt,
             max_tokens=max_tokens,
             sampler=sampler,
-            logits_processors=logits_processors,
+            logits_processors=all_processors if all_processors else None,
             verbose=False,
         )
 
