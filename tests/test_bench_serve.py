@@ -709,6 +709,14 @@ class TestFormatters:
         output = format_sql([r])
         assert "it''s a test" in output
 
+    def test_format_sql_handles_nan_inf(self):
+        r = _make_sample_result(ttft_ms=float("nan"), gen_tps=float("inf"))
+        output = format_sql([r])
+        # NaN and Inf should become NULL, not invalid SQL literals
+        assert "nan" not in output.lower().split("'")[-1]  # not outside strings
+        assert "inf" not in output.lower().split("'")[-1]
+        assert "NULL" in output
+
     def test_result_columns_match_dataclass(self):
         import dataclasses
 

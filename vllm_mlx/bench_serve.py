@@ -17,10 +17,12 @@ It is a pure HTTP client that talks to a running OpenAI-compatible server.
 
 import asyncio
 import csv as csv_mod
+import dataclasses as _dataclasses
 import io
 import itertools
 import json
 import logging
+import math
 import platform
 import re
 import statistics
@@ -491,7 +493,9 @@ def compute_request_metrics(
     else:
         tpot_ms = 0.0
 
-    gen_duration = t_end - t_first_token
+    # Use last token time (not t_end which includes HTTP teardown)
+    t_last_token = token_times[-1] if token_times else t_end
+    gen_duration = t_last_token - t_first_token
     gen_tps = completion_tokens / gen_duration if gen_duration > 0 else 0.0
 
     prompt_duration = t_first_token - t_start
@@ -786,8 +790,6 @@ async def run_concurrent_requests(
 # Task 6: Output formatters
 # ---------------------------------------------------------------------------
 
-import dataclasses as _dataclasses  # noqa: E402 — local alias avoids shadowing
-
 RESULT_COLUMNS: list[str] = [f.name for f in _dataclasses.fields(BenchServeResult)]
 
 _TABLE_COLUMNS = [
@@ -882,7 +884,11 @@ def _sql_escape(value) -> str:
         return "NULL"
     if isinstance(value, bool):
         return "1" if value else "0"
-    if isinstance(value, (int, float)):
+    if isinstance(value, float):
+        if math.isnan(value) or math.isinf(value):
+            return "NULL"
+        return str(value)
+    if isinstance(value, int):
         return str(value)
     # str
     escaped = str(value).replace("'", "''")
