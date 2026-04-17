@@ -176,6 +176,7 @@ class ChatCompletionRequest(BaseModel):
     # MLLM-specific parameters
     video_fps: float | None = None
     video_max_frames: int | None = None
+    extract_audio_from_video: bool | None = None
     # Sampling penalties
     repetition_penalty: float | None = None  # mlx-lm style (>1.0 penalizes)
     # Request timeout in seconds (None = use server default)

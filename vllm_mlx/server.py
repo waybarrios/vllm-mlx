@@ -128,6 +128,7 @@ _default_max_tokens: int = 32768
 _default_timeout: float = 300.0  # Default request timeout in seconds (5 minutes)
 _default_temperature: float | None = None  # Set via --default-temperature
 _default_top_p: float | None = None  # Set via --default-top-p
+_extract_audio_from_video: bool = False  # Set via --extract-audio-from-video
 _metrics_enabled = False
 
 _FALLBACK_TEMPERATURE = 0.7
@@ -1708,6 +1709,12 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
             chat_kwargs["video_fps"] = request.video_fps
         if request.video_max_frames:
             chat_kwargs["video_max_frames"] = request.video_max_frames
+        extract_audio = (
+            request.extract_audio_from_video
+            if request.extract_audio_from_video is not None
+            else _extract_audio_from_video
+        )
+        chat_kwargs["extract_audio_from_video"] = extract_audio
 
     # SpecPrefill: per-request overrides
     if request.specprefill is not None:
