@@ -706,6 +706,8 @@ class SimpleEngine(BaseEngine):
         model, then generates autoregressively. Falls back to normal generation
         on any error.
         """
+        from threading import Event
+
         model = self._model.model
         tokenizer = self._model.tokenizer
         n_tokens = len(tokens)
