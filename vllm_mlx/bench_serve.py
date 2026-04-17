@@ -19,6 +19,8 @@ import itertools
 import json
 import platform
 import re
+import statistics
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -390,3 +392,237 @@ async def scrape_metrics(client: httpx.AsyncClient, base_url: str) -> dict:
         return parse_metrics_text(resp.text)
     except Exception:
         return {}
+
+
+# ---------------------------------------------------------------------------
+# Task 4: SSE streaming core + token counting + request timing
+# ---------------------------------------------------------------------------
+
+
+def parse_sse_line(line: str) -> Optional[dict]:
+    """Parse one Server-Sent Events line from a streaming chat completion.
+
+    Args:
+        line: A single raw line from the SSE stream (may or may not include
+            a trailing newline — it is stripped before processing).
+
+    Returns:
+        ``None`` for blank lines, comment lines (starting with ``:``) and the
+        ``data: [DONE]`` sentinel.  For all other ``data:`` lines the JSON is
+        parsed and a dict is returned::
+
+            {"content": str, "finish_reason": Optional[str], "usage": Optional[dict]}
+
+        Missing keys (``choices``, ``delta``, ``content``) are handled
+        gracefully and default to empty string / ``None``.
+    """
+    line = line.strip()
+    if not line:
+        return None
+    if line.startswith(":"):
+        return None
+    if line == "data: [DONE]":
+        return None
+    if not line.startswith("data: "):
+        return None
+
+    payload = line[len("data: ") :]
+    try:
+        chunk = json.loads(payload)
+    except json.JSONDecodeError:
+        return None
+
+    choices = chunk.get("choices") or []
+    delta = choices[0].get("delta", {}) if choices else {}
+    content = delta.get("content", "") or ""
+    finish_reason = choices[0].get("finish_reason") if choices else None
+    usage = chunk.get("usage")
+
+    return {
+        "content": content,
+        "finish_reason": finish_reason,
+        "usage": usage,
+    }
+
+
+def compute_request_metrics(
+    t_start: float,
+    t_first_token: float,
+    token_times: list,
+    t_end: float,
+    prompt_tokens: int,
+    completion_tokens: int,
+) -> dict:
+    """Compute standard latency and throughput metrics for a single request.
+
+    All time arguments are :func:`time.perf_counter` values (seconds as
+    floats).
+
+    Args:
+        t_start: Timestamp immediately before the request was sent.
+        t_first_token: Timestamp when the first content token was received.
+        token_times: List of timestamps, one per content token (including the
+            first).  When there is only one token ``tpot_ms`` is ``0.0``.
+        t_end: Timestamp after the final SSE chunk was consumed.
+        prompt_tokens: Number of prompt tokens reported by the server.
+        completion_tokens: Number of completion tokens generated.
+
+    Returns:
+        Dict with keys ``ttft_ms``, ``tpot_ms``, ``e2e_latency_ms``,
+        ``gen_tps``, ``prompt_tps`` — all floats.
+    """
+    ttft_ms = (t_first_token - t_start) * 1000.0
+    e2e_latency_ms = (t_end - t_start) * 1000.0
+
+    # TPOT: mean inter-token gap across all generated tokens.
+    if len(token_times) > 1:
+        intervals = [
+            token_times[i] - token_times[i - 1] for i in range(1, len(token_times))
+        ]
+        tpot_ms = statistics.mean(intervals) * 1000.0
+    else:
+        tpot_ms = 0.0
+
+    gen_duration = t_end - t_first_token
+    gen_tps = completion_tokens / gen_duration if gen_duration > 0 else 0.0
+
+    prompt_duration = t_first_token - t_start
+    prompt_tps = prompt_tokens / prompt_duration if prompt_duration > 0 else 0.0
+
+    return {
+        "ttft_ms": ttft_ms,
+        "tpot_ms": tpot_ms,
+        "e2e_latency_ms": e2e_latency_ms,
+        "gen_tps": gen_tps,
+        "prompt_tps": prompt_tps,
+    }
+
+
+async def count_prompt_tokens(
+    client: httpx.AsyncClient,
+    base_url: str,
+    messages: list[dict],
+    model: str,
+) -> int:
+    """Count prompt tokens for a message list by sending a 1-token request.
+
+    Sends a non-streaming chat completion with ``max_tokens=1`` and reads
+    ``usage.prompt_tokens`` from the response.
+
+    Args:
+        client: An open :class:`httpx.AsyncClient`.
+        base_url: Base URL of the server.
+        messages: The message list to send.
+        model: Model ID to target.
+
+    Returns:
+        Number of prompt tokens, or ``0`` on error.
+    """
+    try:
+        resp = await client.post(
+            f"{base_url}/v1/chat/completions",
+            json={
+                "model": model,
+                "messages": messages,
+                "max_tokens": 1,
+                "stream": False,
+            },
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        return int((data.get("usage") or {}).get("prompt_tokens", 0))
+    except Exception:
+        return 0
+
+
+async def stream_chat_completion(
+    client: httpx.AsyncClient,
+    base_url: str,
+    messages: list[dict],
+    model: str,
+    max_tokens: int = 256,
+    enable_thinking: Optional[bool] = None,
+    extra_body: Optional[dict] = None,
+) -> dict:
+    """Send a streaming chat completion and collect per-token timing data.
+
+    Tracks TTFT, per-token timestamps, accumulated content, finish reason,
+    and usage (via ``stream_options: {"include_usage": True}``).
+
+    Args:
+        client: An open :class:`httpx.AsyncClient`.
+        base_url: Base URL of the server.
+        messages: The message list to send.
+        model: Model ID to target.
+        max_tokens: Maximum tokens to generate (default ``256``).
+        enable_thinking: If not ``None``, passed as ``enable_thinking`` in the
+            request body.
+        extra_body: Optional extra keys merged into the request body.
+
+    Returns:
+        Dict with all :func:`compute_request_metrics` fields plus
+        ``completion_tokens``, ``prompt_tokens``, ``finish_reason``,
+        ``content``.
+    """
+    body: dict = {
+        "model": model,
+        "messages": messages,
+        "max_tokens": max_tokens,
+        "stream": True,
+        "stream_options": {"include_usage": True},
+    }
+    if enable_thinking is not None:
+        body["enable_thinking"] = enable_thinking
+    if extra_body:
+        body.update(extra_body)
+
+    t_start = time.perf_counter()
+    t_first_token: Optional[float] = None
+    token_times: list[float] = []
+    content_parts: list[str] = []
+    finish_reason: Optional[str] = None
+    usage: Optional[dict] = None
+
+    async with client.stream(
+        "POST", f"{base_url}/v1/chat/completions", json=body
+    ) as response:
+        response.raise_for_status()
+        async for raw_line in response.aiter_lines():
+            parsed = parse_sse_line(raw_line)
+            if parsed is None:
+                continue
+            if parsed.get("usage"):
+                usage = parsed["usage"]
+            if parsed.get("finish_reason"):
+                finish_reason = parsed["finish_reason"]
+            chunk_content = parsed.get("content", "")
+            if chunk_content:
+                now = time.perf_counter()
+                if t_first_token is None:
+                    t_first_token = now
+                token_times.append(now)
+                content_parts.append(chunk_content)
+
+    t_end = time.perf_counter()
+    if t_first_token is None:
+        t_first_token = t_end
+
+    prompt_tokens = int((usage or {}).get("prompt_tokens", 0))
+    completion_tokens = int((usage or {}).get("completion_tokens", 0))
+
+    metrics = compute_request_metrics(
+        t_start=t_start,
+        t_first_token=t_first_token,
+        token_times=token_times,
+        t_end=t_end,
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+    )
+
+    return {
+        **metrics,
+        "completion_tokens": completion_tokens,
+        "prompt_tokens": prompt_tokens,
+        "finish_reason": finish_reason,
+        "content": "".join(content_parts),
+    }

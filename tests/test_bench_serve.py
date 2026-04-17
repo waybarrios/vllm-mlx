@@ -2,6 +2,7 @@
 """Tests for vllm_mlx.bench_serve — prompt loading and sweep expansion."""
 
 import json
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -10,11 +11,13 @@ import pytest
 from vllm_mlx.bench_serve import (
     BenchServeResult,
     SweepConfig,
+    compute_request_metrics,
     detect_hardware_fingerprint,
     expand_sweep,
     load_prompt_set,
     parse_health_response,
     parse_metrics_text,
+    parse_sse_line,
     parse_status_response,
 )
 
@@ -409,3 +412,119 @@ class TestAutoDetectionParsing:
         assert "os_version" in result
         assert isinstance(result["os_version"], str)
         assert len(result["os_version"]) > 0
+
+
+# ---------------------------------------------------------------------------
+# TestSSEParsing  (Task 4)
+# ---------------------------------------------------------------------------
+
+
+class TestSSEParsing:
+    """Unit tests for parse_sse_line()."""
+
+    def _make_line(self, delta_content=None, finish_reason=None, usage=None):
+        """Build a synthetic SSE data line."""
+        chunk: dict = {
+            "choices": [
+                {
+                    "delta": (
+                        {"content": delta_content} if delta_content is not None else {}
+                    ),
+                    "finish_reason": finish_reason,
+                }
+            ]
+        }
+        if usage is not None:
+            chunk["usage"] = usage
+        return f"data: {json.dumps(chunk)}"
+
+    def test_parse_data_line(self):
+        line = self._make_line(delta_content="Hello")
+        result = parse_sse_line(line)
+        assert result is not None
+        assert result["content"] == "Hello"
+        assert result["finish_reason"] is None
+        assert result["usage"] is None
+
+    def test_parse_done(self):
+        assert parse_sse_line("data: [DONE]") is None
+
+    def test_parse_empty_line(self):
+        assert parse_sse_line("") is None
+
+    def test_parse_comment_line(self):
+        assert parse_sse_line(": keep-alive") is None
+
+    def test_parse_no_content(self):
+        line = self._make_line()  # delta has no content key
+        result = parse_sse_line(line)
+        assert result is not None
+        assert result["content"] == ""
+
+    def test_parse_with_usage(self):
+        usage = {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
+        line = self._make_line(delta_content=None, usage=usage)
+        result = parse_sse_line(line)
+        assert result is not None
+        assert result["usage"] == usage
+
+    def test_parse_with_finish_reason(self):
+        line = self._make_line(finish_reason="stop")
+        result = parse_sse_line(line)
+        assert result is not None
+        assert result["finish_reason"] == "stop"
+
+
+# ---------------------------------------------------------------------------
+# TestRequestMetrics  (Task 4)
+# ---------------------------------------------------------------------------
+
+
+class TestRequestMetrics:
+    """Unit tests for compute_request_metrics()."""
+
+    def test_basic_metrics(self):
+        # Simulate: request starts at 0, first token at 0.1s, then 4 more tokens
+        # every 0.02s.
+        t_start = 0.0
+        t_first = 0.1
+        token_times = [t_first + i * 0.02 for i in range(5)]
+        t_end = token_times[-1] + 0.001  # tiny extra after last token
+        prompt_tokens = 20
+        completion_tokens = 5
+
+        metrics = compute_request_metrics(
+            t_start=t_start,
+            t_first_token=t_first,
+            token_times=token_times,
+            t_end=t_end,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+        )
+
+        # TTFT should be ~100 ms
+        assert metrics["ttft_ms"] == pytest.approx(100.0, abs=1.0)
+        # TPOT should be ~20 ms (inter-token interval)
+        assert metrics["tpot_ms"] == pytest.approx(20.0, abs=1.0)
+        # E2E latency > TTFT
+        assert metrics["e2e_latency_ms"] > metrics["ttft_ms"]
+        # gen_tps > 0
+        assert metrics["gen_tps"] > 0.0
+        # prompt_tps > 0
+        assert metrics["prompt_tps"] > 0.0
+
+    def test_single_token(self):
+        t_start = 0.0
+        t_first = 0.05
+        token_times = [t_first]
+        t_end = t_first + 0.001
+        metrics = compute_request_metrics(
+            t_start=t_start,
+            t_first_token=t_first,
+            token_times=token_times,
+            t_end=t_end,
+            prompt_tokens=10,
+            completion_tokens=1,
+        )
+        # Single token → no inter-token interval → TPOT = 0.0
+        assert metrics["tpot_ms"] == pytest.approx(0.0)
