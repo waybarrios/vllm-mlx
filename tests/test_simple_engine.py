@@ -4,6 +4,7 @@
 import asyncio
 from unittest.mock import MagicMock, patch
 
+import mlx.core as mx
 import pytest
 
 pytestmark = pytest.mark.anyio
@@ -373,3 +374,316 @@ class TestSimpleEngineConcurrency:
 
         assert output.text == ""
         assert output.finish_reason == "stop"
+
+    @pytest.mark.anyio
+    async def test_cancellation_does_not_release_lock_before_worker_finishes(
+        self, mock_llm_model
+    ):
+        """A cancelled blocking chat call must not overlap the next worker."""
+        from threading import Event, Lock
+
+        from vllm_mlx.engine.simple import SimpleEngine
+
+        first_started = Event()
+        release_workers = Event()
+        call_count = 0
+        call_lock = Lock()
+
+        def chat_side_effect(**kwargs):
+            nonlocal call_count
+            with call_lock:
+                call_count += 1
+                current_call = call_count
+                mock_llm_model._concurrent_count += 1
+                mock_llm_model._max_concurrent = max(
+                    mock_llm_model._max_concurrent,
+                    mock_llm_model._concurrent_count,
+                )
+                if current_call == 1:
+                    first_started.set()
+
+            try:
+                release_workers.wait(timeout=1.0)
+                result = MagicMock()
+                result.text = f"response-{current_call}"
+                result.tokens = [1, 2, 3]
+                result.finish_reason = "stop"
+                return result
+            finally:
+                with call_lock:
+                    mock_llm_model._concurrent_count -= 1
+
+        mock_llm_model.chat = MagicMock(side_effect=chat_side_effect)
+
+        with patch("vllm_mlx.engine.simple.is_mllm_model", return_value=False):
+            engine = SimpleEngine("test-model")
+            engine._model = mock_llm_model
+            engine._loaded = True
+
+            task1 = asyncio.create_task(
+                engine.chat(
+                    messages=[{"role": "user", "content": "first"}], max_tokens=8
+                )
+            )
+            await asyncio.to_thread(first_started.wait, 1.0)
+
+            task1.cancel()
+            task2 = asyncio.create_task(
+                engine.chat(
+                    messages=[{"role": "user", "content": "second"}], max_tokens=8
+                )
+            )
+
+            await asyncio.sleep(0.05)
+            release_workers.set()
+
+            with pytest.raises(asyncio.CancelledError):
+                await task1
+            result2 = await task2
+
+            assert result2.text == "response-2"
+            assert mock_llm_model._max_concurrent == 1
+
+    @pytest.mark.anyio
+    async def test_specprefill_path_does_not_prelock_serialized_runner(self):
+        """SpecPrefill should let _run_blocking_serialized own the lock."""
+        from vllm_mlx.engine.simple import SimpleEngine
+
+        async def fake_serialized(func, *args, **kwargs):
+            assert not engine._generation_lock.locked()
+            return []
+
+        with patch("vllm_mlx.engine.simple.is_mllm_model", return_value=False):
+            engine = SimpleEngine("test-model")
+            engine._loaded = True
+            engine._model = MagicMock()
+            engine._model.model = MagicMock()
+            engine._model.tokenizer = MagicMock()
+            engine._draft_model = MagicMock()
+            engine._run_blocking_serialized = fake_serialized  # type: ignore[method-assign]
+
+            outputs = []
+            async for chunk in engine._stream_generate_specprefill(
+                prompt="hello",
+                tokens=[1, 2, 3, 4],
+                max_tokens=4,
+                temperature=0.7,
+                top_p=0.9,
+            ):
+                outputs.append(chunk)
+
+            assert len(outputs) == 1
+            assert outputs[0].finished
+            assert outputs[0].completion_tokens == 0
+
+    @pytest.mark.anyio
+    async def test_text_mtp_path_does_not_prelock_serialized_runner(self):
+        """Text-only MTP path should let _run_blocking_serialized own the lock."""
+        from vllm_mlx.engine.simple import SimpleEngine
+
+        async def fake_serialized(func, *args, **kwargs):
+            assert not engine._generation_lock.locked()
+            return []
+
+        with patch("vllm_mlx.engine.simple.is_mllm_model", return_value=True):
+            engine = SimpleEngine("test-model")
+            engine._loaded = True
+            engine._text_model = MagicMock()
+            engine._text_model.make_mtp_cache = MagicMock(return_value=[])
+            engine._text_tokenizer = MagicMock()
+            engine._text_tokenizer.apply_chat_template = MagicMock(return_value="hello")
+            engine._text_tokenizer.bos_token = None
+            engine._draft_model = None
+            engine._run_blocking_serialized = fake_serialized  # type: ignore[method-assign]
+
+            outputs = []
+            async for chunk in engine._stream_generate_text(
+                messages=[{"role": "user", "content": "hello"}],
+                max_tokens=4,
+                temperature=0.7,
+                top_p=0.9,
+            ):
+                outputs.append(chunk)
+
+            assert len(outputs) == 1
+            assert outputs[0].finished
+            assert outputs[0].completion_tokens == 0
+
+    @pytest.mark.anyio
+    async def test_specprefill_threads_same_cancel_check_to_helpers(self):
+        """SpecPrefill worker should pass one cooperative cancel hook through both phases."""
+        from vllm_mlx.engine.simple import SimpleEngine
+
+        captured = {}
+
+        def fake_score_tokens(*args, cancel_check=None, **kwargs):
+            captured["score"] = cancel_check
+            return mx.array([0.5], dtype=mx.float32)
+
+        def fake_sparse_prefill(*args, cancel_check=None, **kwargs):
+            captured["prefill"] = cancel_check
+            return mx.zeros((1, 1, 8), dtype=mx.float32)
+
+        with patch("vllm_mlx.engine.simple.is_mllm_model", return_value=False):
+            engine = SimpleEngine("test-model")
+            engine._loaded = True
+            engine._draft_model = MagicMock()
+            engine._model = MagicMock()
+            engine._model.model = MagicMock()
+            engine._model.tokenizer = MagicMock()
+            engine._model.tokenizer.decode = MagicMock(return_value="A")
+            engine._model.tokenizer.eos_token_id = 0
+
+            outputs = []
+            with (
+                patch("mlx_lm.models.cache.make_prompt_cache", return_value=[]),
+                patch(
+                    "mlx_lm.sample_utils.make_sampler",
+                    return_value=lambda logits: mx.array([0], dtype=mx.int32),
+                ),
+                patch(
+                    "vllm_mlx.specprefill.score_tokens", side_effect=fake_score_tokens
+                ),
+                patch(
+                    "vllm_mlx.specprefill.select_chunks",
+                    return_value=mx.array([0], dtype=mx.int32),
+                ),
+                patch(
+                    "vllm_mlx.specprefill.sparse_prefill",
+                    side_effect=fake_sparse_prefill,
+                ),
+                patch("vllm_mlx.specprefill.cleanup_rope"),
+            ):
+                async for chunk in engine._stream_generate_specprefill(
+                    prompt="hello",
+                    tokens=[1, 2, 3, 4],
+                    max_tokens=4,
+                    temperature=0.7,
+                    top_p=0.9,
+                ):
+                    outputs.append(chunk.new_text)
+
+        assert outputs == ["A"]
+        assert callable(captured["score"])
+        assert captured["score"] is captured["prefill"]
+
+    @pytest.mark.anyio
+    async def test_cancelling_specprefill_request_stops_during_scoring(self):
+        """Cancelling SpecPrefill should signal the blocking scorer and exit without output."""
+        import time
+        from threading import Event
+
+        from vllm_mlx.engine.simple import SimpleEngine, _SpecPrefillCancelled
+
+        score_started = Event()
+        score_cancelled = Event()
+
+        def fake_score_tokens(*args, cancel_check=None, **kwargs):
+            assert callable(cancel_check)
+            score_started.set()
+            while True:
+                try:
+                    cancel_check()
+                except _SpecPrefillCancelled:
+                    score_cancelled.set()
+                    raise
+                time.sleep(0.01)
+
+        with patch("vllm_mlx.engine.simple.is_mllm_model", return_value=False):
+            engine = SimpleEngine("test-model")
+            engine._loaded = True
+            engine._draft_model = MagicMock()
+            engine._model = MagicMock()
+            engine._model.model = MagicMock()
+            engine._model.tokenizer = MagicMock()
+
+            async def consume():
+                async for _chunk in engine._stream_generate_specprefill(
+                    prompt="hello",
+                    tokens=[1, 2, 3, 4],
+                    max_tokens=4,
+                    temperature=0.7,
+                    top_p=0.9,
+                ):
+                    pytest.fail("Cancelled SpecPrefill request should not emit output")
+
+            with (
+                patch("mlx_lm.models.cache.make_prompt_cache", return_value=[]),
+                patch(
+                    "vllm_mlx.specprefill.score_tokens",
+                    side_effect=fake_score_tokens,
+                ),
+                patch("vllm_mlx.specprefill.cleanup_rope"),
+            ):
+                task = asyncio.create_task(consume())
+                assert await asyncio.to_thread(score_started.wait, 1.0)
+                task.cancel()
+
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+
+        assert await asyncio.to_thread(score_cancelled.wait, 1.0)
+
+    @pytest.mark.anyio
+    async def test_cancelling_specprefill_request_stops_during_sparse_prefill(self):
+        """Cancelling SpecPrefill should signal the sparse-prefill loop and exit without output."""
+        import time
+        from threading import Event
+
+        from vllm_mlx.engine.simple import SimpleEngine, _SpecPrefillCancelled
+
+        prefill_started = Event()
+        prefill_cancelled = Event()
+
+        def fake_sparse_prefill(*args, cancel_check=None, **kwargs):
+            assert callable(cancel_check)
+            prefill_started.set()
+            while True:
+                try:
+                    cancel_check()
+                except _SpecPrefillCancelled:
+                    prefill_cancelled.set()
+                    raise
+                time.sleep(0.01)
+
+        with patch("vllm_mlx.engine.simple.is_mllm_model", return_value=False):
+            engine = SimpleEngine("test-model")
+            engine._loaded = True
+            engine._draft_model = MagicMock()
+            engine._model = MagicMock()
+            engine._model.model = MagicMock()
+            engine._model.tokenizer = MagicMock()
+
+            async def consume():
+                async for _chunk in engine._stream_generate_specprefill(
+                    prompt="hello",
+                    tokens=[1, 2, 3, 4],
+                    max_tokens=4,
+                    temperature=0.7,
+                    top_p=0.9,
+                ):
+                    pytest.fail("Cancelled SpecPrefill request should not emit output")
+
+            with (
+                patch("mlx_lm.models.cache.make_prompt_cache", return_value=[]),
+                patch(
+                    "vllm_mlx.specprefill.score_tokens",
+                    return_value=mx.array([0.5], dtype=mx.float32),
+                ),
+                patch(
+                    "vllm_mlx.specprefill.select_chunks",
+                    return_value=mx.array([0], dtype=mx.int32),
+                ),
+                patch(
+                    "vllm_mlx.specprefill.sparse_prefill",
+                    side_effect=fake_sparse_prefill,
+                ),
+                patch("vllm_mlx.specprefill.cleanup_rope"),
+            ):
+                task = asyncio.create_task(consume())
+                assert await asyncio.to_thread(prefill_started.wait, 1.0)
+                task.cancel()
+
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+        assert await asyncio.to_thread(prefill_cancelled.wait, 1.0)

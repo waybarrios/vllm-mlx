@@ -42,6 +42,10 @@ def _has_media_content(messages: list) -> bool:
     return False
 
 
+class _SpecPrefillCancelled(Exception):
+    """Cooperative cancellation sentinel for blocking SpecPrefill workers."""
+
+
 class SimpleEngine(BaseEngine):
     """
     Simple engine for direct model calls.
@@ -228,7 +232,7 @@ class SimpleEngine(BaseEngine):
         self._system_kv_token_count = 0
         logger.info("SimpleEngine stopped")
 
-    async def _run_blocking_serialized(self, func, /, *args, **kwargs):
+    async def _run_blocking_serialized(self, func, /, *args, on_cancel=None, **kwargs):
         """Run a blocking MLX operation under the generation lock.
 
         Cancellation must not release the async lock before the worker thread
@@ -240,6 +244,14 @@ class SimpleEngine(BaseEngine):
             try:
                 return await asyncio.shield(task)
             except asyncio.CancelledError:
+                if on_cancel is not None:
+                    try:
+                        on_cancel()
+                    except Exception:
+                        logger.debug(
+                            "Blocking worker cancellation callback failed",
+                            exc_info=True,
+                        )
                 try:
                     await task
                 except BaseException:
@@ -694,13 +706,25 @@ class SimpleEngine(BaseEngine):
         model, then generates autoregressively. Falls back to normal generation
         on any error.
         """
+        from threading import Event
+
         model = self._model.model
         tokenizer = self._model.tokenizer
         n_tokens = len(tokens)
+        cancel_requested = Event()
+
+        def _request_cancel() -> None:
+            cancel_requested.set()
+
+        def _cancel_check() -> None:
+            if cancel_requested.is_set():
+                raise _SpecPrefillCancelled()
 
         def _run_all():
             try:
                 return _run_specprefill()
+            except _SpecPrefillCancelled:
+                raise
             except Exception as e:
                 logger.error("SpecPrefill failed, falling back to normal path: %s", e)
                 return _run_normal()
@@ -730,10 +754,12 @@ class SimpleEngine(BaseEngine):
                     self._draft_model,
                     tokens,
                     prefill_step_size=self._prefill_step_size,
+                    cancel_check=_cancel_check,
                 )
                 t_score = time.monotonic() - t0
 
                 # Phase 2: Select important chunks
+                _cancel_check()
                 effective_keep = specprefill_keep_pct or self._specprefill_keep_pct
                 selected = select_chunks(importance, keep_pct=effective_keep)
                 n_selected = selected.shape[0]
@@ -746,6 +772,7 @@ class SimpleEngine(BaseEngine):
                     selected,
                     cache,
                     step_size=self._prefill_step_size,
+                    cancel_check=_cancel_check,
                 )
                 t_prefill = time.monotonic() - t0
 
@@ -762,6 +789,7 @@ class SimpleEngine(BaseEngine):
 
                 # Phase 4: Generate (simple autoregressive, no MTP)
                 sampler = make_sampler(temp=temperature, top_p=top_p)
+                _cancel_check()
                 eos_id = tokenizer.eos_token_id
                 y = sampler(logits[:, -1, :])
                 mx.eval(y)
@@ -771,6 +799,7 @@ class SimpleEngine(BaseEngine):
                 prev_decoded = ""
 
                 for _ in range(max_tokens):
+                    _cancel_check()
                     tok_id = y.item()
                     generated_ids.append(tok_id)
 
@@ -789,6 +818,7 @@ class SimpleEngine(BaseEngine):
                     if is_eos:
                         break
 
+                    _cancel_check()
                     logits = model(y.reshape(1, -1), cache=cache)
                     y = sampler(logits[:, -1, :])
                     mx.eval(y)
@@ -811,6 +841,7 @@ class SimpleEngine(BaseEngine):
                 stop=stop,
                 **kwargs,
             ):
+                _cancel_check()
                 new_text = chunk.text if hasattr(chunk, "text") else str(chunk)
                 results.append(
                     SimpleNamespace(
@@ -820,7 +851,9 @@ class SimpleEngine(BaseEngine):
                 )
             return results
 
-        all_resps = await self._run_blocking_serialized(_run_all)
+        all_resps = await self._run_blocking_serialized(
+            _run_all, on_cancel=_request_cancel
+        )
 
         # Yield results as GenerationOutput
         accumulated_text = ""
