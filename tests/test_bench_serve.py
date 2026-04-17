@@ -10,8 +10,12 @@ import pytest
 from vllm_mlx.bench_serve import (
     BenchServeResult,
     SweepConfig,
+    detect_hardware_fingerprint,
     expand_sweep,
     load_prompt_set,
+    parse_health_response,
+    parse_metrics_text,
+    parse_status_response,
 )
 
 # ---------------------------------------------------------------------------
@@ -315,3 +319,93 @@ class TestBenchServeResult:
         assert hasattr(r, "tokens_saved")
         # Validation
         assert hasattr(r, "validated")
+
+
+# ---------------------------------------------------------------------------
+# TestAutoDetectionParsing  (Task 3)
+# ---------------------------------------------------------------------------
+
+
+class TestAutoDetectionParsing:
+    """Unit tests for server response parsers and hardware fingerprint."""
+
+    def test_parse_health_response(self):
+        data = {
+            "status": "healthy",
+            "model_loaded": True,
+            "model_name": "mlx-community/Llama-3.2-1B-Instruct-4bit",
+            "model_type": "llm",
+        }
+        result = parse_health_response(data)
+        assert result["model_name"] == "mlx-community/Llama-3.2-1B-Instruct-4bit"
+        assert result["model_type"] == "llm"
+
+    def test_parse_health_mllm(self):
+        data = {
+            "status": "healthy",
+            "model_loaded": True,
+            "model_name": "mlx-community/gemma-4-27b",
+            "model_type": "mllm",
+        }
+        result = parse_health_response(data)
+        assert result["model_type"] == "mllm"
+        assert result["model_name"] == "mlx-community/gemma-4-27b"
+
+    def test_parse_status_response(self):
+        data = {
+            "model": "mlx-community/Llama-3.2-1B-Instruct-4bit",
+            "metal": {
+                "active_gb": 12.5,
+                "peak_gb": 14.0,
+                "cache_gb": 2.0,
+            },
+            "cache": {"type": "paged"},
+        }
+        result = parse_status_response(data)
+        assert result["model"] == "mlx-community/Llama-3.2-1B-Instruct-4bit"
+        assert result["metal_active_gb"] == pytest.approx(12.5)
+        assert result["metal_peak_gb"] == pytest.approx(14.0)
+        assert result["metal_cache_gb"] == pytest.approx(2.0)
+        assert result["cache_type"] == "paged"
+
+    def test_parse_status_no_metal(self):
+        data = {"model": "some-model"}
+        result = parse_status_response(data)
+        assert result["metal_active_gb"] == pytest.approx(0.0)
+        assert result["metal_peak_gb"] == pytest.approx(0.0)
+        assert result["metal_cache_gb"] == pytest.approx(0.0)
+        assert result["cache_type"] == ""
+
+    def test_parse_metrics_text_with_cache_stats(self):
+        text = (
+            "# HELP vllm_prefix_cache_hits_total Total prefix cache hits\n"
+            "# TYPE vllm_prefix_cache_hits_total counter\n"
+            "vllm_prefix_cache_hits_total 42\n"
+            "# HELP vllm_prefix_cache_misses_total Total prefix cache misses\n"
+            "# TYPE vllm_prefix_cache_misses_total counter\n"
+            "vllm_prefix_cache_misses_total 8\n"
+            "# HELP vllm_prefix_cache_tokens_saved_total Tokens saved\n"
+            "# TYPE vllm_prefix_cache_tokens_saved_total counter\n"
+            "vllm_prefix_cache_tokens_saved_total 1024\n"
+        )
+        result = parse_metrics_text(text)
+        assert result["cache_hits"] == 42
+        assert result["cache_misses"] == 8
+        assert result["tokens_saved"] == 1024
+
+    def test_parse_metrics_empty(self):
+        result = parse_metrics_text("")
+        assert result["cache_hits"] == 0
+        assert result["cache_misses"] == 0
+        assert result["tokens_saved"] == 0
+
+    def test_detect_hardware_fingerprint(self):
+        result = detect_hardware_fingerprint()
+        assert isinstance(result, dict)
+        assert "chip" in result
+        assert "gpu_cores" in result
+        assert "memory_gb" in result
+        assert "bandwidth_gbs" in result
+        assert "os_version" in result
+        assert isinstance(result["os_version"], str)
+        assert len(result["os_version"]) > 0
