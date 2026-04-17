@@ -20,11 +20,15 @@ import csv as csv_mod
 import io
 import itertools
 import json
+import logging
 import platform
 import re
 import statistics
+import sys
 import time
+import uuid
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -920,3 +924,384 @@ def format_sql(results: list[BenchServeResult]) -> str:
         values = ", ".join(_sql_escape(d[col]) for col in RESULT_COLUMNS)
         lines.append(f"INSERT INTO bench_serve VALUES ({values});")
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Task 7: Main async orchestrator
+# ---------------------------------------------------------------------------
+
+logger = logging.getLogger(__name__)
+
+
+async def run_bench_serve(
+    url: str = "http://127.0.0.1:8080",
+    model: Optional[str] = None,
+    prompt_sets: list[str] = None,
+    prompt_file: Optional[str] = None,
+    concurrencies: list[int] = None,
+    max_tokens: int = 256,
+    repetitions: int = 3,
+    warmup: int = 1,
+    thinking_values: list[Optional[bool]] = None,
+    extra_bodies: list[str] = None,
+    output_path: Optional[str] = None,
+    fmt: str = "table",
+    do_validate: bool = True,
+    scrape: bool = True,
+    tag: Optional[str] = None,
+    override_fields: Optional[dict] = None,
+) -> list[BenchServeResult]:
+    """Run the full bench-serve sweep against a running vllm-mlx server.
+
+    Args:
+        url: Base URL of the server.
+        model: Model ID to use. If ``None``, auto-detected from the server.
+        prompt_sets: List of prompt set names or paths. Defaults to
+            ``["short", "medium", "long"]``.
+        prompt_file: Optional path to an extra prompt file to include.
+        concurrencies: Concurrency levels to sweep. Defaults to ``[1, 4]``.
+        max_tokens: Maximum tokens to generate per request.
+        repetitions: Number of repetitions per sweep config.
+        warmup: Number of warmup rounds before the first measured repetition.
+        thinking_values: Values for ``enable_thinking``. Defaults to
+            ``[None]``.
+        extra_bodies: JSON strings for extra body parameters. Defaults to
+            ``[""]`` (no extra body).
+        output_path: File path to write results to. If ``None``, prints to
+            stdout.
+        fmt: Output format — one of ``"table"``, ``"json"``, ``"csv"``,
+            ``"sql"``.
+        do_validate: Whether to validate each response.
+        scrape: Whether to scrape ``/metrics`` before and after each run.
+        tag: Optional tag string stored in every result row.
+        override_fields: Dict of field names to override on every result.
+
+    Returns:
+        List of :class:`BenchServeResult` instances.
+    """
+    # 1. Set defaults
+    if prompt_sets is None:
+        prompt_sets = ["short", "medium", "long"]
+    if concurrencies is None:
+        concurrencies = [1, 4]
+    if thinking_values is None:
+        thinking_values = [None]
+    if extra_bodies is None:
+        extra_bodies = [""]
+    if override_fields is None:
+        override_fields = {}
+
+    # 2. Generate run_id and timestamp
+    run_id = str(uuid.uuid4())[:8]
+    timestamp = datetime.now(timezone.utc).isoformat()
+
+    # 3. Open HTTP client
+    async with httpx.AsyncClient(timeout=httpx.Timeout(300.0)) as client:
+        # 4. Auto-detect runtime and hardware
+        print(f"Connecting to {url}...")
+        runtime = await auto_detect_runtime(client, url)
+        hw = detect_hardware_fingerprint()
+
+        # 5. Resolve model_id
+        model_id = model or runtime.get("model_id", "")
+        if not model_id:
+            print(
+                "Error: could not determine model ID. Use --model to specify.",
+                file=sys.stderr,
+            )
+            return []
+
+        # 6. Print hardware and runtime info
+        print(
+            f"Hardware: {hw.get('chip', 'unknown')} / {hw.get('memory_gb', 0):.0f}GB / {hw.get('os_version', '')}"
+        )
+        print(
+            f"Runtime:  model={model_id}  engine={runtime.get('engine_type', '')}  cache={runtime.get('cache_type', '')}"
+        )
+
+        # 7. Load prompts
+        all_prompts: dict[str, list[dict]] = {}
+        for ps in prompt_sets:
+            try:
+                all_prompts[ps] = load_prompt_set(ps)
+            except FileNotFoundError as exc:
+                print(f"Warning: skipping prompt set '{ps}': {exc}", file=sys.stderr)
+        if prompt_file:
+            try:
+                all_prompts[prompt_file] = load_prompt_set(prompt_file)
+            except FileNotFoundError as exc:
+                print(
+                    f"Warning: skipping prompt file '{prompt_file}': {exc}",
+                    file=sys.stderr,
+                )
+
+        if not all_prompts:
+            print("Error: no prompt sets could be loaded.", file=sys.stderr)
+            return []
+
+        # 8. Token-count first prompt from each set
+        prompt_token_counts: dict[str, int] = {}
+        for ps, prompts in all_prompts.items():
+            try:
+                count = await count_prompt_tokens(client, url, [prompts[0]], model_id)
+                prompt_token_counts[ps] = count
+            except Exception:
+                prompt_token_counts[ps] = 0
+
+        # 9. Expand sweep
+        sweep = expand_sweep(
+            list(all_prompts.keys()),
+            concurrencies,
+            thinking_values,
+            extra_bodies,
+            repetitions,
+        )
+
+        # Account for warmup rounds: insert warmup configs at rep==0 boundaries.
+        # We handle warmup inline during the sweep by tracking which
+        # (ps, conc, think, eb) combos have been warmed up.
+        total_runs = len(sweep)
+        print(f"Total runs: {total_runs} (+ warmup on first rep of each config)")
+
+        results: list[BenchServeResult] = []
+        warmed_up: set[tuple] = set()
+
+        # 11. Iterate over sweep
+        for ps, conc, think, eb, rep in sweep:
+            prompts = all_prompts[ps]
+
+            # Parse extra_body
+            extra_body_dict: Optional[dict] = None
+            if eb:
+                try:
+                    extra_body_dict = json.loads(eb)
+                except json.JSONDecodeError:
+                    extra_body_dict = None
+
+            # Format progress label
+            think_label = f"think={think}" if think is not None else ""
+            eb_label = f"eb={eb[:20]}" if eb else ""
+            label_parts = [ps, f"conc={conc}", f"rep={rep}"]
+            if think_label:
+                label_parts.append(think_label)
+            if eb_label:
+                label_parts.append(eb_label)
+            label = " ".join(label_parts)
+
+            # d. Warmup on first rep of each unique config
+            warmup_key = (ps, conc, think, eb)
+            if rep == 0 and warmup_key not in warmed_up and warmup > 0:
+                warmed_up.add(warmup_key)
+                for _ in range(warmup):
+                    try:
+                        await run_concurrent_requests(
+                            client=client,
+                            base_url=url,
+                            prompts=prompts,
+                            model=model_id,
+                            concurrency=conc,
+                            max_tokens=max_tokens,
+                            enable_thinking=think,
+                            extra_body=extra_body_dict,
+                            do_validate=False,
+                        )
+                    except Exception:
+                        pass
+
+            # e. Scrape /metrics before
+            metrics_before: dict = {}
+            if scrape:
+                metrics_before = await scrape_metrics(client, url)
+
+            # f. Run concurrent requests
+            req_results = await run_concurrent_requests(
+                client=client,
+                base_url=url,
+                prompts=prompts,
+                model=model_id,
+                concurrency=conc,
+                max_tokens=max_tokens,
+                enable_thinking=think,
+                extra_body=extra_body_dict,
+                do_validate=do_validate,
+            )
+
+            # g. Scrape /metrics after, compute cache delta
+            metrics_after: dict = {}
+            if scrape:
+                metrics_after = await scrape_metrics(client, url)
+
+            cache_hits_delta = metrics_after.get("cache_hits", 0) - metrics_before.get(
+                "cache_hits", 0
+            )
+            cache_misses_delta = metrics_after.get(
+                "cache_misses", 0
+            ) - metrics_before.get("cache_misses", 0)
+            tokens_saved_delta = metrics_after.get(
+                "tokens_saved", 0
+            ) - metrics_before.get("tokens_saved", 0)
+            total_events = cache_hits_delta + cache_misses_delta
+            cache_hit_rate = (
+                cache_hits_delta / total_events if total_events > 0 else 0.0
+            )
+
+            # h. Get metal memory from /v1/status
+            metal_active_gb = runtime.get("metal_active_gb", 0.0)
+            metal_peak_gb = runtime.get("metal_peak_gb", 0.0)
+            metal_cache_gb = runtime.get("metal_cache_gb", 0.0)
+            try:
+                resp = await client.get(f"{url}/v1/status")
+                resp.raise_for_status()
+                status_data = parse_status_response(resp.json())
+                metal_active_gb = status_data.get("metal_active_gb", metal_active_gb)
+                metal_peak_gb = status_data.get("metal_peak_gb", metal_peak_gb)
+                metal_cache_gb = status_data.get("metal_cache_gb", metal_cache_gb)
+            except Exception:
+                pass
+
+            # i. Aggregate per-request metrics
+            valid_results = [r for r in req_results if "error" not in r]
+            if not valid_results:
+                # All requests errored — build a failed result
+                result_obj = BenchServeResult(
+                    run_id=run_id,
+                    timestamp=timestamp,
+                    tag=tag or "",
+                    # Hardware
+                    chip=hw.get("chip", ""),
+                    gpu_cores=hw.get("gpu_cores", 0),
+                    memory_gb=hw.get("memory_gb", 0.0),
+                    bandwidth_gbs=hw.get("bandwidth_gbs", 0.0),
+                    os_version=hw.get("os_version", ""),
+                    # Runtime
+                    model_id=model_id,
+                    model_type=runtime.get("model_type", ""),
+                    engine_type=runtime.get("engine_type", ""),
+                    mtp_enabled=runtime.get("mtp_enabled", False),
+                    specprefill=runtime.get("specprefill", False),
+                    kv_quant=runtime.get("kv_quant", ""),
+                    cache_type=runtime.get("cache_type", ""),
+                    # Config
+                    prompt_set=ps,
+                    concurrency=conc,
+                    max_tokens=max_tokens,
+                    enable_thinking=think,
+                    extra_body=eb,
+                    repetition=rep,
+                    prompt_tokens=prompt_token_counts.get(ps, 0),
+                    # Latency / throughput all zero
+                    validated=False,
+                )
+                print(f"  {label}: FAIL (all requests errored)")
+            else:
+
+                def _mean(key: str) -> float:
+                    vals = [
+                        r[key] for r in valid_results if key in r and r[key] is not None
+                    ]
+                    return statistics.mean(vals) if vals else 0.0
+
+                mean_ttft = _mean("ttft_ms")
+                mean_tpot = _mean("tpot_ms")
+                mean_gen_tps = _mean("gen_tps")
+                mean_prompt_tps = _mean("prompt_tps")
+                mean_e2e = _mean("e2e_latency_ms")
+
+                total_completion_tokens = sum(
+                    r.get("completion_tokens", 0) for r in valid_results
+                )
+                max_e2e_seconds = (
+                    max(
+                        (r.get("e2e_latency_ms", 0.0) for r in valid_results),
+                        default=0.0,
+                    )
+                    / 1000.0
+                )
+                throughput_tps = (
+                    total_completion_tokens / max_e2e_seconds
+                    if max_e2e_seconds > 0
+                    else 0.0
+                )
+                requests_per_s = conc / max_e2e_seconds if max_e2e_seconds > 0 else 0.0
+
+                all_validated = all(r.get("validated", True) for r in valid_results)
+
+                result_obj = BenchServeResult(
+                    run_id=run_id,
+                    timestamp=timestamp,
+                    tag=tag or "",
+                    # Hardware
+                    chip=hw.get("chip", ""),
+                    gpu_cores=hw.get("gpu_cores", 0),
+                    memory_gb=hw.get("memory_gb", 0.0),
+                    bandwidth_gbs=hw.get("bandwidth_gbs", 0.0),
+                    os_version=hw.get("os_version", ""),
+                    # Runtime
+                    model_id=model_id,
+                    model_type=runtime.get("model_type", ""),
+                    engine_type=runtime.get("engine_type", ""),
+                    mtp_enabled=runtime.get("mtp_enabled", False),
+                    specprefill=runtime.get("specprefill", False),
+                    kv_quant=runtime.get("kv_quant", ""),
+                    cache_type=runtime.get("cache_type", ""),
+                    # Config
+                    prompt_set=ps,
+                    concurrency=conc,
+                    max_tokens=max_tokens,
+                    enable_thinking=think,
+                    extra_body=eb,
+                    repetition=rep,
+                    prompt_tokens=prompt_token_counts.get(ps, 0),
+                    # Latency
+                    ttft_ms=mean_ttft,
+                    tpot_ms=mean_tpot,
+                    e2e_latency_ms=mean_e2e,
+                    # Throughput
+                    gen_tps=mean_gen_tps,
+                    prompt_tps=mean_prompt_tps,
+                    throughput_tps=throughput_tps,
+                    requests_per_s=requests_per_s,
+                    # Memory
+                    metal_active_gb=metal_active_gb,
+                    metal_peak_gb=metal_peak_gb,
+                    metal_cache_gb=metal_cache_gb,
+                    # Cache
+                    cache_hits=cache_hits_delta,
+                    cache_misses=cache_misses_delta,
+                    cache_hit_rate=cache_hit_rate,
+                    tokens_saved=tokens_saved_delta,
+                    # Validation
+                    validated=all_validated,
+                )
+
+                status = "PASS" if all_validated else "FAIL"
+                print(
+                    f"  {label}: TTFT={mean_ttft:.0f}ms  TPS={mean_gen_tps:.1f}  {status}"
+                )
+
+            # j. Apply override_fields
+            for field_name, field_val in override_fields.items():
+                if hasattr(result_obj, field_name):
+                    setattr(result_obj, field_name, field_val)
+
+            results.append(result_obj)
+
+        # 12. Format output
+        formatters = {
+            "table": format_table,
+            "json": format_json,
+            "csv": format_csv,
+            "sql": format_sql,
+        }
+        formatter = formatters.get(fmt, format_table)
+        output = formatter(results)
+
+        # 13. Write to file or stdout
+        if output_path:
+            Path(output_path).write_text(output)
+            print(f"\nResults written to {output_path}")
+        else:
+            print()
+            print(output)
+
+        return results

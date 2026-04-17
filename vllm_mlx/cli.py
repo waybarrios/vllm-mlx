@@ -643,6 +643,65 @@ def bench_kv_cache_command(args):
     )
 
 
+def bench_serve_command(args):
+    """Run serving benchmark."""
+    import asyncio
+    from .bench_serve import run_bench_serve
+
+    prompt_sets = args.prompts.split(",")
+    concurrencies = [int(c) for c in args.concurrency.split(",")]
+
+    # Parse thinking values
+    thinking_values = [None]
+    if args.enable_thinking:
+        thinking_values = []
+        for v in args.enable_thinking.split(","):
+            v = v.strip().lower()
+            if v == "true":
+                thinking_values.append(True)
+            elif v == "false":
+                thinking_values.append(False)
+
+    # Parse extra body (comma-separated JSON dicts)
+    extra_bodies = [""]
+    if args.extra_body:
+        # Handle both '{"a":1}','{"b":2}' and {"a":1},{"b":2}
+        import re
+
+        extra_bodies = [
+            s.strip().strip("'\"")
+            for s in re.split(r"(?<=})\s*,\s*(?={)", args.extra_body)
+        ]
+
+    # Parse override fields
+    overrides = {}
+    for kv in args.override_field or []:
+        if "=" in kv:
+            k, v = kv.split("=", 1)
+            overrides[k] = v
+
+    asyncio.run(
+        run_bench_serve(
+            url=args.url,
+            model=args.model,
+            prompt_sets=prompt_sets,
+            prompt_file=args.prompt_file,
+            concurrencies=concurrencies,
+            max_tokens=args.max_tokens,
+            repetitions=args.repetitions,
+            warmup=args.warmup,
+            thinking_values=thinking_values,
+            extra_bodies=extra_bodies,
+            output_path=args.output,
+            fmt=args.format,
+            do_validate=args.validate == "true",
+            scrape=args.scrape_metrics == "true",
+            tag=args.tag,
+            override_fields=overrides,
+        )
+    )
+
+
 def create_parser() -> argparse.ArgumentParser:
     """Build the top-level CLI parser."""
     parser = argparse.ArgumentParser(
@@ -1139,6 +1198,110 @@ Examples:
         help="Download as multimodal model (broader file patterns)",
     )
 
+    # Serving benchmark
+    bench_serve_parser = subparsers.add_parser(
+        "bench-serve", help="Benchmark a running vllm-mlx server via HTTP API"
+    )
+    bench_serve_parser.add_argument(
+        "--url",
+        type=str,
+        default="http://127.0.0.1:8080",
+        help="Base URL of the running server (default: http://127.0.0.1:8080)",
+    )
+    bench_serve_parser.add_argument(
+        "--model",
+        type=str,
+        default=None,
+        help="Model ID to benchmark (default: auto-detected from server)",
+    )
+    bench_serve_parser.add_argument(
+        "--prompts",
+        type=str,
+        default="short,medium,long",
+        help="Comma-separated prompt set names or paths (default: short,medium,long)",
+    )
+    bench_serve_parser.add_argument(
+        "--prompt-file",
+        type=str,
+        default=None,
+        help="Path to an additional prompt file (JSON list of message dicts)",
+    )
+    bench_serve_parser.add_argument(
+        "--concurrency",
+        type=str,
+        default="1,4",
+        help="Comma-separated concurrency levels to sweep (default: 1,4)",
+    )
+    bench_serve_parser.add_argument(
+        "--max-tokens",
+        type=int,
+        default=256,
+        help="Maximum tokens to generate per request (default: 256)",
+    )
+    bench_serve_parser.add_argument(
+        "--repetitions",
+        type=int,
+        default=3,
+        help="Number of repetitions per sweep configuration (default: 3)",
+    )
+    bench_serve_parser.add_argument(
+        "--warmup",
+        type=int,
+        default=1,
+        help="Warmup rounds before the first measured repetition (default: 1)",
+    )
+    bench_serve_parser.add_argument(
+        "--enable-thinking",
+        type=str,
+        default=None,
+        help='Enable thinking mode: "true", "false", or "true,false" to sweep both',
+    )
+    bench_serve_parser.add_argument(
+        "--extra-body",
+        type=str,
+        default=None,
+        help="Comma-separated JSON dicts to pass as extra body parameters",
+    )
+    bench_serve_parser.add_argument(
+        "--output",
+        type=str,
+        default=None,
+        help="File path to write results to (default: stdout)",
+    )
+    bench_serve_parser.add_argument(
+        "--format",
+        type=str,
+        default="table",
+        choices=["table", "json", "csv", "sql"],
+        help="Output format (default: table)",
+    )
+    bench_serve_parser.add_argument(
+        "--validate",
+        type=str,
+        default="true",
+        choices=["true", "false"],
+        help="Validate responses (default: true)",
+    )
+    bench_serve_parser.add_argument(
+        "--scrape-metrics",
+        type=str,
+        default="true",
+        choices=["true", "false"],
+        help="Scrape /metrics before and after each run (default: true)",
+    )
+    bench_serve_parser.add_argument(
+        "--tag",
+        type=str,
+        default=None,
+        help="Optional tag string stored in every result row",
+    )
+    bench_serve_parser.add_argument(
+        "--override-field",
+        nargs="*",
+        default=[],
+        help="Override result fields as key=value pairs (e.g. chip=M4Pro)",
+    )
+
     return parser
 
 
@@ -1156,6 +1319,8 @@ def main():
         bench_kv_cache_command(args)
     elif args.command == "download":
         download_command(args)
+    elif args.command == "bench-serve":
+        bench_serve_command(args)
     else:
         parser.print_help()
         sys.exit(1)
