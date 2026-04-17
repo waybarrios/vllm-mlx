@@ -912,3 +912,85 @@ def build_json_system_prompt(
         return prompt
 
     return None
+
+
+def build_json_logits_processor(
+    response_format: ResponseFormat | dict[str, Any] | None,
+    tokenizer: Any,
+):
+    """
+    Build a logits processor that constrains generation to valid JSON matching
+    ``response_format``.
+
+    Unlike :func:`build_json_system_prompt` which nudges the model via the
+    system prompt, this processor masks logits at every generation step so
+    the model *cannot* emit invalid JSON (grammar-guided decoding).
+
+    Args:
+        response_format: ``ResponseFormat`` specification (or dict).
+        tokenizer: The tokenizer used by the engine.  May be a HF tokenizer,
+            a ``mlx_lm.TokenizerWrapper``, or a VLM ``processor``; the
+            underlying tokenizer is resolved automatically.
+
+    Returns:
+        A callable ``(tokens, logits) -> logits`` suitable for passing to
+        ``mlx_lm.stream_generate`` via ``logits_processors``.  ``None`` when
+        no constraint is needed (e.g. ``type=text``) or when constrained
+        decoding cannot be enabled (missing optional dependency, tokenizer
+        incompatibility) — in that case the caller should fall back to the
+        system-prompt path.
+    """
+    if response_format is None:
+        return None
+
+    # Normalize to dict
+    if isinstance(response_format, ResponseFormat):
+        format_type = response_format.type
+        schema: dict | None = None
+        if response_format.json_schema is not None:
+            schema = response_format.json_schema.schema_
+    elif isinstance(response_format, dict):
+        format_type = response_format.get("type", "text")
+        json_schema_spec = response_format.get("json_schema") or {}
+        if isinstance(json_schema_spec, dict):
+            schema = json_schema_spec.get("schema")
+        else:
+            schema = getattr(json_schema_spec, "schema_", None) or getattr(
+                json_schema_spec, "schema", None
+            )
+    else:
+        return None
+
+    if format_type == "text":
+        return None
+
+    if format_type not in ("json_object", "json_schema"):
+        return None
+
+    try:
+        from ..constrained import (
+            JSONSchemaLogitsProcessor,
+            LMFormatEnforcerNotAvailableError,
+            is_available,
+        )
+    except ImportError:
+        # Constrained decoding module could not be imported; fall back.
+        return None
+
+    if not is_available():
+        # ``lm-format-enforcer`` optional dependency missing; fall back.
+        return None
+
+    # ``json_schema`` without an actual schema degrades to ``json_object``
+    # (both paths pass ``schema=None`` to the processor).
+    if format_type == "json_object" or (format_type == "json_schema" and not schema):
+        schema = None
+
+    try:
+        return JSONSchemaLogitsProcessor(schema=schema, tokenizer=tokenizer)
+    except LMFormatEnforcerNotAvailableError:
+        return None
+    except Exception:
+        # Malformed schema or tokenizer issue — fall back to prompt-only
+        # mode.  Callers still run post-hoc validation as a safety net.
+        return None

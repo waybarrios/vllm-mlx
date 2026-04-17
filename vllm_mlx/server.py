@@ -99,6 +99,7 @@ from .api.models import (
 )
 from .api.tool_calling import (
     StreamingJsonFenceStripper,
+    build_json_logits_processor,
     build_json_system_prompt,
     convert_tools_for_template,
     parse_json_output,
@@ -1648,11 +1649,40 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
 
     # Handle response_format - inject system prompt if needed
     response_format = request.response_format
+    json_logits_processor = None
     if response_format:
         json_instruction = build_json_system_prompt(response_format)
         if json_instruction:
             # Inject JSON instruction into messages
             messages = _inject_json_instruction(messages, json_instruction)
+
+        # Build a grammar-guided logits processor so the model *cannot*
+        # emit invalid JSON.  If the optional ``lm-format-enforcer``
+        # dependency is missing, or the tokenizer cannot be adapted, this
+        # returns ``None`` and we fall back to prompt-only guidance plus
+        # post-hoc validation.  ``tools`` + ``response_format`` is an
+        # undefined combination in the OpenAI spec — we skip the
+        # constraint in that case so tool-call markup can still be
+        # emitted.
+        if not (request.tools and request.tool_choice != "none"):
+            tokenizer_obj = _get_engine_tokenizer(engine)
+            if tokenizer_obj is not None:
+                try:
+                    json_logits_processor = build_json_logits_processor(
+                        response_format, tokenizer_obj
+                    )
+                except Exception as exc:
+                    logger.warning("Failed to build JSON logits processor: %s", exc)
+                    json_logits_processor = None
+                if json_logits_processor is not None:
+                    logger.info(
+                        "Constrained decoding enabled for response_format.type=%s",
+                        (
+                            getattr(response_format, "type", None)
+                            if not isinstance(response_format, dict)
+                            else response_format.get("type")
+                        ),
+                    )
 
     # Resolve repetition penalty
     rep_penalty = request.repetition_penalty
@@ -1692,6 +1722,20 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
     # Add tools if provided
     if request.tools and request.tool_choice != "none":
         chat_kwargs["tools"] = convert_tools_for_template(request.tools)
+
+    # Wire constrained decoding logits processor if available.  Must be
+    # appended after all other kwargs because the engine may merge it with
+    # penalty processors internally.
+    if json_logits_processor is not None:
+        existing = chat_kwargs.get("logits_processors") or []
+        chat_kwargs["logits_processors"] = list(existing) + [json_logits_processor]
+        # Constrained decoding is incompatible with reasoning parsers:
+        # the model cannot emit <think> tags when forced to produce JSON.
+        # Suppress thinking so the reasoning parser doesn't capture the
+        # JSON output as reasoning_content.
+        if request.enable_thinking is None:
+            request.enable_thinking = False
+            chat_kwargs["enable_thinking"] = False
 
     if request.stream:
         return StreamingResponse(
@@ -1762,7 +1806,13 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
             # Return JSON as string
             cleaned_text = json.dumps(parsed_json)
         if not is_valid:
-            logger.warning(f"JSON validation failed: {error}")
+            if json_logits_processor is not None:
+                # Constrained decoding was active yet validation still failed.
+                # This is unexpected and indicates a bug in the grammar
+                # integration — log at error level so it surfaces in CI/logs.
+                logger.error("Constrained decoding produced invalid JSON: %s", error)
+            else:
+                logger.warning(f"JSON validation failed: {error}")
 
     # Determine finish reason
     finish_reason = "tool_calls" if tool_calls else output.finish_reason
@@ -1848,6 +1898,21 @@ def _normalize_messages(messages: list[dict]) -> list[dict]:
         logger.info(f"Normalized messages: {', '.join(parts)}")
 
     return merged
+
+
+def _get_engine_tokenizer(engine) -> object | None:
+    """
+    Return the tokenizer backing ``engine``, if exposed.
+
+    Different engine classes store the tokenizer under different attributes.
+    We try the common ones and return ``None`` if nothing matches, so that
+    optional features like constrained decoding can degrade gracefully.
+    """
+    for attr in ("_tokenizer", "tokenizer", "_processor", "processor"):
+        tok = getattr(engine, attr, None)
+        if tok is not None:
+            return tok
+    return None
 
 
 def _inject_json_instruction(messages: list, instruction: str) -> list:
@@ -1977,6 +2042,36 @@ async def create_anthropic_message(
     )
     messages = _normalize_messages(messages)
 
+    # Handle response_format (propagated from Anthropic request via adapter):
+    # inject prompt-level instruction AND wire a grammar-guided logits
+    # processor so the model cannot emit invalid JSON.
+    response_format = openai_request.response_format
+    json_logits_processor = None
+    if response_format:
+        json_instruction = build_json_system_prompt(response_format)
+        if json_instruction:
+            messages = _inject_json_instruction(messages, json_instruction)
+        if not (openai_request.tools and openai_request.tool_choice != "none"):
+            tokenizer_obj = _get_engine_tokenizer(engine)
+            if tokenizer_obj is not None:
+                try:
+                    json_logits_processor = build_json_logits_processor(
+                        response_format, tokenizer_obj
+                    )
+                except Exception as exc:
+                    logger.warning("Failed to build JSON logits processor: %s", exc)
+                    json_logits_processor = None
+                if json_logits_processor is not None:
+                    logger.info(
+                        "Constrained decoding enabled for Anthropic "
+                        "response_format.type=%s",
+                        (
+                            getattr(response_format, "type", None)
+                            if not isinstance(response_format, dict)
+                            else response_format.get("type")
+                        ),
+                    )
+
     chat_kwargs = {
         "max_tokens": openai_request.max_tokens or _default_max_tokens,
         "temperature": openai_request.temperature,
@@ -1989,6 +2084,12 @@ async def create_anthropic_message(
 
     if openai_request.tools and openai_request.tool_choice != "none":
         chat_kwargs["tools"] = convert_tools_for_template(openai_request.tools)
+
+    if json_logits_processor is not None:
+        existing = chat_kwargs.get("logits_processors") or []
+        chat_kwargs["logits_processors"] = list(existing) + [json_logits_processor]
+        # Suppress thinking: constrained decoding prevents <think> tags.
+        chat_kwargs["enable_thinking"] = False
 
     start_time = time.perf_counter()
     timeout = _default_timeout
@@ -2020,13 +2121,33 @@ async def create_anthropic_message(
     else:
         cleaned_text, tool_calls = output.text, None
 
-    # Extract reasoning if parser is configured
+    # Extract reasoning if parser is configured — skip when constrained
+    # decoding was active (no <think> tags possible).
     reasoning_text = None
-    if _reasoning_parser and not tool_calls:
+    if _reasoning_parser and not tool_calls and json_logits_processor is None:
         text_to_parse = cleaned_text or output.text
         reasoning_text, cleaned_text = _reasoning_parser.extract_reasoning(
             text_to_parse
         )
+
+    # Post-hoc response_format validation / normalization (safety net even
+    # when constrained decoding was active).
+    if response_format and not tool_calls:
+        json_input = cleaned_text or output.text
+        _, parsed_json, is_valid, error = parse_json_output(json_input, response_format)
+        if parsed_json is not None:
+            cleaned_text = json.dumps(parsed_json)
+        if not is_valid:
+            if json_logits_processor is not None:
+                logger.error(
+                    "Constrained decoding produced invalid JSON on "
+                    "Anthropic endpoint: %s",
+                    error,
+                )
+            else:
+                logger.warning(
+                    "JSON validation failed on Anthropic endpoint: %s", error
+                )
 
     # Clean output text
     final_content = None
@@ -2253,6 +2374,29 @@ async def _stream_anthropic_messages(
     if openai_request.tools and openai_request.tool_choice != "none":
         chat_kwargs["tools"] = convert_tools_for_template(openai_request.tools)
 
+    # Wire constrained decoding if response_format was requested via the
+    # Anthropic extension field and tools are not also requested.
+    response_format = getattr(openai_request, "response_format", None)
+    if response_format is not None and not (
+        openai_request.tools and openai_request.tool_choice != "none"
+    ):
+        json_instruction = build_json_system_prompt(response_format)
+        if json_instruction:
+            messages = _inject_json_instruction(messages, json_instruction)
+        tokenizer_obj = _get_engine_tokenizer(engine)
+        if tokenizer_obj is not None:
+            try:
+                processor = build_json_logits_processor(response_format, tokenizer_obj)
+            except Exception as exc:
+                logger.warning(
+                    "Failed to build JSON logits processor (Anthropic stream): %s",
+                    exc,
+                )
+                processor = None
+            if processor is not None:
+                chat_kwargs["logits_processors"] = [processor]
+                chat_kwargs["enable_thinking"] = False
+
     # Emit message_start
     message_start = {
         "type": "message_start",
@@ -2272,7 +2416,9 @@ async def _stream_anthropic_messages(
     }
     yield f"event: message_start\ndata: {json.dumps(message_start)}\n\n"
 
-    use_reasoning = _reasoning_parser is not None
+    use_reasoning = _reasoning_parser is not None and not chat_kwargs.get(
+        "logits_processors"
+    )
 
     if use_reasoning:
         _reasoning_parser.reset_state()
@@ -2956,6 +3102,39 @@ async def stream_chat_completion(
                     ],
                 )
                 yield f"data: {tool_chunk.model_dump_json()}\n\n"
+
+        # Safety-net validation: if response_format was requested, verify the
+        # accumulated output still parses.  When constrained decoding is active
+        # this should always succeed; if it fails we log loudly (error) so we
+        # notice grammar-integration regressions.  When constrained decoding was
+        # *not* active (optional dep missing, incompatible tokenizer, combined
+        # with tools), we log at warning level only — the prompt-only path is
+        # best-effort.
+        if (
+            getattr(request, "response_format", None) is not None
+            and not tool_calls_detected
+        ):
+            try:
+                _, _parsed, _is_valid, _err = parse_json_output(
+                    accumulated_text, request.response_format
+                )
+                if not _is_valid:
+                    # Determine whether constrained decoding was wired up.  We
+                    # passed the processor through ``kwargs`` so its presence is
+                    # the signal.
+                    has_constrained = any(
+                        p.__class__.__name__ == "JSONSchemaLogitsProcessor"
+                        for p in (kwargs.get("logits_processors") or [])
+                    )
+                    if has_constrained:
+                        logger.error(
+                            "Streaming constrained decoding produced invalid JSON: %s",
+                            _err,
+                        )
+                    else:
+                        logger.warning("Streaming JSON validation failed: %s", _err)
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.warning("Streaming JSON validation raised: %s", exc)
 
         # Log throughput
         elapsed = time.perf_counter() - start_time
