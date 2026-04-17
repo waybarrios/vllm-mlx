@@ -39,7 +39,7 @@ class TestBatchedEngineGenerate:
         mock.finish_reason = finish_reason
         return mock
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_tokens_field_is_populated(self):
         """tokens should contain the output token IDs from AsyncEngineCore."""
         engine = self._make_engine()
@@ -56,7 +56,7 @@ class TestBatchedEngineGenerate:
 
         assert result.tokens == token_ids
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_tokens_field_empty_when_no_tokens_generated(self):
         """tokens should be an empty list when output_token_ids is empty."""
         engine = self._make_engine()
@@ -70,7 +70,7 @@ class TestBatchedEngineGenerate:
 
         assert result.tokens == []
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_other_output_fields_still_populated(self):
         """Existing fields (text, prompt_tokens, etc.) must remain correct."""
         engine = self._make_engine()
