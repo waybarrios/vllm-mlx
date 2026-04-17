@@ -787,41 +787,37 @@ class SimpleEngine(BaseEngine):
                     t_prefill,
                 )
 
-                # Phase 4: Generate (simple autoregressive, no MTP)
+                # Phase 4: Generate via engine's standard pipelined path
                 sampler = make_sampler(temp=temperature, top_p=top_p)
                 _cancel_check()
+                first_token_id = sampler(logits[:, -1, :]).item()
+                first_text = tokenizer.decode([first_token_id])
                 eos_id = tokenizer.eos_token_id
-                y = sampler(logits[:, -1, :])
-                mx.eval(y)
 
-                results = []
-                generated_ids = []
-                prev_decoded = ""
-
-                for _ in range(max_tokens):
-                    _cancel_check()
-                    tok_id = y.item()
-                    generated_ids.append(tok_id)
-
-                    decoded = tokenizer.decode(generated_ids)
-                    new_text = decoded[len(prev_decoded) :]
-                    prev_decoded = decoded
-
-                    is_eos = tok_id == eos_id
-                    results.append(
-                        SimpleNamespace(
-                            text=new_text,
-                            finish_reason="stop" if is_eos else None,
-                        )
+                results = [
+                    SimpleNamespace(
+                        text=first_text,
+                        finish_reason="stop" if first_token_id == eos_id else None,
                     )
+                ]
 
-                    if is_eos:
-                        break
-
-                    _cancel_check()
-                    logits = model(y.reshape(1, -1), cache=cache)
-                    y = sampler(logits[:, -1, :])
-                    mx.eval(y)
+                if first_token_id != eos_id:
+                    for chunk in self._model.stream_generate(
+                        prompt=mx.array([first_token_id]),
+                        max_tokens=max_tokens - 1,
+                        temperature=temperature,
+                        top_p=top_p,
+                        stop=stop,
+                        prompt_cache=cache,
+                    ):
+                        _cancel_check()
+                        new_text = chunk.text if hasattr(chunk, "text") else str(chunk)
+                        results.append(
+                            SimpleNamespace(
+                                text=new_text,
+                                finish_reason=getattr(chunk, "finish_reason", None),
+                            )
+                        )
 
                 return results
 
@@ -1190,6 +1186,7 @@ class SimpleEngine(BaseEngine):
             from types import SimpleNamespace
 
             import mlx.core as mx
+            from mlx_lm import stream_generate as mlx_stream_generate
             from mlx_lm.models.cache import make_prompt_cache
             from mlx_lm.sample_utils import make_sampler
 
@@ -1250,39 +1247,28 @@ class SimpleEngine(BaseEngine):
                     effective_keep,
                 )
 
-                # Phase 4: Generate (simple autoregressive, no MTP)
+                # Phase 4: Generate via mlx_lm pipelined path (no MTP)
                 eos_id = self._text_tokenizer.eos_token_id
-                y = sampler(logits[:, -1, :])
-                mx.eval(y)
+                first_token_id = sampler(logits[:, -1, :]).item()
+                first_text = self._text_tokenizer.decode([first_token_id])
 
-                results = []
-                generated_ids = []
-                prev_decoded = ""
-
-                for _ in range(max_tokens):
-                    tok_id = y.item()
-                    generated_ids.append(tok_id)
-
-                    # Incremental text decode
-                    decoded = self._text_tokenizer.decode(generated_ids)
-                    new_text = decoded[len(prev_decoded) :]
-                    prev_decoded = decoded
-
-                    is_eos = tok_id == eos_id
-                    results.append(
-                        SimpleNamespace(
-                            text=new_text,
-                            finish_reason="stop" if is_eos else None,
-                        )
+                results = [
+                    SimpleNamespace(
+                        text=first_text,
+                        finish_reason="stop" if first_token_id == eos_id else None,
                     )
+                ]
 
-                    if is_eos:
-                        break
-
-                    # Next token
-                    logits = model(y.reshape(1, -1), cache=bc)
-                    y = sampler(logits[:, -1, :])
-                    mx.eval(y)
+                if first_token_id != eos_id:
+                    for resp in mlx_stream_generate(
+                        model,
+                        self._text_tokenizer,
+                        prompt=mx.array([first_token_id]),
+                        max_tokens=max_tokens - 1,
+                        sampler=sampler,
+                        prompt_cache=bc,
+                    ):
+                        results.append(resp)
 
                 return results
 

@@ -100,6 +100,58 @@ def test_model_stream_generate(small_model_name):
 
 
 @pytest.mark.slow
+def test_model_stream_generate_with_prompt_cache(small_model_name):
+    """Test streaming generation with pre-populated prompt_cache."""
+    pytest.importorskip("mlx_lm")
+    import mlx.core as mx
+    from mlx_lm.models.cache import make_prompt_cache
+
+    from vllm_mlx.models.llm import MLXLanguageModel
+
+    model = MLXLanguageModel(small_model_name)
+    model.load()
+
+    # Pre-populate cache by running a prefill
+    cache = make_prompt_cache(model.model)
+    tokens = model.tokenizer.encode("Hello")
+    model.model(mx.array([tokens]), cache=cache)
+    mx.eval([c.state for c in cache])
+
+    # Generate from a single token with the pre-populated cache
+    prompt_token = mx.array([tokens[-1]])
+    chunks = list(
+        model.stream_generate(
+            prompt=prompt_token,
+            max_tokens=10,
+            prompt_cache=cache,
+        )
+    )
+
+    assert len(chunks) > 0
+    assert any(chunk.finished for chunk in chunks)
+    # prompt_tokens should reflect the single-token prompt, not the full string
+    assert chunks[0].prompt_tokens == 1
+
+
+@pytest.mark.slow
+def test_model_stream_generate_with_list_prompt(small_model_name):
+    """Test streaming generation with list[int] prompt."""
+    pytest.importorskip("mlx_lm")
+
+    from vllm_mlx.models.llm import MLXLanguageModel
+
+    model = MLXLanguageModel(small_model_name)
+    model.load()
+
+    token_ids = model.tokenizer.encode("Hello")
+    chunks = list(model.stream_generate(prompt=token_ids, max_tokens=10))
+
+    assert len(chunks) > 0
+    assert any(chunk.finished for chunk in chunks)
+    assert chunks[0].prompt_tokens == len(token_ids)
+
+
+@pytest.mark.slow
 def test_model_chat(small_model_name):
     """Test chat interface."""
     pytest.importorskip("mlx_lm")

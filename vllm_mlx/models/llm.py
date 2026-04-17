@@ -7,8 +7,12 @@ integrating with vLLM's model execution system.
 """
 
 import logging
+from collections.abc import Iterator
 from dataclasses import dataclass
-from typing import Iterator
+from typing import TYPE_CHECKING, Union
+
+if TYPE_CHECKING:
+    import mlx.core as mx
 
 logger = logging.getLogger(__name__)
 
@@ -98,11 +102,10 @@ class MLXLanguageModel:
             self._loaded = True
             logger.info(f"Model loaded successfully: {self.model_name}")
 
-        except ImportError:
+        except ImportError as err:
             raise ImportError(
-                "mlx-lm is required for LLM inference. "
-                "Install with: pip install mlx-lm"
-            )
+                "mlx-lm is required for LLM inference. Install with: pip install mlx-lm"
+            ) from err
         except Exception as e:
             logger.error(f"Failed to load model: {e}")
             raise
@@ -214,7 +217,7 @@ class MLXLanguageModel:
 
     def stream_generate(
         self,
-        prompt: str,
+        prompt: Union[str, "mx.array", list[int]],
         max_tokens: int = 256,
         temperature: float = 0.7,
         top_p: float = 0.9,
@@ -224,13 +227,14 @@ class MLXLanguageModel:
         repetition_penalty: float = 1.0,
         stop: list[str] | None = None,
         logits_processors: list | None = None,
+        prompt_cache=None,
         **kwargs,
     ) -> Iterator[StreamingOutput]:
         """
         Stream text generation token by token.
 
         Args:
-            prompt: Input prompt text
+            prompt: Input prompt text, token array, or token id list
             max_tokens: Maximum number of tokens to generate
             temperature: Sampling temperature (0 = greedy)
             top_p: Top-p (nucleus) sampling parameter
@@ -239,6 +243,7 @@ class MLXLanguageModel:
             presence_penalty: Additive penalty for token presence
             repetition_penalty: Multiplicative penalty for repeating tokens
             stop: List of stop sequences
+            prompt_cache: Pre-populated KV cache (e.g. from SpecPrefill)
 
         Yields:
             StreamingOutput for each generated token
@@ -259,25 +264,31 @@ class MLXLanguageModel:
             all_processors = (logits_processors or []) + (penalty_processors or [])
 
         # Count prompt tokens once upfront
-        num_prompt_tokens = len(self.tokenizer.encode(prompt))
+        if isinstance(prompt, str):
+            num_prompt_tokens = len(self.tokenizer.encode(prompt))
+        else:
+            num_prompt_tokens = len(prompt)
 
-        token_count = 0
         accumulated_text = ""
 
         mtp_kwargs = {}
         if self._mtp:
             mtp_kwargs["mtp"] = True
+        if prompt_cache is not None:
+            mtp_kwargs["prompt_cache"] = prompt_cache
 
-        for response in stream_generate(
-            self.model,
-            self.tokenizer,
-            prompt=prompt,
-            max_tokens=max_tokens,
-            sampler=sampler,
-            logits_processors=all_processors,
-            **mtp_kwargs,
+        for token_count, response in enumerate(
+            stream_generate(
+                self.model,
+                self.tokenizer,
+                prompt=prompt,
+                max_tokens=max_tokens,
+                sampler=sampler,
+                logits_processors=all_processors,
+                **mtp_kwargs,
+            ),
+            start=1,
         ):
-            token_count += 1
             # response.text is the new token text (not accumulated)
             new_text = response.text
             accumulated_text += new_text
