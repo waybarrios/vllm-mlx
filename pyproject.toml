@@ -119,6 +119,9 @@ vllm-mlx-bench = "vllm_mlx.benchmark:main"
 where = ["."]
 include = ["vllm_mlx*"]
 
+[tool.setuptools.package-data]
+"vllm_mlx.bench_serve_prompts" = ["*.json"]
+
 [tool.black]
 line-length = 88
 target-version = ["py310", "py311", "py312", "py313"]
