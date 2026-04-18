@@ -603,6 +603,7 @@ def _parse_tool_calls_with_parser(
         logger.warning(f"Tool parser error: {e}")
         return parse_tool_calls(output_text, request_dict)
 
+
 def _new_response_item_id(prefix: str) -> str:
     """Generate stable OpenAI-style item ids."""
     return f"{prefix}_{uuid.uuid4().hex}"
