@@ -205,6 +205,15 @@ _RESPONSES_STORE_MAX_SIZE: int = 1000
 # Safety net: the tool parser should consume these, but if it doesn't
 # (e.g. malformed JSON, stray closing tags), strip them before emitting.
 _TOOL_MARKUP_PATTERN = re.compile(r"</?tool_call>|</?tool_call_reasoning>")
+_STREAMING_TOOL_MARKERS = (
+    "<tool_call>",
+    "<|tool_call>",
+    "<function=",
+    "[Calling tool:",
+    "[TOOL_CALLS]",
+    "<minimax:tool_call>",
+    '<invoke name="',
+)
 
 
 def _load_prefix_cache_from_disk() -> None:
@@ -1488,6 +1497,66 @@ def _detect_native_tool_support() -> bool:
         # Unexpected error during detection
         logger.warning(f"Failed to detect native tool support: {e}")
         return False
+
+
+def _tool_choice_disabled(request: ChatCompletionRequest | None) -> bool:
+    """Return True when tool_choice explicitly disables tool calling."""
+    if request is None:
+        return False
+
+    tool_choice = getattr(request, "tool_choice", None)
+    if tool_choice is None:
+        request_dict = request.model_dump()
+        tool_choice = request_dict.get("tool_choice")
+    return tool_choice == "none"
+
+
+def _get_streaming_tool_parser(request: ChatCompletionRequest | None):
+    """Get a streaming-capable tool parser for this request.
+
+    Uses the configured parser when auto tool choice is enabled, otherwise falls
+    back to the generic auto parser so streaming still matches the generic
+    non-streaming tool parsing behavior.
+    """
+    global _tool_parser_instance
+
+    if request is None:
+        return None
+    if _tool_choice_disabled(request):
+        return None
+
+    tokenizer = None
+    if _engine is not None and hasattr(_engine, "_tokenizer"):
+        tokenizer = _engine._tokenizer
+
+    if _enable_auto_tool_choice and _tool_call_parser:
+        if _tool_parser_instance is None:
+            try:
+                parser_cls = ToolParserManager.get_tool_parser(_tool_call_parser)
+                _tool_parser_instance = parser_cls(tokenizer)
+                logger.info(f"Initialized tool call parser: {_tool_call_parser}")
+            except Exception as e:
+                logger.warning(f"Failed to init tool parser for streaming: {e}")
+                return None
+        _tool_parser_instance.reset()
+        return _tool_parser_instance
+
+    if not getattr(request, "tools", None):
+        return None
+
+    try:
+        parser_cls = ToolParserManager.get_tool_parser("auto")
+        parser = parser_cls(tokenizer)
+        parser.reset()
+        return parser
+    except Exception as e:
+        logger.warning(f"Failed to init generic streaming tool parser: {e}")
+        return None
+
+
+def _streaming_tool_markup_possible(text: str) -> bool:
+    """Heuristic marker check to avoid parser work on ordinary text chunks."""
+    return any(marker in text for marker in _STREAMING_TOOL_MARKERS)
 
 
 def load_embedding_model(
@@ -3414,24 +3483,10 @@ async def _stream_anthropic_messages(
 
     # Tool call streaming suppression — prevents raw tool markup from leaking
     # as text_delta events. Mirrors the OpenAI streaming path logic.
-    global _tool_parser_instance
     tool_parser = None
     tool_accumulated_text = ""
     tool_markup_possible = False
-    tool_choice = getattr(openai_request, "tool_choice", None)
-    if _enable_auto_tool_choice and _tool_call_parser and tool_choice != "none":
-        if _tool_parser_instance is None:
-            try:
-                parser_cls = ToolParserManager.get_tool_parser(_tool_call_parser)
-                tokenizer = None
-                if _engine is not None and hasattr(_engine, "_tokenizer"):
-                    tokenizer = _engine._tokenizer
-                _tool_parser_instance = parser_cls(tokenizer)
-            except Exception:
-                pass
-        if _tool_parser_instance is not None:
-            tool_parser = _tool_parser_instance
-            tool_parser.reset()
+    tool_parser = _get_streaming_tool_parser(openai_request)
 
     try:
         async for output in engine.stream_chat(messages=messages, **chat_kwargs):
@@ -3461,7 +3516,12 @@ async def _stream_anthropic_messages(
 
                 # Filter tool call markup during streaming
                 if tool_parser and content_to_emit:
-                    if not tool_markup_possible and "<" not in content_to_emit:
+                    if (
+                        not tool_markup_possible
+                        and not _streaming_tool_markup_possible(
+                            tool_accumulated_text + content_to_emit
+                        )
+                    ):
                         tool_accumulated_text += content_to_emit
                     else:
                         if not tool_markup_possible:
@@ -3506,7 +3566,12 @@ async def _stream_anthropic_messages(
 
                 # Filter tool call markup during streaming
                 if tool_parser and content_to_emit:
-                    if not tool_markup_possible and "<" not in content_to_emit:
+                    if (
+                        not tool_markup_possible
+                        and not _streaming_tool_markup_possible(
+                            tool_accumulated_text + content_to_emit
+                        )
+                    ):
                         tool_accumulated_text += content_to_emit
                     else:
                         if not tool_markup_possible:
@@ -3752,27 +3817,11 @@ async def stream_chat_completion(
         fence_stripper = StreamingJsonFenceStripper()
 
     # Tool call streaming state
-    global _tool_parser_instance
     tool_parser = None
     tool_accumulated_text = ""
     tool_calls_detected = False
-    tool_markup_possible = False  # Fast path: skip parsing until '<' seen
-    tool_choice = getattr(request, "tool_choice", None)
-    if _enable_auto_tool_choice and _tool_call_parser and tool_choice != "none":
-        # Initialize parser if needed (same as _parse_tool_calls_with_parser)
-        if _tool_parser_instance is None:
-            try:
-                parser_cls = ToolParserManager.get_tool_parser(_tool_call_parser)
-                tokenizer = None
-                if _engine is not None and hasattr(_engine, "_tokenizer"):
-                    tokenizer = _engine._tokenizer
-                _tool_parser_instance = parser_cls(tokenizer)
-                logger.info(f"Initialized tool call parser: {_tool_call_parser}")
-            except Exception as e:
-                logger.warning(f"Failed to init tool parser for streaming: {e}")
-        if _tool_parser_instance is not None:
-            tool_parser = _tool_parser_instance
-            tool_parser.reset()
+    tool_markup_possible = False  # Fast path: skip parsing until markers appear
+    tool_parser = _get_streaming_tool_parser(request)
 
     try:
         # Stream content
@@ -3823,7 +3872,12 @@ async def stream_chat_completion(
 
                 # Tool call parsing on content portion
                 if tool_parser and content:
-                    if not tool_markup_possible and "<" not in content:
+                    if (
+                        not tool_markup_possible
+                        and not _streaming_tool_markup_possible(
+                            tool_accumulated_text + content
+                        )
+                    ):
                         tool_accumulated_text += content
                         # Suppress whitespace-only content when tools are active;
                         # avoids emitting stray newlines before tool call XML.
@@ -3941,10 +3995,16 @@ async def stream_chat_completion(
 
                 # Tool call streaming parsing
                 if tool_parser and delta_text:
-                    # Fast path: skip full parsing until '<' is seen in the stream,
-                    # which could start tool markup (e.g. <tool_call>). This avoids
-                    # per-token string scanning on the growing accumulated text.
-                    if not tool_markup_possible and "<" not in delta_text:
+                    # Fast path: skip full parsing until likely tool markup appears.
+                    # This preserves the cheap path for ordinary text while still
+                    # allowing generic streaming tool parsing when no explicit
+                    # parser flags are configured.
+                    if (
+                        not tool_markup_possible
+                        and not _streaming_tool_markup_possible(
+                            tool_accumulated_text + delta_text
+                        )
+                    ):
                         tool_accumulated_text += delta_text
                         # No tool markup yet, fall through to normal chunk emission
                     else:
@@ -4033,11 +4093,7 @@ async def stream_chat_completion(
             tool_parser
             and tool_accumulated_text
             and not tool_calls_detected
-            and (
-                "<tool_call>" in tool_accumulated_text
-                or "<|tool_call>" in tool_accumulated_text
-                or "<function" in tool_accumulated_text
-            )
+            and _streaming_tool_markup_possible(tool_accumulated_text)
         ):
             final_parse_result = tool_parser.extract_tool_calls(tool_accumulated_text)
             if final_parse_result.tools_called:

@@ -713,6 +713,177 @@ class TestStreamChatCompletion:
     """Tests for streaming chat completion behavior."""
 
     @pytest.mark.anyio
+    async def test_stream_without_parser_flags_emits_structured_tool_calls(
+        self, monkeypatch
+    ):
+        """Streaming tools should still parse without explicit parser flags."""
+        from vllm_mlx.engine.base import GenerationOutput
+        from vllm_mlx.server import (
+            ChatCompletionRequest,
+            Message,
+            stream_chat_completion,
+        )
+        import vllm_mlx.server as server
+
+        class FakeEngine:
+            model_name = "fake-engine"
+
+            async def stream_chat(self, messages, **kwargs):
+                chunks = [
+                    GenerationOutput(text="", new_text="<tool_call>", finished=False),
+                    GenerationOutput(
+                        text="",
+                        new_text="<function=list_directory>",
+                        finished=False,
+                    ),
+                    GenerationOutput(
+                        text="",
+                        new_text="<parameter=path>/Users/testuser</parameter>",
+                        finished=False,
+                    ),
+                    GenerationOutput(
+                        text="",
+                        new_text="</function>",
+                        finished=False,
+                    ),
+                    GenerationOutput(
+                        text="",
+                        new_text="</tool_call>",
+                        finished=True,
+                        finish_reason="stop",
+                        prompt_tokens=5,
+                        completion_tokens=7,
+                    ),
+                ]
+                for chunk in chunks:
+                    yield chunk
+
+        monkeypatch.setattr(server, "_model_name", "served-model")
+        monkeypatch.setattr(server, "_reasoning_parser", None)
+        monkeypatch.setattr(server, "_enable_auto_tool_choice", False)
+        monkeypatch.setattr(server, "_tool_call_parser", None)
+        monkeypatch.setattr(server, "_tool_parser_instance", None)
+
+        request = ChatCompletionRequest(
+            model="served-model",
+            messages=[Message(role="user", content="hi")],
+            tools=[
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "list_directory",
+                        "description": "List files in a directory",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"path": {"type": "string"}},
+                            "required": ["path"],
+                        },
+                    },
+                }
+            ],
+            stream=True,
+        )
+
+        chunks = [
+            chunk
+            async for chunk in stream_chat_completion(
+                FakeEngine(), request.messages, request
+            )
+        ]
+
+        payloads = [
+            json.loads(chunk.removeprefix("data: ").strip())
+            for chunk in chunks
+            if chunk != "data: [DONE]\n\n"
+        ]
+        tool_payloads = [
+            payload
+            for payload in payloads
+            if payload["choices"] and payload["choices"][0]["delta"].get("tool_calls")
+        ]
+
+        assert len(tool_payloads) == 1
+        delta = tool_payloads[0]["choices"][0]["delta"]
+        assert delta["tool_calls"][0]["function"]["name"] == "list_directory"
+        assert delta["tool_calls"][0]["function"]["arguments"] == (
+            '{"path": "/Users/testuser"}'
+        )
+        assert delta["content"] is None
+        assert tool_payloads[0]["choices"][0]["finish_reason"] == "tool_calls"
+        assert tool_payloads[0]["usage"] == {
+            "prompt_tokens": 5,
+            "completion_tokens": 7,
+            "total_tokens": 12,
+        }
+
+    @pytest.mark.anyio
+    async def test_stream_without_parser_flags_keeps_plain_text(self, monkeypatch):
+        """Generic streaming fallback should not interfere with normal text."""
+        from vllm_mlx.engine.base import GenerationOutput
+        from vllm_mlx.server import (
+            ChatCompletionRequest,
+            Message,
+            stream_chat_completion,
+        )
+        import vllm_mlx.server as server
+
+        class FakeEngine:
+            model_name = "fake-engine"
+
+            async def stream_chat(self, messages, **kwargs):
+                chunks = [
+                    GenerationOutput(text="", new_text="hello ", finished=False),
+                    GenerationOutput(
+                        text="",
+                        new_text="world",
+                        finished=True,
+                        finish_reason="stop",
+                        prompt_tokens=4,
+                        completion_tokens=2,
+                    ),
+                ]
+                for chunk in chunks:
+                    yield chunk
+
+        monkeypatch.setattr(server, "_model_name", "served-model")
+        monkeypatch.setattr(server, "_reasoning_parser", None)
+        monkeypatch.setattr(server, "_enable_auto_tool_choice", False)
+        monkeypatch.setattr(server, "_tool_call_parser", None)
+        monkeypatch.setattr(server, "_tool_parser_instance", None)
+
+        request = ChatCompletionRequest(
+            model="served-model",
+            messages=[Message(role="user", content="hi")],
+            tools=[
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "list_directory",
+                        "description": "List files in a directory",
+                        "parameters": {"type": "object", "properties": {}},
+                    },
+                }
+            ],
+            stream=True,
+        )
+
+        chunks = [
+            chunk
+            async for chunk in stream_chat_completion(
+                FakeEngine(), request.messages, request
+            )
+        ]
+        payloads = [
+            json.loads(chunk.removeprefix("data: ").strip())
+            for chunk in chunks
+            if chunk != "data: [DONE]\n\n"
+        ]
+
+        assert payloads[1]["choices"][0]["delta"]["content"] == "hello "
+        assert payloads[2]["choices"][0]["delta"]["content"] == "world"
+        assert payloads[2]["choices"][0]["finish_reason"] == "stop"
+
+    @pytest.mark.anyio
     async def test_reasoning_stream_emits_structured_tool_calls(self, monkeypatch):
         """Tool markup after </think> should emit tool_calls chunks."""
         from vllm_mlx.engine.base import GenerationOutput
