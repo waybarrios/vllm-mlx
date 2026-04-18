@@ -867,8 +867,10 @@ Examples:
         help=(
             "Path to a JSON file with prompts to pre-run at startup. Populates "
             "the prefix cache so the first real request hits warm (cold TTFT "
-            "drops 8-21x on agent workloads). File format is a list of message "
-            "arrays, same shape as /v1/chat/completions messages."
+            "drops 1.3-2.3x on agent workloads). File format is a list of "
+            "message arrays, same shape as /v1/chat/completions messages. "
+            "Prompts are warmed concurrently — keep the file small (1-3 entries "
+            "for typical agent deployments) to avoid memory pressure at boot."
         ),
     )
     serve_parser.add_argument(

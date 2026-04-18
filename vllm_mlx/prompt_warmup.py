@@ -18,6 +18,12 @@ state to the prefix cache.
 
 Paths resolve from the current working directory. A single-message system
 prompt is sufficient if that is the shared prefix.
+
+Sizing note: prompts are warmed concurrently via ``asyncio.gather``, so N
+entries fire N concurrent prefills at startup. Each prefill allocates KV
+cache for its prompt length. For typical agent deployments 1–3 entries
+(one per active persona) cover the hot paths; a very large warm-prompts
+file on a memory-tight model can exhaust headroom at boot.
 """
 
 from __future__ import annotations
@@ -85,40 +91,6 @@ def _ensure_user_terminator(messages: list[dict[str, Any]]) -> list[dict[str, An
     return [*messages, {"role": "user", "content": " "}]
 
 
-def _normalise_token_ids(token_ids: Any) -> list[int] | None:
-    """Normalise an apply_chat_template return to a plain list[int].
-
-    Handles multiple shapes HF tokenizers return:
-    - plain list[int]
-    - list[list[int]] (batched)
-    - torch/numpy tensor (``.tolist()``)
-    - BatchEncoding-like (has ``.input_ids``)
-    - Encoding-like (has ``.ids``)
-
-    Returns None if the shape is unrecognised.
-    """
-    # BatchEncoding: use input_ids attribute
-    if hasattr(token_ids, "input_ids"):
-        token_ids = token_ids.input_ids
-    # tokenizers.Encoding: use ids attribute
-    if hasattr(token_ids, "ids") and not isinstance(token_ids, (list, tuple)):
-        token_ids = token_ids.ids
-    # tensor → list
-    if hasattr(token_ids, "tolist"):
-        token_ids = token_ids.tolist()
-    # Some templates return [[ids]] — unwrap one level
-    if isinstance(token_ids, list) and token_ids and isinstance(token_ids[0], list):
-        token_ids = token_ids[0]
-    # Single-element list wrapping an Encoding (seen on Llama-3 HF tokenizer)
-    if isinstance(token_ids, list) and token_ids and hasattr(token_ids[0], "ids"):
-        token_ids = token_ids[0].ids
-    if not isinstance(token_ids, list) or not all(
-        isinstance(t, int) for t in token_ids
-    ):
-        return None
-    return token_ids
-
-
 def _build_strict_prefix_string(
     tokenizer: Any, messages: list[dict[str, Any]], enable_thinking: bool = True
 ) -> str | None:
@@ -160,15 +132,22 @@ def _build_strict_prefix_string(
         "enable_thinking": enable_thinking,
     }
 
+    # Multi-character probes that differ at position 0. Multi-char is safer
+    # than "A"/"B" against hypothetical templates that treat single-character
+    # content specially (e.g. stripping or wrapping). Differ-at-position-0 is
+    # required: probes that share a prefix (e.g. "__PROBE_A__"/"__PROBE_B__")
+    # would make the divergence loop overshoot into the shared-prefix region
+    # and cache bytes that are not in real requests.
+    probe_a, probe_b = "Alpha", "Bravo"
     try:
-        a = apply(_with_user("A"), **kwargs)
-        b = apply(_with_user("B"), **kwargs)
+        a = apply(_with_user(probe_a), **kwargs)
+        b = apply(_with_user(probe_b), **kwargs)
     except Exception:
         # Template may reject enable_thinking on non-Qwen models — retry without
         try:
             kwargs.pop("enable_thinking", None)
-            a = apply(_with_user("A"), **kwargs)
-            b = apply(_with_user("B"), **kwargs)
+            a = apply(_with_user(probe_a), **kwargs)
+            b = apply(_with_user(probe_b), **kwargs)
         except Exception:
             return None
 
