@@ -8,9 +8,11 @@ and other attacks via MCP server configurations.
 
 import logging
 import os
+import posixpath
 import re
 import shutil
 import time
+from urllib.parse import unquote, urlparse
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
@@ -98,6 +100,7 @@ BLOCKED_COMMAND_ARG_RULES: Dict[str, Dict[str, str]] = {
         "--call": "shell command execution",
     },
 }
+CONTROL_CHARS = ("\n", "\r")
 
 
 class MCPSecurityError(Exception):
@@ -145,6 +148,51 @@ class MCPCommandValidator:
                 "This should NEVER be used in production!"
             )
 
+    def _check_control_chars(self, value: str, context: str, server_name: str) -> None:
+        """Block command separators carried via literal newlines."""
+        if any(ch in value for ch in CONTROL_CHARS):
+            raise MCPSecurityError(
+                f"MCP server '{server_name}': {context} contains newline characters. "
+                "Potential command injection blocked."
+            )
+
+    def _check_path_traversal(self, value: str, context: str, server_name: str) -> None:
+        """
+        Block parent-directory traversal, including URL-encoded forms.
+
+        This normalizes likely path-like inputs rather than relying only on
+        the simple ``../`` regex, which can be bypassed by percent-encoding.
+        """
+        candidates = [value]
+        decoded = unquote(value)
+        if decoded != value:
+            candidates.append(decoded)
+
+        for candidate in candidates:
+            if (
+                "/" not in candidate
+                and "\\" not in candidate
+                and "%2e" not in value.lower()
+            ):
+                continue
+
+            normalized = posixpath.normpath(candidate.replace("\\", "/"))
+            if normalized == ".." or normalized.startswith("../"):
+                raise MCPSecurityError(
+                    f"MCP server '{server_name}': {context} contains path traversal: "
+                    f"'{value}'."
+                )
+
+            # Also reject any explicit parent segments before or after normalization.
+            path_parts = [
+                part for part in candidate.replace("\\", "/").split("/") if part
+            ]
+            if any(part == ".." for part in path_parts):
+                raise MCPSecurityError(
+                    f"MCP server '{server_name}': {context} contains path traversal: "
+                    f"'{value}'."
+                )
+
     def validate_command(self, command: str, server_name: str) -> None:
         """
         Validate that a command is safe to execute.
@@ -162,6 +210,9 @@ class MCPCommandValidator:
                 f"allowing command '{command}' (unsafe mode)"
             )
             return
+
+        self._check_control_chars(command, "Command", server_name)
+        self._check_path_traversal(command, "Command", server_name)
 
         # Check for dangerous patterns in command
         for pattern in DANGEROUS_PATTERNS:
@@ -221,6 +272,8 @@ class MCPCommandValidator:
             return
 
         for i, arg in enumerate(args):
+            self._check_control_chars(arg, f"Argument {i}", server_name)
+            self._check_path_traversal(arg, f"Argument {i}", server_name)
             for pattern in DANGEROUS_ARG_PATTERNS:
                 if pattern.search(arg):
                     raise MCPSecurityError(
@@ -302,6 +355,14 @@ class MCPCommandValidator:
         }
 
         for key, value in env.items():
+            self._check_control_chars(
+                value, f"Environment variable '{key}'", server_name
+            )
+            self._check_path_traversal(
+                value,
+                f"Environment variable '{key}'",
+                server_name,
+            )
             # Check for dangerous env var names
             if key.upper() in dangerous_env_vars:
                 raise MCPSecurityError(
@@ -335,6 +396,8 @@ class MCPCommandValidator:
         if self.allow_unsafe:
             return
 
+        self._check_control_chars(url, "URL", server_name)
+
         # Must be http or https
         if not url.startswith(("http://", "https://")):
             raise MCPSecurityError(
@@ -348,6 +411,11 @@ class MCPCommandValidator:
                 f"MCP server '{server_name}': Using insecure HTTP connection to {url}. "
                 f"Consider using HTTPS for production environments."
             )
+
+        parsed = urlparse(url)
+        self._check_path_traversal(parsed.path, "URL", server_name)
+        if parsed.query:
+            self._check_control_chars(parsed.query, "URL query", server_name)
 
         # Check for dangerous patterns
         for pattern in DANGEROUS_PATTERNS:

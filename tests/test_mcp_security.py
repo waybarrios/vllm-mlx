@@ -98,7 +98,16 @@ class TestMCPCommandValidator:
         with pytest.raises(MCPSecurityError) as exc_info:
             validator.validate_command("../../../bin/bash", "test-server")
 
-        assert "dangerous pattern" in str(exc_info.value)
+        assert "path traversal" in str(exc_info.value)
+
+    def test_command_newline_blocked(self):
+        """Test that newline separators in commands are rejected."""
+        validator = MCPCommandValidator(check_path_exists=False)
+
+        with pytest.raises(MCPSecurityError) as exc_info:
+            validator.validate_command("npx\ncat /etc/passwd", "test-server")
+
+        assert "newline characters" in str(exc_info.value)
 
 
 class TestArgumentValidation:
@@ -188,6 +197,26 @@ class TestArgumentValidation:
             "sqlite",
         )
 
+    def test_newline_in_args_blocked(self):
+        """Test that newline command separators in args are blocked."""
+        validator = MCPCommandValidator(check_path_exists=False)
+
+        with pytest.raises(MCPSecurityError) as exc_info:
+            validator.validate_args(["safe", "line1\nline2"], "test-server")
+
+        assert "newline characters" in str(exc_info.value)
+
+    def test_url_encoded_path_traversal_in_args_blocked(self):
+        """Test that encoded traversal in args is rejected."""
+        validator = MCPCommandValidator(check_path_exists=False)
+
+        with pytest.raises(MCPSecurityError) as exc_info:
+            validator.validate_args(
+                ["--path", "%2e%2e/%2e%2e/etc/passwd"], "test-server"
+            )
+
+        assert "path traversal" in str(exc_info.value)
+
 
 class TestEnvironmentValidation:
     """Tests for environment variable validation."""
@@ -235,6 +264,15 @@ class TestEnvironmentValidation:
 
         assert "dangerous pattern" in str(exc_info.value)
 
+    def test_newline_in_env_value_blocked(self):
+        """Test that newlines in environment values are rejected."""
+        validator = MCPCommandValidator(check_path_exists=False)
+
+        with pytest.raises(MCPSecurityError) as exc_info:
+            validator.validate_env({"SAFE_VAR": "line1\rline2"}, "test-server")
+
+        assert "newline characters" in str(exc_info.value)
+
 
 class TestURLValidation:
     """Tests for SSE URL validation."""
@@ -281,6 +319,29 @@ class TestURLValidation:
             validator.validate_url("https://example.com/sse; rm -rf /", "test-server")
 
         assert "dangerous pattern" in str(exc_info.value)
+
+    def test_newline_in_url_blocked(self):
+        """Test that newlines in URLs are rejected."""
+        validator = MCPCommandValidator(check_path_exists=False)
+
+        with pytest.raises(MCPSecurityError) as exc_info:
+            validator.validate_url(
+                "https://example.com/sse\ncurl attacker", "test-server"
+            )
+
+        assert "newline characters" in str(exc_info.value)
+
+    def test_url_encoded_path_traversal_in_url_blocked(self):
+        """Test that encoded traversal in URL paths is rejected."""
+        validator = MCPCommandValidator(check_path_exists=False)
+
+        with pytest.raises(MCPSecurityError) as exc_info:
+            validator.validate_url(
+                "https://example.com/%2e%2e/%2e%2e/private",
+                "test-server",
+            )
+
+        assert "path traversal" in str(exc_info.value)
 
 
 class TestUnsafeMode:
@@ -402,6 +463,18 @@ class TestMCPServerConfigSecurity:
             )
 
         assert "dangerous pattern" in str(exc_info.value)
+
+    def test_encoded_path_traversal_in_config_rejected(self):
+        """Test that encoded traversal in config args is rejected."""
+        with pytest.raises(ValueError) as exc_info:
+            MCPServerConfig(
+                name="encoded-traversal",
+                transport=MCPTransport.STDIO,
+                command="npx",
+                args=["-y", "@modelcontextprotocol/server-filesystem", "%2e%2e/%2e%2e"],
+            )
+
+        assert "path traversal" in str(exc_info.value)
 
     def test_valid_sse_config(self):
         """Test that valid SSE config passes validation."""
