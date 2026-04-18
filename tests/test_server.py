@@ -994,6 +994,161 @@ class TestServerIntegration:
         assert data["choices"][0]["message"]["content"]
 
 
+class TestSseDoneTermination:
+    """Regression tests for SSE data: [DONE] termination signal.
+
+    Covers #101: streaming responses must always emit exactly one
+    data: [DONE] event, even when the engine raises mid-stream.
+    """
+
+    @pytest.mark.anyio
+    async def test_stream_completion_normal_emits_done(self, monkeypatch):
+        """Normal stream_completion yields exactly one [DONE] at the end."""
+        from vllm_mlx.api.models import CompletionRequest
+        from vllm_mlx.engine.base import GenerationOutput
+        from vllm_mlx.server import stream_completion
+
+        import vllm_mlx.server as server
+
+        class FakeEngine:
+            model_name = "fake-engine"
+
+            async def stream_generate(self, **kwargs):
+                yield GenerationOutput(text="Hello", new_text="Hello", finished=False)
+                yield GenerationOutput(
+                    text="Hello world",
+                    new_text=" world",
+                    finished=True,
+                    finish_reason="stop",
+                    prompt_tokens=5,
+                    completion_tokens=2,
+                )
+
+        monkeypatch.setattr(server, "_model_name", "test-model")
+        monkeypatch.setattr(server, "_default_max_tokens", 100)
+
+        request = CompletionRequest(model="test-model", prompt="Say hello")
+        chunks = [
+            chunk
+            async for chunk in stream_completion(FakeEngine(), "Say hello", request)
+        ]
+
+        done_chunks = [c for c in chunks if c == "data: [DONE]\n\n"]
+        assert (
+            len(done_chunks) == 1
+        ), f"Expected exactly 1 [DONE], got {len(done_chunks)}"
+        assert chunks[-1] == "data: [DONE]\n\n", "[DONE] must be the last chunk"
+
+    @pytest.mark.anyio
+    async def test_stream_completion_exception_still_emits_done(self, monkeypatch):
+        """When engine raises mid-stream, [DONE] is still emitted via _ensure_sse_terminal."""
+        from vllm_mlx.api.models import CompletionRequest
+        from vllm_mlx.engine.base import GenerationOutput
+        from vllm_mlx.server import _ensure_sse_terminal, stream_completion
+
+        import vllm_mlx.server as server
+
+        class ExplodingEngine:
+            model_name = "exploding-engine"
+
+            async def stream_generate(self, **kwargs):
+                yield GenerationOutput(
+                    text="partial", new_text="partial", finished=False
+                )
+                raise RuntimeError("Metal command buffer SIGABRT")
+
+        monkeypatch.setattr(server, "_model_name", "test-model")
+        monkeypatch.setattr(server, "_default_max_tokens", 100)
+
+        request = CompletionRequest(model="test-model", prompt="Say hello")
+        # Wrap with _ensure_sse_terminal, matching server routing
+        chunks = [
+            chunk
+            async for chunk in _ensure_sse_terminal(
+                stream_completion(ExplodingEngine(), "Say hello", request),
+                "data: [DONE]\n\n",
+            )
+        ]
+
+        done_chunks = [c for c in chunks if c == "data: [DONE]\n\n"]
+        assert (
+            len(done_chunks) == 1
+        ), f"Expected exactly 1 [DONE], got {len(done_chunks)}"
+        assert chunks[-1] == "data: [DONE]\n\n", "[DONE] must be the last chunk"
+
+    @pytest.mark.anyio
+    async def test_ensure_sse_terminal_normal_no_duplicate(self):
+        """Wrapper passes through the generator's own [DONE] without duplicating."""
+        from vllm_mlx.server import _ensure_sse_terminal
+
+        async def happy_generator():
+            yield "data: {}\n\n"
+            yield "data: [DONE]\n\n"
+
+        chunks = [
+            chunk
+            async for chunk in _ensure_sse_terminal(
+                happy_generator(), "data: [DONE]\n\n"
+            )
+        ]
+
+        done_chunks = [c for c in chunks if c == "data: [DONE]\n\n"]
+        assert (
+            len(done_chunks) == 1
+        ), f"Expected exactly 1 [DONE], got {len(done_chunks)}"
+
+    @pytest.mark.anyio
+    async def test_ensure_sse_terminal_exception_emits_done(self):
+        """Wrapper emits [DONE] when inner generator raises before reaching it."""
+        from vllm_mlx.server import _ensure_sse_terminal
+
+        async def exploding_generator():
+            yield "data: {}\n\n"
+            raise RuntimeError("engine crashed")
+
+        chunks = [
+            chunk
+            async for chunk in _ensure_sse_terminal(
+                exploding_generator(), "data: [DONE]\n\n"
+            )
+        ]
+
+        done_chunks = [c for c in chunks if c == "data: [DONE]\n\n"]
+        assert (
+            len(done_chunks) == 1
+        ), f"Expected exactly 1 [DONE], got {len(done_chunks)}"
+        assert chunks[-1] == "data: [DONE]\n\n", "[DONE] must be the last chunk"
+
+    @pytest.mark.anyio
+    async def test_ensure_sse_terminal_anthropic_protocol(self):
+        """Wrapper emits Anthropic message_stop, not OpenAI [DONE], on exception."""
+        import json
+
+        from vllm_mlx.server import _ensure_sse_terminal
+
+        anthropic_terminal = (
+            f"event: message_stop\ndata: {json.dumps({'type': 'message_stop'})}\n\n"
+        )
+
+        async def exploding_anthropic_stream():
+            yield "event: content_block_delta\ndata: {}\n\n"
+            raise RuntimeError("engine crashed")
+
+        chunks = [
+            chunk
+            async for chunk in _ensure_sse_terminal(
+                exploding_anthropic_stream(), anthropic_terminal
+            )
+        ]
+
+        # Must emit Anthropic terminal, NOT OpenAI [DONE]
+        assert chunks[-1] == anthropic_terminal
+        openai_done = [c for c in chunks if c == "data: [DONE]\n\n"]
+        assert (
+            len(openai_done) == 0
+        ), "Must not emit OpenAI [DONE] for Anthropic streams"
+
+
 def pytest_addoption(parser):
     """Add custom command line options."""
     parser.addoption(
