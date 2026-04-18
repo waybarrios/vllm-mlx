@@ -129,6 +129,33 @@ class SchedulerOutput:
     has_work: bool = False
 
 
+def _install_prompt_cache_save(batch_gen: "BatchGenerator", prompt_cache_save) -> None:
+    """Monkey-patch ``_process_prompts`` to capture prompt-only cache state.
+
+    Can be installed independently of chunked prefill.  If chunked prefill is
+    also installed, *it* takes over ``_process_prompts`` and invokes the
+    callback itself, so call this **before** ``_install_chunked_prefill``.
+    """
+    _orig_process_prompts = batch_gen._process_prompts
+
+    try:
+        from mlx_lm.generate import Batch as _batch_cls
+    except ImportError:
+        _batch_cls = None  # extract_cache fallback handled in patched fn
+
+    def _patched_process_prompts(prompts, _self=batch_gen):
+        batch = _orig_process_prompts(prompts)
+        for e, uid in enumerate(batch.uids):
+            if batch.num_tokens[e] == 0:
+                try:
+                    prompt_cache_save(uid, batch.extract_cache(e))
+                except Exception:
+                    pass
+        return batch
+
+    batch_gen._process_prompts = _patched_process_prompts
+
+
 def _install_chunked_prefill(
     batch_gen: "BatchGenerator",
     budget: int,
@@ -1271,11 +1298,14 @@ class Scheduler:
         # monkey-patch. Not a BatchGenerator constructor parameter.
         bg.prompt_progress_callback = _prefill_progress
 
-        # Install chunked prefill when explicitly configured OR when
-        # memory-aware cache is active (needed for prefix_boundary saves
-        # in agentic multi-turn workloads with hybrid Mamba+Transformer models).
+        # Install chunked prefill only when explicitly configured.
+        # memory_aware_cache fetch/store works independently; the mid-prefill
+        # save callback is an optimisation, not a requirement.
+        # When chunked_prefill_tokens == 0 (the default), honour the user's
+        # intent — do NOT silently re-enable chunked prefill just because
+        # memory_aware_cache is active (see #178).
         chunked_budget = self.config.chunked_prefill_tokens
-        need_chunked = chunked_budget > 0 or self.memory_aware_cache is not None
+        need_chunked = chunked_budget > 0
 
         # The chunked prefill monkey-patch relies on BatchGenerator internals
         # (_process_prompts, active_batch, _step, etc.) that were refactored
@@ -1284,20 +1314,19 @@ class Scheduler:
             bg, "active_batch"
         )
 
+        prompt_cache_cb = None
+        if self.memory_aware_cache is not None:
+            prompt_cache_cb = self._make_prompt_cache_save_callback()
+
         if need_chunked and chunked_compatible:
-            if chunked_budget <= 0:
-                # No explicit budget — use a very large value so normal
-                # prompts pass through unchanged.  Prefix boundary splits
-                # still trigger via _needs_boundary_split.
-                chunked_budget = 999_999
+            # Full chunked prefill with mid-prefill saves and prompt cache
+            # save wired through the chunked next() and _process_prompts
+            # monkey-patches inside _install_chunked_prefill.
             mid_prefill_cb = None
             save_interval = self.config.mid_prefill_save_interval
             if save_interval > 0 and self.memory_aware_cache is not None:
                 mid_prefill_cb = self._make_mid_prefill_save_callback(save_interval)
                 logger.info(f"[mid_prefill_cache] enabled, interval={save_interval}")
-            prompt_cache_cb = None
-            if self.memory_aware_cache is not None:
-                prompt_cache_cb = self._make_prompt_cache_save_callback()
             _install_chunked_prefill(
                 bg,
                 chunked_budget,
@@ -1313,6 +1342,14 @@ class Scheduler:
                 "internals (_process_prompts, active_batch). Upgrade mlx-lm or "
                 "check compatibility."
             )
+
+        # When chunked prefill is off but memory_aware_cache is active,
+        # install the lightweight _process_prompts hook so prompt-only
+        # cache entries are still captured.  This is the only safe capture
+        # point for hybrid Mamba+Transformer models (#178).
+        if not need_chunked and prompt_cache_cb is not None:
+            if hasattr(bg, "_process_prompts"):
+                _install_prompt_cache_save(bg, prompt_cache_cb)
 
         # Install MTP if the model supports it
         if self.config.enable_mtp:
