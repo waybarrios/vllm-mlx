@@ -1596,6 +1596,7 @@ def load_model(
     force_mllm: bool = False,
     gpu_memory_utilization: float = 0.90,
     served_model_name: str | None = None,
+    trust_remote_code: bool = False,
     mtp: bool = False,
     prefill_step_size: int = 2048,
     specprefill_enabled: bool = False,
@@ -1613,6 +1614,7 @@ def load_model(
         stream_interval: Tokens to batch before streaming (batched mode only)
         max_tokens: Default max tokens for generation
         force_mllm: Force loading as MLLM even if not auto-detected
+        trust_remote_code: Allow HuggingFace remote code execution during model/tokenizer loading
         mtp: Enable native MTP speculative decoding (SimpleEngine only)
         prefill_step_size: Chunk size for prompt prefill processing (default: 2048)
         specprefill_enabled: Enable SpecPrefill (SimpleEngine only)
@@ -1635,6 +1637,7 @@ def load_model(
         logger.info(f"Loading model with BatchedEngine: {model_name}")
         _engine = BatchedEngine(
             model_name=model_name,
+            trust_remote_code=trust_remote_code,
             scheduler_config=scheduler_config,
             stream_interval=stream_interval,
             force_mllm=force_mllm,
@@ -1647,6 +1650,7 @@ def load_model(
         logger.info(f"Loading model with SimpleEngine: {model_name}")
         _engine = SimpleEngine(
             model_name=model_name,
+            trust_remote_code=trust_remote_code,
             force_mllm=force_mllm,
             mtp=mtp,
             prefill_step_size=prefill_step_size,
@@ -4244,6 +4248,82 @@ async def init_mcp(config_path: str):
 
 def main():
     """Run the server."""
+    parser = create_parser()
+    args = parser.parse_args()
+
+    # Set global configuration
+    global _api_key, _default_timeout, _rate_limiter, _metrics_enabled
+    global _default_temperature, _default_top_p
+    _api_key = args.api_key
+    _default_timeout = args.timeout
+    _metrics_enabled = args.enable_metrics
+    _metrics.configure(enabled=args.enable_metrics)
+    if args.default_temperature is not None:
+        _default_temperature = args.default_temperature
+    if args.default_top_p is not None:
+        _default_top_p = args.default_top_p
+
+    # Configure rate limiter
+    if args.rate_limit > 0:
+        _rate_limiter = RateLimiter(requests_per_minute=args.rate_limit, enabled=True)
+        logger.info(
+            f"Rate limiting enabled: {args.rate_limit} requests/minute per client"
+        )
+
+    # Security summary at startup
+    logger.info("=" * 60)
+    logger.info("SECURITY CONFIGURATION")
+    logger.info("=" * 60)
+    if _api_key:
+        logger.info("  Authentication: ENABLED (API key required)")
+    else:
+        logger.warning("  Authentication: DISABLED - Use --api-key to enable")
+    if args.rate_limit > 0:
+        logger.info(f"  Rate limiting: ENABLED ({args.rate_limit} req/min)")
+    else:
+        logger.warning("  Rate limiting: DISABLED - Use --rate-limit to enable")
+    logger.info(f"  Request timeout: {args.timeout}s")
+    if args.enable_metrics:
+        logger.info("  Metrics: ENABLED (/metrics, unauthenticated)")
+    else:
+        logger.info("  Metrics: DISABLED - Use --enable-metrics to expose /metrics")
+    if args.trust_remote_code:
+        logger.warning("  Remote code loading: ENABLED (--trust-remote-code)")
+    else:
+        logger.info("  Remote code loading: DISABLED (default)")
+    logger.info("=" * 60)
+
+    # Set MCP config for lifespan
+    if args.mcp_config:
+        os.environ["VLLM_MLX_MCP_CONFIG"] = args.mcp_config
+
+    # Initialize reasoning parser if specified
+    if args.reasoning_parser:
+        global _reasoning_parser
+        from .reasoning import get_parser
+
+        parser_cls = get_parser(args.reasoning_parser)
+        _reasoning_parser = parser_cls()
+        logger.info(f"Reasoning parser enabled: {args.reasoning_parser}")
+
+    # Pre-load embedding model if specified
+    load_embedding_model(args.embedding_model, lock=True)
+
+    # Load model before starting server
+    load_model(
+        args.model,
+        use_batching=args.continuous_batching,
+        max_tokens=args.max_tokens,
+        force_mllm=args.mllm,
+        trust_remote_code=args.trust_remote_code,
+    )
+
+    # Start server
+    uvicorn.run(app, host=args.host, port=args.port)
+
+
+def create_parser() -> argparse.ArgumentParser:
+    """Create the standalone server CLI parser."""
     parser = argparse.ArgumentParser(
         description="vllm-mlx OpenAI-compatible server for LLM and MLLM inference",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -4281,6 +4361,11 @@ Examples:
         "--mllm",
         action="store_true",
         help="Force loading as MLLM (multimodal language model)",
+    )
+    parser.add_argument(
+        "--trust-remote-code",
+        action="store_true",
+        help="Allow HuggingFace remote code execution during model/tokenizer loading",
     )
     parser.add_argument(
         "--continuous-batching",
@@ -4354,73 +4439,7 @@ Examples:
         default=None,
         help="Default top_p for generation when not specified in request",
     )
-
-    args = parser.parse_args()
-
-    # Set global configuration
-    global _api_key, _default_timeout, _rate_limiter, _metrics_enabled
-    global _default_temperature, _default_top_p
-    _api_key = args.api_key
-    _default_timeout = args.timeout
-    _metrics_enabled = args.enable_metrics
-    _metrics.configure(enabled=args.enable_metrics)
-    if args.default_temperature is not None:
-        _default_temperature = args.default_temperature
-    if args.default_top_p is not None:
-        _default_top_p = args.default_top_p
-
-    # Configure rate limiter
-    if args.rate_limit > 0:
-        _rate_limiter = RateLimiter(requests_per_minute=args.rate_limit, enabled=True)
-        logger.info(
-            f"Rate limiting enabled: {args.rate_limit} requests/minute per client"
-        )
-
-    # Security summary at startup
-    logger.info("=" * 60)
-    logger.info("SECURITY CONFIGURATION")
-    logger.info("=" * 60)
-    if _api_key:
-        logger.info("  Authentication: ENABLED (API key required)")
-    else:
-        logger.warning("  Authentication: DISABLED - Use --api-key to enable")
-    if args.rate_limit > 0:
-        logger.info(f"  Rate limiting: ENABLED ({args.rate_limit} req/min)")
-    else:
-        logger.warning("  Rate limiting: DISABLED - Use --rate-limit to enable")
-    logger.info(f"  Request timeout: {args.timeout}s")
-    if args.enable_metrics:
-        logger.info("  Metrics: ENABLED (/metrics, unauthenticated)")
-    else:
-        logger.info("  Metrics: DISABLED - Use --enable-metrics to expose /metrics")
-    logger.info("=" * 60)
-
-    # Set MCP config for lifespan
-    if args.mcp_config:
-        os.environ["VLLM_MLX_MCP_CONFIG"] = args.mcp_config
-
-    # Initialize reasoning parser if specified
-    if args.reasoning_parser:
-        global _reasoning_parser
-        from .reasoning import get_parser
-
-        parser_cls = get_parser(args.reasoning_parser)
-        _reasoning_parser = parser_cls()
-        logger.info(f"Reasoning parser enabled: {args.reasoning_parser}")
-
-    # Pre-load embedding model if specified
-    load_embedding_model(args.embedding_model, lock=True)
-
-    # Load model before starting server
-    load_model(
-        args.model,
-        use_batching=args.continuous_batching,
-        max_tokens=args.max_tokens,
-        force_mllm=args.mllm,
-    )
-
-    # Start server
-    uvicorn.run(app, host=args.host, port=args.port)
+    return parser
 
 
 if __name__ == "__main__":
