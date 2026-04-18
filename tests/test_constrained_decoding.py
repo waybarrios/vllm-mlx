@@ -301,5 +301,133 @@ class TestAnthropicAdapterResponseFormat:
         assert openai_req.response_format is None
 
 
+# ---------------------------------------------------------------------------
+# _simplify_schema — metadata stripping and anyOf flattening.
+# ---------------------------------------------------------------------------
+
+
+class TestSimplifySchema:
+    """Test ``_simplify_schema`` handles metadata and nested anyOf correctly."""
+
+    def test_strips_default_and_metadata(self):
+        from vllm_mlx.constrained.json_schema_processor import _simplify_schema
+
+        schema = {
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "default": "unknown",
+                    "title": "Name",
+                    "description": "The name",
+                    "examples": ["Alice"],
+                },
+            },
+        }
+        result = _simplify_schema(schema)
+        name_prop = result["properties"]["name"]
+        for kw in ("default", "title", "description", "examples"):
+            assert kw not in name_prop, f"{kw!r} should have been stripped"
+        assert name_prop["type"] == "string"
+
+    def test_flattens_nested_anyof(self):
+        from vllm_mlx.constrained.json_schema_processor import _simplify_schema
+
+        schema = {
+            "anyOf": [
+                {"anyOf": [{"type": "string"}, {"type": "integer"}]},
+                {"type": "null"},
+            ]
+        }
+        result = _simplify_schema(schema)
+        # Nested anyOf should be flattened to 3 branches.
+        assert "anyOf" in result
+        assert len(result["anyOf"]) == 3
+
+    def test_fact_batch_schema_simplifies_cleanly(self):
+        """Regression test: the ``fact_batch`` schema that caused enforcer
+        to get stuck in production (nested anyOf + default + $ref + not)."""
+        from vllm_mlx.constrained.json_schema_processor import _simplify_schema
+
+        fact_batch_schema = {
+            "type": "object",
+            "properties": {
+                "facts": {
+                    "anyOf": [
+                        {
+                            "anyOf": [
+                                {"not": {"$ref": "#/definitions/OpenAiAnyType"}},
+                                {
+                                    "type": "array",
+                                    "items": {
+                                        "type": "object",
+                                        "properties": {
+                                            "kind": {
+                                                "type": "string",
+                                                "enum": [
+                                                    "number",
+                                                    "price",
+                                                    "product_name",
+                                                ],
+                                            },
+                                            "value": {
+                                                "type": "string",
+                                                "minLength": 1,
+                                                "maxLength": 300,
+                                            },
+                                            "confidence": {
+                                                "type": "string",
+                                                "enum": [
+                                                    "high",
+                                                    "medium",
+                                                    "low",
+                                                ],
+                                            },
+                                        },
+                                        "required": ["kind", "value", "confidence"],
+                                        "additionalProperties": False,
+                                    },
+                                    "maxItems": 6,
+                                },
+                            ],
+                            "default": [],
+                        },
+                        {"type": "null"},
+                    ]
+                }
+            },
+            "required": ["facts"],
+            "additionalProperties": False,
+            "definitions": {
+                "OpenAiAnyType": {
+                    "type": ["string", "number", "integer", "boolean", "array", "null"],
+                    "items": {"$ref": "#/definitions/OpenAiAnyType"},
+                }
+            },
+            "$schema": "https://json-schema.org/draft/2019-09/schema#",
+        }
+
+        result = _simplify_schema(fact_batch_schema)
+
+        # $schema must be stripped.
+        assert "$schema" not in result
+        # definitions must be consumed.
+        assert "definitions" not in result
+
+        # The ``facts`` property must exist and contain a flat anyOf.
+        facts = result["properties"]["facts"]
+        assert "anyOf" in facts
+        # ``default`` must be stripped from all levels.
+        assert "default" not in facts
+        for branch in facts["anyOf"]:
+            assert "default" not in branch
+        # No nested anyOf wrappers should remain — each branch is either
+        # the array schema or ``{type: null}``.
+        for branch in facts["anyOf"]:
+            if "anyOf" in branch:
+                # Inner anyOf should have been flattened into the outer one.
+                pytest.fail(f"Nested anyOf still present in branch: {branch!r}")
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
