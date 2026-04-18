@@ -15,15 +15,17 @@ Features:
 
 import atexit
 import base64
+import ipaddress
 import logging
 import math
 import os
+import socket
 import tempfile
 import threading
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
 import numpy as np
 import requests
@@ -115,6 +117,12 @@ class FileSizeExceededError(Exception):
     pass
 
 
+class UnsafeRemoteURLError(ValueError):
+    """Raised when a remote media URL targets an unsafe destination."""
+
+    pass
+
+
 @dataclass
 class MultimodalInput:
     """Input for multimodal generation."""
@@ -182,6 +190,83 @@ def decode_base64_image(
     return base64.b64decode(base64_string)
 
 
+def _validate_url_safety(url: str) -> None:
+    """Reject remote URLs that target local or private network resources."""
+    parsed = urlparse(url)
+    if parsed.scheme not in {"http", "https"}:
+        raise UnsafeRemoteURLError(
+            f"Unsupported remote media URL scheme: {parsed.scheme or '<missing>'}"
+        )
+
+    hostname = parsed.hostname
+    if not hostname:
+        raise UnsafeRemoteURLError("Remote media URL must include a hostname")
+
+    if hostname == "localhost" or hostname.endswith(".localhost"):
+        raise UnsafeRemoteURLError(
+            f"Remote media URL targets a blocked host: {hostname}"
+        )
+
+    try:
+        resolved_ips = [ipaddress.ip_address(hostname)]
+    except ValueError:
+        try:
+            addrinfo = socket.getaddrinfo(
+                hostname,
+                parsed.port or (443 if parsed.scheme == "https" else 80),
+                type=socket.SOCK_STREAM,
+            )
+        except socket.gaierror as exc:
+            raise UnsafeRemoteURLError(
+                f"Failed to resolve remote media host {hostname}: {exc}"
+            ) from exc
+        resolved_ips = [ipaddress.ip_address(info[4][0]) for info in addrinfo]
+
+    blocked_ips = [str(ip) for ip in resolved_ips if not ip.is_global]
+    if blocked_ips:
+        raise UnsafeRemoteURLError(
+            f"Remote media URL resolves to blocked address(es): {', '.join(sorted(set(blocked_ips)))}"
+        )
+
+
+def _request_with_safe_redirects(
+    method: str,
+    url: str,
+    *,
+    timeout: int,
+    headers: dict[str, str],
+    stream: bool = False,
+    max_redirects: int = 5,
+):
+    """Issue a requests call while validating every redirect target."""
+    current_url = url
+    for _ in range(max_redirects + 1):
+        _validate_url_safety(current_url)
+        response = requests.request(
+            method,
+            current_url,
+            timeout=timeout,
+            headers=headers,
+            allow_redirects=False,
+            verify=True,
+            stream=stream,
+        )
+        if not response.is_redirect and not response.is_permanent_redirect:
+            return response
+
+        location = response.headers.get("location")
+        response.close()
+        if not location:
+            raise UnsafeRemoteURLError(
+                f"Remote media URL redirect missing Location header: {current_url}"
+            )
+        current_url = urljoin(current_url, location)
+
+    raise UnsafeRemoteURLError(
+        f"Remote media URL exceeded redirect limit ({max_redirects}): {url}"
+    )
+
+
 def download_image(url: str, timeout: int = 30, max_size: int = MAX_IMAGE_SIZE) -> str:
     """
     Download image from URL and return local path.
@@ -203,8 +288,8 @@ def download_image(url: str, timeout: int = 30, max_size: int = MAX_IMAGE_SIZE) 
 
     # First, make a HEAD request to check Content-Length
     try:
-        head_response = requests.head(
-            url, timeout=timeout, headers=headers, allow_redirects=True, verify=True
+        head_response = _request_with_safe_redirects(
+            "HEAD", url, timeout=timeout, headers=headers
         )
         content_length = head_response.headers.get("content-length")
         if content_length and int(content_length) > max_size:
@@ -216,8 +301,8 @@ def download_image(url: str, timeout: int = 30, max_size: int = MAX_IMAGE_SIZE) 
         # HEAD request failed, proceed with GET and check during download
         pass
 
-    response = requests.get(
-        url, timeout=timeout, headers=headers, stream=True, verify=True
+    response = _request_with_safe_redirects(
+        "GET", url, timeout=timeout, headers=headers, stream=True
     )
     response.raise_for_status()
 
@@ -241,7 +326,7 @@ def download_image(url: str, timeout: int = 30, max_size: int = MAX_IMAGE_SIZE) 
         ext = ".webp"
     else:
         # Try to get from URL
-        path = urlparse(url).path
+        path = urlparse(response.url).path
         ext = Path(path).suffix or ".jpg"
 
     # Save to temp file with size checking during download
@@ -293,8 +378,8 @@ def download_video(url: str, timeout: int = 120, max_size: int = MAX_VIDEO_SIZE)
 
     # First, make a HEAD request to check Content-Length
     try:
-        head_response = requests.head(
-            url, timeout=timeout, headers=headers, allow_redirects=True, verify=True
+        head_response = _request_with_safe_redirects(
+            "HEAD", url, timeout=timeout, headers=headers
         )
         content_length = head_response.headers.get("content-length")
         if content_length and int(content_length) > max_size:
@@ -306,8 +391,8 @@ def download_video(url: str, timeout: int = 120, max_size: int = MAX_VIDEO_SIZE)
         # HEAD request failed, proceed with GET and check during download
         pass
 
-    response = requests.get(
-        url, timeout=timeout, headers=headers, stream=True, verify=True
+    response = _request_with_safe_redirects(
+        "GET", url, timeout=timeout, headers=headers, stream=True
     )
     response.raise_for_status()
 
@@ -333,7 +418,7 @@ def download_video(url: str, timeout: int = 120, max_size: int = MAX_VIDEO_SIZE)
         ext = ".mkv"
     else:
         # Try to get from URL
-        path = urlparse(url).path
+        path = urlparse(response.url).path
         ext = Path(path).suffix or ".mp4"
 
     # Save to temp file (stream for larger files) with size checking
