@@ -35,6 +35,7 @@ vllm-mlx serve <model> [options]
 | `--no-memory-aware-cache` | Use legacy entry-count cache | False |
 | `--use-paged-cache` | Enable paged KV cache | False |
 | `--max-tokens` | Default max tokens | 32768 |
+| `--max-request-tokens` | Maximum `max_tokens` accepted from API clients | 32768 |
 | `--stream-interval` | Tokens per stream chunk | 1 |
 | `--mcp-config` | Path to MCP config file | None |
 | `--paged-cache-block-size` | Tokens per cache block | 64 |

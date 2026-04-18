@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from fastapi.testclient import TestClient
+from pydantic import ValidationError
 
 # Skip all tests if not on Apple Silicon
 pytestmark = pytest.mark.skipif(
@@ -155,6 +156,17 @@ class TestChatCompletionRequest:
         assert request.video_fps == 2.0
         assert request.video_max_frames == 16
 
+    def test_max_tokens_must_be_positive(self):
+        """Chat completion requests reject zero or negative max_tokens."""
+        from vllm_mlx.server import ChatCompletionRequest, Message
+
+        with pytest.raises(ValidationError):
+            ChatCompletionRequest(
+                model="test-model",
+                messages=[Message(role="user", content="Hello")],
+                max_tokens=0,
+            )
+
 
 class TestCompletionRequest:
     """Test CompletionRequest model."""
@@ -168,6 +180,30 @@ class TestCompletionRequest:
         assert request.model == "test-model"
         assert request.prompt == "Once upon a time"
         assert request.max_tokens is None  # uses _default_max_tokens when None
+
+    def test_max_tokens_must_be_positive(self):
+        """Completion requests reject zero or negative max_tokens."""
+        from vllm_mlx.server import CompletionRequest
+
+        with pytest.raises(ValidationError):
+            CompletionRequest(
+                model="test-model", prompt="Once upon a time", max_tokens=0
+            )
+
+
+class TestAnthropicRequest:
+    """Test Anthropic request model."""
+
+    def test_max_tokens_must_be_positive(self):
+        """Anthropic requests reject zero or negative max_tokens."""
+        from vllm_mlx.api.anthropic_models import AnthropicRequest
+
+        with pytest.raises(ValidationError):
+            AnthropicRequest(
+                model="test-model",
+                messages=[{"role": "user", "content": "Hello"}],
+                max_tokens=0,
+            )
 
 
 class TestMCPExecuteEndpoint:
@@ -298,6 +334,28 @@ class TestServeCli:
             ["--model", "mlx-community/Llama-3.2-3B-Instruct-4bit"]
         )
         assert server_args.host == "127.0.0.1"
+
+    def test_max_request_tokens_defaults_and_overrides(self):
+        """Serve CLI exposes a separate request max_tokens ceiling."""
+        from vllm_mlx.cli import create_parser
+
+        parser = create_parser()
+        args = parser.parse_args(["serve", "mlx-community/Llama-3.2-3B-Instruct-4bit"])
+        assert args.max_tokens == 32768
+        assert args.max_request_tokens == 32768
+
+        args = parser.parse_args(
+            [
+                "serve",
+                "mlx-community/Llama-3.2-3B-Instruct-4bit",
+                "--max-tokens",
+                "2048",
+                "--max-request-tokens",
+                "4096",
+            ]
+        )
+        assert args.max_tokens == 2048
+        assert args.max_request_tokens == 4096
 
     def test_tool_call_parser_accepts_harmony_aliases(self):
         """GPT-OSS/Harmony parsers should be selectable from the serve CLI."""
@@ -778,6 +836,116 @@ class TestRequestTimeoutField:
             model="test-model", prompt="Once upon a time", timeout=120.0
         )
         assert request_with_timeout.timeout == 120.0
+
+
+class TestMaxTokensLimit:
+    """Test server-side max_tokens ceiling enforcement."""
+
+    def test_resolve_request_max_tokens(self):
+        """Explicit requests must stay within the configured server ceiling."""
+        import vllm_mlx.server as server
+
+        original_default = server._default_max_tokens
+        original_limit = server._max_request_tokens
+        try:
+            server._default_max_tokens = 1024
+            server._max_request_tokens = 2048
+
+            assert server._resolve_request_max_tokens(None) == 1024
+            assert server._resolve_request_max_tokens(512) == 512
+
+            with pytest.raises(server.HTTPException) as exc_info:
+                server._resolve_request_max_tokens(4096)
+
+            assert exc_info.value.status_code == 400
+            assert "server limit" in exc_info.value.detail
+        finally:
+            server._default_max_tokens = original_default
+            server._max_request_tokens = original_limit
+
+    @pytest.mark.anyio
+    async def test_create_completion_rejects_over_limit_before_engine_lookup(
+        self, monkeypatch
+    ):
+        """Completions should reject oversized requests at the API boundary."""
+        from vllm_mlx.server import CompletionRequest, create_completion
+        import vllm_mlx.server as server
+
+        monkeypatch.setattr(server, "_max_request_tokens", 1024)
+        monkeypatch.setattr(
+            server,
+            "get_engine",
+            lambda: (_ for _ in ()).throw(AssertionError("engine should not load")),
+        )
+
+        request = CompletionRequest(
+            model="test-model",
+            prompt="Once upon a time",
+            max_tokens=2048,
+        )
+
+        with pytest.raises(server.HTTPException) as exc_info:
+            await create_completion(request, raw_request=None)
+
+        assert exc_info.value.status_code == 400
+
+    @pytest.mark.anyio
+    async def test_create_chat_completion_rejects_over_limit_before_engine_lookup(
+        self, monkeypatch
+    ):
+        """Chat completions should reject oversized requests at the API boundary."""
+        from vllm_mlx.server import (
+            ChatCompletionRequest,
+            Message,
+            create_chat_completion,
+        )
+        import vllm_mlx.server as server
+
+        monkeypatch.setattr(server, "_max_request_tokens", 1024)
+        monkeypatch.setattr(
+            server,
+            "get_engine",
+            lambda: (_ for _ in ()).throw(AssertionError("engine should not load")),
+        )
+
+        request = ChatCompletionRequest(
+            model="test-model",
+            messages=[Message(role="user", content="Hello")],
+            max_tokens=2048,
+        )
+
+        with pytest.raises(server.HTTPException) as exc_info:
+            await create_chat_completion(request, raw_request=None)
+
+        assert exc_info.value.status_code == 400
+
+    @pytest.mark.anyio
+    async def test_create_anthropic_message_rejects_over_limit_before_engine_lookup(
+        self, monkeypatch
+    ):
+        """Anthropic requests should reject oversized requests before engine use."""
+        from vllm_mlx.server import create_anthropic_message
+        import vllm_mlx.server as server
+
+        class FakeRequest:
+            async def json(self):
+                return {
+                    "model": "test-model",
+                    "messages": [{"role": "user", "content": "Hello"}],
+                    "max_tokens": 2048,
+                }
+
+        monkeypatch.setattr(server, "_max_request_tokens", 1024)
+        monkeypatch.setattr(
+            server,
+            "get_engine",
+            lambda: (_ for _ in ()).throw(AssertionError("engine should not load")),
+        )
+
+        with pytest.raises(server.HTTPException) as exc_info:
+            await create_anthropic_message(FakeRequest())
+
+        assert exc_info.value.status_code == 400
 
 
 class TestAPIKeyVerification:
@@ -1556,7 +1724,12 @@ class TestSseDoneTermination:
         request = CompletionRequest(model="test-model", prompt="Say hello")
         chunks = [
             chunk
-            async for chunk in stream_completion(FakeEngine(), "Say hello", request)
+            async for chunk in stream_completion(
+                FakeEngine(),
+                "Say hello",
+                request,
+                max_tokens=server._default_max_tokens,
+            )
         ]
 
         done_chunks = [c for c in chunks if c == "data: [DONE]\n\n"]
@@ -1591,7 +1764,12 @@ class TestSseDoneTermination:
         chunks = [
             chunk
             async for chunk in _ensure_sse_terminal(
-                stream_completion(ExplodingEngine(), "Say hello", request),
+                stream_completion(
+                    ExplodingEngine(),
+                    "Say hello",
+                    request,
+                    max_tokens=server._default_max_tokens,
+                ),
                 "data: [DONE]\n\n",
             )
         ]

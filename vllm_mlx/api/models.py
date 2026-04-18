@@ -163,7 +163,7 @@ class ChatCompletionRequest(BaseModel):
     min_p: float | None = None
     presence_penalty: float | None = None
     repetition_penalty: float | None = None
-    max_tokens: int | None = None
+    max_tokens: int | None = Field(default=None, gt=0)
     stream: bool = False
     stream_options: StreamOptions | None = (
         None  # Streaming options (include_usage, etc.)
@@ -250,7 +250,7 @@ class CompletionRequest(BaseModel):
     min_p: float | None = None
     presence_penalty: float | None = None
     repetition_penalty: float | None = None
-    max_tokens: int | None = None
+    max_tokens: int | None = Field(default=None, gt=0)
     stream: bool = False
     stop: list[str] | None = None
     # Sampling penalties
