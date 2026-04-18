@@ -647,6 +647,9 @@ class MemoryAwarePrefixCache:
         # Track the match type from the last fetch() call
         self._last_match_type: str | None = None
 
+        # Optional SSD cold tier (set via set_ssd_tier())
+        self._ssd_tier = None
+
         logger.info(
             f"MemoryAwarePrefixCache initialized: "
             f"max_memory={self._max_memory / _BYTES_PER_MB:.1f}MB, "
@@ -987,7 +990,11 @@ class MemoryAwarePrefixCache:
             self._sorted_keys.pop(idx)
 
     def _evict_lru(self) -> None:
-        """Evict the least recently used entry."""
+        """Evict the least recently used entry.
+
+        If an SSD tier is attached, the entry is spilled to disk instead
+        of being discarded.
+        """
         if not self._entries:
             return
 
@@ -999,9 +1006,14 @@ class MemoryAwarePrefixCache:
         self._stats.entry_count = len(self._entries)
         self._stats.current_memory_bytes = self._current_memory
 
+        # Spill to SSD tier if available
+        if self._ssd_tier is not None:
+            self._ssd_tier.enqueue_spill(tokens_key, entry.cache, entry.memory_bytes)
+
         logger.debug(
             f"[lru_evict] removed {len(tokens_key)} tokens, "
             f"freed {entry.memory_bytes / _BYTES_PER_MB:.2f}MB"
+            f"{'  (spilled to SSD)' if self._ssd_tier is not None else ''}"
         )
 
     def remove(self, tokens: list[int]) -> bool:
@@ -1061,6 +1073,53 @@ class MemoryAwarePrefixCache:
     def __contains__(self, tokens: list[int]) -> bool:
         """Check if tokens are cached."""
         return tuple(tokens) in self._entries
+
+    def set_ssd_tier(self, ssd_tier) -> None:
+        """Attach an SSD cache tier for eviction spilling.
+
+        When set, evicted entries are spilled to SSD instead of discarded.
+
+        Args:
+            ssd_tier: An SSDCacheTier instance (or None to disable).
+        """
+        self._ssd_tier = ssd_tier
+        if ssd_tier is not None:
+            logger.info("[memory_cache] SSD tier attached for eviction spilling")
+
+    def check_ssd(self, tokens: list[int]) -> dict | None:
+        """Check if tokens have an SSD cache hit (without reading data).
+
+        Returns metadata dict with 'match_type' ('exact' or 'prefix') if
+        found in SSD tier, None if not found. For prefix matches, the dict
+        also includes 'matched_tokens' (the count of tokens the SSD entry
+        covers).
+
+        This is a fast synchronous call (SQLite lookup only).
+        The actual data read happens via the scheduler handoff.
+        """
+        if self._ssd_tier is None:
+            return None
+
+        tokens_key = tuple(tokens)
+
+        # If already in RAM, no SSD needed
+        if tokens_key in self._entries:
+            return None
+
+        # Check SSD tier — exact match first, then prefix
+        candidate = self._ssd_tier.lookup_ssd(tokens_key)
+        if candidate is not None:
+            candidate["match_type"] = "exact"
+            candidate["matched_tokens"] = len(tokens)
+            return candidate
+
+        prefix = self._ssd_tier.lookup_ssd_prefix(tokens_key)
+        if prefix is not None:
+            prefix["match_type"] = "prefix"
+            prefix["matched_tokens"] = prefix["num_tokens"]
+            return prefix
+
+        return None
 
     # -----------------------------------------------------------------
     # Disk persistence — survives server restarts

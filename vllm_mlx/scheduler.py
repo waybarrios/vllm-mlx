@@ -24,6 +24,7 @@ from mlx_lm.tokenizer_utils import NaiveStreamingDetokenizer
 
 from .memory_cache import MemoryAwarePrefixCache, MemoryCacheConfig
 from .paged_cache import PagedCacheManager
+from .ssd_cache import SSDCacheConfig, SSDCacheTier
 from .prefix_cache import BlockAwarePrefixCache, PrefixCacheManager
 from .request import Request, RequestOutput, RequestStatus, SamplingParams
 from .utils.mamba_cache import ensure_mamba_support
@@ -97,6 +98,10 @@ class SchedulerConfig:
     # saved cache is reused for the next request with the same prefix.
     # 0 = disabled. Only effective when chunked_prefill_tokens > 0.
     mid_prefill_save_interval: int = 8192
+
+    # SSD cache tiering
+    ssd_cache_dir: Optional[str] = None  # None = disabled
+    ssd_cache_max_gb: float = 10.0
 
     # MTP (Multi-Token Prediction) settings
     # Uses the model's built-in MTP head to predict multiple tokens per step
@@ -1183,6 +1188,22 @@ class Scheduler:
                     f"Memory-aware cache enabled: "
                     f"limit={self.memory_aware_cache.memory_limit_mb:.1f}MB"
                 )
+
+                # Attach SSD tier if configured
+                self._ssd_tier: Optional[SSDCacheTier] = None
+                if self.config.ssd_cache_dir is not None:
+                    ssd_config = SSDCacheConfig(
+                        cache_dir=self.config.ssd_cache_dir,
+                        max_size_gb=self.config.ssd_cache_max_gb,
+                    )
+                    self._ssd_tier = SSDCacheTier(ssd_config)
+                    self._ssd_tier.start_writer()
+                    self._ssd_tier.reconcile()
+                    self.memory_aware_cache.set_ssd_tier(self._ssd_tier)
+                    logger.info(
+                        f"SSD cache tier enabled: dir={self.config.ssd_cache_dir}, "
+                        f"max={self.config.ssd_cache_max_gb}GB"
+                    )
             else:
                 # Use legacy entry-count based prefix cache
                 self.prefix_cache = PrefixCacheManager(
@@ -1790,6 +1811,14 @@ class Scheduler:
                     f"prompt_tokens={len(request.prompt_token_ids)} "
                     f"time={_fetch_dt:.3f}s entries={len(self.memory_aware_cache._entries)}"
                 )
+                # Check SSD tier for cold-tier hit
+                if hasattr(self, "_ssd_tier") and self._ssd_tier is not None:
+                    ssd_candidate = self.memory_aware_cache.check_ssd(
+                        request.prompt_token_ids
+                    )
+                    if ssd_candidate is not None:
+                        request.cache_hit_type = "ssd_pending"
+                        request._ssd_candidate = ssd_candidate
         elif self.prefix_cache is not None:
             # Use legacy prefix cache
             cache, remaining = self.prefix_cache.fetch_cache(request.prompt_token_ids)
@@ -1918,6 +1947,12 @@ class Scheduler:
         Returns:
             List of requests that were scheduled
         """
+        # Attempt synchronous SSD promotion for any ssd_pending requests
+        # before scheduling. This keeps SSD I/O out of fetch() while
+        # avoiding engine modifications.
+        if hasattr(self, "_ssd_tier") and self._ssd_tier is not None:
+            self._try_promote_ssd_pending()
+
         scheduled = []
 
         while self.waiting and len(self.running) < self.config.max_num_seqs:
@@ -2660,6 +2695,9 @@ class Scheduler:
         if self.prefix_cache is not None:
             self.prefix_cache.clear()
 
+        # Close SSD tier on reset
+        self.close_ssd_tier()
+
     def deep_reset(self) -> None:
         """
         Deep reset that clears ALL cache state including model-level caches.
@@ -2707,3 +2745,204 @@ class Scheduler:
             return self.memory_aware_cache.load_from_disk(cache_dir)
         logger.info("[cache_persist] no memory-aware cache to load into")
         return 0
+
+    def close_ssd_tier(self) -> None:
+        """Shut down the SSD cache tier if present."""
+        if hasattr(self, "_ssd_tier") and self._ssd_tier is not None:
+            self._ssd_tier.close()
+            self._ssd_tier = None
+            logger.info("SSD cache tier closed")
+
+    def _try_promote_ssd_pending(self) -> None:
+        """Attempt synchronous SSD promotion for waiting requests tagged ssd_pending.
+
+        Called from _schedule_waiting() before requests are moved to running.
+        Reads SSD entries synchronously (disk I/O stays out of fetch() per spec).
+        """
+        for request in self.waiting:
+            if getattr(request, "cache_hit_type", None) != "ssd_pending":
+                continue
+
+            candidate = getattr(request, "_ssd_candidate", None)
+            if candidate is None:
+                continue
+
+            memory_bytes = candidate["memory_bytes"]
+
+            # Check RAM budget availability
+            if self.memory_aware_cache is None:
+                request.cache_hit_type = "miss"
+                continue
+
+            if (
+                self.memory_aware_cache._current_memory + memory_bytes
+                > self.memory_aware_cache._max_memory
+            ):
+                self._ssd_tier._stats.promotion_failures += 1
+                request.cache_hit_type = "miss"
+                logger.info(
+                    f"[ssd_promote] request={request.request_id[:12]} "
+                    f"budget denied ({memory_bytes} bytes)"
+                )
+                continue
+
+            # Tentatively reserve budget
+            self.memory_aware_cache._current_memory += memory_bytes
+
+            # Use the SSD entry's actual token count for read and store,
+            # NOT the full prompt tokens. For prefix hits these differ.
+            matched_count = candidate["matched_tokens"]
+            matched_tokens = tuple(request.prompt_token_ids[:matched_count])
+
+            try:
+                cache_layers = self._ssd_tier._read_entry(
+                    matched_tokens, candidate["file_path"]
+                )
+            except Exception:
+                self.memory_aware_cache._current_memory -= memory_bytes
+                self._ssd_tier._stats.promotion_failures += 1
+                request.cache_hit_type = "miss"
+                logger.exception(
+                    f"[ssd_promote] request={request.request_id[:12]} "
+                    f"disk read failed"
+                )
+                continue
+
+            if cache_layers is None:
+                self.memory_aware_cache._current_memory -= memory_bytes
+                self._ssd_tier._stats.promotion_failures += 1
+                request.cache_hit_type = "miss"
+                continue
+
+            # Release tentative budget (store() will account properly)
+            self.memory_aware_cache._current_memory -= memory_bytes
+
+            # Reconstruct and store under the matched prefix tokens
+            reconstructed = self._reconstruct_ssd_layers(cache_layers)
+            if reconstructed is None:
+                request.cache_hit_type = "miss"
+                continue
+
+            self.memory_aware_cache.store(
+                list(matched_tokens), reconstructed, evict_prefixes=False
+            )
+
+            request.prompt_cache = reconstructed
+            request.cached_tokens = matched_count
+            request.remaining_tokens = request.prompt_token_ids[matched_count:]
+            request.cache_hit_type = "ssd_hit"
+
+            self._ssd_tier._stats.ssd_hits += 1
+            self._ssd_tier._index.touch(matched_tokens)
+
+            logger.info(
+                f"[ssd_promote] request={request.request_id[:12]} "
+                f"{candidate['match_type']} promote: {matched_count}/{len(request.prompt_token_ids)} tokens from SSD, "
+                f"{len(request.remaining_tokens)} remaining"
+            )
+
+    async def promote_from_ssd(self, request) -> bool:
+        """Promote a cold-tier cache entry for a request (async version).
+
+        Alternative to _try_promote_ssd_pending() for callers with an
+        async event loop. Uses asyncio.to_thread for non-blocking disk I/O.
+
+        Returns True if promotion succeeded and request was updated.
+        """
+        if not hasattr(self, "_ssd_tier") or self._ssd_tier is None:
+            return False
+
+        candidate = getattr(request, "_ssd_candidate", None)
+        if candidate is None:
+            return False
+
+        def reserve_budget(nbytes: int) -> bool:
+            """Tentatively reserve RAM budget for promotion."""
+            if self.memory_aware_cache is None:
+                return False
+            if (
+                self.memory_aware_cache._current_memory + nbytes
+                > self.memory_aware_cache._max_memory
+            ):
+                return False
+            self.memory_aware_cache._current_memory += nbytes
+            return True
+
+        def release_budget(nbytes: int) -> None:
+            """Release tentatively reserved budget on failure."""
+            if self.memory_aware_cache is not None:
+                self.memory_aware_cache._current_memory -= nbytes
+
+        # Use matched token count, not full prompt, for prefix hits
+        matched_count = candidate.get("matched_tokens", len(request.prompt_token_ids))
+        matched_tokens = tuple(request.prompt_token_ids[:matched_count])
+
+        cache_layers = await self._ssd_tier.async_promote(
+            matched_tokens, reserve_budget, release_budget
+        )
+
+        if cache_layers is None:
+            request.cache_hit_type = "miss"
+            return False
+
+        # Release tentative budget — store() will account properly
+        release_budget(candidate["memory_bytes"])
+
+        # Reconstruct cache objects from deserialized layer dicts
+        reconstructed = self._reconstruct_ssd_layers(cache_layers)
+        if reconstructed is None:
+            request.cache_hit_type = "miss"
+            return False
+
+        # Store in RAM cache under the matched prefix tokens
+        self.memory_aware_cache.store(
+            list(matched_tokens), reconstructed, evict_prefixes=False
+        )
+
+        request.prompt_cache = reconstructed
+        request.cached_tokens = matched_count
+        request.remaining_tokens = request.prompt_token_ids[matched_count:]
+        request.cache_hit_type = "ssd_hit"
+
+        logger.info(
+            f"[ssd_promote] request={request.request_id[:12]} "
+            f"{candidate.get('match_type', 'exact')} promote: "
+            f"{matched_count}/{len(request.prompt_token_ids)} tokens from SSD, "
+            f"{len(request.remaining_tokens)} remaining"
+        )
+        return True
+
+    def _reconstruct_ssd_layers(self, layer_dicts: list[dict]) -> list | None:
+        """Reconstruct cache objects from deserialized layer dicts.
+
+        Converts numpy arrays back to MLX arrays and creates KVCache objects.
+        """
+        try:
+            from mlx_lm.models.cache import KVCache
+
+            result = []
+            for ld in layer_dicts:
+                if "keys" in ld and "values" in ld:
+                    kv = KVCache()
+                    kv.keys = mx.array(ld["keys"])
+                    kv.values = mx.array(ld["values"])
+                    kv.offset = ld["offset"]
+                    for attr in ("max_size", "keep", "step", "_idx"):
+                        if attr in ld:
+                            setattr(kv, attr, ld[attr])
+                    result.append(kv)
+                elif "state" in ld:
+                    # ArraysCache — need to wrap in a compatible object
+                    state_arrays = [mx.array(a) for a in ld["state"]]
+                    # Create a simple namespace-like object
+                    layer_obj = type("ArraysCacheLayer", (), {"state": state_arrays})()
+                    result.append(layer_obj)
+                else:
+                    logger.warning(
+                        f"[ssd_promote] unknown layer dict format: {list(ld.keys())}"
+                    )
+                    return None
+            return result
+        except Exception as e:
+            logger.warning(f"[ssd_promote] reconstruction failed: {e}")
+            return None
