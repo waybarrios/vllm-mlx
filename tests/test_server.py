@@ -1721,6 +1721,196 @@ class TestStreamChatCompletion:
         assert payloads[2]["choices"][0]["finish_reason"] == "stop"
 
 
+class TestReasoningAndToolCallsNonStreaming:
+    """Non-streaming coexistence of reasoning extraction and tool parsing."""
+
+    @pytest.fixture()
+    def client(self):
+        """Create a FastAPI test client."""
+        from fastapi.testclient import TestClient
+
+        from vllm_mlx.server import app
+
+        return TestClient(app)
+
+    def test_chat_completion_preserves_reasoning_with_tool_calls(
+        self, client, monkeypatch
+    ):
+        """Reasoning should survive when tool calls are present in final output."""
+        import vllm_mlx.server as server
+        from vllm_mlx.engine.base import GenerationOutput
+        from vllm_mlx.server import ToolCall, FunctionCall
+
+        parsed_inputs = []
+
+        class FakeEngine:
+            model_name = "fake-engine"
+            is_mllm = False
+            preserve_native_tool_format = False
+
+            async def chat(self, messages, **kwargs):
+                return GenerationOutput(
+                    text="<think>Need tool</think><tool_call>",
+                    prompt_tokens=7,
+                    completion_tokens=3,
+                    finish_reason="stop",
+                )
+
+        class FakeReasoningParser:
+            def extract_reasoning(self, model_output):
+                assert model_output == "<think>Need tool</think><tool_call>"
+                return "Need tool", "<tool_call>"
+
+        def fake_parse_tool_calls(text, request):
+            parsed_inputs.append(text)
+            if text == "<tool_call>":
+                return None, [
+                    ToolCall(
+                        id="call_1",
+                        type="function",
+                        function=FunctionCall(
+                            name="get_weather",
+                            arguments='{"city":"Paris"}',
+                        ),
+                    )
+                ]
+            return text, None
+
+        monkeypatch.setattr(server, "_engine", FakeEngine())
+        monkeypatch.setattr(server, "_model_name", "test-model")
+        monkeypatch.setattr(server, "_default_timeout", 30.0)
+        monkeypatch.setattr(server, "_default_max_tokens", 128)
+        monkeypatch.setattr(server, "_api_key", None)
+        monkeypatch.setattr(
+            server,
+            "_rate_limiter",
+            server.RateLimiter(requests_per_minute=60, enabled=False),
+        )
+        monkeypatch.setattr(server, "_reasoning_parser", FakeReasoningParser())
+        monkeypatch.setattr(
+            server, "_parse_tool_calls_with_parser", fake_parse_tool_calls
+        )
+
+        response = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "Weather?"}],
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "get_weather",
+                            "description": "Get weather",
+                            "parameters": {
+                                "type": "object",
+                                "properties": {"city": {"type": "string"}},
+                                "required": ["city"],
+                            },
+                        },
+                    }
+                ],
+                "max_tokens": 32,
+            },
+        )
+
+        assert response.status_code == 200
+        body = response.json()
+        choice = body["choices"][0]
+        assert parsed_inputs == ["<tool_call>"]
+        assert choice["message"]["content"] is None
+        assert choice["message"]["reasoning_content"] == "Need tool"
+        assert choice["message"]["tool_calls"][0]["function"]["name"] == "get_weather"
+        assert choice["finish_reason"] == "tool_calls"
+
+    def test_anthropic_message_preserves_thinking_with_tool_use(
+        self, client, monkeypatch
+    ):
+        """Anthropic non-streaming should emit thinking and tool_use blocks."""
+        import vllm_mlx.server as server
+        from vllm_mlx.engine.base import GenerationOutput
+        from vllm_mlx.server import ToolCall, FunctionCall
+
+        parsed_inputs = []
+
+        class FakeEngine:
+            model_name = "fake-engine"
+            is_mllm = False
+            preserve_native_tool_format = False
+
+            async def chat(self, messages, **kwargs):
+                return GenerationOutput(
+                    text="<think>Need tool</think><tool_call>",
+                    prompt_tokens=11,
+                    completion_tokens=4,
+                    finish_reason="stop",
+                )
+
+        class FakeReasoningParser:
+            def extract_reasoning(self, model_output):
+                assert model_output == "<think>Need tool</think><tool_call>"
+                return "Need tool", "<tool_call>"
+
+        def fake_parse_tool_calls(text, request):
+            parsed_inputs.append(text)
+            if text == "<tool_call>":
+                return None, [
+                    ToolCall(
+                        id="call_1",
+                        type="function",
+                        function=FunctionCall(
+                            name="get_weather",
+                            arguments='{"city":"Paris"}',
+                        ),
+                    )
+                ]
+            return text, None
+
+        monkeypatch.setattr(server, "_engine", FakeEngine())
+        monkeypatch.setattr(server, "_model_name", "test-model")
+        monkeypatch.setattr(server, "_default_timeout", 30.0)
+        monkeypatch.setattr(server, "_default_max_tokens", 128)
+        monkeypatch.setattr(server, "_api_key", None)
+        monkeypatch.setattr(
+            server,
+            "_rate_limiter",
+            server.RateLimiter(requests_per_minute=60, enabled=False),
+        )
+        monkeypatch.setattr(server, "_reasoning_parser", FakeReasoningParser())
+        monkeypatch.setattr(
+            server, "_parse_tool_calls_with_parser", fake_parse_tool_calls
+        )
+
+        response = client.post(
+            "/v1/messages",
+            json={
+                "model": "test-model",
+                "max_tokens": 32,
+                "messages": [{"role": "user", "content": "Weather?"}],
+                "tools": [
+                    {
+                        "name": "get_weather",
+                        "description": "Get weather",
+                        "input_schema": {
+                            "type": "object",
+                            "properties": {"city": {"type": "string"}},
+                            "required": ["city"],
+                        },
+                    }
+                ],
+            },
+        )
+
+        assert response.status_code == 200
+        body = response.json()
+        assert parsed_inputs == ["<tool_call>"]
+        assert body["stop_reason"] == "tool_use"
+        assert [block["type"] for block in body["content"]] == ["thinking", "tool_use"]
+        assert body["content"][0]["thinking"] == "Need tool"
+        assert body["content"][1]["name"] == "get_weather"
+        assert body["content"][1]["input"] == {"city": "Paris"}
+
+
 # =============================================================================
 # Integration Tests (require running server)
 # =============================================================================
