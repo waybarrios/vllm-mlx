@@ -1018,15 +1018,29 @@ class SimpleEngine(BaseEngine):
                         and system_token_count == self._system_kv_token_count
                     ):
                         # Cache HIT — restore KV state into fresh backbone cache
-                        import mlx.core as mx
-                        from mlx_lm.models.cache import make_prompt_cache
+                        def make_cache_with_snapshot(
+                            text_model,
+                            system_kv_snapshot,
+                        ):
+                            import mlx.core as mx
+                            from mlx_lm.models.cache import make_prompt_cache
 
-                        backbone_cache = make_prompt_cache(self._text_model)
-                        for i, saved_state in enumerate(self._system_kv_snapshot):
-                            backbone_cache[i].state = saved_state
+                            backbone_cache = make_prompt_cache(text_model)
+                            for i, saved_state in enumerate(system_kv_snapshot):
+                                backbone_cache[i].state = saved_state
 
-                        prompt_to_send = mx.array(suffix_tokens)
+                            prompt_to_send = mx.array(suffix_tokens)
+                            return backbone_cache, prompt_to_send
+
+                        backbone_cache, prompt_to_send = (
+                            await self._run_blocking_serialized(
+                                make_cache_with_snapshot,
+                                self._text_model,
+                                self._system_kv_snapshot,
+                            )
+                        )
                         cache_hit = True
+
                         logger.info(
                             "System KV cache HIT: reusing %d cached tokens, "
                             "prefilling %d new tokens (hash=%s)",
