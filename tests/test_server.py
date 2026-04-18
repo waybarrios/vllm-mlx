@@ -4,6 +4,7 @@
 import json
 import platform
 import sys
+from unittest.mock import MagicMock, patch
 
 import pytest
 from fastapi.testclient import TestClient
@@ -172,6 +173,23 @@ class TestCompletionRequest:
 class TestServeCli:
     """Test serve CLI argument parsing."""
 
+    def test_trust_remote_code_flag_defaults_false(self):
+        """Serve CLI should require explicit opt-in for remote code loading."""
+        from vllm_mlx.cli import create_parser
+
+        parser = create_parser()
+        args = parser.parse_args(["serve", "mlx-community/Llama-3.2-3B-Instruct-4bit"])
+        assert args.trust_remote_code is False
+
+        args = parser.parse_args(
+            [
+                "serve",
+                "mlx-community/Llama-3.2-3B-Instruct-4bit",
+                "--trust-remote-code",
+            ]
+        )
+        assert args.trust_remote_code is True
+
     def test_tool_call_parser_accepts_harmony_aliases(self):
         """GPT-OSS/Harmony parsers should be selectable from the serve CLI."""
         from vllm_mlx.cli import create_parser
@@ -202,6 +220,72 @@ class TestServeCli:
         )
 
         assert args.tool_call_parser == "gpt-oss"
+
+
+class TestStandaloneServerCli:
+    """Test standalone server CLI argument parsing."""
+
+    def test_trust_remote_code_flag_defaults_false(self):
+        """Standalone server should require explicit opt-in for remote code loading."""
+        from vllm_mlx.server import create_parser
+
+        parser = create_parser()
+        args = parser.parse_args(
+            ["--model", "mlx-community/Llama-3.2-3B-Instruct-4bit"]
+        )
+        assert args.trust_remote_code is False
+
+        args = parser.parse_args(
+            [
+                "--model",
+                "mlx-community/Llama-3.2-3B-Instruct-4bit",
+                "--trust-remote-code",
+            ]
+        )
+        assert args.trust_remote_code is True
+
+
+class TestLoadModelTrustRemoteCode:
+    """Test load_model trust_remote_code wiring into engine constructors."""
+
+    def test_load_model_simple_defaults_trust_remote_code_false(self):
+        """SimpleEngine should receive trust_remote_code=False by default."""
+        from vllm_mlx import server
+
+        fake_engine = MagicMock()
+        fake_loop = MagicMock()
+
+        with (
+            patch.object(
+                server, "SimpleEngine", return_value=fake_engine
+            ) as mock_engine,
+            patch.object(server, "_detect_native_tool_support", return_value=False),
+            patch("vllm_mlx.server.asyncio.new_event_loop", return_value=fake_loop),
+            patch("vllm_mlx.server.asyncio.set_event_loop"),
+        ):
+            server.load_model("test-model", use_batching=False)
+
+        assert mock_engine.call_args.kwargs["trust_remote_code"] is False
+
+    def test_load_model_batched_forwards_explicit_trust_remote_code(self):
+        """BatchedEngine should receive explicit trust_remote_code opt-in."""
+        from vllm_mlx import server
+
+        fake_engine = MagicMock()
+
+        with (
+            patch.object(
+                server, "BatchedEngine", return_value=fake_engine
+            ) as mock_engine,
+            patch.object(server, "_detect_native_tool_support", return_value=False),
+        ):
+            server.load_model(
+                "test-model",
+                use_batching=True,
+                trust_remote_code=True,
+            )
+
+        assert mock_engine.call_args.kwargs["trust_remote_code"] is True
 
 
 # =============================================================================

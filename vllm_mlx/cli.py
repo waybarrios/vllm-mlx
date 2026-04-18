@@ -108,6 +108,10 @@ def serve_command(args):
         print("  Metrics: ENABLED (/metrics, unauthenticated)")
     else:
         print("  Metrics: DISABLED - Use --enable-metrics to expose /metrics")
+    if args.trust_remote_code:
+        print("  Remote code loading: ENABLED (--trust-remote-code)")
+    else:
+        print("  Remote code loading: DISABLED (default)")
     if args.enable_auto_tool_choice:
         print(f"  Tool calling: ENABLED (parser: {args.tool_call_parser})")
     else:
@@ -230,6 +234,7 @@ def serve_command(args):
         force_mllm=getattr(args, "mllm", False),
         gpu_memory_utilization=args.gpu_memory_utilization,
         served_model_name=args.served_model_name,
+        trust_remote_code=args.trust_remote_code,
         mtp=args.enable_mtp,
         prefill_step_size=args.prefill_step_size,
         specprefill_enabled=args.specprefill,
@@ -942,6 +947,11 @@ Examples:
         "--mllm",
         action="store_true",
         help="Force load model as multimodal (vision) even if name doesn't match auto-detection patterns",
+    )
+    serve_parser.add_argument(
+        "--trust-remote-code",
+        action="store_true",
+        help="Allow HuggingFace remote code execution during model/tokenizer loading",
     )
     # Generation defaults
     serve_parser.add_argument(
