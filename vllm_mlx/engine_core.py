@@ -125,6 +125,10 @@ class EngineCore:
             except asyncio.CancelledError:
                 pass
             self._task = None
+        # Safety net: close batch generator if _engine_loop didn't get a
+        # chance to clean up (e.g. it was never started).  The call is
+        # idempotent — _close_batch_generator checks for None.
+        self.scheduler._close_batch_generator()
         logger.info("Engine stopped")
 
     def is_running(self) -> bool:
@@ -162,94 +166,107 @@ class EngineCore:
             _memory_pressure_threshold = 200 * 1024 * 1024 * 1024
         _memory_check_interval = 64
 
-        while self._running:
-            try:
-                if self.scheduler.has_requests():
-                    # Hybrid approach: use executor only when prefill is likely.
-                    # Prefill happens when there are waiting requests that need
-                    # to be inserted into the batch (may block for seconds).
-                    # Generation-only steps are fast (<3ms) and can run inline.
-                    has_waiting = self.scheduler.get_num_waiting() > 0
-                    has_partial = (
-                        self.scheduler.batch_generator is not None
-                        and getattr(self.scheduler.batch_generator, "_partial", None)
-                        is not None
-                    )
-                    needs_executor = has_waiting or has_partial
-
-                    if needs_executor:
-                        output = await loop.run_in_executor(
-                            _executor, self.scheduler.step
+        try:
+            while self._running:
+                try:
+                    if self.scheduler.has_requests():
+                        # Hybrid approach: use executor only when prefill is likely.
+                        # Prefill happens when there are waiting requests that need
+                        # to be inserted into the batch (may block for seconds).
+                        # Generation-only steps are fast (<3ms) and can run inline.
+                        has_waiting = self.scheduler.get_num_waiting() > 0
+                        has_partial = (
+                            self.scheduler.batch_generator is not None
+                            and getattr(
+                                self.scheduler.batch_generator, "_partial", None
+                            )
+                            is not None
                         )
-                    else:
-                        output = self.scheduler.step()
-                        # Yield to event loop after inline step
-                        await asyncio.sleep(0)
-                    self._steps_executed += 1
+                        needs_executor = has_waiting or has_partial
 
-                    # Emergency memory pressure check
-                    if self._steps_executed % _memory_check_interval == 0:
-                        try:
-                            active_mem = mx.get_active_memory()
-                            if active_mem > _memory_pressure_threshold:
-                                mx.clear_cache()
-                                logger.warning(
-                                    f"[Memory pressure] {active_mem / 1e9:.1f}GB > "
-                                    f"{_memory_pressure_threshold / 1e9:.0f}GB threshold, "
-                                    f"forced cache clear"
-                                )
-                        except Exception:
-                            pass
+                        if needs_executor:
+                            output = await loop.run_in_executor(
+                                _executor, self.scheduler.step
+                            )
+                        else:
+                            output = self.scheduler.step()
+                            # Yield to event loop after inline step
+                            await asyncio.sleep(0)
+                        self._steps_executed += 1
 
-                    # Fast path: distribute outputs to collectors
-                    outputs = output.outputs
-                    if outputs:
-                        collectors = self._output_collectors
-                        states = self._stream_states
-                        events = self._finished_events
+                        # Emergency memory pressure check
+                        if self._steps_executed % _memory_check_interval == 0:
+                            try:
+                                active_mem = mx.get_active_memory()
+                                if active_mem > _memory_pressure_threshold:
+                                    mx.clear_cache()
+                                    logger.warning(
+                                        f"[Memory pressure] {active_mem / 1e9:.1f}GB > "
+                                        f"{_memory_pressure_threshold / 1e9:.0f}GB threshold, "
+                                        f"forced cache clear"
+                                    )
+                            except Exception:
+                                pass
 
-                        for req_output in outputs:
-                            rid = req_output.request_id
-                            collector = collectors.get(rid)
+                        # Fast path: distribute outputs to collectors
+                        outputs = output.outputs
+                        if outputs:
+                            collectors = self._output_collectors
+                            states = self._stream_states
+                            events = self._finished_events
 
-                            if collector is not None:
-                                # Optimized: skip stream_interval check when interval=1
-                                if use_simple_streaming:
-                                    collector.put(req_output)
-                                else:
-                                    state = states.get(rid)
-                                    if state and state.should_send(
-                                        req_output.completion_tokens,
-                                        req_output.finished,
-                                    ):
+                            for req_output in outputs:
+                                rid = req_output.request_id
+                                collector = collectors.get(rid)
+
+                                if collector is not None:
+                                    # Optimized: skip stream_interval check when interval=1
+                                    if use_simple_streaming:
                                         collector.put(req_output)
-                                        state.mark_sent(req_output.completion_tokens)
+                                    else:
+                                        state = states.get(rid)
+                                        if state and state.should_send(
+                                            req_output.completion_tokens,
+                                            req_output.finished,
+                                        ):
+                                            collector.put(req_output)
+                                            state.mark_sent(
+                                                req_output.completion_tokens
+                                            )
 
-                            if req_output.finished:
-                                event = events.get(rid)
-                                if event:
-                                    event.set()
+                                if req_output.finished:
+                                    event = events.get(rid)
+                                    if event:
+                                        event.set()
 
-                        # Free Metal buffers after distributing finished outputs
-                        if output.finished_request_ids:
-                            mx.clear_cache()
+                            # Free Metal buffers after distributing finished outputs
+                            if output.finished_request_ids:
+                                mx.clear_cache()
 
-                        # Always yield to prevent event loop starvation.
-                        # Without this, orphaned requests (client disconnected but
-                        # request still in scheduler) block the entire event loop,
-                        # making the server unresponsive to all HTTP requests.
-                        await asyncio.sleep(0)
-                else:
-                    # No work, yield control
-                    await asyncio.sleep(step_interval)
+                            # Always yield to prevent event loop starvation.
+                            # Without this, orphaned requests (client disconnected but
+                            # request still in scheduler) block the entire event loop,
+                            # making the server unresponsive to all HTTP requests.
+                            await asyncio.sleep(0)
+                    else:
+                        # No work, yield control
+                        await asyncio.sleep(step_interval)
 
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                import traceback
+                except asyncio.CancelledError:
+                    break
+                except Exception as e:
+                    import traceback
 
-                logger.error(f"Engine loop error: {e}\n{traceback.format_exc()}")
-                await asyncio.sleep(0.1)
+                    logger.error(f"Engine loop error: {e}\n{traceback.format_exc()}")
+                    await asyncio.sleep(0.1)
+        finally:
+            # Shut down the executor and wait for any in-flight step() to finish
+            # before closing the batch generator.  This prevents the GC from
+            # collecting a stale BatchGenerator on the worker thread, whose
+            # __del__ → close() → mx.synchronize(generation_stream) would
+            # conflict with concurrent Metal operations and SIGABRT.
+            _executor.shutdown(wait=True)
+            self.scheduler._close_batch_generator()
 
     async def add_request(
         self,
