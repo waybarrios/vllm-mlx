@@ -4204,13 +4204,19 @@ async def init_mcp(config_path: str):
     global _mcp_manager, _mcp_executor
 
     try:
-        from vllm_mlx.mcp import MCPClientManager, ToolExecutor, load_mcp_config
+        from vllm_mlx.mcp import (
+            MCPClientManager,
+            ToolExecutor,
+            ToolSandbox,
+            load_mcp_config,
+        )
 
         config = load_mcp_config(config_path)
         _mcp_manager = MCPClientManager(config)
         await _mcp_manager.start()
 
-        _mcp_executor = ToolExecutor(_mcp_manager)
+        sandbox = ToolSandbox(allowed_high_risk_tools=config.allowed_high_risk_tools)
+        _mcp_executor = ToolExecutor(_mcp_manager, sandbox=sandbox)
 
         logger.info(f"MCP initialized with {len(_mcp_manager.get_all_tools())} tools")
 
