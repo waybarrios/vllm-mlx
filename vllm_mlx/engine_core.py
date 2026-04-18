@@ -564,6 +564,11 @@ class EngineCore:
         """Load prefix cache from disk."""
         return self.scheduler.load_cache_from_disk(cache_dir)
 
+    def clear_prefix_cache(self) -> None:
+        """Clear the prefix cache (delegates to scheduler)."""
+        if hasattr(self.scheduler, "clear_prefix_cache"):
+            self.scheduler.clear_prefix_cache()
+
     def _release_model(self) -> None:
         """Release model ownership."""
         if self._owns_model and not self._closed:

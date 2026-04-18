@@ -41,45 +41,52 @@ class TestPromptLoading:
         prompts = load_prompt_set("short")
         assert isinstance(prompts, list)
         assert len(prompts) == 5
-        for p in prompts:
-            assert "role" in p
-            assert p["role"] == "user"
-            assert "content" in p
-            assert len(p["content"]) > 0
+        for msgs in prompts:
+            assert isinstance(msgs, list) and msgs
+            first = msgs[0]
+            assert first["role"] == "user"
+            assert "content" in first and len(first["content"]) > 0
 
     def test_load_medium(self):
         prompts = load_prompt_set("medium")
         assert isinstance(prompts, list)
         assert len(prompts) == 5
-        for p in prompts:
-            assert "role" in p
-            assert "content" in p
+        for msgs in prompts:
+            assert isinstance(msgs, list) and msgs
+            assert "role" in msgs[0]
+            assert "content" in msgs[0]
 
     def test_load_long(self):
         prompts = load_prompt_set("long")
         assert isinstance(prompts, list)
         assert len(prompts) == 3
-        for p in prompts:
-            assert "role" in p
-            assert "content" in p
-            # Long prompts should actually be long
-            assert len(p["content"]) > 1000
+        for msgs in prompts:
+            assert isinstance(msgs, list) and msgs
+            assert "role" in msgs[0]
+            assert "content" in msgs[0]
+            # Long prompts should actually be long (sum across all messages)
+            assert sum(len(m["content"]) for m in msgs) > 1000
 
     def test_load_thinking(self):
         prompts = load_prompt_set("thinking")
         assert isinstance(prompts, list)
         assert len(prompts) == 3
-        for p in prompts:
-            assert "role" in p
-            assert "content" in p
+        for msgs in prompts:
+            assert isinstance(msgs, list) and msgs
+            assert "role" in msgs[0]
+            assert "content" in msgs[0]
 
-    def test_all_builtins_are_lists_of_dicts(self):
+    def test_all_builtins_return_lists_of_message_lists(self):
         for name in ("short", "medium", "long", "thinking"):
             prompts = load_prompt_set(name)
             assert isinstance(prompts, list), f"{name}: expected list"
             assert len(prompts) > 0, f"{name}: expected non-empty list"
-            for item in prompts:
-                assert isinstance(item, dict), f"{name}: items must be dicts"
+            for msgs in prompts:
+                assert (
+                    isinstance(msgs, list) and msgs
+                ), f"{name}: items must be non-empty lists"
+                for m in msgs:
+                    assert isinstance(m, dict), f"{name}: messages must be dicts"
 
     def test_unknown_name_raises_file_not_found(self):
         with pytest.raises(FileNotFoundError):
@@ -89,7 +96,8 @@ class TestPromptLoading:
         with pytest.raises(FileNotFoundError):
             load_prompt_set("/tmp/does_not_exist_bench_serve_test.json")
 
-    def test_custom_file_via_tmp_path(self, tmp_path: Path):
+    def test_custom_file_flat_format(self, tmp_path: Path):
+        """Legacy flat format — list of dicts — still works, normalised to list-of-lists."""
         custom = [
             {"role": "user", "content": "Hello, world!"},
             {"role": "user", "content": "What is 2+2?"},
@@ -98,24 +106,61 @@ class TestPromptLoading:
         custom_file.write_text(json.dumps(custom))
 
         loaded = load_prompt_set(str(custom_file))
+        assert loaded == [[m] for m in custom]
+
+    def test_custom_file_multi_message_format(self, tmp_path: Path):
+        """New format — list of message lists — used for system+user scenarios."""
+        custom = [
+            [
+                {"role": "system", "content": "You are a code assistant."},
+                {"role": "user", "content": "Hi"},
+            ],
+            [
+                {"role": "system", "content": "You are a code assistant."},
+                {"role": "user", "content": "What is 2+2?"},
+            ],
+        ]
+        custom_file = tmp_path / "multi.json"
+        custom_file.write_text(json.dumps(custom))
+
+        loaded = load_prompt_set(str(custom_file))
         assert loaded == custom
 
-    def test_custom_file_returns_exact_data(self, tmp_path: Path):
+    def test_custom_file_preserves_extra_fields(self, tmp_path: Path):
         payload = [{"role": "user", "content": "test", "extra": 42}]
         p = tmp_path / "test.json"
         p.write_text(json.dumps(payload))
 
         result = load_prompt_set(str(p))
-        assert result == payload
+        # Flat format → normalised to [[msg]]
+        assert result == [[payload[0]]]
+
+    def test_invalid_top_level_raises(self, tmp_path: Path):
+        p = tmp_path / "bad.json"
+        p.write_text('{"not": "a list"}')
+        with pytest.raises(ValueError, match="non-empty JSON list"):
+            load_prompt_set(str(p))
+
+    def test_empty_list_raises(self, tmp_path: Path):
+        p = tmp_path / "empty.json"
+        p.write_text("[]")
+        with pytest.raises(ValueError, match="non-empty JSON list"):
+            load_prompt_set(str(p))
+
+    def test_invalid_entry_type_raises(self, tmp_path: Path):
+        p = tmp_path / "weird.json"
+        p.write_text('["not a dict or list"]')
+        with pytest.raises(ValueError, match="must be dict or list"):
+            load_prompt_set(str(p))
 
     def test_short_prompts_are_user_role(self):
         prompts = load_prompt_set("short")
-        roles = {p["role"] for p in prompts}
+        roles = {msgs[0]["role"] for msgs in prompts}
         assert roles == {"user"}
 
     def test_thinking_prompts_contain_reasoning_keywords(self):
         prompts = load_prompt_set("thinking")
-        combined = " ".join(p["content"] for p in prompts).lower()
+        combined = " ".join(m["content"] for msgs in prompts for m in msgs).lower()
         # At least one reasoning-heavy keyword should appear
         keywords = ["step", "deduc", "logic", "proof", "weighing", "clue"]
         assert any(kw in combined for kw in keywords)

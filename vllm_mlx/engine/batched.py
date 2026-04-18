@@ -994,3 +994,14 @@ class BatchedEngine(BaseEngine):
         if self._engine:
             return self._engine.load_cache_from_disk(cache_dir)
         return 0
+
+    def clear_prefix_cache(self) -> None:
+        """Clear the in-memory prefix cache. Used by bench-serve for clean
+        cold-start measurements between configurations."""
+        if self._mllm_scheduler and self._mllm_scheduler.batch_generator:
+            pc = self._mllm_scheduler.batch_generator.prefix_cache
+            if pc is not None and hasattr(pc, "clear"):
+                pc.clear()
+                return
+        if self._engine and hasattr(self._engine, "clear_prefix_cache"):
+            self._engine.clear_prefix_cache()

@@ -2746,6 +2746,18 @@ class Scheduler:
         logger.info("[cache_persist] no memory-aware cache to load into")
         return 0
 
+    def clear_prefix_cache(self) -> None:
+        """Clear the in-memory prefix cache (keeps disk cache untouched)."""
+        if self.memory_aware_cache is not None and hasattr(
+            self.memory_aware_cache, "clear"
+        ):
+            self.memory_aware_cache.clear()
+            logger.info("[clear_prefix_cache] memory-aware cache cleared")
+            return
+        if self.prefix_cache is not None and hasattr(self.prefix_cache, "clear"):
+            self.prefix_cache.clear()
+            logger.info("[clear_prefix_cache] prefix cache cleared")
+
     def close_ssd_tier(self) -> None:
         """Shut down the SSD cache tier if present."""
         if hasattr(self, "_ssd_tier") and self._ssd_tier is not None:
