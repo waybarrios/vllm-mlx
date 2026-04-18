@@ -1989,15 +1989,27 @@ async def list_mcp_servers() -> MCPServersResponse:
 @app.post("/v1/mcp/execute", dependencies=[Depends(verify_api_key)])
 async def execute_mcp_tool(request: MCPExecuteRequest) -> MCPExecuteResponse:
     """Execute an MCP tool."""
+    global _mcp_executor
+
     if _mcp_manager is None:
         raise HTTPException(
             status_code=503, detail="MCP not configured. Start server with --mcp-config"
         )
 
-    result = await _mcp_manager.execute_tool(
-        request.tool_name,
-        request.arguments,
-    )
+    if _mcp_executor is None:
+        from vllm_mlx.mcp import ToolExecutor
+
+        _mcp_executor = ToolExecutor(_mcp_manager)
+
+    tool_call = {
+        "id": f"mcp-{uuid.uuid4().hex[:8]}",
+        "type": "function",
+        "function": {
+            "name": request.tool_name,
+            "arguments": request.arguments,
+        },
+    }
+    result, _ = (await _mcp_executor.execute_tool_calls([tool_call], parallel=False))[0]
 
     return MCPExecuteResponse(
         tool_name=result.tool_name,
