@@ -139,6 +139,11 @@ from .api.utils import (
     is_mllm_model,  # noqa: F401
 )
 from .engine import BaseEngine, BatchedEngine, GenerationOutput, SimpleEngine
+from .endpoint_model_policies import (
+    resolve_embedding_model_name,
+    resolve_stt_model_name,
+    resolve_tts_model_name,
+)
 from .metrics import metrics as _metrics
 from .tool_parsers import ToolParserManager
 
@@ -1854,33 +1859,27 @@ async def create_embeddings(request: EmbeddingRequest) -> EmbeddingResponse:
     }
     ```
 
-    Supported models:
+    Supported request-time models:
     - mlx-community/all-MiniLM-L6-v2-4bit (fast, compact)
     - mlx-community/embeddinggemma-300m-6bit (high quality)
     - mlx-community/bge-large-en-v1.5-4bit (best for English)
-    - Any BERT/XLM-RoBERTa/ModernBERT model from HuggingFace
+    - mlx-community/multilingual-e5-small-mlx
+    - mlx-community/multilingual-e5-large-mlx
+    - mlx-community/bert-base-uncased-mlx
+    - mlx-community/ModernBERT-base-mlx
+
+    Other embedding models must be pinned explicitly with --embedding-model at
+    server startup.
     """
     global _embedding_engine
     tracker = _metrics.track_inference("embeddings", stream=False)
 
     try:
-        # Resolve model name
-        model_name = request.model
-
-        # If an embedding model was pre-configured at startup, only allow that model
-        if (
-            _embedding_model_locked is not None
-            and model_name != _embedding_model_locked
-        ):
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    f"Embedding model '{model_name}' is not available. "
-                    f"This server was started with --embedding-model {_embedding_model_locked}. "
-                    f"Only '{_embedding_model_locked}' can be used for embeddings. "
-                    f"Restart the server with a different --embedding-model to use '{model_name}'."
-                ),
-            )
+        # Resolve model name before any lazy-load path is reached.
+        model_name = resolve_embedding_model_name(
+            request.model,
+            locked_model=_embedding_model_locked,
+        )
 
         # Lazy-load or swap embedding engine
         load_embedding_model(model_name, lock=False, reuse_existing=True)
@@ -2039,16 +2038,7 @@ async def create_transcription(
     try:
         from .audio.stt import STTEngine  # Lazy import - optional feature
 
-        # Map model aliases to full names
-        model_map = {
-            "whisper-large-v3": "mlx-community/whisper-large-v3-mlx",
-            "whisper-large-v3-turbo": "mlx-community/whisper-large-v3-turbo",
-            "whisper-medium": "mlx-community/whisper-medium-mlx",
-            "whisper-small": "mlx-community/whisper-small-mlx",
-            "parakeet": "mlx-community/parakeet-tdt-0.6b-v2",
-            "parakeet-v3": "mlx-community/parakeet-tdt-0.6b-v3",
-        }
-        model_name = model_map.get(model, model)
+        model_name = resolve_stt_model_name(model)
 
         # Load engine if needed
         if _stt_engine is None or _stt_engine.model_name != model_name:
@@ -2115,16 +2105,7 @@ async def create_speech(
     try:
         from .audio.tts import TTSEngine  # Lazy import - optional feature
 
-        # Map model aliases to full names
-        model_map = {
-            "kokoro": "mlx-community/Kokoro-82M-bf16",
-            "kokoro-4bit": "mlx-community/Kokoro-82M-4bit",
-            "chatterbox": "mlx-community/chatterbox-turbo-fp16",
-            "chatterbox-4bit": "mlx-community/chatterbox-turbo-4bit",
-            "vibevoice": "mlx-community/VibeVoice-Realtime-0.5B-4bit",
-            "voxcpm": "mlx-community/VoxCPM1.5",
-        }
-        model_name = model_map.get(model, model)
+        model_name = resolve_tts_model_name(model)
 
         # Load engine if needed
         if _tts_engine is None or _tts_engine.model_name != model_name:
