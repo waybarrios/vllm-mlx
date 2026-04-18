@@ -62,9 +62,13 @@ def _simplify_schema(schema: dict) -> dict:
     1. Resolves ``$ref`` by inlining referenced definitions (with cycle
        detection so recursive definitions are truncated to ``{}``).
     2. Removes ``not`` sub-schemas (makes the schema more permissive).
-    3. Converts ``type: [t1, t2, ...]`` to ``anyOf: [{type: t1}, ...]``.
-    4. Strips ``$schema`` and ``$id`` metadata keys.
+    3. Strips metadata / serialisation-hint keywords that the enforcer does
+       not understand: ``default``, ``examples``, ``title``, ``description``,
+       ``$schema``, ``$id``.
+    4. Converts ``type: [t1, t2, ...]`` to ``anyOf: [{type: t1}, ...]``.
     5. Cleans up empty ``anyOf`` / ``oneOf`` branches.
+    6. Flattens nested ``anyOf``/``oneOf`` (e.g.
+       ``anyOf: [{anyOf: [A, B]}, C]`` → ``anyOf: [A, B, C]``).
     """
     schema = copy.deepcopy(schema)
     definitions: dict = {}
@@ -104,6 +108,12 @@ def _simplify_schema(schema: dict) -> dict:
         node.pop("not", None)
         node.pop("$schema", None)
         node.pop("$id", None)
+        # Metadata / serialisation hints that lm-format-enforcer doesn't
+        # understand — keeping them causes the parser to mis-navigate.
+        node.pop("default", None)
+        node.pop("examples", None)
+        node.pop("title", None)
+        node.pop("description", None)
 
         # --- type array → anyOf --------------------------------------------
         if isinstance(node.get("type"), list):
@@ -136,6 +146,20 @@ def _simplify_schema(schema: dict) -> dict:
                 node[key] = [it for it in resolved_items if it != {}]
                 if not node[key]:
                     del node[key]
+
+        # --- flatten nested anyOf/oneOf ------------------------------------
+        # ``anyOf: [{anyOf: [A, B]}, C]`` → ``anyOf: [A, B, C]`` when the
+        # wrapper dict has no extra keys.  This removes one level of nesting
+        # that confuses lm-format-enforcer's UnionParser.
+        for key in ("anyOf", "oneOf"):
+            if key in node and isinstance(node[key], list):
+                flattened: list[Any] = []
+                for item in node[key]:
+                    if isinstance(item, dict) and key in item and len(item) == 1:
+                        flattened.extend(item[key])
+                    else:
+                        flattened.append(item)
+                node[key] = flattened
 
         return node
 
