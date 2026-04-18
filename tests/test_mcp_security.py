@@ -142,6 +142,52 @@ class TestArgumentValidation:
 
         assert "dangerous pattern" in str(exc_info.value)
 
+    def test_python_inline_code_flag_blocked(self):
+        """Test that python -c is rejected even though python is whitelisted."""
+        validator = MCPCommandValidator(check_path_exists=False)
+
+        with pytest.raises(MCPSecurityError) as exc_info:
+            validator.validate_command_args("python3", ["-c", "print('owned')"], "test")
+
+        assert "inline Python execution" in str(exc_info.value)
+
+    def test_node_eval_flag_blocked(self):
+        """Test that node --eval is rejected."""
+        validator = MCPCommandValidator(check_path_exists=False)
+
+        with pytest.raises(MCPSecurityError) as exc_info:
+            validator.validate_command_args(
+                "node",
+                ["--eval=console.log('owned')"],
+                "test",
+            )
+
+        assert "inline JavaScript evaluation" in str(exc_info.value)
+
+    def test_npx_call_flag_blocked(self):
+        """Test that npx -c shell execution is rejected."""
+        validator = MCPCommandValidator(check_path_exists=False)
+
+        with pytest.raises(MCPSecurityError) as exc_info:
+            validator.validate_command_args("npx", ["-c", "echo owned"], "test")
+
+        assert "shell command execution" in str(exc_info.value)
+
+    def test_interpreter_normal_launch_args_still_pass(self):
+        """Test that standard MCP launches are unaffected."""
+        validator = MCPCommandValidator(check_path_exists=False)
+
+        validator.validate_command_args(
+            "npx",
+            ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"],
+            "filesystem",
+        )
+        validator.validate_command_args(
+            "uvx",
+            ["mcp-server-sqlite", "--db-path", "data.db"],
+            "sqlite",
+        )
+
 
 class TestEnvironmentValidation:
     """Tests for environment variable validation."""
@@ -321,6 +367,30 @@ class TestMCPServerConfigSecurity:
             )
 
         assert "not in the allowed commands whitelist" in str(exc_info.value)
+
+    def test_inline_python_execution_in_config_rejected(self):
+        """Test that interpreter eval forms are rejected in config."""
+        with pytest.raises(ValueError) as exc_info:
+            MCPServerConfig(
+                name="inline-python",
+                transport=MCPTransport.STDIO,
+                command="python3",
+                args=["-c", "print('owned')"],
+            )
+
+        assert "inline Python execution" in str(exc_info.value)
+
+    def test_node_eval_in_config_rejected(self):
+        """Test that node eval forms are rejected in config."""
+        with pytest.raises(ValueError) as exc_info:
+            MCPServerConfig(
+                name="inline-node",
+                transport=MCPTransport.STDIO,
+                command="node",
+                args=["--eval=console.log('owned')"],
+            )
+
+        assert "inline JavaScript evaluation" in str(exc_info.value)
 
     def test_command_injection_in_config_rejected(self):
         """Test that command injection in config is rejected."""

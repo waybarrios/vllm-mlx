@@ -77,6 +77,28 @@ DANGEROUS_ARG_PATTERNS: List[re.Pattern] = [
     re.compile(r"<\s*/"),  # Read from absolute path
 ]
 
+# Explicit inline-code execution forms for interpreter-like commands. These
+# combinations turn an otherwise whitelisted runtime into a raw code-execution
+# primitive and are not needed for normal MCP server launches.
+BLOCKED_COMMAND_ARG_RULES: Dict[str, Dict[str, str]] = {
+    "python": {
+        "-c": "inline Python execution",
+    },
+    "python3": {
+        "-c": "inline Python execution",
+    },
+    "node": {
+        "-e": "inline JavaScript evaluation",
+        "--eval": "inline JavaScript evaluation",
+        "-p": "JavaScript evaluation/print",
+        "--print": "JavaScript evaluation/print",
+    },
+    "npx": {
+        "-c": "shell command execution",
+        "--call": "shell command execution",
+    },
+}
+
 
 class MCPSecurityError(Exception):
     """Raised when MCP security validation fails."""
@@ -208,6 +230,50 @@ class MCPCommandValidator:
 
         logger.debug(
             f"MCP server '{server_name}': {len(args)} arguments validated successfully"
+        )
+
+    def validate_command_args(
+        self,
+        command: str,
+        args: List[str],
+        server_name: str,
+    ) -> None:
+        """
+        Validate command-specific argument combinations.
+
+        Some whitelisted runtimes (python, node, npx) remain acceptable for
+        launching packaged MCP servers, but inline evaluator flags such as
+        ``python -c`` and ``node -e`` must be rejected.
+        """
+        if self.allow_unsafe or not args:
+            return
+
+        base_command = Path(command).name
+        blocked_rules = BLOCKED_COMMAND_ARG_RULES.get(base_command)
+        if not blocked_rules:
+            return
+
+        for i, arg in enumerate(args):
+            if arg in blocked_rules:
+                raise MCPSecurityError(
+                    f"MCP server '{server_name}': Argument {i} '{arg}' enables "
+                    f"{blocked_rules[arg]} for '{base_command}', which is not allowed."
+                )
+
+            if base_command == "node" and arg.startswith("--eval="):
+                raise MCPSecurityError(
+                    f"MCP server '{server_name}': Argument {i} '{arg}' enables "
+                    "inline JavaScript evaluation for 'node', which is not allowed."
+                )
+
+            if base_command == "npx" and arg.startswith("--call="):
+                raise MCPSecurityError(
+                    f"MCP server '{server_name}': Argument {i} '{arg}' enables "
+                    "shell command execution for 'npx', which is not allowed."
+                )
+
+        logger.debug(
+            f"MCP server '{server_name}': command-specific arguments validated"
         )
 
     def validate_env(self, env: Optional[Dict[str, str]], server_name: str) -> None:
@@ -342,6 +408,8 @@ def validate_mcp_server_config(
 
     if args:
         validator.validate_args(args, server_name)
+        if command:
+            validator.validate_command_args(command, args, server_name)
 
     if env:
         validator.validate_env(env, server_name)
