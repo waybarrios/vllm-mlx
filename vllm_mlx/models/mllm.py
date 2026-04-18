@@ -506,7 +506,6 @@ def process_video_input(video: str | dict) -> str:
     Process video input in various formats and return local path.
 
     Supports:
-    - Local file path
     - URL (http/https)
     - Base64 encoded string (data:video/mp4;base64,...)
     - OpenAI format dict: {"url": "..."} or {"url": "data:video/...;base64,..."}
@@ -527,10 +526,6 @@ def process_video_input(video: str | dict) -> str:
     if not video:
         raise ValueError("Empty video input")
 
-    # Check if it's a local file
-    if Path(video).exists():
-        return video
-
     # Check if it's a URL
     if is_url(video):
         return download_video(video)
@@ -539,7 +534,9 @@ def process_video_input(video: str | dict) -> str:
     if is_base64_video(video):
         return decode_base64_video(video)
 
-    raise ValueError(f"Cannot process video: {video[:50]}...")
+    raise ValueError(
+        "Unsupported video input. Only http(s) URLs and data:video base64 payloads are allowed."
+    )
 
 
 # Cache for base64 images to avoid re-saving the same image
@@ -590,7 +587,6 @@ def process_image_input(image: str | dict) -> str:
     Process image input in various formats and return local path.
 
     Supports:
-    - Local file path
     - URL (http/https)
     - Base64 encoded string
     - OpenAI format dict: {"url": "..."} or {"url": "data:image/...;base64,..."}
@@ -613,11 +609,9 @@ def process_image_input(image: str | dict) -> str:
     if is_url(image):
         return download_image(image)
 
-    # Check if it's a local file (only for short strings that could be paths)
-    if len(image) < 4096 and Path(image).exists():
-        return image
-
-    raise ValueError(f"Cannot process image: {image[:50]}...")
+    raise ValueError(
+        "Unsupported image input. Only http(s) URLs and data:image base64 payloads are allowed."
+    )
 
 
 def round_by_factor(x: int, factor: int) -> int:
@@ -843,7 +837,7 @@ class MLXMultimodalLM:
         return self.processor.tokenizer
 
     def _prepare_images(self, images: list) -> list[str]:
-        """Process image inputs and return local file paths."""
+        """Process remote/base64 image inputs into local temp file paths."""
         processed = []
         for img in images:
             try:
@@ -863,7 +857,6 @@ class MLXMultimodalLM:
         Process video input and extract frames.
 
         Supports:
-        - Local file paths
         - URLs (http/https) - will be downloaded
         - Base64 encoded videos (data:video/mp4;base64,...)
         - OpenAI format dicts: {"url": "..."} or {"video_url": {"url": "..."}}
@@ -1058,7 +1051,7 @@ class MLXMultimodalLM:
     ) -> list[dict]:
         """Translate OpenAI API format messages to process_vision_info format.
 
-        Converts video_url/video types and resolves URLs/base64 to local paths.
+        Converts video_url/video types and resolves remote/base64 inputs to local paths.
         Images are preserved as-is (process_vision_info handles them).
         """
         translated = []
@@ -1159,8 +1152,8 @@ class MLXMultimodalLM:
 
         Args:
             prompt: Text prompt/question
-            images: List of image paths, URLs, or base64 strings
-            videos: List of video inputs (paths, URLs, base64, or OpenAI format dicts)
+            images: List of image URLs or base64 strings
+            videos: List of video inputs (URLs, base64, or OpenAI format dicts)
             audio: List of audio file paths
             max_tokens: Maximum tokens to generate
             temperature: Sampling temperature
@@ -2081,9 +2074,6 @@ class MLXMultimodalLM:
             Video description text
 
         Example:
-            # Local file
-            model.describe_video("video.mp4")
-
             # URL
             model.describe_video("https://example.com/video.mp4")
 

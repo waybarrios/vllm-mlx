@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for MLX Multimodal Language Model (MLLM) wrapper."""
 
+import base64
 import platform
 import sys
 from pathlib import Path
@@ -245,19 +246,19 @@ class TestVideoFrameExtraction:
 class TestImageProcessing:
     """Test image processing functions."""
 
-    def test_process_image_input_local_file(self, test_image_path):
-        """Test processing local image file."""
+    def test_process_image_input_local_file_rejected(self, test_image_path):
+        """Test that local image paths are rejected."""
         from vllm_mlx.models.mllm import process_image_input
 
-        result = process_image_input(test_image_path)
-        assert result == test_image_path
+        with pytest.raises(ValueError, match="Unsupported image input"):
+            process_image_input(test_image_path)
 
-    def test_process_image_input_dict_format(self, test_image_path):
-        """Test processing image in dict format."""
+    def test_process_image_input_dict_format_base64(self):
+        """Test processing image in dict format with base64 payload."""
         from vllm_mlx.models.mllm import process_image_input
 
-        # OpenAI format
-        result = process_image_input({"url": test_image_path})
+        image_b64 = base64.b64encode(b"\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR").decode()
+        result = process_image_input({"url": f"data:image/png;base64,{image_b64}"})
         assert Path(result).exists()
 
     def test_download_image_blocks_unsafe_url_before_request(self, monkeypatch):
@@ -276,19 +277,19 @@ class TestImageProcessing:
 class TestVideoProcessing:
     """Test video processing functions."""
 
-    def test_process_video_input_local_file(self, test_video_path):
-        """Test processing local video file."""
+    def test_process_video_input_local_file_rejected(self, test_video_path):
+        """Test that local video paths are rejected."""
         from vllm_mlx.models.mllm import process_video_input
 
-        result = process_video_input(test_video_path)
-        assert result == test_video_path
+        with pytest.raises(ValueError, match="Unsupported video input"):
+            process_video_input(test_video_path)
 
-    def test_process_video_input_dict_format(self, test_video_path):
-        """Test processing video in dict format."""
+    def test_process_video_input_dict_format_base64(self):
+        """Test processing video in dict format with base64 payload."""
         from vllm_mlx.models.mllm import process_video_input
 
-        # OpenAI format
-        result = process_video_input({"url": test_video_path})
+        video_b64 = base64.b64encode(b"\x00" * 100).decode()
+        result = process_video_input({"url": f"data:video/mp4;base64,{video_b64}"})
         assert Path(result).exists()
 
     def test_process_video_input_empty_raises(self):
