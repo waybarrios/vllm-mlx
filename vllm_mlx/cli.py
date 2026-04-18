@@ -677,7 +677,10 @@ Examples:
         help="The model name used in the API. If not specified, the model argument is used.",
     )
     serve_parser.add_argument(
-        "--host", type=str, default="0.0.0.0", help="Host to bind"
+        "--host",
+        type=str,
+        default="127.0.0.1",
+        help="Host to bind (default: localhost; use 0.0.0.0 to expose externally)",
     )
     serve_parser.add_argument("--port", type=int, default=8000, help="Port to bind")
     serve_parser.add_argument(
