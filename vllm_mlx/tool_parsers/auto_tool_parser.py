@@ -55,6 +55,8 @@ class AutoToolParser(ToolParser):
     NEMOTRON_PARAM_PATTERN = re.compile(
         r"<parameter=([^>]+)>\s*(.*?)\s*</parameter>", re.DOTALL
     )
+    BARE_BRACKET_PATTERN = re.compile(r"\[(\w+)\((\{.*?\})\)\]", re.DOTALL)
+    BARE_BRACKET_PARTIAL_PATTERN = re.compile(r"\[\w+\($")
 
     def extract_tool_calls(
         self, model_output: str, request: dict[str, Any] | None = None
@@ -150,7 +152,35 @@ class AutoToolParser(ToolParser):
         if bracket_matches:
             cleaned_text = self.QWEN_BRACKET_PATTERN.sub("", cleaned_text).strip()
 
-        # 4. Try Nemotron pattern (before Qwen XML as it's more specific)
+        # 4. Try bare bracket format: [func({...})]
+        bare_matches = self.BARE_BRACKET_PATTERN.findall(cleaned_text)
+        for name, args_str in bare_matches:
+            try:
+                arguments = json.loads(args_str)
+                tool_calls.append(
+                    {
+                        "id": generate_tool_id(),
+                        "name": name.strip(),
+                        "arguments": (
+                            json.dumps(arguments, ensure_ascii=False)
+                            if isinstance(arguments, dict)
+                            else str(arguments)
+                        ),
+                    }
+                )
+            except json.JSONDecodeError:
+                tool_calls.append(
+                    {
+                        "id": generate_tool_id(),
+                        "name": name.strip(),
+                        "arguments": args_str,
+                    }
+                )
+
+        if bare_matches:
+            cleaned_text = self.BARE_BRACKET_PATTERN.sub("", cleaned_text).strip()
+
+        # 5. Try Nemotron pattern (before Qwen XML as it's more specific)
         nemotron_matches = self.NEMOTRON_PATTERN.findall(cleaned_text)
         for name, params_block in nemotron_matches:
             params = self.NEMOTRON_PARAM_PATTERN.findall(params_block)
@@ -166,7 +196,7 @@ class AutoToolParser(ToolParser):
         if nemotron_matches:
             cleaned_text = self.NEMOTRON_PATTERN.sub("", cleaned_text).strip()
 
-        # 5. Try Qwen/Hermes XML pattern
+        # 6. Try Qwen/Hermes XML pattern
         xml_matches = self.QWEN_XML_PATTERN.findall(cleaned_text)
         for match in xml_matches:
             try:
@@ -191,7 +221,7 @@ class AutoToolParser(ToolParser):
         if xml_matches:
             cleaned_text = self.QWEN_XML_PATTERN.sub("", cleaned_text).strip()
 
-        # 6. Try Llama pattern
+        # 7. Try Llama pattern
         llama_matches = self.LLAMA_PATTERN.findall(cleaned_text)
         for name, args_str in llama_matches:
             try:
@@ -219,7 +249,7 @@ class AutoToolParser(ToolParser):
         if llama_matches:
             cleaned_text = self.LLAMA_PATTERN.sub("", cleaned_text).strip()
 
-        # 7. Fallback: Try raw JSON
+        # 8. Fallback: Try raw JSON
         if not tool_calls:
             raw_calls = self._parse_raw_json_tool_calls(cleaned_text)
             if raw_calls:
@@ -339,11 +369,24 @@ class AutoToolParser(ToolParser):
             "<|tool_call>",
             self.MISTRAL_TOKEN,
             "[Calling tool:",
+            "[",
             "<tool_call>",
             "<function=",
         ]
 
-        has_marker = any(m in current_text for m in markers)
+        has_marker = any(m in current_text for m in markers) and (
+            self.BARE_BRACKET_PARTIAL_PATTERN.search(current_text) is not None
+            or self.BARE_BRACKET_PATTERN.search(current_text) is not None
+            or "[Calling tool:" in current_text
+            or self.MISTRAL_TOKEN in current_text
+            or "<" in current_text
+        )
+
+        if (
+            self.BARE_BRACKET_PARTIAL_PATTERN.search(current_text) is not None
+            and self.BARE_BRACKET_PATTERN.search(current_text) is None
+        ):
+            return None
 
         if not has_marker:
             return {"content": delta_text}
