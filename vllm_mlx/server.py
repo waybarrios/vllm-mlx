@@ -1724,7 +1724,7 @@ async def health():
     }
 
 
-@app.get("/v1/status")
+@app.get("/v1/status", dependencies=[Depends(verify_api_key)])
 async def status():
     """Real-time status with per-request details for debugging and monitoring."""
     if _engine is None:
@@ -1754,7 +1754,7 @@ async def status():
     }
 
 
-@app.get("/v1/cache/stats")
+@app.get("/v1/cache/stats", dependencies=[Depends(verify_api_key)])
 async def cache_stats():
     """Get cache statistics for debugging and monitoring."""
     try:
@@ -1773,7 +1773,7 @@ async def cache_stats():
         return {"error": "Cache stats not available (mlx_vlm not loaded)"}
 
 
-@app.delete("/v1/cache")
+@app.delete("/v1/cache", dependencies=[Depends(verify_api_key)])
 async def clear_cache():
     """Clear all caches."""
     try:
@@ -2999,7 +2999,9 @@ def _convert_anthropic_stop_reason(openai_reason: str | None) -> str:
     return mapping.get(openai_reason or "", "end_turn")
 
 
-@app.post("/v1/messages")
+@app.post(
+    "/v1/messages", dependencies=[Depends(verify_api_key), Depends(check_rate_limit)]
+)
 async def create_anthropic_message(
     request: Request,
 ):
@@ -3251,7 +3253,10 @@ async def create_anthropic_message(
     )
 
 
-@app.post("/v1/messages/count_tokens")
+@app.post(
+    "/v1/messages/count_tokens",
+    dependencies=[Depends(verify_api_key), Depends(check_rate_limit)],
+)
 async def count_anthropic_tokens(request: Request):
     """
     Count tokens for an Anthropic Messages API request.
