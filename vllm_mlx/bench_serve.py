@@ -45,24 +45,36 @@ _BUILTIN_DIR = Path(__file__).parent / "bench_serve_prompts"
 _BUILTIN_NAMES = {"short", "medium", "long", "thinking"}
 
 
-def load_prompt_set(name_or_path: str) -> list[dict]:
+def load_prompt_set(name_or_path: str) -> list[list[dict]]:
     """Load a prompt set by builtin name or file path.
 
     Builtin sets (``short``, ``medium``, ``long``, ``thinking``) are loaded
     from the ``bench_serve_prompts/`` directory next to this module.  Any
     other value is treated as a filesystem path and loaded directly.
 
-    Args:
-        name_or_path: One of the builtin set names, or an absolute / relative
-            path to a JSON file containing a list of message dicts.
+    Two file formats are accepted (detected automatically):
+
+    1. **Flat** — list of single message dicts. Each dict becomes a
+       single-message prompt. Backwards-compatible with the original format.
+
+       ``[{"role": "user", "content": "..."}, ...]``
+
+    2. **Multi-message** — list of message-dict lists. Each inner list is a
+       full chat history (e.g. ``[system, user]``). Use this format when you
+       want to benchmark with system prompts that match an ``--warm-prompts``
+       warm-up, or to simulate multi-turn conversation.
+
+       ``[[{"role":"system","content":"..."}, {"role":"user","content":"..."}], ...]``
 
     Returns:
-        A list of message dicts (each with at minimum a ``"role"`` key).
+        A list of message-dict lists, i.e. every entry is a full chat history.
+        Flat-format files are normalized to single-element lists.
 
     Raises:
         FileNotFoundError: If ``name_or_path`` is not a known builtin name and
             the path does not exist, or if a builtin name is requested but its
             JSON file is missing from the package.
+        ValueError: If the file shape is not recognised.
     """
     if name_or_path in _BUILTIN_NAMES:
         target = _BUILTIN_DIR / f"{name_or_path}.json"
@@ -71,17 +83,31 @@ def load_prompt_set(name_or_path: str) -> list[dict]:
                 f"Builtin prompt set '{name_or_path}' not found at {target}"
             )
         with target.open() as fh:
-            return json.load(fh)
+            raw = json.load(fh)
+    else:
+        path = Path(name_or_path).expanduser()
+        if not path.exists():
+            raise FileNotFoundError(
+                f"Unknown prompt set name or missing file: '{name_or_path}'. "
+                f"Builtin names are: {sorted(_BUILTIN_NAMES)}"
+            )
+        with path.open() as fh:
+            raw = json.load(fh)
 
-    # Treat as a custom filesystem path.
-    path = Path(name_or_path)
-    if not path.exists():
-        raise FileNotFoundError(
-            f"Unknown prompt set name or missing file: '{name_or_path}'. "
-            f"Builtin names are: {sorted(_BUILTIN_NAMES)}"
-        )
-    with path.open() as fh:
-        return json.load(fh)
+    if not isinstance(raw, list) or not raw:
+        raise ValueError(f"Prompt file must be a non-empty JSON list: {name_or_path}")
+
+    # Auto-detect format: dict entries = flat; list entries = multi-message.
+    first = raw[0]
+    if isinstance(first, dict):
+        # Flat format: wrap each message in a single-element list.
+        return [[msg] for msg in raw]
+    if isinstance(first, list):
+        return raw
+    raise ValueError(
+        f"Prompt entries must be dict or list, got {type(first).__name__} "
+        f"in {name_or_path}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -723,7 +749,7 @@ def compute_summary_stats(values: list[float]) -> dict:
 async def run_concurrent_requests(
     client: httpx.AsyncClient,
     base_url: str,
-    prompts: list[dict],
+    prompts: list[list[dict]],
     model: str,
     concurrency: int,
     max_tokens: int = 256,
@@ -756,12 +782,12 @@ async def run_concurrent_requests(
     prompt_cycle = itertools.cycle(prompts)
     selected = [next(prompt_cycle) for _ in range(concurrency)]
 
-    async def _single(messages: dict) -> dict:
+    async def _single(messages: list[dict]) -> dict:
         try:
             result = await stream_chat_completion(
                 client=client,
                 base_url=base_url,
-                messages=[messages],
+                messages=messages,
                 model=model,
                 max_tokens=max_tokens,
                 enable_thinking=enable_thinking,
@@ -956,6 +982,8 @@ async def run_bench_serve(
     scrape: bool = True,
     tag: Optional[str] = None,
     override_fields: Optional[dict] = None,
+    system_prompt_file: Optional[str] = None,
+    skip_preflight_token_count: bool = False,
 ) -> list[BenchServeResult]:
     """Run the full bench-serve sweep against a running vllm-mlx server.
 
@@ -1026,7 +1054,7 @@ async def run_bench_serve(
         )
 
         # 7. Load prompts
-        all_prompts: dict[str, list[dict]] = {}
+        all_prompts: dict[str, list[list[dict]]] = {}
         for ps in prompt_sets:
             try:
                 all_prompts[ps] = load_prompt_set(ps)
@@ -1045,14 +1073,50 @@ async def run_bench_serve(
             print("Error: no prompt sets could be loaded.", file=sys.stderr)
             return []
 
-        # 8. Token-count first prompt from each set
+        # 7b. If --system-prompt-file given, prepend that system message to
+        # every prompt across every set. This is the warm-prompts path: the
+        # server was started with the same system in its warm-up file, so
+        # every request here hits the prefix cache.
+        if system_prompt_file:
+            sys_path = Path(system_prompt_file).expanduser()
+            if not sys_path.exists():
+                print(
+                    f"Error: --system-prompt-file not found: {sys_path}",
+                    file=sys.stderr,
+                )
+                return []
+            sys_content = sys_path.read_text()
+            system_msg = {"role": "system", "content": sys_content}
+            for ps, prompts in all_prompts.items():
+                patched: list[list[dict]] = []
+                for msgs in prompts:
+                    # Do not double-prepend if the prompt already has a system
+                    # as its first message.
+                    if msgs and msgs[0].get("role") == "system":
+                        patched.append(msgs)
+                    else:
+                        patched.append([system_msg] + msgs)
+                all_prompts[ps] = patched
+            print(f"System prompt prepended from {sys_path} ({len(sys_content)} chars)")
+
+        # 8. Token-count first prompt from each set.
+        # This sends a non-streaming max_tokens=1 request per prompt set, which
+        # populates the server's prefix cache with the full prompt. That is
+        # harmless for ordinary benchmarking but DEFEATS cold-vs-warm
+        # comparisons (both paths end up warm after the pre-flight). Skip it
+        # when --skip-preflight-token-count is set; prompt_tokens will be
+        # populated from the first measured request's usage instead.
         prompt_token_counts: dict[str, int] = {}
-        for ps, prompts in all_prompts.items():
-            try:
-                count = await count_prompt_tokens(client, url, [prompts[0]], model_id)
-                prompt_token_counts[ps] = count
-            except Exception:
+        if skip_preflight_token_count:
+            for ps in all_prompts:
                 prompt_token_counts[ps] = 0
+        else:
+            for ps, prompts in all_prompts.items():
+                try:
+                    count = await count_prompt_tokens(client, url, prompts[0], model_id)
+                    prompt_token_counts[ps] = count
+                except Exception:
+                    prompt_token_counts[ps] = 0
 
         # 9. Expand sweep
         sweep = expand_sweep(
@@ -1067,7 +1131,8 @@ async def run_bench_serve(
         # We handle warmup inline during the sweep by tracking which
         # (ps, conc, think, eb) combos have been warmed up.
         total_runs = len(sweep)
-        print(f"Total runs: {total_runs} (+ warmup on first rep of each config)")
+        warmup_note = f" (+ {warmup} warmup per config)" if warmup > 0 else ""
+        print(f"Total runs: {total_runs}{warmup_note}")
 
         results: list[BenchServeResult] = []
         warmed_up: set[tuple] = set()

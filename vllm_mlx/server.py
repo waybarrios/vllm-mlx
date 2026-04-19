@@ -166,6 +166,7 @@ _model_name: str | None = None
 _model_path: str | None = (
     None  # Actual model path (for cache dir, not affected by --served-model-name)
 )
+_warm_prompts_path: str | None = None  # Path to JSON of prompts to pre-warm at startup
 _default_max_tokens: int = 32768
 _max_request_tokens: int = 32768
 _default_timeout: float = 300.0  # Default request timeout in seconds (5 minutes)
@@ -347,6 +348,33 @@ async def lifespan(app: FastAPI):
     # Load persisted cache from disk (AFTER engine start — AsyncEngineCore must exist)
     if _engine is not None and hasattr(_engine, "load_cache_from_disk"):
         _load_prefix_cache_from_disk()
+
+    # Warm up prefix cache with user-provided prompts (AFTER disk cache load, so
+    # any already-persisted entries are preserved and warm-up only fills gaps).
+    if _warm_prompts_path and _engine is not None and hasattr(_engine, "stream_chat"):
+        try:
+            from vllm_mlx.prompt_warmup import load_warmup_file, warm_prefix_cache
+
+            prompts = load_warmup_file(_warm_prompts_path)
+            logger.info(
+                "[lifespan] Warming prefix cache with %d prompts from %s",
+                len(prompts),
+                _warm_prompts_path,
+            )
+            result = await warm_prefix_cache(_engine, prompts)
+            logger.info(
+                "[lifespan] Warm-up done (%s): %d completed, %d skipped, %d prompt tokens in %.1fs",
+                result.get("mode", "?"),
+                result["count"],
+                result["skipped"],
+                result["total_prompt_tokens"],
+                result["elapsed_ms"] / 1000,
+            )
+        except Exception as e:
+            logger.warning(
+                "[lifespan] Warm-up failed: %s",
+                _sanitize_log_text(e, limit=500),
+            )
 
     # Initialize MCP if config provided
     mcp_config = os.environ.get("VLLM_MLX_MCP_CONFIG")
@@ -1754,6 +1782,7 @@ def load_model(
     specprefill_threshold: int = 8192,
     specprefill_keep_pct: float = 0.3,
     specprefill_draft_model: str = None,
+    warm_prompts_path: str | None = None,
 ):
     """
     Load a model (auto-detects MLLM vs LLM).
@@ -1775,7 +1804,9 @@ def load_model(
         specprefill_draft_model: Path to small draft model for SpecPrefill scoring
     """
     global _engine, _model_name, _model_path, _default_max_tokens
-    global _max_request_tokens, _tool_parser_instance
+    global _max_request_tokens, _tool_parser_instance, _warm_prompts_path
+
+    _warm_prompts_path = warm_prompts_path
 
     if max_tokens < 1:
         raise ValueError("Default max tokens must be at least 1")
@@ -1956,6 +1987,60 @@ async def clear_cache():
         }
     except ImportError:
         return {"error": "Cache clear not available (mlx_vlm not loaded)"}
+
+
+@app.delete("/v1/cache/prefix", dependencies=[Depends(verify_api_key)])
+async def clear_prefix_cache():
+    """Clear the text prefix cache used for KV reuse in continuous batching.
+
+    If the server was started with ``--warm-prompts``, the warm-up is
+    re-run in the background after clear so the next real request still
+    hits the cache. Response returns immediately without waiting for
+    the re-warm to finish.
+    """
+    if _engine is None:
+        return {"status": "no_engine"}
+    cleared = False
+    if hasattr(_engine, "clear_prefix_cache"):
+        try:
+            _engine.clear_prefix_cache()
+            cleared = True
+        except Exception as e:
+            logger.warning(
+                "[clear_prefix_cache] engine.clear_prefix_cache failed: %s",
+                _sanitize_log_text(e, limit=500),
+            )
+
+    # Auto re-warm in background if warm-prompts was configured.
+    rewarm_scheduled = False
+    if cleared and _warm_prompts_path and hasattr(_engine, "stream_chat"):
+
+        async def _rewarm():
+            try:
+                from vllm_mlx.prompt_warmup import (
+                    load_warmup_file,
+                    warm_prefix_cache,
+                )
+
+                prompts = load_warmup_file(_warm_prompts_path)
+                result = await warm_prefix_cache(_engine, prompts)
+                logger.info(
+                    "[clear_prefix_cache] re-warm done: %d completed, %d skipped, %.1fs",
+                    result["count"],
+                    result["skipped"],
+                    result["elapsed_ms"] / 1000,
+                )
+            except Exception as e:
+                logger.warning(
+                    "[clear_prefix_cache] re-warm failed: %s",
+                    _sanitize_log_text(e, limit=500),
+                )
+
+        asyncio.create_task(_rewarm())
+        rewarm_scheduled = True
+
+    status = "cleared" if cleared else "not_supported"
+    return {"status": status, "rewarm_scheduled": rewarm_scheduled}
 
 
 @app.get("/v1/models", dependencies=[Depends(verify_api_key)])

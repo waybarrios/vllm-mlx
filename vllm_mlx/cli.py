@@ -268,6 +268,7 @@ def serve_command(args):
         specprefill_threshold=args.specprefill_threshold,
         specprefill_keep_pct=args.specprefill_keep_pct,
         specprefill_draft_model=args.specprefill_draft_model,
+        warm_prompts_path=args.warm_prompts,
     )
 
     # Start server
@@ -730,6 +731,13 @@ def bench_serve_command(args):
             scrape=args.scrape_metrics == "true",
             tag=args.tag,
             override_fields=overrides,
+            system_prompt_file=args.system_prompt_file,
+            # Auto-enable skip-preflight when a system-prompt-file is set:
+            # the whole point of that flag is measuring warm-cache behavior,
+            # and the preflight count_prompt_tokens request pollutes the cache.
+            skip_preflight_token_count=(
+                args.skip_preflight_token_count or bool(args.system_prompt_file)
+            ),
         )
     )
 
@@ -850,6 +858,20 @@ Examples:
         type=float,
         default=10.0,
         help="Maximum SSD cache size in GB (default: 10.0)",
+    )
+    # Prompt warm-up options
+    serve_parser.add_argument(
+        "--warm-prompts",
+        type=str,
+        default=None,
+        help=(
+            "Path to a JSON file with prompts to pre-run at startup. Populates "
+            "the prefix cache so the first real request hits warm (cold TTFT "
+            "drops 1.3-2.3x on agent workloads). File format is a list of "
+            "message arrays, same shape as /v1/chat/completions messages. "
+            "Prompts are warmed concurrently — keep the file small (1-3 entries "
+            "for typical agent deployments) to avoid memory pressure at boot."
+        ),
     )
     serve_parser.add_argument(
         "--stream-interval",
@@ -1303,6 +1325,29 @@ Examples:
         type=str,
         default=None,
         help="Path to an additional prompt file (JSON list of message dicts)",
+    )
+    bench_serve_parser.add_argument(
+        "--system-prompt-file",
+        type=str,
+        default=None,
+        help=(
+            "Path to a text file whose contents are prepended as a system "
+            "message to every prompt. Use this together with --warm-prompts "
+            "to benchmark the warm-cache path (the warmup populates the "
+            "prefix cache with this same system, so every request in the "
+            "bench hits the cache)."
+        ),
+    )
+    bench_serve_parser.add_argument(
+        "--skip-preflight-token-count",
+        action="store_true",
+        help=(
+            "Skip the pre-flight max_tokens=1 request that counts prompt "
+            "tokens per prompt set. That request populates the prefix cache "
+            "with the full prompt, which defeats cold-vs-warm comparisons. "
+            "Auto-enabled when --system-prompt-file is set; pass this flag "
+            "explicitly to force-enable regardless."
+        ),
     )
     bench_serve_parser.add_argument(
         "--concurrency",
