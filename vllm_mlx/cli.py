@@ -45,10 +45,12 @@ def serve_command(args):
     if args.max_tokens < 1:
         print("Error: --max-tokens must be at least 1")
         sys.exit(1)
-    if args.max_request_tokens < 1:
+    max_request_tokens = getattr(args, "max_request_tokens", args.max_tokens)
+    trust_remote_code = getattr(args, "trust_remote_code", False)
+    if max_request_tokens < 1:
         print("Error: --max-request-tokens must be at least 1")
         sys.exit(1)
-    if args.max_tokens > args.max_request_tokens:
+    if args.max_tokens > max_request_tokens:
         print("Error: --max-tokens cannot exceed --max-request-tokens")
         sys.exit(1)
 
@@ -57,7 +59,7 @@ def serve_command(args):
     server._default_timeout = args.timeout
     server._metrics_enabled = args.enable_metrics
     server._metrics.configure(enabled=args.enable_metrics)
-    server._max_request_tokens = args.max_request_tokens
+    server._max_request_tokens = max_request_tokens
     if args.rate_limit > 0:
         server._rate_limiter = RateLimiter(
             requests_per_minute=args.rate_limit, enabled=True
@@ -76,8 +78,10 @@ def serve_command(args):
         server._default_temperature = args.default_temperature
     if args.default_top_p is not None:
         server._default_top_p = args.default_top_p
-    server._max_audio_upload_bytes = args.max_audio_upload_mb * 1024 * 1024
-    server._max_tts_input_chars = args.max_tts_input_chars
+    max_audio_upload_mb = getattr(args, "max_audio_upload_mb", 25)
+    max_tts_input_chars = getattr(args, "max_tts_input_chars", 4096)
+    server._max_audio_upload_bytes = max_audio_upload_mb * 1024 * 1024
+    server._max_tts_input_chars = max_tts_input_chars
 
     # Configure reasoning parser
     if args.reasoning_parser:
@@ -119,7 +123,7 @@ def serve_command(args):
         print("  Metrics: ENABLED (/metrics, unauthenticated)")
     else:
         print("  Metrics: DISABLED - Use --enable-metrics to expose /metrics")
-    if args.trust_remote_code:
+    if trust_remote_code:
         print("  Remote code loading: ENABLED (--trust-remote-code)")
     else:
         print("  Remote code loading: DISABLED (default)")
@@ -136,8 +140,8 @@ def serve_command(args):
     else:
         print("  Reasoning: Use --reasoning-parser to enable")
     print(
-        f"  Audio upload limit: {args.max_audio_upload_mb} MiB, "
-        f"TTS input limit: {args.max_tts_input_chars} chars"
+        f"  Audio upload limit: {max_audio_upload_mb} MiB, "
+        f"TTS input limit: {max_tts_input_chars} chars"
     )
     print("=" * 60)
 
@@ -162,7 +166,7 @@ def serve_command(args):
     else:
         print(f"Loading model: {args.model}")
     print(f"Default max tokens: {args.max_tokens}")
-    print(f"Max request tokens: {args.max_request_tokens}")
+    print(f"Max request tokens: {max_request_tokens}")
 
     # Store MCP config path for FastAPI startup
     if args.mcp_config:
@@ -170,16 +174,18 @@ def serve_command(args):
         os.environ["VLLM_MLX_MCP_CONFIG"] = args.mcp_config
 
     # Pre-load embedding model if specified
-    if args.embedding_model:
-        print(f"Pre-loading embedding model: {args.embedding_model}")
-        server.load_embedding_model(args.embedding_model, lock=True)
-        print(f"Embedding model loaded: {args.embedding_model}")
+    embedding_model = getattr(args, "embedding_model", None)
+    if embedding_model:
+        print(f"Pre-loading embedding model: {embedding_model}")
+        server.load_embedding_model(embedding_model, lock=True)
+        print(f"Embedding model loaded: {embedding_model}")
 
     # Pre-load reranker model if specified
-    if args.rerank_model:
-        print(f"Pre-loading reranker model: {args.rerank_model}")
-        server.load_reranker_model(args.rerank_model, lock=True)
-        print(f"Reranker model loaded: {args.rerank_model}")
+    rerank_model = getattr(args, "rerank_model", None)
+    if rerank_model:
+        print(f"Pre-loading reranker model: {rerank_model}")
+        server.load_reranker_model(rerank_model, lock=True)
+        print(f"Reranker model loaded: {rerank_model}")
 
     # Build scheduler config for batched mode
     scheduler_config = None
@@ -218,8 +224,8 @@ def serve_command(args):
                 args.mllm_prefill_step_size if args.mllm_prefill_step_size > 0 else None
             ),
             # SSD cache tiering
-            ssd_cache_dir=args.ssd_cache_dir,
-            ssd_cache_max_gb=args.ssd_cache_max_gb,
+            ssd_cache_dir=getattr(args, "ssd_cache_dir", None),
+            ssd_cache_max_gb=getattr(args, "ssd_cache_max_gb", 10.0),
         )
 
         print("Mode: Continuous batching (for multiple concurrent users)")
@@ -266,18 +272,18 @@ def serve_command(args):
         scheduler_config=scheduler_config,
         stream_interval=args.stream_interval if args.continuous_batching else 1,
         max_tokens=args.max_tokens,
-        max_request_tokens=args.max_request_tokens,
+        max_request_tokens=max_request_tokens,
         force_mllm=getattr(args, "mllm", False),
         gpu_memory_utilization=args.gpu_memory_utilization,
         served_model_name=args.served_model_name,
-        trust_remote_code=args.trust_remote_code,
+        trust_remote_code=trust_remote_code,
         mtp=args.enable_mtp,
         prefill_step_size=args.prefill_step_size,
         specprefill_enabled=args.specprefill,
         specprefill_threshold=args.specprefill_threshold,
         specprefill_keep_pct=args.specprefill_keep_pct,
         specprefill_draft_model=args.specprefill_draft_model,
-        warm_prompts_path=args.warm_prompts,
+        warm_prompts_path=getattr(args, "warm_prompts", None),
         auto_unload_idle_seconds=args.auto_unload_idle_seconds,
         lazy_load_model=args.lazy_load_model,
     )

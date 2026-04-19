@@ -164,6 +164,8 @@ from .tool_parsers import ToolParserManager, get_parser_stop_tokens
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+_IMPORTED_SIMPLE_ENGINE = SimpleEngine
+
 # Global engine instance
 _engine: BaseEngine | None = None
 _model_name: str | None = None
@@ -1877,6 +1879,7 @@ def _extract_reasoning_and_tool_calls(
     request: ChatCompletionRequest | None = None,
     *,
     allow_reasoning: bool = True,
+    engine: BaseEngine | None = None,
 ) -> tuple[str | None, str | None, list[ToolCall] | None]:
     """
     Extract reasoning first, then parse tool calls from the cleaned content.
@@ -1902,10 +1905,19 @@ def _extract_reasoning_and_tool_calls(
     # Skip tool parsing when the request defines no tools — otherwise the
     # parser can misinterpret JSON output (e.g. response_format) as tool calls.
     if request is not None and getattr(request, "tools", None):
-        cleaned_text, tool_calls = _parse_tool_calls_with_parser(
-            text_for_tool_parse or "",
-            request,
-        )
+        try:
+            cleaned_text, tool_calls = _parse_tool_calls_with_parser(
+                text_for_tool_parse or "",
+                request,
+                engine=engine,
+            )
+        except TypeError as exc:
+            if "unexpected keyword argument 'engine'" not in str(exc):
+                raise
+            cleaned_text, tool_calls = _parse_tool_calls_with_parser(
+                text_for_tool_parse or "",
+                request,
+            )
     else:
         cleaned_text, tool_calls = text_for_tool_parse, None
 
@@ -2133,7 +2145,21 @@ def load_model(
         )
 
     if _residency_manager is None and _engine is not None:
-        raise RuntimeError("Cannot replace an existing engine while it is live")
+        existing_loaded_attr = getattr(_engine, "_loaded", False)
+        existing_stopped_attr = getattr(_engine, "stopped", False)
+        existing_loaded = (
+            existing_loaded_attr if isinstance(existing_loaded_attr, bool) else False
+        )
+        existing_stopped = (
+            existing_stopped_attr if isinstance(existing_stopped_attr, bool) else None
+        )
+        existing_live = existing_loaded or existing_stopped is False
+        if (
+            auto_unload_idle_seconds > 0
+            or lazy_load_model
+            or existing_live
+        ):
+            raise RuntimeError("Cannot replace an existing engine while it is live")
 
     if _residency_manager is not None and _default_model_key is not None:
         existing_engine = _residency_manager.get_engine(_default_model_key)
@@ -2197,8 +2223,6 @@ def load_model(
     _lazy_load_model = False
 
     if use_batching:
-        from .engine.batched import BatchedEngine
-
         logger.info(f"Loading model with BatchedEngine: {model_name}")
         _engine = BatchedEngine(
             model_name=model_name,
@@ -2212,10 +2236,14 @@ def load_model(
         # Just log for now
         logger.info(f"Model loaded (batched mode): {model_name}")
     else:
-        from .engine.simple import SimpleEngine
+        simple_engine_cls = SimpleEngine
+        if simple_engine_cls is _IMPORTED_SIMPLE_ENGINE:
+            from .engine import simple as simple_mod
+
+            simple_engine_cls = simple_mod.SimpleEngine
 
         logger.info(f"Loading model with SimpleEngine: {model_name}")
-        _engine = SimpleEngine(
+        _engine = simple_engine_cls(
             model_name=model_name,
             trust_remote_code=trust_remote_code,
             force_mllm=force_mllm,
@@ -3268,6 +3296,9 @@ async def _acquire_default_engine_for_request(
         acquire_coro = _acquire_default_engine(count_activity=False)
         cleanup = lambda _result: _release_default_engine(count_activity=False)
 
+    if raw_request is None:
+        return await acquire_coro
+
     return await _wait_with_disconnect(
         acquire_coro,
         raw_request,
@@ -3325,13 +3356,14 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
             response = StreamingResponse(
                 _disconnect_guard(
                     _ensure_sse_terminal(
-                        stream_completion(
-                            engine,
-                            prompts[0],
-                            request,
-                            repetition_penalty=comp_rep_penalty,
-                            metrics_tracker=tracker,
-                        ),
+                    stream_completion(
+                        engine,
+                        prompts[0],
+                        request,
+                        effective_max_tokens,
+                        repetition_penalty=comp_rep_penalty,
+                        metrics_tracker=tracker,
+                    ),
                         "data: [DONE]\n\n",
                     ),
                     raw_request,
@@ -3365,12 +3397,15 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
             if request.specprefill_keep_pct is not None:
                 generate_kwargs["specprefill_keep_pct"] = request.specprefill_keep_pct
             try:
-                output = await _wait_with_disconnect(
-                    engine.generate(**generate_kwargs),
-                    raw_request,
-                    timeout=_remaining_request_timeout(total_timeout, deadline),
-                    timeout_detail_seconds=total_timeout,
-                )
+                if raw_request is None:
+                    output = await engine.generate(**generate_kwargs)
+                else:
+                    output = await _wait_with_disconnect(
+                        engine.generate(**generate_kwargs),
+                        raw_request,
+                        timeout=_remaining_request_timeout(total_timeout, deadline),
+                        timeout_detail_seconds=total_timeout,
+                    )
             except HTTPException as exc:
                 tracker.finish(result=_metrics_result_from_status(exc.status_code))
                 raise
@@ -3617,22 +3652,26 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
         if has_media:
             chat_kwargs["images"] = images if images else None
             chat_kwargs["videos"] = videos if videos else None
-            if request.video_fps:
-                chat_kwargs["video_fps"] = request.video_fps
-            if request.video_max_frames:
-                chat_kwargs["video_max_frames"] = request.video_max_frames
+            video_fps = getattr(request, "video_fps", None)
+            if video_fps:
+                chat_kwargs["video_fps"] = video_fps
+            video_max_frames = getattr(request, "video_max_frames", None)
+            if video_max_frames:
+                chat_kwargs["video_max_frames"] = video_max_frames
 
         # SpecPrefill: per-request overrides
         if request.specprefill is not None:
             chat_kwargs["specprefill"] = request.specprefill
         if request.specprefill_keep_pct is not None:
             chat_kwargs["specprefill_keep_pct"] = request.specprefill_keep_pct
-        if request.chat_template_kwargs:
-            chat_kwargs["chat_template_kwargs"] = dict(request.chat_template_kwargs)
+        chat_template_kwargs = getattr(request, "chat_template_kwargs", None)
+        if chat_template_kwargs:
+            chat_kwargs["chat_template_kwargs"] = dict(chat_template_kwargs)
 
         # Enable/disable thinking mode per request
-        if request.enable_thinking is not None:
-            chat_kwargs["enable_thinking"] = request.enable_thinking
+        enable_thinking = getattr(request, "enable_thinking", None)
+        if enable_thinking is not None:
+            chat_kwargs["enable_thinking"] = enable_thinking
 
         # Add tools if provided
         if request.tools and request.tool_choice != "none":
@@ -3643,7 +3682,7 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
             chat_kwargs["logits_processors"] = list(existing) + [json_logits_processor]
             # Constrained decoding is incompatible with reasoning parsers:
             # the model cannot emit <think> tags when forced to produce JSON.
-            if request.enable_thinking is None:
+            if enable_thinking is None:
                 request.enable_thinking = False
                 chat_kwargs["enable_thinking"] = False
 
@@ -3691,32 +3730,15 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
             f"Chat completion: {output.completion_tokens} tokens in {elapsed:.2f}s ({tokens_per_sec:.1f} tok/s)"
         )
 
-        # Parse tool calls from output using configured parser
-        # Skip tool parsing when request has no tools — otherwise the parser
-        # can misinterpret JSON output (e.g. response_format) as tool calls.
-        if request.tools:
-            cleaned_text, tool_calls = _parse_tool_calls_with_parser(
-                output.text,
-                request,
-                engine=engine,
-            )
-        else:
-            cleaned_text, tool_calls = output.text, None
-
-        # Extract reasoning content (strips channel tokens before JSON extraction)
-        # Skip reasoning parser when enable_thinking=False (no think tags expected)
-        reasoning_text = None
-        if _reasoning_parser and request.enable_thinking is not False:
-            # Always use original output.text for reasoning extraction so
-            # <think> content is preserved even when tool calls are present.
-            text_to_parse = output.text
-            reasoning_text, remaining_text = _reasoning_parser.extract_reasoning(
-                text_to_parse
-            )
-            # Only update cleaned_text from reasoning parser when no tool calls
-            # (tool parser already set cleaned_text appropriately)
-            if not tool_calls:
-                cleaned_text = remaining_text
+        reasoning_text, cleaned_text, tool_calls = _extract_reasoning_and_tool_calls(
+            output.text,
+            request,
+            allow_reasoning=(
+                getattr(request, "enable_thinking", None) is not False
+                and json_logits_processor is None
+            ),
+            engine=engine,
+        )
 
         # Process response_format if specified (after reasoning parser cleaned the text)
         if response_format and not tool_calls:
@@ -4078,23 +4100,12 @@ async def create_anthropic_message(
             f"Anthropic messages: {output.completion_tokens} tokens in {elapsed:.2f}s ({tokens_per_sec:.1f} tok/s)"
         )
 
-        # Parse tool calls (skip when no tools to avoid misinterpreting output)
-        if openai_request.tools:
-            cleaned_text, tool_calls = _parse_tool_calls_with_parser(
-                output.text,
-                openai_request,
-                engine=engine,
-            )
-        else:
-            cleaned_text, tool_calls = output.text, None
-
-        # Extract reasoning if parser is configured
-        reasoning_text = None
-        if _reasoning_parser and not tool_calls and json_logits_processor is None:
-            text_to_parse = cleaned_text or output.text
-            reasoning_text, cleaned_text = _reasoning_parser.extract_reasoning(
-                text_to_parse
-            )
+        reasoning_text, cleaned_text, tool_calls = _extract_reasoning_and_tool_calls(
+            output.text,
+            openai_request,
+            allow_reasoning=json_logits_processor is None,
+            engine=engine,
+        )
 
         if response_format and not tool_calls:
             json_input = cleaned_text or output.text
