@@ -295,6 +295,7 @@ def _log_and_raise_internal_error(log_prefix: str, exc: Exception, detail: str) 
     logger.error("%s: %s", log_prefix, _sanitize_log_text(exc, limit=500))
     raise HTTPException(status_code=500, detail=detail)
 
+
 # Lifecycle startup coordination — an Event lets the lifecycle loop block
 # efficiently instead of polling with short sleeps.  Created lazily so
 # it binds to the correct event loop at runtime rather than import time.
@@ -574,7 +575,9 @@ async def lifespan(app: FastAPI):
             if not _lazy_load_model:
                 await _residency_manager.ensure_loaded(_default_model_key)
             _sync_engine_from_residency()
-        elif _engine is not None and hasattr(_engine, "_loaded") and not _engine._loaded:
+        elif (
+            _engine is not None and hasattr(_engine, "_loaded") and not _engine._loaded
+        ):
             await _engine.start()
 
         # Load persisted cache from disk (AFTER engine start — AsyncEngineCore must exist)
@@ -588,7 +591,11 @@ async def lifespan(app: FastAPI):
         # Warm up prefix cache with user-provided prompts (AFTER disk cache load,
         # so any already-persisted entries are preserved and warm-up only fills
         # gaps).
-        if _warm_prompts_path and _engine is not None and hasattr(_engine, "stream_chat"):
+        if (
+            _warm_prompts_path
+            and _engine is not None
+            and hasattr(_engine, "stream_chat")
+        ):
             try:
                 from vllm_mlx.prompt_warmup import load_warmup_file, warm_prefix_cache
 
@@ -2153,11 +2160,7 @@ def load_model(
             existing_stopped_attr if isinstance(existing_stopped_attr, bool) else None
         )
         existing_live = existing_loaded or existing_stopped is False
-        if (
-            auto_unload_idle_seconds > 0
-            or lazy_load_model
-            or existing_live
-        ):
+        if auto_unload_idle_seconds > 0 or lazy_load_model or existing_live:
             raise RuntimeError("Cannot replace an existing engine while it is live")
 
     if _residency_manager is not None and _default_model_key is not None:
@@ -3355,14 +3358,14 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
             response = StreamingResponse(
                 _disconnect_guard(
                     _ensure_sse_terminal(
-                    stream_completion(
-                        engine,
-                        prompts[0],
-                        request,
-                        effective_max_tokens,
-                        repetition_penalty=comp_rep_penalty,
-                        metrics_tracker=tracker,
-                    ),
+                        stream_completion(
+                            engine,
+                            prompts[0],
+                            request,
+                            effective_max_tokens,
+                            repetition_penalty=comp_rep_penalty,
+                            metrics_tracker=tracker,
+                        ),
                         "data: [DONE]\n\n",
                     ),
                     raw_request,
@@ -3585,13 +3588,17 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
             # MLLM extracts media from messages directly, so images/videos are
             # always empty. Check message content for video/image types instead.
             for msg in request.messages:
-                content = msg.content if hasattr(msg, "content") else msg.get("content", "")
+                content = (
+                    msg.content if hasattr(msg, "content") else msg.get("content", "")
+                )
                 if isinstance(content, list):
                     for item in content:
                         item_type = (
                             item.type
                             if hasattr(item, "type")
-                            else (item.get("type", "") if isinstance(item, dict) else "")
+                            else (
+                                item.get("type", "") if isinstance(item, dict) else ""
+                            )
                         )
                         if item_type in ("image_url", "image", "video", "video_url"):
                             has_media = True
@@ -3750,7 +3757,9 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
                 cleaned_text = json.dumps(parsed_json)
             if not is_valid:
                 if json_logits_processor is not None:
-                    logger.error("Constrained decoding produced invalid JSON: %s", error)
+                    logger.error(
+                        "Constrained decoding produced invalid JSON: %s", error
+                    )
                 else:
                     logger.warning(f"JSON validation failed: {error}")
 
@@ -3767,9 +3776,9 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
             choices=[
                 ChatCompletionChoice(
                     message=AssistantMessage(
-                        content=clean_output_text(cleaned_text)
-                        if cleaned_text
-                        else None,
+                        content=(
+                            clean_output_text(cleaned_text) if cleaned_text else None
+                        ),
                         reasoning=reasoning_text,
                         tool_calls=tool_calls,
                     ),
@@ -4259,9 +4268,7 @@ async def count_anthropic_tokens(request: Request):
                                 if isinstance(item, dict):
                                     item_text = item.get("text", "")
                                     if item_text:
-                                        total_tokens += len(
-                                            tokenizer.encode(item_text)
-                                        )
+                                        total_tokens += len(tokenizer.encode(item_text))
 
         # Tools
         for tool in body.get("tools", []):

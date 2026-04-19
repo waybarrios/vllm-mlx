@@ -56,9 +56,7 @@ class ResidentModel:
     last_error: str | None = None
     estimated_memory_bytes: int | None = None
     _load_waiters: int = field(default=0, repr=False)
-    _load_waiter_task: asyncio.Task[BaseEngine] | None = field(
-        default=None, repr=False
-    )
+    _load_waiter_task: asyncio.Task[BaseEngine] | None = field(default=None, repr=False)
     _prepare_task: asyncio.Task[None] | None = field(default=None, repr=False)
     _abandoned_loading_task: asyncio.Task[BaseEngine] | None = field(
         default=None, repr=False
@@ -74,10 +72,12 @@ class ResidencyManager:
         self,
         engine_factory: Callable[[ModelSpec], Awaitable[BaseEngine]],
         *,
-        on_engine_loaded: Callable[[ModelSpec, BaseEngine], Awaitable[None] | None]
-        | None = None,
-        on_engine_unloading: Callable[[ModelSpec, BaseEngine], Awaitable[None] | None]
-        | None = None,
+        on_engine_loaded: (
+            Callable[[ModelSpec, BaseEngine], Awaitable[None] | None] | None
+        ) = None,
+        on_engine_unloading: (
+            Callable[[ModelSpec, BaseEngine], Awaitable[None] | None] | None
+        ) = None,
         time_fn: Callable[[], float] | None = None,
         auto_unload_idle_seconds: float = 0,
     ) -> None:
@@ -136,7 +136,10 @@ class ResidencyManager:
 
             async with self._lock:
                 resident = self._resident(model_key)
-                if resident.state == ResidentState.LOADED and resident.engine is not None:
+                if (
+                    resident.state == ResidentState.LOADED
+                    and resident.engine is not None
+                ):
                     return resident.engine
 
                 if resident._unloading_task is not None:
@@ -166,7 +169,11 @@ class ResidencyManager:
             except asyncio.CancelledError:
                 current_task = asyncio.current_task()
                 cancelling = getattr(current_task, "cancelling", None)
-                if task.done() and task.cancelled() and (cancelling is None or cancelling() == 0):
+                if (
+                    task.done()
+                    and task.cancelled()
+                    and (cancelling is None or cancelling() == 0)
+                ):
                     async with self._lock:
                         resident = self._resident(model_key)
                         if resident._abandoned_loading_task is task:
@@ -259,7 +266,10 @@ class ResidencyManager:
                     if resident._loading_task is not None:
                         resident._loading_task.cancel()
                         loading_task = resident._loading_task
-                    elif resident.engine is None or resident.state == ResidentState.UNLOADED:
+                    elif (
+                        resident.engine is None
+                        or resident.state == ResidentState.UNLOADED
+                    ):
                         break
                     else:
                         if resident._unloading_task is None:
@@ -473,4 +483,3 @@ class ResidencyManager:
             task_to_cancel.cancel()
             with suppress(asyncio.CancelledError):
                 await task_to_cancel
-

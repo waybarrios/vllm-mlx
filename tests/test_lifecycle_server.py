@@ -51,10 +51,7 @@ def restore_server_globals():
         "_tool_parser_instance",
         "_idle_unload_enabled",
     )
-    snapshot = {
-        name: getattr(srv, name, sentinel)
-        for name in global_names
-    }
+    snapshot = {name: getattr(srv, name, sentinel) for name in global_names}
 
     yield
 
@@ -158,9 +155,7 @@ class TestLifecycleStatusEndpoints:
         assert payload["auto_unload_idle_seconds"] == 120
 
     @pytest.mark.anyio
-    async def test_failed_resident_surfaces_as_unhealthy_and_failed(
-        self, monkeypatch
-    ):
+    async def test_failed_resident_surfaces_as_unhealthy_and_failed(self, monkeypatch):
         """Public status should not leak backend model identity or raw errors."""
         import vllm_mlx.server as srv
 
@@ -302,7 +297,9 @@ class TestCompletionStreamingRelease:
     """Verify the completion endpoint releases residency on all paths."""
 
     @pytest.mark.anyio
-    async def test_completion_nonstreaming_error_releases_active_request(self, monkeypatch):
+    async def test_completion_nonstreaming_error_releases_active_request(
+        self, monkeypatch
+    ):
         """Non-streaming completion errors must still release the active request."""
         import vllm_mlx.server as srv
 
@@ -322,7 +319,9 @@ class TestCompletionStreamingRelease:
             async def generate(self, **kwargs):
                 raise RuntimeError("generation failed")
 
-        async def fake_acquire(raw_request, *, total_timeout=None, deadline=None, count_activity=True):
+        async def fake_acquire(
+            raw_request, *, total_timeout=None, deadline=None, count_activity=True
+        ):
             acquires["count"] += 1
             return FakeEngine()
 
@@ -358,9 +357,9 @@ class TestCompletionStreamingRelease:
             await srv.create_completion(request, FakeRequest())
 
         assert acquires["count"] == 1
-        assert releases["count"] == 1, (
-            "Non-streaming completion must release residency on generation errors"
-        )
+        assert (
+            releases["count"] == 1
+        ), "Non-streaming completion must release residency on generation errors"
 
     @pytest.mark.anyio
     async def test_completion_streaming_release_matches_chat_pattern(self, monkeypatch):
@@ -385,13 +384,17 @@ class TestCompletionStreamingRelease:
 
             async def stream_generate(self, **kwargs):
                 yield SimpleNamespace(
-                    text="done", new_text="done",
+                    text="done",
+                    new_text="done",
                     finish_reason="stop",
-                    completion_tokens=1, prompt_tokens=1,
+                    completion_tokens=1,
+                    prompt_tokens=1,
                     finished=True,
                 )
 
-        async def fake_acquire(raw_request, *, total_timeout=None, deadline=None, count_activity=True):
+        async def fake_acquire(
+            raw_request, *, total_timeout=None, deadline=None, count_activity=True
+        ):
             return FakeEngine()
 
         async def fake_release(*, count_activity=True):
@@ -428,16 +431,18 @@ class TestCompletionStreamingRelease:
         async for _ in response.body_iterator:
             pass
 
-        assert releases["count"] == 1, (
-            "Streaming completion must release residency via cleanup callback"
-        )
+        assert (
+            releases["count"] == 1
+        ), "Streaming completion must release residency via cleanup callback"
 
 
 class TestStatusEndpointEngineRace:
     """Verify status/health endpoints handle engine being None."""
 
     @pytest.mark.anyio
-    async def test_status_endpoint_returns_not_loaded_when_engine_is_none(self, monkeypatch):
+    async def test_status_endpoint_returns_not_loaded_when_engine_is_none(
+        self, monkeypatch
+    ):
         """/v1/status should not 500 if engine is unloaded between check and use."""
         import vllm_mlx.server as srv
 
@@ -445,6 +450,7 @@ class TestStatusEndpointEngineRace:
 
         class DisappearingEngine:
             """Engine that disappears after the null check."""
+
             def get_stats(self):
                 call_count["n"] += 1
                 return {
@@ -595,7 +601,9 @@ class TestLifecycleFailureHandling:
     """Regression coverage for lifecycle failure paths."""
 
     @pytest.mark.anyio
-    async def test_anthropic_validation_error_does_not_acquire_resident(self, monkeypatch):
+    async def test_anthropic_validation_error_does_not_acquire_resident(
+        self, monkeypatch
+    ):
         """Malformed Anthropic payloads should not touch residency at all."""
         from pydantic import ValidationError
 
@@ -872,7 +880,10 @@ class TestLifecycleFailureHandling:
             with pytest.raises(RuntimeError, match="mcp boom") as excinfo:
                 await lifespan.__anext__()
             assert excinfo.value.__cause__ is None
-            assert "Lifecycle cleanup failed while preserving the original exception" in caplog.text
+            assert (
+                "Lifecycle cleanup failed while preserving the original exception"
+                in caplog.text
+            )
             assert "stop boom" in caplog.text
         finally:
             if srv._lifecycle_task is not None:
@@ -1159,17 +1170,25 @@ class TestLifecycleFailureHandling:
 
             engine = engine_mod.BatchedEngine("fake-model")
             if engine_kind == "batched-llm":
+
                 async def unexpected_start_llm():
                     raise AssertionError("_start_llm should not run after cancellation")
 
                 monkeypatch.setattr(engine, "_is_mllm", False, raising=False)
-                monkeypatch.setattr(engine, "_start_llm", unexpected_start_llm, raising=False)
+                monkeypatch.setattr(
+                    engine, "_start_llm", unexpected_start_llm, raising=False
+                )
             else:
+
                 async def unexpected_start_mllm():
-                    raise AssertionError("_start_mllm should not run after cancellation")
+                    raise AssertionError(
+                        "_start_mllm should not run after cancellation"
+                    )
 
                 monkeypatch.setattr(engine, "_is_mllm", True, raising=False)
-                monkeypatch.setattr(engine, "_start_mllm", unexpected_start_mllm, raising=False)
+                monkeypatch.setattr(
+                    engine, "_start_mllm", unexpected_start_mllm, raising=False
+                )
 
         prepare_entered = threading.Event()
         allow_prepare_finish = threading.Event()
@@ -1277,7 +1296,9 @@ class TestLifecycleFailureHandling:
                     await start_task
 
     @pytest.mark.anyio
-    async def test_run_blocking_startup_work_waits_for_thread_under_repeated_cancel(self):
+    async def test_run_blocking_startup_work_waits_for_thread_under_repeated_cancel(
+        self,
+    ):
         """Repeated cancellation should not return before blocking startup work finishes."""
         import threading
 
@@ -1342,7 +1363,9 @@ class TestLifecycleFailureHandling:
             time.sleep(0.05)
             finished.set()
 
-        task = asyncio.create_task(srv._run_blocking_engine_cache_io(blocking_io, FakeEngine()))
+        task = asyncio.create_task(
+            srv._run_blocking_engine_cache_io(blocking_io, FakeEngine())
+        )
         try:
             assert await asyncio.wait_for(
                 asyncio.to_thread(entered.wait, 1.0),
@@ -1433,7 +1456,9 @@ class TestLifecycleFailureHandling:
                 await manager.shutdown()
 
     @pytest.mark.anyio
-    async def test_run_blocking_startup_work_does_not_livelock_on_cancelled_inner_task(self):
+    async def test_run_blocking_startup_work_does_not_livelock_on_cancelled_inner_task(
+        self,
+    ):
         """If the inner to_thread task ends up cancelled, the drain loop must
         exit instead of spinning forever on CancelledError."""
         from vllm_mlx.engine.base import run_blocking_startup_work
@@ -1441,7 +1466,9 @@ class TestLifecycleFailureHandling:
         def work_that_will_be_cancelled():
             raise asyncio.CancelledError()
 
-        task = asyncio.create_task(run_blocking_startup_work(work_that_will_be_cancelled))
+        task = asyncio.create_task(
+            run_blocking_startup_work(work_that_will_be_cancelled)
+        )
         await asyncio.sleep(0)
         task.cancel()
 
@@ -1502,9 +1529,7 @@ class TestLifecycleFailureHandling:
         except asyncio.CancelledError:
             pass  # expected: the load was cancelled
         except asyncio.TimeoutError:
-            pytest.fail(
-                "Drain loop livelocked — load_task did not complete within 2s"
-            )
+            pytest.fail("Drain loop livelocked — load_task did not complete within 2s")
 
         # Clean up
         with suppress(Exception):
@@ -1539,7 +1564,9 @@ class TestLifecycleFailureHandling:
             monkeypatch.setattr(engine, "_is_mllm", False, raising=False)
             monkeypatch.setattr(engine, "_model", object(), raising=False)
             monkeypatch.setattr(engine, "_tokenizer", object(), raising=False)
-            monkeypatch.setattr(engine, "_start_llm", cancellable_start_phase, raising=False)
+            monkeypatch.setattr(
+                engine, "_start_llm", cancellable_start_phase, raising=False
+            )
         else:
             monkeypatch.setattr(engine, "_is_mllm", True, raising=False)
             monkeypatch.setattr(engine, "_model", object(), raising=False)
@@ -1984,7 +2011,9 @@ class TestLifecycleFailureHandling:
                 return self._tokenizer_value
 
         engine_state = {"engine": FakeEngine("tok-1")}
-        fake_manager = SimpleNamespace(get_engine=lambda model_key: engine_state["engine"])
+        fake_manager = SimpleNamespace(
+            get_engine=lambda model_key: engine_state["engine"]
+        )
 
         monkeypatch.setattr(srv, "_enable_auto_tool_choice", True, raising=False)
         monkeypatch.setattr(srv, "_tool_call_parser", "fake", raising=False)
@@ -2100,6 +2129,7 @@ class TestLifecycleFailureHandling:
                 self.stopped = True
 
         old_engine = OldEngine()
+
         class NewEngine:
             def __init__(self):
                 self.is_mllm = False
@@ -2204,7 +2234,10 @@ class TestLifecycleFailureHandling:
                 observed_loop["loop"].close()
             if not previous_loop.is_closed():
                 previous_loop.close()
-            if created_loop["loop"] is not None and not created_loop["loop"].is_closed():
+            if (
+                created_loop["loop"] is not None
+                and not created_loop["loop"].is_closed()
+            ):
                 created_loop["loop"].close()
             monkeypatch.setattr(srv, "_engine", None, raising=False)
 
@@ -2523,7 +2556,9 @@ class TestLifecycleFailureHandling:
                     await request_task
 
     @pytest.mark.anyio
-    async def test_completion_disconnect_covers_cold_resident_acquire(self, monkeypatch):
+    async def test_completion_disconnect_covers_cold_resident_acquire(
+        self, monkeypatch
+    ):
         """Disconnect handling should abort a cold resident acquire before generation."""
         from fastapi.responses import Response
 
@@ -2590,7 +2625,9 @@ class TestLifecycleFailureHandling:
             timeout=60.0,
         )
 
-        request_task = asyncio.create_task(srv.create_completion(request, FakeRequest()))
+        request_task = asyncio.create_task(
+            srv.create_completion(request, FakeRequest())
+        )
         try:
             # Leave generous slack over the production 0.5s poll interval so
             # this stays a behavior test rather than a scheduler-jitter race.
@@ -2846,9 +2883,7 @@ class TestLifecycleFailureHandling:
         assert calls["acquire"] == 0
 
     @pytest.mark.anyio
-    async def test_anthropic_messages_refresh_idle_unload_activity(
-        self, monkeypatch
-    ):
+    async def test_anthropic_messages_refresh_idle_unload_activity(self, monkeypatch):
         """Successful Anthropic messages requests should count as residency activity."""
         import vllm_mlx.server as srv
 
@@ -3272,9 +3307,9 @@ class TestLifecycleLoopIdleEvent:
         try:
             # Give it time — if it were polling at 0.1s it would iterate many times
             await asyncio.sleep(0.3)
-            assert iterations == 0, (
-                f"Loop iterated {iterations} times while event was cleared"
-            )
+            assert (
+                iterations == 0
+            ), f"Loop iterated {iterations} times while event was cleared"
 
             # Now set the event and let it run one iteration
             idle_event.set()
@@ -3295,19 +3330,23 @@ class TestPublicLifecycleStatusSanitization:
     def test_none_error_stays_none(self):
         import vllm_mlx.server as srv
 
-        result = srv._public_lifecycle_status({
-            "state": "loaded",
-            "last_error": None,
-        })
+        result = srv._public_lifecycle_status(
+            {
+                "state": "loaded",
+                "last_error": None,
+            }
+        )
         assert result["last_error"] is None
 
     def test_raw_error_replaced_with_category(self):
         import vllm_mlx.server as srv
 
-        result = srv._public_lifecycle_status({
-            "state": "failed",
-            "last_error": "OSError: /tmp/model not found",
-        })
+        result = srv._public_lifecycle_status(
+            {
+                "state": "failed",
+                "last_error": "OSError: /tmp/model not found",
+            }
+        )
         assert result["last_error"] == "model_load_failed"
 
     def test_returns_none_for_none_input(self):
@@ -3346,9 +3385,7 @@ class TestPublicLifecycleStatusSanitization:
         assert payload["last_error"] == "model_load_failed"
 
     @pytest.mark.anyio
-    async def test_health_omits_last_error_for_healthy_resident(
-        self, monkeypatch
-    ):
+    async def test_health_omits_last_error_for_healthy_resident(self, monkeypatch):
         """Healthy/loaded resident should not include last_error in health."""
         import vllm_mlx.server as srv
 
@@ -3366,6 +3403,7 @@ class TestPublicLifecycleStatusSanitization:
 
         class FakeEngine:
             is_mllm = False
+
             def get_stats(self):
                 return {"engine_type": "simple"}
 
@@ -3381,9 +3419,7 @@ class TestPublicLifecycleStatusSanitization:
         assert "last_error" not in payload
 
     @pytest.mark.anyio
-    async def test_health_and_status_agree_on_empty_string_error(
-        self, monkeypatch
-    ):
+    async def test_health_and_status_agree_on_empty_string_error(self, monkeypatch):
         """An empty-string last_error should be treated the same by both
         /health and /v1/status — both use ``is not None`` for consistency."""
         import vllm_mlx.server as srv
@@ -3417,10 +3453,12 @@ class TestPublicLifecycleStatusSanitization:
         """_public_lifecycle_status should treat '' the same as a real error."""
         import vllm_mlx.server as srv
 
-        result = srv._public_lifecycle_status({
-            "state": "failed",
-            "last_error": "",
-        })
+        result = srv._public_lifecycle_status(
+            {
+                "state": "failed",
+                "last_error": "",
+            }
+        )
         assert result["last_error"] == "model_load_failed"
 
 
@@ -3451,7 +3489,9 @@ class TestResponseModelFieldUsesServedName:
 
         served_name = "my-custom-served-name"
 
-        async def fake_acquire(raw_request, *, total_timeout=None, deadline=None, count_activity=True):
+        async def fake_acquire(
+            raw_request, *, total_timeout=None, deadline=None, count_activity=True
+        ):
             return FakeEngine()
 
         async def fake_release(*, count_activity=True):
@@ -3496,7 +3536,9 @@ class TestResponseModelFieldUsesServedName:
 
         served_name = "my-custom-served-name"
 
-        async def fake_acquire(raw_request, *, total_timeout=None, deadline=None, count_activity=True):
+        async def fake_acquire(
+            raw_request, *, total_timeout=None, deadline=None, count_activity=True
+        ):
             return FakeEngine()
 
         async def fake_release(*, count_activity=True):
@@ -3545,7 +3587,9 @@ class TestResponseModelFieldUsesServedName:
 
         served_name = "my-custom-served-name"
 
-        async def fake_acquire(raw_request, *, total_timeout=None, deadline=None, count_activity=True):
+        async def fake_acquire(
+            raw_request, *, total_timeout=None, deadline=None, count_activity=True
+        ):
             return FakeEngine()
 
         async def fake_release(*, count_activity=True):

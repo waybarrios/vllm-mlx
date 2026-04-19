@@ -1193,7 +1193,9 @@ class TestResidencyManagerEdgeCases:
             return FakeEngine()
 
         manager = ResidencyManager(
-            factory, time_fn=lambda: 1000.0, auto_unload_idle_seconds=60,
+            factory,
+            time_fn=lambda: 1000.0,
+            auto_unload_idle_seconds=60,
         )
         manager.register_model(ModelSpec(model_key="m", model_name="test"))
 
@@ -1220,7 +1222,9 @@ class TestResidencyManagerEdgeCases:
             return FakeEngine()
 
         manager = ResidencyManager(
-            factory, time_fn=lambda: 1000.0, auto_unload_idle_seconds=60,
+            factory,
+            time_fn=lambda: 1000.0,
+            auto_unload_idle_seconds=60,
         )
         manager.register_model(ModelSpec(model_key="m", model_name="test"))
 
@@ -1313,7 +1317,9 @@ class TestResidencyManagerEdgeCases:
             return FakeEngine()
 
         manager = ResidencyManager(
-            factory, time_fn=lambda: 1000.0, auto_unload_idle_seconds=60,
+            factory,
+            time_fn=lambda: 1000.0,
+            auto_unload_idle_seconds=60,
         )
         manager.register_model(ModelSpec(model_key="m", model_name="test"))
 

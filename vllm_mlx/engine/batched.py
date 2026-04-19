@@ -216,7 +216,9 @@ class BatchedEngine(BaseEngine):
                 await self._start_llm()
 
             self._loaded = True
-            logger.info(f"BatchedEngine loaded: {self._model_name} (mllm={self._is_mllm})")
+            logger.info(
+                f"BatchedEngine loaded: {self._model_name} (mllm={self._is_mllm})"
+            )
         except asyncio.CancelledError:
             await cleanup_startup_cancellation(self.stop)
             raise

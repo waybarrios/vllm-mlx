@@ -24,7 +24,6 @@ from .base import (
 logger = logging.getLogger(__name__)
 
 
-
 class _SpecPrefillCancelled(Exception):
     """Cooperative cancellation sentinel for blocking SpecPrefill workers."""
 
@@ -192,7 +191,9 @@ class SimpleEngine(BaseEngine):
                 try:
                     from mlx_lm import load as mlx_lm_load
 
-                    self._draft_model, _ = mlx_lm_load(self._specprefill_draft_model_path)
+                    self._draft_model, _ = mlx_lm_load(
+                        self._specprefill_draft_model_path
+                    )
                     logger.info(
                         "SpecPrefill: draft model loaded (%s), threshold=%d, keep=%.0f%%",
                         self._specprefill_draft_model_path,

@@ -43,10 +43,7 @@ def restore_server_globals():
         "_tool_parser_instance",
         "_idle_unload_enabled",
     )
-    snapshot = {
-        name: getattr(srv, name, sentinel)
-        for name in global_names
-    }
+    snapshot = {name: getattr(srv, name, sentinel) for name in global_names}
 
     yield
 
@@ -319,9 +316,7 @@ class TestLifecycleCli:
         assert scheduler_config.mtp_num_draft_tokens == 4
         assert scheduler_config.mtp_optimistic is True
 
-    def test_server_main_preserves_use_batching_with_residency_flags(
-        self, monkeypatch
-    ):
+    def test_server_main_preserves_use_batching_with_residency_flags(self, monkeypatch):
         """server.main should forward use_batching and residency knobs together."""
         import vllm_mlx.server as srv
 

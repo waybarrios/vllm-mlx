@@ -34,7 +34,8 @@ def test_async_tests_use_anyio_markers():
                 ):
                     offenders.append(f"{path.name}:{node.lineno}")
 
-    assert offenders == [], (
-        "Found pytest.mark.asyncio after the suite migrated to AnyIO: "
-        + ", ".join(offenders)
+    assert (
+        offenders == []
+    ), "Found pytest.mark.asyncio after the suite migrated to AnyIO: " + ", ".join(
+        offenders
     )

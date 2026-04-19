@@ -408,7 +408,9 @@ def has_media_content(messages: list) -> bool:
     """
     for msg in messages:
         content = (
-            msg.get("content") if isinstance(msg, dict) else getattr(msg, "content", None)
+            msg.get("content")
+            if isinstance(msg, dict)
+            else getattr(msg, "content", None)
         )
         if isinstance(content, list):
             for part in content:
