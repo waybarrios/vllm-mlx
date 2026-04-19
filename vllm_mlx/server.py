@@ -140,7 +140,6 @@ from .api.utils import (
     SPECIAL_TOKENS_PATTERN,
     clean_output_text,
     extract_multimodal_content,
-    has_media_content,
     is_mllm_model,  # noqa: F401
 )
 from .audio_limits import (
