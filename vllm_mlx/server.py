@@ -2929,9 +2929,9 @@ async def _wait_with_disconnect(
 )
 async def create_completion(request: CompletionRequest, raw_request: Request):
     """Create a text completion."""
+    effective_max_tokens = _resolve_request_max_tokens(request.max_tokens)
     model_ctx = await _acquire_request_model(request.model)
     engine = model_ctx.engine
-    effective_max_tokens = _resolve_request_max_tokens(request.max_tokens)
     tracker = _metrics.track_inference("completions", stream=request.stream)
 
     # Handle single prompt or list of prompts
@@ -3099,9 +3099,9 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
     }
     ```
     """
+    effective_max_tokens = _resolve_request_max_tokens(request.max_tokens)
     model_ctx = await _acquire_request_model(request.model)
     engine = model_ctx.engine
-    effective_max_tokens = _resolve_request_max_tokens(request.max_tokens)
     tracker = _metrics.track_inference("chat_completions", stream=request.stream)
 
     # --- Detailed request logging ---
@@ -3551,9 +3551,9 @@ async def create_anthropic_message(
             raise
     anthropic_request = AnthropicRequest(**body)
 
+    effective_max_tokens = _resolve_request_max_tokens(anthropic_request.max_tokens)
     model_ctx = await _acquire_request_model(anthropic_request.model)
     engine = model_ctx.engine
-    effective_max_tokens = _resolve_request_max_tokens(anthropic_request.max_tokens)
 
     # --- Detailed request logging ---
     n_msgs = len(anthropic_request.messages)
