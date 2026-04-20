@@ -77,11 +77,36 @@ class Gemma4ReasoningParser(BaseThinkingReasoningParser):
         # Tracks whether we have emitted the first content delta past the
         # <|channel>response transition — used to strip the leading newline.
         self._content_seen: bool = False
+        # Gemma 4's chat template injects an empty `<|channel>thought\n<channel|>`
+        # preamble on every model turn when enable_thinking=false. The prompt
+        # thus already ends in the END marker, so the model's first emitted
+        # token is content, not reasoning. The base class would otherwise
+        # stay in pre_think and route everything into `reasoning_content`
+        # until a stray `<|channel>` shows up — then choke on the transition
+        # and leak the closing marker into content. Starting in "content"
+        # phase matches the template's actual behavior and still handles
+        # mid-stream thought blocks via the base class's content-phase
+        # re-entry path.
+        self._phase = "content"
+        # Counters used while eating the "thought\n" channel-name prefix at
+        # the start of each reasoning block. Works at delta granularity —
+        # the prefix can be split across arbitrary chunk boundaries
+        # ("tho" / "ught" / "\n") and we still consume it exactly once.
+        self._thought_prefix_consumed: int = 0
+        self._thought_newline_consumed: bool = False
 
     def reset_state(self):
         super().reset_state()
         self._pending = ""
         self._content_seen = False
+        self._phase = "content"
+        self._thought_prefix_consumed = 0
+        self._thought_newline_consumed = False
+
+    def _arm_thought_strip(self) -> None:
+        """Re-arm the thought-prefix stripper when entering a new thinking block."""
+        self._thought_prefix_consumed = 0
+        self._thought_newline_consumed = False
 
     def _trailing_partial_marker_len(self, text: str) -> int:
         """
@@ -243,30 +268,40 @@ class Gemma4ReasoningParser(BaseThinkingReasoningParser):
                     return DeltaMessage(content=stripped)
                 return DeltaMessage(content=delta_text)
 
+        # If the base class entered a new thinking block in this delta
+        # (start token appears somewhere inside delta_text), re-arm the
+        # thought-prefix stripper so we eat the next "thought\n" again.
+        if self.start_token in delta_text:
+            self._arm_thought_strip()
+
         # Delegate to base class for standard <|channel>/<channel|> handling
         result = super().extract_reasoning_streaming(
             previous_text, current_text, delta_text
         )
 
-        # Strip "thought" channel name from initial reasoning
+        # Strip the "thought" channel-name token (and its trailing newline)
+        # from the START of each reasoning block, chunk-by-chunk. We operate
+        # directly on ``result.reasoning`` — NOT on ``current_text`` — so
+        # any ``result.content`` the base class split off stays intact.
         if result is not None and result.reasoning is not None:
-            # First reasoning delta after <|channel> will be "thought" or "thought\n"
-            if self.start_token in current_text:
-                # Check if this is the very first reasoning content
-                after_channel = current_text.split(self.start_token, 1)[1]
-                if after_channel.startswith(_THOUGHT_PREFIX):
-                    # Remove "thought" prefix from the accumulated reasoning so far
-                    clean = after_channel[len(_THOUGHT_PREFIX) :].lstrip("\n")
-                    # Compute what portion of clean text is in this delta
-                    prev_after = ""
-                    if self.start_token in previous_text:
-                        prev_after = previous_text.split(self.start_token, 1)[1]
-                        if prev_after.startswith(_THOUGHT_PREFIX):
-                            prev_after = prev_after[len(_THOUGHT_PREFIX) :].lstrip("\n")
-                    # The new reasoning text is clean minus what was already emitted
-                    new_reasoning = clean[len(prev_after) :]
-                    if new_reasoning:
-                        return DeltaMessage(reasoning=new_reasoning)
-                    return None  # Suppress channel name token
+            r = result.reasoning
+            while (
+                self._thought_prefix_consumed < len(_THOUGHT_PREFIX)
+                and r
+                and r[0] == _THOUGHT_PREFIX[self._thought_prefix_consumed]
+            ):
+                r = r[1:]
+                self._thought_prefix_consumed += 1
+            if (
+                self._thought_prefix_consumed == len(_THOUGHT_PREFIX)
+                and not self._thought_newline_consumed
+                and r.startswith("\n")
+            ):
+                r = r.lstrip("\n")
+                self._thought_newline_consumed = True
+
+            if not r and not result.content:
+                return None
+            return DeltaMessage(reasoning=r or None, content=result.content)
 
         return result
