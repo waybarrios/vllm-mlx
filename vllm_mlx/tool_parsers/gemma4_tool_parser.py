@@ -146,41 +146,133 @@ class Gemma4ToolParser(ToolParser):
     def prepare_messages(
         self, messages: list[dict[str, Any]]
     ) -> list[dict[str, Any]]:
-        """Adapt OpenAI-style ``role: tool`` messages to Gemma 4's
-        expected dict-shape tool-response content.
+        """Coalesce OpenAI ``role:tool`` messages into the preceding
+        assistant's ``tool_responses`` field — the Gemma-native layout
+        the chat template's legacy branch handles correctly.
 
-        OpenAI's Chat Completions API has ``role: tool`` messages
-        carrying string ``content`` (e.g. file contents, shell stdout).
-        Gemma 4's chat template's string-response branch wraps that as
-        ``response:name{value:<|"|>...<|"|>}``, which the model wasn't
-        trained on — it was trained on dict-shape responses matching
-        the tool's declared output schema (``response:name{field1:val1,
-        field2:val2}``). When the model sees the ``{value:...}`` synthetic
-        key, it doesn't recognize the tool call as complete, silently
-        ignores the response, and emits a fresh identical ``<|tool_call>``
-        on the next turn — infinite tool-call loop.
+        OpenAI's Chat Completions shape:
 
-        Wrapping the string as ``{"content": string}`` routes through
-        the template's mapping branch and produces
-        ``response:name{content:<|"|>string<|"|>}``. ``content`` matches
-        OpenAI's own field name for tool message bodies, and the model
-        recognizes the dict shape as a completed response.
+            [assistant{tool_calls:[A,B]}, tool{tool_call_id:A.id, content},
+             tool{tool_call_id:B.id, content}, ...]
 
-        Verified empirically: without the wrap, opencode + Gemma 4 loops
-        on every tool call; with the wrap, the model answers referencing
-        the tool output as expected.
+        Gemma 4 native shape (same data, different layout):
+
+            [assistant{tool_calls:[A,B],
+                       tool_responses:[{name:A.name, response:{content:"..."}},
+                                       {name:B.name, response:{content:"..."}}]}]
+
+        Why this matters: the chat template has two paths for tool
+        responses. The OpenAI forward-scan path (``elif tool_calls``)
+        reads each ``role:tool`` follow-up's ``content`` and dispatches
+        on type — and Jinja2's ``is sequence`` returns True for dicts,
+        so the dict-content branch falls into the sequence loop that
+        calls ``.get('type')`` on each dict *key* (string), which
+        crashes. The legacy ``if tool_responses`` path calls
+        ``format_tool_response_block`` directly with the dict response,
+        which routes through that macro's ``is mapping`` branch and
+        renders the Gemma-native ``response:name{field:value,...}``.
+
+        Wrapping the raw string as ``{"content": str}`` and placing the
+        pair inside ``tool_responses`` lets the template's legacy branch
+        do its job — the model sees
+        ``response:name{content:<|"|>str<|"|>}``, which matches its
+        training data and unblocks the tool loop. No template edits.
+
+        Verified empirically: a raw /v1/completions with this exact
+        shape produces coherent ``The README says ...`` output against
+        the same weights that loop on the template's default string
+        wrapper (``response:name{value:<|"|>...<|"|>}``).
         """
+        import json
+
         adapted: list[dict[str, Any]] = []
-        for msg in messages:
-            if (
-                msg.get("role") == "tool"
-                and isinstance(msg.get("content"), str)
-            ):
-                new_msg = dict(msg)
-                new_msg["content"] = {"content": msg["content"]}
-                adapted.append(new_msg)
-            else:
+        i = 0
+        while i < len(messages):
+            msg = messages[i]
+            role = msg.get("role")
+
+            # Pass-through for anything that isn't an assistant with
+            # tool_calls — the template already renders these correctly.
+            if role != "assistant" or not msg.get("tool_calls"):
                 adapted.append(msg)
+                i += 1
+                continue
+
+            tool_calls = msg.get("tool_calls") or []
+            # Parse arg strings into dicts (no-op when already dict).
+            # The template's tool-call rendering only works on dicts;
+            # server.py does the same for native-format parsers but
+            # this keeps the parser's prepare_messages self-contained
+            # for callers that skip the server-layer conversion.
+            normalized_calls = []
+            id_to_name: dict[str, str] = {}
+            for tc in tool_calls:
+                tc_copy = dict(tc)
+                func = dict(tc_copy.get("function") or {})
+                args = func.get("arguments")
+                if isinstance(args, str):
+                    try:
+                        func["arguments"] = json.loads(args)
+                    except (json.JSONDecodeError, ValueError):
+                        pass
+                tc_copy["function"] = func
+                normalized_calls.append(tc_copy)
+                if tc_copy.get("id") and func.get("name"):
+                    id_to_name[tc_copy["id"]] = func["name"]
+
+            # Forward-scan consecutive role:tool messages and convert
+            # each into a tool_responses entry keyed to the matching
+            # tool_call's name (so the rendered response:<name>{...}
+            # matches the call:<name>{...} above it).
+            tool_responses: list[dict[str, Any]] = []
+            j = i + 1
+            while j < len(messages) and messages[j].get("role") == "tool":
+                tool_msg = messages[j]
+                name = (
+                    id_to_name.get(tool_msg.get("tool_call_id") or "")
+                    or tool_msg.get("name")
+                    or "unknown"
+                )
+                content = tool_msg.get("content")
+                if isinstance(content, str):
+                    response = {"content": content}
+                elif isinstance(content, dict):
+                    response = content
+                elif isinstance(content, list):
+                    # Multimodal tool content (e.g. screenshot return). The
+                    # template's dict branch iterates keys, so coalesce any
+                    # text parts into a single string under ``content`` and
+                    # pass image/etc parts through under type-keyed fields
+                    # preserving order. For the common text-only case this
+                    # matches the string branch output.
+                    text_parts: list[str] = []
+                    extras: list[dict[str, Any]] = []
+                    for part in content:
+                        if hasattr(part, "model_dump"):
+                            part = part.model_dump(exclude_none=True)
+                        if not isinstance(part, dict):
+                            continue
+                        if part.get("type") == "text":
+                            text_parts.append(part.get("text", ""))
+                        else:
+                            extras.append(part)
+                    response = {"content": "".join(text_parts)}
+                    if extras:
+                        response["parts"] = extras
+                else:
+                    response = {"content": "" if content is None else str(content)}
+
+                tool_responses.append({"name": name, "response": response})
+                j += 1
+
+            # Rebuild the assistant message with the coalesced responses.
+            new_msg = {k: v for k, v in msg.items() if k != "tool_calls"}
+            new_msg["tool_calls"] = normalized_calls
+            if tool_responses:
+                new_msg["tool_responses"] = tool_responses
+            adapted.append(new_msg)
+            i = j  # skip past the consumed tool messages
+
         return adapted
 
     def extract_tool_calls(
