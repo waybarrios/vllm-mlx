@@ -1801,6 +1801,45 @@ def _tool_choice_disabled(request: ChatCompletionRequest | None) -> bool:
     return tool_choice == "none"
 
 
+def _apply_tool_parser_message_adapter(
+    messages: list[dict],
+) -> list[dict]:
+    """Run the configured tool parser's ``prepare_messages`` hook over
+    the message list. Per-model adaptation of OpenAI-shape messages to
+    what the model's chat template expects — see ToolParser.prepare_messages.
+
+    No-op when auto-tool-choice is off, no parser is configured, or the
+    parser hasn't yet been instantiated. Safe to call at any point in
+    the request pipeline.
+    """
+    if not _enable_auto_tool_choice or not _tool_call_parser:
+        return messages
+    global _tool_parser_instance
+    if _tool_parser_instance is None:
+        try:
+            parser_cls = ToolParserManager.get_tool_parser(_tool_call_parser)
+            tokenizer = None
+            if _engine is not None and hasattr(_engine, "_tokenizer"):
+                tokenizer = _engine._tokenizer
+            _tool_parser_instance = parser_cls(tokenizer)
+        except Exception as exc:
+            logger.debug(
+                f"prepare_messages: parser init failed ({exc}); "
+                f"passing messages through unchanged"
+            )
+            return messages
+    try:
+        return _tool_parser_instance.prepare_messages(messages)
+    except Exception as exc:
+        logger.warning(
+            "prepare_messages: parser %r raised (%s); "
+            "passing messages through unchanged",
+            _tool_call_parser,
+            _sanitize_log_text(exc, limit=300),
+        )
+        return messages
+
+
 def _get_streaming_tool_parser(request: ChatCompletionRequest | None):
     """Get a streaming-capable tool parser for this request.
 
@@ -3171,6 +3210,7 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
                         except (json.JSONDecodeError, ValueError):
                             pass
         messages = _normalize_messages(messages)
+        messages = _apply_tool_parser_message_adapter(messages)
     else:
         # For LLM, extract text, images, and videos separately
         messages, images, videos = extract_multimodal_content(
@@ -3178,6 +3218,7 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
             preserve_native_format=engine.preserve_native_tool_format,
         )
         messages = _normalize_messages(messages)
+        messages = _apply_tool_parser_message_adapter(messages)
 
     has_media = bool(images or videos)
     if engine.is_mllm and not has_media:
@@ -3612,6 +3653,7 @@ async def create_anthropic_message(
         preserve_native_format=engine.preserve_native_tool_format,
     )
     messages = _normalize_messages(messages)
+    messages = _apply_tool_parser_message_adapter(messages)
 
     # Handle response_format (propagated from Anthropic request via adapter):
     # inject prompt-level instruction AND wire a grammar-guided logits
@@ -3925,6 +3967,7 @@ async def _stream_anthropic_messages(
         preserve_native_format=engine.preserve_native_tool_format,
     )
     messages = _normalize_messages(messages)
+    messages = _apply_tool_parser_message_adapter(messages)
 
     chat_kwargs = {
         "max_tokens": max_tokens,

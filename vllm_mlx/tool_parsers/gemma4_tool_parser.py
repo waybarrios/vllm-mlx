@@ -143,6 +143,46 @@ class Gemma4ToolParser(ToolParser):
 
     SUPPORTS_NATIVE_TOOL_FORMAT = True
 
+    def prepare_messages(
+        self, messages: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        """Adapt OpenAI-style ``role: tool`` messages to Gemma 4's
+        expected dict-shape tool-response content.
+
+        OpenAI's Chat Completions API has ``role: tool`` messages
+        carrying string ``content`` (e.g. file contents, shell stdout).
+        Gemma 4's chat template's string-response branch wraps that as
+        ``response:name{value:<|"|>...<|"|>}``, which the model wasn't
+        trained on — it was trained on dict-shape responses matching
+        the tool's declared output schema (``response:name{field1:val1,
+        field2:val2}``). When the model sees the ``{value:...}`` synthetic
+        key, it doesn't recognize the tool call as complete, silently
+        ignores the response, and emits a fresh identical ``<|tool_call>``
+        on the next turn — infinite tool-call loop.
+
+        Wrapping the string as ``{"content": string}`` routes through
+        the template's mapping branch and produces
+        ``response:name{content:<|"|>string<|"|>}``. ``content`` matches
+        OpenAI's own field name for tool message bodies, and the model
+        recognizes the dict shape as a completed response.
+
+        Verified empirically: without the wrap, opencode + Gemma 4 loops
+        on every tool call; with the wrap, the model answers referencing
+        the tool output as expected.
+        """
+        adapted: list[dict[str, Any]] = []
+        for msg in messages:
+            if (
+                msg.get("role") == "tool"
+                and isinstance(msg.get("content"), str)
+            ):
+                new_msg = dict(msg)
+                new_msg["content"] = {"content": msg["content"]}
+                adapted.append(new_msg)
+            else:
+                adapted.append(msg)
+        return adapted
+
     def extract_tool_calls(
         self, model_output: str, request: dict[str, Any] | None = None
     ) -> ExtractedToolCallInformation:
