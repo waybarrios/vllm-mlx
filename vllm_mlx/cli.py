@@ -72,11 +72,21 @@ def serve_command(args):
         server._enable_auto_tool_choice = False
         server._tool_call_parser = None
 
-    # Configure generation defaults
+    # Configure generation defaults. CLI values are applied here pre-load
+    # so _apply_generation_config_defaults() (called after load_model)
+    # only fills in values the operator did NOT pin via CLI.
     if args.default_temperature is not None:
         server._default_temperature = args.default_temperature
     if args.default_top_p is not None:
         server._default_top_p = args.default_top_p
+    if getattr(args, "default_top_k", None) is not None:
+        server._default_top_k = args.default_top_k
+    if getattr(args, "default_min_p", None) is not None:
+        server._default_min_p = args.default_min_p
+    if getattr(args, "default_presence_penalty", None) is not None:
+        server._default_presence_penalty = args.default_presence_penalty
+    if getattr(args, "default_repetition_penalty", None) is not None:
+        server._default_repetition_penalty = args.default_repetition_penalty
     server._max_audio_upload_bytes = args.max_audio_upload_mb * 1024 * 1024
     server._max_tts_input_chars = args.max_tts_input_chars
 
@@ -270,6 +280,10 @@ def serve_command(args):
         specprefill_draft_model=args.specprefill_draft_model,
         warm_prompts_path=args.warm_prompts,
     )
+
+    # Fill in any sampling default the operator didn't pin via CLI from
+    # the loaded model's generation_config.json.
+    server._apply_generation_config_defaults()
 
     # Start server
     print(f"Starting server at http://{args.host}:{args.port}")
