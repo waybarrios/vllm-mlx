@@ -1397,9 +1397,10 @@ class MLXMultimodalLM:
         from mlx_vlm import generate
         from mlx_vlm.prompt_utils import get_chat_template
 
-        # Extract text and images from messages
-        # Build chat_messages for multi-turn support WITH proper image tokens per message
+        # Extract text, images and audio from messages
+        # Build chat_messages for multi-turn support WITH proper image/audio tokens per message
         all_image_urls = []  # Raw URLs/paths to process later
+        all_audio_urls = []  # Raw audio URLs/paths to process later
         chat_messages = []  # List of properly formatted messages for chat template
 
         logger.info(f"MLLM.chat() called with {len(messages)} messages")
@@ -1483,17 +1484,27 @@ class MLXMultimodalLM:
                             )
                             msg_image_count += 1
 
+                        elif item_type == "audio_url":
+                            aud_url = item.get("audio_url", {})
+                            if isinstance(aud_url, str):
+                                all_audio_urls.append(aud_url)
+                            else:
+                                all_audio_urls.append(aud_url.get("url", ""))
+
             # Add video frame count to image count for this message
             msg_image_count += _msg_video_frame_counts.get(msg_idx, 0)
+            msg_audio_count = len(all_audio_urls)
 
-            # Build properly structured message for Qwen3-VL-MoE
-            # Format: {"role": "...", "content": [{"type": "image"}, ..., {"type": "text", "text": "..."}]}
-            if msg_text or msg_image_count > 0:
-                if role == "user" and msg_image_count > 0:
-                    # User message WITH images - build content array with image tokens FIRST
+            # Build properly structured message
+            # Format: {"role": "...", "content": [{"type": "image"}, ..., {"type": "audio"}, ..., {"type": "text", "text": "..."}]}
+            if msg_text or msg_image_count > 0 or msg_audio_count > 0:
+                if role == "user" and (msg_image_count > 0 or msg_audio_count > 0):
+                    # User message WITH images/audio - build content array with media tokens FIRST
                     content_list = []
                     for _ in range(msg_image_count):
                         content_list.append({"type": "image"})
+                    for _ in range(msg_audio_count):
+                        content_list.append({"type": "audio"})
                     content_list.append(
                         {"type": "text", "text": msg_text, "content": msg_text}
                     )
@@ -1521,7 +1532,7 @@ class MLXMultimodalLM:
 
         # Apply chat template directly - messages are already properly structured
         logger.info(
-            f"Applying chat template with {len(chat_messages)} messages, {len(all_images)} images"
+            f"Applying chat template with {len(chat_messages)} messages, {len(all_images)} images, {len(all_audio_urls)} audios"
         )
         for i, cm in enumerate(chat_messages):
             content_preview = str(cm.get("content", ""))[:80]
@@ -1664,6 +1675,7 @@ class MLXMultimodalLM:
             self.processor,
             formatted_prompt,
             all_images if all_images else None,
+            audio=all_audio_urls if all_audio_urls else None,
             max_tokens=max_tokens,
             temp=temperature,
             verbose=False,
