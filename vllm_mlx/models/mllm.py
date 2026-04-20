@@ -1133,6 +1133,126 @@ class MLXMultimodalLM:
 
         return translated
 
+    def _prepare_chat_messages(
+        self,
+        messages: list[dict],
+        video_frame_counts: dict[int, int] | None = None,
+    ) -> tuple[list[dict], list]:
+        """Transform OpenAI-format messages into chat-template-ready form.
+
+        Preserves every message's full structure — ``role``, ``tool_calls``
+        (assistant side), ``tool_call_id`` + ``name`` (tool side), and
+        content in whatever shape it arrived (None, str, dict, list). For
+        list content, walks items in order and:
+
+        - Text parts: passed through as ``{type: text, text: ...}``.
+        - ``image_url`` / ``image`` parts: URL registered into
+          ``all_image_urls`` for the image pipeline; item replaced with
+          ``{type: image}`` so the chat template emits its model-specific
+          image placeholder at that position. Order inside the content
+          list is preserved.
+        - ``video``/``video_url`` and unknown part types: passed through
+          unchanged so specialised templates can render them.
+
+        ``video_frame_counts`` maps message index → number of frames that
+        the video-frame-fallback pipeline extracted from videos in that
+        message. Each frame is a real image already added to
+        ``all_video_frames`` by the caller; we append one ``{type: image}``
+        placeholder per frame so the template emits the matching count of
+        image tokens aligned with the frame pixels passed to the model.
+
+        Dict content on a message passes through unchanged — supports the
+        tool-parser adapter's wrap pattern (e.g. Gemma 4 wrapping string
+        tool responses as ``{"content": str}`` so the template's
+        mapping-branch renders them as
+        ``response:name{content:<|"|>str<|"|>}`` rather than the synthetic
+        ``{value:...}`` the model wasn't trained on).
+
+        Returns the rebuilt messages list plus the flat list of image URLs
+        that need downloading/decoding via ``_prepare_images``.
+        """
+        chat_messages: list[dict] = []
+        all_image_urls: list = []
+        video_frame_counts = video_frame_counts or {}
+
+        for msg_idx, msg in enumerate(messages):
+            role = msg.get("role", "user")
+            content = msg.get("content", "")
+
+            out: dict = {"role": role}
+            for k in ("tool_calls", "tool_call_id", "name"):
+                if k in msg and msg[k] is not None:
+                    out[k] = msg[k]
+
+            n_video_frames = video_frame_counts.get(msg_idx, 0)
+
+            if isinstance(content, list):
+                transformed: list = []
+                for item in content:
+                    if isinstance(item, str):
+                        transformed.append({"type": "text", "text": item})
+                        continue
+
+                    # Pydantic model conversion (drop None fields to avoid
+                    # e.g. `image_url: null` on text parts tripping templates)
+                    if hasattr(item, "model_dump"):
+                        item = item.model_dump(exclude_none=True)
+                    elif hasattr(item, "dict"):
+                        item = {k: v for k, v in item.dict().items() if v is not None}
+
+                    if not isinstance(item, dict):
+                        continue
+
+                    item_type = item.get("type", "")
+                    if item_type == "text":
+                        transformed.append(item)
+                    elif item_type == "image_url":
+                        url_obj = item.get("image_url", {})
+                        url = (
+                            url_obj.get("url", "")
+                            if isinstance(url_obj, dict)
+                            else url_obj
+                        )
+                        if url:
+                            all_image_urls.append(url)
+                            transformed.append({"type": "image"})
+                    elif item_type == "image":
+                        url = item.get("image", item.get("url", ""))
+                        if url:
+                            all_image_urls.append(url)
+                            transformed.append({"type": "image"})
+                    else:
+                        # video/video_url/audio/etc. — pass through so
+                        # specialised templates can render them.
+                        transformed.append(item)
+
+                # One image placeholder per extracted video frame, each
+                # corresponding to a real frame already in all_video_frames.
+                for _ in range(n_video_frames):
+                    transformed.append({"type": "image"})
+                out["content"] = transformed
+            elif n_video_frames:
+                # String / None / dict content alongside extracted video frames
+                # — promote to list so the frame placeholders sit next to text.
+                parts: list = []
+                for _ in range(n_video_frames):
+                    parts.append({"type": "image"})
+                if isinstance(content, str) and content:
+                    parts.append({"type": "text", "text": content})
+                elif isinstance(content, dict):
+                    # Rare but legal: preserve dict next to frame placeholders.
+                    parts.append(content)
+                out["content"] = parts
+            else:
+                # None, str, dict — pass through verbatim. Tool-call-only
+                # assistant turns (content=None) and tool-parser-wrapped
+                # dict content both fall through here.
+                out["content"] = content
+
+            chat_messages.append(out)
+
+        return chat_messages, all_image_urls
+
     def generate(
         self,
         prompt: str,
@@ -1397,11 +1517,6 @@ class MLXMultimodalLM:
         from mlx_vlm import generate
         from mlx_vlm.prompt_utils import get_chat_template
 
-        # Extract text and images from messages
-        # Build chat_messages for multi-turn support WITH proper image tokens per message
-        all_image_urls = []  # Raw URLs/paths to process later
-        chat_messages = []  # List of properly formatted messages for chat template
-
         logger.info(f"MLLM.chat() called with {len(messages)} messages")
 
         # Pop params early so they don't leak into mlx_vlm.generate()
@@ -1440,77 +1555,13 @@ class MLXMultimodalLM:
                 logger.info(f"Added {len(frames)} frames from video: {vid_input}")
             _msg_video_frame_counts[msg_idx] = total_frames
 
-        # Second pass: build chat messages with image counts that include video frames
-        for msg_idx, msg in enumerate(messages):
-            role = msg.get("role", "user")
-            content = msg.get("content", "")
-            msg_text = ""  # Text content for this message
-            msg_image_count = 0  # Number of images in THIS message
-
-            if isinstance(content, str):
-                msg_text = content
-            elif isinstance(content, list):
-                # OpenAI multimodal format - extract text and count images for THIS message
-                for item in content:
-                    if isinstance(item, str):
-                        msg_text += item
-                        continue
-
-                    # Convert Pydantic models to dicts, excluding None fields
-                    # to avoid null keys like image_url: null on text parts
-                    if hasattr(item, "model_dump"):
-                        item = item.model_dump(exclude_none=True)
-                    elif hasattr(item, "dict"):
-                        item = {k: v for k, v in item.dict().items() if v is not None}
-
-                    if isinstance(item, dict):
-                        item_type = item.get("type", "")
-
-                        if item_type == "text":
-                            msg_text += item.get("text", "")
-
-                        elif item_type == "image_url":
-                            img_url = item.get("image_url", {})
-                            if isinstance(img_url, str):
-                                all_image_urls.append(img_url)
-                            else:
-                                all_image_urls.append(img_url.get("url", ""))
-                            msg_image_count += 1
-
-                        elif item_type == "image":
-                            all_image_urls.append(
-                                item.get("image", item.get("url", ""))
-                            )
-                            msg_image_count += 1
-
-            # Add video frame count to image count for this message
-            msg_image_count += _msg_video_frame_counts.get(msg_idx, 0)
-
-            # Build properly structured message for Qwen3-VL-MoE
-            # Format: {"role": "...", "content": [{"type": "image"}, ..., {"type": "text", "text": "..."}]}
-            if msg_text or msg_image_count > 0:
-                if role == "user" and msg_image_count > 0:
-                    # User message WITH images - build content array with image tokens FIRST
-                    content_list = []
-                    for _ in range(msg_image_count):
-                        content_list.append({"type": "image"})
-                    content_list.append(
-                        {"type": "text", "text": msg_text, "content": msg_text}
-                    )
-                    chat_messages.append({"role": role, "content": content_list})
-                elif role == "assistant":
-                    # Assistant messages - just text content (not array)
-                    chat_messages.append({"role": role, "content": msg_text})
-                else:
-                    # User/system message WITHOUT images - still use content array format
-                    chat_messages.append(
-                        {
-                            "role": role,
-                            "content": [
-                                {"type": "text", "text": msg_text, "content": msg_text}
-                            ],
-                        }
-                    )
+        # Rebuild messages for the template. Preserves tool_calls /
+        # tool_call_id / name / dict-content intact while extracting image
+        # URLs and inserting `{type: image}` placeholders inline at each
+        # image's original position.
+        chat_messages, all_image_urls = self._prepare_chat_messages(
+            messages, _msg_video_frame_counts
+        )
 
         # Process images
         all_images = []
@@ -1796,11 +1847,6 @@ class MLXMultimodalLM:
             yield output
             return
 
-        # Extract text and images from messages
-        # Build chat_messages for multi-turn support WITH proper image tokens per message
-        all_image_urls = []  # Raw URLs/paths to process later
-        chat_messages = []  # List of properly formatted messages for chat template
-
         # Pop params early so they don't leak into mlx_vlm.generate()
         video_fps = kwargs.pop("video_fps", DEFAULT_FPS)
         video_max_frames = kwargs.pop("video_max_frames", MAX_FRAMES)
@@ -1844,67 +1890,12 @@ class MLXMultimodalLM:
                 logger.info(f"Added {len(frames)} frames from video: {vid_input}")
             _msg_video_frame_counts[msg_idx] = total_frames
 
-        for msg_idx, msg in enumerate(messages):
-            role = msg.get("role", "user")
-            content = msg.get("content", "")
-            msg_text = ""
-            msg_image_count = 0
-
-            if isinstance(content, str):
-                msg_text = content
-            elif isinstance(content, list):
-                for item in content:
-                    if isinstance(item, str):
-                        msg_text += item
-                        continue
-
-                    if hasattr(item, "model_dump"):
-                        item = item.model_dump(exclude_none=True)
-                    elif hasattr(item, "dict"):
-                        item = {k: v for k, v in item.dict().items() if v is not None}
-
-                    if isinstance(item, dict):
-                        item_type = item.get("type", "")
-
-                        if item_type == "text":
-                            msg_text += item.get("text", "")
-
-                        elif item_type == "image_url":
-                            img_url = item.get("image_url", {})
-                            if isinstance(img_url, str):
-                                all_image_urls.append(img_url)
-                            else:
-                                all_image_urls.append(img_url.get("url", ""))
-                            msg_image_count += 1
-
-                        elif item_type == "image":
-                            all_image_urls.append(
-                                item.get("image", item.get("url", ""))
-                            )
-                            msg_image_count += 1
-
-            msg_image_count += _msg_video_frame_counts.get(msg_idx, 0)
-
-            if msg_text or msg_image_count > 0:
-                if role == "user" and msg_image_count > 0:
-                    content_list = []
-                    for _ in range(msg_image_count):
-                        content_list.append({"type": "image"})
-                    content_list.append(
-                        {"type": "text", "text": msg_text, "content": msg_text}
-                    )
-                    chat_messages.append({"role": role, "content": content_list})
-                elif role == "assistant":
-                    chat_messages.append({"role": role, "content": msg_text})
-                else:
-                    chat_messages.append(
-                        {
-                            "role": role,
-                            "content": [
-                                {"type": "text", "text": msg_text, "content": msg_text}
-                            ],
-                        }
-                    )
+        # Rebuild messages for the template. Preserves tool_calls /
+        # tool_call_id / name / dict-content intact while extracting image
+        # URLs and inserting `{type: image}` placeholders inline.
+        chat_messages, all_image_urls = self._prepare_chat_messages(
+            messages, _msg_video_frame_counts
+        )
 
         all_images = []
         if all_image_urls:
