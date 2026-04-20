@@ -239,28 +239,45 @@ class Gemma4ToolParser(ToolParser):
         delta_token_ids: Sequence[int] | None = None,
         request: dict[str, Any] | None = None,
     ) -> dict[str, Any] | None:
-        """Extract tool calls from streaming Gemma 4 model output."""
-        has_start = TOOL_CALL_START in current_text
+        """Extract tool calls from streaming Gemma 4 model output.
 
-        if not has_start:
+        OpenAI delta semantics: each streamed ``tool_calls`` entry gets
+        a stable ``id`` that the client concatenates deltas into, keyed
+        by ``index``. This implementation emits newly-completed tool
+        call blocks once, in order, and uses ``self.prev_tool_call_arr``
+        (reset per stream by the base class) to avoid re-emitting
+        earlier blocks — which would otherwise regenerate fresh UUIDs
+        every time a later ``<tool_call|>`` arrived.
+        """
+        if TOOL_CALL_START not in current_text:
             return {"content": delta_text}
 
-        if TOOL_CALL_END in delta_text:
-            result = self.extract_tool_calls(current_text)
-            if result.tools_called:
-                return {
-                    "tool_calls": [
-                        {
-                            "index": i,
-                            "id": tc["id"],
-                            "type": "function",
-                            "function": {
-                                "name": tc["name"],
-                                "arguments": tc["arguments"],
-                            },
-                        }
-                        for i, tc in enumerate(result.tool_calls)
-                    ]
-                }
+        # Only emit when at least one block has completed in this delta.
+        if TOOL_CALL_END not in delta_text:
+            return None
 
-        return None
+        result = self.extract_tool_calls(current_text)
+        if not result.tools_called:
+            return None
+
+        already_emitted = len(self.prev_tool_call_arr)
+        new_calls = result.tool_calls[already_emitted:]
+        if not new_calls:
+            return None
+
+        self.prev_tool_call_arr.extend(new_calls)
+
+        return {
+            "tool_calls": [
+                {
+                    "index": already_emitted + i,
+                    "id": tc["id"],
+                    "type": "function",
+                    "function": {
+                        "name": tc["name"],
+                        "arguments": tc["arguments"],
+                    },
+                }
+                for i, tc in enumerate(new_calls)
+            ]
+        }
