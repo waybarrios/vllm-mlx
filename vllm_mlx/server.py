@@ -271,8 +271,17 @@ def _apply_generation_config_defaults() -> None:
         )
         return
 
-    tokenizer = getattr(_engine, "tokenizer", None)
-    tok_path = getattr(tokenizer, "name_or_path", None) if tokenizer else None
+    # For MLLM engines ``_engine.tokenizer`` returns the HF processor; the
+    # actual tokenizer hangs off that. mllm_scheduler unwraps the same way
+    # when collecting EOS token IDs.
+    processor_or_tokenizer = getattr(_engine, "tokenizer", None)
+    tokenizer = (
+        getattr(processor_or_tokenizer, "tokenizer", None)
+        or processor_or_tokenizer
+    )
+    tok_path = getattr(tokenizer, "name_or_path", None)
+    if not tok_path:
+        tok_path = getattr(processor_or_tokenizer, "name_or_path", None)
 
     if not tok_path:
         logger.info(
