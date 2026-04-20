@@ -242,73 +242,76 @@ def _resolve_repetition_penalty(request_value: float | None) -> float:
     return _FALLBACK_REPETITION_PENALTY
 
 
-def _apply_generation_config_defaults(model_path: str | None) -> None:
-    """Read the model's ``generation_config.json`` and fill in any server
-    sampling defaults the user didn't override via CLI.
+def _apply_generation_config_defaults() -> None:
+    """Fill in any server sampling default the operator didn't pin via CLI
+    from the loaded model's ``generation_config.json``.
 
-    Priority on request time: request body > CLI flag > generation_config.json
-    > hardcoded fallback. CLI flags get priority because operators explicitly
-    chose them; generation_config.json fills in only the blanks.
+    Many HF models ship reasonable sampling defaults in that file
+    (``temperature``, ``top_p``, ``top_k``, ``min_p``, ``repetition_penalty``).
+    Without this loader, clients that omit sampling params get mlx-lm's
+    generic fallbacks regardless of what the model was tuned for.
 
-    Gemma 4 is the motivating case: its generation_config.json ships
-    ``temperature=1.0, top_p=0.95, top_k=64`` — without this loader those
-    values went unused and clients omitting sampling params got mlx-lm's
-    fallbacks (temp 0.7, top_k 0), which destabilizes the model.
+    Resolution order at request time: request body > CLI flag >
+    generation_config.json > hardcoded fallback. CLI wins over the model
+    file because an operator override is an explicit choice.
+
+    The tokenizer's ``name_or_path`` is the authoritative source for the
+    resolved model directory post-load — same path ``mllm_scheduler`` uses
+    to fish out EOS tokens. Call only after ``load_model()``.
     """
     global _default_temperature, _default_top_p, _default_top_k
     global _default_min_p, _default_repetition_penalty
 
-    if not model_path:
-        return
-
     import json
     from pathlib import Path
 
-    # ``model_path`` may be a repo ID (not a filesystem path) if the user
-    # passed e.g. ``unsloth/gemma-4-31b-it-MLX-8bit``. In that case resolve
-    # it via the HF cache directory the model actually landed in.
-    candidate_paths: list[Path] = []
-    mp = Path(model_path)
-    if mp.exists():
-        candidate_paths.append(mp)
-    else:
-        try:
-            from huggingface_hub import snapshot_download
-
-            cache_path = Path(
-                snapshot_download(repo_id=model_path, local_files_only=True)
-            )
-            candidate_paths.append(cache_path)
-        except Exception:
-            return
-
-    for base in candidate_paths:
-        gc_path = base / "generation_config.json"
-        if not gc_path.exists():
-            continue
-        try:
-            gc = json.loads(gc_path.read_text())
-        except Exception:
-            continue
-
-        if _default_temperature is None and "temperature" in gc:
-            _default_temperature = float(gc["temperature"])
-        if _default_top_p is None and "top_p" in gc:
-            _default_top_p = float(gc["top_p"])
-        if _default_top_k is None and "top_k" in gc:
-            _default_top_k = int(gc["top_k"])
-        if _default_min_p is None and "min_p" in gc:
-            _default_min_p = float(gc["min_p"])
-        if _default_repetition_penalty is None and "repetition_penalty" in gc:
-            _default_repetition_penalty = float(gc["repetition_penalty"])
-
+    if _engine is None:
         logger.info(
-            "sampling defaults from generation_config.json: "
-            f"temperature={_default_temperature} top_p={_default_top_p} "
-            f"top_k={_default_top_k} min_p={_default_min_p} "
-            f"repetition_penalty={_default_repetition_penalty}"
+            "sampling defaults: engine not loaded, using CLI/fallbacks only"
         )
-        break
+        return
+
+    tokenizer = getattr(_engine, "tokenizer", None)
+    tok_path = getattr(tokenizer, "name_or_path", None) if tokenizer else None
+
+    if not tok_path:
+        logger.info(
+            "sampling defaults: tokenizer has no name_or_path, using "
+            "CLI/fallbacks only"
+        )
+        return
+
+    gc_path = Path(tok_path) / "generation_config.json"
+    if not gc_path.exists():
+        logger.info(
+            f"sampling defaults: no generation_config.json at {gc_path}, "
+            "using CLI/fallbacks only"
+        )
+        return
+
+    try:
+        gc = json.loads(gc_path.read_text())
+    except Exception as exc:
+        logger.warning(f"sampling defaults: could not read {gc_path}: {exc}")
+        return
+
+    if _default_temperature is None and "temperature" in gc:
+        _default_temperature = float(gc["temperature"])
+    if _default_top_p is None and "top_p" in gc:
+        _default_top_p = float(gc["top_p"])
+    if _default_top_k is None and "top_k" in gc:
+        _default_top_k = int(gc["top_k"])
+    if _default_min_p is None and "min_p" in gc:
+        _default_min_p = float(gc["min_p"])
+    if _default_repetition_penalty is None and "repetition_penalty" in gc:
+        _default_repetition_penalty = float(gc["repetition_penalty"])
+
+    logger.info(
+        f"sampling defaults loaded from {gc_path}: "
+        f"temperature={_default_temperature} top_p={_default_top_p} "
+        f"top_k={_default_top_k} min_p={_default_min_p} "
+        f"repetition_penalty={_default_repetition_penalty}"
+    )
 
 
 def _resolve_request_max_tokens(requested_value: int | None) -> int:
@@ -4823,11 +4826,9 @@ def main():
         trust_remote_code=args.trust_remote_code,
     )
 
-    # Fill in any sampling defaults the operator didn't pin via CLI from the
-    # model's generation_config.json. This is how Gemma 4's declared
-    # top_k=64 / top_p=0.95 / temperature=1.0 actually reach the sampler
-    # when clients omit these fields.
-    _apply_generation_config_defaults(_model_path)
+    # Fill in any sampling default the operator didn't pin via CLI from
+    # the loaded model's generation_config.json.
+    _apply_generation_config_defaults()
 
     # Start server
     uvicorn.run(app, host=args.host, port=args.port)
