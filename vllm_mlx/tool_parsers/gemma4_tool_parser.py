@@ -131,7 +131,17 @@ class Gemma4ToolParser(ToolParser):
     Parses: <|tool_call>call:func{<|"|>key<|"|>: <|"|>val<|"|>}<tool_call|>
 
     Used when --enable-auto-tool-choice --tool-call-parser gemma4 are set.
+
+    Native tool format is supported end-to-end: Gemma 4's chat template
+    renders ``role: tool`` messages via a forward-scan inside the
+    preceding assistant turn (``<|tool_response>response:name{...}<tool_response|>``)
+    and expects tool_call ``arguments`` as a dict (not a JSON-string) so
+    its mapping-render branch can emit ``key:<|"|>value<|"|>`` pairs
+    instead of leaking OpenAI's ``{"key":"value"}`` JSON verbatim —
+    which produces the double-brace ``{{"k":"v"}}`` pathology.
     """
+
+    SUPPORTS_NATIVE_TOOL_FORMAT = True
 
     def extract_tool_calls(
         self, model_output: str, request: dict[str, Any] | None = None
