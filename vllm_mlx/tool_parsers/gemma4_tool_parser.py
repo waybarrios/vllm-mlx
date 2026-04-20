@@ -139,6 +139,12 @@ class Gemma4ToolParser(ToolParser):
 
     SUPPORTS_NATIVE_TOOL_FORMAT = True
 
+    # The chat template renders <|tool_response> (token 50) when the assistant
+    # emits a tool call without its own tool_responses block — it's the signal
+    # that it's the runtime's turn, not the model's. Treat it as EOG so the
+    # model doesn't keep generating past the tool call (ref: llama.cpp #21418).
+    extra_stop_tokens = ["<|tool_response>"]
+
     def prepare_messages(
         self, messages: list[dict[str, Any]]
     ) -> list[dict[str, Any]]:

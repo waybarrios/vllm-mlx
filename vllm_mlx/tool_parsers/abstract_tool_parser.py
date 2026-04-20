@@ -50,6 +50,12 @@ class ToolParser(ABC):
     # without needing conversion to text format.
     SUPPORTS_NATIVE_TOOL_FORMAT: bool = False
 
+    # Extra stop tokens specific to this parser's model format. The server
+    # merges these into the request's `stop` list when the parser is active,
+    # so the model halts on format-specific EOG markers (e.g. Gemma 4's
+    # <|tool_response>) that are not part of the tokenizer's default eos set.
+    extra_stop_tokens: list[str] = []
+
     @classmethod
     def supports_native_format(cls) -> bool:
         """
