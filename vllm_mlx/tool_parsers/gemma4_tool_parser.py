@@ -133,6 +133,13 @@ class Gemma4ToolParser(ToolParser):
     Used when --enable-auto-tool-choice --tool-call-parser gemma4 are set.
     """
 
+    # The chat template renders <|tool_response> (token 50) when the assistant
+    # emits a tool call without its own tool_responses block — it's the signal
+    # that it's the runtime's turn, not the model's. Treat it as EOG so the
+    # model doesn't keep generating past the tool call.
+    # Ref: llama.cpp PR #21418.
+    extra_stop_tokens = ["<|tool_response>"]
+
     def extract_tool_calls(
         self, model_output: str, request: dict[str, Any] | None = None
     ) -> ExtractedToolCallInformation:

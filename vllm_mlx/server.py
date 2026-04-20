@@ -155,7 +155,7 @@ from .endpoint_model_policies import (
     resolve_tts_model_name,
 )
 from .metrics import metrics as _metrics
-from .tool_parsers import ToolParserManager
+from .tool_parsers import ToolParserManager, get_parser_stop_tokens
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -3128,6 +3128,14 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
     # Add tools if provided
     if request.tools and request.tool_choice != "none":
         chat_kwargs["tools"] = convert_tools_for_template(request.tools)
+
+    # Merge stop sequences: user-supplied + parser-declared EOG tokens.
+    # Gemma 4's <|tool_response> is the canonical example — without it the
+    # model keeps generating text after a tool call (llama.cpp PR #21418).
+    parser_name = _tool_call_parser if _enable_auto_tool_choice else None
+    merged_stop = get_parser_stop_tokens(parser_name, request.stop)
+    if merged_stop:
+        chat_kwargs["stop"] = merged_stop
 
     # Wire constrained decoding logits processor if available.  Must be
     # appended after all other kwargs because the engine may merge it with

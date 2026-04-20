@@ -167,7 +167,6 @@ class TestGemma4ToolParserExtract:
         args = json.loads(result.tool_calls[0]["arguments"])
         assert args == {"text": 'line1\nline2 said "hello"'}
 
-
 class TestGemma4ToolParserStreaming:
     """Test streaming tool call extraction."""
 
@@ -237,4 +236,47 @@ class TestGemma4Registration:
 
     def test_native_format_false(self):
         assert Gemma4ToolParser.SUPPORTS_NATIVE_TOOL_FORMAT is False
+
+    def test_extra_stop_tokens_declares_tool_response(self):
+        """Gemma 4 treats <|tool_response> (id 50) as end-of-generation
+        after a tool call. The parser exposes it so the server can merge it
+        into the request's stop sequences.
+        Reference: llama.cpp PR #21418.
+        """
+        parser = Gemma4ToolParser()
+        assert "<|tool_response>" in parser.extra_stop_tokens
+
+    def test_abstract_parser_default_empty_stop_tokens(self):
+        """Other parsers that don't override keep an empty default."""
+        from vllm_mlx.tool_parsers.abstract_tool_parser import ToolParser
+
+        assert ToolParser.extra_stop_tokens == []
+
+    def test_merge_helper_adds_parser_extras(self):
+        """get_parser_stop_tokens adds the parser's EOG tokens on top of user stops."""
+        from vllm_mlx.tool_parsers import get_parser_stop_tokens
+
+        merged = get_parser_stop_tokens("gemma4", ["END"])
+        assert "END" in merged
+        assert "<|tool_response>" in merged
+
+    def test_merge_helper_dedupes(self):
+        """Parser extra tokens already present in user stops aren't duplicated."""
+        from vllm_mlx.tool_parsers import get_parser_stop_tokens
+
+        merged = get_parser_stop_tokens("gemma4", ["<|tool_response>"])
+        assert merged.count("<|tool_response>") == 1
+
+    def test_merge_helper_unknown_parser_is_passthrough(self):
+        """Unknown parser name leaves user stops untouched."""
+        from vllm_mlx.tool_parsers import get_parser_stop_tokens
+
+        assert get_parser_stop_tokens("nonexistent_parser_xyz", ["A"]) == ["A"]
+
+    def test_merge_helper_none_parser_is_passthrough(self):
+        """No parser name returns user stops as-is."""
+        from vllm_mlx.tool_parsers import get_parser_stop_tokens
+
+        assert get_parser_stop_tokens(None, ["A"]) == ["A"]
+        assert get_parser_stop_tokens(None, None) == []
         assert Gemma4ToolParser.supports_native_format() is False
