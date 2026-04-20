@@ -136,26 +136,66 @@ class Gemma4ToolParser(ToolParser):
     def extract_tool_calls(
         self, model_output: str, request: dict[str, Any] | None = None
     ) -> ExtractedToolCallInformation:
-        """Extract tool calls from a complete Gemma 4 model response."""
+        """Extract tool calls from a complete Gemma 4 model response.
+
+        Handles both layouts the wild can produce:
+
+        1. Single-block, multi-call (per the tool-parser docstring /
+           mlx-lm PR #1105): one ``<|tool_call>`` ... ``<tool_call|>``
+           enclosing several ``call:name{...}`` entries.
+        2. Multi-block (what the chat_template.jinja currently emits for
+           parallel tool calls): one ``<|tool_call>call:A{...}<tool_call|>``
+           immediately followed by ``<|tool_call>call:B{...}<tool_call|>``,
+           etc.
+
+        Iterating every delimited block means whichever shape the model
+        produces, we don't silently drop calls 2..N.
+        """
         cleaned = self.strip_think_tags(model_output)
 
-        start_idx = cleaned.find(TOOL_CALL_START)
-        if start_idx == -1:
+        first_start = cleaned.find(TOOL_CALL_START)
+        if first_start == -1:
             return ExtractedToolCallInformation(
                 tools_called=False, tool_calls=[], content=model_output
             )
 
-        content_before = cleaned[:start_idx].strip() or None
-
-        block_start = start_idx + len(TOOL_CALL_START)
-        end_idx = cleaned.find(TOOL_CALL_END, block_start)
-        if end_idx == -1:
-            block = cleaned[block_start:]
-        else:
-            block = cleaned[block_start:end_idx]
-
+        content_before = cleaned[:first_start].strip() or None
         tool_calls: list[dict[str, Any]] = []
 
+        cursor = first_start
+        while cursor < len(cleaned):
+            start_idx = cleaned.find(TOOL_CALL_START, cursor)
+            if start_idx == -1:
+                break
+            block_start = start_idx + len(TOOL_CALL_START)
+            end_idx = cleaned.find(TOOL_CALL_END, block_start)
+            if end_idx == -1:
+                # Unterminated block at the tail — parse what we have
+                # and stop iterating.
+                block = cleaned[block_start:]
+                cursor = len(cleaned)
+            else:
+                block = cleaned[block_start:end_idx]
+                cursor = end_idx + len(TOOL_CALL_END)
+            self._extract_calls_from_block(block, tool_calls)
+
+        if tool_calls:
+            return ExtractedToolCallInformation(
+                tools_called=True,
+                tool_calls=tool_calls,
+                content=content_before,
+            )
+        return ExtractedToolCallInformation(
+            tools_called=False, tool_calls=[], content=model_output
+        )
+
+    def _extract_calls_from_block(
+        self, block: str, tool_calls: list[dict[str, Any]]
+    ) -> None:
+        """Parse every ``call:name{...}`` sub-section inside a single
+        ``<|tool_call>...<tool_call|>`` block and append them to
+        ``tool_calls``.
+        """
         pos = 0
         while pos < len(block):
             m = _CALL_PREFIX.search(block, pos)
@@ -188,17 +228,6 @@ class Gemma4ToolParser(ToolParser):
                 )
 
             pos = brace_end + 1
-
-        if tool_calls:
-            return ExtractedToolCallInformation(
-                tools_called=True,
-                tool_calls=tool_calls,
-                content=content_before,
-            )
-        else:
-            return ExtractedToolCallInformation(
-                tools_called=False, tool_calls=[], content=model_output
-            )
 
     def extract_tool_calls_streaming(
         self,
