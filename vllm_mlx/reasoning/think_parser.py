@@ -185,9 +185,16 @@ class BaseThinkingReasoningParser(ReasoningParser):
             return DeltaMessage(reasoning=delta_text)
 
         # ── Phase: thinking ───────────────────────────────────────
-        # Inside a reasoning block, waiting for end tag.
+        # Inside a reasoning block, waiting for end tag. The end-token
+        # detection uses a count comparison rather than
+        # ``end_tok in current_text and end_tok not in previous_text``
+        # so that models which emit multiple back-to-back reasoning
+        # blocks (e.g. Gemma 4 with its ``<|channel>thought<channel|>``
+        # pattern) correctly detect each new closing marker —
+        # ``previous_text`` already contains earlier end tokens from
+        # prior blocks.
         if self._phase == "thinking":
-            if end_tok in current_text and end_tok not in previous_text:
+            if current_text.count(end_tok) > previous_text.count(end_tok):
                 self._phase = "content"
                 idx = delta_text.find(end_tok)
                 if idx >= 0:
@@ -205,5 +212,30 @@ class BaseThinkingReasoningParser(ReasoningParser):
             return DeltaMessage(reasoning=delta_text)
 
         # ── Phase: content ────────────────────────────────────────
-        # Past the reasoning block — everything is content.
+        # Past the reasoning block. Some models (Gemma 4) emit multiple
+        # back-to-back reasoning blocks — detect a fresh start token in
+        # this delta and re-enter thinking so the markers don't leak as
+        # literal content. If both start AND end tags appear in the same
+        # delta, treat it as a full mini-block: content around it,
+        # reasoning between them, phase stays in content.
+        if start_tok in delta_text:
+            start_idx = delta_text.find(start_tok)
+            pre_content = delta_text[:start_idx]
+            after_start = delta_text[start_idx + len(start_tok) :]
+            if end_tok in after_start:
+                end_idx = after_start.find(end_tok)
+                reasoning = after_start[:end_idx]
+                post_content = after_start[end_idx + len(end_tok) :]
+                combined = pre_content + post_content
+                if not combined and not reasoning:
+                    return None
+                return DeltaMessage(
+                    content=combined or None,
+                    reasoning=reasoning or None,
+                )
+            self._phase = "thinking"
+            return DeltaMessage(
+                content=pre_content or None,
+                reasoning=after_start or None,
+            )
         return DeltaMessage(content=delta_text)
