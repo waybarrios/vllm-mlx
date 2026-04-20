@@ -533,6 +533,27 @@ class SimpleEngine(BaseEngine):
                 finish_reason=output.finish_reason,
             )
         else:
+            # Diagnostic: render the prompt the model is about to see so we
+            # can verify the chat template handled tool_calls / tool_responses
+            # the way we expect. Logged at DEBUG so it only fires when opted
+            # in via --log-level debug.
+            if logger.isEnabledFor(logging.DEBUG):
+                try:
+                    _tok = self._model.tokenizer
+                    _dbg_tok = (
+                        _tok.tokenizer if hasattr(_tok, "tokenizer") else _tok
+                    )
+                    _rendered = _dbg_tok.apply_chat_template(
+                        messages,
+                        tokenize=False,
+                        add_generation_prompt=True,
+                        tools=template_tools,
+                        **chat_template_kwargs,
+                    )
+                    logger.debug("[RENDERED PROMPT] %r", _rendered)
+                except Exception as exc:
+                    logger.debug(f"[RENDERED PROMPT] render failed: {exc}")
+
             output = await self._run_blocking_serialized(
                 self._model.chat,
                 messages=messages,
@@ -622,6 +643,27 @@ class SimpleEngine(BaseEngine):
         if self._is_mllm:
             if self._text_model is not None:
                 logger.info("Media request → MLLM path")
+
+            # Diagnostic: render the prompt the model is about to see so we
+            # can verify the chat template handled tool_calls / tool_responses
+            # as expected. Logged at DEBUG level only.
+            if logger.isEnabledFor(logging.DEBUG):
+                try:
+                    _tok = self._model.tokenizer
+                    _dbg_tok = (
+                        _tok.tokenizer if hasattr(_tok, "tokenizer") else _tok
+                    )
+                    _rendered = _dbg_tok.apply_chat_template(
+                        messages,
+                        tokenize=False,
+                        add_generation_prompt=True,
+                        tools=template_tools,
+                        **chat_template_kwargs,
+                    )
+                    logger.debug("[RENDERED PROMPT] %r", _rendered)
+                except Exception as exc:
+                    logger.debug(f"[RENDERED PROMPT] render failed: {exc}")
+
             # For MLLM, use stream_chat which yields tokens incrementally.
             # Must hold _generation_lock to prevent concurrent Metal access
             # (e.g. OpenCode sends title + main request simultaneously).
