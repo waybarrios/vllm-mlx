@@ -13,7 +13,7 @@ import time
 import uuid
 from typing import Any
 
-from pydantic import AliasChoices, BaseModel, Field
+from pydantic import AliasChoices, BaseModel, Field, model_serializer
 
 # =============================================================================
 # Content Types (for multimodal messages)
@@ -189,6 +189,8 @@ class ChatCompletionRequest(BaseModel):
     specprefill_keep_pct: float | None = None
     # Enable/disable thinking mode (None = server default, typically True)
     enable_thinking: bool | None = None
+    # Thinking token budget: caps reasoning tokens as a sub-limit of max_tokens
+    thinking_token_budget: int | None = Field(default=None, ge=0)
 
 
 class AssistantMessage(BaseModel):
@@ -221,6 +223,18 @@ class Usage(BaseModel):
     prompt_tokens: int = 0
     completion_tokens: int = 0
     total_tokens: int = 0
+    # Only present when reasoning parsing is active; omitted from serialization
+    # when None so existing tests and clients are not affected.
+    reasoning_tokens: int | None = Field(
+        default=None, json_schema_extra={"nullable": True}
+    )
+
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler):
+        d = handler(self)
+        if d.get("reasoning_tokens") is None:
+            d.pop("reasoning_tokens", None)
+        return d
 
 
 class ChatCompletionResponse(BaseModel):

@@ -69,6 +69,8 @@ class AnthropicRequest(BaseModel):
     # clients commonly forward it via extra_body or top-level for structured
     # output / constrained decoding on this endpoint).
     response_format: dict | None = None
+    # Thinking token budget: caps reasoning tokens via logits-level enforcement
+    thinking_token_budget: int | None = Field(default=None, ge=0)
 
 
 # =============================================================================
@@ -83,6 +85,7 @@ class AnthropicUsage(BaseModel):
     output_tokens: int = 0
     cache_creation_input_tokens: int | None = None
     cache_read_input_tokens: int | None = None
+    reasoning_tokens: int | None = None
 
 
 class AnthropicResponseContentBlock(BaseModel):

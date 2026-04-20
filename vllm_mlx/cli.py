@@ -79,6 +79,8 @@ def serve_command(args):
         server._default_top_p = args.default_top_p
     server._max_audio_upload_bytes = args.max_audio_upload_mb * 1024 * 1024
     server._max_tts_input_chars = args.max_tts_input_chars
+    if args.default_thinking_token_budget is not None:
+        server._default_thinking_token_budget = args.default_thinking_token_budget
 
     # Configure reasoning parser
     if args.reasoning_parser:
@@ -1107,6 +1109,14 @@ Examples:
         type=float,
         default=None,
         help="Override default top_p for all requests (default: use model default)",
+    )
+    serve_parser.add_argument(
+        "--default-thinking-token-budget",
+        type=int,
+        default=None,
+        help="Default thinking token budget for reasoning models. Caps reasoning "
+        "tokens as a sub-limit of max_tokens via logits-level enforcement. "
+        "Per-request thinking_token_budget overrides this.",
     )
     # Embedding model option
     serve_parser.add_argument(
