@@ -242,6 +242,25 @@ def _resolve_repetition_penalty(request_value: float | None) -> float:
     return _FALLBACK_REPETITION_PENALTY
 
 
+def _log_resolved_sampling(kwargs: dict) -> None:
+    """Log the final sampling kwargs the sampler actually sees.
+
+    The [REQUEST] line prints raw ``request.*`` values, which are ``None``
+    whenever the client omits a field. Operators need to see what the
+    resolvers produced to tell at a glance whether generation_config /
+    CLI defaults landed.
+    """
+    logger.info(
+        "[SAMPLING] "
+        f"temperature={kwargs.get('temperature')} "
+        f"top_p={kwargs.get('top_p')} "
+        f"top_k={kwargs.get('top_k')} "
+        f"min_p={kwargs.get('min_p')} "
+        f"presence_penalty={kwargs.get('presence_penalty')} "
+        f"repetition_penalty={kwargs.get('repetition_penalty')}"
+    )
+
+
 def _apply_generation_config_defaults() -> None:
     """Fill in any server sampling default the operator didn't pin via CLI
     from the loaded model's ``generation_config.json``.
@@ -2985,6 +3004,7 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
             generate_kwargs["repetition_penalty"] = comp_rep_penalty
         else:
             generate_kwargs["repetition_penalty"] = _resolve_repetition_penalty(None)
+        _log_resolved_sampling(generate_kwargs)
         if request.specprefill is not None:
             generate_kwargs["specprefill"] = request.specprefill
         if request.specprefill_keep_pct is not None:
@@ -3228,6 +3248,7 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
         "presence_penalty": _resolve_presence_penalty(request.presence_penalty),
         "repetition_penalty": rep_penalty,
     }
+    _log_resolved_sampling(chat_kwargs)
 
     # Add multimodal content
     if has_media:
@@ -3631,6 +3652,7 @@ async def create_anthropic_message(
         "presence_penalty": _resolve_presence_penalty(openai_request.presence_penalty),
         "repetition_penalty": _resolve_repetition_penalty(openai_request.repetition_penalty),
     }
+    _log_resolved_sampling(chat_kwargs)
 
     if openai_request.tools and openai_request.tool_choice != "none":
         chat_kwargs["tools"] = convert_tools_for_template(openai_request.tools)
@@ -3913,6 +3935,7 @@ async def _stream_anthropic_messages(
         "presence_penalty": _resolve_presence_penalty(openai_request.presence_penalty),
         "repetition_penalty": _resolve_repetition_penalty(openai_request.repetition_penalty),
     }
+    _log_resolved_sampling(chat_kwargs)
 
     if openai_request.tools and openai_request.tool_choice != "none":
         chat_kwargs["tools"] = convert_tools_for_template(openai_request.tools)
@@ -4203,6 +4226,7 @@ async def stream_completion(
         generate_kwargs["repetition_penalty"] = repetition_penalty
     else:
         generate_kwargs["repetition_penalty"] = _resolve_repetition_penalty(None)
+    _log_resolved_sampling(generate_kwargs)
     if request.specprefill is not None:
         generate_kwargs["specprefill"] = request.specprefill
     if request.specprefill_keep_pct is not None:
