@@ -386,18 +386,24 @@ def _trim_cache_offset(cache: list[Any], trim_by: int) -> list[Any]:
             orig_cls = type(layer_cache)
             tc = orig_cls.__new__(orig_cls)
             new_offset = max(layer_cache.offset - trim_by, 0)
-            # Slice to new_offset, not only shrink the pointer: KV-shared
-            # attention layers read ``cache.state`` directly and would
-            # otherwise attend to stale trailing slots from a prior sequence.
-            k_src = layer_cache.keys
-            v_src = layer_cache.values
-            if k_src is not None and k_src.shape[2] > new_offset:
-                tc.keys = k_src[:, :, :new_offset, :]
-                tc.values = v_src[:, :, :new_offset, :]
+            # Slice to new_offset rather than only shrinking the offset
+            # pointer: KV-shared attention layers read cache.state directly
+            # (bypassing update_and_fetch) and would otherwise attend to
+            # stale trailing slots from the previous owner — upstream #384.
+            keys = layer_cache.keys
+            values = layer_cache.values
+            if (
+                keys is not None
+                and hasattr(keys, "shape")
+                and len(keys.shape) >= 3
+                and new_offset < keys.shape[-2]
+            ):
+                tc.keys = keys[..., :new_offset, :]
+                tc.values = values[..., :new_offset, :]
                 eval_targets.extend([tc.keys, tc.values])
             else:
-                tc.keys = k_src
-                tc.values = v_src
+                tc.keys = keys
+                tc.values = values
             tc.offset = new_offset
             for attr in ("max_size", "keep", "step"):
                 if hasattr(layer_cache, attr):
