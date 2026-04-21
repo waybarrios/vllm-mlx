@@ -167,6 +167,42 @@ class TestGemma4ToolParserExtract:
         args = json.loads(result.tool_calls[0]["arguments"])
         assert args == {"text": 'line1\nline2 said "hello"'}
 
+    def test_bare_string_value_without_delimiters(self):
+        """Nullable type (e.g. ["string", "null"]) makes the template skip the
+        <|"|> wrap around string values. The parser must still produce valid
+        JSON with the value as a string.
+        Reference: llama.cpp PR #21327.
+        """
+        output = "<|tool_call>call:set_state{domain:light}<tool_call|>"
+        result = self.parser.extract_tool_calls(output)
+        assert result.tools_called is True
+        args = json.loads(result.tool_calls[0]["arguments"])
+        assert args == {"domain": "light"}
+
+    def test_bare_string_mixed_with_number_and_bool(self):
+        """Bare string value must not interfere with numeric/bool parsing."""
+        output = "<|tool_call>call:update{name:alice,count:5,active:true}<tool_call|>"
+        result = self.parser.extract_tool_calls(output)
+        assert result.tools_called is True
+        args = json.loads(result.tool_calls[0]["arguments"])
+        assert args == {"name": "alice", "count": 5, "active": True}
+
+    def test_bare_string_preserves_null_and_bool_literals(self):
+        """null/true/false must NOT be treated as bare strings."""
+        output = "<|tool_call>call:cfg{flag:null,ready:true,done:false,name:bob}<tool_call|>"
+        result = self.parser.extract_tool_calls(output)
+        args = json.loads(result.tool_calls[0]["arguments"])
+        assert args == {"flag": None, "ready": True, "done": False, "name": "bob"}
+
+    def test_bare_string_in_array(self):
+        """Enum-without-type: array of bare strings should be quoted per element."""
+        output = "<|tool_call>call:filter{tags:[alpha,beta,gamma]}<tool_call|>"
+        result = self.parser.extract_tool_calls(output)
+        assert result.tools_called is True
+        args = json.loads(result.tool_calls[0]["arguments"])
+        assert args == {"tags": ["alpha", "beta", "gamma"]}
+
+
 class TestGemma4ToolParserStreaming:
     """Test streaming tool call extraction."""
 
