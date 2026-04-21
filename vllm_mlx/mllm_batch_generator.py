@@ -2556,15 +2556,16 @@ def install_chunked_prefill_mllm(
                         remaining_ids = None
 
                 if cached_kv is not None and remaining_ids:
-                    # Prefix cache hit
-                    request_cache = batch_gen._copy_prefix_cache(cached_kv)
+                    # Prefix cache hit. fetch() already returns an owned
+                    # deep copy, so no further copy is needed here.
+                    request_cache = cached_kv
                     batch_gen._trim_rotating_caches(request_cache)
                     remaining = mx.array(remaining_ids)[None, :]
                     cached_count = total_tokens - len(remaining_ids)
                     remaining_count = len(remaining_ids)
                 elif cached_kv is not None and not remaining_ids:
                     # Exact hit — treat as very short remaining (1 token)
-                    request_cache = batch_gen._copy_prefix_cache(cached_kv)
+                    request_cache = cached_kv
                     batch_gen._trim_rotating_caches(request_cache)
                     remaining = input_ids[:, -1:]
                     cached_count = total_tokens - 1
