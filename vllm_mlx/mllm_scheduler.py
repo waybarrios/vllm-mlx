@@ -986,9 +986,16 @@ class MLLMScheduler:
                 if output is None:
                     finished_normally = True
                     break
-                yield output
+                # Mark finished BEFORE yield. If the consumer breaks out of
+                # its async-for loop right after seeing output.finished, the
+                # async generator gets aclose()'d and our finally runs while
+                # suspended at ``yield``. Setting the flag pre-yield avoids
+                # the false-positive "Aborting orphaned" log on what is
+                # actually a clean completion.
                 if output.finished:
                     finished_normally = True
+                yield output
+                if output.finished:
                     break
         finally:
             if not finished_normally:
