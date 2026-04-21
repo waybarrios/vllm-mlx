@@ -589,8 +589,11 @@ def process_image_input(image: str | dict) -> str:
     Supports:
     - URL (http/https)
     - Base64 encoded string
+    - Local filesystem path (used for pre-extracted video frames)
     - OpenAI format dict: {"url": "..."} or {"url": "data:image/...;base64,..."}
     """
+    from pathlib import Path
+
     # Handle dict format (OpenAI style)
     if isinstance(image, dict):
         url = image.get("url", image.get("image_url", ""))
@@ -609,8 +612,19 @@ def process_image_input(image: str | dict) -> str:
     if is_url(image):
         return download_image(image)
 
+    # Local filesystem path (e.g. video frames pre-extracted by the engine).
+    # Bounded by length so we don't stat() a multi-MB base64 blob.
+    if len(image) < 4096:
+        try:
+            p = Path(image)
+            if p.is_file():
+                return str(p)
+        except (OSError, ValueError):
+            pass
+
     raise ValueError(
-        "Unsupported image input. Only http(s) URLs and data:image base64 payloads are allowed."
+        "Unsupported image input. Only http(s) URLs, data:image base64 "
+        "payloads, and local file paths are allowed."
     )
 
 

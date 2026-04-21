@@ -532,72 +532,20 @@ class BatchedEngine(BaseEngine):
             return prompt + "\nassistant:"
 
     @staticmethod
-    def _expand_video_frames(
-        messages: list[dict[str, Any]],
-    ) -> tuple[list[dict[str, Any]], list[str]]:
-        """Replace video content parts with N image placeholders and return
-        the flat list of frame paths.
-
-        Batched path needs the template to emit one image token per extracted
-        frame; without this, frames arrive at prepare_inputs with no matching
-        placeholder in input_ids and the model silently sees no media.
-        Mirrors what MLXMultimodalLM._prepare_chat_messages does inline.
-        """
-        from ..models.mllm import (
-            DEFAULT_FPS,
-            MAX_FRAMES,
-            extract_video_frames_smart,
-            process_video_input,
-            save_frames_to_temp,
-        )
-
-        all_frames: list[str] = []
-        rewritten: list[dict[str, Any]] = []
-
+    def _messages_have_video(messages: list[dict[str, Any]]) -> bool:
+        """True if any message content part is a video or video_url."""
         for msg in messages:
             if not isinstance(msg, dict):
-                rewritten.append(msg)
                 continue
             content = msg.get("content")
             if not isinstance(content, list):
-                rewritten.append(msg)
                 continue
-
-            new_content: list = []
             for part in content:
                 if hasattr(part, "model_dump"):
                     part = part.model_dump(exclude_none=True)
-                if not isinstance(part, dict):
-                    new_content.append(part)
-                    continue
-                part_type = part.get("type", "")
-                if part_type in ("video", "video_url"):
-                    url_obj = part.get(part_type)
-                    if isinstance(url_obj, dict):
-                        url = url_obj.get("url", "")
-                    else:
-                        url = url_obj or part.get("url", "")
-                    if not url:
-                        continue
-                    try:
-                        vpath = process_video_input(url)
-                        frames = extract_video_frames_smart(
-                            vpath, fps=DEFAULT_FPS, max_frames=MAX_FRAMES
-                        )
-                        frame_paths = save_frames_to_temp(frames)
-                    except Exception as exc:
-                        logger.warning(
-                            f"Failed to extract video frames: {type(exc).__name__}: {exc}"
-                        )
-                        frame_paths = []
-                    all_frames.extend(frame_paths)
-                    for _ in frame_paths:
-                        new_content.append({"type": "image"})
-                else:
-                    new_content.append(part)
-            rewritten.append({**msg, "content": new_content})
-
-        return rewritten, all_frames
+                if isinstance(part, dict) and part.get("type") in ("video", "video_url"):
+                    return True
+        return False
 
     @staticmethod
     def _prepare_mllm_messages(
@@ -851,20 +799,27 @@ class BatchedEngine(BaseEngine):
         all_images = (images or []) + extracted_images
         all_videos = (videos or []) + extracted_videos
 
-        # Expand inline video content into frame images so the chat template
-        # emits a matching image placeholder per frame.
-        if any(
-            isinstance(m, dict)
-            and isinstance(m.get("content"), list)
-            and any(
-                isinstance(p, dict) and p.get("type") in ("video", "video_url")
-                for p in m["content"]
-            )
-            for m in messages
+        # Native video path: Gemma 4 (and Qwen-VL) emit their own
+        # <|image>...<|video|>...<image|> interleave with timestamps when
+        # the processor sees {type: video}. Batched can't consume that
+        # shape through its text-prompt scheduler, so delegate a video
+        # request to the MLXMultimodalLM's native pipeline for this call.
+        if (
+            self._is_mllm
+            and self._mllm_instance is not None
+            and getattr(self._mllm_instance, "_video_native", False)
+            and (all_videos or self._messages_have_video(messages))
         ):
-            messages, video_frames = self._expand_video_frames(messages)
-            all_images.extend(video_frames)
-            all_videos = []  # frames are now in all_images
+            import asyncio
+
+            return await asyncio.to_thread(
+                self._mllm_instance.chat,
+                messages=messages,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                tools=tools,
+                **kwargs,
+            )
 
         # Convert tools for template
         template_tools = convert_tools_for_template(tools) if tools else None
@@ -995,20 +950,31 @@ class BatchedEngine(BaseEngine):
         all_images = (images or []) + extracted_images
         all_videos = (videos or []) + extracted_videos
 
-        # Expand inline video content into frame images so the chat template
-        # emits a matching image placeholder per frame.
-        if any(
-            isinstance(m, dict)
-            and isinstance(m.get("content"), list)
-            and any(
-                isinstance(p, dict) and p.get("type") in ("video", "video_url")
-                for p in m["content"]
-            )
-            for m in messages
+        # Native video path: Gemma 4 (and Qwen-VL) handle video via their own
+        # processor interleave. Delegate to MLXMultimodalLM.stream_chat for
+        # video requests so the native markers survive.
+        if (
+            self._is_mllm
+            and self._mllm_instance is not None
+            and getattr(self._mllm_instance, "_video_native", False)
+            and (all_videos or self._messages_have_video(messages))
         ):
-            messages, video_frames = self._expand_video_frames(messages)
-            all_images.extend(video_frames)
-            all_videos = []
+            import asyncio
+
+            def _run():
+                return list(
+                    self._mllm_instance.stream_chat(
+                        messages=messages,
+                        max_tokens=max_tokens,
+                        temperature=temperature,
+                        tools=tools,
+                        **kwargs,
+                    )
+                )
+
+            for chunk in await asyncio.to_thread(_run):
+                yield chunk
+            return
 
         # Convert tools for template
         template_tools = convert_tools_for_template(tools) if tools else None
