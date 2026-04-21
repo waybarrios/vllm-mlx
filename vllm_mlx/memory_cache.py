@@ -530,6 +530,143 @@ def _quantize_cache(cache: list[Any], bits: int = 8, group_size: int = 64) -> li
     return quantized
 
 
+def _pack_cache_for_spill(cache: list[Any]) -> list[dict[str, Any]]:
+    """Convert cache layers to numpy-backed dicts for the SSD writer.
+
+    Must be called on the MLX executor thread — the conversions touch
+    ``mx.array.view`` and trigger buffer-protocol materialisation, both
+    of which must run on the thread that owns Metal work. The writer
+    thread receives plain dicts with numpy arrays and JSON-serialisable
+    metadata, never MLX objects.
+    """
+    from .ssd_cache import _mlx_array_to_numpy
+
+    packed: list[dict[str, Any]] = []
+    for layer in cache:
+        if isinstance(layer, _QuantizedCacheWrapper):
+            k_wq, k_wq_dt = _mlx_array_to_numpy(layer.keys[0])
+            k_sc, k_sc_dt = _mlx_array_to_numpy(layer.keys[1])
+            k_bs, k_bs_dt = _mlx_array_to_numpy(layer.keys[2])
+            v_wq, v_wq_dt = _mlx_array_to_numpy(layer.values[0])
+            v_sc, v_sc_dt = _mlx_array_to_numpy(layer.values[1])
+            v_bs, v_bs_dt = _mlx_array_to_numpy(layer.values[2])
+            packed.append(
+                {
+                    "layer_type": "_QuantizedCacheWrapper",
+                    "arrays": {
+                        "keys_wq": k_wq,
+                        "keys_scales": k_sc,
+                        "keys_biases": k_bs,
+                        "values_wq": v_wq,
+                        "values_scales": v_sc,
+                        "values_biases": v_bs,
+                    },
+                    "dtypes": {
+                        "keys_wq": k_wq_dt,
+                        "keys_scales": k_sc_dt,
+                        "keys_biases": k_bs_dt,
+                        "values_wq": v_wq_dt,
+                        "values_scales": v_sc_dt,
+                        "values_biases": v_bs_dt,
+                    },
+                    "offset": layer.offset,
+                    "bits": layer.bits,
+                    "group_size": layer.group_size,
+                    "orig_type": layer.orig_type.__name__,
+                    "orig_attrs": layer.orig_attrs,
+                }
+            )
+            continue
+        if hasattr(layer, "state") and isinstance(getattr(layer, "state", None), list):
+            # ArraysCache — not expected for the MLLM path but kept for
+            # completeness with the LLM scheduler's cache.
+            state_arrays = []
+            state_dtypes = []
+            for s in layer.state:
+                np_arr, dt = _mlx_array_to_numpy(s)
+                state_arrays.append(np_arr)
+                state_dtypes.append(dt)
+            packed.append(
+                {
+                    "layer_type": type(layer).__name__,
+                    "arrays": {f"state_{i}": a for i, a in enumerate(state_arrays)},
+                    "dtypes": {f"state_{i}": d for i, d in enumerate(state_dtypes)},
+                    "num_arrays": len(state_arrays),
+                }
+            )
+            continue
+        # Plain KVCache / RotatingKVCache
+        k_np, k_dt = _mlx_array_to_numpy(layer.keys)
+        v_np, v_dt = _mlx_array_to_numpy(layer.values)
+        entry: dict[str, Any] = {
+            "layer_type": type(layer).__name__,
+            "arrays": {"keys": k_np, "values": v_np},
+            "dtypes": {"keys": k_dt, "values": v_dt},
+            "offset": layer.offset,
+        }
+        for attr in ("max_size", "keep", "step", "_idx"):
+            if hasattr(layer, attr):
+                entry[attr] = getattr(layer, attr)
+        packed.append(entry)
+    return packed
+
+
+def _unpack_cache_from_ssd(layer_dicts: list[dict[str, Any]]) -> list[Any]:
+    """Inverse of ``_pack_cache_for_spill``: reconstruct MLX cache objects.
+
+    Must be called on the MLX executor thread since it constructs MLX
+    arrays. Handles KVCache, RotatingKVCache, and ``_QuantizedCacheWrapper``
+    — the last is rebuilt with its original cache class preserved so
+    subsequent dequantize calls restore the correct shape.
+    """
+    from mlx_lm.models.cache import KVCache, RotatingKVCache
+
+    from .ssd_cache import _numpy_to_mlx_array
+
+    rebuilt: list[Any] = []
+    for ld in layer_dicts:
+        layer_type = ld.get("layer_type")
+        if layer_type == "_QuantizedCacheWrapper":
+            dtypes = ld.get("dtypes", {})
+            keys_tuple = tuple(
+                _numpy_to_mlx_array(ld["keys"][i], dtypes.get(name))
+                for i, name in enumerate(("keys_wq", "keys_scales", "keys_biases"))
+            )
+            values_tuple = tuple(
+                _numpy_to_mlx_array(ld["values"][i], dtypes.get(name))
+                for i, name in enumerate(("values_wq", "values_scales", "values_biases"))
+            )
+            wrapper = _QuantizedCacheWrapper.__new__(_QuantizedCacheWrapper)
+            wrapper.keys = keys_tuple
+            wrapper.values = values_tuple
+            wrapper.offset = ld["offset"]
+            wrapper.bits = ld["bits"]
+            wrapper.group_size = ld["group_size"]
+            type_name = ld["orig_type"]
+            wrapper.orig_type = (
+                RotatingKVCache if type_name == "RotatingKVCache" else KVCache
+            )
+            wrapper.orig_attrs = ld["orig_attrs"]
+            rebuilt.append(wrapper)
+            continue
+        if layer_type == "RotatingKVCache":
+            layer = RotatingKVCache(
+                max_size=ld.get("max_size", 1024),
+                keep=ld.get("keep", 0),
+            )
+        else:
+            layer = KVCache()
+        dtypes = ld.get("dtypes", {})
+        layer.keys = _numpy_to_mlx_array(ld.get("keys"), dtypes.get("keys"))
+        layer.values = _numpy_to_mlx_array(ld.get("values"), dtypes.get("values"))
+        layer.offset = ld.get("offset", 0)
+        for attr in ("max_size", "keep", "step", "_idx"):
+            if attr in ld and hasattr(layer, attr):
+                setattr(layer, attr, ld[attr])
+        rebuilt.append(layer)
+    return rebuilt
+
+
 def _clone_cache_for_fetch(cache: list[Any]) -> list[Any]:
     """Return a per-request copy of a stored cache entry.
 
@@ -959,11 +1096,22 @@ class MemoryAwarePrefixCache:
             return None
 
         try:
-            cache_layers = self._ssd_tier._read_entry(lookup_key, meta["file_path"])
+            layer_dicts = self._ssd_tier._read_entry(lookup_key, meta["file_path"])
         except Exception:
             logger.exception("[ssd_promote] read failed for %d tokens", len(lookup_key))
             return None
-        if cache_layers is None:
+        if layer_dicts is None:
+            return None
+
+        try:
+            cache_layers = _unpack_cache_from_ssd(layer_dicts)
+        except Exception as exc:
+            logger.warning(
+                "[ssd_promote] unpack failed for %d tokens: %s: %s",
+                len(lookup_key),
+                type(exc).__name__,
+                exc,
+            )
             return None
 
         entry = _CacheEntry(
@@ -1125,9 +1273,20 @@ class MemoryAwarePrefixCache:
         self._stats.entry_count = len(self._entries)
         self._stats.current_memory_bytes = self._current_memory
 
-        # Spill to SSD tier if available
+        # Spill to SSD tier if available. Layers are packed to numpy-backed
+        # dicts here (on the MLX executor thread) so the writer thread
+        # never touches MLX arrays directly — quantized wrappers keep
+        # their (wq, scales, biases) compact form, and bfloat16 is
+        # preserved bit-for-bit via uint16 reinterpret.
         if self._ssd_tier is not None:
-            self._ssd_tier.enqueue_spill(tokens_key, entry.cache, entry.memory_bytes)
+            try:
+                packed = _pack_cache_for_spill(entry.cache)
+                self._ssd_tier.enqueue_spill(tokens_key, packed, entry.memory_bytes)
+            except Exception as exc:
+                logger.warning(
+                    f"[lru_evict] pack-for-spill failed for "
+                    f"{len(tokens_key)} tokens: {type(exc).__name__}: {exc}"
+                )
 
         logger.debug(
             f"[lru_evict] removed {len(tokens_key)} tokens, "

@@ -360,14 +360,56 @@ class SSDIndex:
             self._conn.close()
 
 
-# Support matrix: maps cache type names to their serializer status
+# Support matrix: maps cache type names to their serializer status.
+# All types are serialized in their native representation (quantized layers
+# stay quantized on disk) — dtype-conversion (notably bfloat16) is handled
+# bit-exactly via uint16 reinterpret on the calling thread.
 SERIALIZER_SUPPORT_MATRIX = {
     "KVCache": "supported",
     "RotatingKVCache": "supported",  # Serialized as KVCache (keys/values/offset)
     "ArraysCache": "supported",
     "MambaCache": "supported",  # Legacy name for ArraysCache
-    "_QuantizedCacheWrapper": "not_supported_spill_dequantized",
+    "_QuantizedCacheWrapper": "supported",
 }
+
+
+_BFLOAT16_MARKER = "bfloat16"
+
+
+def _mlx_array_to_numpy(arr):
+    """Convert a materialized MLX array to numpy, preserving bfloat16 bits.
+
+    numpy has no native bfloat16 dtype — the buffer-protocol conversion
+    raises ``RuntimeError: Item size 2 for PEP 3118 buffer format string
+    B does not match the dtype B item size 1`` otherwise. We reinterpret
+    bf16 as uint16 (same 2 bytes) so the write is lossless, and record
+    the original dtype in metadata so the load path can cast back.
+
+    Must be called on a thread that's allowed to submit MLX work — i.e.
+    the shared MLX executor thread. Callers from the SSD writer thread
+    must pre-pack on the MLX thread before handing arrays over.
+    """
+    import numpy as np
+    import mlx.core as mx
+
+    if arr is None:
+        return None, None
+    if arr.dtype == mx.bfloat16:
+        return np.array(arr.view(mx.uint16)), _BFLOAT16_MARKER
+    return np.array(arr), str(arr.dtype).split(".")[-1]
+
+
+def _numpy_to_mlx_array(np_arr, recorded_dtype):
+    """Inverse of ``_mlx_array_to_numpy`` — reconstruct an MLX array,
+    restoring bfloat16 from its uint16 bit-preserving view when needed."""
+    import mlx.core as mx
+
+    if np_arr is None:
+        return None
+    mx_arr = mx.array(np_arr)
+    if recorded_dtype == _BFLOAT16_MARKER:
+        mx_arr = mx_arr.view(mx.bfloat16)
+    return mx_arr
 
 
 class LayerSerializer(ABC):
@@ -412,6 +454,9 @@ class KVCacheSerializer(LayerSerializer):
 
     Handles layers with .keys, .values, .offset attributes.
     RotatingKVCache also has .max_size, .keep, .step, ._idx.
+
+    Input layers are *packed* dicts produced on the MLX thread — the
+    writer thread never touches an MLX array directly.
     """
 
     def serialize_layer(
@@ -419,24 +464,22 @@ class KVCacheSerializer(LayerSerializer):
     ) -> dict[str, Any]:
         from safetensors.numpy import save_file
 
-        keys_np = np.array(layer.keys)
-        values_np = np.array(layer.values)
-
         tensors = {
-            f"layer_{layer_idx}_keys": keys_np,
-            f"layer_{layer_idx}_values": values_np,
+            f"layer_{layer_idx}_keys": layer["arrays"]["keys"],
+            f"layer_{layer_idx}_values": layer["arrays"]["values"],
         }
         save_file(tensors, file_path)
 
         metadata = {
-            "layer_type": "KVCache",
+            "layer_type": layer["layer_type"],
             "layer_idx": layer_idx,
-            "offset": layer.offset,
+            "offset": layer["offset"],
+            "dtypes": layer["dtypes"],
         }
         # Preserve RotatingKVCache extra attributes
         for attr in ("max_size", "keep", "step", "_idx"):
-            if hasattr(layer, attr):
-                metadata[attr] = getattr(layer, attr)
+            if attr in layer:
+                metadata[attr] = layer[attr]
 
         return metadata
 
@@ -447,14 +490,79 @@ class KVCacheSerializer(LayerSerializer):
         tensors = load_file(file_path)
 
         result = {
+            "layer_type": metadata.get("layer_type", "KVCache"),
             "keys": tensors[f"layer_{layer_idx}_keys"],
             "values": tensors[f"layer_{layer_idx}_values"],
             "offset": metadata["offset"],
+            "dtypes": metadata.get("dtypes", {}),
         }
         for attr in ("max_size", "keep", "step", "_idx"):
             if attr in metadata:
                 result[attr] = metadata[attr]
         return result
+
+
+class QuantizedCacheSerializer(LayerSerializer):
+    """Serializer for ``_QuantizedCacheWrapper`` layers.
+
+    Quantized caches store keys and values as tuples of
+    ``(packed_weights, scales, biases)``. All three components are
+    written verbatim so the entry stays quantized on disk — no
+    dequantize round-trip, no 4x disk blow-up.
+    """
+
+    def serialize_layer(
+        self, layer: Any, layer_idx: int, file_path: str
+    ) -> dict[str, Any]:
+        from safetensors.numpy import save_file
+
+        arrays = layer["arrays"]
+        tensors = {
+            f"layer_{layer_idx}_keys_wq": arrays["keys_wq"],
+            f"layer_{layer_idx}_keys_scales": arrays["keys_scales"],
+            f"layer_{layer_idx}_keys_biases": arrays["keys_biases"],
+            f"layer_{layer_idx}_values_wq": arrays["values_wq"],
+            f"layer_{layer_idx}_values_scales": arrays["values_scales"],
+            f"layer_{layer_idx}_values_biases": arrays["values_biases"],
+        }
+        save_file(tensors, file_path)
+
+        return {
+            "layer_type": "_QuantizedCacheWrapper",
+            "layer_idx": layer_idx,
+            "offset": layer["offset"],
+            "bits": layer["bits"],
+            "group_size": layer["group_size"],
+            "orig_type": layer["orig_type"],
+            "orig_attrs": layer["orig_attrs"],
+            "dtypes": layer["dtypes"],
+        }
+
+    def deserialize_layer(self, file_path: str, metadata: dict[str, Any]) -> dict:
+        from safetensors.numpy import load_file
+
+        layer_idx = metadata["layer_idx"]
+        tensors = load_file(file_path)
+
+        return {
+            "layer_type": "_QuantizedCacheWrapper",
+            "keys": (
+                tensors[f"layer_{layer_idx}_keys_wq"],
+                tensors[f"layer_{layer_idx}_keys_scales"],
+                tensors[f"layer_{layer_idx}_keys_biases"],
+            ),
+            "values": (
+                tensors[f"layer_{layer_idx}_values_wq"],
+                tensors[f"layer_{layer_idx}_values_scales"],
+                tensors[f"layer_{layer_idx}_values_biases"],
+            ),
+            "offset": metadata["offset"],
+            "bits": metadata["bits"],
+            "group_size": metadata["group_size"],
+            "orig_type": metadata["orig_type"],
+            "orig_attrs": metadata["orig_attrs"],
+            "dtypes": metadata["dtypes"],
+        }
 
 
 class ArraysCacheSerializer(LayerSerializer):
@@ -495,21 +603,28 @@ class ArraysCacheSerializer(LayerSerializer):
 
 
 def get_serializer_for_layer(layer: Any) -> LayerSerializer:
-    """Return the appropriate serializer for a cache layer.
+    """Return the appropriate serializer for a *packed* cache layer dict.
 
-    Dispatches based on duck-typing:
-    - If layer has .keys and .values and .offset -> KVCacheSerializer
-    - If layer has .state and it's a list -> ArraysCacheSerializer
-
-    Raises ValueError for unsupported layer types.
+    Packed layers are produced on the MLX thread by
+    ``memory_cache._pack_cache_for_spill`` and arrive at the writer
+    thread as plain dicts. Dispatch is on the ``layer_type`` tag so the
+    writer never has to introspect an MLX object.
     """
-    if hasattr(layer, "keys") and hasattr(layer, "values") and hasattr(layer, "offset"):
-        return KVCacheSerializer()
-    if hasattr(layer, "state") and isinstance(getattr(layer, "state", None), list):
-        return ArraysCacheSerializer()
+    if isinstance(layer, dict):
+        layer_type = layer.get("layer_type")
+        if layer_type == "_QuantizedCacheWrapper":
+            return QuantizedCacheSerializer()
+        if layer_type in ("KVCache", "RotatingKVCache"):
+            return KVCacheSerializer()
+        if layer_type in ("ArraysCache", "MambaCache"):
+            return ArraysCacheSerializer()
+        raise ValueError(
+            f"Unsupported packed layer type: {layer_type!r}. "
+            f"Supported: {list(SERIALIZER_SUPPORT_MATRIX.keys())}"
+        )
     raise ValueError(
-        f"Unsupported cache layer type: {type(layer).__name__}. "
-        f"Supported: {list(SERIALIZER_SUPPORT_MATRIX.keys())}"
+        f"SSD writer expects packed dicts, got {type(layer).__name__} — "
+        "cache layers must be pre-packed on the MLX thread before spill"
     )
 
 
@@ -852,7 +967,9 @@ class SSDCacheTier:
             layer_type = layer_meta["layer_type"]
 
             try:
-                if layer_type in ("KVCache", "RotatingKVCache"):
+                if layer_type == "_QuantizedCacheWrapper":
+                    serializer = QuantizedCacheSerializer()
+                elif layer_type in ("KVCache", "RotatingKVCache"):
                     serializer = KVCacheSerializer()
                 elif layer_type in ("ArraysCache", "MambaCache"):
                     serializer = ArraysCacheSerializer()
