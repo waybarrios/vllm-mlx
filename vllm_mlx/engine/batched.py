@@ -455,6 +455,94 @@ class BatchedEngine(BaseEngine):
 
         return TOKENIZER_LOCK
 
+    def _native_video_preprocess(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict] | None,
+        chat_template_kwargs: dict[str, Any] | None,
+    ) -> tuple[str, dict[str, Any]]:
+        """Run MLXMultimodalLM's native multimodal preprocessing under the
+        tokenizer lock and return (prompt, preprocessed_kwargs) ready to
+        hand to the scheduler.
+        """
+        from ..mllm_batch_generator import TOKENIZER_LOCK
+
+        with TOKENIZER_LOCK:
+            prompt, gen_kwargs = self._mllm_instance._prepare_native_video_inputs(
+                messages,
+                tools=tools,
+            )
+        extra_kwargs: dict[str, Any] = {}
+        for key in ("video_grid_thw", "image_grid_thw"):
+            val = gen_kwargs.get(key)
+            if val is not None:
+                extra_kwargs[key] = val
+        return prompt, {
+            "preprocessed_input_ids": gen_kwargs.get("input_ids"),
+            "preprocessed_pixel_values": gen_kwargs.get("pixel_values"),
+            "preprocessed_attention_mask": gen_kwargs.get("mask"),
+            "preprocessed_extra_kwargs": extra_kwargs or None,
+        }
+
+    async def _generate_native_video(
+        self,
+        messages: list[dict[str, Any]],
+        max_tokens: int,
+        temperature: float,
+        top_p: float,
+        tools: list[dict] | None,
+        chat_template_kwargs: dict[str, Any] | None,
+        enable_thinking: bool | None,
+        **kwargs,
+    ) -> GenerationOutput:
+        """Non-streaming video-native path through the batched scheduler."""
+        import asyncio
+
+        prompt, pre = await asyncio.to_thread(
+            self._native_video_preprocess,
+            messages,
+            tools,
+            chat_template_kwargs,
+        )
+        return await self.generate(
+            prompt=prompt,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            **pre,
+            **kwargs,
+        )
+
+    async def _stream_generate_native_video(
+        self,
+        messages: list[dict[str, Any]],
+        max_tokens: int,
+        temperature: float,
+        top_p: float,
+        tools: list[dict] | None,
+        chat_template_kwargs: dict[str, Any] | None,
+        enable_thinking: bool | None,
+        **kwargs,
+    ) -> AsyncIterator[GenerationOutput]:
+        """Streaming video-native path through the batched scheduler."""
+        import asyncio
+
+        prompt, pre = await asyncio.to_thread(
+            self._native_video_preprocess,
+            messages,
+            tools,
+            chat_template_kwargs,
+        )
+        async for output in self.stream_generate(
+            prompt=prompt,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            **pre,
+            **kwargs,
+        ):
+            yield output
+
     def _apply_chat_template(
         self,
         messages: list[dict[str, Any]],
@@ -628,6 +716,10 @@ class BatchedEngine(BaseEngine):
                 presence_penalty=kwargs.pop("presence_penalty", 0.0),
                 repetition_penalty=kwargs.pop("repetition_penalty", 1.0),
                 logits_processors=kwargs.pop("logits_processors", None),
+                preprocessed_input_ids=kwargs.pop("preprocessed_input_ids", None),
+                preprocessed_pixel_values=kwargs.pop("preprocessed_pixel_values", None),
+                preprocessed_attention_mask=kwargs.pop("preprocessed_attention_mask", None),
+                preprocessed_extra_kwargs=kwargs.pop("preprocessed_extra_kwargs", None),
             )
 
             return GenerationOutput(
@@ -712,6 +804,10 @@ class BatchedEngine(BaseEngine):
                 presence_penalty=kwargs.pop("presence_penalty", 0.0),
                 repetition_penalty=kwargs.pop("repetition_penalty", 1.0),
                 logits_processors=kwargs.pop("logits_processors", None),
+                preprocessed_input_ids=kwargs.pop("preprocessed_input_ids", None),
+                preprocessed_pixel_values=kwargs.pop("preprocessed_pixel_values", None),
+                preprocessed_attention_mask=kwargs.pop("preprocessed_attention_mask", None),
+                preprocessed_extra_kwargs=kwargs.pop("preprocessed_extra_kwargs", None),
             )
 
             async for output in self._mllm_scheduler.stream_outputs(request_id):
@@ -799,34 +895,34 @@ class BatchedEngine(BaseEngine):
         all_images = (images or []) + extracted_images
         all_videos = (videos or []) + extracted_videos
 
-        # Native video path: Gemma 4 (and Qwen-VL) emit their own
-        # <|image>...<|video|>...<image|> interleave with timestamps when
-        # the processor sees {type: video}. Batched can't consume that
-        # shape through its text-prompt scheduler, so delegate a video
-        # request to the MLXMultimodalLM's native pipeline for this call.
+        # Convert tools for template
+        template_tools = convert_tools_for_template(tools) if tools else None
+        chat_template_kwargs = dict(kwargs.pop("chat_template_kwargs", {}) or {})
+        enable_thinking = kwargs.pop("enable_thinking", None)
+
+        # Native multimodal pipeline (video_native models: Gemma 4, Qwen-VL,
+        # etc.). When a request has video, Gemma 4's processor emits its own
+        # <|image>...<|video|>...<image|> interleave with timestamps; the
+        # batched path can't reconstruct that from a rendered string, so we
+        # pre-tokenize via MLXMultimodalLM._prepare_native_video_inputs and
+        # hand the scheduler a request with input_ids / pixel_values /
+        # video_grid_thw already populated.
         if (
             self._is_mllm
             and self._mllm_instance is not None
             and getattr(self._mllm_instance, "_video_native", False)
-            and (all_videos or self._messages_have_video(messages))
+            and self._messages_have_video(messages)
         ):
-            import asyncio
-
-            return await asyncio.to_thread(
-                self._mllm_instance.chat,
-                messages=messages,
+            return await self._generate_native_video(
+                messages,
                 max_tokens=max_tokens,
                 temperature=temperature,
+                top_p=top_p,
                 tools=tools,
+                chat_template_kwargs=chat_template_kwargs,
+                enable_thinking=enable_thinking,
                 **kwargs,
             )
-
-        # Convert tools for template
-        template_tools = convert_tools_for_template(tools) if tools else None
-        chat_template_kwargs = dict(kwargs.pop("chat_template_kwargs", {}) or {})
-
-        # Per-request enable_thinking override
-        enable_thinking = kwargs.pop("enable_thinking", None)
 
         # Apply chat template
         prompt = self._apply_chat_template(
@@ -950,38 +1046,31 @@ class BatchedEngine(BaseEngine):
         all_images = (images or []) + extracted_images
         all_videos = (videos or []) + extracted_videos
 
-        # Native video path: Gemma 4 (and Qwen-VL) handle video via their own
-        # processor interleave. Delegate to MLXMultimodalLM.stream_chat for
-        # video requests so the native markers survive.
+        # Convert tools for template
+        template_tools = convert_tools_for_template(tools) if tools else None
+        chat_template_kwargs = dict(kwargs.pop("chat_template_kwargs", {}) or {})
+        enable_thinking = kwargs.pop("enable_thinking", None)
+
+        # Native multimodal pipeline: pre-tokenize via MLXMultimodalLM and
+        # hand the scheduler an already-preprocessed request. See chat().
         if (
             self._is_mllm
             and self._mllm_instance is not None
             and getattr(self._mllm_instance, "_video_native", False)
-            and (all_videos or self._messages_have_video(messages))
+            and self._messages_have_video(messages)
         ):
-            import asyncio
-
-            def _run():
-                return list(
-                    self._mllm_instance.stream_chat(
-                        messages=messages,
-                        max_tokens=max_tokens,
-                        temperature=temperature,
-                        tools=tools,
-                        **kwargs,
-                    )
-                )
-
-            for chunk in await asyncio.to_thread(_run):
-                yield chunk
+            async for output in self._stream_generate_native_video(
+                messages,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                tools=tools,
+                chat_template_kwargs=chat_template_kwargs,
+                enable_thinking=enable_thinking,
+                **kwargs,
+            ):
+                yield output
             return
-
-        # Convert tools for template
-        template_tools = convert_tools_for_template(tools) if tools else None
-        chat_template_kwargs = dict(kwargs.pop("chat_template_kwargs", {}) or {})
-
-        # Per-request enable_thinking override
-        enable_thinking = kwargs.pop("enable_thinking", None)
 
         # Apply chat template
         prompt = self._apply_chat_template(

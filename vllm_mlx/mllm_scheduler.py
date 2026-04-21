@@ -97,6 +97,14 @@ class MLLMRequest:
     sampling_params: SamplingParams = field(default_factory=SamplingParams)
     arrival_time: float = field(default_factory=time.time)
 
+    # Pre-computed inputs — set when the engine has already tokenized +
+    # ran the vision/audio/video processor upstream (e.g. video-native
+    # models). _preprocess_request trusts these and skips its own path.
+    preprocessed_input_ids: Optional[Any] = None
+    preprocessed_pixel_values: Optional[Any] = None
+    preprocessed_attention_mask: Optional[Any] = None
+    preprocessed_extra_kwargs: Optional[Dict[str, Any]] = None
+
     # Batch generator UID (assigned when scheduled)
     batch_uid: Optional[int] = None
 
@@ -383,12 +391,23 @@ class MLLMScheduler:
             logits_processors=kwargs.pop("logits_processors", None),
         )
 
+        # Extract upstream-preprocessed inputs if the engine handed us pre-
+        # tokenized native-multimodal inputs (e.g. Gemma 4 video pipeline).
+        preprocessed_input_ids = kwargs.pop("preprocessed_input_ids", None)
+        preprocessed_pixel_values = kwargs.pop("preprocessed_pixel_values", None)
+        preprocessed_attention_mask = kwargs.pop("preprocessed_attention_mask", None)
+        preprocessed_extra_kwargs = kwargs.pop("preprocessed_extra_kwargs", None)
+
         request = MLLMRequest(
             request_id=request_id,
             prompt=prompt,
             images=images,
             videos=videos,
             sampling_params=sampling_params,
+            preprocessed_input_ids=preprocessed_input_ids,
+            preprocessed_pixel_values=preprocessed_pixel_values,
+            preprocessed_attention_mask=preprocessed_attention_mask,
+            preprocessed_extra_kwargs=preprocessed_extra_kwargs,
         )
 
         # Estimate prompt token count for monitoring (text tokens only;
@@ -537,6 +556,18 @@ class MLLMScheduler:
                 repetition_penalty=request.sampling_params.repetition_penalty,
                 logits_processors=request.sampling_params.logits_processors,
             )
+            # Propagate pre-computed tokenization + vision inputs from the
+            # engine's native-multimodal pipeline so the batch generator
+            # doesn't re-tokenize (which would lose the native interleave).
+            if request.preprocessed_input_ids is not None:
+                batch_req.input_ids = request.preprocessed_input_ids
+                batch_req.pixel_values = request.preprocessed_pixel_values
+                batch_req.attention_mask = request.preprocessed_attention_mask
+                extras = dict(request.preprocessed_extra_kwargs or {})
+                if "image_grid_thw" in extras:
+                    batch_req.image_grid_thw = extras.pop("image_grid_thw")
+                batch_req.extra_kwargs = extras
+                batch_req.is_preprocessed = True
             batch_requests.append(batch_req)
 
             request.status = RequestStatus.RUNNING

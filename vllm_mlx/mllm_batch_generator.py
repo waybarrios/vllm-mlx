@@ -101,6 +101,12 @@ class MLLMBatchRequest:
     # Text-only flag (no images/videos — eligible for prefix cache)
     is_text_only: bool = False
 
+    # Upstream-tokenized flag: when the engine has already run the
+    # native multimodal pipeline (processor + vision encoder setup) and
+    # pre-populated input_ids/pixel_values/extra_kwargs, _preprocess_request
+    # trusts those and skips its own tokenization path.
+    is_preprocessed: bool = False
+
     # Generation state
     num_tokens: int = 0  # Tokens generated so far
     output_tokens: List[int] = field(default_factory=list)
@@ -779,6 +785,14 @@ class MLLMBatchGenerator:
         Args:
             request: Request to preprocess
         """
+        # Upstream-preprocessed (engine ran the native multimodal pipeline
+        # end-to-end): trust the pre-populated input_ids / pixel_values /
+        # extra_kwargs and set is_text_only based on whether pixel data came
+        # along so _process_prompts routes to the correct prefill path.
+        if request.is_preprocessed:
+            request.is_text_only = request.pixel_values is None
+            return
+
         # Already preprocessed (e.g. by chunked prefill interleaving).
         # Only skip for text-only requests; vision requests need pixel cache
         # lookup even if input_ids was set by a previous preprocess call.
