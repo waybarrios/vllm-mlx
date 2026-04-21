@@ -27,6 +27,27 @@ def stream_parse(parser, text, token_list):
     return "".join(reasoning_parts), "".join(content_parts)
 
 
+def test_thought_label_split_across_deltas():
+    """The channel-name word 'thought' can arrive split across deltas in
+    production streams. The parser must buffer the partial prefix rather than
+    leak 'th' / 'tho' / 'thou' / 'thoug' into the reasoning output.
+    """
+    parser = Gemma4ReasoningParser()
+    tokens = [
+        "<|channel>",
+        "tho",  # partial "thought" label
+        "ught",  # completes the label
+        "\n",
+        "real reasoning",
+        "<channel|>",
+        "content",
+    ]
+    reasoning, content = stream_parse(parser, None, tokens)
+    assert reasoning == "real reasoning", f"Label leaked: {reasoning!r}"
+    assert content == "content", f"Got content: {content!r}"
+    print("[PASS] test_thought_label_split_across_deltas")
+
+
 def test_channel_marker_split_across_tokens():
     """<|channel> alone should not leak into reasoning if response follows."""
     parser = Gemma4ReasoningParser()

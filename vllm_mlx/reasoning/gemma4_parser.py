@@ -28,6 +28,11 @@ from .think_parser import BaseThinkingReasoningParser
 # Channel names that follow <|channel> — stripped from output
 _THOUGHT_PREFIX = "thought"
 _RESPONSE_MARKER = "<|channel>response"
+# Full "open-thinking" marker. Kept as a buffering target so that partial
+# prefixes arriving mid-stream (e.g. "<|channel>th", "<|channel>thoug") are
+# held back until the label completes, instead of leaking 'th', 'tho', etc.
+# into the reasoning output.
+_THOUGHT_MARKER = "<|channel>thought"
 
 
 def _strip_channel_name(text: str, prefix: str) -> str:
@@ -95,7 +100,7 @@ class Gemma4ReasoningParser(BaseThinkingReasoningParser):
         when it appears AT THE END and is not followed by more text (i.e.,
         `response` or `thought` hasn't arrived yet).
         """
-        markers = (_RESPONSE_MARKER, self.end_token, self.start_token)
+        markers = (_RESPONSE_MARKER, _THOUGHT_MARKER, self.end_token, self.start_token)
         max_len = 0
         for marker in markers:
             # Scan from longest proper prefix downwards
