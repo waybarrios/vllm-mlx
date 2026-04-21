@@ -389,9 +389,27 @@ def _trim_cache_offset(cache: list[Any], trim_by: int) -> list[Any]:
         ):
             orig_cls = type(layer_cache)
             tc = orig_cls.__new__(orig_cls)
-            tc.keys = layer_cache.keys
-            tc.values = layer_cache.values
-            tc.offset = max(layer_cache.offset - trim_by, 0)
+            new_offset = max(layer_cache.offset - trim_by, 0)
+            keys = layer_cache.keys
+            values = layer_cache.values
+            # Slice the arrays down to new_offset rather than just shrinking the
+            # offset pointer.  Sharing the original (over-sized) array across
+            # requests lets attention paths that read the full underlying
+            # buffer (e.g. Gemma 4's KV-shared layers, which read cache.state
+            # directly instead of going through update_and_fetch) see stale
+            # tokens from the previous owner — issue #384.
+            if (
+                keys is not None
+                and hasattr(keys, "shape")
+                and len(keys.shape) >= 3
+                and new_offset < keys.shape[-2]
+            ):
+                tc.keys = keys[..., :new_offset, :]
+                tc.values = values[..., :new_offset, :]
+            else:
+                tc.keys = keys
+                tc.values = values
+            tc.offset = new_offset
             # Preserve type-specific attrs (max_size, keep, step, _idx)
             for attr in ("max_size", "keep", "step", "_idx"):
                 if hasattr(layer_cache, attr):
@@ -536,6 +554,19 @@ def _dequantize_cache(cache: list[Any]) -> list[Any]:
                 *layer.values, group_size=layer.group_size, bits=layer.bits
             )
             kv.offset = layer.offset
+            # Slice the dequantized arrays down to offset so that readers
+            # which bypass offset (e.g. Gemma 4 KV-shared layers reading
+            # cache.state directly) cannot see stale tokens from a previous
+            # request.  Mirrors the plain-KVCache slice in
+            # _trim_cache_offset — see issue #384.
+            if (
+                kv.keys is not None
+                and hasattr(kv.keys, "shape")
+                and len(kv.keys.shape) >= 3
+                and kv.offset < kv.keys.shape[-2]
+            ):
+                kv.keys = kv.keys[..., : kv.offset, :]
+                kv.values = kv.values[..., : kv.offset, :]
             # Restore type-specific attrs (max_size, keep, step, _idx)
             for attr, val in layer.orig_attrs.items():
                 setattr(kv, attr, val)
