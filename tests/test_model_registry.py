@@ -132,7 +132,7 @@ def test_acquire_shares_single_inflight_load(tmp_path):
         )
 
         first = asyncio.create_task(manager.acquire("alpha"))
-        await asyncio.sleep(0)
+        await asyncio.sleep(0.05)  # give _resolve_source thread time to return
         second = asyncio.create_task(manager.acquire("alpha"))
         await asyncio.sleep(0)
 

@@ -588,7 +588,7 @@ def get_engine() -> BaseEngine:
 
 def _list_available_model_names() -> list[str]:
     if _model_manager is not None:
-        return sorted(_model_manager._registry.keys())
+        return _model_manager.registered_model_names
     return [_model_name] if _model_name else []
 
 
@@ -4836,9 +4836,10 @@ def main():
 
     # Initialize reasoning parser if specified
     if args.reasoning_parser:
-        global _reasoning_parser
+        global _reasoning_parser, _reasoning_parser_name
         from .reasoning import get_parser
 
+        _reasoning_parser_name = args.reasoning_parser
         parser_cls = get_parser(args.reasoning_parser)
         _reasoning_parser = parser_cls()
         logger.info(f"Reasoning parser enabled: {args.reasoning_parser}")

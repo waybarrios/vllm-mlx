@@ -19,8 +19,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 
-import yaml
-
 from .api.utils import is_mllm_model
 from .engine.base import BaseEngine
 from .engine.batched import BatchedEngine
@@ -266,6 +264,8 @@ def load_registry_config(
     defaults: RegistryServeDefaults,
 ) -> tuple[RegistryManagerConfig, dict[str, RegisteredModel]]:
     """Load and validate the models registry YAML file."""
+    import yaml  # lazy: only needed when a registry config is provided
+
     raw = yaml.safe_load(Path(config_path).read_text()) or {}
     models = raw.get("models")
     if not isinstance(models, list) or not models:
@@ -364,6 +364,11 @@ class ModelManager:
     @property
     def memory_budget_bytes(self) -> int:
         return self._config.memory_budget_bytes
+
+    @property
+    def registered_model_names(self) -> list[str]:
+        """Return sorted list of all registered model names."""
+        return sorted(self._registry.keys())
 
     def has_model(self, model_name: str) -> bool:
         return model_name in self._registry
@@ -590,7 +595,7 @@ class ModelManager:
         unload_after_load: LoadedModel | None = None
 
         try:
-            resolved_source = self._resolve_source(entry)
+            resolved_source = await self._resolve_source(entry)
             loaded = await self._instantiate_model(entry, resolved_source)
         except Exception as exc:
             async with self._condition:
@@ -781,7 +786,10 @@ class ModelManager:
         await engine.start()
         return LoadedModel(config=config, engine=engine)
 
-    def _resolve_source(self, entry: RegisteredModel) -> str:
+    async def _resolve_source(self, entry: RegisteredModel) -> str:
+        return await asyncio.to_thread(self._resolve_source_sync, entry)
+
+    def _resolve_source_sync(self, entry: RegisteredModel) -> str:
         source = entry.source
         if Path(source).exists():
             return source
