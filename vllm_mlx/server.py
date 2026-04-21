@@ -455,6 +455,9 @@ async def lifespan(app: FastAPI):
     # Startup: Start engine if loaded (needed for BatchedEngine in uvicorn's event loop)
     if _engine is not None and hasattr(_engine, "_loaded") and not _engine._loaded:
         await _engine.start()
+        # Must run AFTER start() — BatchedEngine only populates its processor
+        # during start(), so sampling defaults can't resolve before this point.
+        _apply_generation_config_defaults()
 
     # Load persisted cache from disk (AFTER engine start — AsyncEngineCore must exist)
     if _engine is not None and hasattr(_engine, "load_cache_from_disk"):
