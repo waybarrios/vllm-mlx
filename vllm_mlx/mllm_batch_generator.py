@@ -929,14 +929,19 @@ class MLLMBatchGenerator:
 
     @staticmethod
     def _trim_rotating_caches(cache_list):
-        """Trim RotatingKVCache buffers restored from prefix cache.
+        """Normalize RotatingKVCache buffers restored from prefix cache.
 
-        Prefix cache stores the full KV state (offset may exceed max_size for
-        sliding-window layers).  RotatingKVCache._update_in_place computes
-        ``new_size = min(step, max_size - prev)`` which goes negative when
-        ``prev > max_size``, crashing with "Negative dimensions not allowed".
+        Prefix-cache entries can contain over-sized buffers (buf_len >
+        max_size) from a supersequence/LCP trim that crossed the max_size
+        boundary. RotatingKVCache._update_in_place then computes
+        ``new_size = min(step, max_size - prev)`` with ``prev > max_size``,
+        going negative ("Negative dimensions not allowed").
 
-        Trimming the buffer to max_size and clamping offset/idx prevents this.
+        Trim over-sized buffers back to max_size. DO NOT clamp
+        ``layer_cache.offset`` — it tracks the global token position and
+        is consumed by RoPE. Clamping it to max_size would tell RoPE a
+        12K-token prefill landed at position 1024, making every
+        subsequently generated token hallucinate.
         """
         from mlx_lm.models.cache import RotatingKVCache
 
@@ -952,7 +957,6 @@ class MLLMBatchGenerator:
                 layer_cache.keys = layer_cache._trim(trim_size, layer_cache.keys)
                 layer_cache.values = layer_cache._trim(trim_size, layer_cache.values)
                 layer_cache._idx = layer_cache.max_size
-            layer_cache.offset = min(layer_cache.offset, layer_cache.max_size)
             # Defensive: ensure size() <= keys.shape[2] to prevent merge crash.
             # Prefix cache trimming can create offset > keys.shape[2] when
             # a supersequence/LCP trim crosses the max_size boundary.
