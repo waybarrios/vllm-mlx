@@ -563,9 +563,7 @@ class TestAsyncFetchPath:
         def release_fn(nbytes):
             budget_released.append(nbytes)
 
-        result = asyncio.get_event_loop().run_until_complete(
-            tier.async_promote(tokens, reserve_fn, release_fn)
-        )
+        result = asyncio.run(tier.async_promote(tokens, reserve_fn, release_fn))
 
         # Budget was reserved
         assert len(budget_reserved) == 1
@@ -589,9 +587,7 @@ class TestAsyncFetchPath:
         def release_fn(nbytes):
             pass
 
-        result = asyncio.get_event_loop().run_until_complete(
-            tier.async_promote(tokens, reserve_fn, release_fn)
-        )
+        result = asyncio.run(tier.async_promote(tokens, reserve_fn, release_fn))
 
         assert result is None
         assert tier._stats.promotion_failures == 1
@@ -617,9 +613,7 @@ class TestAsyncFetchPath:
         with open(manifest_path, "w") as f:
             f.write("corrupted!")
 
-        result = asyncio.get_event_loop().run_until_complete(
-            tier.async_promote(tokens, reserve_fn, release_fn)
-        )
+        result = asyncio.run(tier.async_promote(tokens, reserve_fn, release_fn))
 
         assert result is None
         # Budget was reserved then released
@@ -859,7 +853,7 @@ class TestIntegrationSpillAndFetch:
                 lambda n: None,
             )
 
-        promoted = asyncio.get_event_loop().run_until_complete(do_promote())
+        promoted = asyncio.run(do_promote())
         assert promoted is not None
         assert len(promoted) == 1  # One layer
         assert ssd_tier._stats.ssd_hits == 1
@@ -890,7 +884,7 @@ class TestIntegrationSpillAndFetch:
                 lambda n: None,
             )
 
-        promoted = asyncio.get_event_loop().run_until_complete(do_promote())
+        promoted = asyncio.run(do_promote())
         assert promoted is not None
         assert len(promoted) == 1
         assert "state" in promoted[0]
@@ -965,7 +959,7 @@ class TestIntegrationSpillAndFetch:
                     evicted_tokens, lambda n: True, lambda n: None
                 )
 
-            asyncio.get_event_loop().run_until_complete(promote())
+            asyncio.run(promote())
             stats = ssd_tier.get_stats()
             assert stats["ssd_hits"] >= 1
             assert stats["reload_bytes"] > 0

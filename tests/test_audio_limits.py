@@ -26,7 +26,7 @@ class FakeUpload:
 
 
 class TestAudioUploadLimits:
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_save_upload_with_limit_writes_file(self):
         upload = FakeUpload([b"a" * 8, b"b" * 4])
 
@@ -37,7 +37,7 @@ class TestAudioUploadLimits:
         finally:
             Path(path).unlink(missing_ok=True)
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_save_upload_with_limit_rejects_oversize_and_cleans_up(self):
         upload = FakeUpload([b"a" * 16, b"b" * 16, b"c"])
 

@@ -1137,7 +1137,7 @@ class MLXMultimodalLM:
         self,
         messages: list[dict],
         video_frame_counts: dict[int, int] | None = None,
-    ) -> tuple[list[dict], list]:
+    ) -> tuple[list[dict], list, list]:
         """Transform OpenAI-format messages into chat-template-ready form.
 
         Preserves every message's full structure — ``role``, ``tool_calls``
@@ -1151,6 +1151,9 @@ class MLXMultimodalLM:
           ``{type: image}`` so the chat template emits its model-specific
           image placeholder at that position. Order inside the content
           list is preserved.
+        - ``audio_url`` / ``audio`` parts: URL registered into
+          ``all_audio_urls`` and item replaced with ``{type: audio}``
+          for the template's audio placeholder.
         - ``video``/``video_url`` and unknown part types: passed through
           unchanged so specialised templates can render them.
 
@@ -1168,11 +1171,13 @@ class MLXMultimodalLM:
         ``response:name{content:<|"|>str<|"|>}`` rather than the synthetic
         ``{value:...}`` the model wasn't trained on).
 
-        Returns the rebuilt messages list plus the flat list of image URLs
-        that need downloading/decoding via ``_prepare_images``.
+        Returns the rebuilt messages list, the flat list of image URLs
+        that need downloading/decoding via ``_prepare_images``, and the
+        flat list of audio URLs to pass through to the audio pipeline.
         """
         chat_messages: list[dict] = []
         all_image_urls: list = []
+        all_audio_urls: list = []
         video_frame_counts = video_frame_counts or {}
 
         for msg_idx, msg in enumerate(messages):
@@ -1221,8 +1226,23 @@ class MLXMultimodalLM:
                         if url:
                             all_image_urls.append(url)
                             transformed.append({"type": "image"})
+                    elif item_type == "audio_url":
+                        url_obj = item.get("audio_url", {})
+                        url = (
+                            url_obj.get("url", "")
+                            if isinstance(url_obj, dict)
+                            else url_obj
+                        )
+                        if url:
+                            all_audio_urls.append(url)
+                            transformed.append({"type": "audio"})
+                    elif item_type == "audio":
+                        url = item.get("audio", item.get("url", ""))
+                        if url:
+                            all_audio_urls.append(url)
+                            transformed.append({"type": "audio"})
                     else:
-                        # video/video_url/audio/etc. — pass through so
+                        # video/video_url/etc. — pass through so
                         # specialised templates can render them.
                         transformed.append(item)
 
@@ -1251,7 +1271,7 @@ class MLXMultimodalLM:
 
             chat_messages.append(out)
 
-        return chat_messages, all_image_urls
+        return chat_messages, all_image_urls, all_audio_urls
 
     def generate(
         self,
@@ -1557,9 +1577,9 @@ class MLXMultimodalLM:
 
         # Rebuild messages for the template. Preserves tool_calls /
         # tool_call_id / name / dict-content intact while extracting image
-        # URLs and inserting `{type: image}` placeholders inline at each
-        # image's original position.
-        chat_messages, all_image_urls = self._prepare_chat_messages(
+        # and audio URLs and inserting `{type: image}` / `{type: audio}`
+        # placeholders inline at each media part's original position.
+        chat_messages, all_image_urls, all_audio_urls = self._prepare_chat_messages(
             messages, _msg_video_frame_counts
         )
 
@@ -1572,7 +1592,7 @@ class MLXMultimodalLM:
 
         # Apply chat template directly - messages are already properly structured
         logger.info(
-            f"Applying chat template with {len(chat_messages)} messages, {len(all_images)} images"
+            f"Applying chat template with {len(chat_messages)} messages, {len(all_images)} images, {len(all_audio_urls)} audios"
         )
         for i, cm in enumerate(chat_messages):
             content_preview = str(cm.get("content", ""))[:80]
@@ -1715,6 +1735,7 @@ class MLXMultimodalLM:
             self.processor,
             formatted_prompt,
             all_images if all_images else None,
+            audio=all_audio_urls if all_audio_urls else None,
             max_tokens=max_tokens,
             temp=temperature,
             verbose=False,
@@ -1892,8 +1913,8 @@ class MLXMultimodalLM:
 
         # Rebuild messages for the template. Preserves tool_calls /
         # tool_call_id / name / dict-content intact while extracting image
-        # URLs and inserting `{type: image}` placeholders inline.
-        chat_messages, all_image_urls = self._prepare_chat_messages(
+        # and audio URLs and inserting placeholders inline.
+        chat_messages, all_image_urls, all_audio_urls = self._prepare_chat_messages(
             messages, _msg_video_frame_counts
         )
 
@@ -1963,6 +1984,7 @@ class MLXMultimodalLM:
             self.processor,
             formatted_prompt,
             all_images if all_images else None,
+            audio=all_audio_urls if all_audio_urls else None,
             max_tokens=max_tokens,
             temp=temperature,
             prompt_cache=prompt_cache,
