@@ -180,9 +180,13 @@ class BatchedEngine(BaseEngine):
 
     @property
     def tokenizer(self) -> Any:
-        """Get the tokenizer."""
+        """Return the processor for MLLM (matches SimpleEngine) so callers that
+        rely on ``name_or_path`` or processor-level methods get a live handle.
+        The processor exposes ``.encode`` via its inner tokenizer, which is the
+        only method the token-counting caller uses.
+        """
         if self._is_mllm and self._processor:
-            return getattr(self._processor, "tokenizer", self._processor)
+            return self._processor
         return self._tokenizer
 
     async def start(self) -> None:
