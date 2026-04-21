@@ -1062,6 +1062,14 @@ class MLLMBatchGenerator:
         if request.image_grid_thw is not None:
             kwargs["image_grid_thw"] = request.image_grid_thw
 
+        pv = request.pixel_values
+        pv_shape = getattr(pv, "shape", None) if pv is not None else None
+        logger.info(
+            f"[vision] request={request.request_id[:12]} "
+            f"pixel_values={'set' if pv is not None else 'NONE'} "
+            f"shape={pv_shape} input_ids_len={request.input_ids.size if request.input_ids is not None else 0}"
+        )
+
         # Run full VLM forward pass with cache.
         # The VLM passes cache= through to self.language_model(),
         # so the language model writes KV state directly into our cache.
