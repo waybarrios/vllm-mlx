@@ -783,6 +783,12 @@ class MLLMScheduler:
         if self._running:
             return
 
+        # Build the batch generator up front so its init (attention patches,
+        # _compute_think_suffix_len, prefix cache setup) completes before
+        # any request handler touches the tokenizer or model. Avoids a race
+        # between lazy init and the first concurrent request.
+        self._ensure_batch_generator()
+
         self._running = True
         self._processing_task = asyncio.create_task(self._process_loop())
         logger.info(
