@@ -417,6 +417,10 @@ class MLLMBatchGenerator:
         # ≤ window/2 guarantees every query sees at least window/2 prior
         # tokens in its cache.
         sliding_window = _smallest_sliding_window(self.language_model)
+        logger.info(
+            f"MLLMBatchGenerator: detected sliding_window={sliding_window} "
+            f"(prefill_step_size={prefill_step_size})"
+        )
         if sliding_window and prefill_step_size > sliding_window // 2:
             capped = max(sliding_window // 2, 64)
             logger.info(

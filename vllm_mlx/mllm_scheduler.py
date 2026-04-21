@@ -311,13 +311,19 @@ class MLLMScheduler:
             )
 
             # Install chunked prefill BEFORE MTP (MTP wraps _next,
-            # chunked replaces it — MTP then wraps the chunked version)
+            # chunked replaces it — MTP then wraps the chunked version).
+            # Cap at prefill_step_size so the sliding-window safety cap the
+            # generator applied also governs the interleaved budget.
             if self.config.chunked_prefill_tokens > 0:
                 from .mllm_batch_generator import install_chunked_prefill_mllm
 
+                budget = min(
+                    self.config.chunked_prefill_tokens,
+                    self.batch_generator.prefill_step_size,
+                )
                 install_chunked_prefill_mllm(
                     self.batch_generator,
-                    budget=self.config.chunked_prefill_tokens,
+                    budget=budget,
                 )
 
             # Install MTP if enabled and language model supports it
