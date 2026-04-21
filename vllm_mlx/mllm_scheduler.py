@@ -277,12 +277,15 @@ class MLLMScheduler:
     def _ensure_batch_generator(self) -> None:
         """Ensure batch generator exists."""
         if self.batch_generator is None:
-            from mlx_lm.sample_utils import make_sampler
-
             from .memory_cache import MemoryCacheConfig
 
-            # Default sampler (can be overridden per-request in future)
-            sampler = make_sampler(temp=0.7, top_p=0.9)
+            # No global sampler — every request now builds its own sampler
+            # in ``MLLMBatchGenerator._process_prompts`` from its
+            # ``temperature`` / ``top_p`` / ``top_k`` / ``min_p`` and the
+            # result flows through to ``_step``. ``self.sampler`` is only
+            # consulted as a last-resort fallback, which is the
+            # MLLMBatchGenerator default (``argmax``).
+            sampler = None
 
             # Configure KV prefix cache for text-only requests
             # KV cache quantization reduces prefix cache memory ~4x (BF16→Q8).

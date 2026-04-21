@@ -1086,12 +1086,28 @@ class MLLMBatchGenerator:
         # For text-only requests, we check the prefix cache first. If there's
         # a hit, we skip the full VLM forward and run only the language model
         # on the remaining (uncached) tokens.
+        from mlx_lm.sample_utils import make_sampler as _make_sampler
+
         first_tokens = []
         all_logprobs = []
         per_request_caches = []
 
         aborted_requests = []
         for req in requests:
+            # Per-request sampler honoring the request's own temperature /
+            # top_p / top_k / min_p — used for first-token sampling below
+            # and stored in ``batch_samplers`` for subsequent ``_step`` calls.
+            # Without this, every first token was drawn from the scheduler's
+            # hardcoded ``make_sampler(temp=0.7, top_p=0.9)`` regardless of
+            # what the caller requested, which clamps caller-specified
+            # temperatures and collapses generation for models tuned at
+            # other settings (e.g. Gemma 4 at temp=0.95).
+            req_sampler = _make_sampler(
+                temp=req.temperature,
+                top_p=req.top_p,
+                top_k=req.top_k,
+                min_p=req.min_p,
+            )
             try:
                 # Check abort before starting prefill
                 if req.request_id in self._aborted_request_ids:
@@ -1213,7 +1229,7 @@ class MLLMBatchGenerator:
                         logprobs = last_logits - mx.logsumexp(
                             last_logits, axis=-1, keepdims=True
                         )
-                        sampled = self.sampler(logprobs)
+                        sampled = req_sampler(logprobs)
                         mx.eval(sampled, logprobs)
 
                         first_tokens.append(sampled.item())
@@ -1259,7 +1275,7 @@ class MLLMBatchGenerator:
                         logprobs = last_logits - mx.logsumexp(
                             last_logits, axis=-1, keepdims=True
                         )
-                        sampled = self.sampler(logprobs)
+                        sampled = req_sampler(logprobs)
                         mx.eval(sampled, logprobs)
 
                         first_tokens.append(sampled.item())
@@ -1305,7 +1321,7 @@ class MLLMBatchGenerator:
                         logprobs = last_logits - mx.logsumexp(
                             last_logits, axis=-1, keepdims=True
                         )
-                        sampled = self.sampler(logprobs)
+                        sampled = req_sampler(logprobs)
 
                         mx.eval(sampled, logprobs)
 
@@ -1423,25 +1439,30 @@ class MLLMBatchGenerator:
             else:
                 batch_logits_processors.append(None)
 
-        # Build per-request samplers for top_k/min_p
+        # Per-request samplers. Built unconditionally so that every request
+        # samples at its own ``temperature`` / ``top_p`` / ``top_k`` /
+        # ``min_p`` during ``_step`` — matching the first-token sampler
+        # already built above. A previous version gated sampler creation on
+        # ``top_k != 0 or min_p != 0.0`` which caused every "default"
+        # request to silently fall through to ``self.sampler``, a scheduler
+        # global hardcoded at ``temp=0.7, top_p=0.9`` regardless of what
+        # the caller asked for.
         batch_samplers = []
-        has_any_sampler = False
         for req in requests:
-            if req.top_k != 0 or req.min_p != 0.0:
-                s = make_sampler(
+            batch_samplers.append(
+                make_sampler(
                     temp=req.temperature,
                     top_p=req.top_p,
                     top_k=req.top_k,
                     min_p=req.min_p,
                 )
-                batch_samplers.append(s)
-                has_any_sampler = True
-                logger.info(
-                    f"[sampling] request={req.request_id[:12]} "
-                    f"top_k={req.top_k} min_p={req.min_p}"
-                )
-            else:
-                batch_samplers.append(None)
+            )
+            logger.info(
+                f"[sampling] request={req.request_id[:12]} "
+                f"temp={req.temperature} top_p={req.top_p} "
+                f"top_k={req.top_k} min_p={req.min_p}"
+            )
+        has_any_sampler = bool(batch_samplers)
 
         self._stats.prompt_time += time.perf_counter() - tic
 
