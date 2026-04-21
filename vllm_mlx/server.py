@@ -2783,26 +2783,25 @@ async def _disconnect_guard(
     import time as _time
 
     _t0 = _time.monotonic()
+    # Short tag for cross-referencing with upstream MLLM request IDs in
+    # the same log stream.
+    scope = getattr(raw_request, "scope", None) or {}
+    client = scope.get("client") or ("?", "?")
+    tag = f"{client[0]}:{client[1]}"
 
     def _elapsed():
         return f"{_time.monotonic() - _t0:.1f}s"
 
-    logger.info(
-        f"[disconnect_guard] START poll={poll_interval}s heartbeat={heartbeat_interval}s"
-    )
+    logger.info(f"[disconnect_guard {tag}] START elapsed=0.0s")
 
     async def _wait_disconnect():
-        poll_count = 0
         while True:
             await asyncio.sleep(poll_interval)
-            poll_count += 1
             is_disc = await raw_request.is_disconnected()
-            if poll_count % 10 == 0 or is_disc:
-                logger.info(
-                    f"[disconnect_guard] poll #{poll_count} "
-                    f"disconnected={is_disc} elapsed={_elapsed()}"
-                )
             if is_disc:
+                logger.info(
+                    f"[disconnect_guard {tag}] DISCONNECT elapsed={_elapsed()}"
+                )
                 return
 
     chunk_count = 0
@@ -2825,7 +2824,7 @@ async def _disconnect_guard(
 
             if disconnect_task in done:
                 logger.info(
-                    f"[disconnect_guard] CLIENT DISCONNECTED after "
+                    f"[disconnect_guard {tag}] CLIENT DISCONNECTED after "
                     f"{chunk_count} chunks, {heartbeat_count} heartbeats, "
                     f"elapsed={_elapsed()}"
                 )
@@ -2841,20 +2840,20 @@ async def _disconnect_guard(
                     chunk = anext_task.result()
                 except StopAsyncIteration:
                     logger.info(
-                        f"[disconnect_guard] generator exhausted normally, "
+                        f"[disconnect_guard {tag}] generator exhausted normally, "
                         f"{chunk_count} chunks, elapsed={_elapsed()}"
                     )
                     break
                 except Exception as exc:
                     logger.error(
-                        f"[disconnect_guard] generator raised {type(exc).__name__}: {exc}, "
+                        f"[disconnect_guard {tag}] generator raised {type(exc).__name__}: {exc}, "
                         f"after {chunk_count} chunks, elapsed={_elapsed()}"
                     )
                     break
                 chunk_count += 1
                 if chunk_count == 1:
                     logger.info(
-                        f"[disconnect_guard] first chunk arrived, elapsed={_elapsed()}"
+                        f"[disconnect_guard {tag}] first chunk arrived, elapsed={_elapsed()}"
                     )
                 yield chunk
                 anext_task = None
@@ -2869,7 +2868,7 @@ async def _disconnect_guard(
 
     except GeneratorExit:
         logger.info(
-            f"[disconnect_guard] GeneratorExit after {chunk_count} chunks, elapsed={_elapsed()}"
+            f"[disconnect_guard {tag}] GeneratorExit after {chunk_count} chunks, elapsed={_elapsed()}"
         )
     finally:
         # Cancel AND await the helper tasks. Just cancelling leaves them
@@ -2898,7 +2897,7 @@ async def _disconnect_guard(
         #   anext_task.cancel() → CancelledError in stream_outputs() →
         #   finally block → abort_request() → request removed from scheduler.
         logger.info(
-            f"[disconnect_guard] CLEANUP done, {chunk_count} chunks, "
+            f"[disconnect_guard {tag}] CLEANUP done, {chunk_count} chunks, "
             f"{heartbeat_count} heartbeats, elapsed={_elapsed()}"
         )
 
@@ -2918,21 +2917,21 @@ async def _wait_with_disconnect(
     import time as _time
 
     _t0 = _time.monotonic()
+    scope = getattr(raw_request, "scope", None) or {}
+    client = scope.get("client") or ("?", "?")
+    tag = f"{client[0]}:{client[1]}"
 
     task = asyncio.ensure_future(coro)
 
     async def _wait_disconnect():
-        poll_count = 0
         while True:
             await asyncio.sleep(poll_interval)
-            poll_count += 1
             is_disc = await raw_request.is_disconnected()
-            if poll_count % 10 == 0 or is_disc:
-                logger.info(
-                    f"[disconnect_guard] poll #{poll_count} "
-                    f"disconnected={is_disc} elapsed={_time.monotonic() - _t0:.1f}s"
-                )
             if is_disc:
+                logger.info(
+                    f"[disconnect_guard {tag}] DISCONNECT (non-stream) "
+                    f"elapsed={_time.monotonic() - _t0:.1f}s"
+                )
                 return
 
     disconnect_task = asyncio.create_task(_wait_disconnect())
@@ -2957,11 +2956,7 @@ async def _wait_with_disconnect(
             )
 
         if disconnect_task in done:
-            # Client disconnected
-            logger.info(
-                f"[disconnect_guard] CLIENT DISCONNECTED (non-stream) "
-                f"elapsed={_time.monotonic() - _t0:.1f}s"
-            )
+            # Client disconnected (already logged inside _wait_disconnect)
             task.cancel()
             try:
                 await task
