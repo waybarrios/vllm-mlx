@@ -835,37 +835,6 @@ class MLLMBatchGenerator:
         )
 
     @staticmethod
-    def _copy_prefix_cache(cache_list):
-        """Create shallow copies of cache objects to prevent mutation of stored prefix cache.
-
-        MLX arrays are immutable and safe to share, but cache objects have mutable
-        Python attributes (offset, _idx) that get modified by update_and_fetch().
-        Without copying, the stored prefix cache entry is corrupted after each use.
-        """
-        from mlx_lm.models.cache import KVCache, RotatingKVCache
-
-        copies = []
-        for c in cache_list:
-            if isinstance(c, RotatingKVCache):
-                new_c = RotatingKVCache(c.max_size, c.keep)
-                new_c.step = c.step
-                new_c.keys = c.keys
-                new_c.values = c.values
-                new_c.offset = c.offset
-                new_c._idx = c._idx
-                copies.append(new_c)
-            elif isinstance(c, KVCache):
-                new_c = KVCache()
-                new_c.step = c.step
-                new_c.keys = c.keys
-                new_c.values = c.values
-                new_c.offset = c.offset
-                copies.append(new_c)
-            else:
-                copies.append(c)
-        return copies
-
-    @staticmethod
     def _has_empty_rotating_cache(cache_list):
         """Check if any RotatingKVCache layer has no data (keys=None).
 
@@ -1166,8 +1135,8 @@ class MLLMBatchGenerator:
 
                 if cached_kv is not None and remaining_ids:
                     # Prefix/LCP match — run language model on remaining tokens.
-                    # Copy cache to prevent mutation of stored prefix cache entry.
-                    request_cache = self._copy_prefix_cache(cached_kv)
+                    # fetch() already deep-copies, so cached_kv is owned by us.
+                    request_cache = cached_kv
                     self._trim_rotating_caches(request_cache)
                     remaining = mx.array(remaining_ids)[None, :]
                     cached_count = len(input_ids_list) - len(remaining_ids)

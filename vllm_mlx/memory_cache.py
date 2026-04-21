@@ -27,6 +27,7 @@ from __future__ import annotations
 import bisect
 import logging
 import math
+import threading
 from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Any
@@ -529,18 +530,19 @@ def _quantize_cache(cache: list[Any], bits: int = 8, group_size: int = 64) -> li
     return quantized
 
 
-def _dequantize_cache(cache: list[Any]) -> list[Any]:
-    """Dequantize _QuantizedCacheWrapper layers and copy non-quantized layers.
+def _clone_cache_for_fetch(cache: list[Any]) -> list[Any]:
+    """Return a per-request copy of a stored cache entry.
 
-    All layers are copied (never returned by reference) so that the model's
-    ``update_and_fetch`` mutations don't corrupt the stored cache entry.
+    Dequantizes ``_QuantizedCacheWrapper`` layers and deep-copies all other
+    layers (new ``mx.array`` for keys/values, fresh cache object) so the
+    model's ``update_and_fetch`` — which mutates RotatingKVCache buffers in
+    place — can't corrupt the stored entry the next request will re-fetch.
     """
     import mlx.core as mx
 
     result = []
     for layer in cache:
         if isinstance(layer, _QuantizedCacheWrapper):
-            # Reconstruct original cache type from quantized data
             orig_cls = layer.orig_type
             kv = orig_cls.__new__(orig_cls)
             kv.keys = mx.dequantize(
@@ -550,13 +552,10 @@ def _dequantize_cache(cache: list[Any]) -> list[Any]:
                 *layer.values, group_size=layer.group_size, bits=layer.bits
             )
             kv.offset = layer.offset
-            # Restore type-specific attrs (max_size, keep, step, _idx)
             for attr, val in layer.orig_attrs.items():
                 setattr(kv, attr, val)
             result.append(kv)
         elif hasattr(layer, "keys") and hasattr(layer, "offset"):
-            # Deep-copy non-quantized cache layers (e.g. RotatingKVCache)
-            # so model's in-place mutations don't corrupt stored entries
             orig_cls = type(layer)
             kv = orig_cls.__new__(orig_cls)
             kv.keys = mx.array(layer.keys) if layer.keys is not None else None
@@ -569,6 +568,11 @@ def _dequantize_cache(cache: list[Any]) -> list[Any]:
         else:
             result.append(layer)
     return result
+
+
+# Alias kept for call sites that conceptually "dequantize"; they now always
+# get a deep copy even when no quantization was used.
+_dequantize_cache = _clone_cache_for_fetch
 
 
 def _compute_model_fingerprint(model: Any) -> str:
@@ -623,7 +627,10 @@ class MemoryAwarePrefixCache:
     - OrderedDict for O(1) LRU operations
 
     Thread Safety:
-        This class is NOT thread-safe. Use external locking if needed.
+        All public methods hold ``self._lock`` while touching ``_entries``,
+        ``_sorted_keys``, ``_current_memory``, and ``_stats``. Safe to call
+        ``fetch`` / ``store`` / ``remove`` / ``clear`` / ``save_to_disk`` /
+        ``load_from_disk`` from multiple threads.
     """
 
     def __init__(
@@ -664,6 +671,11 @@ class MemoryAwarePrefixCache:
         # Optional SSD cold tier (set via set_ssd_tier())
         self._ssd_tier = None
 
+        # Protects _entries / _sorted_keys / _current_memory / _stats across
+        # threads. Re-entrant because a few helpers call back into locked
+        # methods (e.g. clear → _evict_lru chain during test teardown).
+        self._lock = threading.RLock()
+
         logger.info(
             f"MemoryAwarePrefixCache initialized: "
             f"max_memory={self._max_memory / _BYTES_PER_MB:.1f}MB, "
@@ -689,6 +701,12 @@ class MemoryAwarePrefixCache:
             - cache: Cached KV state if found, None otherwise
             - remaining_tokens: Tokens that still need processing
         """
+        with self._lock:
+            return self._fetch_locked(tokens)
+
+    def _fetch_locked(
+        self, tokens: list[int]
+    ) -> tuple[list[Any] | None, list[int]]:
         if not tokens:
             self._stats.misses += 1
             self._last_match_type = "miss"
@@ -703,12 +721,7 @@ class MemoryAwarePrefixCache:
             self._stats.hits += 1
             self._stats.tokens_saved += len(tokens)
             self._last_match_type = "exact"
-            cache_out = (
-                _dequantize_cache(entry.cache)
-                if self._config.kv_quantize
-                else entry.cache
-            )
-            return cache_out, []
+            return _clone_cache_for_fetch(entry.cache), []
 
         # --- O(log N) prefix & supersequence match via sorted index ---
         best_match: _CacheEntry | None = None
@@ -778,23 +791,13 @@ class MemoryAwarePrefixCache:
                 self._stats.hits += 1
                 self._stats.tokens_saved += n_requested
                 self._last_match_type = "supersequence"
-                trimmed_cache = (
-                    _dequantize_cache(trimmed_cache)
-                    if self._config.kv_quantize
-                    else trimmed_cache
-                )
-                return trimmed_cache, []
+                return _clone_cache_for_fetch(trimmed_cache), []
             else:
                 self._entries.move_to_end(best_super.tokens)
                 self._stats.hits += 1
                 self._stats.tokens_saved += n_requested
                 self._last_match_type = "supersequence"
-                cache_out = (
-                    _dequantize_cache(best_super.cache)
-                    if self._config.kv_quantize
-                    else best_super.cache
-                )
-                return cache_out, []
+                return _clone_cache_for_fetch(best_super.cache), []
 
         # --- Prefix match ---
         if best_match is not None:
@@ -803,12 +806,7 @@ class MemoryAwarePrefixCache:
             self._stats.tokens_saved += best_length
             remaining = tokens[best_length:]
             self._last_match_type = "prefix"
-            cache_out = (
-                _dequantize_cache(best_match.cache)
-                if self._config.kv_quantize
-                else best_match.cache
-            )
-            return cache_out, remaining
+            return _clone_cache_for_fetch(best_match.cache), remaining
 
         # --- LCP (Longest Common Prefix) for divergent sequences ---
         # This handles the agentic pattern: same system+context prefix
@@ -819,18 +817,19 @@ class MemoryAwarePrefixCache:
 
         if sorted_keys:
             idx = bisect.bisect_left(sorted_keys, tokens_key)
-            # Check neighbors around insertion point (they share the most
-            # common prefix due to lexicographic ordering).
-            for i in (idx - 1, idx):
-                if i < 0 or i >= len(sorted_keys):
-                    continue
+            # Scan outward from the insertion point and stop on first-token
+            # divergence (lexicographic order clusters same-first-token
+            # entries contiguously).
+            first = tokens_key[0]
+            for i in range(idx - 1, -1, -1):
                 cached_key = sorted_keys[i]
+                if cached_key[0] != first:
+                    break
                 if cached_key == tokens_key:
-                    continue  # Skip exact (already handled)
+                    continue
                 min_len = min(len(cached_key), len(tokens_key))
                 if min_len <= best_lcp_length:
                     continue
-                # Compute LCP length
                 lcp = 0
                 for j in range(min_len):
                     if cached_key[j] != tokens_key[j]:
@@ -839,10 +838,23 @@ class MemoryAwarePrefixCache:
                 if lcp > best_lcp_length:
                     best_lcp_entry = self._entries[cached_key]
                     best_lcp_length = lcp
-                    logger.debug(
-                        f"[cache_fetch] LCP scan: cached_len={len(cached_key)} "
-                        f"req_len={len(tokens_key)} lcp={lcp}"
-                    )
+            for i in range(idx, len(sorted_keys)):
+                cached_key = sorted_keys[i]
+                if cached_key[0] != first:
+                    break
+                if cached_key == tokens_key:
+                    continue
+                min_len = min(len(cached_key), len(tokens_key))
+                if min_len <= best_lcp_length:
+                    continue
+                lcp = 0
+                for j in range(min_len):
+                    if cached_key[j] != tokens_key[j]:
+                        break
+                    lcp = j + 1
+                if lcp > best_lcp_length:
+                    best_lcp_entry = self._entries[cached_key]
+                    best_lcp_length = lcp
 
         if best_lcp_entry is not None and best_lcp_length > 0:
             excess = len(best_lcp_entry.tokens) - best_lcp_length
@@ -878,12 +890,7 @@ class MemoryAwarePrefixCache:
                     f"trimmed={excess} remaining={len(remaining)}"
                 )
                 self._last_match_type = "lcp"
-                trimmed_cache = (
-                    _dequantize_cache(trimmed_cache)
-                    if self._config.kv_quantize
-                    else trimmed_cache
-                )
-                return trimmed_cache, remaining
+                return _clone_cache_for_fetch(trimmed_cache), remaining
 
         self._stats.misses += 1
         self._last_match_type = "miss"
@@ -912,6 +919,12 @@ class MemoryAwarePrefixCache:
         Returns:
             True if stored successfully, False if rejected.
         """
+        with self._lock:
+            return self._store_locked(tokens, cache, evict_prefixes)
+
+    def _store_locked(
+        self, tokens: list[int], cache: list[Any], evict_prefixes: bool
+    ) -> bool:
         if not tokens or not cache:
             return False
 
@@ -1041,21 +1054,23 @@ class MemoryAwarePrefixCache:
             True if entry was found and removed.
         """
         tokens_key = tuple(tokens)
-        entry = self._entries.pop(tokens_key, None)
-        if entry is not None:
-            self._current_memory -= entry.memory_bytes
-            self._remove_from_sorted(tokens_key)
-            self._stats.entry_count = len(self._entries)
-            self._stats.current_memory_bytes = self._current_memory
-            return True
-        return False
+        with self._lock:
+            entry = self._entries.pop(tokens_key, None)
+            if entry is not None:
+                self._current_memory -= entry.memory_bytes
+                self._remove_from_sorted(tokens_key)
+                self._stats.entry_count = len(self._entries)
+                self._stats.current_memory_bytes = self._current_memory
+                return True
+            return False
 
     def clear(self) -> None:
         """Clear all cached entries."""
-        self._entries.clear()
-        self._sorted_keys.clear()
-        self._current_memory = 0
-        self._stats = CacheStats(max_memory_bytes=self._max_memory)
+        with self._lock:
+            self._entries.clear()
+            self._sorted_keys.clear()
+            self._current_memory = 0
+            self._stats = CacheStats(max_memory_bytes=self._max_memory)
         logger.debug("Cache cleared")
 
     def get_stats(self) -> dict[str, Any]:
@@ -1156,9 +1171,17 @@ class MemoryAwarePrefixCache:
         import os
         import time as _time
 
-        if not self._entries:
-            logger.info("[cache_persist] nothing to save (0 entries)")
-            return False
+        with self._lock:
+            if not self._entries:
+                logger.info("[cache_persist] nothing to save (0 entries)")
+                return False
+
+            # Snapshot entries under the lock; writes themselves happen outside
+            # so a long save doesn't block fetch/store. Entries are safe to
+            # iterate post-snapshot because cache entries are effectively
+            # immutable once stored.
+            entries_snapshot = list(self._entries.items())
+            total_memory_snapshot = self._current_memory
 
         t0 = _time.monotonic()
         os.makedirs(cache_dir, exist_ok=True)
@@ -1172,13 +1195,13 @@ class MemoryAwarePrefixCache:
         index = {
             "version": _CACHE_PERSIST_VERSION,
             "model_fingerprint": self._model_fingerprint,
-            "num_entries": len(self._entries),
-            "total_memory_bytes": self._current_memory,
+            "num_entries": len(entries_snapshot),
+            "total_memory_bytes": total_memory_snapshot,
             "entries": [],
         }
 
         saved = 0
-        for i, (tokens_key, entry) in enumerate(self._entries.items()):
+        for i, (tokens_key, entry) in enumerate(entries_snapshot):
             entry_path = os.path.join(cache_dir, f"entry_{i}.safetensors")
             try:
                 save_prompt_cache(
@@ -1217,9 +1240,9 @@ class MemoryAwarePrefixCache:
 
         dt = _time.monotonic() - t0
         logger.info(
-            f"[cache_persist] SAVED {saved}/{len(self._entries)} entries "
+            f"[cache_persist] SAVED {saved}/{len(entries_snapshot)} entries "
             f"to {cache_dir} in {dt:.1f}s "
-            f"({self._current_memory / _BYTES_PER_MB:.0f}MB total)"
+            f"({total_memory_snapshot / _BYTES_PER_MB:.0f}MB total)"
         )
         return saved > 0
 
@@ -1305,9 +1328,10 @@ class MemoryAwarePrefixCache:
                     cache=cache,
                     memory_bytes=memory,
                 )
-                self._entries[tokens_key] = entry
-                self._current_memory += memory
-                bisect.insort(self._sorted_keys, tokens_key)
+                with self._lock:
+                    self._entries[tokens_key] = entry
+                    self._current_memory += memory
+                    bisect.insort(self._sorted_keys, tokens_key)
                 loaded += 1
 
                 logger.info(
@@ -1319,8 +1343,9 @@ class MemoryAwarePrefixCache:
             except Exception as e:
                 logger.warning(f"[cache_persist] failed to load entry {i}: {e}")
 
-        self._stats.entry_count = len(self._entries)
-        self._stats.current_memory_bytes = self._current_memory
+        with self._lock:
+            self._stats.entry_count = len(self._entries)
+            self._stats.current_memory_bytes = self._current_memory
 
         dt = _time.monotonic() - t0
         logger.info(
