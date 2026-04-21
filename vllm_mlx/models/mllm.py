@@ -1164,12 +1164,9 @@ class MLXMultimodalLM:
         placeholder per frame so the template emits the matching count of
         image tokens aligned with the frame pixels passed to the model.
 
-        Dict content on a message passes through unchanged — supports the
-        tool-parser adapter's wrap pattern (e.g. Gemma 4 wrapping string
-        tool responses as ``{"content": str}`` so the template's
-        mapping-branch renders them as
-        ``response:name{content:<|"|>str<|"|>}`` rather than the synthetic
-        ``{value:...}`` the model wasn't trained on).
+        Dict content on a message passes through unchanged so that tool
+        parsers' ``prepare_messages`` hook can wrap tool responses in a
+        template-specific shape.
 
         Returns the rebuilt messages list, the flat list of image URLs
         that need downloading/decoding via ``_prepare_images``, and the

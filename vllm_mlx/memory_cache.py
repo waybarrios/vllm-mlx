@@ -386,9 +386,9 @@ def _trim_cache_offset(cache: list[Any], trim_by: int) -> list[Any]:
             orig_cls = type(layer_cache)
             tc = orig_cls.__new__(orig_cls)
             new_offset = max(layer_cache.offset - trim_by, 0)
-            # Slice to new_offset, not only shrink the pointer: Gemma 4's
-            # KV-shared layers read cache.state directly and would otherwise
-            # attend to stale trailing slots from a prior sequence.
+            # Slice to new_offset, not only shrink the pointer: KV-shared
+            # attention layers read ``cache.state`` directly and would
+            # otherwise attend to stale trailing slots from a prior sequence.
             k_src = layer_cache.keys
             v_src = layer_cache.values
             if k_src is not None and k_src.shape[2] > new_offset:
