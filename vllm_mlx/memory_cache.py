@@ -389,9 +389,27 @@ def _trim_cache_offset(cache: list[Any], trim_by: int) -> list[Any]:
         ):
             orig_cls = type(layer_cache)
             tc = orig_cls.__new__(orig_cls)
-            tc.keys = layer_cache.keys
-            tc.values = layer_cache.values
-            tc.offset = max(layer_cache.offset - trim_by, 0)
+            new_offset = max(layer_cache.offset - trim_by, 0)
+            keys = layer_cache.keys
+            values = layer_cache.values
+            # Slice the arrays down to new_offset rather than just shrinking the
+            # offset pointer.  Sharing the original (over-sized) array across
+            # requests lets attention paths that read the full underlying
+            # buffer (e.g. Gemma 4's KV-shared layers, which read cache.state
+            # directly instead of going through update_and_fetch) see stale
+            # tokens from the previous owner — issue #384.
+            if (
+                keys is not None
+                and hasattr(keys, "shape")
+                and len(keys.shape) >= 3
+                and new_offset < keys.shape[-2]
+            ):
+                tc.keys = keys[..., :new_offset, :]
+                tc.values = values[..., :new_offset, :]
+            else:
+                tc.keys = keys
+                tc.values = values
+            tc.offset = new_offset
             # Preserve type-specific attrs (max_size, keep, step, _idx)
             for attr in ("max_size", "keep", "step", "_idx"):
                 if hasattr(layer_cache, attr):
