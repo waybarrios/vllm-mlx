@@ -845,36 +845,33 @@ class MLLMScheduler:
     async def _process_loop(self) -> None:
         """Main async processing loop.
 
-        Every scheduler step runs on the single-worker ``mllm-step``
-        executor thread. Two invariants follow:
+        Every scheduler step runs on the process-wide MLX executor
+        thread (see ``vllm_mlx.mlx_thread``). Two invariants follow:
 
-        1. **Correctness.** MLX's per-stream state (command buffer,
-           encoder lifecycle) is not thread-safe; only one thread may
-           submit work to a given ``mx.Stream`` at a time. The prior
-           split — prefill on the executor, decode inline on the event
-           loop — meant ``_stream`` was touched by two threads
-           alternately, and Metal's driver asserted
+        1. **Correctness.** MLX's per-stream state is not thread-safe;
+           only one thread may submit work to the Metal device at a
+           time. Routing every step and every other MLX-touching code
+           path (embeddings, rerank, etc.) through the one shared
+           executor eliminates cross-thread Metal asserts such as
            ``'A command encoder is already encoding to this command
-           buffer'`` when the next thread created an encoder before the
-           previous thread's encoder state had fully settled (an
-           effect of ``mx.async_eval``'s pipelined submit).
-        2. **Responsiveness.** Inline decode blocks the event loop for
-           the full duration of the step (~3 ms of GPU work). Handing
-           every step off via ``run_in_executor`` releases the loop
-           while the executor thread runs the step, so HTTP handlers,
+           buffer'`` and ``'Completed handler provided after commit
+           call'`` that otherwise fire under concurrent load.
+        2. **Responsiveness.** Handing every step off via
+           ``run_in_executor`` releases the event loop for the full
+           duration of the step (~3 ms of GPU work), so HTTP handlers,
            metrics, disconnect detection, and background tasks are
-           free to schedule during the step. Submit overhead is on the
-           order of tens of µs, dwarfed by the step itself.
+           free to schedule. Submit overhead is on the order of tens
+           of µs.
         """
-        _executor = concurrent.futures.ThreadPoolExecutor(
-            max_workers=1, thread_name_prefix="mllm-step"
-        )
+        from .mlx_thread import get_executor
+
+        executor = get_executor()
         loop = asyncio.get_running_loop()
 
         while self._running:
             try:
                 if self.has_requests():
-                    await loop.run_in_executor(_executor, self.step)
+                    await loop.run_in_executor(executor, self.step)
                 else:
                     # No work, wait a bit
                     await asyncio.sleep(0.01)

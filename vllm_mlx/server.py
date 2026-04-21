@@ -2279,8 +2279,12 @@ async def create_embeddings(request: EmbeddingRequest) -> EmbeddingResponse:
             locked_model=_embedding_model_locked,
         )
 
-        # Lazy-load or swap embedding engine
-        load_embedding_model(model_name, lock=False, reuse_existing=True)
+        # Lazy-load or swap embedding engine on the shared MLX thread.
+        # load() submits Metal work; doing it on the event loop while
+        # the chat scheduler is running would race per-device state.
+        from .mlx_thread import run_mlx
+
+        await run_mlx(load_embedding_model, model_name, lock=False, reuse_existing=True)
 
         # Normalise input to list
         texts = request.input if isinstance(request.input, list) else [request.input]
@@ -2290,11 +2294,10 @@ async def create_embeddings(request: EmbeddingRequest) -> EmbeddingResponse:
 
         start_time = time.perf_counter()
 
-        # Count tokens for usage reporting
-        prompt_tokens = _embedding_engine.count_tokens(texts)
-
-        # Generate embeddings (batch)
-        embeddings = _embedding_engine.embed(texts)
+        # Count tokens and embed on the shared MLX thread — same
+        # reason as the load_embedding_model call above.
+        prompt_tokens = await run_mlx(_embedding_engine.count_tokens, texts)
+        embeddings = await run_mlx(_embedding_engine.embed, texts)
 
         elapsed = time.perf_counter() - start_time
         logger.info(
@@ -2426,13 +2429,13 @@ async def rerank_documents(request: RerankRequest) -> RerankResponse:
 
         start_time = time.perf_counter()
 
-        # Run scoring off the event loop with concurrency limit.
-        # score_pairs returns (scores, total_tokens) from the same
-        # tokenization pass used for scoring — no double tokenization.
-        import asyncio
+        # Run scoring on the shared MLX thread so it serializes against
+        # chat + embeddings instead of racing on Metal command buffers.
+        # The engine's own _semaphore still gates concurrent entry.
+        from .mlx_thread import run_mlx
 
         async with _rerank_engine._semaphore:
-            scores, total_tokens = await asyncio.to_thread(
+            scores, total_tokens = await run_mlx(
                 _rerank_engine.score_pairs, request.query, doc_texts
             )
 
@@ -2583,10 +2586,14 @@ async def create_transcription(
 
         model_name = resolve_stt_model_name(model)
 
-        # Load engine if needed
+        # Load + transcribe on the shared MLX thread — both can submit
+        # Metal work and must stay off the event loop while chat /
+        # embeddings are running on the MLX executor.
+        from .mlx_thread import run_mlx
+
         if _stt_engine is None or _stt_engine.model_name != model_name:
             _stt_engine = STTEngine(model_name)
-            _stt_engine.load()
+            await run_mlx(_stt_engine.load)
 
         # Stream uploaded file to disk under a hard size cap.
         tmp_path = await save_upload_with_limit(
@@ -2596,7 +2603,9 @@ async def create_transcription(
         )
 
         try:
-            result = _stt_engine.transcribe(tmp_path, language=language)
+            result = await run_mlx(
+                _stt_engine.transcribe, tmp_path, language=language
+            )
         finally:
             os.unlink(tmp_path)
 
@@ -2655,12 +2664,15 @@ async def create_speech(
         model_name = resolve_tts_model_name(model)
         validate_tts_input_length(input, max_chars=_max_tts_input_chars)
 
-        # Load engine if needed
+        # Load + synthesize on the shared MLX thread so Metal submits
+        # serialize with chat / embeddings.
+        from .mlx_thread import run_mlx
+
         if _tts_engine is None or _tts_engine.model_name != model_name:
             _tts_engine = TTSEngine(model_name)
-            _tts_engine.load()
+            await run_mlx(_tts_engine.load)
 
-        audio = _tts_engine.generate(input, voice=voice, speed=speed)
+        audio = await run_mlx(_tts_engine.generate, input, voice=voice, speed=speed)
         audio_bytes = _tts_engine.to_bytes(audio, format=response_format)
 
         content_type = (
