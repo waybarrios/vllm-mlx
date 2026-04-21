@@ -399,17 +399,14 @@ class MLLMScheduler:
             if hasattr(self.processor, "tokenizer")
             else self.processor
         )
-        # Serialize with the batch generator's tokenizer_lock — HF's fast
-        # tokenizer raises RuntimeError: Already borrowed under concurrent
-        # access, and this call runs from the async request handler thread.
-        lock = None
-        if self.batch_generator is not None:
-            lock = getattr(self.batch_generator, "tokenizer_lock", None)
+        # Serialize with the module-level TOKENIZER_LOCK so we can't race
+        # with _preprocess_request or _apply_chat_template on HF's fast
+        # tokenizer (raises RuntimeError: Already borrowed under concurrent
+        # access).
+        from .mllm_batch_generator import TOKENIZER_LOCK
+
         try:
-            if lock is not None:
-                with lock:
-                    request.num_prompt_tokens = len(tokenizer.encode(prompt))
-            else:
+            with TOKENIZER_LOCK:
                 request.num_prompt_tokens = len(tokenizer.encode(prompt))
         except Exception:
             pass

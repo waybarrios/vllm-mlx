@@ -32,6 +32,16 @@ from .vision_embedding_cache import VisionEmbeddingCache
 logger = logging.getLogger(__name__)
 
 
+# Module-level lock serializing all HF-fast-tokenizer access across threads.
+# The Rust-backed tokenizer raises ``RuntimeError: Already borrowed`` when
+# two Python threads hold its inner state at once. The lock has to live
+# above the MLLMBatchGenerator instance because the generator itself is
+# constructed lazily on first request — during that construction the
+# tokenizer is already being used (``_compute_think_suffix_len``), while
+# concurrent request handlers may also try to tokenize.
+TOKENIZER_LOCK = threading.Lock()
+
+
 class PrefillAbortedError(Exception):
     """Raised when a prefill is aborted due to client disconnect."""
 
@@ -430,13 +440,10 @@ class MLLMBatchGenerator:
             prefill_step_size = capped
         self.prefill_step_size = prefill_step_size
 
-        # Serializes all HF-fast-tokenizer access (processor.apply_chat_template,
-        # processor(prompt), tokenizer.encode, etc). The Rust-backed tokenizer
-        # raises ``RuntimeError: Already borrowed`` when two Python threads
-        # hold its inner state at once — which happens with async request
-        # handlers templating a prompt while the scheduler thread tokenizes
-        # a prior request. Acquire via ``tokenizer_lock`` at every call site.
-        self.tokenizer_lock = threading.Lock()
+        # Alias the module-level TOKENIZER_LOCK on the instance for
+        # backward-compatible callers (engine/scheduler reach it via the
+        # batch generator when one exists).
+        self.tokenizer_lock = TOKENIZER_LOCK
 
         # Request management
         self.unprocessed_requests: List[MLLMBatchRequest] = []
@@ -608,18 +615,19 @@ class MLLMBatchGenerator:
             dummy = [{"role": "user", "content": "x"}]
 
             try:
-                text_with = applicator.apply_chat_template(
-                    dummy,
-                    tokenize=False,
-                    add_generation_prompt=True,
-                    enable_thinking=True,
-                )
-                text_without = applicator.apply_chat_template(
-                    dummy,
-                    tokenize=False,
-                    add_generation_prompt=True,
-                    enable_thinking=False,
-                )
+                with TOKENIZER_LOCK:
+                    text_with = applicator.apply_chat_template(
+                        dummy,
+                        tokenize=False,
+                        add_generation_prompt=True,
+                        enable_thinking=True,
+                    )
+                    text_without = applicator.apply_chat_template(
+                        dummy,
+                        tokenize=False,
+                        add_generation_prompt=True,
+                        enable_thinking=False,
+                    )
             except TypeError:
                 return 0
 
@@ -629,8 +637,9 @@ class MLLMBatchGenerator:
             for tag in ["<think>\n", "<think>"]:
                 if text_with.endswith(tag) and not text_without.endswith(tag):
                     tokenizer = getattr(self.processor, "tokenizer", self.processor)
-                    suffix_tokens = tokenizer.encode(tag)
-                    base_tokens = tokenizer.encode("")
+                    with TOKENIZER_LOCK:
+                        suffix_tokens = tokenizer.encode(tag)
+                        base_tokens = tokenizer.encode("")
                     suffix_len = len(suffix_tokens) - len(base_tokens)
                     if suffix_len > 0:
                         logger.info(

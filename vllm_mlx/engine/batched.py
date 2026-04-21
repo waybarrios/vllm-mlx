@@ -450,18 +450,10 @@ class BatchedEngine(BaseEngine):
         logger.info("BatchedEngine stopped")
 
     def _tokenizer_lock(self):
-        """Return the batch generator's tokenizer lock, or a null context.
-        Shared with ``MLLMBatchGenerator._preprocess_request`` so chat-template
-        rendering and preprocess tokenization can't race on the same Rust-backed
-        tokenizer.
-        """
-        import contextlib
+        """Module-level HF-fast-tokenizer mutex shared with preprocess."""
+        from ..mllm_batch_generator import TOKENIZER_LOCK
 
-        if self._mllm_scheduler is not None:
-            bg = self._mllm_scheduler.batch_generator
-            if bg is not None and getattr(bg, "tokenizer_lock", None) is not None:
-                return bg.tokenizer_lock
-        return contextlib.nullcontext()
+        return TOKENIZER_LOCK
 
     def _apply_chat_template(
         self,
