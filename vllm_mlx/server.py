@@ -3455,6 +3455,7 @@ async def create_anthropic_message(
                         engine,
                         openai_request,
                         anthropic_request,
+                        max_tokens=effective_max_tokens,
                         metrics_tracker=tracker,
                     ),
                     _anthropic_terminal,
