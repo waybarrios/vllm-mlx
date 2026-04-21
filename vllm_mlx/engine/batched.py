@@ -442,6 +442,20 @@ class BatchedEngine(BaseEngine):
         self._loaded = False
         logger.info("BatchedEngine stopped")
 
+    def _tokenizer_lock(self):
+        """Return the batch generator's tokenizer lock, or a null context.
+        Shared with ``MLLMBatchGenerator._preprocess_request`` so chat-template
+        rendering and preprocess tokenization can't race on the same Rust-backed
+        tokenizer.
+        """
+        import contextlib
+
+        if self._mllm_scheduler is not None:
+            bg = self._mllm_scheduler.batch_generator
+            if bg is not None and getattr(bg, "tokenizer_lock", None) is not None:
+                return bg.tokenizer_lock
+        return contextlib.nullcontext()
+
     def _apply_chat_template(
         self,
         messages: list[dict[str, Any]],
@@ -490,10 +504,16 @@ class BatchedEngine(BaseEngine):
             if tools and "tools" not in template_kwargs:
                 template_kwargs["tools"] = tools
 
+            # Serialize HF-fast-tokenizer access with the batch generator's
+            # lock. Without it, concurrent async handlers racing on
+            # apply_chat_template trip ``RuntimeError: Already borrowed``
+            # against the same Rust-backed tokenizer state.
+            lock = self._tokenizer_lock()
             try:
-                return template_applicator.apply_chat_template(
-                    messages, **template_kwargs
-                )
+                with lock:
+                    return template_applicator.apply_chat_template(
+                        messages, **template_kwargs
+                    )
             except TypeError as e:
                 # Some templates don't accept extra kwargs; retry without them.
                 logger.debug(f"Chat template TypeError, retrying without extras: {e}")
@@ -503,9 +523,10 @@ class BatchedEngine(BaseEngine):
                     *(chat_template_kwargs or {}).keys(),
                 ]:
                     template_kwargs.pop(key, None)
-                return template_applicator.apply_chat_template(
-                    messages, **template_kwargs
-                )
+                with lock:
+                    return template_applicator.apply_chat_template(
+                        messages, **template_kwargs
+                    )
         else:
             # Fallback for models without apply_chat_template
             prompt = "\n".join(f"{m['role']}: {m['content']}" for m in messages)
@@ -837,8 +858,9 @@ class BatchedEngine(BaseEngine):
             if hasattr(tokenizer, "tokenizer"):
                 tokenizer = tokenizer.tokenizer
 
-            real_tokens = tokenizer.encode(real_prompt)
-            dummy_tokens = tokenizer.encode(dummy_prompt)
+            with self._tokenizer_lock():
+                real_tokens = tokenizer.encode(real_prompt)
+                dummy_tokens = tokenizer.encode(dummy_prompt)
 
             # Find LCP — the point where the two diverge is the boundary
             lcp = 0

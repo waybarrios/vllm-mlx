@@ -17,6 +17,7 @@ Architecture:
 """
 
 import logging
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -383,6 +384,14 @@ class MLLMBatchGenerator:
         self.prefill_batch_size = prefill_batch_size
         self.completion_batch_size = max(completion_batch_size, prefill_batch_size)
         self.prefill_step_size = prefill_step_size
+
+        # Serializes all HF-fast-tokenizer access (processor.apply_chat_template,
+        # processor(prompt), tokenizer.encode, etc). The Rust-backed tokenizer
+        # raises ``RuntimeError: Already borrowed`` when two Python threads
+        # hold its inner state at once — which happens with async request
+        # handlers templating a prompt while the scheduler thread tokenizes
+        # a prior request. Acquire via ``tokenizer_lock`` at every call site.
+        self.tokenizer_lock = threading.Lock()
 
         # Request management
         self.unprocessed_requests: List[MLLMBatchRequest] = []
@@ -775,13 +784,16 @@ class MLLMBatchGenerator:
             getattr(model_config, "image_token_index", None) if model_config else None
         )
 
-        # Prepare inputs using mlx_vlm
-        inputs = prepare_inputs(
-            self.processor,
-            images=all_images if all_images else None,
-            prompts=request.prompt,
-            image_token_index=image_token_index,
-        )
+        # Prepare inputs using mlx_vlm. Serialize with tokenizer_lock since
+        # prepare_inputs ends up calling the HF fast tokenizer, which raises
+        # ``RuntimeError: Already borrowed`` under concurrent access.
+        with self.tokenizer_lock:
+            inputs = prepare_inputs(
+                self.processor,
+                images=all_images if all_images else None,
+                prompts=request.prompt,
+                image_token_index=image_token_index,
+            )
 
         request.input_ids = inputs.get("input_ids")
         request.pixel_values = inputs.get("pixel_values")
