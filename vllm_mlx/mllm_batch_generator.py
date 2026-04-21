@@ -40,6 +40,21 @@ class PrefillAbortedError(Exception):
         super().__init__(f"Prefill aborted for request {request_id}")
 
 
+def _smallest_sliding_window(model: Any) -> Optional[int]:
+    """Smallest sliding_window among the model's SWA layers, or None."""
+    cfg = getattr(model, "config", None) or getattr(model, "args", None)
+    if cfg is None:
+        return None
+    sw = getattr(cfg, "sliding_window", None)
+    if sw is None:
+        text_cfg = getattr(cfg, "text_config", None)
+        if text_cfg is not None:
+            sw = getattr(text_cfg, "sliding_window", None)
+    if isinstance(sw, int) and sw > 0:
+        return sw
+    return None
+
+
 @dataclass
 class MLLMBatchRequest:
     """
@@ -231,7 +246,19 @@ class MLLMBatch:
                 cache.keep = getattr(c, "keep", 0)
                 result.append(cache)
             else:
-                result.append(c.extract(idx))
+                extracted = c.extract(idx)
+                # Detach from the batch's shared buffers: c.extract may hand
+                # back slice views of the batch KV tensor, which would mutate
+                # under the extracted cache if the batch keeps generating for
+                # other slots. Materialise owned arrays.
+                if (
+                    extracted is not None
+                    and hasattr(extracted, "keys")
+                    and extracted.keys is not None
+                ):
+                    extracted.keys = mx.array(extracted.keys)
+                    extracted.values = mx.array(extracted.values)
+                result.append(extracted)
         return result
 
 
@@ -383,6 +410,20 @@ class MLLMBatchGenerator:
 
         self.prefill_batch_size = prefill_batch_size
         self.completion_batch_size = max(completion_batch_size, prefill_batch_size)
+        # Cap step size at half the smallest sliding window the language model
+        # uses. Chunked prefill into a rotating KV cache evicts the previous
+        # chunk wholesale at each boundary; queries early in the next chunk
+        # then see no in-window context, breaking SWA layers. Keeping step
+        # ≤ window/2 guarantees every query sees at least window/2 prior
+        # tokens in its cache.
+        sliding_window = _smallest_sliding_window(self.language_model)
+        if sliding_window and prefill_step_size > sliding_window // 2:
+            capped = max(sliding_window // 2, 64)
+            logger.info(
+                f"MLLMBatchGenerator: capping prefill_step_size "
+                f"{prefill_step_size} → {capped} (sliding_window={sliding_window})"
+            )
+            prefill_step_size = capped
         self.prefill_step_size = prefill_step_size
 
         # Serializes all HF-fast-tokenizer access (processor.apply_chat_template,
@@ -787,13 +828,28 @@ class MLLMBatchGenerator:
         # Prepare inputs using mlx_vlm. Serialize with tokenizer_lock since
         # prepare_inputs ends up calling the HF fast tokenizer, which raises
         # ``RuntimeError: Already borrowed`` under concurrent access.
-        with self.tokenizer_lock:
-            inputs = prepare_inputs(
-                self.processor,
-                images=all_images if all_images else None,
-                prompts=request.prompt,
-                image_token_index=image_token_index,
-            )
+        # prepare_inputs sets ``tokenizer.pad_token = tokenizer.eos_token``
+        # when pad_token is None, a persistent mutation on the shared
+        # tokenizer. Snapshot and restore so the rest of the system sees
+        # the original values.
+        tok = getattr(self.processor, "tokenizer", self.processor)
+        prev_pad = getattr(tok, "pad_token", None)
+        prev_pad_id = getattr(tok, "pad_token_id", None)
+        try:
+            with self.tokenizer_lock:
+                inputs = prepare_inputs(
+                    self.processor,
+                    images=all_images if all_images else None,
+                    prompts=request.prompt,
+                    image_token_index=image_token_index,
+                )
+        finally:
+            if prev_pad is None and getattr(tok, "pad_token", None) is not None:
+                try:
+                    tok.pad_token = prev_pad
+                    tok.pad_token_id = prev_pad_id
+                except Exception:
+                    pass
 
         request.input_ids = inputs.get("input_ids")
         request.pixel_values = inputs.get("pixel_values")

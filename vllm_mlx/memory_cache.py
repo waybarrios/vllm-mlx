@@ -545,12 +545,25 @@ def _clone_cache_for_fetch(cache: list[Any]) -> list[Any]:
         if isinstance(layer, _QuantizedCacheWrapper):
             orig_cls = layer.orig_type
             kv = orig_cls.__new__(orig_cls)
-            kv.keys = mx.dequantize(
+            keys = mx.dequantize(
                 *layer.keys, group_size=layer.group_size, bits=layer.bits
             )
-            kv.values = mx.dequantize(
+            values = mx.dequantize(
                 *layer.values, group_size=layer.group_size, bits=layer.bits
             )
+            # Slice to offset so stale trailing slots (e.g. from a post-trim
+            # wrapper whose quantized arrays still cover the pre-trim length)
+            # don't leak into attention on the next forward pass.
+            if (
+                keys is not None
+                and hasattr(keys, "shape")
+                and len(keys.shape) >= 3
+                and layer.offset < keys.shape[-2]
+            ):
+                keys = keys[..., : layer.offset, :]
+                values = values[..., : layer.offset, :]
+            kv.keys = keys
+            kv.values = values
             kv.offset = layer.offset
             for attr, val in layer.orig_attrs.items():
                 setattr(kv, attr, val)
