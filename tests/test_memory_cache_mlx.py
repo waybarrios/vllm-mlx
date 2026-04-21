@@ -279,3 +279,174 @@ class TestTrimCacheOffset:
         # cross-request contamination in #384).
         assert float(mx.max(tc.keys).item()) == 1.0
         assert remaining == [999, 1000, 1001]
+
+
+class TestDequantizeCacheSlice:
+    """Tests for _dequantize_cache slicing after dequantization.
+
+    When KV cache quantization is enabled (--kv-cache-quantization), the
+    prefix cache stores _QuantizedCacheWrapper layers.  After LCP trim
+    reduces the offset, _dequantize_cache must slice the dequantized arrays
+    down to offset to prevent readers that bypass offset (e.g. Gemma 4's
+    KV-shared layers reading cache.state) from seeing stale tokens.
+
+    This is the quantized-cache counterpart of the plain-KVCache fix
+    tested in TestTrimCacheOffset above.
+    """
+
+    def test_dequantize_slices_to_offset(self):
+        """After trim + dequantize, keys/values shape[-2] == offset."""
+        import mlx.core as mx
+        from mlx_lm.models.cache import KVCache
+
+        from vllm_mlx.memory_cache import (
+            _QuantizedCacheWrapper,
+            _dequantize_cache,
+            _trim_cache_offset,
+        )
+
+        # Build a KVCache with 500 tokens, quantize it, then trim to 60.
+        layer = KVCache()
+        layer.keys = mx.ones((1, 4, 512, 64), dtype=mx.float32)
+        layer.values = mx.ones((1, 4, 512, 64), dtype=mx.float32)
+        layer.offset = 512
+        mx.eval(layer.keys, layer.values)
+
+        qw = _QuantizedCacheWrapper(layer, bits=8, group_size=64)
+        trimmed = _trim_cache_offset([qw], 512 - 60)
+        result = _dequantize_cache(trimmed)
+
+        tc = result[0]
+        assert tc.offset == 60
+        assert tc.keys.shape[-2] == 60
+        assert tc.values.shape[-2] == 60
+
+    def test_dequantize_no_stale_tokens_via_state(self):
+        """Stale tokens from a previous request must not be visible via cache.state."""
+        import mlx.core as mx
+        from mlx_lm.models.cache import KVCache
+
+        from vllm_mlx.memory_cache import (
+            _QuantizedCacheWrapper,
+            _dequantize_cache,
+            _trim_cache_offset,
+        )
+
+        layer = KVCache()
+        # First 64 positions: shared prefix (1.0), next 448: private (7.0)
+        shared = mx.ones((1, 4, 64, 64), dtype=mx.float32)
+        private = mx.full((1, 4, 448, 64), 7.0, dtype=mx.float32)
+        layer.keys = mx.concatenate([shared, private], axis=2)
+        layer.values = mx.concatenate([shared, private], axis=2)
+        layer.offset = 512
+        mx.eval(layer.keys, layer.values)
+
+        qw = _QuantizedCacheWrapper(layer, bits=8, group_size=64)
+        trimmed = _trim_cache_offset([qw], 512 - 64)
+        result = _dequantize_cache(trimmed)
+
+        tc = result[0]
+        keys_view, _ = tc.state
+        assert keys_view.shape[-2] == 64
+        # Dequantized values are approximate (quantization error), but should
+        # be close to 1.0 (the shared prefix), never near 7.0 (the private data).
+        assert float(mx.max(keys_view).item()) < 2.0
+
+    def test_dequantize_no_trim_preserves_full_array(self):
+        """When offset == shape[-2], no slicing occurs."""
+        import mlx.core as mx
+        from mlx_lm.models.cache import KVCache
+
+        from vllm_mlx.memory_cache import (
+            _QuantizedCacheWrapper,
+            _dequantize_cache,
+        )
+
+        layer = KVCache()
+        layer.keys = mx.ones((1, 4, 128, 64), dtype=mx.float32)
+        layer.values = mx.ones((1, 4, 128, 64), dtype=mx.float32)
+        layer.offset = 128
+        mx.eval(layer.keys, layer.values)
+
+        qw = _QuantizedCacheWrapper(layer, bits=8, group_size=64)
+        result = _dequantize_cache([qw])
+
+        tc = result[0]
+        assert tc.offset == 128
+        assert tc.keys.shape[-2] == 128
+        assert tc.values.shape[-2] == 128
+
+    def test_dequantize_source_unaffected(self):
+        """Dequantizing must not mutate the stored quantized wrapper."""
+        import mlx.core as mx
+        from mlx_lm.models.cache import KVCache
+
+        from vllm_mlx.memory_cache import (
+            _QuantizedCacheWrapper,
+            _dequantize_cache,
+            _trim_cache_offset,
+        )
+
+        layer = KVCache()
+        layer.keys = mx.ones((1, 4, 256, 64), dtype=mx.float32)
+        layer.values = mx.ones((1, 4, 256, 64), dtype=mx.float32)
+        layer.offset = 256
+        mx.eval(layer.keys, layer.values)
+
+        qw = _QuantizedCacheWrapper(layer, bits=8, group_size=64)
+        original_offset = qw.offset
+        original_keys_shape = qw.keys[0].shape  # quantized data tuple
+
+        trimmed = _trim_cache_offset([qw], 192)
+        _dequantize_cache(trimmed)
+
+        # Source wrapper unchanged
+        assert qw.offset == original_offset
+        assert qw.keys[0].shape == original_keys_shape
+
+    def test_dequantize_end_to_end_fetch_with_quantization(self):
+        """End-to-end: store with kv_quantize=True, fetch with LCP, verify no stale data."""
+        import mlx.core as mx
+        from mlx_lm.models.cache import KVCache
+
+        from vllm_mlx.memory_cache import (
+            MemoryAwarePrefixCache,
+            MemoryCacheConfig,
+        )
+
+        model = MagicMock()
+        pc = MemoryAwarePrefixCache(
+            model,
+            MemoryCacheConfig(
+                max_memory_mb=64,
+                max_entries=10,
+                kv_quantize=True,
+                kv_bits=8,
+                kv_group_size=64,
+                kv_min_quantize_tokens=0,
+            ),
+        )
+
+        # Store a KVCache with 128 tokens — store() quantizes automatically.
+        layer = KVCache()
+        shared = mx.ones((1, 2, 64, 64), dtype=mx.float32)
+        private = mx.full((1, 2, 64, 64), 7.0, dtype=mx.float32)
+        layer.keys = mx.concatenate([shared, private], axis=2)
+        layer.values = mx.concatenate([shared, private], axis=2)
+        layer.offset = 128
+        mx.eval(layer.keys, layer.values)
+
+        pc.store(list(range(1, 129)), [layer])
+
+        # Fetch with partial match (first 60 tokens match, then diverge).
+        # fetch() dequantizes automatically when kv_quantize=True.
+        new_tokens = list(range(1, 61)) + [999, 1000]
+        fetched, remaining = pc.fetch(new_tokens)
+
+        assert fetched is not None
+        tc = fetched[0]
+        assert tc.offset == 60
+        assert tc.keys.shape[-2] == 60
+        # No private data (7.0) visible — only shared prefix (~1.0 with quantization noise)
+        assert float(mx.max(tc.keys).item()) < 2.0
+        assert remaining == [999, 1000]

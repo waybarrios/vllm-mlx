@@ -554,6 +554,19 @@ def _dequantize_cache(cache: list[Any]) -> list[Any]:
                 *layer.values, group_size=layer.group_size, bits=layer.bits
             )
             kv.offset = layer.offset
+            # Slice the dequantized arrays down to offset so that readers
+            # which bypass offset (e.g. Gemma 4 KV-shared layers reading
+            # cache.state directly) cannot see stale tokens from a previous
+            # request.  Mirrors the plain-KVCache slice in
+            # _trim_cache_offset — see issue #384.
+            if (
+                kv.keys is not None
+                and hasattr(kv.keys, "shape")
+                and len(kv.keys.shape) >= 3
+                and kv.offset < kv.keys.shape[-2]
+            ):
+                kv.keys = kv.keys[..., : kv.offset, :]
+                kv.values = kv.values[..., : kv.offset, :]
             # Restore type-specific attrs (max_size, keep, step, _idx)
             for attr, val in layer.orig_attrs.items():
                 setattr(kv, attr, val)
