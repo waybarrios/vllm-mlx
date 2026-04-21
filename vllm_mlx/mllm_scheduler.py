@@ -845,10 +845,26 @@ class MLLMScheduler:
     async def _process_loop(self) -> None:
         """Main async processing loop.
 
-        Uses a thread pool executor for steps that involve prefill
-        (waiting requests or partial prefill in progress) so that the
-        event loop stays responsive for health checks and other HTTP
-        endpoints.  Decode-only steps are fast (<3 ms) and run inline.
+        Every scheduler step runs on the single-worker ``mllm-step``
+        executor thread. Two invariants follow:
+
+        1. **Correctness.** MLX's per-stream state (command buffer,
+           encoder lifecycle) is not thread-safe; only one thread may
+           submit work to a given ``mx.Stream`` at a time. The prior
+           split — prefill on the executor, decode inline on the event
+           loop — meant ``_stream`` was touched by two threads
+           alternately, and Metal's driver asserted
+           ``'A command encoder is already encoding to this command
+           buffer'`` when the next thread created an encoder before the
+           previous thread's encoder state had fully settled (an
+           effect of ``mx.async_eval``'s pipelined submit).
+        2. **Responsiveness.** Inline decode blocks the event loop for
+           the full duration of the step (~3 ms of GPU work). Handing
+           every step off via ``run_in_executor`` releases the loop
+           while the executor thread runs the step, so HTTP handlers,
+           metrics, disconnect detection, and background tasks are
+           free to schedule during the step. Submit overhead is on the
+           order of tens of µs, dwarfed by the step itself.
         """
         _executor = concurrent.futures.ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="mllm-step"
@@ -858,18 +874,7 @@ class MLLMScheduler:
         while self._running:
             try:
                 if self.has_requests():
-                    has_waiting = self.get_num_waiting() > 0
-                    has_partial = (
-                        self.batch_generator is not None
-                        and getattr(self.batch_generator, "_partial", None) is not None
-                    )
-                    needs_executor = has_waiting or has_partial
-
-                    if needs_executor:
-                        await loop.run_in_executor(_executor, self.step)
-                    else:
-                        self.step()
-                        await asyncio.sleep(0)
+                    await loop.run_in_executor(_executor, self.step)
                 else:
                     # No work, wait a bit
                     await asyncio.sleep(0.01)
