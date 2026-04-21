@@ -1433,6 +1433,34 @@ class MLLMBatchGenerator:
             if not requests:
                 return None
 
+        # Store prompt-only KV for text-only requests right after prefill
+        # completes. The generation-end store (``_maybe_store_prefix_cache``)
+        # trims by the full output count, which wipes sliding-window layers
+        # entirely on long generations — stored entries come back empty on
+        # fetch and force a full re-prefill next turn. Storing here trims
+        # by only (last prompt token + think suffix), so the SWA layers
+        # keep up to ``sliding_window - (1 + S)`` prompt tokens. Next-turn
+        # LCP match can actually reuse the KV state.
+        for req, rc in zip(requests, per_request_caches):
+            if (
+                self.prefix_cache is None
+                or not req.is_text_only
+                or req.input_ids is None
+            ):
+                continue
+            try:
+                input_ids_list = req.input_ids.reshape(-1).tolist()
+                S = self._think_suffix_len
+                cache_key = input_ids_list[:-S] if S > 0 else input_ids_list
+                trim_amount = 1 + S
+                store_cache = _trim_cache_offset(rc, trim_amount)
+                self.prefix_cache.store(cache_key, store_cache)
+            except Exception as e:
+                logger.warning(
+                    f"Failed to store prefix cache after prefill for "
+                    f"{req.request_id}: {type(e).__name__}: {e}"
+                )
+
         # Merge per-request caches into batched caches.
         # Both KVCache.merge() and ArraysCache.merge() produce batch-aware
         # caches that support filter/extend/extract for continuous batching.
@@ -1851,12 +1879,16 @@ class MLLMBatchGenerator:
                     input_ids_list = req.input_ids.reshape(-1).tolist()
                     # Store prompt-only KV: trim generated tokens (+ think
                     # suffix) so the stored offset equals key length exactly.
-                    # The exact-match path trims by 1 at fetch time to
-                    # re-derive logits for the last prompt token.
                     output_count = batch.num_tokens[i]
                     S = self._think_suffix_len
                     total_trim = output_count + S
                     prompt_cache = _trim_cache_offset(extracted, total_trim)
+                    # Skip writes that wiped every sliding-window layer —
+                    # this happens when output_count exceeds the SWA buffer
+                    # size. The prefill-completion store in _process_prompts
+                    # already captured a usable copy of this entry.
+                    if self._has_empty_rotating_cache(prompt_cache):
+                        continue
                     cache_key = input_ids_list[:-S] if S > 0 else input_ids_list
                     self.prefix_cache.store(cache_key, prompt_cache)
                 except Exception as e:
