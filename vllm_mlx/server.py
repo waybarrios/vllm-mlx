@@ -2839,19 +2839,31 @@ async def _disconnect_guard(
             f"[disconnect_guard] GeneratorExit after {chunk_count} chunks, elapsed={_elapsed()}"
         )
     finally:
-        if disconnect_task and not disconnect_task.done():
+        # Cancel AND await the helper tasks. Just cancelling leaves them
+        # suspended mid-await, which triggers Python's
+        # "async generator ignored GeneratorExit" finalizer warning when
+        # the consumer calls aclose() on us. Awaiting lets them unwind.
+        if disconnect_task is not None and not disconnect_task.done():
             disconnect_task.cancel()
-        if anext_task and not anext_task.done():
+            try:
+                await disconnect_task
+            except (asyncio.CancelledError, Exception):
+                pass
+        if anext_task is not None and not anext_task.done():
             anext_task.cancel()
+            try:
+                await anext_task
+            except (asyncio.CancelledError, StopAsyncIteration, Exception):
+                pass
         # NOTE: Do NOT call generator.aclose() here.  With run_in_executor,
         # scheduler.step() runs in a background thread.  aclose() would throw
         # GeneratorExit into the async-generator chain, which can trigger
         # mlx::core::eval on the main thread while the executor thread is also
         # mid-eval → Metal assertion failure → SIGABRT.
         #
-        # Instead, rely on the task cancellation propagation:
-        #   anext_task.cancel() → CancelledError in stream_outputs()
-        #   → finally block → abort_request() → request removed from scheduler
+        # Instead rely on task cancellation propagation:
+        #   anext_task.cancel() → CancelledError in stream_outputs() →
+        #   finally block → abort_request() → request removed from scheduler.
         logger.info(
             f"[disconnect_guard] CLEANUP done, {chunk_count} chunks, "
             f"{heartbeat_count} heartbeats, elapsed={_elapsed()}"
