@@ -2443,42 +2443,38 @@ def install_chunked_prefill_mllm(
                     samplers=[req_sampler] if req_sampler else None,
                 )
 
-                # Extend active batch or set as new
+                # Convert per-request cache to batch-compatible format via
+                # merge. Both branches need _trim_rotating_caches FIRST so
+                # rotating buffers larger than max_size don't reach .merge()
+                # and trip the shape check inside mlx-lm.
+                from mlx_lm.models.cache import RotatingKVCache
+
+                request_cache = partial["cache"]
+                batch_gen._trim_rotating_caches(request_cache)
+                for layer_cache in request_cache:
+                    if isinstance(layer_cache, RotatingKVCache):
+                        if layer_cache.keys is not None:
+                            actual_buf = layer_cache.keys.shape[2]
+                            if layer_cache._idx != actual_buf and actual_buf > 0:
+                                layer_cache.keys = layer_cache._temporal_order(
+                                    layer_cache.keys
+                                )
+                                layer_cache.values = layer_cache._temporal_order(
+                                    layer_cache.values
+                                )
+                                # Use the post-_temporal_order size — the
+                                # call can shrink keys back to max_size on
+                                # a wrapped ring buffer.
+                                layer_cache._idx = layer_cache.keys.shape[2]
+
+                merged_cache = [
+                    request_cache[layer_idx].merge([request_cache[layer_idx]])
+                    for layer_idx in range(len(request_cache))
+                ]
+                new_batch.cache = merged_cache
                 if batch_gen.active_batch is not None:
-                    # Convert per-request cache to batch-compatible format
-                    # via merge (same as _process_prompts does)
-                    from mlx_lm.models.cache import RotatingKVCache
-
-                    request_cache = partial["cache"]
-                    batch_gen._trim_rotating_caches(request_cache)
-                    for layer_cache in request_cache:
-                        if isinstance(layer_cache, RotatingKVCache):
-                            if layer_cache.keys is not None:
-                                actual_buf = layer_cache.keys.shape[2]
-                                if layer_cache._idx != actual_buf and actual_buf > 0:
-                                    layer_cache.keys = layer_cache._temporal_order(
-                                        layer_cache.keys
-                                    )
-                                    layer_cache.values = layer_cache._temporal_order(
-                                        layer_cache.values
-                                    )
-                                    layer_cache._idx = actual_buf
-
-                    # Merge single-request cache into batch cache format
-                    merged_cache = [
-                        request_cache[layer_idx].merge([request_cache[layer_idx]])
-                        for layer_idx in range(len(request_cache))
-                    ]
-                    new_batch.cache = merged_cache
                     batch_gen.active_batch.extend(new_batch)
                 else:
-                    # No active batch — merge cache for batch format
-                    request_cache = partial["cache"]
-                    merged_cache = [
-                        request_cache[layer_idx].merge([request_cache[layer_idx]])
-                        for layer_idx in range(len(request_cache))
-                    ]
-                    new_batch.cache = merged_cache
                     batch_gen.active_batch = new_batch
 
                 # Store in prefix cache (prompt-only)
