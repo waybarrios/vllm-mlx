@@ -510,6 +510,10 @@ class TestHelperFunctions:
         class FakeManager:
             _registry = {"fast": object(), "smart": object()}
 
+            @property
+            def registered_model_names(self):
+                return sorted(self._registry.keys())
+
             def has_model(self, name):
                 return name in self._registry
 
