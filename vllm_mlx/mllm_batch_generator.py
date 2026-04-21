@@ -1054,39 +1054,49 @@ class MLLMBatchGenerator:
         """
         Run the initial VLM forward pass to encode vision and get first logits.
 
-        This runs the full VLM model (vision + language) on the prompt,
-        which encodes the images and fills the provided KV cache.
+        Mirrors the multimodal prefill in ``mlx_vlm.generate.generate_step``:
+        1. ``model.get_input_embeddings(input_ids, pixel_values, mask=mask, **extras)``
+           merges vision features into the text embeddings and returns any
+           derived state (position_ids, mrope deltas, …).
+        2. ``language_model(inputs=..., inputs_embeds=..., cache=cache, **state)``
+           runs prefill into the caller-provided cache.
 
-        Args:
-            request: Preprocessed request with input_ids and pixel_values
-            cache: KV cache list for the language model. If provided, the
-                   language model writes its KV state directly into this cache
-                   during the forward pass.
-
-        Returns:
-            Logits from the forward pass
+        Keeping the split identical to upstream means ``mask`` is named
+        correctly, ``video_grid_thw`` / ``image_grid_thw`` flow through
+        ``**kwargs``, and any embedding-time state the model needs for
+        decode (e.g. M-RoPE deltas) is forwarded without guessing.
         """
-        # Build model call kwargs
-        kwargs = dict(request.extra_kwargs)
-
-        if request.pixel_values is not None:
-            kwargs["pixel_values"] = request.pixel_values
-        if request.attention_mask is not None:
-            kwargs["attention_mask"] = request.attention_mask
+        extras = dict(request.extra_kwargs)
         if request.image_grid_thw is not None:
-            kwargs["image_grid_thw"] = request.image_grid_thw
+            extras["image_grid_thw"] = request.image_grid_thw
 
-        # Run full VLM forward pass with cache.
-        # The VLM passes cache= through to self.language_model(),
-        # so the language model writes KV state directly into our cache.
         input_ids = request.input_ids
         if input_ids.ndim == 1:
             input_ids = input_ids[None, :]
 
-        output = self.model(input_ids, cache=cache, **kwargs)
+        embedding_output = self.model.get_input_embeddings(
+            input_ids,
+            request.pixel_values,
+            mask=request.attention_mask,
+            **extras,
+        )
+        inputs_embeds = embedding_output.inputs_embeds
+        extras.update(
+            {
+                k: v
+                for k, v in embedding_output.to_dict().items()
+                if k != "inputs_embeds" and v is not None
+            }
+        )
+
+        output = self.language_model(
+            inputs=input_ids,
+            inputs_embeds=inputs_embeds,
+            cache=cache,
+            **extras,
+        )
         request.vision_encoded = True
 
-        # Handle LanguageModelOutput or plain tensor
         if hasattr(output, "logits"):
             return output.logits
         return output
