@@ -2713,19 +2713,25 @@ async def _ensure_sse_terminal(
     *generator*, even if the generator raises mid-stream.
 
     If the inner generator already yields the terminal frame on its happy path,
-    the wrapper detects it and avoids double-emission.  If the generator raises
-    before reaching the terminal, the wrapper emits it in the ``finally`` block.
+    the wrapper detects it and avoids double-emission. On a plain exception
+    we emit the terminal; on ``GeneratorExit`` (consumer closed us) we must
+    NOT yield — yielding inside finally while unwinding from GeneratorExit
+    produces Python's "async generator ignored GeneratorExit" warning.
     """
     emitted = False
+    closing = False
     try:
         async for chunk in generator:
             if chunk == terminal_frame:
                 emitted = True
             yield chunk
+    except GeneratorExit:
+        closing = True
+        raise
     except Exception as e:
         logger.error(f"Streaming error, ensuring terminal frame: {e}")
     finally:
-        if not emitted:
+        if not emitted and not closing:
             yield terminal_frame
 
 
