@@ -1153,6 +1153,23 @@ class BatchedEngine(BaseEngine):
             return self._engine.get_cache_stats()
         return None
 
+    @property
+    def has_ssd_cache_tier(self) -> bool:
+        """True when an SSD cold tier is already managing durable persistence.
+
+        When present, the lifespan one-shot ``save_cache_to_disk`` /
+        ``load_cache_from_disk`` hooks should be skipped — the SSD tier
+        writes through on eviction and survives crashes on its own.
+        """
+        if self._mllm_scheduler is not None:
+            if getattr(self._mllm_scheduler, "_ssd_tier", None) is not None:
+                return True
+        if self._engine is not None:
+            inner = getattr(self._engine, "scheduler", None)
+            if inner is not None and getattr(inner, "_ssd_tier", None) is not None:
+                return True
+        return False
+
     def save_cache_to_disk(self, cache_dir: str) -> bool:
         """Save prefix cache to disk for persistence across restarts."""
         if self._mllm_scheduler and self._mllm_scheduler.batch_generator:

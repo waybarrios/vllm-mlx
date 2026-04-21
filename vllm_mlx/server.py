@@ -459,8 +459,17 @@ async def lifespan(app: FastAPI):
         # during start(), so sampling defaults can't resolve before this point.
         _apply_generation_config_defaults()
 
-    # Load persisted cache from disk (AFTER engine start — AsyncEngineCore must exist)
-    if _engine is not None and hasattr(_engine, "load_cache_from_disk"):
+    # Load persisted cache from disk only when no SSD tier is wired. With an
+    # SSD tier attached, durability is already handled incrementally via the
+    # evict-and-spill path and the tier's own reconcile() on startup — this
+    # one-shot snapshot is a legacy fallback for deployments that don't run
+    # with --ssd-cache-dir.
+    _has_ssd = bool(getattr(_engine, "has_ssd_cache_tier", False))
+    if (
+        _engine is not None
+        and hasattr(_engine, "load_cache_from_disk")
+        and not _has_ssd
+    ):
         _load_prefix_cache_from_disk()
 
     # Warm up prefix cache with user-provided prompts (AFTER disk cache load, so
@@ -497,8 +506,14 @@ async def lifespan(app: FastAPI):
 
     yield
 
-    # Shutdown: Save cache to disk BEFORE stopping engine
-    if _engine is not None and hasattr(_engine, "save_cache_to_disk"):
+    # Shutdown: Save cache to disk BEFORE stopping engine — fallback path
+    # only. With an SSD tier attached, durability was already handled
+    # incrementally and this one-shot save would just redo work.
+    if (
+        _engine is not None
+        and hasattr(_engine, "save_cache_to_disk")
+        and not bool(getattr(_engine, "has_ssd_cache_tier", False))
+    ):
         _save_prefix_cache_to_disk()
 
     # Shutdown: Close MCP connections and stop engine
