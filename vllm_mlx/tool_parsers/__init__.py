@@ -62,6 +62,7 @@ from .glm47_tool_parser import Glm47ToolParser
 from .harmony_tool_parser import HarmonyToolParser
 from .minimax_tool_parser import MiniMaxToolParser
 
+
 def get_parser_stop_tokens(
     parser_name: str | None,
     user_stops: list[str] | None,
