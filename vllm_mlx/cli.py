@@ -72,9 +72,8 @@ def serve_command(args):
         server._enable_auto_tool_choice = False
         server._tool_call_parser = None
 
-    # Configure generation defaults. CLI values are applied here pre-load
-    # so _apply_generation_config_defaults() (called after load_model)
-    # only fills in values the operator did NOT pin via CLI.
+    # Apply CLI sampling defaults pre-load so _apply_generation_config_defaults
+    # (post-load) only fills in what the operator didn't pin.
     if args.default_temperature is not None:
         server._default_temperature = args.default_temperature
     if args.default_top_p is not None:
@@ -281,8 +280,7 @@ def serve_command(args):
         warm_prompts_path=args.warm_prompts,
     )
 
-    # Fill in any sampling default the operator didn't pin via CLI from
-    # the loaded model's generation_config.json.
+    # Fill remaining sampling defaults from generation_config.json.
     server._apply_generation_config_defaults()
 
     # Start server

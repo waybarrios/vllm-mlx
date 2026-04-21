@@ -132,13 +132,9 @@ class Gemma4ToolParser(ToolParser):
 
     Used when --enable-auto-tool-choice --tool-call-parser gemma4 are set.
 
-    Native tool format is supported end-to-end: Gemma 4's chat template
-    renders ``role: tool`` messages via a forward-scan inside the
-    preceding assistant turn (``<|tool_response>response:name{...}<tool_response|>``)
-    and expects tool_call ``arguments`` as a dict (not a JSON-string) so
-    its mapping-render branch can emit ``key:<|"|>value<|"|>`` pairs
-    instead of leaking OpenAI's ``{"key":"value"}`` JSON verbatim —
-    which produces the double-brace ``{{"k":"v"}}`` pathology.
+    Native tool format: Gemma 4's template expects tool_call ``arguments``
+    as a dict (not a JSON string) so its mapping branch emits
+    ``key:<|"|>value<|"|>`` pairs — raw JSON leaks as ``{{"k":"v"}}``.
     """
 
     SUPPORTS_NATIVE_TOOL_FORMAT = True
@@ -147,41 +143,21 @@ class Gemma4ToolParser(ToolParser):
         self, messages: list[dict[str, Any]]
     ) -> list[dict[str, Any]]:
         """Coalesce OpenAI ``role:tool`` messages into the preceding
-        assistant's ``tool_responses`` field — the Gemma-native layout
-        the chat template's legacy branch handles correctly.
+        assistant's ``tool_responses`` field — the Gemma-native layout.
 
-        OpenAI's Chat Completions shape:
+        OpenAI shape::
 
             [assistant{tool_calls:[A,B]}, tool{tool_call_id:A.id, content},
              tool{tool_call_id:B.id, content}, ...]
 
-        Gemma 4 native shape (same data, different layout):
+        Gemma 4 native::
 
             [assistant{tool_calls:[A,B],
-                       tool_responses:[{name:A.name, response:{content:"..."}},
-                                       {name:B.name, response:{content:"..."}}]}]
+                       tool_responses:[{name:A.name, response:{content:...}},
+                                       {name:B.name, response:{content:...}}]}]
 
-        Why this matters: the chat template has two paths for tool
-        responses. The OpenAI forward-scan path (``elif tool_calls``)
-        reads each ``role:tool`` follow-up's ``content`` and dispatches
-        on type — and Jinja2's ``is sequence`` returns True for dicts,
-        so the dict-content branch falls into the sequence loop that
-        calls ``.get('type')`` on each dict *key* (string), which
-        crashes. The legacy ``if tool_responses`` path calls
-        ``format_tool_response_block`` directly with the dict response,
-        which routes through that macro's ``is mapping`` branch and
-        renders the Gemma-native ``response:name{field:value,...}``.
-
-        Wrapping the raw string as ``{"content": str}`` and placing the
-        pair inside ``tool_responses`` lets the template's legacy branch
-        do its job — the model sees
-        ``response:name{content:<|"|>str<|"|>}``, which matches its
-        training data and unblocks the tool loop. No template edits.
-
-        Verified empirically: a raw /v1/completions with this exact
-        shape produces coherent ``The README says ...`` output against
-        the same weights that loop on the template's default string
-        wrapper (``response:name{value:<|"|>...<|"|>}``).
+        Routes through the template's ``is mapping`` branch, producing
+        ``response:name{content:<|"|>str<|"|>}`` which matches training.
         """
         import json
 
@@ -199,11 +175,7 @@ class Gemma4ToolParser(ToolParser):
                 continue
 
             tool_calls = msg.get("tool_calls") or []
-            # Parse arg strings into dicts (no-op when already dict).
-            # The template's tool-call rendering only works on dicts;
-            # server.py does the same for native-format parsers but
-            # this keeps the parser's prepare_messages self-contained
-            # for callers that skip the server-layer conversion.
+            # Template rendering requires dict arguments; parse JSON strings.
             normalized_calls = []
             id_to_name: dict[str, str] = {}
             for tc in tool_calls:
@@ -220,10 +192,8 @@ class Gemma4ToolParser(ToolParser):
                 if tc_copy.get("id") and func.get("name"):
                     id_to_name[tc_copy["id"]] = func["name"]
 
-            # Forward-scan consecutive role:tool messages and convert
-            # each into a tool_responses entry keyed to the matching
-            # tool_call's name (so the rendered response:<name>{...}
-            # matches the call:<name>{...} above it).
+            # Forward-scan consecutive role:tool messages into
+            # tool_responses entries keyed by matching tool_call name.
             tool_responses: list[dict[str, Any]] = []
             j = i + 1
             while j < len(messages) and messages[j].get("role") == "tool":
@@ -239,12 +209,8 @@ class Gemma4ToolParser(ToolParser):
                 elif isinstance(content, dict):
                     response = content
                 elif isinstance(content, list):
-                    # Multimodal tool content (e.g. screenshot return). The
-                    # template's dict branch iterates keys, so coalesce any
-                    # text parts into a single string under ``content`` and
-                    # pass image/etc parts through under type-keyed fields
-                    # preserving order. For the common text-only case this
-                    # matches the string branch output.
+                    # Multimodal tool content — coalesce text parts into
+                    # ``content``; non-text parts go to ``parts`` preserving order.
                     text_parts: list[str] = []
                     extras: list[dict[str, Any]] = []
                     for part in content:
@@ -280,18 +246,8 @@ class Gemma4ToolParser(ToolParser):
     ) -> ExtractedToolCallInformation:
         """Extract tool calls from a complete Gemma 4 model response.
 
-        Handles both layouts the wild can produce:
-
-        1. Single-block, multi-call (per the tool-parser docstring /
-           mlx-lm PR #1105): one ``<|tool_call>`` ... ``<tool_call|>``
-           enclosing several ``call:name{...}`` entries.
-        2. Multi-block (what the chat_template.jinja currently emits for
-           parallel tool calls): one ``<|tool_call>call:A{...}<tool_call|>``
-           immediately followed by ``<|tool_call>call:B{...}<tool_call|>``,
-           etc.
-
-        Iterating every delimited block means whichever shape the model
-        produces, we don't silently drop calls 2..N.
+        Handles both single-block (multi-call in one ``<|tool_call>...
+        <tool_call|>``) and multi-block (back-to-back blocks) layouts.
         """
         cleaned = self.strip_think_tags(model_output)
 
@@ -334,10 +290,7 @@ class Gemma4ToolParser(ToolParser):
     def _extract_calls_from_block(
         self, block: str, tool_calls: list[dict[str, Any]]
     ) -> None:
-        """Parse every ``call:name{...}`` sub-section inside a single
-        ``<|tool_call>...<tool_call|>`` block and append them to
-        ``tool_calls``.
-        """
+        """Parse every ``call:name{...}`` inside a single tool-call block."""
         pos = 0
         while pos < len(block):
             m = _CALL_PREFIX.search(block, pos)
@@ -381,15 +334,9 @@ class Gemma4ToolParser(ToolParser):
         delta_token_ids: Sequence[int] | None = None,
         request: dict[str, Any] | None = None,
     ) -> dict[str, Any] | None:
-        """Extract tool calls from streaming Gemma 4 model output.
-
-        OpenAI delta semantics: each streamed ``tool_calls`` entry gets
-        a stable ``id`` that the client concatenates deltas into, keyed
-        by ``index``. This implementation emits newly-completed tool
-        call blocks once, in order, and uses ``self.prev_tool_call_arr``
-        (reset per stream by the base class) to avoid re-emitting
-        earlier blocks — which would otherwise regenerate fresh UUIDs
-        every time a later ``<tool_call|>`` arrived.
+        """Extract tool calls from streaming Gemma 4 output.
+        Emits each newly-completed block once with a stable ``id``,
+        using ``self.prev_tool_call_arr`` to track what was already sent.
         """
         if TOOL_CALL_START not in current_text:
             return {"content": delta_text}

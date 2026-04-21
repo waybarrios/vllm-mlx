@@ -279,12 +279,7 @@ class MLLMScheduler:
         if self.batch_generator is None:
             from .memory_cache import MemoryCacheConfig
 
-            # No global sampler — every request now builds its own sampler
-            # in ``MLLMBatchGenerator._process_prompts`` from its
-            # ``temperature`` / ``top_p`` / ``top_k`` / ``min_p`` and the
-            # result flows through to ``_step``. ``self.sampler`` is only
-            # consulted as a last-resort fallback, which is the
-            # MLLMBatchGenerator default (``argmax``).
+            # Per-request samplers are built in _process_prompts; no global.
             sampler = None
 
             # Configure KV prefix cache for text-only requests

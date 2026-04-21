@@ -262,16 +262,9 @@ def _trim_cache_offset(cache: list[Any], trim_by: int) -> list[Any]:
 
     Used when returning a cached KV state to the scheduler so the last N
     positions are "freed" and the model recomputes them on the next
-    forward pass (preventing duplicate KV entries).
-
-    For plain KVCache: MUST slice keys/values to the new offset. Shrinking
-    the offset alone leaves stale content in the underlying array, and
-    Gemma 4's KV-shared attention layers read ``cache.state`` directly
-    (bypassing update_and_fetch), so they attend to that stale content and
-    condition on another sequence's private tokens.
-
-    For RotatingKVCache: actually trims the circular buffer — reducing
-    offset alone breaks ``size()`` / ``_temporal_order`` invariants.
+    forward pass. For RotatingKVCache the circular buffer is actually
+    trimmed — reducing offset alone breaks ``size()`` / ``_temporal_order``
+    invariants.
 
     Supports KVCache, RotatingKVCache, and _QuantizedCacheWrapper.
     """
@@ -393,17 +386,9 @@ def _trim_cache_offset(cache: list[Any], trim_by: int) -> list[Any]:
             orig_cls = type(layer_cache)
             tc = orig_cls.__new__(orig_cls)
             new_offset = max(layer_cache.offset - trim_by, 0)
-            # MUST slice the arrays down to new_offset, not just shrink the
-            # offset pointer. Gemma 4's KV-shared attention layers read
-            # ``cache.state`` (raw keys/values) directly rather than going
-            # through ``update_and_fetch``, so any stale slots past
-            # new_offset get attended to and condition the next request on
-            # another sequence's private content. The LCP-fallback path in
-            # MemoryAwarePrefixCache.fetch() exercises exactly this: a new
-            # request gets handed a trimmed entry whose underlying array
-            # still holds the stored sequence's tail, producing coherent-
-            # but-wrong outputs across unrelated concurrent requests under
-            # continuous batching.
+            # Slice to new_offset, not only shrink the pointer: Gemma 4's
+            # KV-shared layers read cache.state directly and would otherwise
+            # attend to stale trailing slots from a prior sequence.
             k_src = layer_cache.keys
             v_src = layer_cache.values
             if k_src is not None and k_src.shape[2] > new_offset:
@@ -414,9 +399,6 @@ def _trim_cache_offset(cache: list[Any], trim_by: int) -> list[Any]:
                 tc.keys = k_src
                 tc.values = v_src
             tc.offset = new_offset
-            # Preserve type-specific attrs (max_size, keep, step, _idx).
-            # _idx, when present, must track the new buffer size so that
-            # size() / _temporal_order stay consistent after trimming.
             for attr in ("max_size", "keep", "step"):
                 if hasattr(layer_cache, attr):
                     setattr(tc, attr, getattr(layer_cache, attr))

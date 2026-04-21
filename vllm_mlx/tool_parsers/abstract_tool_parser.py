@@ -168,22 +168,9 @@ class ToolParser(ABC):
         self, messages: list[dict[str, Any]]
     ) -> list[dict[str, Any]]:
         """Per-model adaptation of OpenAI-style messages before the chat
-        template renders them.
-
-        Symmetric pair of ``extract_tool_calls`` (which adapts model
-        output → OpenAI shape going out). This method adapts OpenAI
-        shape → what the model was trained on going in, where the
-        generic ``SUPPORTS_NATIVE_TOOL_FORMAT`` conversions the server
-        already performs aren't enough.
-
-        Default is a no-op passthrough. Override in subclasses that
-        need massaging — e.g. Gemma 4 requires string tool-message
-        content to be wrapped as ``{"content": str}`` so the template's
-        dict-shape ``response:name{field:val}`` branch renders what the
-        model was trained to see.
-
-        Parsers MUST NOT mutate the input list in place — return a new
-        list with copied dicts when changes are made.
+        template renders them. Symmetric inverse of ``extract_tool_calls``.
+        Default is passthrough. Subclasses MUST NOT mutate ``messages``
+        in place — return a new list when changes are made.
         """
         return messages
 

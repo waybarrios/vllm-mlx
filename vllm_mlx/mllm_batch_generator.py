@@ -1094,14 +1094,8 @@ class MLLMBatchGenerator:
 
         aborted_requests = []
         for req in requests:
-            # Per-request sampler honoring the request's own temperature /
-            # top_p / top_k / min_p — used for first-token sampling below
-            # and stored in ``batch_samplers`` for subsequent ``_step`` calls.
-            # Without this, every first token was drawn from the scheduler's
-            # hardcoded ``make_sampler(temp=0.7, top_p=0.9)`` regardless of
-            # what the caller requested, which clamps caller-specified
-            # temperatures and collapses generation for models tuned at
-            # other settings (e.g. Gemma 4 at temp=0.95).
+            # Per-request first-token sampler from the request's own
+            # temperature / top_p / top_k / min_p.
             req_sampler = _make_sampler(
                 temp=req.temperature,
                 top_p=req.top_p,
@@ -1439,14 +1433,8 @@ class MLLMBatchGenerator:
             else:
                 batch_logits_processors.append(None)
 
-        # Per-request samplers. Built unconditionally so that every request
-        # samples at its own ``temperature`` / ``top_p`` / ``top_k`` /
-        # ``min_p`` during ``_step`` — matching the first-token sampler
-        # already built above. A previous version gated sampler creation on
-        # ``top_k != 0 or min_p != 0.0`` which caused every "default"
-        # request to silently fall through to ``self.sampler``, a scheduler
-        # global hardcoded at ``temp=0.7, top_p=0.9`` regardless of what
-        # the caller asked for.
+        # Per-request samplers for ``_step`` — built unconditionally so
+        # every request honors its own sampling params during decode.
         batch_samplers = []
         for req in requests:
             batch_samplers.append(

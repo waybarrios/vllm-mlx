@@ -243,13 +243,7 @@ def _resolve_repetition_penalty(request_value: float | None) -> float:
 
 
 def _log_resolved_sampling(kwargs: dict) -> None:
-    """Log the final sampling kwargs the sampler actually sees.
-
-    The [REQUEST] line prints raw ``request.*`` values, which are ``None``
-    whenever the client omits a field. Operators need to see what the
-    resolvers produced to tell at a glance whether generation_config /
-    CLI defaults landed.
-    """
+    """Log resolved sampling kwargs (post-resolver, pre-sampler)."""
     logger.info(
         "[SAMPLING] "
         f"temperature={kwargs.get('temperature')} "
@@ -262,21 +256,9 @@ def _log_resolved_sampling(kwargs: dict) -> None:
 
 
 def _apply_generation_config_defaults() -> None:
-    """Fill in any server sampling default the operator didn't pin via CLI
-    from the loaded model's ``generation_config.json``.
-
-    Many HF models ship reasonable sampling defaults in that file
-    (``temperature``, ``top_p``, ``top_k``, ``min_p``, ``repetition_penalty``).
-    Without this loader, clients that omit sampling params get mlx-lm's
-    generic fallbacks regardless of what the model was tuned for.
-
-    Resolution order at request time: request body > CLI flag >
-    generation_config.json > hardcoded fallback. CLI wins over the model
-    file because an operator override is an explicit choice.
-
-    The tokenizer's ``name_or_path`` is the authoritative source for the
-    resolved model directory post-load — same path ``mllm_scheduler`` uses
-    to fish out EOS tokens. Call only after ``load_model()``.
+    """Populate unset server sampling defaults from the loaded model's
+    ``generation_config.json``. Resolution order: request > CLI > this >
+    hardcoded fallback. Call after the engine is loaded.
     """
     global _default_temperature, _default_top_p, _default_top_k
     global _default_min_p, _default_repetition_penalty
@@ -285,42 +267,27 @@ def _apply_generation_config_defaults() -> None:
     from pathlib import Path
 
     if _engine is None:
-        logger.info(
-            "sampling defaults: engine not loaded, using CLI/fallbacks only"
-        )
         return
 
-    # For MLLM engines ``_engine.tokenizer`` returns the HF processor; the
-    # actual tokenizer hangs off that. mllm_scheduler unwraps the same way
-    # when collecting EOS token IDs.
     processor_or_tokenizer = getattr(_engine, "tokenizer", None)
     tokenizer = (
         getattr(processor_or_tokenizer, "tokenizer", None)
         or processor_or_tokenizer
     )
-    tok_path = getattr(tokenizer, "name_or_path", None)
+    tok_path = getattr(tokenizer, "name_or_path", None) or getattr(
+        processor_or_tokenizer, "name_or_path", None
+    )
     if not tok_path:
-        tok_path = getattr(processor_or_tokenizer, "name_or_path", None)
-
-    if not tok_path:
-        logger.info(
-            "sampling defaults: tokenizer has no name_or_path, using "
-            "CLI/fallbacks only"
-        )
         return
 
     gc_path = Path(tok_path) / "generation_config.json"
     if not gc_path.exists():
-        logger.info(
-            f"sampling defaults: no generation_config.json at {gc_path}, "
-            "using CLI/fallbacks only"
-        )
         return
 
     try:
         gc = json.loads(gc_path.read_text())
     except Exception as exc:
-        logger.warning(f"sampling defaults: could not read {gc_path}: {exc}")
+        logger.warning(f"generation_config.json unreadable at {gc_path}: {exc}")
         return
 
     if _default_temperature is None and "temperature" in gc:
@@ -335,7 +302,7 @@ def _apply_generation_config_defaults() -> None:
         _default_repetition_penalty = float(gc["repetition_penalty"])
 
     logger.info(
-        f"sampling defaults loaded from {gc_path}: "
+        f"sampling defaults from {gc_path.name}: "
         f"temperature={_default_temperature} top_p={_default_top_p} "
         f"top_k={_default_top_k} min_p={_default_min_p} "
         f"repetition_penalty={_default_repetition_penalty}"
@@ -1804,13 +1771,8 @@ def _tool_choice_disabled(request: ChatCompletionRequest | None) -> bool:
 def _apply_tool_parser_message_adapter(
     messages: list[dict],
 ) -> list[dict]:
-    """Run the configured tool parser's ``prepare_messages`` hook over
-    the message list. Per-model adaptation of OpenAI-shape messages to
-    what the model's chat template expects — see ToolParser.prepare_messages.
-
-    No-op when auto-tool-choice is off, no parser is configured, or the
-    parser hasn't yet been instantiated. Safe to call at any point in
-    the request pipeline.
+    """Run the configured tool parser's ``prepare_messages`` hook.
+    No-op when auto-tool-choice is off or no parser is configured.
     """
     if not _enable_auto_tool_choice or not _tool_call_parser:
         return messages
@@ -4902,8 +4864,7 @@ def main():
         trust_remote_code=args.trust_remote_code,
     )
 
-    # Fill in any sampling default the operator didn't pin via CLI from
-    # the loaded model's generation_config.json.
+    # Fill remaining sampling defaults from generation_config.json.
     _apply_generation_config_defaults()
 
     # Start server

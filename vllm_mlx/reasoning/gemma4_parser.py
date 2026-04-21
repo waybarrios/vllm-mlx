@@ -77,21 +77,13 @@ class Gemma4ReasoningParser(BaseThinkingReasoningParser):
         # Tracks whether we have emitted the first content delta past the
         # <|channel>response transition — used to strip the leading newline.
         self._content_seen: bool = False
-        # Gemma 4's chat template injects an empty `<|channel>thought\n<channel|>`
-        # preamble on every model turn when enable_thinking=false. The prompt
-        # thus already ends in the END marker, so the model's first emitted
-        # token is content, not reasoning. The base class would otherwise
-        # stay in pre_think and route everything into `reasoning_content`
-        # until a stray `<|channel>` shows up — then choke on the transition
-        # and leak the closing marker into content. Starting in "content"
-        # phase matches the template's actual behavior and still handles
-        # mid-stream thought blocks via the base class's content-phase
-        # re-entry path.
+        # Gemma 4's template injects `<|channel>thought\n<channel|>` as
+        # preamble, so the model starts emitting content, not reasoning.
+        # Start in "content" phase; mid-stream thought blocks re-enter via
+        # the base class's content-phase path.
         self._phase = "content"
-        # Counters used while eating the "thought\n" channel-name prefix at
-        # the start of each reasoning block. Works at delta granularity —
-        # the prefix can be split across arbitrary chunk boundaries
-        # ("tho" / "ught" / "\n") and we still consume it exactly once.
+        # Counters for eating the "thought\n" channel-name prefix at the
+        # start of each reasoning block, tolerant to chunk-boundary splits.
         self._thought_prefix_consumed: int = 0
         self._thought_newline_consumed: bool = False
 
@@ -268,21 +260,15 @@ class Gemma4ReasoningParser(BaseThinkingReasoningParser):
                     return DeltaMessage(content=stripped)
                 return DeltaMessage(content=delta_text)
 
-        # If the base class entered a new thinking block in this delta
-        # (start token appears somewhere inside delta_text), re-arm the
-        # thought-prefix stripper so we eat the next "thought\n" again.
+        # Re-arm the prefix stripper each time a new thought block opens.
         if self.start_token in delta_text:
             self._arm_thought_strip()
 
-        # Delegate to base class for standard <|channel>/<channel|> handling
         result = super().extract_reasoning_streaming(
             previous_text, current_text, delta_text
         )
 
-        # Strip the "thought" channel-name token (and its trailing newline)
-        # from the START of each reasoning block, chunk-by-chunk. We operate
-        # directly on ``result.reasoning`` — NOT on ``current_text`` — so
-        # any ``result.content`` the base class split off stays intact.
+        # Eat the "thought\n" label from the start of each reasoning block.
         if result is not None and result.reasoning is not None:
             r = result.reasoning
             while (
