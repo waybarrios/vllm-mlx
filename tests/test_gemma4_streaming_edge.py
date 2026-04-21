@@ -35,8 +35,8 @@ def test_thought_label_split_across_deltas():
     parser = Gemma4ReasoningParser()
     tokens = [
         "<|channel>",
-        "tho",        # partial "thought" label
-        "ught",       # completes the label
+        "tho",  # partial "thought" label
+        "ught",  # completes the label
         "\n",
         "real reasoning",
         "<channel|>",

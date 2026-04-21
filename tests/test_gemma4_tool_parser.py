@@ -189,7 +189,9 @@ class TestGemma4ToolParserExtract:
 
     def test_bare_string_preserves_null_and_bool_literals(self):
         """null/true/false must NOT be treated as bare strings."""
-        output = "<|tool_call>call:cfg{flag:null,ready:true,done:false,name:bob}<tool_call|>"
+        output = (
+            "<|tool_call>call:cfg{flag:null,ready:true,done:false,name:bob}<tool_call|>"
+        )
         result = self.parser.extract_tool_calls(output)
         args = json.loads(result.tool_calls[0]["arguments"])
         assert args == {"flag": None, "ready": True, "done": False, "name": "bob"}
