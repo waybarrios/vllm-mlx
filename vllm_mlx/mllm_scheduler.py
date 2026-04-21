@@ -80,6 +80,14 @@ class MLLMSchedulerConfig:
     kv_cache_quantization_group_size: int = 64
     # Interleaved prefill/decode budget per step (0 = disabled, blocking prefill)
     chunked_prefill_tokens: int = 0
+    # SSD cache tier — evict-and-spill destination for the prefix cache.
+    # When set, evicted RAM entries asynchronously spill to NVMe via the
+    # SQLite-indexed ``SSDCacheTier``, survive process restarts, and are
+    # promoted back on fetch. Gives incremental durability (no one-shot
+    # shutdown save required) and effectively unbounds the cache to the
+    # configured disk budget.
+    ssd_cache_dir: Optional[str] = None  # None = disabled
+    ssd_cache_max_gb: float = 10.0
 
 
 @dataclass
@@ -317,6 +325,30 @@ class MLLMScheduler:
                 prefill_step_size=self.config.prefill_step_size,
                 prefix_cache_config=prefix_cache_config,
             )
+
+            # Attach SSD cold tier to the prefix cache if configured. Evicted
+            # RAM entries spill to NVMe asynchronously, fetches fall through
+            # to SSD on RAM miss, and the SQLite-indexed tier survives
+            # restarts / crashes / OOMs — no reliance on lifespan shutdown.
+            self._ssd_tier = None
+            if (
+                self.config.ssd_cache_dir is not None
+                and self.batch_generator.prefix_cache is not None
+            ):
+                from .ssd_cache import SSDCacheConfig, SSDCacheTier
+
+                ssd_config = SSDCacheConfig(
+                    cache_dir=self.config.ssd_cache_dir,
+                    max_size_gb=self.config.ssd_cache_max_gb,
+                )
+                self._ssd_tier = SSDCacheTier(ssd_config)
+                self._ssd_tier.start_writer()
+                self._ssd_tier.reconcile()
+                self.batch_generator.prefix_cache.set_ssd_tier(self._ssd_tier)
+                logger.info(
+                    f"MLLM SSD cache tier enabled: dir={self.config.ssd_cache_dir}, "
+                    f"max={self.config.ssd_cache_max_gb}GB"
+                )
 
             # Install chunked prefill BEFORE MTP (MTP wraps _next,
             # chunked replaces it — MTP then wraps the chunked version).
@@ -839,6 +871,14 @@ class MLLMScheduler:
         if self.batch_generator is not None:
             self.batch_generator.close()
             self.batch_generator = None
+
+        ssd_tier = getattr(self, "_ssd_tier", None)
+        if ssd_tier is not None:
+            try:
+                ssd_tier.close()
+            except Exception as exc:
+                logger.warning(f"SSD tier close failed: {exc}")
+            self._ssd_tier = None
 
         logger.info("MLLM Scheduler stopped")
 

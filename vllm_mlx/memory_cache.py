@@ -905,10 +905,89 @@ class MemoryAwarePrefixCache:
                 self._last_match_type = "lcp"
                 return _clone_cache_for_fetch(trimmed_cache), remaining
 
+        # RAM miss — try the SSD cold tier before giving up. Sync-read and
+        # promote into RAM so the next hit stays hot. The SSD tier is the
+        # durable half of the cache (SQLite index + safetensors data,
+        # survives process crashes), so this is also how caches persist
+        # across restarts.
+        if self._ssd_tier is not None:
+            promoted_entry = self._try_promote_from_ssd(tokens_key)
+            if promoted_entry is not None:
+                self._stats.hits += 1
+                self._stats.tokens_saved += len(tokens)
+                self._last_match_type = "ssd_exact"
+                return _clone_cache_for_fetch(promoted_entry.cache), []
+
         self._stats.misses += 1
         self._last_match_type = "miss"
 
         return None, tokens
+
+    def _try_promote_from_ssd(
+        self, tokens_key: tuple[int, ...]
+    ) -> _CacheEntry | None:
+        """Sync SSD lookup + read + RAM store. Returns the promoted entry
+        (now also resident in RAM) or None if SSD missed or the disk read
+        failed.
+
+        Runs on the calling thread — keep calls to this outside the hot
+        MLX decode path. For prefill-time fetches the cost of a single
+        SSD read (tens of MB → tens of ms on NVMe) is dwarfed by the
+        alternative of a full re-prefill.
+        """
+        meta = self._ssd_tier.lookup_ssd(tokens_key)
+        if meta is None:
+            prefix_meta = self._ssd_tier.lookup_ssd_prefix(tokens_key)
+            if prefix_meta is None:
+                return None
+            meta = prefix_meta
+            matched_count = meta.get("matched_tokens") or meta.get("num_tokens")
+            if matched_count is None or matched_count <= 0:
+                return None
+            lookup_key = tuple(tokens_key[:matched_count])
+        else:
+            lookup_key = tokens_key
+
+        memory_bytes = meta.get("memory_bytes", 0)
+        # Reserve the RAM budget before the disk read so concurrent
+        # promotions don't race past max_memory.
+        if self._current_memory + memory_bytes > self._max_memory:
+            try:
+                self._ssd_tier._stats.promotion_failures += 1
+            except Exception:
+                pass
+            return None
+
+        try:
+            cache_layers = self._ssd_tier._read_entry(lookup_key, meta["file_path"])
+        except Exception:
+            logger.exception("[ssd_promote] read failed for %d tokens", len(lookup_key))
+            return None
+        if cache_layers is None:
+            return None
+
+        entry = _CacheEntry(
+            tokens=lookup_key,
+            cache=cache_layers,
+            memory_bytes=memory_bytes or estimate_kv_cache_memory(cache_layers),
+        )
+        self._entries[lookup_key] = entry
+        self._current_memory += entry.memory_bytes
+        bisect.insort(self._sorted_keys, lookup_key)
+        self._stats.entry_count = len(self._entries)
+        self._stats.current_memory_bytes = self._current_memory
+        # Bump touch time in SSD index so recently-promoted entries outlive
+        # colder neighbours during retention-driven eviction.
+        try:
+            self._ssd_tier._index.touch(lookup_key)
+        except Exception:
+            pass
+        logger.info(
+            "[ssd_promote] hit: promoted %d tokens (%.1fMB) into RAM",
+            len(lookup_key),
+            entry.memory_bytes / _BYTES_PER_MB,
+        )
+        return entry
 
     def store(
         self, tokens: list[int], cache: list[Any], evict_prefixes: bool = True

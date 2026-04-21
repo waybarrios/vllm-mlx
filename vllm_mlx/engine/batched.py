@@ -274,6 +274,8 @@ class BatchedEngine(BaseEngine):
             self._scheduler_config, "mllm_prefill_step_size", None
         )
         chunked_prefill = getattr(self._scheduler_config, "chunked_prefill_tokens", 0)
+        ssd_cache_dir = getattr(self._scheduler_config, "ssd_cache_dir", None)
+        ssd_cache_max_gb = getattr(self._scheduler_config, "ssd_cache_max_gb", 10.0)
         mllm_extra = {}
         if prefill_step_size is not None:
             mllm_extra["prefill_step_size"] = prefill_step_size
@@ -291,6 +293,8 @@ class BatchedEngine(BaseEngine):
             kv_cache_quantization=kv_quant,
             kv_cache_quantization_bits=kv_bits,
             kv_cache_quantization_group_size=kv_group_size,
+            ssd_cache_dir=ssd_cache_dir,
+            ssd_cache_max_gb=ssd_cache_max_gb,
             **mllm_extra,
         )
 
