@@ -47,6 +47,33 @@ def test_batched_engine_applies_chat_template_kwargs():
         )
 
 
+def test_batched_engine_mllm_falls_back_to_tokenizer_when_processor_has_no_template():
+    with patch("vllm_mlx.engine.batched.is_mllm_model", return_value=True):
+        from vllm_mlx.engine.batched import BatchedEngine
+
+        engine = BatchedEngine("test-mllm-model")
+        engine._is_mllm = True
+
+        tokenizer = MagicMock()
+        tokenizer.apply_chat_template.return_value = "prompt-from-tokenizer"
+
+        processor = MagicMock()
+        processor.tokenizer = tokenizer
+        processor.apply_chat_template.side_effect = ValueError(
+            "Cannot use apply_chat_template because this processor does not have a chat template."
+        )
+        engine._processor = processor
+
+        prompt = engine._apply_chat_template(
+            [{"role": "user", "content": "Hello"}],
+            chat_template_kwargs={"enable_thinking": False},
+        )
+
+        assert prompt == "prompt-from-tokenizer"
+        processor.apply_chat_template.assert_called_once()
+        tokenizer.apply_chat_template.assert_called_once()
+
+
 def test_chat_completion_endpoint_forwards_chat_template_kwargs():
     captured = {}
 
