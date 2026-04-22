@@ -815,7 +815,7 @@ class MLLMScheduler:
                     await asyncio.sleep(0.01)
 
             except asyncio.CancelledError:
-                break
+                raise
             except Exception as e:
                 logger.error(f"Error in MLLM process loop: {e}", exc_info=True)
                 await asyncio.sleep(0.1)
