@@ -89,6 +89,18 @@ def patch_qwen35_attention_for_batching() -> bool:
         # but kv_seq_len must be int for mask[..., :kv_seq_len].
         _offset = _cache_offset_to_int(cache)
 
+        # mlx-vlm caches position_ids on the language model object.
+        # If a subsequent request has a different prompt length, stale
+        # position_ids can be shorter than the current chunk and crash
+        # rotary application with a broadcast shape mismatch.
+        if position_ids is not None and position_ids.shape[-1] != L:
+            logger.debug(
+                "[Qwen3.5 patch] Recomputing stale position_ids: got %s, expected %s",
+                position_ids.shape[-1],
+                L,
+            )
+            position_ids = None
+
         if position_ids is None:
             kv_seq_len += _offset + 1
             position_ids = mx.arange(_offset, _offset + L)
@@ -115,6 +127,6 @@ def patch_qwen35_attention_for_batching() -> bool:
         return self.o_proj(output * mx.sigmoid(gate))
 
     Qwen3_5Attention.__call__ = _patched_call
-    Qwen3_5Attention._batch_patched = True
+    setattr(Qwen3_5Attention, "_batch_patched", True)
     logger.info("[Qwen3.5 patch] Attention patched for BatchKVCache support")
     return True
