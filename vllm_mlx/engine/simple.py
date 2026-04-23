@@ -40,22 +40,6 @@ def _bind_worker_generation_streams() -> None:
             module.generation_stream = default_stream
 
 
-def _only_mtp_safe_thinking_processors(processors: list[Any] | None) -> bool:
-    """Return True when processors are budget-only thinking controllers."""
-    if not processors:
-        return False
-    try:
-        from ..constrained import ThinkingAwareLogitsProcessor
-    except Exception:
-        return False
-
-    return all(
-        isinstance(proc, ThinkingAwareLogitsProcessor)
-        and getattr(proc, "_inner", None) is None
-        for proc in processors
-    )
-
-
 def _seed_logits_processors(
     seed_tokens: mx.array | None,
     processors: list[Any] | None,
@@ -1082,7 +1066,6 @@ class SimpleEngine(BaseEngine):
         )
         all_processors = (external_logits_processors or []) + (penalty_processors or [])
         custom_logits_active = bool(all_processors)
-        mtp_safe_processors = _only_mtp_safe_thinking_processors(all_processors)
         max_tokens = max_tokens or 4096
 
         # --- System prompt KV caching ---
@@ -1255,11 +1238,11 @@ class SimpleEngine(BaseEngine):
             model = self._text_model
             use_mtp = (
                 self._mtp
-                and (not custom_logits_active or mtp_safe_processors)
+                and not custom_logits_active
                 and hasattr(model, "mtp")
                 and model.mtp is not None
             )
-            if self._mtp and custom_logits_active and not mtp_safe_processors:
+            if self._mtp and custom_logits_active:
                 logger.info(
                     "Text route: disabling MTP for request-local logits processors"
                 )

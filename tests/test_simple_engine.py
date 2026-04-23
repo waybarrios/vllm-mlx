@@ -693,10 +693,10 @@ class TestSimpleEngineConcurrency:
         assert captured_kwargs["logits_processors"][0] is user_processor
 
     @pytest.mark.anyio
-    async def test_stream_generate_text_keeps_mtp_for_budget_only_thinking_processor(
+    async def test_stream_generate_text_disables_mtp_for_thinking_processor(
         self,
     ):
-        """Budget-only ThinkingAwareLogitsProcessor should not disable MTP."""
+        """Thinking-budget processors must fail closed to non-MTP decoding."""
         from types import SimpleNamespace
 
         from vllm_mlx.engine.simple import SimpleEngine
@@ -720,13 +720,7 @@ class TestSimpleEngineConcurrency:
 
         thinking_proc = MagicMock()
 
-        with (
-            patch("mlx_lm.stream_generate", side_effect=fake_stream_generate),
-            patch(
-                "vllm_mlx.engine.simple._only_mtp_safe_thinking_processors",
-                return_value=True,
-            ),
-        ):
+        with patch("mlx_lm.stream_generate", side_effect=fake_stream_generate):
             outputs = [
                 chunk
                 async for chunk in engine._stream_generate_text(
@@ -739,7 +733,7 @@ class TestSimpleEngineConcurrency:
             ]
 
         assert outputs[-1].text == "Hello"
-        assert captured_kwargs["mtp"] is True
+        assert "mtp" not in captured_kwargs
         assert captured_kwargs["logits_processors"][0] is thinking_proc
 
     @pytest.mark.anyio
