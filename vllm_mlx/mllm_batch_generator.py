@@ -1839,14 +1839,30 @@ def install_mtp_mllm(
     ) -> Tuple[mx.array, List[mx.array]]:
         """Extended _step with MTP always-advance strategy."""
         batch_size = input_tokens.shape[0]
+        active_requests = (
+            list(batch_gen.active_batch.requests)
+            if batch_gen.active_batch is not None
+            else []
+        )
+        has_non_greedy_sampling = any(
+            getattr(req, "temperature", 0.0) not in (0, 0.0)
+            or getattr(req, "top_p", 1.0) < 1.0
+            or getattr(req, "top_k", 0) != 0
+            or getattr(req, "min_p", 0.0) != 0.0
+            for req in active_requests
+        )
 
         # Prefill guard: skip MTP for multi-token input or when no active batch
         # Also skip MTP when batch has multiple active requests (MTP overhead
-        # hurts aggregate throughput in concurrent scenarios)
+        # hurts aggregate throughput in concurrent scenarios). The current
+        # verifier is only correctness-safe for greedy decoding with no
+        # request-local logits processors.
         if (
             input_tokens.shape[1] > 1
             or batch_gen.active_batch is None
             or len(batch_gen.active_batch) > 1
+            or has_non_greedy_sampling
+            or (logits_processors is not None and any(logits_processors))
         ):
             _skip_state[0] = None
             return _orig_step(

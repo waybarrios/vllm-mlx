@@ -293,11 +293,11 @@ class BatchedEngine(BaseEngine):
             self._scheduler_config, "kv_cache_quantization_group_size", 64
         )
 
-        # Forward MLLM prefill-step override only when explicitly configured.
-        # This keeps default behavior unchanged for MLLM (1024) unless set.
         prefill_step_size = getattr(
             self._scheduler_config, "mllm_prefill_step_size", None
         )
+        if prefill_step_size is None:
+            prefill_step_size = getattr(self._scheduler_config, "prefill_step_size", None)
         mllm_extra = {}
         if prefill_step_size is not None:
             mllm_extra["prefill_step_size"] = prefill_step_size
@@ -1039,7 +1039,8 @@ class BatchedEngine(BaseEngine):
 
     def load_cache_from_disk(self, cache_dir: str) -> int:
         """Load prefix cache from disk. Returns number of entries loaded."""
-        if self._mllm_scheduler and self._mllm_scheduler.batch_generator:
+        if self._mllm_scheduler:
+            self._mllm_scheduler._ensure_batch_generator()
             pc = self._mllm_scheduler.batch_generator.prefix_cache
             if pc is not None:
                 return pc.load_from_disk(cache_dir)
