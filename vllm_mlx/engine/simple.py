@@ -101,20 +101,6 @@ def _processors_retired(processors: list[Any] | None) -> bool:
     )
 
 
-def _processors_are_budget_only_thinking(
-    external_processors: list[Any] | None,
-    penalty_processors: list[Any] | None,
-) -> bool:
-    """True when active request-local processors only enforce thinking budget."""
-    return bool(external_processors) and not penalty_processors and all(
-        isinstance(getattr(p, "is_retired", None), bool)
-        and hasattr(p, "thinking_tokens")
-        and hasattr(p, "state")
-        and getattr(p, "_inner", None) is None
-        for p in external_processors
-    )
-
-
 class _SpecPrefillCancelled(Exception):
     """Cooperative cancellation sentinel for blocking SpecPrefill workers."""
 
@@ -1094,10 +1080,6 @@ class SimpleEngine(BaseEngine):
             presence_penalty=presence_penalty if presence_penalty != 0.0 else None,
         )
         all_processors = (external_logits_processors or []) + (penalty_processors or [])
-        budget_only_thinking_processors = _processors_are_budget_only_thinking(
-            external_logits_processors,
-            penalty_processors,
-        )
         custom_logits_active = bool(all_processors)
         max_tokens = max_tokens or 4096
 
@@ -1248,12 +1230,6 @@ class SimpleEngine(BaseEngine):
         ):
             use_specprefill = False
 
-        if use_specprefill and budget_only_thinking_processors:
-            logger.info(
-                "Text route: disabling SpecPrefill for budget-only thinking processor"
-            )
-            use_specprefill = False
-
         # Upper bound: cap specprefill to avoid draft model OOM on very long prompts
         # 65536 tokens ~ 2GB draft KV cache on Qwen3.5-4B (32KB/token x 8 attn layers)
         _SPECPREFILL_MAX_TOKENS = 65536
@@ -1276,20 +1252,15 @@ class SimpleEngine(BaseEngine):
 
             model = self._text_model
             can_retire_processors = _processors_can_retire(all_processors)
-            allow_budget_only_mtp = budget_only_thinking_processors and not use_specprefill
             use_mtp = (
                 self._mtp
-                and (not custom_logits_active or allow_budget_only_mtp)
+                and not custom_logits_active
                 and hasattr(model, "mtp")
                 and model.mtp is not None
             )
-            if self._mtp and custom_logits_active and not allow_budget_only_mtp:
+            if self._mtp and custom_logits_active:
                 logger.info(
                     "Text route: disabling MTP for request-local logits processors"
-                )
-            elif self._mtp and allow_budget_only_mtp:
-                logger.info(
-                    "Text route: keeping MTP enabled for budget-only thinking processor"
                 )
 
             # Cache MISS with valid prefix: prefill system tokens and snapshot

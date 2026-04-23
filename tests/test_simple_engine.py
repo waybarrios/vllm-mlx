@@ -693,10 +693,10 @@ class TestSimpleEngineConcurrency:
         assert captured_kwargs["logits_processors"][0] is user_processor
 
     @pytest.mark.anyio
-    async def test_stream_generate_text_keeps_mtp_for_budget_only_thinking_processor(
+    async def test_stream_generate_text_disables_mtp_for_thinking_processor(
         self,
     ):
-        """Budget-only thinking processors may keep MTP on the normal path."""
+        """Thinking-budget processors must fail closed to non-MTP decoding."""
         from types import SimpleNamespace
 
         from vllm_mlx.engine.simple import SimpleEngine
@@ -718,17 +718,7 @@ class TestSimpleEngineConcurrency:
         engine._text_model.mtp = MagicMock()
         engine._text_tokenizer = tokenizer
 
-        class BudgetOnlyThinkingProcessor:
-            def __init__(self):
-                self.is_retired = False
-                self.thinking_tokens = 0
-                self.state = object()
-                self._inner = None
-
-            def __call__(self, tokens, logits):
-                return logits
-
-        thinking_proc = BudgetOnlyThinkingProcessor()
+        thinking_proc = MagicMock()
 
         with patch("mlx_lm.stream_generate", side_effect=fake_stream_generate):
             outputs = [
@@ -743,8 +733,7 @@ class TestSimpleEngineConcurrency:
             ]
 
         assert outputs[-1].text == "Hello"
-        assert captured_kwargs["mtp"] is True
-        assert captured_kwargs["num_draft_tokens"] == 1
+        assert "mtp" not in captured_kwargs
         assert captured_kwargs["logits_processors"][0] is thinking_proc
 
     @pytest.mark.anyio
@@ -856,74 +845,6 @@ class TestSimpleEngineConcurrency:
         assert calls[1]["mtp"] is True
         assert calls[1]["num_draft_tokens"] == 4
         assert "logits_processors" not in calls[1]
-
-    @pytest.mark.anyio
-    async def test_stream_generate_text_budget_only_thinking_disables_specprefill(
-        self,
-    ):
-        """Budget-only thinking processors should force normal-path MTP, not SpecPrefill."""
-        from types import SimpleNamespace
-
-        from vllm_mlx.engine.simple import SimpleEngine
-
-        captured_kwargs = {}
-
-        def fake_stream_generate(model, tokenizer, prompt, **kwargs):
-            captured_kwargs["prompt"] = prompt
-            captured_kwargs.update(kwargs)
-            yield SimpleNamespace(text="Hello", finish_reason="stop")
-
-        tokenizer = MagicMock()
-        tokenizer.apply_chat_template.return_value = "<|im_start|>user\nhello"
-        tokenizer.bos_token = None
-        tokenizer.eos_token_id = 42
-        tokenizer.encode.return_value = [1, 2, 3, 4]
-
-        engine = SimpleEngine(
-            "test-model",
-            force_mllm=True,
-            mtp=True,
-            specprefill_enabled=True,
-        )
-        engine._loaded = True
-        engine._draft_model = MagicMock()
-        engine._text_model = MagicMock()
-        engine._text_model.mtp = MagicMock()
-        engine._text_tokenizer = tokenizer
-
-        class BudgetOnlyThinkingProcessor:
-            def __init__(self):
-                self.is_retired = False
-                self.thinking_tokens = 0
-                self.state = object()
-                self._inner = None
-
-            def __call__(self, tokens, logits):
-                return logits
-
-        thinking_proc = BudgetOnlyThinkingProcessor()
-
-        with (
-            patch("mlx_lm.stream_generate", side_effect=fake_stream_generate),
-            patch("vllm_mlx.specprefill.score_tokens") as score_tokens,
-        ):
-            outputs = [
-                chunk
-                async for chunk in engine._stream_generate_text(
-                    messages=[{"role": "user", "content": "hello"}],
-                    max_tokens=16,
-                    temperature=0.7,
-                    top_p=0.9,
-                    specprefill=True,
-                    logits_processors=[thinking_proc],
-                )
-            ]
-
-        assert outputs[-1].text == "Hello"
-        score_tokens.assert_not_called()
-        assert captured_kwargs["mtp"] is True
-        assert captured_kwargs["logits_processors"][0] is thinking_proc
-        assert "prompt_cache" not in captured_kwargs
 
     @pytest.mark.anyio
     async def test_stream_generate_text_specprefill_reenables_mtp_after_retirement(self):
