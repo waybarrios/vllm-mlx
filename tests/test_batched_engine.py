@@ -92,3 +92,35 @@ class TestBatchedEngineGenerate:
         assert result.prompt_tokens == 7
         assert result.completion_tokens == 1
         assert result.finish_reason == "stop"
+
+
+class TestBatchedEngineCacheRestore:
+    def _make_mllm_engine(self):
+        from vllm_mlx.engine.batched import BatchedEngine
+
+        with patch("vllm_mlx.engine.batched.is_mllm_model", return_value=True):
+            engine = BatchedEngine("test-mllm")
+
+        engine._loaded = True
+        engine._is_mllm = True
+        return engine
+
+    def test_load_cache_from_disk_bootstraps_mllm_batch_generator(self):
+        engine = self._make_mllm_engine()
+
+        prefix_cache = MagicMock()
+        prefix_cache.load_from_disk.return_value = 2
+        scheduler = MagicMock()
+        scheduler.batch_generator = None
+
+        def ensure_batch_generator():
+            scheduler.batch_generator = MagicMock(prefix_cache=prefix_cache)
+
+        scheduler._ensure_batch_generator.side_effect = ensure_batch_generator
+        engine._mllm_scheduler = scheduler
+
+        loaded = engine.load_cache_from_disk("/tmp/cache")
+
+        assert loaded == 2
+        scheduler._ensure_batch_generator.assert_called_once_with()
+        prefix_cache.load_from_disk.assert_called_once_with("/tmp/cache")

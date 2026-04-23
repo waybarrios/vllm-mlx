@@ -36,6 +36,7 @@ from .mllm_batch_generator import (
     MLLMBatchRequest,
     MLLMBatchResponse,
 )
+from .mlx_streams import bind_generation_streams
 from .multimodal_processor import MultimodalProcessor
 from .request import RequestOutput, RequestStatus, SamplingParams
 
@@ -785,40 +786,56 @@ class MLLMScheduler:
     async def _process_loop(self) -> None:
         """Main async processing loop.
 
-        Uses a thread pool executor for steps that involve prefill
-        (waiting requests or partial prefill in progress) so that the
-        event loop stays responsive for health checks and other HTTP
-        endpoints.  Decode-only steps are fast (<3 ms) and run inline.
+        All MLLM steps run on one worker thread. MLX generation streams are
+        thread-local, so prefill and decode must not bounce between the event
+        loop thread and a worker thread.
         """
         _executor = concurrent.futures.ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="mllm-step"
         )
         loop = asyncio.get_running_loop()
+        worker_streams_bound = False
 
-        while self._running:
-            try:
-                if self.has_requests():
-                    has_waiting = self.get_num_waiting() > 0
-                    has_partial = (
-                        self.batch_generator is not None
-                        and getattr(self.batch_generator, "_partial", None) is not None
-                    )
-                    needs_executor = has_waiting or has_partial
+        def _ensure_worker_streams_bound() -> None:
+            nonlocal worker_streams_bound
+            if not worker_streams_bound:
+                bind_generation_streams()
+                worker_streams_bound = True
 
-                    if needs_executor:
-                        await loop.run_in_executor(_executor, self.step)
-                    else:
-                        self.step()
+        def _step_on_worker() -> None:
+            _ensure_worker_streams_bound()
+            self.step()
+
+        def _close_batch_generator_on_worker() -> None:
+            _ensure_worker_streams_bound()
+            if self.batch_generator is not None:
+                self.batch_generator.close()
+                self.batch_generator = None
+
+        try:
+            while self._running:
+                try:
+                    if self.has_requests():
+                        await loop.run_in_executor(_executor, _step_on_worker)
                         await asyncio.sleep(0)
-                else:
-                    # No work, wait a bit
-                    await asyncio.sleep(0.01)
+                    else:
+                        # No work, wait a bit
+                        await asyncio.sleep(0.01)
 
-            except asyncio.CancelledError:
-                raise
-            except Exception as e:
-                logger.error(f"Error in MLLM process loop: {e}", exc_info=True)
-                await asyncio.sleep(0.1)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    logger.error(f"Error in MLLM process loop: {e}", exc_info=True)
+                    await asyncio.sleep(0.1)
+        finally:
+            close_future = loop.run_in_executor(
+                _executor, _close_batch_generator_on_worker
+            )
+            try:
+                await asyncio.shield(close_future)
+            except BaseException:
+                pass
+            _executor.shutdown(wait=True)
 
     async def add_request_async(
         self,
@@ -1067,6 +1084,23 @@ class MLLMScheduler:
         stats["memory_aware_cache"] = prefix_stats
 
         return stats
+
+    def clear_runtime_caches(self) -> Dict[str, bool]:
+        """Clear runtime caches without resetting scheduler/request state."""
+        cleared = {
+            "vision_cache": False,
+            "prefix_cache": False,
+        }
+        if self.vision_cache:
+            self.vision_cache.clear()
+            cleared["vision_cache"] = True
+        if (
+            self.batch_generator is not None
+            and self.batch_generator.prefix_cache is not None
+        ):
+            self.batch_generator.prefix_cache.clear()
+            cleared["prefix_cache"] = True
+        return cleared
 
     def reset(self) -> None:
         """Reset the scheduler state."""

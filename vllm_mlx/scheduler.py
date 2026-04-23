@@ -1091,9 +1091,16 @@ def _install_mtp(
     batch_gen._step = _mtp_step
     batch_gen._next = _mtp_next
 
+    if num_draft_tokens != 1:
+        logger.warning(
+            "[MTP] num_draft_tokens=%d requested, but the current batched MTP "
+            "path drafts exactly one token per verify step",
+            num_draft_tokens,
+        )
     mode_str = "optimistic (no verify)" if optimistic else "always-advance"
     logger.info(
-        f"[MTP] installed with num_draft_tokens={num_draft_tokens}, " f"{mode_str} mode"
+        f"[MTP] installed with num_draft_tokens={num_draft_tokens}, "
+        f"effective_draft_tokens=1, {mode_str} mode"
     )
 
 
@@ -2668,6 +2675,24 @@ class Scheduler:
             return self.prefix_cache.get_stats()
         return None
 
+    def clear_runtime_caches(self) -> Dict[str, bool]:
+        """Clear prefix-cache state without resetting scheduler/request state."""
+        cleared = {
+            "paged_cache": False,
+            "memory_aware_cache": False,
+            "prefix_cache": False,
+        }
+        if self.block_aware_cache is not None:
+            self.block_aware_cache.clear()
+            cleared["paged_cache"] = True
+        if self.memory_aware_cache is not None:
+            self.memory_aware_cache.clear()
+            cleared["memory_aware_cache"] = True
+        if self.prefix_cache is not None:
+            self.prefix_cache.clear()
+            cleared["prefix_cache"] = True
+        return cleared
+
     def reset(self) -> None:
         """Reset the scheduler state."""
         # Drain any pending deferred aborts
@@ -2688,12 +2713,7 @@ class Scheduler:
         self._current_sampler_params = None
 
         # Clear caches
-        if self.block_aware_cache is not None:
-            self.block_aware_cache.clear()
-        if self.memory_aware_cache is not None:
-            self.memory_aware_cache.clear()
-        if self.prefix_cache is not None:
-            self.prefix_cache.clear()
+        self.clear_runtime_caches()
 
         # Close SSD tier on reset
         self.close_ssd_tier()

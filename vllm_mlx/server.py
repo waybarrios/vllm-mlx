@@ -2420,6 +2420,13 @@ async def status():
 @app.get("/v1/cache/stats", dependencies=[Depends(verify_api_key)])
 async def cache_stats():
     """Get cache statistics for debugging and monitoring."""
+    engine_cache = None
+    if _engine is not None and hasattr(_engine, "get_cache_stats"):
+        try:
+            engine_cache = _engine.get_cache_stats()
+        except Exception as exc:
+            engine_cache = {"error": f"engine cache stats failed: {exc}"}
+
     try:
         from mlx_vlm.utils import (
             get_multimodal_kv_cache_stats,
@@ -2428,17 +2435,29 @@ async def cache_stats():
         )
 
         return {
+            "engine_cache": engine_cache,
             "multimodal_kv_cache": get_multimodal_kv_cache_stats(),
             "pixel_values_cache": get_pixel_values_cache_stats(),
             "pil_image_cache": get_pil_cache_stats(),
         }
     except ImportError:
-        return {"error": "Cache stats not available (mlx_vlm not loaded)"}
+        return {
+            "engine_cache": engine_cache,
+            "error": "Cache stats not available (mlx_vlm not loaded)",
+        }
 
 
 @app.delete("/v1/cache", dependencies=[Depends(verify_api_key)])
 async def clear_cache():
     """Clear all caches."""
+    cleared_engine = None
+    if _engine is not None and hasattr(_engine, "clear_runtime_caches"):
+        try:
+            cleared_engine = _engine.clear_runtime_caches()
+        except Exception as exc:
+            logger.warning("Failed to clear engine caches: %s", exc, exc_info=True)
+            cleared_engine = {"error": str(exc)}
+
     try:
         from mlx_vlm.utils import (
             clear_multimodal_kv_cache,
@@ -2449,10 +2468,15 @@ async def clear_cache():
         clear_pixel_values_cache()
         return {
             "status": "cleared",
+            "engine_cache": cleared_engine,
             "caches": ["multimodal_kv", "pixel_values", "pil_image"],
         }
     except ImportError:
-        return {"error": "Cache clear not available (mlx_vlm not loaded)"}
+        return {
+            "status": "cleared",
+            "engine_cache": cleared_engine,
+            "error": "Cache clear not available (mlx_vlm not loaded)",
+        }
 
 
 @app.delete("/v1/cache/prefix", dependencies=[Depends(verify_api_key)])
