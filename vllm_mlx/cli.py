@@ -15,6 +15,8 @@ Usage:
 import argparse
 import sys
 
+from .cli_arg_types import make_json_object_arg_parser
+
 
 def serve_command(args):
     """Start the OpenAI-compatible server."""
@@ -78,6 +80,7 @@ def serve_command(args):
         server._default_temperature = args.default_temperature
     if args.default_top_p is not None:
         server._default_top_p = args.default_top_p
+    server._default_chat_template_kwargs = args.default_chat_template_kwargs
     max_audio_upload_mb = getattr(args, "max_audio_upload_mb", 25)
     max_tts_input_chars = getattr(args, "max_tts_input_chars", 4096)
     server._max_audio_upload_bytes = max_audio_upload_mb * 1024 * 1024
@@ -1135,6 +1138,16 @@ Examples:
         type=float,
         default=None,
         help="Override default top_p for all requests (default: use model default)",
+    )
+    serve_parser.add_argument(
+        "--default-chat-template-kwargs",
+        type=make_json_object_arg_parser("--default-chat-template-kwargs"),
+        default=None,
+        help=(
+            "Default chat template kwargs to apply to all requests when request "
+            "chat_template_kwargs is omitted or empty; empty request kwargs use "
+            'existing server defaults (JSON object, e.g. {"enable_thinking": true})'
+        ),
     )
     # Embedding model option
     serve_parser.add_argument(

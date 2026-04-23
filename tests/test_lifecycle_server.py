@@ -618,14 +618,16 @@ class TestLifecycleFailureHandling:
         class FakeEngine:
             preserve_native_tool_format = False
 
-        async def fake_acquire():
+        async def fake_acquire(
+            raw_request, *, total_timeout=None, deadline=None, count_activity=True
+        ):
             calls["acquires"] += 1
             return FakeEngine()
 
-        async def fake_release():
+        async def fake_release(*, count_activity=True):
             calls["releases"] += 1
 
-        monkeypatch.setattr(srv, "_acquire_default_engine", fake_acquire)
+        monkeypatch.setattr(srv, "_acquire_default_engine_for_request", fake_acquire)
         monkeypatch.setattr(srv, "_release_default_engine", fake_release)
 
         with pytest.raises(ValidationError):
@@ -645,11 +647,13 @@ class TestLifecycleFailureHandling:
             is_mllm = False
             preserve_native_tool_format = False
 
-        async def fake_acquire():
+        async def fake_acquire(
+            raw_request, *, total_timeout=None, deadline=None, count_activity=True
+        ):
             calls["acquires"] += 1
             return FakeEngine()
 
-        async def fake_release():
+        async def fake_release(*, count_activity=True):
             calls["releases"] += 1
 
         def fake_extract(messages, preserve_native_format):
@@ -658,7 +662,7 @@ class TestLifecycleFailureHandling:
         def fake_convert_tools(_tools):
             raise RuntimeError("boom")
 
-        monkeypatch.setattr(srv, "_acquire_default_engine", fake_acquire)
+        monkeypatch.setattr(srv, "_acquire_default_engine_for_request", fake_acquire)
         monkeypatch.setattr(srv, "_release_default_engine", fake_release)
         monkeypatch.setattr(srv, "extract_multimodal_content", fake_extract)
         monkeypatch.setattr(srv, "convert_tools_for_template", fake_convert_tools)
@@ -682,6 +686,8 @@ class TestLifecycleFailureHandling:
             video_max_frames=None,
             specprefill=None,
             specprefill_keep_pct=None,
+            chat_template_kwargs=None,
+            stop=None,
             timeout=None,
         )
 
@@ -2525,6 +2531,7 @@ class TestLifecycleFailureHandling:
             video_max_frames=None,
             specprefill=None,
             specprefill_keep_pct=None,
+            chat_template_kwargs=None,
             timeout=0.01,
         )
 

@@ -30,6 +30,17 @@ Memory-efficient caching for production:
 vllm-mlx serve mlx-community/Llama-3.2-3B-Instruct-4bit --port 8000 --continuous-batching --use-paged-cache
 ```
 
+### With Server-Wide Chat Template Defaults
+
+Set server defaults for chat template kwargs. Request-level `chat_template_kwargs`
+values still win per key.
+
+```bash
+vllm-mlx serve mlx-community/Qwen3-8B-4bit \
+  --reasoning-parser qwen3 \
+  --default-chat-template-kwargs '{"enable_thinking": false}'
+```
+
 ## Server Options
 
 | Option | Description | Default |
@@ -48,6 +59,7 @@ vllm-mlx serve mlx-community/Llama-3.2-3B-Instruct-4bit --port 8000 --continuous
 | `--max-request-tokens` | Maximum `max_tokens` accepted from API clients | 32768 |
 | `--default-temperature` | Default temperature when not specified | None |
 | `--default-top-p` | Default top_p when not specified | None |
+| `--default-chat-template-kwargs` | Default chat template kwargs used when request `chat_template_kwargs` is omitted (JSON object) | None |
 | `--stream-interval` | Tokens per stream chunk | 1 |
 | `--mcp-config` | Path to MCP config file | None |
 | `--reasoning-parser` | Parser for reasoning models (`qwen3`, `deepseek_r1`) | None |

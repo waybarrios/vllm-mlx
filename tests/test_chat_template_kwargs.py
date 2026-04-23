@@ -116,6 +116,105 @@ def test_chat_completion_endpoint_forwards_chat_template_kwargs():
     assert response.json()["choices"][0]["message"]["content"] == "ORBIT"
 
 
+def test_chat_completion_endpoint_applies_server_default_chat_template_kwargs():
+    captured = {}
+
+    class FakeEngine:
+        model_name = "test-model"
+        is_mllm = False
+        preserve_native_tool_format = False
+
+        async def chat(self, messages, **kwargs):
+            captured["messages"] = messages
+            captured["kwargs"] = kwargs
+            return GenerationOutput(
+                text="ORBIT",
+                prompt_tokens=4,
+                completion_tokens=1,
+                finish_reason="stop",
+            )
+
+    client = TestClient(srv.app)
+    original_engine = srv._engine
+    original_model_name = srv._model_name
+    original_defaults = getattr(srv, "_default_chat_template_kwargs", None)
+    srv._engine = FakeEngine()
+    srv._model_name = "test-model"
+    srv._default_chat_template_kwargs = {"enable_thinking": False}
+    try:
+        response = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "Reply with ORBIT."}],
+                "max_tokens": 8,
+            },
+        )
+    finally:
+        srv._engine = original_engine
+        srv._model_name = original_model_name
+        srv._default_chat_template_kwargs = original_defaults
+
+    assert response.status_code == 200
+    assert captured["kwargs"]["chat_template_kwargs"] == {"enable_thinking": False}
+    assert response.json()["choices"][0]["message"]["content"] == "ORBIT"
+
+
+def test_chat_completion_endpoint_request_kwargs_override_server_defaults():
+    captured = {}
+
+    class FakeEngine:
+        model_name = "test-model"
+        is_mllm = False
+        preserve_native_tool_format = False
+
+        async def chat(self, messages, **kwargs):
+            captured["messages"] = messages
+            captured["kwargs"] = kwargs
+            return GenerationOutput(
+                text="ORBIT",
+                prompt_tokens=4,
+                completion_tokens=1,
+                finish_reason="stop",
+            )
+
+    client = TestClient(srv.app)
+    original_engine = srv._engine
+    original_model_name = srv._model_name
+    original_defaults = getattr(srv, "_default_chat_template_kwargs", None)
+    srv._engine = FakeEngine()
+    srv._model_name = "test-model"
+    srv._default_chat_template_kwargs = {
+        "enable_thinking": False,
+        "server_default_only": "yes",
+    }
+    try:
+        response = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "Reply with ORBIT."}],
+                "max_tokens": 8,
+                "chat_template_kwargs": {
+                    "enable_thinking": True,
+                    "request_only": 1,
+                },
+            },
+        )
+    finally:
+        srv._engine = original_engine
+        srv._model_name = original_model_name
+        srv._default_chat_template_kwargs = original_defaults
+
+    assert response.status_code == 200
+    assert captured["kwargs"]["chat_template_kwargs"] == {
+        "enable_thinking": True,
+        "server_default_only": "yes",
+        "request_only": 1,
+    }
+    assert response.json()["choices"][0]["message"]["content"] == "ORBIT"
+
+
 def test_llm_chat_applies_chat_template_kwargs_before_generate():
     from vllm_mlx.models.llm import MLXLanguageModel
 

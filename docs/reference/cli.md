@@ -43,6 +43,7 @@ vllm-mlx serve <model> [options]
 | `--max-num-seqs` | Max concurrent sequences | 256 |
 | `--default-temperature` | Default temperature when not specified in request | None |
 | `--default-top-p` | Default top_p when not specified in request | None |
+| `--default-chat-template-kwargs` | Default chat template kwargs applied when request `chat_template_kwargs` is omitted (JSON object) | None |
 | `--max-audio-upload-mb` | Maximum uploaded audio size for `/v1/audio/transcriptions` | 25 |
 | `--max-tts-input-chars` | Maximum text length accepted by `/v1/audio/speech` | 4096 |
 | `--reasoning-parser` | Parser for reasoning models (`qwen3`, `deepseek_r1`) | None |
@@ -86,6 +87,11 @@ vllm-mlx serve mlx-community/Qwen3-VL-4B-Instruct-3bit
 
 # Reasoning model (separates thinking from answer)
 vllm-mlx serve mlx-community/Qwen3-8B-4bit --reasoning-parser qwen3
+
+# Disable server-wide thinking by default (request-level chat_template_kwargs still override)
+vllm-mlx serve mlx-community/Qwen3-8B-4bit \
+  --reasoning-parser qwen3 \
+  --default-chat-template-kwargs '{"enable_thinking": false}'
 
 # DeepSeek reasoning model
 vllm-mlx serve mlx-community/DeepSeek-R1-Distill-Qwen-7B-4bit --reasoning-parser deepseek_r1
