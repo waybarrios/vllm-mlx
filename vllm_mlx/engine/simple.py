@@ -56,6 +56,53 @@ def _only_mtp_safe_thinking_processors(processors: list[Any] | None) -> bool:
     )
 
 
+def _seed_logits_processors(
+    seed_tokens: mx.array | None,
+    processors: list[Any] | None,
+) -> list[Any] | None:
+    """Wrap logits processors so continuation decode sees the full prompt."""
+    if not processors:
+        return None
+    if seed_tokens is None or seed_tokens.size == 0:
+        return list(processors)
+
+    def _wrap(processor):
+        def _seeded(tokens, logits):
+            merged = seed_tokens
+            if tokens is not None:
+                if not isinstance(tokens, mx.array):
+                    tokens_arr = mx.array(tokens, dtype=mx.uint32)
+                else:
+                    tokens_arr = tokens
+                if tokens_arr.size > 0:
+                    merged = mx.concatenate([seed_tokens, tokens_arr])
+            return processor(merged, logits)
+
+        return _seeded
+
+    return [_wrap(processor) for processor in processors]
+
+
+def _sample_with_processors(
+    tokens: mx.array | None,
+    logits: mx.array,
+    sampler: Any,
+    logits_processors: list[Any] | None,
+) -> tuple[mx.array, mx.array]:
+    """Sample a token while honoring any active logits processors."""
+    if logits_processors:
+        is_1d = logits.ndim == 1
+        if is_1d:
+            logits = logits[None]
+        for processor in logits_processors:
+            logits = processor(tokens, logits)
+        if is_1d:
+            logits = logits.squeeze(0)
+    logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+    tok = sampler(logprobs)
+    return tok, logprobs
+
+
 class _SpecPrefillCancelled(Exception):
     """Cooperative cancellation sentinel for blocking SpecPrefill workers."""
 
@@ -274,6 +321,7 @@ class SimpleEngine(BaseEngine):
         corrupt the command-buffer state.
         """
         async with self._generation_lock:
+
             def run_bound():
                 _bind_worker_generation_streams()
                 return func(*args, **kwargs)
@@ -656,7 +704,9 @@ class SimpleEngine(BaseEngine):
             and self._text_model is not None
             and not has_media_content(messages)
         ):
-            has_mtp = hasattr(self._text_model, "mtp") and self._text_model.mtp is not None
+            has_mtp = (
+                hasattr(self._text_model, "mtp") and self._text_model.mtp is not None
+            )
             logger.info("Text-only request → LLM path (MTP=%s)", has_mtp and self._mtp)
             if chat_template_kwargs:
                 kwargs["chat_template_kwargs"] = chat_template_kwargs
@@ -1256,7 +1306,7 @@ class SimpleEngine(BaseEngine):
             # --- SpecPrefill path (with fallback to normal on failure) ---
             if use_specprefill:
                 try:
-                    return _run_specprefill(model, backbone_cache)
+                    return _run_specprefill(model, backbone_cache, use_mtp)
                 except Exception as e:
                     logger.error(
                         "SpecPrefill failed, falling back to normal MTP path: %s",
@@ -1299,14 +1349,12 @@ class SimpleEngine(BaseEngine):
                 results.append(resp)
             return results
 
-        def _run_specprefill(model, bc):
-            """Score tokens, sparse prefill, generate without MTP."""
+        def _run_specprefill(model, bc, use_mtp):
+            """Score tokens, sparse prefill, then continue on the standard decode path."""
             from types import SimpleNamespace
 
-            import mlx.core as mx
             from mlx_lm import stream_generate as mlx_stream_generate
             from mlx_lm.models.cache import make_prompt_cache
-            from mlx_lm.sample_utils import make_sampler
 
             from ..specprefill import (
                 cleanup_rope,
@@ -1314,8 +1362,6 @@ class SimpleEngine(BaseEngine):
                 select_chunks,
                 sparse_prefill,
             )
-
-            sampler = make_sampler(temp=temperature, top_p=top_p)
 
             # Create backbone cache if not already from system KV
             if bc is None:
@@ -1365,26 +1411,58 @@ class SimpleEngine(BaseEngine):
                     effective_keep,
                 )
 
-                # Phase 4: Generate via mlx_lm pipelined path (no MTP)
+                # Phase 4: Sample the first token from the prefilled logits, then
+                # continue through mlx_lm's normal decode path so MTP and request-
+                # local logits processors remain active after sparse prefill.
                 eos_id = self._text_tokenizer.eos_token_id
-                first_token_id = sampler(logits[:, -1, :]).item()
-                first_text = self._text_tokenizer.decode([first_token_id])
+                seed_tokens = (
+                    mx.array(full_tokens_list, dtype=mx.uint32)
+                    if full_tokens_list is not None
+                    else None
+                )
+                seeded_processors = _seed_logits_processors(seed_tokens, all_processors)
+                y, _ = _sample_with_processors(
+                    None,
+                    logits[:, -1, :].squeeze(0),
+                    sampler,
+                    seeded_processors,
+                )
+                mx.eval(y)
 
+                generated_ids = []
+                prev_decoded = ""
+
+                tok_id = y.item()
+                generated_ids.append(tok_id)
+
+                decoded = self._text_tokenizer.decode(generated_ids)
+                new_text = decoded[len(prev_decoded) :]
+                prev_decoded = decoded
+
+                is_eos = tok_id == eos_id
                 results = [
                     SimpleNamespace(
-                        text=first_text,
-                        finish_reason="stop" if first_token_id == eos_id else None,
+                        text=new_text,
+                        finish_reason="stop" if is_eos else None,
                     )
                 ]
 
-                if first_token_id != eos_id:
+                if not is_eos and max_tokens > 1:
+                    prompt_cache = bc
+                    if use_mtp and hasattr(model, "make_mtp_cache"):
+                        prompt_cache = bc + model.make_mtp_cache()
+
+                    continuation_prompt = mx.array([tok_id], dtype=mx.uint32)
                     for resp in mlx_stream_generate(
                         model,
                         self._text_tokenizer,
-                        prompt=mx.array([first_token_id]),
+                        prompt=continuation_prompt,
                         max_tokens=max_tokens - 1,
                         sampler=sampler,
-                        prompt_cache=bc,
+                        prefill_step_size=self._prefill_step_size,
+                        logits_processors=seeded_processors,
+                        prompt_cache=prompt_cache,
+                        mtp=use_mtp,
                     ):
                         results.append(resp)
 

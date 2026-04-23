@@ -464,6 +464,122 @@ class TestSimpleEngineConcurrency:
         assert output.text == ""
         assert output.finish_reason == "stop"
 
+    def test_seed_logits_processors_prepends_prompt_tokens(self):
+        """Continuation decode processors must see the original prompt prefix."""
+        from vllm_mlx.engine.simple import _seed_logits_processors
+
+        seen = {}
+
+        def processor(tokens, logits):
+            seen["tokens"] = tokens.tolist()
+            return logits
+
+        seeded = _seed_logits_processors(
+            mx.array([10, 11], dtype=mx.uint32), [processor]
+        )
+
+        logits = mx.zeros((1, 8), dtype=mx.float32)
+        seeded[0](mx.array([12, 13], dtype=mx.uint32), logits)
+
+        assert seen["tokens"] == [10, 11, 12, 13]
+
+    @pytest.mark.anyio
+    async def test_specprefill_success_preserves_mtp_path(self):
+        """Successful sparse prefill should continue through the normal MTP path."""
+        from types import SimpleNamespace
+
+        from vllm_mlx.engine.simple import SimpleEngine
+
+        captured = {}
+
+        def fake_make_sampler(**kwargs):
+            captured["sampler_kwargs"] = kwargs
+
+            def _sample(_logprobs):
+                return mx.array([17], dtype=mx.uint32)
+
+            return _sample
+
+        def fake_stream_generate(model, tokenizer, prompt, **kwargs):
+            captured["prompt"] = prompt.tolist()
+            captured["kwargs"] = kwargs
+            yield SimpleNamespace(text="B", finish_reason="stop")
+
+        tokenizer = MagicMock()
+        tokenizer.apply_chat_template.return_value = "<|im_start|>user\nhello"
+        tokenizer.bos_token = None
+        tokenizer.eos_token_id = 99
+        tokenizer.encode.return_value = [5, 6, 7]
+        tokenizer.decode.side_effect = lambda ids: "".join(
+            {17: "A", 99: ""}.get(tok, f"<{tok}>") for tok in ids
+        )
+
+        text_model = MagicMock()
+        text_model.mtp = object()
+        text_model.make_mtp_cache.return_value = ["mtp-cache"]
+
+        engine = SimpleEngine(
+            "test-model",
+            force_mllm=True,
+            mtp=True,
+            mtp_num_draft_tokens=4,
+            specprefill_enabled=True,
+            specprefill_threshold=1,
+        )
+        engine._loaded = True
+        engine._text_model = text_model
+        engine._text_tokenizer = tokenizer
+        engine._draft_model = object()
+
+        with (
+            patch("vllm_mlx.engine.simple._bind_worker_generation_streams"),
+            patch(
+                "mlx_lm.models.cache.make_prompt_cache",
+                return_value=["backbone-cache"],
+            ),
+            patch("mlx_lm.sample_utils.make_sampler", side_effect=fake_make_sampler),
+            patch(
+                "mlx_lm.sample_utils.make_logits_processors",
+                return_value=[],
+            ),
+            patch("mlx_lm.stream_generate", side_effect=fake_stream_generate),
+            patch(
+                "vllm_mlx.specprefill.score_tokens",
+                return_value=mx.array([1.0, 0.9, 0.8], dtype=mx.float32),
+            ),
+            patch(
+                "vllm_mlx.specprefill.select_chunks",
+                return_value=mx.array([0, 1, 2], dtype=mx.int32),
+            ),
+            patch(
+                "vllm_mlx.specprefill.sparse_prefill",
+                return_value=mx.zeros((1, 3, 32), dtype=mx.float32),
+            ),
+            patch("vllm_mlx.specprefill.cleanup_rope"),
+        ):
+            outputs = [
+                chunk
+                async for chunk in engine._stream_generate_text(
+                    messages=[{"role": "user", "content": "hello"}],
+                    max_tokens=4,
+                    temperature=0.6,
+                    top_p=0.95,
+                )
+            ]
+
+        assert [chunk.new_text for chunk in outputs] == ["A", "B"]
+        assert captured["sampler_kwargs"] == {
+            "temp": 0.6,
+            "top_p": 0.95,
+            "top_k": 0,
+            "min_p": 0.0,
+        }
+        assert captured["prompt"] == [17]
+        assert captured["kwargs"]["mtp"] is True
+        assert captured["kwargs"]["prompt_cache"] == ["backbone-cache", "mtp-cache"]
+        assert captured["kwargs"]["max_tokens"] == 3
+        assert captured["kwargs"]["logits_processors"] is None
+
     @pytest.mark.anyio
     async def test_stream_generate_text_forwards_logits_processors_and_sampler_args(
         self,
@@ -526,12 +642,8 @@ class TestSimpleEngineConcurrency:
             ]
 
         assert outputs[-1].text == "Hello"
-        assert sampler_calls == [
-            {"temp": 0.3, "top_p": 0.8, "top_k": 40, "min_p": 0.1}
-        ]
-        assert penalty_calls == [
-            {"repetition_penalty": 1.2, "presence_penalty": 1.5}
-        ]
+        assert sampler_calls == [{"temp": 0.3, "top_p": 0.8, "top_k": 40, "min_p": 0.1}]
+        assert penalty_calls == [{"repetition_penalty": 1.2, "presence_penalty": 1.5}]
         assert captured_kwargs["logits_processors"] == [
             user_processor,
             penalty_processor,
