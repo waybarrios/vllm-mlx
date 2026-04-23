@@ -13,33 +13,15 @@ from collections.abc import AsyncIterator
 from typing import Any
 
 from ..api.tool_calling import convert_tools_for_template
-from ..api.utils import clean_output_text, is_mllm_model
-from .base import BaseEngine, GenerationOutput
-
-logger = logging.getLogger(__name__)
-
-
-_MEDIA_TYPES = frozenset(
-    {
-        "image_url",
-        "video_url",
-        "audio_url",
-        "image",
-        "video",
-        "audio",
-    }
+from ..api.utils import clean_output_text, has_media_content, is_mllm_model
+from .base import (
+    BaseEngine,
+    GenerationOutput,
+    cleanup_startup_cancellation,
+    run_blocking_startup_work,
 )
 
-
-def _has_media_content(messages: list) -> bool:
-    """Check if any message contains media content (images, video, audio)."""
-    for msg in messages:
-        content = msg.get("content")
-        if isinstance(content, list):
-            for part in content:
-                if isinstance(part, dict) and part.get("type") in _MEDIA_TYPES:
-                    return True
-    return False
+logger = logging.getLogger(__name__)
 
 
 class _SpecPrefillCancelled(Exception):
@@ -133,9 +115,9 @@ class SimpleEngine(BaseEngine):
             return getattr(self._model, "processor", None)
         return self._model.tokenizer
 
-    async def start(self) -> None:
-        """Start the engine (load model if not loaded)."""
-        if self._loaded:
+    def prepare_for_start(self) -> None:
+        """Load the backing model off the serving event loop."""
+        if self._model is not None:
             return
 
         if self._is_mllm:
@@ -156,69 +138,84 @@ class SimpleEngine(BaseEngine):
             )
 
         self._model.load()
-        self._loaded = True
 
-        # Build parallel mlx_lm TextModel for text-only MTP routing
-        if self._is_mllm and self._mtp:
-            try:
-                from ..text_model_from_vlm import build_text_model
+    async def start(self) -> None:
+        """Start the engine (load model if not loaded)."""
+        if self._loaded:
+            return
+        try:
+            if self._model is None:
+                await run_blocking_startup_work(self.prepare_for_start)
+            self._loaded = True
 
-                self._text_model = build_text_model(self._model.model, self._model_name)
+            # Build parallel mlx_lm TextModel for text-only MTP routing
+            if self._is_mllm and self._mtp:
+                try:
+                    from ..text_model_from_vlm import build_text_model
 
-                if (
-                    self._text_model is not None
-                    and hasattr(self._text_model, "mtp")
-                    and self._text_model.mtp is not None
-                ):
-                    self._text_tokenizer = self._model.get_tokenizer()
+                    self._text_model = build_text_model(
+                        self._model.model, self._model_name
+                    )
 
-                    # Apply Qwen3.5 eos_token fix (matches MLXLanguageModel.load)
-                    if "qwen3" in self._model_name.lower():
-                        self._text_tokenizer.eos_token = "<|im_end|>"
-                        self._text_tokenizer.eos_token_id = (
-                            self._text_tokenizer.convert_tokens_to_ids("<|im_end|>")
+                    if (
+                        self._text_model is not None
+                        and hasattr(self._text_model, "mtp")
+                        and self._text_model.mtp is not None
+                    ):
+                        self._text_tokenizer = self._model.get_tokenizer()
+
+                        # Apply Qwen3.5 eos_token fix (matches MLXLanguageModel.load)
+                        if "qwen3" in self._model_name.lower():
+                            self._text_tokenizer.eos_token = "<|im_end|>"
+                            self._text_tokenizer.eos_token_id = (
+                                self._text_tokenizer.convert_tokens_to_ids("<|im_end|>")
+                            )
+
+                        logger.info(
+                            "MLLM+MTP routing: text-only -> mlx_lm TextModel "
+                            "(MTP=True), media -> mlx_vlm"
                         )
+                    else:
+                        logger.warning(
+                            "TextModel built but no MTP - text-only requests won't use MTP"
+                        )
+                        self._text_model = None
 
-                    logger.info(
-                        "MLLM+MTP routing: text-only → mlx_lm TextModel (MTP=True), "
-                        "media → mlx_vlm"
-                    )
-                else:
-                    logger.warning(
-                        "TextModel built but no MTP — text-only requests won't use MTP"
-                    )
+                except Exception as e:
+                    logger.error("MLLM+MTP routing setup failed: %s", e)
                     self._text_model = None
+                    self._text_tokenizer = None
 
-            except Exception as e:
-                logger.error("MLLM+MTP routing setup failed: %s", e)
-                self._text_model = None
-                self._text_tokenizer = None
+            # Load SpecPrefill draft model (small model for importance scoring)
+            if self._specprefill_enabled and self._specprefill_draft_model_path:
+                try:
+                    from mlx_lm import load as mlx_lm_load
 
-        # Load SpecPrefill draft model (small model for importance scoring)
-        if self._specprefill_enabled and self._specprefill_draft_model_path:
-            try:
-                from mlx_lm import load as mlx_lm_load
+                    self._draft_model, _ = mlx_lm_load(
+                        self._specprefill_draft_model_path
+                    )
+                    logger.info(
+                        "SpecPrefill: draft model loaded (%s), threshold=%d, keep=%.0f%%",
+                        self._specprefill_draft_model_path,
+                        self._specprefill_threshold,
+                        self._specprefill_keep_pct * 100,
+                    )
+                except Exception as e:
+                    logger.error("SpecPrefill: draft model load failed: %s", e)
+                    self._draft_model = None
 
-                self._draft_model, _ = mlx_lm_load(self._specprefill_draft_model_path)
-                logger.info(
-                    "SpecPrefill: draft model loaded (%s), threshold=%d, keep=%.0f%%",
-                    self._specprefill_draft_model_path,
-                    self._specprefill_threshold,
-                    self._specprefill_keep_pct * 100,
-                )
-            except Exception as e:
-                logger.error("SpecPrefill: draft model load failed: %s", e)
-                self._draft_model = None
-
-        mtp_info = f", MTP={self._mtp}" if self._mtp else ""
-        routing = ", routing=per-request" if self._text_model is not None else ""
-        specprefill_info = (
-            ", SpecPrefill=active" if self._draft_model is not None else ""
-        )
-        logger.info(
-            f"SimpleEngine loaded: {self._model_name} "
-            f"(MLLM={self._is_mllm}{mtp_info}{routing}{specprefill_info})"
-        )
+            mtp_info = f", MTP={self._mtp}" if self._mtp else ""
+            routing = ", routing=per-request" if self._text_model is not None else ""
+            specprefill_info = (
+                ", SpecPrefill=active" if self._draft_model is not None else ""
+            )
+            logger.info(
+                f"SimpleEngine loaded: {self._model_name} "
+                f"(MLLM={self._is_mllm}{mtp_info}{routing}{specprefill_info})"
+            )
+        except asyncio.CancelledError:
+            await cleanup_startup_cancellation(self.stop)
+            raise
 
     async def stop(self) -> None:
         """Stop the engine and cleanup resources."""
@@ -602,7 +599,7 @@ class SimpleEngine(BaseEngine):
         if (
             self._is_mllm
             and self._text_model is not None
-            and not _has_media_content(messages)
+            and not has_media_content(messages)
         ):
             logger.info("Text-only request → LLM path (MTP=True)")
             if chat_template_kwargs:

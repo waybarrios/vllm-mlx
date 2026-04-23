@@ -11,6 +11,7 @@ MLLMBatchGenerator. MLLM models only initialise the MLLM scheduler (not the
 LLM engine), so text-only requests must also be routed through it.
 """
 
+import asyncio
 import logging
 import time
 from collections.abc import AsyncIterator
@@ -18,7 +19,12 @@ from typing import Any
 
 from ..api.tool_calling import convert_tools_for_template
 from ..api.utils import clean_output_text, extract_multimodal_content, is_mllm_model
-from .base import BaseEngine, GenerationOutput
+from .base import (
+    BaseEngine,
+    GenerationOutput,
+    cleanup_startup_cancellation,
+    run_blocking_startup_work,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -185,31 +191,47 @@ class BatchedEngine(BaseEngine):
             return getattr(self._processor, "tokenizer", self._processor)
         return self._tokenizer
 
+    def prepare_for_start(self) -> None:
+        """Load heavyweight model state off the serving event loop."""
+        if self._model is not None:
+            return
+
+        if self._is_mllm:
+            self._prepare_mllm_model()
+        else:
+            self._prepare_llm_model()
+
     async def start(self) -> None:
         """Start the engine (load model if not loaded)."""
         if self._loaded:
             return
 
-        if self._is_mllm:
-            await self._start_mllm()
-        else:
-            await self._start_llm()
+        try:
+            if self._model is None:
+                await run_blocking_startup_work(self.prepare_for_start)
 
-        self._loaded = True
-        logger.info(f"BatchedEngine loaded: {self._model_name} (mllm={self._is_mllm})")
+            if self._is_mllm:
+                await self._start_mllm()
+            else:
+                await self._start_llm()
 
-    async def _start_mllm(self) -> None:
-        """Start the MLLM engine with MLLMScheduler (continuous batching)."""
-        from ..mllm_scheduler import MLLMScheduler, MLLMSchedulerConfig
+            self._loaded = True
+            logger.info(
+                f"BatchedEngine loaded: {self._model_name} (mllm={self._is_mllm})"
+            )
+        except asyncio.CancelledError:
+            await cleanup_startup_cancellation(self.stop)
+            raise
+
+    def _prepare_mllm_model(self) -> None:
+        """Load the MLLM model before scheduler startup."""
         from ..models.mllm import MLXMultimodalLM
 
-        # Load the MLLM model
         self._mllm_instance = MLXMultimodalLM(
             self._model_name,
             trust_remote_code=self._trust_remote_code,
         )
         self._mllm_instance.load()
-
         self._model = self._mllm_instance.model
         self._processor = self._mllm_instance.processor
 
@@ -240,6 +262,13 @@ class BatchedEngine(BaseEngine):
         # Inject MTP support if enabled
         if self._scheduler_config and self._scheduler_config.enable_mtp:
             self._inject_mtp_mllm()
+
+    async def _start_mllm(self) -> None:
+        """Start the MLLM engine with MLLMScheduler (continuous batching)."""
+        from ..mllm_scheduler import MLLMScheduler, MLLMSchedulerConfig
+
+        if self._model is None or self._processor is None:
+            self._prepare_mllm_model()
 
         # Create MLLM scheduler config with batch generator support
         if self._scheduler_config and hasattr(self._scheduler_config, "max_num_seqs"):
@@ -350,11 +379,12 @@ class BatchedEngine(BaseEngine):
         else:
             logger.info(f"[MTP-MLLM] MTP not supported for model_type={model_type}")
 
-    async def _start_llm(self) -> None:
-        """Start the LLM engine with AsyncEngineCore."""
-        from ..engine_core import AsyncEngineCore, EngineConfig
-        from ..scheduler import SchedulerConfig
+    def _prepare_llm_model(self) -> None:
+        """Load the LLM model/tokenizer before engine loop startup."""
         from ..utils.tokenizer import load_model_with_fallback
+
+        if self._model is not None and self._tokenizer is not None:
+            return
 
         # Build tokenizer config
         tokenizer_config = {"trust_remote_code": self._trust_remote_code}
@@ -381,8 +411,10 @@ class BatchedEngine(BaseEngine):
                     "See warnings above for details."
                 )
 
-        # Set Metal memory limits to make allocation failures graceful
-        # instead of fatal Metal command buffer errors (SIGABRT)
+        self._configure_metal_memory_limits()
+
+    def _configure_metal_memory_limits(self) -> None:
+        """Make MLX allocation failures graceful during startup."""
         try:
             import mlx.core as mx
 
@@ -405,6 +437,26 @@ class BatchedEngine(BaseEngine):
                     )
         except Exception as e:
             logger.warning(f"Failed to set Metal memory limits: {e}")
+
+    async def _start_llm(self) -> None:
+        """Start the LLM engine with AsyncEngineCore."""
+        from ..engine_core import AsyncEngineCore, EngineConfig
+        from ..scheduler import SchedulerConfig
+
+        if self._model is None or self._tokenizer is None:
+            self._prepare_llm_model()
+
+        # Validate MTP support if enabled
+        if self._scheduler_config and self._scheduler_config.enable_mtp:
+            from ..patches.qwen3_next_mtp import validate_mtp_support
+
+            if validate_mtp_support(self._model):
+                logger.info("[MTP] Model validated for MTP speculative decoding")
+            else:
+                logger.warning(
+                    "[MTP] MTP validation failed — --enable-mtp will be ignored. "
+                    "See warnings above for details."
+                )
 
         # Create engine config
         scheduler_config = self._scheduler_config or SchedulerConfig()

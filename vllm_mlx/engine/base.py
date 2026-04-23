@@ -3,10 +3,15 @@
 Base engine interface for vllm-mlx inference.
 """
 
+import asyncio
+import logging
 from abc import ABC, abstractmethod
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -25,6 +30,61 @@ class GenerationOutput:
     # For streaming
     new_text: str = ""
     finished: bool = True
+
+
+@contextmanager
+def suspend_cancellation():
+    """Temporarily clear task cancellation so cleanup can finish deterministically."""
+    task = asyncio.current_task()
+    if task is None:
+        yield
+        return
+
+    cancelling = getattr(task, "cancelling", None)
+    uncancel = getattr(task, "uncancel", None)
+    if cancelling is None or uncancel is None:
+        yield
+        return
+
+    pending_cancels = cancelling()
+    for _ in range(pending_cancels):
+        uncancel()
+    try:
+        yield
+    finally:
+        for _ in range(pending_cancels):
+            task.cancel()
+
+
+async def run_blocking_startup_work(work: Callable[[], Any]) -> None:
+    """Run blocking startup work off-loop without leaking cancellation races."""
+    task = asyncio.create_task(asyncio.to_thread(work))
+    try:
+        await asyncio.shield(task)
+    except asyncio.CancelledError:
+        with suspend_cancellation():
+            while not task.done():
+                try:
+                    await asyncio.shield(task)
+                except asyncio.CancelledError:
+                    continue
+                except Exception:
+                    break
+        raise
+
+
+async def cleanup_startup_cancellation(cleanup: Callable[[], Awaitable[None]]) -> None:
+    """Run startup cleanup without letting cleanup failures replace cancellation."""
+    with suspend_cancellation():
+        try:
+            await cleanup()
+        except BaseException as exc:
+            if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+                raise
+            logger.error(
+                "Engine startup cleanup failed while preserving cancellation",
+                exc_info=(type(exc), exc, exc.__traceback__),
+            )
 
 
 class BaseEngine(ABC):
@@ -66,6 +126,15 @@ class BaseEngine(ABC):
     @preserve_native_tool_format.setter
     def preserve_native_tool_format(self, value: bool) -> None:
         self._preserve_native_tool_format = value
+
+    def prepare_for_start(self) -> None:
+        """Run blocking startup work before async engine start.
+
+        Engines can override this to perform heavyweight synchronous model
+        loads off the serving event loop. The default implementation is a
+        no-op so lightweight engines do not need extra plumbing.
+        """
+        return None
 
     @abstractmethod
     async def start(self) -> None:

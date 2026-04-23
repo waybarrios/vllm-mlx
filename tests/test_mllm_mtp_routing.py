@@ -3,13 +3,13 @@
 
 
 def test_has_media_content_text_only():
-    from vllm_mlx.engine.simple import _has_media_content
+    from vllm_mlx.api.utils import has_media_content as _has_media_content
 
     assert _has_media_content([{"role": "user", "content": "Hello"}]) is False
 
 
 def test_has_media_content_with_image():
-    from vllm_mlx.engine.simple import _has_media_content
+    from vllm_mlx.api.utils import has_media_content as _has_media_content
 
     messages = [
         {
@@ -26,8 +26,22 @@ def test_has_media_content_with_image():
     assert _has_media_content(messages) is True
 
 
+def test_has_media_content_with_local_image_part():
+    from vllm_mlx.api.utils import has_media_content as _has_media_content
+
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "image", "image": "/tmp/frame.png"},
+            ],
+        }
+    ]
+    assert _has_media_content(messages) is True
+
+
 def test_has_media_content_with_video():
-    from vllm_mlx.engine.simple import _has_media_content
+    from vllm_mlx.api.utils import has_media_content as _has_media_content
 
     messages = [
         {
@@ -40,21 +54,35 @@ def test_has_media_content_with_video():
     assert _has_media_content(messages) is True
 
 
+def test_has_media_content_with_local_video_part():
+    from vllm_mlx.api.utils import has_media_content as _has_media_content
+
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "video", "video": "/tmp/v.mp4"},
+            ],
+        }
+    ]
+    assert _has_media_content(messages) is True
+
+
 def test_has_media_content_empty():
-    from vllm_mlx.engine.simple import _has_media_content
+    from vllm_mlx.api.utils import has_media_content as _has_media_content
 
     assert _has_media_content([]) is False
 
 
 def test_has_media_content_string_content():
     """String content (not list) should return False."""
-    from vllm_mlx.engine.simple import _has_media_content
+    from vllm_mlx.api.utils import has_media_content as _has_media_content
 
     assert _has_media_content([{"role": "user", "content": "Just text"}]) is False
 
 
 def test_has_media_content_audio():
-    from vllm_mlx.engine.simple import _has_media_content
+    from vllm_mlx.api.utils import has_media_content as _has_media_content
 
     messages = [
         {
@@ -69,7 +97,7 @@ def test_has_media_content_audio():
 
 def test_has_media_content_multi_turn():
     """Media in earlier turns should still be detected."""
-    from vllm_mlx.engine.simple import _has_media_content
+    from vllm_mlx.api.utils import has_media_content as _has_media_content
 
     messages = [
         {
@@ -90,7 +118,7 @@ def test_has_media_content_multi_turn():
 
 def test_has_media_content_text_list():
     """List content with only text parts should return False."""
-    from vllm_mlx.engine.simple import _has_media_content
+    from vllm_mlx.api.utils import has_media_content as _has_media_content
 
     messages = [
         {
@@ -101,6 +129,37 @@ def test_has_media_content_text_list():
             ],
         }
     ]
+    assert _has_media_content(messages) is False
+
+
+def test_has_media_content_with_message_models():
+    """Pydantic message models should follow the attribute-based content path."""
+    from vllm_mlx.api.models import ContentPart, Message, VideoUrl
+    from vllm_mlx.api.utils import has_media_content as _has_media_content
+
+    messages = [
+        Message(
+            role="user",
+            content=[
+                ContentPart(type="text", text="Describe this clip"),
+                ContentPart(
+                    type="video_url",
+                    video_url=VideoUrl(url="https://example.com/video.mp4"),
+                ),
+            ],
+        )
+    ]
+
+    assert _has_media_content(messages) is True
+
+
+def test_has_media_content_none_content():
+    """A schema-valid message with None content should not count as media."""
+    from vllm_mlx.api.models import Message
+    from vllm_mlx.api.utils import has_media_content as _has_media_content
+
+    messages = [Message(role="system", content=None)]
+
     assert _has_media_content(messages) is False
 
 

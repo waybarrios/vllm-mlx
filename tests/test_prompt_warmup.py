@@ -27,8 +27,7 @@ from vllm_mlx.prompt_warmup import (
 # Realistic agent system prompts (code-agent-style, ~1-2k tokens each)
 # ---------------------------------------------------------------------------
 
-AGENT_SYSTEM_PROMPT_CODING = (
-    """You are a code assistant running inside a developer's terminal.
+AGENT_SYSTEM_PROMPT_CODING_BASE = """You are a code assistant running inside a developer's terminal.
 
 Rules of engagement:
 - Read files before editing. Never guess at code behaviour.
@@ -44,11 +43,12 @@ Safety:
 - Sanitize input before interpolating into shell, SQL, HTML, regex.
 
 Tools: Read, Write, Edit, Bash, Grep, Glob, Agent.
-Keep final responses concise. Use file_path:line_number for code references.""" * 3
-)  # ~1.5k tokens
+Keep final responses concise. Use file_path:line_number for code references."""
+
+AGENT_SYSTEM_PROMPT_CODING = AGENT_SYSTEM_PROMPT_CODING_BASE * 3  # ~1.5k tokens
 
 
-AGENT_SYSTEM_PROMPT_REVIEWER = """You are a senior code reviewer.
+AGENT_SYSTEM_PROMPT_REVIEWER_BASE = """You are a senior code reviewer.
 
 Evaluate diffs for:
 - Correctness: off-by-one, race conditions, null handling, error paths.
@@ -59,7 +59,9 @@ Evaluate diffs for:
 
 For each finding, cite file_path:line_number and explain WHY it matters.
 Prioritize by severity: blocker, major, minor, nit.
-Do not nitpick formatting that a linter would catch.""" * 4  # ~2k tokens
+Do not nitpick formatting that a linter would catch."""
+
+AGENT_SYSTEM_PROMPT_REVIEWER = AGENT_SYSTEM_PROMPT_REVIEWER_BASE * 4  # ~2k tokens
 
 
 AGENT_CODING_MESSAGES_1 = [{"role": "system", "content": AGENT_SYSTEM_PROMPT_CODING}]

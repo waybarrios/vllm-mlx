@@ -165,7 +165,7 @@ class SSDIndex:
         self._create_tables()
 
     def _create_tables(self) -> None:
-        self._conn.executescript("""
+        schema_sql = """
             CREATE TABLE IF NOT EXISTS schema_version (
                 version INTEGER NOT NULL
             );
@@ -185,7 +185,8 @@ class SSDIndex:
 
             CREATE INDEX IF NOT EXISTS idx_entries_num_tokens
                 ON entries(num_tokens);
-            """)
+            """
+        self._conn.executescript(schema_sql)
         # Insert schema version if not present
         cur = self._conn.execute("SELECT COUNT(*) FROM schema_version")
         if cur.fetchone()[0] == 0:
