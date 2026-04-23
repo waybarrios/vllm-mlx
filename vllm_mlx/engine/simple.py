@@ -1395,6 +1395,9 @@ class SimpleEngine(BaseEngine):
                         prompt_cache=shared_cache,
                     )
                     if hasattr(model, "make_mtp_cache") and model.mtp is not None:
+                        # The processor phase ran without MTP. Resume from the
+                        # trimmed backbone cache with a fresh MTP cache so no
+                        # stale speculative state survives the seed handoff.
                         resume_kwargs["prompt_cache"] = (
                             shared_cache + model.make_mtp_cache()
                         )
@@ -1537,6 +1540,9 @@ class SimpleEngine(BaseEngine):
                             prompt_cache=bc,
                         )
                         if hasattr(model, "make_mtp_cache") and model.mtp is not None:
+                            # Resume speculative decode from the trimmed
+                            # backbone cache with a fresh MTP cache so no stale
+                            # speculative state survives the seed handoff.
                             resume_kwargs["prompt_cache"] = bc + model.make_mtp_cache()
                             resume_kwargs["mtp"] = True
                             resume_kwargs["num_draft_tokens"] = (
@@ -1597,6 +1603,9 @@ class SimpleEngine(BaseEngine):
                             prompt_cache=bc,
                         )
                         if hasattr(model, "make_mtp_cache") and model.mtp is not None:
+                            # Resume speculative decode from the trimmed
+                            # backbone cache with a fresh MTP cache so no stale
+                            # speculative state survives the seed handoff.
                             resume_kwargs["prompt_cache"] = bc + model.make_mtp_cache()
                             resume_kwargs["mtp"] = True
                             resume_kwargs["num_draft_tokens"] = (

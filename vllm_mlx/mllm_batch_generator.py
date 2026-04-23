@@ -1707,6 +1707,10 @@ class MLLMBatchGenerator:
                     batch.logits_processors[i]
                 )
                 if retired_count > 0:
+                    # Keep the per-request slot but replace an empty processor
+                    # stack with None. The next `_mtp_step` uses any([None]) ==
+                    # False, so a fully retired request becomes MTP-eligible
+                    # without changing batch alignment.
                     batch.logits_processors[i] = remaining_processors
                     logger.info(
                         "[MTP-MLLM] request=%s retired %d processor(s); "
@@ -1896,7 +1900,10 @@ def install_mtp_mllm(
         # Also skip MTP when batch has multiple active requests (MTP overhead
         # hurts aggregate throughput in concurrent scenarios). The current
         # verifier is only correctness-safe for greedy decoding with no
-        # request-local logits processors.
+        # request-local logits processors. Accepted drafts are emitted directly
+        # from the greedy draft/argmax verify path; they do not pass through the
+        # request-local sampler. Non-greedy decoding needs a sampler-aware
+        # verifier before this guard can be safely relaxed.
         if (
             input_tokens.shape[1] > 1
             or batch_gen.active_batch is None
