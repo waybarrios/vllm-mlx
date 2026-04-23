@@ -87,6 +87,20 @@ def _sample_with_processors(
     return tok, logprobs
 
 
+def _processors_can_retire(processors: list[Any] | None) -> bool:
+    """True when any processor advertises a retire-to-content transition."""
+    return bool(processors) and any(
+        isinstance(getattr(p, "is_retired", None), bool) for p in processors
+    )
+
+
+def _processors_retired(processors: list[Any] | None) -> bool:
+    """True when any retire-capable processor has entered its retired state."""
+    return bool(processors) and any(
+        getattr(p, "is_retired", False) is True for p in processors
+    )
+
+
 class _SpecPrefillCancelled(Exception):
     """Cooperative cancellation sentinel for blocking SpecPrefill workers."""
 
@@ -1010,6 +1024,7 @@ class SimpleEngine(BaseEngine):
 
         import mlx.core as mx
         from mlx_lm import stream_generate as mlx_stream_generate
+        from mlx_lm.models import cache as cache_module
         from mlx_lm.models.cache import make_prompt_cache
         from mlx_lm.sample_utils import make_logits_processors, make_sampler
 
@@ -1236,6 +1251,7 @@ class SimpleEngine(BaseEngine):
             nonlocal backbone_cache, prompt_to_send
 
             model = self._text_model
+            can_retire_processors = _processors_can_retire(all_processors)
             use_mtp = (
                 self._mtp
                 and not custom_logits_active
@@ -1309,7 +1325,6 @@ class SimpleEngine(BaseEngine):
                 else:
                     prompt_cache = backbone_cache
 
-            results = []
             gen_kwargs = dict(
                 max_tokens=max_tokens,
                 sampler=sampler,
@@ -1322,15 +1337,77 @@ class SimpleEngine(BaseEngine):
                 gen_kwargs["num_draft_tokens"] = self._mtp_num_draft_tokens
             if prompt_cache is not None:
                 gen_kwargs["prompt_cache"] = prompt_cache
+            if can_retire_processors and not use_mtp:
+                shared_cache = prompt_cache
+                if shared_cache is None:
+                    shared_cache = make_prompt_cache(model)
+                gen_kwargs["prompt_cache"] = shared_cache
 
-            for resp in mlx_stream_generate(
-                model,
-                self._text_tokenizer,
-                prompt=prompt_to_send,
-                **gen_kwargs,
-            ):
-                results.append(resp)
-            return results
+                results = []
+                token_count = 0
+                last_resp = None
+                retired = False
+                for resp in mlx_stream_generate(
+                    model,
+                    self._text_tokenizer,
+                    prompt=prompt_to_send,
+                    **gen_kwargs,
+                ):
+                    results.append(resp)
+                    token_count += 1
+                    last_resp = resp
+                    retired = _processors_retired(all_processors)
+                    if retired:
+                        logger.info(
+                            "Text route: request-local processor retired after %d tokens; "
+                            "resuming content phase with MTP=%s",
+                            token_count,
+                            hasattr(model, "make_mtp_cache") and model.mtp is not None,
+                        )
+                        break
+
+                if retired and token_count < max_tokens and last_resp is not None:
+                    last_tok = getattr(last_resp, "token", None)
+                    if last_tok is not None:
+                        cache_module.trim_prompt_cache(shared_cache, 1)
+                        seed = mx.array([last_tok], dtype=mx.uint32)
+                    else:
+                        seed = mx.array(
+                            self._text_tokenizer.encode(
+                                getattr(last_resp, "text", "")
+                            ),
+                            dtype=mx.uint32,
+                        )
+                    resume_kwargs = dict(
+                        max_tokens=max_tokens - token_count,
+                        sampler=sampler,
+                        prefill_step_size=self._prefill_step_size,
+                        prompt_cache=shared_cache,
+                    )
+                    if hasattr(model, "make_mtp_cache") and model.mtp is not None:
+                        resume_kwargs["prompt_cache"] = (
+                            shared_cache + model.make_mtp_cache()
+                        )
+                        resume_kwargs["mtp"] = True
+                        resume_kwargs["num_draft_tokens"] = self._mtp_num_draft_tokens
+                    for resp in mlx_stream_generate(
+                        model,
+                        self._text_tokenizer,
+                        prompt=seed,
+                        **resume_kwargs,
+                    ):
+                        results.append(resp)
+                return results
+            else:
+                results = []
+                for resp in mlx_stream_generate(
+                    model,
+                    self._text_tokenizer,
+                    prompt=prompt_to_send,
+                    **gen_kwargs,
+                ):
+                    results.append(resp)
+                return results
 
         def _run_specprefill(model, bc, use_mtp):
             """Score tokens, sparse prefill, then continue on the standard decode path."""
@@ -1436,11 +1513,39 @@ class SimpleEngine(BaseEngine):
                         prompt_cache = bc + model.make_mtp_cache()
 
                     continuation_prompt = mx.array([tok_id], dtype=mx.uint32)
+                    token_count = 1
+                    if _processors_retired(all_processors) and token_count < max_tokens:
+                        logger.info(
+                            "SpecPrefill text route: request-local processor retired after seed token; "
+                            "resuming content phase with MTP=%s",
+                            hasattr(model, "make_mtp_cache") and model.mtp is not None,
+                        )
+                        resume_kwargs = dict(
+                            max_tokens=max_tokens - token_count,
+                            sampler=sampler,
+                            prefill_step_size=self._prefill_step_size,
+                            prompt_cache=bc,
+                        )
+                        if hasattr(model, "make_mtp_cache") and model.mtp is not None:
+                            resume_kwargs["prompt_cache"] = bc + model.make_mtp_cache()
+                            resume_kwargs["mtp"] = True
+                            resume_kwargs["num_draft_tokens"] = self._mtp_num_draft_tokens
+                        for resp in mlx_stream_generate(
+                            model,
+                            self._text_tokenizer,
+                            prompt=continuation_prompt,
+                            **resume_kwargs,
+                        ):
+                            results.append(resp)
+                        return results
+
+                    last_resp = None
+                    retired = False
                     for resp in mlx_stream_generate(
                         model,
                         self._text_tokenizer,
                         prompt=continuation_prompt,
-                        max_tokens=max_tokens - 1,
+                        max_tokens=max_tokens - token_count,
                         sampler=sampler,
                         prefill_step_size=self._prefill_step_size,
                         logits_processors=seeded_processors,
@@ -1448,6 +1553,47 @@ class SimpleEngine(BaseEngine):
                         mtp=use_mtp,
                     ):
                         results.append(resp)
+                        token_count += 1
+                        last_resp = resp
+                        retired = _processors_retired(all_processors)
+                        if retired:
+                            logger.info(
+                                "SpecPrefill text route: request-local processor retired after %d tokens; "
+                                "resuming content phase with MTP=%s",
+                                token_count,
+                                hasattr(model, "make_mtp_cache") and model.mtp is not None,
+                            )
+                            break
+
+                    if retired and token_count < max_tokens and last_resp is not None:
+                        last_tok = getattr(last_resp, "token", None)
+                        if last_tok is not None:
+                            cache_module.trim_prompt_cache(bc, 1)
+                            seed = mx.array([last_tok], dtype=mx.uint32)
+                        else:
+                            seed = mx.array(
+                                self._text_tokenizer.encode(
+                                    getattr(last_resp, "text", "")
+                                ),
+                                dtype=mx.uint32,
+                            )
+                        resume_kwargs = dict(
+                            max_tokens=max_tokens - token_count,
+                            sampler=sampler,
+                            prefill_step_size=self._prefill_step_size,
+                            prompt_cache=bc,
+                        )
+                        if hasattr(model, "make_mtp_cache") and model.mtp is not None:
+                            resume_kwargs["prompt_cache"] = bc + model.make_mtp_cache()
+                            resume_kwargs["mtp"] = True
+                            resume_kwargs["num_draft_tokens"] = self._mtp_num_draft_tokens
+                        for resp in mlx_stream_generate(
+                            model,
+                            self._text_tokenizer,
+                            prompt=seed,
+                            **resume_kwargs,
+                        ):
+                            results.append(resp)
 
                 return results
 

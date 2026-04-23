@@ -781,6 +781,152 @@ class TestSimpleEngineConcurrency:
         assert captured_kwargs["num_draft_tokens"] == 4
 
     @pytest.mark.anyio
+    async def test_stream_generate_text_reenables_mtp_after_retired_processor(self):
+        """Retired thinking processors should hand off the content phase to MTP."""
+        from types import SimpleNamespace
+
+        from vllm_mlx.engine.simple import SimpleEngine
+
+        calls = []
+
+        class RetiringProcessor:
+            def __init__(self):
+                self.is_retired = False
+
+            def __call__(self, tokens, logits):
+                return logits
+
+        processor = RetiringProcessor()
+
+        def fake_stream_generate(model, tokenizer, prompt, **kwargs):
+            calls.append({"prompt": prompt, **kwargs})
+            if len(calls) == 1:
+                processor.is_retired = True
+                yield SimpleNamespace(token=11, text="Hello", finish_reason=None)
+            else:
+                yield SimpleNamespace(token=12, text=" world", finish_reason="stop")
+
+        tokenizer = MagicMock()
+        tokenizer.apply_chat_template.return_value = "<|im_start|>user\nhello"
+        tokenizer.bos_token = None
+        tokenizer.eos_token_id = 42
+        tokenizer.encode.return_value = [11]
+
+        engine = SimpleEngine(
+            "test-model",
+            force_mllm=True,
+            mtp=True,
+            mtp_num_draft_tokens=4,
+        )
+        engine._loaded = True
+        engine._text_model = MagicMock()
+        engine._text_model.mtp = MagicMock()
+        engine._text_model.make_mtp_cache.return_value = []
+        engine._text_tokenizer = tokenizer
+
+        with patch("mlx_lm.stream_generate", side_effect=fake_stream_generate), patch(
+            "mlx_lm.models.cache.make_prompt_cache", return_value=[]
+        ), patch("mlx_lm.models.cache.trim_prompt_cache"):
+            outputs = [
+                chunk
+                async for chunk in engine._stream_generate_text(
+                    messages=[{"role": "user", "content": "hello"}],
+                    max_tokens=16,
+                    temperature=0.7,
+                    top_p=0.9,
+                    logits_processors=[processor],
+                )
+            ]
+
+        assert outputs[-1].text == "Hello world"
+        assert len(calls) == 2
+        assert "mtp" not in calls[0]
+        assert calls[0]["logits_processors"][0] is processor
+        assert calls[1]["mtp"] is True
+        assert calls[1]["num_draft_tokens"] == 4
+        assert "logits_processors" not in calls[1]
+
+    @pytest.mark.anyio
+    async def test_stream_generate_text_specprefill_reenables_mtp_after_retirement(self):
+        """SpecPrefill continuation should resume with MTP once thinking retires."""
+        from types import SimpleNamespace
+
+        from vllm_mlx.engine.simple import SimpleEngine
+
+        calls = []
+
+        class RetiringProcessor:
+            def __init__(self):
+                self.is_retired = False
+
+            def __call__(self, tokens, logits):
+                return logits
+
+        processor = RetiringProcessor()
+
+        def fake_stream_generate(model, tokenizer, prompt, **kwargs):
+            calls.append({"prompt": prompt, **kwargs})
+            yield SimpleNamespace(token=12, text=" world", finish_reason="stop")
+
+        tokenizer = MagicMock()
+        tokenizer.apply_chat_template.return_value = "<|im_start|>user\nhello"
+        tokenizer.bos_token = None
+        tokenizer.eos_token_id = 42
+        tokenizer.encode.return_value = [1, 2, 3, 4]
+        tokenizer.decode.side_effect = lambda toks: "Hello" if toks == [11] else ""
+
+        engine = SimpleEngine(
+            "test-model",
+            force_mllm=True,
+            mtp=True,
+            mtp_num_draft_tokens=4,
+            specprefill_enabled=True,
+        )
+        engine._loaded = True
+        engine._draft_model = MagicMock()
+        engine._text_model = MagicMock()
+        engine._text_model.mtp = MagicMock()
+        engine._text_model.make_mtp_cache.return_value = []
+        engine._text_tokenizer = tokenizer
+
+        def fake_sample(tokens, logits, sampler, logits_processors):
+            processor.is_retired = True
+            return mx.array(11, dtype=mx.uint32), logits
+
+        with patch("mlx_lm.stream_generate", side_effect=fake_stream_generate), patch(
+            "mlx_lm.models.cache.make_prompt_cache", return_value=[]
+        ), patch(
+            "vllm_mlx.specprefill.score_tokens", return_value=mx.array([0.1, 0.2])
+        ), patch(
+            "vllm_mlx.specprefill.select_chunks", return_value=mx.array([0, 1])
+        ), patch(
+            "vllm_mlx.specprefill.sparse_prefill",
+            return_value=mx.zeros((1, 1, 32)),
+        ), patch(
+            "vllm_mlx.specprefill.cleanup_rope"
+        ), patch(
+            "vllm_mlx.engine.simple._sample_with_processors",
+            side_effect=fake_sample,
+        ):
+            outputs = [
+                chunk
+                async for chunk in engine._stream_generate_text(
+                    messages=[{"role": "user", "content": "hello"}],
+                    max_tokens=16,
+                    temperature=0.7,
+                    top_p=0.9,
+                    specprefill=True,
+                    logits_processors=[processor],
+                )
+            ]
+
+        assert outputs[-1].text == "Hello world"
+        assert len(calls) == 1
+        assert calls[0]["mtp"] is True
+        assert calls[0]["num_draft_tokens"] == 4
+        assert "logits_processors" not in calls[0]
+
+    @pytest.mark.anyio
     async def test_cancellation_does_not_release_lock_before_worker_finishes(
         self, mock_llm_model
     ):
