@@ -677,7 +677,9 @@ class TestQwen3SpecificCases:
 
     def test_qwen3_empty_think_tags_after_implicit_transition(self, parser):
         """Empty blocks after an implicit end tag must not leak to content."""
-        output = "brief reasoning</think>\n\n<think></think>\n\nACK_THINK_READY"
+        output = (
+            "brief reasoning</think>\n\n</think>\n\n<think></think>\n\nACK_THINK_READY"
+        )
         reasoning, content = parser.extract_reasoning(output)
         assert reasoning == "brief reasoning"
         assert content == "ACK_THINK_READY"
@@ -701,6 +703,7 @@ class TestQwen3SpecificCases:
         parser.reset_state()
         deltas = [
             "brief reasoning",
+            "</think>",
             "</think>",
             "\n\n<thi",
             "nk></think>\n\n",
