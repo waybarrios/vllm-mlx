@@ -31,6 +31,30 @@ from .vision_embedding_cache import VisionEmbeddingCache
 logger = logging.getLogger(__name__)
 
 
+def _processors_can_retire(processors: Optional[List[Callable]]) -> bool:
+    """True when any processor advertises a retire-to-content transition."""
+    return bool(processors) and any(
+        isinstance(getattr(p, "is_retired", None), bool) for p in processors
+    )
+
+
+def _drop_retired_processors(
+    processors: Optional[List[Callable]],
+) -> tuple[Optional[List[Callable]], int]:
+    """Drop retire-capable processors that have completed their work."""
+    if not processors:
+        return processors, 0
+
+    remaining = []
+    retired_count = 0
+    for processor in processors:
+        if getattr(processor, "is_retired", False) is True:
+            retired_count += 1
+            continue
+        remaining.append(processor)
+    return (remaining or None), retired_count
+
+
 class PrefillAbortedError(Exception):
     """Raised when a prefill is aborted due to client disconnect."""
 
@@ -1676,6 +1700,22 @@ class MLLMBatchGenerator:
             req.num_tokens = num_tok
             req.output_tokens.append(token)
 
+            if batch.logits_processors and _processors_can_retire(
+                batch.logits_processors[i]
+            ):
+                remaining_processors, retired_count = _drop_retired_processors(
+                    batch.logits_processors[i]
+                )
+                if retired_count > 0:
+                    batch.logits_processors[i] = remaining_processors
+                    logger.info(
+                        "[MTP-MLLM] request=%s retired %d processor(s); "
+                        "mtp_eligible_next_step=%s",
+                        request_id[:12],
+                        retired_count,
+                        remaining_processors is None,
+                    )
+
             finish_reason = None
             cache_fn = None
 
@@ -2150,8 +2190,14 @@ def install_mtp_mllm(
     batch_gen._step = _mtp_step
     batch_gen._next = _mtp_next
 
+    if num_draft_tokens != 1:
+        logger.warning(
+            "[MTP-MLLM] num_draft_tokens=%d requested, but the current batched "
+            "MLLM MTP path drafts exactly one token per verify step",
+            num_draft_tokens,
+        )
     total = _mtp_stats
     logger.info(
         f"[MTP-MLLM] installed with num_draft_tokens={num_draft_tokens}, "
-        f"always-advance verified mode"
+        f"effective_draft_tokens=1, always-advance verified mode"
     )

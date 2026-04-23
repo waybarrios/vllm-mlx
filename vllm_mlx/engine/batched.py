@@ -297,7 +297,9 @@ class BatchedEngine(BaseEngine):
             self._scheduler_config, "mllm_prefill_step_size", None
         )
         if prefill_step_size is None:
-            prefill_step_size = getattr(self._scheduler_config, "prefill_step_size", None)
+            prefill_step_size = getattr(
+                self._scheduler_config, "prefill_step_size", None
+            )
         mllm_extra = {}
         if prefill_step_size is not None:
             mllm_extra["prefill_step_size"] = prefill_step_size
@@ -1022,9 +1024,20 @@ class BatchedEngine(BaseEngine):
     def get_cache_stats(self) -> dict[str, Any] | None:
         """Get cache statistics."""
         if self._mllm_scheduler and self._mllm_scheduler.batch_generator:
-            return self._mllm_scheduler.batch_generator.get_vision_cache_stats()
+            return {
+                "prefix_cache": self._mllm_scheduler.batch_generator.get_prefix_cache_stats(),
+                "vision_embedding_cache": self._mllm_scheduler.batch_generator.get_vision_cache_stats(),
+            }
         elif self._engine:
             return self._engine.get_cache_stats()
+        return None
+
+    def clear_runtime_caches(self) -> dict[str, Any] | None:
+        """Clear engine-managed runtime caches."""
+        if self._mllm_scheduler is not None:
+            return self._mllm_scheduler.clear_runtime_caches()
+        if self._engine is not None:
+            return self._engine.clear_runtime_caches()
         return None
 
     def save_cache_to_disk(self, cache_dir: str) -> bool:

@@ -564,6 +564,10 @@ class EngineCore:
         """Load prefix cache from disk."""
         return self.scheduler.load_cache_from_disk(cache_dir)
 
+    def clear_runtime_caches(self) -> Dict[str, Any] | None:
+        """Clear scheduler-managed runtime caches."""
+        return self.scheduler.clear_runtime_caches()
+
     def clear_prefix_cache(self) -> None:
         """Clear the prefix cache (delegates to scheduler)."""
         if hasattr(self.scheduler, "clear_prefix_cache"):
@@ -713,3 +717,7 @@ class AsyncEngineCore:
     def load_cache_from_disk(self, cache_dir: str) -> int:
         """Load prefix cache from disk."""
         return self.engine.load_cache_from_disk(cache_dir)
+
+    def clear_runtime_caches(self) -> Dict[str, Any] | None:
+        """Clear scheduler-managed runtime caches."""
+        return self.engine.clear_runtime_caches()

@@ -229,6 +229,13 @@ class SimpleEngine(BaseEngine):
                 await run_blocking_startup_work(self.prepare_for_start)
             self._loaded = True
 
+            if self._mtp and self._mtp_num_draft_tokens != 1:
+                logger.warning(
+                    "Native mlx_lm MTP currently ignores num_draft_tokens=%d; "
+                    "effective speculative draft depth remains 1",
+                    self._mtp_num_draft_tokens,
+                )
+
             # Build parallel mlx_lm TextModel for text-only routing.
             # Even when MTP is disabled, text-only requests should not be trapped
             # on the slower mlx_vlm multimodal path.
@@ -286,7 +293,12 @@ class SimpleEngine(BaseEngine):
                     logger.error("SpecPrefill: draft model load failed: %s", e)
                     self._draft_model = None
 
-            mtp_info = f", MTP={self._mtp}" if self._mtp else ""
+            mtp_info = ""
+            if self._mtp:
+                mtp_info = (
+                    f", MTP={self._mtp}(configured={self._mtp_num_draft_tokens}, "
+                    "effective=1)"
+                )
             routing = ", routing=per-request" if self._text_model is not None else ""
             specprefill_info = (
                 ", SpecPrefill=active" if self._draft_model is not None else ""
@@ -1373,9 +1385,7 @@ class SimpleEngine(BaseEngine):
                         seed = mx.array([last_tok], dtype=mx.uint32)
                     else:
                         seed = mx.array(
-                            self._text_tokenizer.encode(
-                                getattr(last_resp, "text", "")
-                            ),
+                            self._text_tokenizer.encode(getattr(last_resp, "text", "")),
                             dtype=mx.uint32,
                         )
                     resume_kwargs = dict(
@@ -1529,7 +1539,9 @@ class SimpleEngine(BaseEngine):
                         if hasattr(model, "make_mtp_cache") and model.mtp is not None:
                             resume_kwargs["prompt_cache"] = bc + model.make_mtp_cache()
                             resume_kwargs["mtp"] = True
-                            resume_kwargs["num_draft_tokens"] = self._mtp_num_draft_tokens
+                            resume_kwargs["num_draft_tokens"] = (
+                                self._mtp_num_draft_tokens
+                            )
                         for resp in mlx_stream_generate(
                             model,
                             self._text_tokenizer,
@@ -1561,7 +1573,8 @@ class SimpleEngine(BaseEngine):
                                 "SpecPrefill text route: request-local processor retired after %d tokens; "
                                 "resuming content phase with MTP=%s",
                                 token_count,
-                                hasattr(model, "make_mtp_cache") and model.mtp is not None,
+                                hasattr(model, "make_mtp_cache")
+                                and model.mtp is not None,
                             )
                             break
 
@@ -1586,7 +1599,9 @@ class SimpleEngine(BaseEngine):
                         if hasattr(model, "make_mtp_cache") and model.mtp is not None:
                             resume_kwargs["prompt_cache"] = bc + model.make_mtp_cache()
                             resume_kwargs["mtp"] = True
-                            resume_kwargs["num_draft_tokens"] = self._mtp_num_draft_tokens
+                            resume_kwargs["num_draft_tokens"] = (
+                                self._mtp_num_draft_tokens
+                            )
                         for resp in mlx_stream_generate(
                             model,
                             self._text_tokenizer,
@@ -1687,4 +1702,11 @@ class SimpleEngine(BaseEngine):
         """Get cache statistics (for MLLM models)."""
         if self._is_mllm and self._model is not None:
             return self._model.get_cache_stats()
+        return None
+
+    def clear_runtime_caches(self) -> dict[str, Any] | None:
+        """Clear engine-managed runtime caches."""
+        if self._is_mllm and self._model is not None:
+            self._model.clear_cache()
+            return {"model_cache": True}
         return None

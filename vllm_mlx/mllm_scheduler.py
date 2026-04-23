@@ -1068,6 +1068,23 @@ class MLLMScheduler:
 
         return stats
 
+    def clear_runtime_caches(self) -> Dict[str, bool]:
+        """Clear runtime caches without resetting scheduler/request state."""
+        cleared = {
+            "vision_cache": False,
+            "prefix_cache": False,
+        }
+        if self.vision_cache:
+            self.vision_cache.clear()
+            cleared["vision_cache"] = True
+        if (
+            self.batch_generator is not None
+            and self.batch_generator.prefix_cache is not None
+        ):
+            self.batch_generator.prefix_cache.clear()
+            cleared["prefix_cache"] = True
+        return cleared
+
     def reset(self) -> None:
         """Reset the scheduler state."""
         # Abort all requests

@@ -265,3 +265,7 @@ class BaseEngine(ABC):
     def get_cache_stats(self) -> dict[str, Any] | None:
         """Get cache statistics. Override in subclasses."""
         return None
+
+    def clear_runtime_caches(self) -> dict[str, Any] | None:
+        """Clear engine-managed runtime caches. Override in subclasses."""
+        return None

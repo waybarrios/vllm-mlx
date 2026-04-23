@@ -824,9 +824,11 @@ class TestSimpleEngineConcurrency:
         engine._text_model.make_mtp_cache.return_value = []
         engine._text_tokenizer = tokenizer
 
-        with patch("mlx_lm.stream_generate", side_effect=fake_stream_generate), patch(
-            "mlx_lm.models.cache.make_prompt_cache", return_value=[]
-        ), patch("mlx_lm.models.cache.trim_prompt_cache"):
+        with (
+            patch("mlx_lm.stream_generate", side_effect=fake_stream_generate),
+            patch("mlx_lm.models.cache.make_prompt_cache", return_value=[]),
+            patch("mlx_lm.models.cache.trim_prompt_cache"),
+        ):
             outputs = [
                 chunk
                 async for chunk in engine._stream_generate_text(
@@ -847,7 +849,9 @@ class TestSimpleEngineConcurrency:
         assert "logits_processors" not in calls[1]
 
     @pytest.mark.anyio
-    async def test_stream_generate_text_specprefill_reenables_mtp_after_retirement(self):
+    async def test_stream_generate_text_specprefill_reenables_mtp_after_retirement(
+        self,
+    ):
         """SpecPrefill continuation should resume with MTP once thinking retires."""
         from types import SimpleNamespace
 
@@ -893,20 +897,22 @@ class TestSimpleEngineConcurrency:
             processor.is_retired = True
             return mx.array(11, dtype=mx.uint32), logits
 
-        with patch("mlx_lm.stream_generate", side_effect=fake_stream_generate), patch(
-            "mlx_lm.models.cache.make_prompt_cache", return_value=[]
-        ), patch(
-            "vllm_mlx.specprefill.score_tokens", return_value=mx.array([0.1, 0.2])
-        ), patch(
-            "vllm_mlx.specprefill.select_chunks", return_value=mx.array([0, 1])
-        ), patch(
-            "vllm_mlx.specprefill.sparse_prefill",
-            return_value=mx.zeros((1, 1, 32)),
-        ), patch(
-            "vllm_mlx.specprefill.cleanup_rope"
-        ), patch(
-            "vllm_mlx.engine.simple._sample_with_processors",
-            side_effect=fake_sample,
+        with (
+            patch("mlx_lm.stream_generate", side_effect=fake_stream_generate),
+            patch("mlx_lm.models.cache.make_prompt_cache", return_value=[]),
+            patch(
+                "vllm_mlx.specprefill.score_tokens", return_value=mx.array([0.1, 0.2])
+            ),
+            patch("vllm_mlx.specprefill.select_chunks", return_value=mx.array([0, 1])),
+            patch(
+                "vllm_mlx.specprefill.sparse_prefill",
+                return_value=mx.zeros((1, 1, 32)),
+            ),
+            patch("vllm_mlx.specprefill.cleanup_rope"),
+            patch(
+                "vllm_mlx.engine.simple._sample_with_processors",
+                side_effect=fake_sample,
+            ),
         ):
             outputs = [
                 chunk

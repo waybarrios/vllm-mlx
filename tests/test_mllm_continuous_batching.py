@@ -13,6 +13,7 @@ Test Cases:
 - Mixed text-only and multimodal requests
 """
 
+import asyncio
 import base64
 import os
 import tempfile
@@ -738,10 +739,56 @@ class TestMLLMBatchGeneratorMTPGuards:
         language_model.assert_not_called()
         language_model.mtp_forward.assert_not_called()
 
+    def test_next_drops_retired_processors_and_makes_request_mtp_eligible(self):
+        from vllm_mlx.mllm_batch_generator import (
+            MLLMBatch,
+            MLLMBatchGenerator,
+            MLLMBatchRequest,
+            MLLMBatchStats,
+        )
+
+        class RetiredProcessor:
+            is_retired = True
+
+            def __call__(self, tokens, logits):
+                return logits
+
+        generator = MLLMBatchGenerator.__new__(MLLMBatchGenerator)
+        generator._stats = MLLMBatchStats()
+        generator.stop_tokens = set()
+        generator.unprocessed_requests = []
+        generator._pending_error_responses = []
+        generator._prefill_progress = {}
+        generator.prefix_cache = None
+        generator._maybe_store_prefix_cache = lambda batch, end_idx: None
+        generator._step = lambda *args, **kwargs: (
+            mx.array([11]),
+            [mx.array([0.2, 0.8])],
+        )
+
+        request = MLLMBatchRequest(uid=1, request_id="req-1", prompt="hello")
+        generator.active_batch = MLLMBatch(
+            uids=[1],
+            request_ids=["req-1"],
+            y=mx.array([7]),
+            logprobs=[mx.array([0.5, 0.5])],
+            max_tokens=[4],
+            num_tokens=[0],
+            cache=[],
+            requests=[request],
+            logits_processors=[[RetiredProcessor()]],
+            samplers=None,
+        )
+
+        responses = MLLMBatchGenerator._next(generator)
+
+        assert len(responses) == 1
+        assert generator.active_batch is not None
+        assert generator.active_batch.logits_processors == [None]
+
 
 class TestBatchedMLLMConfigWiring:
-    @pytest.mark.asyncio
-    async def test_batched_engine_forwards_prefill_step_size_to_mllm_scheduler(
+    def test_batched_engine_forwards_prefill_step_size_to_mllm_scheduler(
         self, monkeypatch
     ):
         from vllm_mlx.engine.batched import BatchedEngine
@@ -795,6 +842,6 @@ class TestBatchedMLLMConfigWiring:
             force_mllm=True,
         )
 
-        await engine._start_mllm()
+        asyncio.run(engine._start_mllm())
 
         assert captured["config_kwargs"]["prefill_step_size"] == 256
