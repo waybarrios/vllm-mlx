@@ -56,6 +56,7 @@ class MLXLanguageModel:
         tokenizer_name: str | None = None,
         trust_remote_code: bool = False,
         mtp: bool = False,
+        mtp_num_draft_tokens: int = 1,
     ):
         """
         Initialize the MLX language model.
@@ -65,11 +66,13 @@ class MLXLanguageModel:
             tokenizer_name: Optional separate tokenizer name
             trust_remote_code: Whether to trust remote code
             mtp: Enable native MTP speculative decoding (model must have MTP head)
+            mtp_num_draft_tokens: Draft tokens per speculative MTP step
         """
         self.model_name = model_name
         self.tokenizer_name = tokenizer_name or model_name
         self.trust_remote_code = trust_remote_code
         self._mtp = mtp
+        self._mtp_num_draft_tokens = mtp_num_draft_tokens
 
         self.model = None
         self.tokenizer = None
@@ -274,6 +277,7 @@ class MLXLanguageModel:
         mtp_kwargs = {}
         if self._mtp:
             mtp_kwargs["mtp"] = True
+            mtp_kwargs["num_draft_tokens"] = self._mtp_num_draft_tokens
         if prompt_cache is not None:
             mtp_kwargs["prompt_cache"] = prompt_cache
 

@@ -270,6 +270,95 @@ class TestSimpleEngineConcurrency:
             assert isinstance(engine._generation_lock, asyncio.Lock)
 
     @pytest.mark.anyio
+    async def test_run_blocking_serialized_rebinds_worker_generation_streams(self):
+        """Worker-thread MLX generation should get fresh thread-local streams."""
+        import importlib
+
+        from vllm_mlx.engine.simple import SimpleEngine
+
+        mlx_lm_generate = importlib.import_module("mlx_lm.generate")
+        sentinel_stream = object()
+
+        with (
+            patch("vllm_mlx.engine.simple.is_mllm_model", return_value=False),
+            patch("vllm_mlx.engine.simple.mx.default_device", return_value="gpu"),
+            patch(
+                "vllm_mlx.engine.simple.mx.new_stream",
+                return_value=sentinel_stream,
+            ),
+            patch("vllm_mlx.engine.simple.mx.set_default_stream"),
+        ):
+            engine = SimpleEngine("test-model")
+            observed = await engine._run_blocking_serialized(
+                lambda: mlx_lm_generate.generation_stream
+            )
+
+        assert observed is sentinel_stream
+
+    @pytest.mark.anyio
+    async def test_start_keeps_text_routing_for_mllm_without_mtp(self):
+        """MLLM text-only routing must stay available when MTP is disabled."""
+        from vllm_mlx.engine.simple import SimpleEngine
+
+        text_model = MagicMock()
+        text_model.mtp = None
+        tokenizer = MagicMock()
+        tokenizer.convert_tokens_to_ids.return_value = 42
+
+        mock_mllm = MagicMock()
+        mock_mllm.model = MagicMock()
+        mock_mllm.get_tokenizer.return_value = tokenizer
+
+        with (
+            patch(
+                "vllm_mlx.models.mllm.MLXMultimodalLM",
+                return_value=mock_mllm,
+            ),
+            patch(
+                "vllm_mlx.text_model_from_vlm.build_text_model",
+                return_value=text_model,
+            ),
+        ):
+            engine = SimpleEngine("qwen3.6-27b", force_mllm=True, mtp=False)
+            await engine.start()
+
+        assert engine._text_model is text_model
+        assert engine._text_tokenizer is tokenizer
+
+    @pytest.mark.anyio
+    async def test_mllm_nonstream_text_only_routes_without_mtp(self):
+        """Non-stream text-only MLLM chat must aggregate the TextModel route."""
+        from vllm_mlx.engine.simple import SimpleEngine
+
+        async def fake_stream_chat(*args, **kwargs):
+            yield MagicMock(
+                text="Hello",
+                tokens=[1],
+                prompt_tokens=5,
+                completion_tokens=1,
+                finish_reason="stop",
+                finished=True,
+            )
+
+        engine = SimpleEngine("test-model", force_mllm=True, mtp=False)
+        engine._loaded = True
+        engine._text_model = MagicMock()
+        engine._model = MagicMock()
+        engine.stream_chat = fake_stream_chat  # type: ignore[method-assign]
+
+        output = await engine.chat(
+            messages=[{"role": "user", "content": "hello"}],
+            max_tokens=16,
+        )
+
+        assert output.text == "Hello"
+        assert output.tokens == [1]
+        assert output.prompt_tokens == 5
+        assert output.completion_tokens == 1
+        assert output.finish_reason == "stop"
+        engine._model.chat.assert_not_called()
+
+    @pytest.mark.anyio
     async def test_requests_complete_in_order(self, mock_model):
         """Test that concurrent requests complete (may be in any order due to lock)."""
         from vllm_mlx.engine.simple import SimpleEngine
@@ -374,6 +463,216 @@ class TestSimpleEngineConcurrency:
 
         assert output.text == ""
         assert output.finish_reason == "stop"
+
+    @pytest.mark.anyio
+    async def test_stream_generate_text_forwards_logits_processors_and_sampler_args(
+        self,
+    ):
+        """Text routing must preserve request-local decoding controls."""
+        from types import SimpleNamespace
+
+        from vllm_mlx.engine.simple import SimpleEngine
+
+        captured_kwargs = {}
+        sampler_calls = []
+        penalty_calls = []
+        user_processor = MagicMock()
+        penalty_processor = MagicMock()
+
+        def fake_stream_generate(model, tokenizer, prompt, **kwargs):
+            captured_kwargs.update(kwargs)
+            yield SimpleNamespace(text="Hello", finish_reason="stop")
+
+        def fake_make_sampler(**kwargs):
+            sampler_calls.append(kwargs)
+            return MagicMock()
+
+        def fake_make_logits_processors(**kwargs):
+            penalty_calls.append(kwargs)
+            return [penalty_processor]
+
+        tokenizer = MagicMock()
+        tokenizer.apply_chat_template.return_value = "<|im_start|>user\nhello"
+        tokenizer.bos_token = None
+        tokenizer.eos_token_id = 42
+
+        engine = SimpleEngine("test-model", force_mllm=True, mtp=False)
+        engine._loaded = True
+        engine._text_model = MagicMock()
+        engine._text_model.mtp = None
+        engine._text_tokenizer = tokenizer
+
+        with (
+            patch("mlx_lm.stream_generate", side_effect=fake_stream_generate),
+            patch("mlx_lm.sample_utils.make_sampler", side_effect=fake_make_sampler),
+            patch(
+                "mlx_lm.sample_utils.make_logits_processors",
+                side_effect=fake_make_logits_processors,
+            ),
+        ):
+            outputs = [
+                chunk
+                async for chunk in engine._stream_generate_text(
+                    messages=[{"role": "user", "content": "hello"}],
+                    max_tokens=16,
+                    temperature=0.3,
+                    top_p=0.8,
+                    top_k=40,
+                    min_p=0.1,
+                    presence_penalty=1.5,
+                    repetition_penalty=1.2,
+                    logits_processors=[user_processor],
+                )
+            ]
+
+        assert outputs[-1].text == "Hello"
+        assert sampler_calls == [
+            {"temp": 0.3, "top_p": 0.8, "top_k": 40, "min_p": 0.1}
+        ]
+        assert penalty_calls == [
+            {"repetition_penalty": 1.2, "presence_penalty": 1.5}
+        ]
+        assert captured_kwargs["logits_processors"] == [
+            user_processor,
+            penalty_processor,
+        ]
+
+    @pytest.mark.anyio
+    async def test_stream_generate_text_disables_mtp_when_logits_processors_active(
+        self,
+    ):
+        """Custom logits processors must fail closed to non-MTP decoding."""
+        from types import SimpleNamespace
+
+        from vllm_mlx.engine.simple import SimpleEngine
+
+        captured_kwargs = {}
+        user_processor = MagicMock()
+
+        def fake_stream_generate(model, tokenizer, prompt, **kwargs):
+            captured_kwargs.update(kwargs)
+            yield SimpleNamespace(text="Hello", finish_reason="stop")
+
+        tokenizer = MagicMock()
+        tokenizer.apply_chat_template.return_value = "<|im_start|>user\nhello"
+        tokenizer.bos_token = None
+        tokenizer.eos_token_id = 42
+
+        engine = SimpleEngine("test-model", force_mllm=True, mtp=True)
+        engine._loaded = True
+        engine._text_model = MagicMock()
+        engine._text_model.mtp = MagicMock()
+        engine._text_tokenizer = tokenizer
+
+        with patch("mlx_lm.stream_generate", side_effect=fake_stream_generate):
+            outputs = [
+                chunk
+                async for chunk in engine._stream_generate_text(
+                    messages=[{"role": "user", "content": "hello"}],
+                    max_tokens=16,
+                    temperature=0.7,
+                    top_p=0.9,
+                    logits_processors=[user_processor],
+                )
+            ]
+
+        assert outputs[-1].text == "Hello"
+        assert "mtp" not in captured_kwargs
+        assert captured_kwargs["logits_processors"][0] is user_processor
+
+    @pytest.mark.anyio
+    async def test_stream_generate_text_keeps_mtp_for_budget_only_thinking_processor(
+        self,
+    ):
+        """Budget-only ThinkingAwareLogitsProcessor should not disable MTP."""
+        from types import SimpleNamespace
+
+        from vllm_mlx.engine.simple import SimpleEngine
+
+        captured_kwargs = {}
+
+        def fake_stream_generate(model, tokenizer, prompt, **kwargs):
+            captured_kwargs.update(kwargs)
+            yield SimpleNamespace(text="Hello", finish_reason="stop")
+
+        tokenizer = MagicMock()
+        tokenizer.apply_chat_template.return_value = "<|im_start|>user\nhello"
+        tokenizer.bos_token = None
+        tokenizer.eos_token_id = 42
+
+        engine = SimpleEngine("test-model", force_mllm=True, mtp=True)
+        engine._loaded = True
+        engine._text_model = MagicMock()
+        engine._text_model.mtp = MagicMock()
+        engine._text_tokenizer = tokenizer
+
+        thinking_proc = MagicMock()
+
+        with (
+            patch("mlx_lm.stream_generate", side_effect=fake_stream_generate),
+            patch(
+                "vllm_mlx.engine.simple._only_mtp_safe_thinking_processors",
+                return_value=True,
+            ),
+        ):
+            outputs = [
+                chunk
+                async for chunk in engine._stream_generate_text(
+                    messages=[{"role": "user", "content": "hello"}],
+                    max_tokens=16,
+                    temperature=0.7,
+                    top_p=0.9,
+                    logits_processors=[thinking_proc],
+                )
+            ]
+
+        assert outputs[-1].text == "Hello"
+        assert captured_kwargs["mtp"] is True
+        assert captured_kwargs["logits_processors"][0] is thinking_proc
+
+    @pytest.mark.anyio
+    async def test_stream_generate_text_passes_num_draft_tokens(self):
+        """Text routing should forward configured MTP draft depth."""
+        from types import SimpleNamespace
+
+        from vllm_mlx.engine.simple import SimpleEngine
+
+        captured_kwargs = {}
+
+        def fake_stream_generate(model, tokenizer, prompt, **kwargs):
+            captured_kwargs.update(kwargs)
+            yield SimpleNamespace(text="Hello", finish_reason="stop")
+
+        tokenizer = MagicMock()
+        tokenizer.apply_chat_template.return_value = "<|im_start|>user\nhello"
+        tokenizer.bos_token = None
+        tokenizer.eos_token_id = 42
+
+        engine = SimpleEngine(
+            "test-model",
+            force_mllm=True,
+            mtp=True,
+            mtp_num_draft_tokens=4,
+        )
+        engine._loaded = True
+        engine._text_model = MagicMock()
+        engine._text_model.mtp = MagicMock()
+        engine._text_tokenizer = tokenizer
+
+        with patch("mlx_lm.stream_generate", side_effect=fake_stream_generate):
+            outputs = [
+                chunk
+                async for chunk in engine._stream_generate_text(
+                    messages=[{"role": "user", "content": "hello"}],
+                    max_tokens=16,
+                    temperature=0.7,
+                    top_p=0.9,
+                )
+            ]
+
+        assert outputs[-1].text == "Hello"
+        assert captured_kwargs["mtp"] is True
+        assert captured_kwargs["num_draft_tokens"] == 4
 
     @pytest.mark.anyio
     async def test_cancellation_does_not_release_lock_before_worker_finishes(

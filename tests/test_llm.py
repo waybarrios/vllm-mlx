@@ -3,6 +3,8 @@
 
 import platform
 import sys
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -49,6 +51,31 @@ def test_model_repr():
     assert "MLXLanguageModel" in repr_str
     assert "test-model" in repr_str
     assert "not loaded" in repr_str
+
+
+def test_model_stream_generate_passes_num_draft_tokens():
+    """Native MTP path should forward configured draft depth to mlx_lm."""
+    from vllm_mlx.models.llm import MLXLanguageModel
+
+    model = MLXLanguageModel("test-model", mtp=True, mtp_num_draft_tokens=4)
+    model._loaded = True
+    model.model = object()
+    tokenizer = MagicMock()
+    tokenizer.encode.return_value = [1, 2, 3]
+    model.tokenizer = tokenizer
+
+    captured_kwargs = {}
+
+    def fake_stream_generate(_model, _tokenizer, **kwargs):
+        captured_kwargs.update(kwargs)
+        yield SimpleNamespace(text="Hello")
+
+    with patch("mlx_lm.stream_generate", side_effect=fake_stream_generate):
+        chunks = list(model.stream_generate("Hello", max_tokens=8))
+
+    assert chunks[-1].text == "Hello"
+    assert captured_kwargs["mtp"] is True
+    assert captured_kwargs["num_draft_tokens"] == 4
 
 
 @pytest.mark.slow
