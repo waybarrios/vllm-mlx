@@ -44,11 +44,13 @@ Safety:
 - Sanitize input before interpolating into shell, SQL, HTML, regex.
 
 Tools: Read, Write, Edit, Bash, Grep, Glob, Agent.
-Keep final responses concise. Use file_path:line_number for code references.""" * 3
+Keep final responses concise. Use file_path:line_number for code references."""
+    * 3
 )  # ~1.5k tokens
 
 
-AGENT_SYSTEM_PROMPT_REVIEWER = """You are a senior code reviewer.
+AGENT_SYSTEM_PROMPT_REVIEWER = (
+    """You are a senior code reviewer.
 
 Evaluate diffs for:
 - Correctness: off-by-one, race conditions, null handling, error paths.
@@ -59,7 +61,9 @@ Evaluate diffs for:
 
 For each finding, cite file_path:line_number and explain WHY it matters.
 Prioritize by severity: blocker, major, minor, nit.
-Do not nitpick formatting that a linter would catch.""" * 4  # ~2k tokens
+Do not nitpick formatting that a linter would catch."""
+    * 4
+)  # ~2k tokens
 
 
 AGENT_CODING_MESSAGES_1 = [{"role": "system", "content": AGENT_SYSTEM_PROMPT_CODING}]

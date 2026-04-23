@@ -158,7 +158,7 @@ from .endpoint_model_policies import (
 from .engine.base import suspend_cancellation
 from .lifecycle import ModelSpec, ResidencyManager
 from .metrics import metrics as _metrics
-from .tool_parsers import ToolParserManager, get_parser_stop_tokens
+from .tool_parsers import ToolParserManager
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
