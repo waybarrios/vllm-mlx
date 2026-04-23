@@ -295,6 +295,13 @@ class TestEdgeCases:
         reasoning, content = parser.extract_reasoning(output)
         # Result may vary by parser implementation
 
+    def test_repeated_leading_think_blocks_do_not_leak_to_content(self, parser):
+        """Repeated leading think blocks are reasoning, not final content."""
+        output = "reasoning</think>\n\n<think></think>\n\nanswer"
+        reasoning, content = parser.extract_reasoning(output)
+        assert reasoning == "reasoning"
+        assert content == "answer"
+
     def test_streaming_reset_state(self, parser):
         """reset_state should allow reuse of parser."""
         # First stream
@@ -668,6 +675,15 @@ class TestQwen3SpecificCases:
         assert reasoning is None or reasoning.strip() == ""
         assert content == "Just the answer."
 
+    def test_qwen3_empty_think_tags_after_implicit_transition(self, parser):
+        """Empty blocks after an implicit end tag must not leak to content."""
+        output = (
+            "brief reasoning</think>\n\n</think>\n\n<think></think>\n\nACK_THINK_READY"
+        )
+        reasoning, content = parser.extract_reasoning(output)
+        assert reasoning == "brief reasoning"
+        assert content == "ACK_THINK_READY"
+
     def test_qwen3_whitespace_between_tags(self, parser):
         """Test various whitespace patterns."""
         test_cases = [
@@ -681,6 +697,36 @@ class TestQwen3SpecificCases:
             if expected_reasoning is None:
                 assert reasoning is None or reasoning.strip() == ""
             assert expected_content in (content or "")
+
+    def test_qwen3_streaming_empty_think_tags_after_transition(self, parser):
+        """Streaming parser suppresses repeated leading think blocks in content."""
+        parser.reset_state()
+        deltas = [
+            "brief reasoning",
+            "</think>",
+            "</think>",
+            "\n\n<thi",
+            "nk></think>\n\n",
+            "ACK_THINK_READY",
+        ]
+        previous = ""
+        current = ""
+        reasoning_parts = []
+        content_parts = []
+
+        for delta in deltas:
+            previous = current
+            current += delta
+            result = parser.extract_reasoning_streaming(previous, current, delta)
+            if result is None:
+                continue
+            if result.reasoning:
+                reasoning_parts.append(result.reasoning)
+            if result.content:
+                content_parts.append(result.content)
+
+        assert "".join(reasoning_parts) == "brief reasoning"
+        assert "".join(content_parts) == "ACK_THINK_READY"
 
 
 class TestGptOssParser:
