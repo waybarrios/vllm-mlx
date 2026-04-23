@@ -833,6 +833,37 @@ class TestEngineAsync:
 
         assert not engine.engine.is_running()
 
+    async def test_stream_outputs_consumer_break_after_finished_does_not_abort(self):
+        """Breaking after a finished output is normal consumption, not orphaning."""
+        from vllm_mlx.engine_core import EngineCore
+        from vllm_mlx.output_collector import RequestOutputCollector
+        from vllm_mlx.request import RequestOutput
+
+        engine = EngineCore.__new__(EngineCore)
+        engine._output_collectors = {"req-1": RequestOutputCollector()}
+        engine._stream_states = {}
+        engine._finished_events = {}
+        engine.scheduler = MagicMock()
+        engine.scheduler.abort_request = MagicMock(return_value=True)
+        engine.scheduler.remove_finished_request = MagicMock()
+
+        engine._output_collectors["req-1"].put(
+            RequestOutput(
+                request_id="req-1",
+                output_text="done",
+                finished=True,
+                finish_reason="stop",
+            )
+        )
+
+        stream = EngineCore.stream_outputs(engine, "req-1")
+        output = await stream.__anext__()
+        assert output.finished is True
+        await stream.aclose()
+
+        engine.scheduler.abort_request.assert_not_called()
+        engine.scheduler.remove_finished_request.assert_called_once_with("req-1")
+
 
 class TestChunkedPrefillConfig:
     """Regression tests for chunked prefill configuration (#178)."""

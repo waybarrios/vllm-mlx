@@ -878,10 +878,11 @@ class MLLMScheduler:
                 if output is None:
                     finished_normally = True
                     break
-                yield output
                 if output.finished:
                     finished_normally = True
+                    yield output
                     break
+                yield output
         finally:
             if not finished_normally:
                 logger.info(f"Aborting orphaned MLLM request {request_id}")

@@ -688,6 +688,32 @@ class TestMLLMSchedulerIntegration:
         finally:
             await scheduler.stop()
 
+    async def test_stream_outputs_consumer_break_after_finished_does_not_abort(self):
+        """Breaking after a finished output is normal consumption, not orphaning."""
+        from vllm_mlx.mllm_scheduler import MLLMScheduler
+        from vllm_mlx.request import RequestOutput
+
+        scheduler = MLLMScheduler.__new__(MLLMScheduler)
+        scheduler.output_queues = {"req-1": asyncio.Queue()}
+        scheduler.abort_request = MagicMock(return_value=True)
+
+        await scheduler.output_queues["req-1"].put(
+            RequestOutput(
+                request_id="req-1",
+                output_text="done",
+                finished=True,
+                finish_reason="stop",
+            )
+        )
+
+        stream = MLLMScheduler.stream_outputs(scheduler, "req-1")
+        output = await stream.__anext__()
+        assert output.finished is True
+        await stream.aclose()
+
+        scheduler.abort_request.assert_not_called()
+        assert "req-1" not in scheduler.output_queues
+
 
 # Run tests
 if __name__ == "__main__":

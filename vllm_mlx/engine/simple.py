@@ -9,6 +9,7 @@ performance when serving a single user at a time.
 import asyncio
 import logging
 import os
+import threading
 import time
 from collections.abc import AsyncIterator
 from typing import Any
@@ -1047,6 +1048,7 @@ class SimpleEngine(BaseEngine):
         repetition_penalty = kwargs.pop("repetition_penalty", 1.0)
         stop = kwargs.pop("stop", None)
         external_logits_processors = kwargs.pop("logits_processors", None)
+        abort_event = threading.Event()
 
         # Per-request enable_thinking override; fall back to env var / default True.
         enable_thinking = kwargs.pop("enable_thinking", None)
@@ -1255,6 +1257,20 @@ class SimpleEngine(BaseEngine):
             )
             use_specprefill = False
 
+        loop = asyncio.get_running_loop()
+        response_queue: asyncio.Queue[tuple[str, Any]] = asyncio.Queue()
+
+        def _emit_response(resp: Any) -> None:
+            if abort_event.is_set():
+                return
+            loop.call_soon_threadsafe(response_queue.put_nowait, ("resp", resp))
+
+        def _emit_done() -> None:
+            loop.call_soon_threadsafe(response_queue.put_nowait, ("done", None))
+
+        def _emit_error(exc: BaseException) -> None:
+            loop.call_soon_threadsafe(response_queue.put_nowait, ("error", exc))
+
         def _seed_from_last_response(prompt_cache, last_resp):
             last_tok = getattr(last_resp, "token", None)
             if last_tok is not None:
@@ -1270,7 +1286,6 @@ class SimpleEngine(BaseEngine):
             prompt_cache,
             prompt,
             remaining_tokens: int,
-            results: list[Any],
         ) -> None:
             resume_kwargs = dict(
                 max_tokens=remaining_tokens,
@@ -1291,7 +1306,10 @@ class SimpleEngine(BaseEngine):
                 prompt=prompt,
                 **resume_kwargs,
             ):
-                results.append(resp)
+                if abort_event.is_set():
+                    logger.info("Text route: abort requested; stopping resume decode")
+                    break
+                _emit_response(resp)
 
         # Run all Metal ops in a single serialized thread.
         def _run_all():
@@ -1352,7 +1370,8 @@ class SimpleEngine(BaseEngine):
             # --- SpecPrefill path (with fallback to normal on failure) ---
             if use_specprefill:
                 try:
-                    return _run_specprefill(model, backbone_cache, use_mtp)
+                    _run_specprefill(model, backbone_cache, use_mtp)
+                    return
                 except Exception as e:
                     logger.error(
                         "SpecPrefill failed, falling back to normal MTP path: %s",
@@ -1390,7 +1409,6 @@ class SimpleEngine(BaseEngine):
                     shared_cache = make_prompt_cache(model)
                 gen_kwargs["prompt_cache"] = shared_cache
 
-                results = []
                 token_count = 0
                 last_resp = None
                 retired = False
@@ -1400,7 +1418,13 @@ class SimpleEngine(BaseEngine):
                     prompt=prompt_to_send,
                     **gen_kwargs,
                 ):
-                    results.append(resp)
+                    if abort_event.is_set():
+                        logger.info(
+                            "Text route: abort requested; stopping decode after %d tokens",
+                            token_count,
+                        )
+                        break
+                    _emit_response(resp)
                     token_count += 1
                     last_resp = resp
                     retired = _processors_retired(all_processors)
@@ -1420,19 +1444,18 @@ class SimpleEngine(BaseEngine):
                         shared_cache,
                         seed,
                         max_tokens - token_count,
-                        results,
                     )
-                return results
             else:
-                results = []
                 for resp in mlx_stream_generate(
                     model,
                     self._text_tokenizer,
                     prompt=prompt_to_send,
                     **gen_kwargs,
                 ):
-                    results.append(resp)
-                return results
+                    if abort_event.is_set():
+                        logger.info("Text route: abort requested; stopping decode")
+                        break
+                    _emit_response(resp)
 
         def _run_specprefill(model, bc, use_mtp):
             """Score tokens, sparse prefill, then continue on the standard decode path."""
@@ -1525,103 +1548,144 @@ class SimpleEngine(BaseEngine):
                 prev_decoded = decoded
 
                 is_eos = tok_id == eos_id
-                results = [
+                _emit_response(
                     SimpleNamespace(
                         text=new_text,
                         finish_reason="stop" if is_eos else None,
                     )
-                ]
+                )
 
-                if not is_eos and max_tokens > 1:
-                    prompt_cache = bc
-                    if use_mtp and hasattr(model, "make_mtp_cache"):
-                        prompt_cache = bc + model.make_mtp_cache()
+                if abort_event.is_set():
+                    logger.info(
+                        "SpecPrefill text route: abort requested after seed token"
+                    )
+                    return
 
-                    continuation_prompt = mx.array([tok_id], dtype=mx.uint32)
-                    token_count = 1
-                    if _processors_retired(all_processors) and token_count < max_tokens:
+                if is_eos or max_tokens <= 1:
+                    return
+
+                prompt_cache = bc
+                if use_mtp and hasattr(model, "make_mtp_cache"):
+                    prompt_cache = bc + model.make_mtp_cache()
+
+                continuation_prompt = mx.array([tok_id], dtype=mx.uint32)
+                token_count = 1
+                if _processors_retired(all_processors) and token_count < max_tokens:
+                    logger.info(
+                        "SpecPrefill text route: request-local processor retired after seed token; "
+                        "resuming content phase with MTP=%s",
+                        hasattr(model, "make_mtp_cache") and model.mtp is not None,
+                    )
+                    _resume_after_processor_retirement(
+                        model,
+                        bc,
+                        continuation_prompt,
+                        max_tokens - token_count,
+                    )
+                    return
+
+                last_resp = None
+                retired = False
+                for resp in mlx_stream_generate(
+                    model,
+                    self._text_tokenizer,
+                    prompt=continuation_prompt,
+                    max_tokens=max_tokens - token_count,
+                    sampler=sampler,
+                    prefill_step_size=self._prefill_step_size,
+                    logits_processors=seeded_processors,
+                    prompt_cache=prompt_cache,
+                    mtp=use_mtp,
+                ):
+                    if abort_event.is_set():
                         logger.info(
-                            "SpecPrefill text route: request-local processor retired after seed token; "
+                            "SpecPrefill text route: abort requested; stopping decode"
+                        )
+                        break
+                    _emit_response(resp)
+                    token_count += 1
+                    last_resp = resp
+                    retired = _processors_retired(all_processors)
+                    if retired:
+                        logger.info(
+                            "SpecPrefill text route: request-local processor retired after %d tokens; "
                             "resuming content phase with MTP=%s",
+                            token_count,
                             hasattr(model, "make_mtp_cache") and model.mtp is not None,
                         )
-                        _resume_after_processor_retirement(
-                            model,
-                            bc,
-                            continuation_prompt,
-                            max_tokens - token_count,
-                            results,
-                        )
-                        return results
+                        break
 
-                    last_resp = None
-                    retired = False
-                    for resp in mlx_stream_generate(
+                if retired and token_count < max_tokens and last_resp is not None:
+                    seed = _seed_from_last_response(bc, last_resp)
+                    _resume_after_processor_retirement(
                         model,
-                        self._text_tokenizer,
-                        prompt=continuation_prompt,
-                        max_tokens=max_tokens - token_count,
-                        sampler=sampler,
-                        prefill_step_size=self._prefill_step_size,
-                        logits_processors=seeded_processors,
-                        prompt_cache=prompt_cache,
-                        mtp=use_mtp,
-                    ):
-                        results.append(resp)
-                        token_count += 1
-                        last_resp = resp
-                        retired = _processors_retired(all_processors)
-                        if retired:
-                            logger.info(
-                                "SpecPrefill text route: request-local processor retired after %d tokens; "
-                                "resuming content phase with MTP=%s",
-                                token_count,
-                                hasattr(model, "make_mtp_cache")
-                                and model.mtp is not None,
-                            )
-                            break
-
-                    if retired and token_count < max_tokens and last_resp is not None:
-                        seed = _seed_from_last_response(bc, last_resp)
-                        _resume_after_processor_retirement(
-                            model,
-                            bc,
-                            seed,
-                            max_tokens - token_count,
-                            results,
-                        )
-
-                return results
+                        bc,
+                        seed,
+                        max_tokens - token_count,
+                    )
 
             finally:
                 cleanup_rope(model)
 
-        all_resps = await self._run_blocking_serialized(_run_all)
+        async def _produce_responses() -> None:
+            try:
+                await self._run_blocking_serialized(
+                    _run_all,
+                    on_cancel=abort_event.set,
+                )
+            except asyncio.CancelledError:
+                raise
+            except BaseException as exc:
+                _emit_error(exc)
+            else:
+                _emit_done()
+
+        producer_task = asyncio.create_task(_produce_responses())
 
         # Yield results as GenerationOutput
         accumulated_text = ""
         token_count = 0
         finished = False
-        for i, resp in enumerate(all_resps):
-            token_count += 1
-            new_text = resp.text if hasattr(resp, "text") else str(resp)
-            accumulated_text += new_text
+        try:
+            while True:
+                kind, payload = await response_queue.get()
+                if kind == "done":
+                    break
+                if kind == "error":
+                    raise payload
+                resp = payload
 
-            is_last = i == len(all_resps) - 1
-            finished = is_last or token_count >= max_tokens
+                token_count += 1
+                new_text = resp.text if hasattr(resp, "text") else str(resp)
+                accumulated_text += new_text
 
-            yield GenerationOutput(
-                text=accumulated_text,
-                new_text=new_text,
-                prompt_tokens=full_token_count or 0,
-                completion_tokens=token_count,
-                finished=finished,
-                finish_reason=getattr(resp, "finish_reason", None)
-                or ("stop" if finished else None),
-            )
+                stop_hit = False
+                if stop:
+                    stop_hit = any(stop_seq in accumulated_text for stop_seq in stop)
+                finished = stop_hit or token_count >= max_tokens
+                finish_reason = getattr(resp, "finish_reason", None)
+                if stop_hit:
+                    finish_reason = "stop"
+                elif finish_reason is None and finished:
+                    finish_reason = "stop"
+                elif finish_reason is not None:
+                    finished = True
 
-            if finished:
-                break
+                yield GenerationOutput(
+                    text=accumulated_text,
+                    new_text=new_text,
+                    prompt_tokens=full_token_count or 0,
+                    completion_tokens=token_count,
+                    finished=finished,
+                    finish_reason=finish_reason,
+                )
+
+                if finished:
+                    break
+        finally:
+            if not producer_task.done():
+                abort_event.set()
+            await producer_task
 
         if not finished:
             yield GenerationOutput(
