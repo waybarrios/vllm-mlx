@@ -17,6 +17,7 @@ Architecture:
 """
 
 import logging
+import os
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -33,6 +34,8 @@ logger = logging.getLogger(__name__)
 
 def _processors_can_retire(processors: Optional[List[Callable]]) -> bool:
     """True when any processor advertises a retire-to-content transition."""
+    if os.getenv("VLLM_MLX_ENABLE_THINKING_RETIREMENT_RESUME") != "1":
+        return False
     return bool(processors) and any(
         isinstance(getattr(p, "is_retired", None), bool) for p in processors
     )

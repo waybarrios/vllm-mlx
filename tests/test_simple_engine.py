@@ -781,8 +781,10 @@ class TestSimpleEngineConcurrency:
         assert captured_kwargs["num_draft_tokens"] == 4
 
     @pytest.mark.anyio
-    async def test_stream_generate_text_reenables_mtp_after_retired_processor(self):
-        """Retired thinking processors should hand off the content phase to MTP."""
+    async def test_stream_generate_text_reenables_mtp_after_retired_processor_when_enabled(
+        self,
+    ):
+        """Retired thinking processor handoff is an explicit opt-in path."""
         from types import SimpleNamespace
 
         from vllm_mlx.engine.simple import SimpleEngine
@@ -825,6 +827,10 @@ class TestSimpleEngineConcurrency:
         engine._text_tokenizer = tokenizer
 
         with (
+            patch.dict(
+                "os.environ",
+                {"VLLM_MLX_ENABLE_THINKING_RETIREMENT_RESUME": "1"},
+            ),
             patch("mlx_lm.stream_generate", side_effect=fake_stream_generate),
             patch("mlx_lm.models.cache.make_prompt_cache", return_value=[]),
             patch("mlx_lm.models.cache.trim_prompt_cache"),
@@ -852,7 +858,7 @@ class TestSimpleEngineConcurrency:
     async def test_stream_generate_text_specprefill_reenables_mtp_after_retirement(
         self,
     ):
-        """SpecPrefill continuation should resume with MTP once thinking retires."""
+        """SpecPrefill retirement-to-MTP continuation is explicit opt-in."""
         from types import SimpleNamespace
 
         from vllm_mlx.engine.simple import SimpleEngine
@@ -898,6 +904,10 @@ class TestSimpleEngineConcurrency:
             return mx.array(11, dtype=mx.uint32), logits
 
         with (
+            patch.dict(
+                "os.environ",
+                {"VLLM_MLX_ENABLE_THINKING_RETIREMENT_RESUME": "1"},
+            ),
             patch("mlx_lm.stream_generate", side_effect=fake_stream_generate),
             patch("mlx_lm.models.cache.make_prompt_cache", return_value=[]),
             patch(

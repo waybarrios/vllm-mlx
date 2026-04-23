@@ -19,7 +19,6 @@ Architecture:
 """
 
 import asyncio
-import concurrent.futures
 import logging
 import time
 import uuid
@@ -786,56 +785,34 @@ class MLLMScheduler:
     async def _process_loop(self) -> None:
         """Main async processing loop.
 
-        All MLLM steps run on one worker thread. MLX generation streams are
-        thread-local, so prefill and decode must not bounce between the event
-        loop thread and a worker thread.
+        MLLM models are loaded on the server/event-loop thread, so their MLX
+        arrays and cache state must be consumed on that same thread.  Unlike
+        the text-only EngineCore path, moving MLLM prefill to a worker crosses
+        MLX stream ownership and can fail with "no Stream in current thread".
         """
-        _executor = concurrent.futures.ThreadPoolExecutor(
-            max_workers=1, thread_name_prefix="mllm-step"
-        )
-        loop = asyncio.get_running_loop()
-        worker_streams_bound = False
+        streams_bound = False
 
-        def _ensure_worker_streams_bound() -> None:
-            nonlocal worker_streams_bound
-            if not worker_streams_bound:
+        def _ensure_streams_bound() -> None:
+            nonlocal streams_bound
+            if not streams_bound:
                 bind_generation_streams()
-                worker_streams_bound = True
+                streams_bound = True
 
-        def _step_on_worker() -> None:
-            _ensure_worker_streams_bound()
-            self.step()
-
-        def _close_batch_generator_on_worker() -> None:
-            _ensure_worker_streams_bound()
-            if self.batch_generator is not None:
-                self.batch_generator.close()
-                self.batch_generator = None
-
-        try:
-            while self._running:
-                try:
-                    if self.has_requests():
-                        await loop.run_in_executor(_executor, _step_on_worker)
-                        await asyncio.sleep(0)
-                    else:
-                        # No work, wait a bit
-                        await asyncio.sleep(0.01)
-
-                except asyncio.CancelledError:
-                    raise
-                except Exception as e:
-                    logger.error(f"Error in MLLM process loop: {e}", exc_info=True)
-                    await asyncio.sleep(0.1)
-        finally:
-            close_future = loop.run_in_executor(
-                _executor, _close_batch_generator_on_worker
-            )
+        while self._running:
             try:
-                await asyncio.shield(close_future)
-            except BaseException:
-                pass
-            _executor.shutdown(wait=True)
+                if self.has_requests():
+                    _ensure_streams_bound()
+                    self.step()
+                    await asyncio.sleep(0)
+                else:
+                    # No work, wait a bit
+                    await asyncio.sleep(0.01)
+
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.error(f"Error in MLLM process loop: {e}", exc_info=True)
+                await asyncio.sleep(0.1)
 
     async def add_request_async(
         self,

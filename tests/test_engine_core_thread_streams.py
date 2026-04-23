@@ -68,8 +68,8 @@ async def test_engine_core_runs_all_scheduler_steps_on_one_worker_thread(monkeyp
 
 
 @pytest.mark.anyio
-async def test_mllm_scheduler_runs_all_steps_on_one_worker_thread(monkeypatch):
-    """MLLM scheduler loop follows the same thread-local stream invariant."""
+async def test_mllm_scheduler_runs_steps_on_model_load_thread(monkeypatch):
+    """MLLM keeps generation on the event-loop thread that loaded the model."""
     from vllm_mlx.mllm_scheduler import MLLMScheduler
 
     scheduler = object.__new__(MLLMScheduler)
@@ -107,6 +107,6 @@ async def test_mllm_scheduler_runs_all_steps_on_one_worker_thread(monkeypatch):
 
     assert step_threads
     assert len(set(step_threads)) == 1
-    assert step_threads[0] != main_thread
-    assert bind_threads == [step_threads[0]]
-    assert close_threads == [step_threads[0]]
+    assert step_threads[0] == main_thread
+    assert bind_threads == [main_thread]
+    assert close_threads == []
