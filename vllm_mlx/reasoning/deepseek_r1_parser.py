@@ -53,10 +53,7 @@ class DeepSeekR1ReasoningParser(BaseThinkingReasoningParser):
         """
         # If we have end token but no start token, treat beginning as reasoning
         if self.end_token in model_output and self.start_token not in model_output:
-            reasoning, _, content = model_output.partition(self.end_token)
-            reasoning = reasoning.strip() or None
-            content = content.strip() or None
-            return reasoning, content
+            return self._extract_complete_reasoning(model_output)
 
         # If neither token, return as pure content
         if self.end_token not in model_output and self.start_token not in model_output:
