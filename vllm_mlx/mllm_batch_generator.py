@@ -208,13 +208,16 @@ class MLLMBatch:
             self.samplers = list(self_s) + list(other_s)
 
         # Extend cache - handle both BatchKVCache (.keys/.values) and
-        # ArraysCache (.cache list) from hybrid models like Qwen3.5
+        # ArraysCache (.cache list) from hybrid models like Qwen3.5. Some
+        # cache integrations, such as quantized SDPA caches, expose state only
+        # through empty()/extend() and do not publish .keys.
         for c, o in zip(self.cache, other.cache):
             if c is not None and o is not None and hasattr(c, "extend"):
                 try:
                     has_kv = hasattr(c, "keys") and c.keys is not None
                     has_arrays = hasattr(c, "cache")
-                    if has_kv or has_arrays:
+                    has_extendable_state = hasattr(c, "empty") and not c.empty()
+                    if has_kv or has_arrays or has_extendable_state:
                         c.extend(o)
                 except Exception as e:
                     logger.warning(f"Failed to extend cache: {e}")

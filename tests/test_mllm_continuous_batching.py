@@ -235,6 +235,51 @@ class TestMLLMBatch:
         assert batch.uids == [1, 3]
         assert batch.request_ids == ["req-1", "req-3"]
 
+    def test_batch_extend_handles_empty_protocol_caches_without_keys(self):
+        """Caches with empty()/extend() but no .keys still need batch extension."""
+        from vllm_mlx.mllm_batch_generator import MLLMBatch, MLLMBatchRequest
+
+        class OpaqueCache:
+            def __init__(self):
+                self.extend_calls = 0
+                self.extended_with = None
+
+            def empty(self):
+                return False
+
+            def extend(self, other):
+                self.extend_calls += 1
+                self.extended_with = other
+
+        primary_cache = OpaqueCache()
+        other_cache = OpaqueCache()
+        primary = MLLMBatch(
+            uids=[1],
+            request_ids=["req-1"],
+            y=mx.array([100]),
+            logprobs=[mx.array([0.1])],
+            max_tokens=[100],
+            num_tokens=[0],
+            cache=[primary_cache],
+            requests=[MLLMBatchRequest(uid=1, request_id="req-1", prompt="one")],
+        )
+        other = MLLMBatch(
+            uids=[2],
+            request_ids=["req-2"],
+            y=mx.array([200]),
+            logprobs=[mx.array([0.2])],
+            max_tokens=[100],
+            num_tokens=[0],
+            cache=[other_cache],
+            requests=[MLLMBatchRequest(uid=2, request_id="req-2", prompt="two")],
+        )
+
+        primary.extend(other)
+
+        assert primary.y.shape == (2,)
+        assert primary_cache.extend_calls == 1
+        assert primary_cache.extended_with is other_cache
+
 
 class TestMLLMBatchStats:
     """Tests for MLLMBatchStats."""
