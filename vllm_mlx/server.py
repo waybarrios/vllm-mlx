@@ -1440,10 +1440,17 @@ async def _run_responses_request(
 
     cleaned_text, tool_calls = _parse_tool_calls_with_parser(output.text, chat_request)
     reasoning_text = None
-    if _reasoning_parser and not tool_calls:
-        reasoning_text, cleaned_text = _reasoning_parser.extract_reasoning(
-            cleaned_text or output.text
+    if _reasoning_parser:
+        reasoning_text, remaining_text = _reasoning_parser.extract_reasoning(
+            output.text
         )
+        if not tool_calls:
+            cleaned_text = remaining_text
+        else:
+            # Tool parser already stripped tool markup from cleaned_text,
+            # but reasoning markers (e.g. <|channel>thought...<channel|>)
+            # remain. Run reasoning parser on cleaned_text to strip them.
+            _, cleaned_text = _reasoning_parser.extract_reasoning(cleaned_text or "")
 
     output_items = _build_responses_output_items(
         clean_output_text(cleaned_text) if cleaned_text else None,
