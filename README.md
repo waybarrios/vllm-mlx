@@ -1,110 +1,39 @@
-# vLLM-MLX
+# vllm-mlx
 
-**vLLM-like inference for Apple Silicon** - GPU-accelerated Text, Image, Video & Audio on Mac
+**Read this in other languages:** [English](README.md) · [Español](README.es.md) · [Français](README.fr.md) · [中文](README.zh.md)
 
-[![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
+**Continuous batching + OpenAI + Anthropic APIs in one server. Native Apple Silicon inference.**
+
+[![PyPI version](https://img.shields.io/pypi/v/vllm-mlx.svg)](https://pypi.org/project/vllm-mlx/)
+[![PyPI Downloads](https://img.shields.io/pypi/dm/vllm-mlx.svg)](https://pypi.org/project/vllm-mlx/)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
+[![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 [![Apple Silicon](https://img.shields.io/badge/Apple-Silicon-black.svg)](https://support.apple.com/en-us/HT211814)
-[![GitHub](https://img.shields.io/badge/GitHub-waybarrios%2Fvllm--mlx-blue?logo=github)](https://github.com/waybarrios/vllm-mlx)
+[![GitHub stars](https://img.shields.io/github/stars/waybarrios/vllm-mlx.svg?style=social)](https://github.com/waybarrios/vllm-mlx)
 
-## Overview
+---
 
-vllm-mlx brings native Apple Silicon GPU acceleration to vLLM by integrating:
+## What is vllm-mlx?
 
-- **[MLX](https://github.com/ml-explore/mlx)**: Apple's ML framework with unified memory and Metal kernels
-- **[mlx-lm](https://github.com/ml-explore/mlx-lm)**: Optimized LLM inference with KV cache and quantization
-- **[mlx-vlm](https://github.com/Blaizzy/mlx-vlm)**: Vision-language models for multimodal inference
-- **[mlx-audio](https://github.com/Blaizzy/mlx-audio)**: Speech-to-Text and Text-to-Speech with native voices
-- **[mlx-embeddings](https://github.com/Blaizzy/mlx-embeddings)**: Text embeddings for semantic search and RAG
+A vLLM-style inference server for Apple Silicon Macs. Unlike `Ollama` or `mlx-lm` used directly, it ships **continuous batching, paged KV cache, prefix caching, and SSD-tiered cache**, and exposes **both OpenAI `/v1/*` and Anthropic `/v1/messages`** from a single process. Run LLMs, vision models, audio, and embeddings on Metal with unified memory, no conversion step.
 
-## Features
-
-- **Multimodal** - Text, Image, Video & Audio in one platform
-- **Native GPU acceleration** on Apple Silicon (M1, M2, M3, M4)
-- **Native TTS voices** - Spanish, French, Chinese, Japanese + 5 more languages
-- **OpenAI API compatible** - drop-in replacement for OpenAI client
-- **Anthropic Messages API** - native `/v1/messages` endpoint for Claude Code and OpenCode
-- **Embeddings** - OpenAI-compatible `/v1/embeddings` endpoint with mlx-embeddings
-- **Reasoning Models** - extract thinking process from Qwen3, DeepSeek-R1
-- **MCP Tool Calling** - integrate external tools via Model Context Protocol
-- **Paged KV Cache** - memory-efficient caching with prefix sharing
-- **Continuous Batching** - high throughput for multiple concurrent users
-
-## Quick Start
-
-### Installation
-
-**Using uv (recommended):**
+## Quick start (30 seconds)
 
 ```bash
-# Install as CLI tool (system-wide)
-uv tool install git+https://github.com/waybarrios/vllm-mlx.git
-
-# Or install in a project/virtual environment
-uv pip install git+https://github.com/waybarrios/vllm-mlx.git
-```
-
-**Using pip:**
-
-```bash
-# Install from GitHub
-pip install git+https://github.com/waybarrios/vllm-mlx.git
-
-# Or clone and install in development mode
-git clone https://github.com/waybarrios/vllm-mlx.git
-cd vllm-mlx
-pip install -e .
-```
-
-### Start Server
-
-```bash
-# Simple mode (single user, max throughput)
-vllm-mlx serve mlx-community/Llama-3.2-3B-Instruct-4bit --port 8000
-
-# Continuous batching (multiple users)
+pip install vllm-mlx
 vllm-mlx serve mlx-community/Llama-3.2-3B-Instruct-4bit --port 8000 --continuous-batching
-
-# With API key authentication
-vllm-mlx serve mlx-community/Llama-3.2-3B-Instruct-4bit --port 8000 --api-key your-secret-key
 ```
 
-### Use with OpenAI SDK
+**OpenAI SDK:**
 
 ```python
 from openai import OpenAI
-
-# Without API key (local development)
 client = OpenAI(base_url="http://localhost:8000/v1", api_key="not-needed")
-
-# With API key (production)
-client = OpenAI(base_url="http://localhost:8000/v1", api_key="your-secret-key")
-
-response = client.chat.completions.create(
-    model="default",
-    messages=[{"role": "user", "content": "Hello!"}],
-)
-print(response.choices[0].message.content)
+r = client.chat.completions.create(model="default", messages=[{"role": "user", "content": "Hi!"}])
+print(r.choices[0].message.content)
 ```
 
-### Use with Anthropic SDK
-
-vllm-mlx exposes an Anthropic-compatible `/v1/messages` endpoint, so tools like Claude Code and OpenCode can connect directly.
-
-```python
-from anthropic import Anthropic
-
-client = Anthropic(base_url="http://localhost:8000", api_key="not-needed")
-
-response = client.messages.create(
-    model="default",
-    max_tokens=256,
-    messages=[{"role": "user", "content": "Hello!"}]
-)
-print(response.content[0].text)
-```
-
-To use with Claude Code:
+**Anthropic SDK / Claude Code:**
 
 ```bash
 export ANTHROPIC_BASE_URL=http://localhost:8000
@@ -112,291 +41,262 @@ export ANTHROPIC_API_KEY=not-needed
 claude
 ```
 
-See [Anthropic Messages API docs](docs/guides/server.md#anthropic-messages-api) for streaming, tool calling, system messages, and token counting.
+## Features
 
-### Multimodal (Images & Video)
+### APIs
+- **OpenAI-compatible**: `/v1/chat/completions`, `/v1/completions`, `/v1/embeddings`, `/v1/rerank`, `/v1/responses`
+- **Anthropic-compatible**: `/v1/messages` (streaming, tool use, system prompts)
+- **MCP Tool Calling**: 12 parsers (OpenAI, Anthropic, Gemini, Qwen, DeepSeek, Gemma, and more)
+- **Structured output**: JSON Schema via `response_format` (lm-format-enforcer)
+
+### Throughput & memory
+- **Continuous batching**: high throughput for concurrent requests
+- **Paged KV cache**: memory-efficient with prefix sharing
+- **SSD-tiered KV cache**: spill prefix cache to disk for long-context agents (`--ssd-cache-dir`)
+- **Warm prompts**: preload popular prefixes at startup (`--warm-prompts`) for 1.3-2.25x TTFT
+- **Prefix cache**: trie-based, shared across requests
+
+### Multimodal
+- **Text + image + video + audio** from one server
+- Vision models: Gemma 3, Gemma 4, Qwen3-VL, Pixtral, Llama vision
+- **Audio input** in chat (`audio_url` content blocks)
+- **Native TTS**: 11 voices, 15+ languages (Kokoro, Chatterbox, VibeVoice, VoxCPM)
+- **STT**: Whisper family with RTF up to 197x on M4 Max
+
+### Reasoning & advanced
+- **Reasoning extraction**: Qwen3, DeepSeek-R1 (`--reasoning-parser`)
+- **MoE expert reduction**: `--moe-top-k` for +7-16% on Qwen3-30B-A3B
+- **Speculative decoding**: `--mtp` for Qwen3-Next
+- **Sparse prefill**: attention-based `--spec-prefill` for TTFT reduction
+
+### Observability
+- **Prometheus metrics**: `/metrics` endpoint with `--metrics`
+- **Built-in benchmarker**: `vllm-mlx bench-serve` for prompt sweeps with CSV/JSON output
+
+### Native GPU acceleration
+- Apple Silicon only (M1, M2, M3, M4) with Metal kernels via MLX
+- Unified memory, no model conversion
+
+## Performance
+
+**LLM decode (M4 Max, 128 GB, greedy, single stream):**
+
+| Model | Tok/s | Memory |
+|-------|------:|-------:|
+| Qwen3-0.6B-8bit | 417.9 | 0.7 GB |
+| Llama-3.2-3B-Instruct-4bit | 205.6 | 1.8 GB |
+| Qwen3-30B-A3B-4bit | 127.7 | ~18 GB |
+
+**Audio speech-to-text (M4 Max, RTF = real-time factor):**
+
+| Model | RTF | Use case |
+|-------|----:|----------|
+| whisper-tiny | 197x | Real-time / low latency |
+| whisper-large-v3-turbo | 55x | Quality + speed |
+| whisper-large-v3 | 24x | Highest accuracy |
+
+See [docs/benchmarks/](docs/benchmarks/) for continuous-batching results, KV-cache quantization (4-bit / 8-bit / fp16), and MoE top-k sweeps.
+
+## Examples
+
+### Anthropic API (Claude Code, OpenCode)
+
+```bash
+vllm-mlx serve mlx-community/Qwen3-8B-4bit --port 8000
+export ANTHROPIC_BASE_URL=http://localhost:8000
+export ANTHROPIC_API_KEY=not-needed
+claude
+```
+
+### Reasoning models (Qwen3, DeepSeek-R1)
+
+```bash
+vllm-mlx serve mlx-community/Qwen3-8B-4bit --reasoning-parser qwen3
+```
+
+```python
+r = client.chat.completions.create(
+    model="default",
+    messages=[{"role": "user", "content": "What is 17 * 23?"}],
+)
+print("Thinking:", r.choices[0].message.reasoning)
+print("Answer:",   r.choices[0].message.content)
+```
+
+### Multimodal (image + text)
 
 ```bash
 vllm-mlx serve mlx-community/Qwen3-VL-4B-Instruct-3bit --port 8000
 ```
 
 ```python
-response = client.chat.completions.create(
+r = client.chat.completions.create(
     model="default",
-    messages=[{
-        "role": "user",
-        "content": [
-            {"type": "text", "text": "What's in this image?"},
-            {"type": "image_url", "image_url": {"url": "https://example.com/image.jpg"}}
-        ]
-    }]
+    messages=[{"role": "user", "content": [
+        {"type": "text", "text": "What is in this image?"},
+        {"type": "image_url", "image_url": {"url": "https://example.com/cat.jpg"}},
+    ]}],
 )
 ```
 
-### Audio (TTS/STT)
-
-```bash
-# Install audio dependencies
-pip install vllm-mlx[audio]
-python -m spacy download en_core_web_sm
-brew install espeak-ng  # macOS, for non-English languages
-```
-
-```bash
-# Text-to-Speech (English)
-python examples/tts_example.py "Hello, how are you?" --play
-
-# Text-to-Speech (Spanish)
-python examples/tts_multilingual.py "Hola mundo" --lang es --play
-
-# List available models and languages
-python examples/tts_multilingual.py --list-models
-python examples/tts_multilingual.py --list-languages
-```
-
-**Supported TTS Models:**
-| Model | Languages | Description |
-|-------|-----------|-------------|
-| Kokoro | EN, ES, FR, JA, ZH, IT, PT, HI | Fast, 82M params, 11 voices |
-| Chatterbox | 15+ languages | Expressive, voice cloning |
-| VibeVoice | EN | Realtime, low latency |
-| VoxCPM | ZH, EN | High quality Chinese/English |
-
-### Reasoning Models
-
-Extract the thinking process from reasoning models like Qwen3 and DeepSeek-R1:
-
-```bash
-# Start server with reasoning parser
-vllm-mlx serve mlx-community/Qwen3-8B-4bit --reasoning-parser qwen3
-```
+### Structured output (JSON Schema)
 
 ```python
-response = client.chat.completions.create(
+r = client.chat.completions.create(
     model="default",
-    messages=[{"role": "user", "content": "What is 17 × 23?"}]
+    messages=[{"role": "user", "content": "List 3 colors."}],
+    response_format={
+        "type": "json_schema",
+        "json_schema": {
+            "schema": {"type": "object", "properties": {"colors": {"type": "array", "items": {"type": "string"}}}}
+        },
+    },
 )
-
-# Access reasoning separately from the answer
-print("Thinking:", response.choices[0].message.reasoning)
-print("Answer:", response.choices[0].message.content)
 ```
 
-**Supported Parsers:**
-| Parser | Models | Description |
-|--------|--------|-------------|
-| `qwen3` | Qwen3 series | Requires both `<think>` and `</think>` tags |
-| `deepseek_r1` | DeepSeek-R1 | Handles implicit `<think>` tag |
+### Reranking (`/v1/rerank`)
+
+```bash
+curl http://localhost:8000/v1/rerank -H 'Content-Type: application/json' -d '{
+  "model": "default",
+  "query": "apple silicon inference",
+  "documents": ["MLX is Apples framework", "Metal kernels on M-series", "CUDA on NVIDIA"]
+}'
+```
 
 ### Embeddings
 
-Generate text embeddings for semantic search, RAG, and similarity:
-
 ```bash
-# Start server with an embedding model pre-loaded
-vllm-mlx serve mlx-community/Llama-3.2-3B-Instruct-4bit --embedding-model mlx-community/all-MiniLM-L6-v2-4bit
+vllm-mlx serve <llm-model> --embedding-model mlx-community/all-MiniLM-L6-v2-4bit
 ```
 
 ```python
-# Generate embeddings using the OpenAI SDK
-embeddings = client.embeddings.create(
-    model="mlx-community/all-MiniLM-L6-v2-4bit",
-    input=["Hello world", "How are you?"]
-)
-print(f"Dimensions: {len(embeddings.data[0].embedding)}")
+emb = client.embeddings.create(model="mlx-community/all-MiniLM-L6-v2-4bit", input=["Hello", "World"])
 ```
 
-See [Embeddings Guide](docs/guides/embeddings.md) for details on supported models and lazy loading.
+### Audio (TTS / STT)
+
+```bash
+pip install vllm-mlx[audio]
+brew install espeak-ng        # macOS, needed for non-English TTS
+
+python examples/tts_example.py "Hello, how are you?" --play
+python examples/tts_multilingual.py "Hola mundo" --lang es --play
+```
+
+### Built-in benchmarking
+
+```bash
+vllm-mlx bench-serve --url http://localhost:8000 --concurrency 5 --prompts prompts.txt --output results.csv
+```
+
+### Prometheus metrics
+
+```bash
+vllm-mlx serve <model> --metrics
+curl http://localhost:8000/metrics
+```
+
+## Installation
+
+**Using uv (recommended):**
+
+```bash
+uv tool install vllm-mlx                 # CLI, system-wide
+# or in a project
+uv pip install vllm-mlx
+```
+
+**Using pip:**
+
+```bash
+pip install vllm-mlx
+
+# Audio extras
+pip install vllm-mlx[audio]
+brew install espeak-ng
+python -m spacy download en_core_web_sm
+```
+
+**From source:**
+
+```bash
+git clone https://github.com/waybarrios/vllm-mlx.git
+cd vllm-mlx
+pip install -e .
+```
+
+See [Installation Guide](docs/getting-started/installation.md) for full options.
 
 ## Documentation
 
-For full documentation, see the [docs](docs/) directory:
-
-- **Getting Started**
-  - [Installation](docs/getting-started/installation.md)
-  - [Quick Start](docs/getting-started/quickstart.md)
-
-- **User Guides**
-  - [OpenAI-Compatible Server](docs/guides/server.md)
-  - [Anthropic Messages API](docs/guides/server.md#anthropic-messages-api)
-  - [Python API](docs/guides/python-api.md)
-  - [Multimodal (Images & Video)](docs/guides/multimodal.md)
-  - [Audio (STT/TTS)](docs/guides/audio.md)
-  - [Embeddings](docs/guides/embeddings.md)
-  - [Reasoning Models](docs/guides/reasoning.md)
-  - [MCP & Tool Calling](docs/guides/mcp-tools.md)
-  - [Continuous Batching](docs/guides/continuous-batching.md)
-
-- **Reference**
-  - [CLI Commands](docs/reference/cli.md)
-  - [Supported Models](docs/reference/models.md)
-  - [Configuration](docs/reference/configuration.md)
-
-- **Benchmarks**
-  - [LLM Benchmarks](docs/benchmarks/llm.md)
-  - [Image Benchmarks](docs/benchmarks/image.md)
-  - [Video Benchmarks](docs/benchmarks/video.md)
-  - [Audio Benchmarks](docs/benchmarks/audio.md)
+- **Getting started**: [Installation](docs/getting-started/installation.md) · [Quick Start](docs/getting-started/quickstart.md)
+- **Servers & APIs**: [OpenAI server](docs/guides/server.md) · [Anthropic Messages API](docs/guides/server.md#anthropic-messages-api) · [Python API](docs/guides/python-api.md)
+- **Features**: [Multimodal](docs/guides/multimodal.md) · [Audio](docs/guides/audio.md) · [Embeddings](docs/guides/embeddings.md) · [Reasoning](docs/guides/reasoning.md) · [MCP & Tool Calling](docs/guides/mcp-tools.md) · [Tool Parsers](docs/guides/tool-calling.md)
+- **Performance**: [Continuous Batching](docs/guides/continuous-batching.md) · [Warm Prompts](docs/guides/warm-prompts.md) · [MoE Top-K](docs/guides/moe-top-k.md)
+- **Reference**: [CLI](docs/reference/cli.md) · [Models](docs/reference/models.md) · [Configuration](docs/reference/configuration.md)
+- **Benchmarks**: [LLM](docs/benchmarks/llm.md) · [Image](docs/benchmarks/image.md) · [Video](docs/benchmarks/video.md) · [Audio](docs/benchmarks/audio.md)
 
 ## Architecture
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────┐
-│                           vLLM API Layer                                │
-│                    (OpenAI-compatible interface)                         │
+│                           vllm-mlx Server                               │
+│   OpenAI /v1/*  ·  Anthropic /v1/messages  ·  /v1/rerank  ·  /metrics   │
 └─────────────────────────────────────────────────────────────────────────┘
                                    │
                                    ▼
 ┌─────────────────────────────────────────────────────────────────────────┐
-│                            MLXPlatform                                  │
-│               (vLLM platform plugin for Apple Silicon)                  │
+│  Continuous batching · Paged KV cache · Prefix cache · SSD tiering      │
 └─────────────────────────────────────────────────────────────────────────┘
                                    │
         ┌─────────────┬────────────┴────────────┬─────────────┐
         ▼             ▼                         ▼             ▼
 ┌───────────────┐ ┌───────────────┐ ┌───────────────┐ ┌───────────────┐
 │    mlx-lm     │ │   mlx-vlm     │ │   mlx-audio   │ │mlx-embeddings │
-│(LLM inference)│ │ (Vision+LLM)  │ │  (TTS + STT)  │ │ (Embeddings)  │
+│    (LLMs)     │ │  (Vision)     │ │  (TTS + STT)  │ │ (Embeddings)  │
 └───────────────┘ └───────────────┘ └───────────────┘ └───────────────┘
-        │             │                         │             │
-        └─────────────┴─────────────────────────┴─────────────┘
                                    │
                                    ▼
 ┌─────────────────────────────────────────────────────────────────────────┐
-│                              MLX                                        │
-│                (Apple ML Framework - Metal kernels)                      │
+│                   MLX · Metal kernels · Unified memory                  │
 └─────────────────────────────────────────────────────────────────────────┘
 ```
 
-## Performance
-
-**LLM Performance (M4 Max, 128GB):**
-
-| Model | Speed | Memory |
-|-------|-------|--------|
-| Qwen3-0.6B-8bit | 402 tok/s | 0.7 GB |
-| Llama-3.2-1B-4bit | 464 tok/s | 0.7 GB |
-| Llama-3.2-3B-4bit | 200 tok/s | 1.8 GB |
-
-**Continuous Batching (5 concurrent requests):**
-
-| Model | Single | Batched | Speedup |
-|-------|--------|---------|---------|
-| Qwen3-0.6B-8bit | 328 tok/s | 1112 tok/s | **3.4x** |
-| Llama-3.2-1B-4bit | 299 tok/s | 613 tok/s | **2.0x** |
-
-**Audio - Speech-to-Text (M4 Max, 128GB):**
-
-| Model | RTF* | Use Case |
-|-------|------|----------|
-| whisper-tiny | **197x** | Real-time, low latency |
-| whisper-large-v3-turbo | **55x** | Best quality/speed balance |
-| whisper-large-v3 | **24x** | Highest accuracy |
-
-*RTF = Real-Time Factor. RTF of 100x means 1 minute transcribes in ~0.6 seconds.
-
-See [benchmarks](docs/benchmarks/) for detailed results.
-
-## Gemma 3 Support
-
-vllm-mlx includes native support for Gemma 3 vision models. Gemma 3 is automatically detected as MLLM.
-
-### Usage
-
-```bash
-# Start server with Gemma 3
-vllm-mlx serve mlx-community/gemma-3-27b-it-4bit --port 8000
-
-# Verify it loaded as MLLM (not LLM)
-curl http://localhost:8000/health
-# Should show: "model_type": "mllm"
-```
-
-### Long Context Patch (mlx-vlm)
-
-Gemma 3's default `sliding_window=1024` limits context to ~10K tokens on Apple Silicon (Metal GPU timeout at higher context). To enable longer context (up to ~50K tokens), patch mlx-vlm:
-
-**Location:** `~/.../site-packages/mlx_vlm/models/gemma3/language.py`
-
-Find the `make_cache` method and replace with:
-
-```python
-def make_cache(self):
-    import os
-    # Set GEMMA3_SLIDING_WINDOW=8192 for ~40K context
-    # Set GEMMA3_SLIDING_WINDOW=0 for ~50K context (full KVCache)
-    sliding_window = int(os.environ.get('GEMMA3_SLIDING_WINDOW', self.config.sliding_window))
-
-    caches = []
-    for i in range(self.config.num_hidden_layers):
-        if (
-            i % self.config.sliding_window_pattern
-            == self.config.sliding_window_pattern - 1
-        ):
-            caches.append(KVCache())
-        elif sliding_window == 0:
-            caches.append(KVCache())  # Full context for all layers
-        else:
-            caches.append(RotatingKVCache(max_size=sliding_window, keep=0))
-    return caches
-```
-
-**Usage:**
-
-```bash
-# Default (~10K max context)
-vllm-mlx serve mlx-community/gemma-3-27b-it-4bit --port 8000
-
-# Extended context (~40K max)
-GEMMA3_SLIDING_WINDOW=8192 vllm-mlx serve mlx-community/gemma-3-27b-it-4bit --port 8000
-
-# Maximum context (~50K max)
-GEMMA3_SLIDING_WINDOW=0 vllm-mlx serve mlx-community/gemma-3-27b-it-4bit --port 8000
-```
-
-**Benchmark Results (M4 Max 128GB):**
-
-| Setting | Max Context | Memory |
-|---------|-------------|--------|
-| Default (1024) | ~10K tokens | ~16GB |
-| `GEMMA3_SLIDING_WINDOW=8192` | ~40K tokens | ~25GB |
-| `GEMMA3_SLIDING_WINDOW=0` | ~50K tokens | ~35GB |
-
 ## Contributing
 
-We welcome contributions! See [Contributing Guide](docs/development/contributing.md) for details.
-
-- Bug fixes and improvements
-- Performance optimizations
-- Documentation improvements
-- Benchmarks on different Apple Silicon chips
-
-Submit PRs to: [https://github.com/waybarrios/vllm-mlx](https://github.com/waybarrios/vllm-mlx)
+Bug fixes, perf work, docs, and benchmarks on different Apple Silicon chips all welcome. See the [Contributing Guide](docs/development/contributing.md).
 
 ## License
 
-Apache 2.0 - see [LICENSE](LICENSE) for details.
+Apache 2.0. See [LICENSE](LICENSE).
 
 ## Citation
-
-If you use vLLM-MLX in your research or project, please cite:
 
 ```bibtex
 @software{vllm_mlx2025,
   author = {Barrios, Wayner},
-  title = {vLLM-MLX: Apple Silicon MLX Backend for vLLM},
-  year = {2025},
-  url = {https://github.com/waybarrios/vllm-mlx},
-  note = {Native GPU-accelerated LLM and vision-language model inference on Apple Silicon}
+  title  = {vllm-mlx: Apple Silicon MLX Backend for vLLM},
+  year   = {2025},
+  url    = {https://github.com/waybarrios/vllm-mlx},
+  note   = {Native GPU-accelerated LLM and vision-language model inference on Apple Silicon}
 }
 ```
 
 ## Acknowledgments
 
-- [MLX](https://github.com/ml-explore/mlx) - Apple's ML framework
-- [mlx-lm](https://github.com/ml-explore/mlx-lm) - LLM inference library
-- [mlx-vlm](https://github.com/Blaizzy/mlx-vlm) - Vision-language models
-- [mlx-audio](https://github.com/Blaizzy/mlx-audio) - Text-to-Speech and Speech-to-Text
-- [mlx-embeddings](https://github.com/Blaizzy/mlx-embeddings) - Text embeddings
-- [Rapid-MLX](https://github.com/raullenchai/Rapid-MLX) - Community fork of vllm-mlx
-- [vLLM](https://github.com/vllm-project/vllm) - High-throughput LLM serving
+- [MLX](https://github.com/ml-explore/mlx). Apple's ML framework.
+- [mlx-lm](https://github.com/ml-explore/mlx-lm). LLM inference library.
+- [mlx-vlm](https://github.com/Blaizzy/mlx-vlm). Vision-language models.
+- [mlx-audio](https://github.com/Blaizzy/mlx-audio). Text-to-Speech and Speech-to-Text.
+- [mlx-embeddings](https://github.com/Blaizzy/mlx-embeddings). Text embeddings.
+- [Rapid-MLX](https://github.com/raullenchai/Rapid-MLX). Community fork of vllm-mlx.
+- [vLLM](https://github.com/vllm-project/vllm). High-throughput LLM serving. vllm-mlx is inspired by vLLM and adopts its continuous-batching and paged KV-cache design for Apple Silicon via MLX.
+
+## Star history
+
+[![Star History Chart](https://api.star-history.com/svg?repos=waybarrios/vllm-mlx&type=Date)](https://star-history.com/#waybarrios/vllm-mlx&Date)
+
+---
+
+**If vllm-mlx helped you, please star the repo. It helps more Apple Silicon devs find it.**
