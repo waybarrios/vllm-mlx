@@ -804,13 +804,65 @@ class TestMLLMBatchGeneratorMTPGuards:
         assert request_sampler.call_count == 1
         assert batch_gen.sampler.call_count == 0
 
-    def test_next_drops_retired_processors_and_makes_request_mtp_eligible(self):
+    def test_next_keeps_retired_processors_by_default(self, monkeypatch):
         from vllm_mlx.mllm_batch_generator import (
             MLLMBatch,
             MLLMBatchGenerator,
             MLLMBatchRequest,
             MLLMBatchStats,
         )
+
+        monkeypatch.delenv("VLLM_MLX_ENABLE_THINKING_RETIREMENT_RESUME", raising=False)
+
+        class RetiredProcessor:
+            is_retired = True
+
+            def __call__(self, tokens, logits):
+                return logits
+
+        processor = RetiredProcessor()
+        generator = MLLMBatchGenerator.__new__(MLLMBatchGenerator)
+        generator._stats = MLLMBatchStats()
+        generator.stop_tokens = set()
+        generator.unprocessed_requests = []
+        generator._pending_error_responses = []
+        generator._prefill_progress = {}
+        generator.prefix_cache = None
+        generator._maybe_store_prefix_cache = lambda batch, end_idx: None
+        generator._step = lambda *args, **kwargs: (
+            mx.array([11]),
+            [mx.array([0.2, 0.8])],
+        )
+
+        request = MLLMBatchRequest(uid=1, request_id="req-1", prompt="hello")
+        generator.active_batch = MLLMBatch(
+            uids=[1],
+            request_ids=["req-1"],
+            y=mx.array([7]),
+            logprobs=[mx.array([0.5, 0.5])],
+            max_tokens=[4],
+            num_tokens=[0],
+            cache=[],
+            requests=[request],
+            logits_processors=[[processor]],
+            samplers=None,
+        )
+
+        responses = MLLMBatchGenerator._next(generator)
+
+        assert len(responses) == 1
+        assert generator.active_batch is not None
+        assert generator.active_batch.logits_processors == [[processor]]
+
+    def test_next_drops_retired_processors_only_when_enabled(self, monkeypatch):
+        from vllm_mlx.mllm_batch_generator import (
+            MLLMBatch,
+            MLLMBatchGenerator,
+            MLLMBatchRequest,
+            MLLMBatchStats,
+        )
+
+        monkeypatch.setenv("VLLM_MLX_ENABLE_THINKING_RETIREMENT_RESUME", "1")
 
         class RetiredProcessor:
             is_retired = True
