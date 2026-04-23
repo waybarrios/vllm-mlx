@@ -281,12 +281,12 @@ class TestSimpleEngineConcurrency:
 
         with (
             patch("vllm_mlx.engine.simple.is_mllm_model", return_value=False),
-            patch("vllm_mlx.engine.simple.mx.default_device", return_value="gpu"),
+            patch("vllm_mlx.mlx_streams.mx.default_device", return_value="gpu"),
             patch(
-                "vllm_mlx.engine.simple.mx.new_stream",
+                "vllm_mlx.mlx_streams.mx.new_stream",
                 return_value=sentinel_stream,
             ),
-            patch("vllm_mlx.engine.simple.mx.set_default_stream"),
+            patch("vllm_mlx.mlx_streams.mx.set_default_stream"),
         ):
             engine = SimpleEngine("test-model")
             observed = await engine._run_blocking_serialized(

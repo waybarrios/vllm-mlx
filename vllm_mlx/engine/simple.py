@@ -7,7 +7,6 @@ performance when serving a single user at a time.
 """
 
 import asyncio
-import importlib
 import logging
 import time
 from collections.abc import AsyncIterator
@@ -23,21 +22,14 @@ from .base import (
     cleanup_startup_cancellation,
     run_blocking_startup_work,
 )
+from ..mlx_streams import bind_generation_streams
 
 logger = logging.getLogger(__name__)
 
 
 def _bind_worker_generation_streams() -> None:
     """Rebind mlx generation streams inside the current worker thread."""
-    default_stream = mx.new_stream(mx.default_device())
-    mx.set_default_stream(default_stream)
-    for module_name in ("mlx_lm.generate", "mlx_vlm.generate"):
-        try:
-            module = importlib.import_module(module_name)
-        except ImportError:
-            continue
-        if hasattr(module, "generation_stream"):
-            module.generation_stream = default_stream
+    bind_generation_streams()
 
 
 def _seed_logits_processors(
