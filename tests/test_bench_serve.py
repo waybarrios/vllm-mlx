@@ -511,9 +511,9 @@ class TestAutoDetectionParsing:
         data = {
             "model": "mlx-community/Llama-3.2-1B-Instruct-4bit",
             "metal": {
-                "active_gb": 12.5,
-                "peak_gb": 14.0,
-                "cache_gb": 2.0,
+                "active_memory_gb": 12.5,
+                "peak_memory_gb": 14.0,
+                "cache_memory_gb": 2.0,
             },
             "cache": {"type": "paged"},
         }
@@ -523,6 +523,20 @@ class TestAutoDetectionParsing:
         assert result["metal_peak_gb"] == pytest.approx(14.0)
         assert result["metal_cache_gb"] == pytest.approx(2.0)
         assert result["cache_type"] == "paged"
+
+    def test_parse_status_response_accepts_legacy_metal_keys(self):
+        data = {
+            "model": "legacy-server",
+            "metal": {
+                "active_gb": 12.5,
+                "peak_gb": 14.0,
+                "cache_gb": 2.0,
+            },
+        }
+        result = parse_status_response(data)
+        assert result["metal_active_gb"] == pytest.approx(12.5)
+        assert result["metal_peak_gb"] == pytest.approx(14.0)
+        assert result["metal_cache_gb"] == pytest.approx(2.0)
 
     def test_parse_status_no_metal(self):
         data = {"model": "some-model"}
@@ -846,9 +860,9 @@ class TestWorkloadRunner:
                 return {
                     "cache": {"type": "paged"},
                     "metal": {
-                        "active_gb": 42.0,
-                        "peak_gb": 45.0,
-                        "cache_gb": 4.0,
+                        "active_memory_gb": 42.0,
+                        "peak_memory_gb": 45.0,
+                        "cache_memory_gb": 4.0,
                     },
                 }
 

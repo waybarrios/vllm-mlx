@@ -402,9 +402,15 @@ def parse_status_response(data: dict) -> dict:
     cache = data.get("cache") or {}
     return {
         "model": data.get("model", ""),
-        "metal_active_gb": float(metal.get("active_gb") or 0.0),
-        "metal_peak_gb": float(metal.get("peak_gb") or 0.0),
-        "metal_cache_gb": float(metal.get("cache_gb") or 0.0),
+        "metal_active_gb": float(
+            metal.get("active_memory_gb") or metal.get("active_gb") or 0.0
+        ),
+        "metal_peak_gb": float(
+            metal.get("peak_memory_gb") or metal.get("peak_gb") or 0.0
+        ),
+        "metal_cache_gb": float(
+            metal.get("cache_memory_gb") or metal.get("cache_gb") or 0.0
+        ),
         "cache_type": cache.get("type", "") or "",
     }
 
