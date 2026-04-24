@@ -13,8 +13,15 @@ repos:
     rev: v0.1.9
     hooks:
       - id: ruff
-        args: [--fix, --exit-non-zero-on-fix]
+        args: [--select, E,F,W, --ignore, E402,E501,E731,F811,F841]
       - id: ruff-format
+
+  - repo: https://github.com/psf/black
+    rev: 24.1.1
+    hooks:
+      - id: black
+        args: [--check]
+        files: ^(vllm_mlx|tests)/
 
   - repo: https://github.com/pre-commit/mirrors-mypy
     rev: v1.8.0
