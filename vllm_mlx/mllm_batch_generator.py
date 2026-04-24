@@ -66,6 +66,39 @@ class PrefillAbortedError(Exception):
         super().__init__(f"Prefill aborted for request {request_id}")
 
 
+def _cache_eval_tensors(cache: List[Any]) -> List[Any]:
+    """Return realized tensors that break lazy cache graphs between chunks."""
+    tensors: List[Any] = []
+    for c in cache:
+        keys = getattr(c, "keys", None)
+        values = getattr(c, "values", None)
+        if keys is not None or values is not None:
+            if keys is not None:
+                tensors.append(keys)
+            if values is not None:
+                tensors.append(values)
+            continue
+
+        try:
+            state = getattr(c, "state", None)
+        except AttributeError:
+            state = None
+        if state is None:
+            continue
+        if isinstance(state, (list, tuple)):
+            tensors.extend(s for s in state if s is not None)
+        else:
+            tensors.append(state)
+    return tensors
+
+
+def _eval_prompt_cache(cache: List[Any]) -> None:
+    """Evaluate all cache tensors used by hybrid chunked prefill."""
+    tensors = _cache_eval_tensors(cache)
+    if tensors:
+        mx.eval(*tensors)
+
+
 @dataclass
 class MLLMBatchRequest:
     """
@@ -979,7 +1012,12 @@ class MLLMBatchGenerator:
 
             chunk = input_ids[:, processed : processed + step]
             self.language_model(chunk, cache=cache)
-            mx.eval([c.state for c in cache])
+            # Eval ALL cache types to break the lazy graph between chunks.
+            # ArraysCache (e.g. GatedDeltaNet) has .state; KVCache (full
+            # attention) has .keys/.values. Hybrid models like Qwen3.5 use
+            # both. Skipping either type lets the computation graph grow
+            # across chunks → OOM on long prompts.
+            _eval_prompt_cache(cache)
             processed += step
             chunk_count += 1
             self._prefill_progress[request.request_id] = (processed, total)
@@ -1266,7 +1304,8 @@ class MLLMBatchGenerator:
 
                                 chunk = remaining[:, processed : processed + step]
                                 self.language_model(chunk, cache=request_cache)
-                                mx.eval([c.state for c in request_cache])
+                                # Eval ALL cache types (see _run_chunked_text_prefill)
+                                _eval_prompt_cache(request_cache)
                                 processed += step
                                 chunk_count += 1
                                 self._prefill_progress[req.request_id] = (
