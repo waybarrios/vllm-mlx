@@ -722,9 +722,7 @@ if __name__ == "__main__":
 
 
 class TestMLLMBatchGeneratorMTPGuards:
-    def test_process_prompts_applies_request_sampling_to_first_token(
-        self, monkeypatch
-    ):
+    def test_process_prompts_applies_request_sampling_to_first_token(self, monkeypatch):
         from vllm_mlx.mllm_batch_generator import (
             MLLMBatchGenerator,
             MLLMBatchRequest,
@@ -757,7 +755,9 @@ class TestMLLMBatchGeneratorMTPGuards:
             "mlx_lm.models.cache.make_prompt_cache", lambda model: [FakeCache()]
         )
         monkeypatch.setattr("mlx_lm.sample_utils.make_sampler", fake_make_sampler)
-        monkeypatch.setattr("mlx_lm.sample_utils.make_logits_processors", lambda **_: [])
+        monkeypatch.setattr(
+            "mlx_lm.sample_utils.make_logits_processors", lambda **_: []
+        )
 
         generator = MLLMBatchGenerator.__new__(MLLMBatchGenerator)
         generator._stats = MLLMBatchStats()
@@ -796,9 +796,7 @@ class TestMLLMBatchGeneratorMTPGuards:
         assert processor.calls == [[]]
         assert request_sampler.call_count == 1
         fallback_sampler.assert_not_called()
-        assert sampler_calls == [
-            {"temp": 0.3, "top_p": 0.8, "top_k": 0, "min_p": 0.0}
-        ]
+        assert sampler_calls == [{"temp": 0.3, "top_p": 0.8, "top_k": 0, "min_p": 0.0}]
 
     def test_next_passes_current_token_to_logits_processor_prefix(self):
         from vllm_mlx.mllm_batch_generator import (
