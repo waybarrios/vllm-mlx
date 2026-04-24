@@ -269,3 +269,7 @@ class BaseEngine(ABC):
     def clear_runtime_caches(self) -> dict[str, Any] | None:
         """Clear engine-managed runtime caches. Override in subclasses."""
         return None
+
+    async def abort_request(self, request_id: str) -> bool:
+        """Abort an active or queued request when the engine supports it."""
+        return False

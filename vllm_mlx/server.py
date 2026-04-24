@@ -2424,6 +2424,46 @@ async def status():
     }
 
 
+@app.post(
+    "/v1/requests/{request_id}/cancel",
+    dependencies=[Depends(verify_api_key), Depends(check_rate_limit)],
+)
+async def cancel_request(request_id: str):
+    """Cancel an active or queued request without restarting the model server."""
+    engine = get_engine()
+    try:
+        aborted = await engine.abort_request(request_id)
+    except Exception as exc:
+        logger.exception("Failed to cancel request %s", request_id)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to cancel request {request_id}: {exc}",
+        ) from exc
+
+    if not aborted:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Request not found or cancellation is unsupported: {request_id}",
+        )
+
+    logger.info("[cancel_request] accepted request_id=%s", request_id)
+    return {
+        "object": "request.cancel",
+        "id": request_id,
+        "cancelled": True,
+        "model": _model_name,
+    }
+
+
+@app.delete(
+    "/v1/requests/{request_id}",
+    dependencies=[Depends(verify_api_key), Depends(check_rate_limit)],
+)
+async def delete_request(request_id: str):
+    """OpenAI-style alias for cancelling an active or queued request."""
+    return await cancel_request(request_id)
+
+
 @app.get("/v1/cache/stats", dependencies=[Depends(verify_api_key)])
 async def cache_stats():
     """Get cache statistics for debugging and monitoring."""
