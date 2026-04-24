@@ -33,12 +33,16 @@ def server_state():
     original_store = srv._responses_store
     original_store_max_size = srv._RESPONSES_STORE_MAX_SIZE
     original_api_key = srv._api_key
+    original_default_chat_template_kwargs = getattr(
+        srv, "_default_chat_template_kwargs", None
+    )
 
     srv._engine = None
     srv._model_name = "test-model"
     srv._responses_store = OrderedDict()
     srv._RESPONSES_STORE_MAX_SIZE = 1000
     srv._api_key = None
+    srv._default_chat_template_kwargs = None
 
     try:
         yield
@@ -48,6 +52,7 @@ def server_state():
         srv._responses_store = original_store
         srv._RESPONSES_STORE_MAX_SIZE = original_store_max_size
         srv._api_key = original_api_key
+        srv._default_chat_template_kwargs = original_default_chat_template_kwargs
 
 
 def _mock_engine(*outputs):
@@ -129,6 +134,52 @@ class TestResponsesEndpoint:
         assert body["output"][0]["content"][0]["type"] == "output_text"
         assert body["usage"]["input_tokens"] == 7
         assert body["usage"]["output_tokens"] == 3
+
+    def test_responses_applies_server_default_chat_template_kwargs(self, client):
+        import vllm_mlx.server as srv
+
+        engine = _mock_engine(_output("Hello there"))
+        srv._engine = engine
+        srv._default_chat_template_kwargs = {"enable_thinking": False}
+
+        resp = client.post(
+            "/v1/responses",
+            json={"model": "test-model", "input": "Say hello"},
+        )
+
+        assert resp.status_code == 200
+        assert engine.chat.call_args.kwargs["chat_template_kwargs"] == {
+            "enable_thinking": False
+        }
+
+    def test_responses_request_kwargs_override_server_defaults(self, client):
+        import vllm_mlx.server as srv
+
+        engine = _mock_engine(_output("Hello there"))
+        srv._engine = engine
+        srv._default_chat_template_kwargs = {
+            "enable_thinking": False,
+            "server_default_only": "yes",
+        }
+
+        resp = client.post(
+            "/v1/responses",
+            json={
+                "model": "test-model",
+                "input": "Say hello",
+                "chat_template_kwargs": {
+                    "enable_thinking": True,
+                    "request_only": 1,
+                },
+            },
+        )
+
+        assert resp.status_code == 200
+        assert engine.chat.call_args.kwargs["chat_template_kwargs"] == {
+            "enable_thinking": True,
+            "server_default_only": "yes",
+            "request_only": 1,
+        }
 
     def test_previous_response_id_reuses_prior_context(self, client):
         import vllm_mlx.server as srv

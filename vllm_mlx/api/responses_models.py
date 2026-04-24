@@ -11,6 +11,7 @@ OpenAI's gpt-oss reference server and llama.cpp's OpenAI-compatible server.
 import time
 import uuid
 from typing import Literal
+from typing import Any
 
 from pydantic import BaseModel, Field, computed_field
 
@@ -169,6 +170,7 @@ class ResponsesRequest(BaseModel):
     previous_response_id: str | None = None
     temperature: float | None = None
     top_p: float | None = None
+    chat_template_kwargs: dict[str, Any] | None = None
     metadata: dict = Field(default_factory=dict)
     text: ResponseTextConfig = Field(default_factory=ResponseTextConfig)
     reasoning: ResponseReasoningConfig | None = None

@@ -389,6 +389,81 @@ class TestServeCli:
 
         assert args.tool_call_parser == "gpt-oss"
 
+    def test_default_chat_template_kwargs_accepts_json_object(self):
+        """Serve CLI should parse default chat template kwargs from a JSON object."""
+        from vllm_mlx.cli import create_parser
+
+        parser = create_parser()
+        args = parser.parse_args(
+            [
+                "serve",
+                "mlx-community/Qwen3-0.6B-8bit",
+                "--default-chat-template-kwargs",
+                '{"enable_thinking": false}',
+            ]
+        )
+
+        assert args.default_chat_template_kwargs == {"enable_thinking": False}
+
+    def test_default_chat_template_kwargs_help_mentions_empty_request_behavior(
+        self, capsys
+    ):
+        """Serve CLI help should explain empty request kwargs keep server defaults."""
+        from vllm_mlx.cli import create_parser
+
+        parser = create_parser()
+        with pytest.raises(SystemExit):
+            parser.parse_args(["serve", "mlx-community/Qwen3-0.6B-8bit", "--help"])
+
+        captured = capsys.readouterr()
+        normalized = " ".join(captured.out.split())
+        assert "omitted or empty" in normalized
+        assert "server defaults" in normalized
+
+    @pytest.mark.parametrize("bad_json", ["{not-json}", "{"])
+    def test_default_chat_template_kwargs_rejects_malformed_json(
+        self, bad_json, capsys
+    ):
+        """Serve CLI should fail fast on malformed JSON input."""
+        from vllm_mlx.cli import create_parser
+
+        parser = create_parser()
+        with pytest.raises(SystemExit):
+            parser.parse_args(
+                [
+                    "serve",
+                    "mlx-community/Qwen3-0.6B-8bit",
+                    "--default-chat-template-kwargs",
+                    bad_json,
+                ]
+            )
+
+        captured = capsys.readouterr()
+        assert "--default-chat-template-kwargs" in captured.err
+        assert "JSON object" in captured.err
+
+    @pytest.mark.parametrize("non_object", ["[]", "true", "123"])
+    def test_default_chat_template_kwargs_rejects_non_object_json(
+        self, non_object, capsys
+    ):
+        """Serve CLI should reject valid JSON values that are not objects."""
+        from vllm_mlx.cli import create_parser
+
+        parser = create_parser()
+        with pytest.raises(SystemExit):
+            parser.parse_args(
+                [
+                    "serve",
+                    "mlx-community/Qwen3-0.6B-8bit",
+                    "--default-chat-template-kwargs",
+                    non_object,
+                ]
+            )
+
+        captured = capsys.readouterr()
+        assert "--default-chat-template-kwargs" in captured.err
+        assert "JSON object" in captured.err
+
 
 class TestStandaloneServerCli:
     """Test standalone server CLI argument parsing."""
@@ -411,6 +486,81 @@ class TestStandaloneServerCli:
             ]
         )
         assert args.trust_remote_code is True
+
+    def test_default_chat_template_kwargs_accepts_json_object(self):
+        """Standalone server should parse default chat template kwargs JSON."""
+        from vllm_mlx.server import create_parser
+
+        parser = create_parser()
+        args = parser.parse_args(
+            [
+                "--model",
+                "mlx-community/Qwen3-0.6B-8bit",
+                "--default-chat-template-kwargs",
+                '{"enable_thinking": false}',
+            ]
+        )
+
+        assert args.default_chat_template_kwargs == {"enable_thinking": False}
+
+    def test_default_chat_template_kwargs_help_mentions_empty_request_behavior(
+        self, capsys
+    ):
+        """Standalone help should explain empty request kwargs keep server defaults."""
+        from vllm_mlx.server import create_parser
+
+        parser = create_parser()
+        with pytest.raises(SystemExit):
+            parser.parse_args(["--help"])
+
+        captured = capsys.readouterr()
+        normalized = " ".join(captured.out.split())
+        assert "omitted or empty" in normalized
+        assert "server defaults" in normalized
+
+    @pytest.mark.parametrize("bad_json", ["{not-json}", "{"])
+    def test_default_chat_template_kwargs_rejects_malformed_json(
+        self, bad_json, capsys
+    ):
+        """Standalone server should fail fast on malformed JSON input."""
+        from vllm_mlx.server import create_parser
+
+        parser = create_parser()
+        with pytest.raises(SystemExit):
+            parser.parse_args(
+                [
+                    "--model",
+                    "mlx-community/Qwen3-0.6B-8bit",
+                    "--default-chat-template-kwargs",
+                    bad_json,
+                ]
+            )
+
+        captured = capsys.readouterr()
+        assert "--default-chat-template-kwargs" in captured.err
+        assert "JSON object" in captured.err
+
+    @pytest.mark.parametrize("non_object", ["[]", "false", "0"])
+    def test_default_chat_template_kwargs_rejects_non_object_json(
+        self, non_object, capsys
+    ):
+        """Standalone server should reject valid JSON values that are not objects."""
+        from vllm_mlx.server import create_parser
+
+        parser = create_parser()
+        with pytest.raises(SystemExit):
+            parser.parse_args(
+                [
+                    "--model",
+                    "mlx-community/Qwen3-0.6B-8bit",
+                    "--default-chat-template-kwargs",
+                    non_object,
+                ]
+            )
+
+        captured = capsys.readouterr()
+        assert "--default-chat-template-kwargs" in captured.err
+        assert "JSON object" in captured.err
 
 
 class TestLoadModelTrustRemoteCode:
@@ -932,6 +1082,88 @@ class TestMaxTokensLimit:
         assert exc_info.value.status_code == 400
 
     @pytest.mark.anyio
+    @pytest.mark.parametrize(
+        ("user_stop", "expected_stop"),
+        [
+            (None, ["<|tool_response>"]),
+            (["END_USER"], ["END_USER", "<|tool_response>"]),
+        ],
+    )
+    async def test_create_chat_completion_merges_parser_stop_tokens(
+        self, monkeypatch, user_stop, expected_stop
+    ):
+        """Parser-declared stop tokens should be merged into chat kwargs."""
+        from vllm_mlx.engine.base import GenerationOutput
+        from vllm_mlx.server import (
+            ChatCompletionRequest,
+            Message,
+            create_chat_completion,
+        )
+        import vllm_mlx.server as server
+
+        captured = {}
+        helper_calls = []
+
+        class FakeEngine:
+            model_name = "fake-engine"
+            is_mllm = False
+            preserve_native_tool_format = False
+
+            async def chat(self, messages, **kwargs):
+                captured["messages"] = messages
+                captured["kwargs"] = kwargs
+                return GenerationOutput(
+                    text="ok",
+                    prompt_tokens=5,
+                    completion_tokens=2,
+                    finish_reason="stop",
+                )
+
+        fake_engine = FakeEngine()
+
+        async def fake_acquire(
+            raw_request, *, total_timeout=None, deadline=None, count_activity=True
+        ):
+            return fake_engine
+
+        async def fake_release(*, count_activity=True):
+            return None
+
+        def fake_get_parser_stop_tokens(parser_name, user_stops):
+            helper_calls.append((parser_name, user_stops))
+            merged = list(user_stops or [])
+            if "<|tool_response>" not in merged:
+                merged.append("<|tool_response>")
+            return merged
+
+        monkeypatch.setattr(server, "_validate_model_name", lambda _m: None)
+        monkeypatch.setattr(server, "_acquire_default_engine_for_request", fake_acquire)
+        monkeypatch.setattr(server, "_release_default_engine", fake_release)
+        monkeypatch.setattr(
+            server, "get_parser_stop_tokens", fake_get_parser_stop_tokens
+        )
+        monkeypatch.setattr(server, "_model_name", "served-model")
+        monkeypatch.setattr(server, "_default_max_tokens", 128)
+        monkeypatch.setattr(server, "_default_timeout", 30.0)
+        monkeypatch.setattr(server, "_enable_auto_tool_choice", True)
+        monkeypatch.setattr(server, "_tool_call_parser", "fake")
+        monkeypatch.setattr(server, "_tool_parser_instance", None)
+
+        request = ChatCompletionRequest(
+            model="served-model",
+            messages=[Message(role="user", content="Hello")],
+            max_tokens=16,
+            stop=user_stop,
+        )
+
+        response = await create_chat_completion(request, raw_request=None)
+
+        assert helper_calls
+        assert all(call == ("fake", user_stop) for call in helper_calls)
+        assert captured["kwargs"]["stop"] == expected_stop
+        assert response.choices[0].message.content == "ok"
+
+    @pytest.mark.anyio
     async def test_create_anthropic_message_rejects_over_limit_before_engine_lookup(
         self, monkeypatch
     ):
@@ -958,6 +1190,56 @@ class TestMaxTokensLimit:
             await create_anthropic_message(FakeRequest())
 
         assert exc_info.value.status_code == 400
+
+
+class TestChatTemplateKwargsResolver:
+    """Test default chat template kwargs precedence contract."""
+
+    def test_resolver_prefers_request_values_over_server_defaults(self, monkeypatch):
+        """Request kwargs should override server defaults key-by-key."""
+        import vllm_mlx.server as server
+
+        monkeypatch.setattr(
+            server,
+            "_default_chat_template_kwargs",
+            {"enable_thinking": False, "temperature_hint": "server"},
+            raising=False,
+        )
+
+        resolved = server._resolve_chat_template_kwargs(
+            {"enable_thinking": True, "request_only": 1}
+        )
+        assert resolved == {
+            "enable_thinking": True,
+            "temperature_hint": "server",
+            "request_only": 1,
+        }
+
+    def test_resolver_uses_server_defaults_when_request_omits_kwargs(self, monkeypatch):
+        """Resolver should return server defaults when request kwargs are absent."""
+        import vllm_mlx.server as server
+
+        monkeypatch.setattr(
+            server,
+            "_default_chat_template_kwargs",
+            {"enable_thinking": False},
+            raising=False,
+        )
+
+        assert server._resolve_chat_template_kwargs(None) == {"enable_thinking": False}
+
+    def test_resolver_returns_empty_dict_when_no_values_are_provided(self, monkeypatch):
+        """Resolver should produce an empty dict when neither source provides values."""
+        import vllm_mlx.server as server
+
+        monkeypatch.setattr(
+            server,
+            "_default_chat_template_kwargs",
+            None,
+            raising=False,
+        )
+
+        assert server._resolve_chat_template_kwargs(None) == {}
 
 
 class TestAPIKeyVerification:
@@ -1909,6 +2191,224 @@ class TestReasoningAndToolCallsNonStreaming:
         assert body["content"][0]["thinking"] == "Need tool"
         assert body["content"][1]["name"] == "get_weather"
         assert body["content"][1]["input"] == {"city": "Paris"}
+
+    def test_anthropic_message_applies_server_default_chat_template_kwargs(
+        self, client, monkeypatch
+    ):
+        """Anthropic endpoint should forward server default chat_template_kwargs."""
+        import vllm_mlx.server as server
+        from vllm_mlx.engine.base import GenerationOutput
+
+        captured = {}
+
+        class FakeEngine:
+            model_name = "fake-engine"
+            is_mllm = False
+            preserve_native_tool_format = False
+
+            async def chat(self, messages, **kwargs):
+                captured["messages"] = messages
+                captured["kwargs"] = kwargs
+                return GenerationOutput(
+                    text="Final answer",
+                    prompt_tokens=11,
+                    completion_tokens=4,
+                    finish_reason="stop",
+                )
+
+        monkeypatch.setattr(server, "_engine", FakeEngine())
+        monkeypatch.setattr(server, "_model_name", "test-model")
+        monkeypatch.setattr(server, "_default_timeout", 30.0)
+        monkeypatch.setattr(server, "_default_max_tokens", 128)
+        monkeypatch.setattr(server, "_api_key", None)
+        monkeypatch.setattr(
+            server,
+            "_rate_limiter",
+            server.RateLimiter(requests_per_minute=60, enabled=False),
+        )
+        monkeypatch.setattr(server, "_reasoning_parser", None)
+        monkeypatch.setattr(
+            server,
+            "_default_chat_template_kwargs",
+            {"enable_thinking": False},
+            raising=False,
+        )
+
+        response = client.post(
+            "/v1/messages",
+            json={
+                "model": "test-model",
+                "max_tokens": 32,
+                "messages": [{"role": "user", "content": "Weather?"}],
+            },
+        )
+
+        assert response.status_code == 200
+        assert captured["kwargs"]["chat_template_kwargs"] == {"enable_thinking": False}
+
+    def test_anthropic_message_request_kwargs_override_server_defaults(
+        self, client, monkeypatch
+    ):
+        """Anthropic request chat_template_kwargs should override server defaults."""
+        import vllm_mlx.server as server
+        from vllm_mlx.engine.base import GenerationOutput
+
+        captured = {}
+
+        class FakeEngine:
+            model_name = "fake-engine"
+            is_mllm = False
+            preserve_native_tool_format = False
+
+            async def chat(self, messages, **kwargs):
+                captured["messages"] = messages
+                captured["kwargs"] = kwargs
+                return GenerationOutput(
+                    text="Final answer",
+                    prompt_tokens=11,
+                    completion_tokens=4,
+                    finish_reason="stop",
+                )
+
+        monkeypatch.setattr(server, "_engine", FakeEngine())
+        monkeypatch.setattr(server, "_model_name", "test-model")
+        monkeypatch.setattr(server, "_default_timeout", 30.0)
+        monkeypatch.setattr(server, "_default_max_tokens", 128)
+        monkeypatch.setattr(server, "_api_key", None)
+        monkeypatch.setattr(
+            server,
+            "_rate_limiter",
+            server.RateLimiter(requests_per_minute=60, enabled=False),
+        )
+        monkeypatch.setattr(server, "_reasoning_parser", None)
+        monkeypatch.setattr(
+            server,
+            "_default_chat_template_kwargs",
+            {"enable_thinking": False, "server_default_only": "yes"},
+            raising=False,
+        )
+
+        response = client.post(
+            "/v1/messages",
+            json={
+                "model": "test-model",
+                "max_tokens": 32,
+                "messages": [{"role": "user", "content": "Weather?"}],
+                "chat_template_kwargs": {
+                    "enable_thinking": True,
+                    "request_only": 1,
+                },
+            },
+        )
+
+        assert response.status_code == 200
+        assert captured["kwargs"]["chat_template_kwargs"] == {
+            "enable_thinking": True,
+            "server_default_only": "yes",
+            "request_only": 1,
+        }
+
+    def test_chat_completion_prepares_messages_once_in_non_stream_path(
+        self, client, monkeypatch
+    ):
+        """Chat non-streaming should prepare request messages a single time."""
+        import vllm_mlx.server as server
+        from vllm_mlx.engine.base import GenerationOutput
+
+        extract_calls = {"count": 0}
+
+        class FakeEngine:
+            model_name = "fake-engine"
+            is_mllm = False
+            preserve_native_tool_format = False
+
+            async def chat(self, messages, **kwargs):
+                return GenerationOutput(
+                    text="done",
+                    prompt_tokens=3,
+                    completion_tokens=1,
+                    finish_reason="stop",
+                )
+
+        def fake_extract(messages, preserve_native_format=False):
+            extract_calls["count"] += 1
+            return ([{"role": "user", "content": "hi"}], [], [])
+
+        monkeypatch.setattr(server, "_engine", FakeEngine())
+        monkeypatch.setattr(server, "_model_name", "test-model")
+        monkeypatch.setattr(server, "_default_timeout", 30.0)
+        monkeypatch.setattr(server, "_default_max_tokens", 128)
+        monkeypatch.setattr(server, "_api_key", None)
+        monkeypatch.setattr(
+            server,
+            "_rate_limiter",
+            server.RateLimiter(requests_per_minute=60, enabled=False),
+        )
+        monkeypatch.setattr(server, "extract_multimodal_content", fake_extract)
+        monkeypatch.setattr(server, "_reasoning_parser", None)
+
+        response = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "Hello"}],
+                "max_tokens": 8,
+            },
+        )
+
+        assert response.status_code == 200
+        assert extract_calls["count"] == 1
+
+    def test_anthropic_message_prepares_messages_once_in_non_stream_path(
+        self, client, monkeypatch
+    ):
+        """Anthropic non-streaming should prepare request messages a single time."""
+        import vllm_mlx.server as server
+        from vllm_mlx.engine.base import GenerationOutput
+
+        extract_calls = {"count": 0}
+
+        class FakeEngine:
+            model_name = "fake-engine"
+            is_mllm = False
+            preserve_native_tool_format = False
+
+            async def chat(self, messages, **kwargs):
+                return GenerationOutput(
+                    text="done",
+                    prompt_tokens=3,
+                    completion_tokens=1,
+                    finish_reason="stop",
+                )
+
+        def fake_extract(messages, preserve_native_format=False):
+            extract_calls["count"] += 1
+            return ([{"role": "user", "content": "hi"}], [], [])
+
+        monkeypatch.setattr(server, "_engine", FakeEngine())
+        monkeypatch.setattr(server, "_model_name", "test-model")
+        monkeypatch.setattr(server, "_default_timeout", 30.0)
+        monkeypatch.setattr(server, "_default_max_tokens", 128)
+        monkeypatch.setattr(server, "_api_key", None)
+        monkeypatch.setattr(
+            server,
+            "_rate_limiter",
+            server.RateLimiter(requests_per_minute=60, enabled=False),
+        )
+        monkeypatch.setattr(server, "extract_multimodal_content", fake_extract)
+        monkeypatch.setattr(server, "_reasoning_parser", None)
+
+        response = client.post(
+            "/v1/messages",
+            json={
+                "model": "test-model",
+                "max_tokens": 8,
+                "messages": [{"role": "user", "content": "Hello"}],
+            },
+        )
+
+        assert response.status_code == 200
+        assert extract_calls["count"] == 1
 
 
 # =============================================================================
