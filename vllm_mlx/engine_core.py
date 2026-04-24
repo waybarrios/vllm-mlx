@@ -15,6 +15,7 @@ import asyncio
 import logging
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any, AsyncIterator, Dict, List, Optional, Union
 
@@ -24,8 +25,15 @@ from .request import Request, RequestOutput, SamplingParams
 from .scheduler import Scheduler, SchedulerConfig
 from .output_collector import RequestOutputCollector, RequestStreamState
 from .model_registry import get_registry
+from .mlx_streams import bind_generation_streams
 
 logger = logging.getLogger(__name__)
+
+
+def _is_stream_thread_error(error: Exception) -> bool:
+    """True when MLX reports stream ownership mismatch across threads."""
+    message = str(error)
+    return "no Stream(" in message or "no Stream(gpu" in message
 
 
 @dataclass
@@ -138,13 +146,31 @@ class EngineCore:
     async def _engine_loop(self) -> None:
         """Main engine loop.
 
-        mlx-lm's generation_stream is created at module import and is
-        thread-local, so scheduler.step must run on the same thread that
-        imported mlx_lm.generate. PR #399 took this route for the MLLM
-        scheduler; this does the same for the text-only engine.
+        scheduler.step runs on one dedicated worker thread. MLX streams are
+        thread-local, so we rebind generation streams inside that worker.
         """
 
+        loop = asyncio.get_running_loop()
+        worker = ThreadPoolExecutor(max_workers=1, thread_name_prefix="engine-core")
+        worker_stream_bound = False
+        model_thread_stream_bound = False
+        use_worker_thread = True
+        stream_thread_fallback_used = False
+
+        def _bind_worker_streams_once() -> None:
+            nonlocal worker_stream_bound
+            if not worker_stream_bound:
+                bind_generation_streams()
+                worker_stream_bound = True
+
+        def _bind_model_streams_once() -> None:
+            nonlocal model_thread_stream_bound
+            if not model_thread_stream_bound:
+                bind_generation_streams()
+                model_thread_stream_bound = True
+
         def _step_on_worker():
+            _bind_worker_streams_once()
             output = self.scheduler.step()
             self._steps_executed += 1
 
@@ -163,10 +189,37 @@ class EngineCore:
 
             return output
 
+        def _step_on_model_thread():
+            _bind_model_streams_once()
+            output = self.scheduler.step()
+            self._steps_executed += 1
+
+            if self._steps_executed % _memory_check_interval == 0:
+                try:
+                    active_mem = mx.get_active_memory()
+                    if active_mem > _memory_pressure_threshold:
+                        mx.clear_cache()
+                        logger.warning(
+                            f"[Memory pressure] {active_mem / 1e9:.1f}GB > "
+                            f"{_memory_pressure_threshold / 1e9:.0f}GB threshold, "
+                            f"forced cache clear"
+                        )
+                except Exception:
+                    pass
+
+            return output
+
+        def _recover_stream_thread_error_on_worker() -> None:
+            _bind_worker_streams_once()
+            self.scheduler._recover_from_cache_error()
+            self.scheduler._reschedule_running_requests()
+
         def _clear_cache_on_worker() -> None:
+            _bind_worker_streams_once()
             mx.clear_cache()
 
         def _close_batch_generator_on_worker() -> None:
+            _bind_worker_streams_once()
             self.scheduler._close_batch_generator()
 
         step_interval = self.config.step_interval
@@ -188,7 +241,30 @@ class EngineCore:
             while self._running:
                 try:
                     if self.scheduler.has_requests():
-                        output = _step_on_worker()
+                        if use_worker_thread:
+                            try:
+                                output = await loop.run_in_executor(
+                                    worker, _step_on_worker
+                                )
+                            except Exception as e:
+                                if (
+                                    _is_stream_thread_error(e)
+                                    and not stream_thread_fallback_used
+                                ):
+                                    await loop.run_in_executor(
+                                        worker, _recover_stream_thread_error_on_worker
+                                    )
+                                    use_worker_thread = False
+                                    stream_thread_fallback_used = True
+                                    _bind_model_streams_once()
+                                    logger.warning(
+                                        "Detected MLX stream/thread mismatch on worker "
+                                        "step; switched this engine to model-thread stepping"
+                                    )
+                                    continue
+                                raise
+                        else:
+                            output = _step_on_model_thread()
                         # Yield to event loop after each step.
                         await asyncio.sleep(0)
 
@@ -225,7 +301,12 @@ class EngineCore:
 
                             # Free Metal buffers after distributing finished outputs
                             if output.finished_request_ids:
-                                _clear_cache_on_worker()
+                                if use_worker_thread:
+                                    await loop.run_in_executor(
+                                        worker, _clear_cache_on_worker
+                                    )
+                                else:
+                                    mx.clear_cache()
 
                             # Always yield to prevent event loop starvation.
                             # Without this, orphaned requests (client disconnected but
@@ -244,9 +325,13 @@ class EngineCore:
                     logger.error(f"Engine loop error: {e}\n{traceback.format_exc()}")
                     await asyncio.sleep(0.1)
         finally:
-            # Close the batch generator on this (event-loop) thread, which owns
-            # mlx-lm's generation streams.
-            _close_batch_generator_on_worker()
+            try:
+                if use_worker_thread:
+                    await loop.run_in_executor(worker, _close_batch_generator_on_worker)
+                else:
+                    self.scheduler._close_batch_generator()
+            finally:
+                worker.shutdown(wait=True)
 
     async def add_request(
         self,

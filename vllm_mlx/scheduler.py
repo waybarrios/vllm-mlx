@@ -2351,6 +2351,11 @@ class Scheduler:
         error_str = str(error)
         return any(pattern in error_str for pattern in CACHE_CORRUPTION_PATTERNS)
 
+    def _is_stream_thread_error(self, error: Exception) -> bool:
+        """Check if an error indicates MLX stream/thread ownership mismatch."""
+        error_str = str(error)
+        return "no Stream(" in error_str or "no Stream(gpu" in error_str
+
     def _recover_from_cache_error(self) -> None:
         """Recover from cache corruption error."""
         # Properly close batch generator (this is the source of the corruption)
@@ -2499,6 +2504,8 @@ class Scheduler:
                 else:
                     raise
             except Exception as e:
+                if self._is_stream_thread_error(e):
+                    raise
                 import traceback
 
                 logger.error(
