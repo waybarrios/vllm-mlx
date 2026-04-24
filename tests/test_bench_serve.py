@@ -222,6 +222,49 @@ class TestWorkloadLoading:
         with pytest.raises(ValueError, match="messages"):
             load_workload(workload_file)
 
+    def test_load_workload_case_from_request_path(self, tmp_path: Path):
+        request_file = tmp_path / "request.json"
+        request_file.write_text(
+            json.dumps(
+                {
+                    "model": "ignored-by-workload-runner",
+                    "messages": [{"role": "user", "content": "Write the artifact."}],
+                    "stream": True,
+                    "max_tokens": 32768,
+                    "enable_thinking": True,
+                    "thinking_token_budget": 8192,
+                    "temperature": 0.6,
+                }
+            )
+        )
+        workload_file = tmp_path / "workload.json"
+        workload_file.write_text(
+            json.dumps(
+                {
+                    "cases": [
+                        {
+                            "id": "resume",
+                            "request_path": "request.json",
+                            "extra_body": {"top_p": 0.95},
+                        }
+                    ]
+                }
+            )
+        )
+
+        workload = load_workload(workload_file)
+        case = workload.cases[0]
+
+        assert case.messages == [{"role": "user", "content": "Write the artifact."}]
+        assert case.request_path == "request.json"
+        assert case.max_tokens == 32768
+        assert case.enable_thinking is True
+        assert case.extra_body == {
+            "thinking_token_budget": 8192,
+            "temperature": 0.6,
+            "top_p": 0.95,
+        }
+
 
 # ---------------------------------------------------------------------------
 # TestExpandSweep
@@ -828,6 +871,7 @@ class TestWorkloadRunner:
         case = WorkloadCase(
             case_id="resume-smoke",
             messages=[{"role": "user", "content": "Write the artifact."}],
+            request_path="/tmp/request.json",
             max_tokens=64,
             enable_thinking=True,
             extra_body={"temperature": 0.6},
@@ -860,6 +904,7 @@ class TestWorkloadRunner:
         assert record["quality"]["ok"] is True
         assert record["quality"]["issues"] == []
         assert record["quality"]["content"].startswith("Dear team")
+        assert record["request"]["request_path"] == "/tmp/request.json"
         assert record["policy"]["within_timeout"] is False
         assert record["metrics"]["cache_hits"] == 2
         assert record["metrics"]["cache_misses"] == 1

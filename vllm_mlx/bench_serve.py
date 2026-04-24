@@ -51,6 +51,7 @@ class WorkloadCase:
 
     case_id: str
     messages: list[dict]
+    request_path: Optional[str] = None
     max_tokens: Optional[int] = None
     enable_thinking: Optional[bool] = None
     extra_body: Optional[dict] = None
@@ -145,6 +146,29 @@ def _require_message_list(value: Any, *, label: str) -> list[dict]:
     return value
 
 
+def _load_case_request(path: str, *, workload_path: Path, case_id: str) -> dict:
+    request_path = Path(path).expanduser()
+    if not request_path.is_absolute():
+        request_path = workload_path.parent / request_path
+    with request_path.open() as fh:
+        request = json.load(fh)
+    if not isinstance(request, dict):
+        raise ValueError(f"{case_id}: request_path must point to a JSON object")
+    return request
+
+
+def _request_extra_body(request: dict) -> dict:
+    reserved = {
+        "model",
+        "messages",
+        "max_tokens",
+        "stream",
+        "stream_options",
+        "enable_thinking",
+    }
+    return {key: value for key, value in request.items() if key not in reserved}
+
+
 def load_workload(path: str | Path) -> Workload:
     """Load a declarative serving benchmark workload.
 
@@ -172,8 +196,21 @@ def load_workload(path: str | Path) -> Workload:
         if not isinstance(item, dict):
             raise ValueError(f"case {idx}: case must be an object")
         case_id = str(item.get("id") or f"case_{idx + 1}")
-        messages = _require_message_list(item.get("messages"), label=case_id)
+        request_path = item.get("request_path")
+        request_defaults: dict = {}
+        if request_path is not None:
+            request_defaults = _load_case_request(
+                str(request_path), workload_path=workload_path, case_id=case_id
+            )
+        messages = _require_message_list(
+            item.get("messages", request_defaults.get("messages")),
+            label=case_id,
+        )
         extra_body = item.get("extra_body", defaults.get("extra_body"))
+        request_extra = _request_extra_body(request_defaults)
+        if extra_body:
+            request_extra.update(extra_body)
+        extra_body = request_extra or None
         if extra_body is not None and not isinstance(extra_body, dict):
             raise ValueError(f"{case_id}: extra_body must be an object")
         checks = item.get("checks", defaults.get("checks"))
@@ -189,9 +226,16 @@ def load_workload(path: str | Path) -> Workload:
             WorkloadCase(
                 case_id=case_id,
                 messages=messages,
-                max_tokens=item.get("max_tokens", defaults.get("max_tokens")),
+                request_path=str(request_path) if request_path is not None else None,
+                max_tokens=item.get(
+                    "max_tokens",
+                    request_defaults.get("max_tokens", defaults.get("max_tokens")),
+                ),
                 enable_thinking=item.get(
-                    "enable_thinking", defaults.get("enable_thinking")
+                    "enable_thinking",
+                    request_defaults.get(
+                        "enable_thinking", defaults.get("enable_thinking")
+                    ),
                 ),
                 extra_body=extra_body,
                 policy_timeout_ms=item.get(
@@ -1072,6 +1116,7 @@ async def run_workload_case(
             "max_tokens": int(
                 case.max_tokens or workload.defaults.get("max_tokens", 256)
             ),
+            "request_path": case.request_path,
             "enable_thinking": case.enable_thinking,
             "extra_body": case.extra_body or {},
             "message_count": len(case.messages),

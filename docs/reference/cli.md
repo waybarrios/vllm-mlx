@@ -137,7 +137,9 @@ curl http://localhost:8000/v1/models \
 
 Benchmark a running vllm-mlx server over HTTP. Prompt-sweep mode measures
 TTFT, TPOT, throughput, cache deltas, and Metal memory. Workload mode adds
-per-case quality checks and comparison-only product policy timeouts.
+per-case quality checks and comparison-only product policy timeouts. Workload
+cases can embed `messages` directly or point `request_path` at an existing
+OpenAI-compatible request JSON.
 
 ### Usage
 

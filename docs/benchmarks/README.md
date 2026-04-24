@@ -64,6 +64,29 @@ Example workload:
 }
 ```
 
+Cases can also reference an existing OpenAI-compatible request JSON instead of
+duplicating a large prompt body:
+
+```json
+{
+  "name": "writing-contract",
+  "cases": [
+    {
+      "id": "resume-golden-1",
+      "request_path": "./fixtures/job543_resume_precise_request.json",
+      "checks": {
+        "finish_reason": "stop",
+        "forbidden_regex": ["<think>"]
+      }
+    }
+  ]
+}
+```
+
+When `request_path` is used, `messages`, `max_tokens`, `enable_thinking`, and
+extra request-body fields such as `thinking_token_budget` are read from that
+file. Case-level `extra_body` values override request-file values.
+
 `policy_timeout_ms` is recorded as comparison evidence. It is not treated as a
 hardware capability claim. Use it to answer "would this run fit my product
 policy?" after first measuring what the model and serving stack can actually do.
