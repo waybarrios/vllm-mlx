@@ -37,6 +37,76 @@ pytestmark = pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
 TEST_IMAGE_B64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
 
 
+class TestMLLMPromptCacheEval:
+    def test_collects_kv_and_arrays_cache_tensors(self):
+        from vllm_mlx.mllm_batch_generator import _cache_eval_tensors
+
+        kv_keys = object()
+        kv_values = object()
+        state_a = object()
+        state_b = object()
+
+        class KVLikeCache:
+            keys = kv_keys
+            values = kv_values
+
+            @property
+            def state(self):
+                raise AssertionError("KV cache state should not be read")
+
+        class ArraysLikeCache:
+            state = [state_a, None, state_b]
+
+        class EmptyKVLikeCache:
+            keys = None
+            values = None
+
+            @property
+            def state(self):
+                raise AttributeError("empty KV cache has no state")
+
+        assert _cache_eval_tensors(
+            [KVLikeCache(), ArraysLikeCache(), EmptyKVLikeCache()]
+        ) == [kv_keys, kv_values, state_a, state_b]
+
+    def test_eval_prompt_cache_skips_empty_cache(self, monkeypatch):
+        from vllm_mlx.mllm_batch_generator import _eval_prompt_cache
+
+        eval_mock = MagicMock()
+        monkeypatch.setattr(mx, "eval", eval_mock)
+
+        class EmptyCache:
+            keys = None
+            values = None
+            state = [None]
+
+        _eval_prompt_cache([EmptyCache()])
+
+        eval_mock.assert_not_called()
+
+    def test_eval_prompt_cache_flattens_cache_tensors(self, monkeypatch):
+        from vllm_mlx.mllm_batch_generator import _eval_prompt_cache
+
+        kv_keys = object()
+        kv_values = object()
+        state = object()
+        eval_mock = MagicMock()
+        monkeypatch.setattr(mx, "eval", eval_mock)
+
+        class KVLikeCache:
+            keys = kv_keys
+            values = kv_values
+
+        class ArraysLikeCache:
+            pass
+
+        ArraysLikeCache.state = [state]
+
+        _eval_prompt_cache([KVLikeCache(), ArraysLikeCache()])
+
+        eval_mock.assert_called_once_with(kv_keys, kv_values, state)
+
+
 def create_test_image(path: str, size: tuple = (32, 32)) -> str:
     """Create a test image file."""
     try:
