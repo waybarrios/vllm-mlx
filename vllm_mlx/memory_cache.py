@@ -158,6 +158,7 @@ class MemoryCacheConfig:
         kv_bits: Number of bits for KV cache quantization.
         kv_group_size: Group size for KV cache quantization.
         kv_min_quantize_tokens: Minimum sequence length for quantization to apply.
+        min_prefix_tokens: Minimum cached prefix length eligible for reuse.
     """
 
     max_memory_mb: int | None = None
@@ -168,6 +169,7 @@ class MemoryCacheConfig:
     kv_bits: int = 8
     kv_group_size: int = 64
     kv_min_quantize_tokens: int = 256
+    min_prefix_tokens: int = 128
 
     def __post_init__(self) -> None:
         if not 0.0 < self.max_memory_percent <= 1.0:
@@ -179,6 +181,10 @@ class MemoryCacheConfig:
         if self.kv_min_quantize_tokens < 0:
             raise ValueError(
                 f"kv_min_quantize_tokens must be >= 0, got {self.kv_min_quantize_tokens}"
+            )
+        if self.min_prefix_tokens < 1:
+            raise ValueError(
+                f"min_prefix_tokens must be >= 1, got {self.min_prefix_tokens}"
             )
 
     def compute_memory_limit(self) -> int:
@@ -710,6 +716,10 @@ class MemoryAwarePrefixCache:
             self._stats.misses += 1
             self._last_match_type = "miss"
             return None, tokens
+        if len(tokens) < self._config.min_prefix_tokens:
+            self._stats.misses += 1
+            self._last_match_type = "miss_short_prefix"
+            return None, tokens
 
         tokens_key = tuple(tokens)
 
@@ -862,6 +872,15 @@ class MemoryAwarePrefixCache:
                     )
 
         if best_lcp_entry is not None and best_lcp_length > 0:
+            if best_lcp_length < self._config.min_prefix_tokens:
+                logger.debug(
+                    "[cache_fetch] LCP skipped: shared=%s below min_prefix_tokens=%s",
+                    best_lcp_length,
+                    self._config.min_prefix_tokens,
+                )
+                self._stats.misses += 1
+                self._last_match_type = "miss_short_lcp"
+                return None, tokens
             excess = len(best_lcp_entry.tokens) - best_lcp_length
 
             has_non_trimmable = any(
@@ -930,6 +949,13 @@ class MemoryAwarePrefixCache:
             True if stored successfully, False if rejected.
         """
         if not tokens or not cache:
+            return False
+        if len(tokens) < self._config.min_prefix_tokens:
+            logger.debug(
+                "[cache_store] skipped short prefix: tokens=%s min_prefix_tokens=%s",
+                len(tokens),
+                self._config.min_prefix_tokens,
+            )
             return False
 
         tokens_key = tuple(tokens)
@@ -1300,6 +1326,15 @@ class MemoryAwarePrefixCache:
                 with open(tokens_path, "rb") as f:
                     arr.fromfile(f, entry_meta["num_tokens"])
                 tokens = list(arr)
+                if len(tokens) < self._config.min_prefix_tokens:
+                    logger.info(
+                        "[cache_persist] skipping short entry %s: %s tokens < "
+                        "min_prefix_tokens=%s",
+                        i,
+                        len(tokens),
+                        self._config.min_prefix_tokens,
+                    )
+                    continue
 
                 # Load KV cache
                 cache = load_prompt_cache(entry_path)
