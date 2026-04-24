@@ -624,7 +624,7 @@ class BatchedEngine(BaseEngine):
                 for part in content:
                     if isinstance(part, dict) and part.get("type") == "image_url":
                         new_content.append({"type": "image"})
-                    elif isinstance(part, (dict, str)):
+                    elif isinstance(part, (dict | str)):
                         new_content.append(part)
                     # skip non-dict/non-str parts to avoid passing unexpected types
                 prepared.append({**msg, "content": new_content})
