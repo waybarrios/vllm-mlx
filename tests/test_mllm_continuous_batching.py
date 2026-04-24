@@ -1228,3 +1228,59 @@ class TestBatchedMLLMConfigWiring:
         asyncio.run(engine._start_mllm())
 
         assert captured["config_kwargs"]["prefill_step_size"] == 256
+
+
+class TestPreprocessIdempotent:
+    """_preprocess_request must be idempotent for text-only requests.
+
+    The scheduler offloads preprocessing to a thread-pool executor so
+    the event loop stays responsive.  _process_prompts then calls
+    _preprocess_request again — the second call must be a no-op.
+    """
+
+    def test_text_only_not_preprocessed_twice(self):
+        """When input_ids is already set (executor did it), skip."""
+        from vllm_mlx.mllm_batch_generator import MLLMBatchRequest
+
+        req = MLLMBatchRequest(
+            uid=0,
+            prompt="Hello",
+            request_id="test-idem",
+        )
+        # Simulate executor having already set input_ids
+        req.input_ids = mx.array([[1, 2, 3]])
+
+        # Build a minimal batch generator with the method
+        from vllm_mlx.mllm_batch_generator import MLLMBatchGenerator
+
+        gen = MLLMBatchGenerator.__new__(MLLMBatchGenerator)
+        gen._preprocess_request = MLLMBatchGenerator._preprocess_request.__get__(
+            gen, MLLMBatchGenerator
+        )
+
+        # Must return immediately without touching prepare_inputs
+        gen._preprocess_request(req)
+        assert req.input_ids.shape == (1, 3)
+
+    def test_vision_request_not_skipped(self):
+        """Vision requests should NOT be skipped even with input_ids set."""
+        from vllm_mlx.mllm_batch_generator import MLLMBatchRequest
+
+        req = MLLMBatchRequest(
+            uid=0,
+            prompt="Describe",
+            request_id="test-vis",
+            images=["fake.png"],
+        )
+        req.input_ids = mx.array([[1, 2, 3]])
+
+        from vllm_mlx.mllm_batch_generator import MLLMBatchGenerator
+
+        gen = MLLMBatchGenerator.__new__(MLLMBatchGenerator)
+        gen._preprocess_request = MLLMBatchGenerator._preprocess_request.__get__(
+            gen, MLLMBatchGenerator
+        )
+
+        # Should NOT return early — will try to import prepare_inputs
+        with pytest.raises(Exception):
+            gen._preprocess_request(req)
