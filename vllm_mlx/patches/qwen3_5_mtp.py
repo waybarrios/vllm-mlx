@@ -25,6 +25,36 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
+_QWEN_MTP_RMSNORM_WEIGHT_SUFFIXES = (
+    "input_layernorm.weight",
+    "post_attention_layernorm.weight",
+    "q_norm.weight",
+    "k_norm.weight",
+    "pre_fc_norm_hidden.weight",
+    "pre_fc_norm_embedding.weight",
+    "norm.weight",
+)
+
+
+def _is_qwen_mtp_rmsnorm_weight(key: str, weight) -> bool:
+    """Return True for MTP RMSNorm weights that use Qwen's offset convention."""
+    return weight.ndim == 1 and any(
+        key.endswith(suffix) for suffix in _QWEN_MTP_RMSNORM_WEIGHT_SUFFIXES
+    )
+
+
+def _apply_qwen_mtp_rmsnorm_offset_fixups(mtp_weights: dict) -> int:
+    """Apply Qwen raw-offset RMSNorm fixups without double-shifting MLX weights."""
+    norm_fixup_count = 0
+    for key, weight in list(mtp_weights.items()):
+        if not _is_qwen_mtp_rmsnorm_weight(key, weight):
+            continue
+        mean_val = weight.mean().item()
+        if mean_val < 0.5:
+            mtp_weights[key] = weight + 1.0
+            norm_fixup_count += 1
+    return norm_fixup_count
+
 
 def _fixup_moe_mtp(mtp, inner_model, loaded_keys: set, mx) -> None:
     """Fix missing weights in MoE MTP module.
@@ -269,13 +299,7 @@ def inject_mtp_support(model: Any, model_path, config: dict) -> bool:
     # The main model's sanitize() handles this, but MTP weights bypass sanitize.
     # Detect raw-offset weights (mean < 0.5) and apply +1.0; skip if already
     # in actual-gamma space (as produced by add_mtp_weights_qwen35.py).
-    norm_fixup_count = 0
-    for key in list(mtp_weights.keys()):
-        if mtp_weights[key].ndim == 1:
-            mean_val = mtp_weights[key].mean().item()
-            if mean_val < 0.5:
-                mtp_weights[key] = mtp_weights[key] + 1.0
-                norm_fixup_count += 1
+    norm_fixup_count = _apply_qwen_mtp_rmsnorm_offset_fixups(mtp_weights)
     if norm_fixup_count > 0:
         logger.info(
             f"[MTP inject] Applied +1.0 RMSNorm offset to {norm_fixup_count} "
