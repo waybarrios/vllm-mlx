@@ -170,6 +170,13 @@ def _request_extra_body(request: dict) -> dict:
     return {key: value for key, value in request.items() if key not in reserved}
 
 
+def _first_not_none(*values: Any) -> Any:
+    for value in values:
+        if value is not None:
+            return value
+    return None
+
+
 def load_workload(path: str | Path) -> Workload:
     """Load a declarative serving benchmark workload.
 
@@ -228,19 +235,21 @@ def load_workload(path: str | Path) -> Workload:
                 case_id=case_id,
                 messages=messages,
                 request_path=str(request_path) if request_path is not None else None,
-                max_tokens=item.get(
-                    "max_tokens",
-                    request_defaults.get("max_tokens", defaults.get("max_tokens")),
+                max_tokens=_first_not_none(
+                    item.get("max_tokens"),
+                    request_defaults.get("max_tokens"),
+                    defaults.get("max_tokens"),
                 ),
-                enable_thinking=item.get(
-                    "enable_thinking",
-                    request_defaults.get(
-                        "enable_thinking", defaults.get("enable_thinking")
-                    ),
+                enable_thinking=_first_not_none(
+                    item.get("enable_thinking"),
+                    request_defaults.get("enable_thinking"),
+                    defaults.get("enable_thinking"),
                 ),
                 extra_body=extra_body,
-                policy_timeout_ms=item.get(
-                    "policy_timeout_ms", defaults.get("policy_timeout_ms")
+                policy_timeout_ms=_first_not_none(
+                    item.get("policy_timeout_ms"),
+                    request_defaults.get("policy_timeout_ms"),
+                    defaults.get("policy_timeout_ms"),
                 ),
                 checks=checks,
                 tags=tuple(str(tag) for tag in tags),
