@@ -40,6 +40,7 @@ The server provides:
 import argparse
 import asyncio
 import copy
+from dataclasses import dataclass
 import json
 import logging
 import os
@@ -149,6 +150,7 @@ from .audio_limits import (
     save_upload_with_limit,
     validate_tts_input_length,
 )
+from .cli_arg_types import make_json_object_arg_parser
 from .engine import BaseEngine, BatchedEngine, GenerationOutput, SimpleEngine
 from .endpoint_model_policies import (
     resolve_embedding_model_name,
@@ -158,7 +160,7 @@ from .endpoint_model_policies import (
 from .engine.base import suspend_cancellation
 from .lifecycle import ModelSpec, ResidencyManager
 from .metrics import metrics as _metrics
-from .tool_parsers import ToolParserManager
+from .tool_parsers import ToolParserManager, get_parser_stop_tokens
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -178,6 +180,7 @@ _max_request_tokens: int = 32768
 _default_timeout: float = 300.0  # Default request timeout in seconds (5 minutes)
 _default_temperature: float | None = None  # Set via --default-temperature
 _default_top_p: float | None = None  # Set via --default-top-p
+_default_chat_template_kwargs: dict[str, object] | None = None
 _metrics_enabled = False
 _max_audio_upload_bytes: int = DEFAULT_MAX_AUDIO_UPLOAD_BYTES
 _max_tts_input_chars: int = DEFAULT_MAX_TTS_INPUT_CHARS
@@ -220,6 +223,272 @@ def _resolve_request_max_tokens(requested_value: int | None) -> int:
             detail=f"max_tokens exceeds server limit ({_max_request_tokens})",
         )
     return requested_value
+
+
+def _resolve_chat_template_kwargs(
+    request_value: dict[str, object] | None,
+) -> dict[str, object]:
+    """Resolve chat template kwargs: request > server default > empty dict."""
+    resolved: dict[str, object] = {}
+    if _default_chat_template_kwargs:
+        resolved.update(_default_chat_template_kwargs)
+    if request_value:
+        resolved.update(request_value)
+    return resolved
+
+
+@dataclass
+class PreparedChatInvocation:
+    """Fully prepared inputs for a single engine.chat/stream_chat call."""
+
+    messages: list[dict]
+    chat_kwargs: dict[str, object]
+    response_format: object | None
+    json_logits_processor: object | None
+
+
+def _prepare_chat_messages(
+    engine: BaseEngine,
+    request_messages: list[Message | dict],
+) -> tuple[list[dict], list, list, bool]:
+    """Normalize messages and collect media once for both stream/non-stream paths."""
+    is_mllm = bool(getattr(engine, "is_mllm", False))
+    preserve_native = bool(getattr(engine, "preserve_native_tool_format", False))
+
+    if is_mllm:
+        # For MLLM models, keep original messages with embedded images
+        # (MLLM.chat() extracts images from message content internally)
+        messages = []
+        for msg in request_messages:
+            if hasattr(msg, "model_dump"):
+                msg_dict = msg.model_dump(exclude_none=True)
+            else:
+                raw = dict(msg)
+                msg_dict = {k: v for k, v in raw.items() if v is not None}
+            messages.append(msg_dict)
+        images, videos = [], []  # MLLM extracts these from messages
+        logger.debug(f"MLLM: Processing {len(messages)} messages")
+        # Convert tool_call arguments from JSON string to dict so that
+        # chat templates can iterate them (e.g. GLM-4.6V calls .items()).
+        # The LLM path does this inside extract_multimodal_content(), but
+        # the MLLM path bypasses that function.
+        if preserve_native:
+            for msg_dict in messages:
+                for tc in msg_dict.get("tool_calls") or []:
+                    func = tc.get("function") or {}
+                    args = func.get("arguments")
+                    if isinstance(args, str):
+                        try:
+                            func["arguments"] = json.loads(args)
+                        except (json.JSONDecodeError, ValueError):
+                            pass
+        messages = _normalize_messages(messages)
+    else:
+        # For LLM, extract text, images, and videos separately
+        messages, images, videos = extract_multimodal_content(
+            request_messages,
+            preserve_native_format=preserve_native,
+        )
+        messages = _normalize_messages(messages)
+
+    has_media = bool(images or videos)
+    if is_mllm and not has_media:
+        # MLLM extracts media from messages directly, so images/videos are
+        # always empty. Check message content for video/image types instead.
+        for msg in request_messages:
+            content = msg.content if hasattr(msg, "content") else msg.get("content", "")
+            if isinstance(content, list):
+                for item in content:
+                    item_type = (
+                        item.type
+                        if hasattr(item, "type")
+                        else (item.get("type", "") if isinstance(item, dict) else "")
+                    )
+                    if item_type in ("image_url", "image", "video", "video_url"):
+                        has_media = True
+                        break
+            if has_media:
+                break
+
+    return messages, images, videos, has_media
+
+
+def _prepare_json_logits_processor(
+    engine: BaseEngine,
+    messages: list[dict],
+    response_format: object | None,
+    *,
+    tools: list | None,
+    tool_choice: object | None,
+    log_context: str | None = None,
+) -> tuple[list[dict], object | None]:
+    """Inject response_format instruction and build constrained decoding processor."""
+    json_logits_processor = None
+    if not response_format:
+        return messages, json_logits_processor
+
+    json_instruction = build_json_system_prompt(response_format)
+    if json_instruction:
+        messages = _inject_json_instruction(messages, json_instruction)
+
+    # ``tools`` + ``response_format`` is undefined in OpenAI; skip constraints
+    # when tools are active so tool-call markup can still be emitted.
+    if tools and tool_choice != "none":
+        return messages, json_logits_processor
+
+    tokenizer_obj = _get_engine_tokenizer(engine)
+    if tokenizer_obj is None:
+        return messages, json_logits_processor
+
+    try:
+        json_logits_processor = build_json_logits_processor(
+            response_format, tokenizer_obj
+        )
+    except Exception as exc:
+        logger.warning("Failed to build JSON logits processor: %s", exc)
+        json_logits_processor = None
+
+    if json_logits_processor is not None:
+        log_label = f" for {log_context}" if log_context else ""
+        logger.info(
+            "Constrained decoding enabled%s response_format.type=%s",
+            log_label,
+            (
+                getattr(response_format, "type", None)
+                if not isinstance(response_format, dict)
+                else response_format.get("type")
+            ),
+        )
+
+    return messages, json_logits_processor
+
+
+def _prepare_chat_completion_invocation(
+    engine: BaseEngine,
+    request: ChatCompletionRequest,
+    effective_max_tokens: int,
+) -> PreparedChatInvocation:
+    """Precompute messages, kwargs, and decoding constraints for chat completions."""
+    messages, images, videos, has_media = _prepare_chat_messages(
+        engine, request.messages
+    )
+    response_format = request.response_format
+    messages, json_logits_processor = _prepare_json_logits_processor(
+        engine,
+        messages,
+        response_format,
+        tools=request.tools,
+        tool_choice=request.tool_choice,
+    )
+
+    rep_penalty = request.repetition_penalty
+    chat_kwargs = {
+        "max_tokens": effective_max_tokens,
+        "temperature": _resolve_temperature(request.temperature),
+        "top_p": _resolve_top_p(request.top_p),
+        "top_k": request.top_k or 0,
+        "min_p": request.min_p or 0.0,
+        "presence_penalty": request.presence_penalty or 0.0,
+        "repetition_penalty": request.repetition_penalty or 1.0,
+    }
+    if rep_penalty is not None:
+        chat_kwargs["repetition_penalty"] = rep_penalty
+
+    if has_media:
+        chat_kwargs["images"] = images if images else None
+        chat_kwargs["videos"] = videos if videos else None
+        video_fps = getattr(request, "video_fps", None)
+        if video_fps:
+            chat_kwargs["video_fps"] = video_fps
+        video_max_frames = getattr(request, "video_max_frames", None)
+        if video_max_frames:
+            chat_kwargs["video_max_frames"] = video_max_frames
+
+    if request.specprefill is not None:
+        chat_kwargs["specprefill"] = request.specprefill
+    if request.specprefill_keep_pct is not None:
+        chat_kwargs["specprefill_keep_pct"] = request.specprefill_keep_pct
+    resolved_chat_template_kwargs = _resolve_chat_template_kwargs(
+        request.chat_template_kwargs
+    )
+    if resolved_chat_template_kwargs:
+        chat_kwargs["chat_template_kwargs"] = resolved_chat_template_kwargs
+
+    if request.enable_thinking is not None:
+        chat_kwargs["enable_thinking"] = request.enable_thinking
+
+    if request.tools and request.tool_choice != "none":
+        chat_kwargs["tools"] = convert_tools_for_template(request.tools)
+
+    parser_name = _tool_call_parser if _enable_auto_tool_choice else None
+    merged_stop = get_parser_stop_tokens(parser_name, request.stop)
+    if merged_stop:
+        chat_kwargs["stop"] = merged_stop
+
+    if json_logits_processor is not None:
+        existing = chat_kwargs.get("logits_processors") or []
+        chat_kwargs["logits_processors"] = list(existing) + [json_logits_processor]
+        # Constrained decoding is incompatible with reasoning parsers:
+        # suppress implicit thinking if caller didn't explicitly set it.
+        if request.enable_thinking is None:
+            request.enable_thinking = False
+            chat_kwargs["enable_thinking"] = False
+
+    return PreparedChatInvocation(
+        messages=messages,
+        chat_kwargs=chat_kwargs,
+        response_format=response_format,
+        json_logits_processor=json_logits_processor,
+    )
+
+
+def _prepare_anthropic_invocation(
+    engine: BaseEngine,
+    openai_request: ChatCompletionRequest,
+    effective_max_tokens: int,
+) -> PreparedChatInvocation:
+    """Precompute messages, kwargs, and decoding constraints for Anthropic API."""
+    messages, _, _, _ = _prepare_chat_messages(engine, openai_request.messages)
+    response_format = openai_request.response_format
+    messages, json_logits_processor = _prepare_json_logits_processor(
+        engine,
+        messages,
+        response_format,
+        tools=openai_request.tools,
+        tool_choice=openai_request.tool_choice,
+        log_context="Anthropic",
+    )
+
+    chat_kwargs = {
+        "max_tokens": effective_max_tokens,
+        "temperature": openai_request.temperature,
+        "top_p": openai_request.top_p,
+        "top_k": openai_request.top_k or 0,
+        "min_p": openai_request.min_p or 0.0,
+        "presence_penalty": openai_request.presence_penalty or 0.0,
+        "repetition_penalty": openai_request.repetition_penalty or 1.0,
+    }
+    resolved_chat_template_kwargs = _resolve_chat_template_kwargs(
+        openai_request.chat_template_kwargs
+    )
+    if resolved_chat_template_kwargs:
+        chat_kwargs["chat_template_kwargs"] = resolved_chat_template_kwargs
+
+    if openai_request.tools and openai_request.tool_choice != "none":
+        chat_kwargs["tools"] = convert_tools_for_template(openai_request.tools)
+
+    if json_logits_processor is not None:
+        existing = chat_kwargs.get("logits_processors") or []
+        chat_kwargs["logits_processors"] = list(existing) + [json_logits_processor]
+        # Suppress thinking: constrained decoding prevents <think> tags.
+        chat_kwargs["enable_thinking"] = False
+
+    return PreparedChatInvocation(
+        messages=messages,
+        chat_kwargs=chat_kwargs,
+        response_format=response_format,
+        json_logits_processor=json_logits_processor,
+    )
 
 
 # Global MCP manager
@@ -1269,6 +1538,7 @@ def _responses_request_to_chat_request(
         stream=False,
         tools=tools,
         tool_choice=request.tool_choice,
+        chat_template_kwargs=request.chat_template_kwargs,
     )
 
 
@@ -1412,6 +1682,11 @@ def _prepare_responses_request(
         "temperature": _resolve_temperature(chat_request.temperature),
         "top_p": _resolve_top_p(chat_request.top_p),
     }
+    resolved_chat_template_kwargs = _resolve_chat_template_kwargs(
+        chat_request.chat_template_kwargs
+    )
+    if resolved_chat_template_kwargs:
+        chat_kwargs["chat_template_kwargs"] = resolved_chat_template_kwargs
     if request.tools:
         chat_kwargs["tools"] = convert_tools_for_template(chat_request.tools)
     if images:
@@ -3579,156 +3854,14 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
     )
     if engine is None:
         return Response(status_code=499)
+
     release_on_exit = True
-
     try:
-        # For MLLM models, keep original messages with embedded images
-        # (MLLM.chat() extracts images from message content internally)
-        if engine.is_mllm:
-            # Convert Pydantic messages to dicts, excluding None fields
-            # to prevent chat templates from misinterpreting key presence
-            # (e.g. image_url: null on text parts triggers Qwen3-VL crash)
-            messages = []
-            for msg in request.messages:
-                if hasattr(msg, "model_dump"):
-                    msg_dict = msg.model_dump(exclude_none=True)
-                else:
-                    raw = dict(msg)
-                    msg_dict = {k: v for k, v in raw.items() if v is not None}
-                messages.append(msg_dict)
-            images, videos = [], []  # MLLM extracts these from messages
-            logger.debug(f"MLLM: Processing {len(messages)} messages")
-            # Convert tool_call arguments from JSON string to dict so that
-            # chat templates can iterate them (e.g. GLM-4.6V calls .items()).
-            # The LLM path does this inside extract_multimodal_content(), but
-            # the MLLM path bypasses that function.
-            if engine.preserve_native_tool_format:
-                for msg_dict in messages:
-                    for tc in msg_dict.get("tool_calls") or []:
-                        func = tc.get("function") or {}
-                        args = func.get("arguments")
-                        if isinstance(args, str):
-                            try:
-                                func["arguments"] = json.loads(args)
-                            except (json.JSONDecodeError, ValueError):
-                                pass
-            messages = _normalize_messages(messages)
-        else:
-            # For LLM, extract text, images, and videos separately
-            messages, images, videos = extract_multimodal_content(
-                request.messages,
-                preserve_native_format=engine.preserve_native_tool_format,
-            )
-            messages = _normalize_messages(messages)
-
-        has_media = bool(images or videos)
-        if engine.is_mllm and not has_media:
-            # MLLM extracts media from messages directly, so images/videos are
-            # always empty. Check message content for video/image types instead.
-            for msg in request.messages:
-                content = (
-                    msg.content if hasattr(msg, "content") else msg.get("content", "")
-                )
-                if isinstance(content, list):
-                    for item in content:
-                        item_type = (
-                            item.type
-                            if hasattr(item, "type")
-                            else (
-                                item.get("type", "") if isinstance(item, dict) else ""
-                            )
-                        )
-                        if item_type in ("image_url", "image", "video", "video_url"):
-                            has_media = True
-                            break
-                if has_media:
-                    break
-
-        # Handle response_format - inject system prompt if needed.
-        response_format = request.response_format
-        json_logits_processor = None
-        if response_format:
-            json_instruction = build_json_system_prompt(response_format)
-            if json_instruction:
-                # Inject JSON instruction into messages
-                messages = _inject_json_instruction(messages, json_instruction)
-
-            # Build a grammar-guided logits processor so the model *cannot*
-            # emit invalid JSON. If tools are active, skip the constraint so
-            # tool-call markup can still be emitted.
-            if not (request.tools and request.tool_choice != "none"):
-                tokenizer_obj = _get_engine_tokenizer(engine)
-                if tokenizer_obj is not None:
-                    try:
-                        json_logits_processor = build_json_logits_processor(
-                            response_format, tokenizer_obj
-                        )
-                    except Exception as exc:
-                        logger.warning("Failed to build JSON logits processor: %s", exc)
-                        json_logits_processor = None
-                    if json_logits_processor is not None:
-                        logger.info(
-                            "Constrained decoding enabled for response_format.type=%s",
-                            (
-                                getattr(response_format, "type", None)
-                                if not isinstance(response_format, dict)
-                                else response_format.get("type")
-                            ),
-                        )
-
-        # Resolve repetition penalty
-        rep_penalty = request.repetition_penalty
-
-        # Prepare kwargs
-        chat_kwargs = {
-            "max_tokens": effective_max_tokens,
-            "temperature": _resolve_temperature(request.temperature),
-            "top_p": _resolve_top_p(request.top_p),
-            "top_k": request.top_k or 0,
-            "min_p": request.min_p or 0.0,
-            "presence_penalty": request.presence_penalty or 0.0,
-            "repetition_penalty": request.repetition_penalty or 1.0,
-        }
-        if rep_penalty is not None:
-            chat_kwargs["repetition_penalty"] = rep_penalty
-
-        # Add multimodal content
-        if has_media:
-            chat_kwargs["images"] = images if images else None
-            chat_kwargs["videos"] = videos if videos else None
-            video_fps = getattr(request, "video_fps", None)
-            if video_fps:
-                chat_kwargs["video_fps"] = video_fps
-            video_max_frames = getattr(request, "video_max_frames", None)
-            if video_max_frames:
-                chat_kwargs["video_max_frames"] = video_max_frames
-
-        # SpecPrefill: per-request overrides
-        if request.specprefill is not None:
-            chat_kwargs["specprefill"] = request.specprefill
-        if request.specprefill_keep_pct is not None:
-            chat_kwargs["specprefill_keep_pct"] = request.specprefill_keep_pct
-        chat_template_kwargs = getattr(request, "chat_template_kwargs", None)
-        if chat_template_kwargs:
-            chat_kwargs["chat_template_kwargs"] = dict(chat_template_kwargs)
-
-        # Enable/disable thinking mode per request
-        enable_thinking = getattr(request, "enable_thinking", None)
-        if enable_thinking is not None:
-            chat_kwargs["enable_thinking"] = enable_thinking
-
-        # Add tools if provided
-        if request.tools and request.tool_choice != "none":
-            chat_kwargs["tools"] = convert_tools_for_template(request.tools)
-
-        if json_logits_processor is not None:
-            existing = chat_kwargs.get("logits_processors") or []
-            chat_kwargs["logits_processors"] = list(existing) + [json_logits_processor]
-            # Constrained decoding is incompatible with reasoning parsers:
-            # the model cannot emit <think> tags when forced to produce JSON.
-            if enable_thinking is None:
-                request.enable_thinking = False
-                chat_kwargs["enable_thinking"] = False
+        prepared = _prepare_chat_completion_invocation(
+            engine,
+            request,
+            effective_max_tokens,
+        )
 
         if request.stream:
             response = StreamingResponse(
@@ -3736,10 +3869,10 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
                     _ensure_sse_terminal(
                         stream_chat_completion(
                             engine,
-                            messages,
+                            prepared.messages,
                             request,
                             metrics_tracker=tracker,
-                            **chat_kwargs,
+                            **prepared.chat_kwargs,
                         ),
                         "data: [DONE]\n\n",
                     ),
@@ -3751,12 +3884,11 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
             release_on_exit = False
             return response
 
-        # Non-streaming response with timing and timeout
         start_time = time.perf_counter()
 
         try:
             output = await _wait_with_disconnect(
-                engine.chat(messages=messages, **chat_kwargs),
+                engine.chat(messages=prepared.messages, **prepared.chat_kwargs),
                 raw_request,
                 timeout=_remaining_request_timeout(total_timeout, deadline),
                 timeout_detail_seconds=total_timeout,
@@ -3779,22 +3911,22 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
             request,
             allow_reasoning=(
                 getattr(request, "enable_thinking", None) is not False
-                and json_logits_processor is None
+                and prepared.json_logits_processor is None
             ),
             engine=engine,
         )
 
         # Process response_format if specified (after reasoning parser cleaned the text)
-        if response_format and not tool_calls:
+        if prepared.response_format and not tool_calls:
             json_input = cleaned_text or output.text
             _, parsed_json, is_valid, error = parse_json_output(
-                json_input, response_format
+                json_input, prepared.response_format
             )
             if parsed_json is not None:
                 # Return JSON as string
                 cleaned_text = json.dumps(parsed_json)
             if not is_valid:
-                if json_logits_processor is not None:
+                if prepared.json_logits_processor is not None:
                     logger.error(
                         "Constrained decoding produced invalid JSON: %s", error
                     )
@@ -4043,6 +4175,11 @@ async def create_anthropic_message(
     if engine is None:
         return Response(status_code=499)
     release_on_exit = True
+    prepared = _prepare_anthropic_invocation(
+        engine,
+        openai_request,
+        effective_max_tokens,
+    )
 
     try:
         if anthropic_request.stream:
@@ -4056,7 +4193,7 @@ async def create_anthropic_message(
                             engine,
                             openai_request,
                             anthropic_request,
-                            effective_max_tokens,
+                            prepared,
                             metrics_tracker=tracker,
                         ),
                         anthropic_terminal,
@@ -4073,62 +4210,10 @@ async def create_anthropic_message(
             release_on_exit = False
             return response
 
-        # Non-streaming: run inference through existing engine
-        messages, images, videos = extract_multimodal_content(
-            openai_request.messages,
-            preserve_native_format=engine.preserve_native_tool_format,
-        )
-        messages = _normalize_messages(messages)
-
-        response_format = openai_request.response_format
-        json_logits_processor = None
-        if response_format:
-            json_instruction = build_json_system_prompt(response_format)
-            if json_instruction:
-                messages = _inject_json_instruction(messages, json_instruction)
-            if not (openai_request.tools and openai_request.tool_choice != "none"):
-                tokenizer_obj = _get_engine_tokenizer(engine)
-                if tokenizer_obj is not None:
-                    try:
-                        json_logits_processor = build_json_logits_processor(
-                            response_format, tokenizer_obj
-                        )
-                    except Exception as exc:
-                        logger.warning("Failed to build JSON logits processor: %s", exc)
-                        json_logits_processor = None
-                    if json_logits_processor is not None:
-                        logger.info(
-                            "Constrained decoding enabled for Anthropic response_format.type=%s",
-                            (
-                                getattr(response_format, "type", None)
-                                if not isinstance(response_format, dict)
-                                else response_format.get("type")
-                            ),
-                        )
-
-        chat_kwargs = {
-            "max_tokens": effective_max_tokens,
-            "temperature": openai_request.temperature,
-            "top_p": openai_request.top_p,
-            "top_k": openai_request.top_k or 0,
-            "min_p": openai_request.min_p or 0.0,
-            "presence_penalty": openai_request.presence_penalty or 0.0,
-            "repetition_penalty": openai_request.repetition_penalty or 1.0,
-        }
-
-        if openai_request.tools and openai_request.tool_choice != "none":
-            chat_kwargs["tools"] = convert_tools_for_template(openai_request.tools)
-
-        if json_logits_processor is not None:
-            existing = chat_kwargs.get("logits_processors") or []
-            chat_kwargs["logits_processors"] = list(existing) + [json_logits_processor]
-            # Suppress thinking: constrained decoding prevents <think> tags.
-            chat_kwargs["enable_thinking"] = False
-
         start_time = time.perf_counter()
         try:
             output = await _wait_with_disconnect(
-                engine.chat(messages=messages, **chat_kwargs),
+                engine.chat(messages=prepared.messages, **prepared.chat_kwargs),
                 request,
                 timeout=_remaining_request_timeout(total_timeout, deadline),
                 timeout_detail_seconds=total_timeout,
@@ -4149,19 +4234,19 @@ async def create_anthropic_message(
         reasoning_text, cleaned_text, tool_calls = _extract_reasoning_and_tool_calls(
             output.text,
             openai_request,
-            allow_reasoning=json_logits_processor is None,
+            allow_reasoning=prepared.json_logits_processor is None,
             engine=engine,
         )
 
-        if response_format and not tool_calls:
+        if prepared.response_format and not tool_calls:
             json_input = cleaned_text or output.text
             _, parsed_json, is_valid, error = parse_json_output(
-                json_input, response_format
+                json_input, prepared.response_format
             )
             if parsed_json is not None:
                 cleaned_text = json.dumps(parsed_json)
             if not is_valid:
-                if json_logits_processor is not None:
+                if prepared.json_logits_processor is not None:
                     logger.error(
                         "Constrained decoding produced invalid JSON on Anthropic endpoint: %s",
                         error,
@@ -4381,7 +4466,7 @@ async def _stream_anthropic_messages(
     engine: BaseEngine,
     openai_request: ChatCompletionRequest,
     anthropic_request: AnthropicRequest,
-    max_tokens: int,
+    prepared: PreparedChatInvocation,
     metrics_tracker=None,
 ) -> AsyncIterator[str]:
     """
@@ -4400,48 +4485,8 @@ async def _stream_anthropic_messages(
     result_label = "success"
     prompt_tokens = 0
 
-    # Extract messages for engine
-    messages, images, videos = extract_multimodal_content(
-        openai_request.messages,
-        preserve_native_format=engine.preserve_native_tool_format,
-    )
-    messages = _normalize_messages(messages)
-
-    chat_kwargs = {
-        "max_tokens": max_tokens,
-        "temperature": openai_request.temperature,
-        "top_p": openai_request.top_p,
-        "top_k": openai_request.top_k or 0,
-        "min_p": openai_request.min_p or 0.0,
-        "presence_penalty": openai_request.presence_penalty or 0.0,
-        "repetition_penalty": openai_request.repetition_penalty or 1.0,
-    }
-
-    if openai_request.tools and openai_request.tool_choice != "none":
-        chat_kwargs["tools"] = convert_tools_for_template(openai_request.tools)
-
-    # Wire constrained decoding if response_format was requested via the
-    # Anthropic extension field and tools are not also requested.
-    response_format = getattr(openai_request, "response_format", None)
-    if response_format is not None and not (
-        openai_request.tools and openai_request.tool_choice != "none"
-    ):
-        json_instruction = build_json_system_prompt(response_format)
-        if json_instruction:
-            messages = _inject_json_instruction(messages, json_instruction)
-        tokenizer_obj = _get_engine_tokenizer(engine)
-        if tokenizer_obj is not None:
-            try:
-                processor = build_json_logits_processor(response_format, tokenizer_obj)
-            except Exception as exc:
-                logger.warning(
-                    "Failed to build JSON logits processor (Anthropic stream): %s",
-                    exc,
-                )
-                processor = None
-            if processor is not None:
-                chat_kwargs["logits_processors"] = [processor]
-                chat_kwargs["enable_thinking"] = False
+    messages = prepared.messages
+    chat_kwargs = dict(prepared.chat_kwargs)
 
     # Emit message_start
     message_start = {
@@ -5259,7 +5304,7 @@ def main():
 
     # Set global configuration
     global _api_key, _default_timeout, _rate_limiter, _metrics_enabled
-    global _default_temperature, _default_top_p
+    global _default_temperature, _default_top_p, _default_chat_template_kwargs
     global _max_audio_upload_bytes, _max_tts_input_chars
     _api_key = args.api_key
     _default_timeout = args.timeout
@@ -5269,6 +5314,7 @@ def main():
         _default_temperature = args.default_temperature
     if args.default_top_p is not None:
         _default_top_p = args.default_top_p
+    _default_chat_template_kwargs = args.default_chat_template_kwargs
     _max_audio_upload_bytes = args.max_audio_upload_mb * 1024 * 1024
     _max_tts_input_chars = args.max_tts_input_chars
 
@@ -5477,6 +5523,16 @@ Examples:
         type=float,
         default=None,
         help="Default top_p for generation when not specified in request",
+    )
+    parser.add_argument(
+        "--default-chat-template-kwargs",
+        type=make_json_object_arg_parser("--default-chat-template-kwargs"),
+        default=None,
+        help=(
+            "Default chat template kwargs to apply to all requests when request "
+            "chat_template_kwargs is omitted or empty; empty request kwargs use "
+            'existing server defaults (JSON object, e.g. {"enable_thinking": false})'
+        ),
     )
     parser.add_argument(
         "--max-audio-upload-mb",
