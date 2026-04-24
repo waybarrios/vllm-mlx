@@ -13,7 +13,7 @@ import time
 import uuid
 from typing import Any
 
-from pydantic import AliasChoices, BaseModel, Field
+from pydantic import AliasChoices, BaseModel, Field, model_serializer
 
 # =============================================================================
 # Content Types (for multimodal messages)
@@ -205,6 +205,20 @@ class AssistantMessage(BaseModel):
     @property
     def reasoning(self) -> str | None:
         return self.reasoning_content
+
+    @model_serializer
+    def _serialize(self) -> dict:
+        """Serialize with OpenAI-compatible schema.
+
+        - ``tool_calls`` and ``reasoning_content`` are omitted when None.
+        - ``content`` is always included (even as null) per OpenAI spec.
+        """
+        d: dict = {"role": self.role, "content": self.content}
+        if self.reasoning_content is not None:
+            d["reasoning_content"] = self.reasoning_content
+        if self.tool_calls is not None:
+            d["tool_calls"] = [tc.model_dump() for tc in self.tool_calls]
+        return d
 
 
 class ChatCompletionChoice(BaseModel):
@@ -490,6 +504,24 @@ class ChatCompletionChunkDelta(BaseModel):
     @property
     def reasoning(self) -> str | None:
         return self.reasoning_content
+
+    @model_serializer
+    def _serialize(self) -> dict:
+        """Serialize delta with only non-None fields.
+
+        Per OpenAI streaming spec, delta objects only include fields that
+        carry new content.
+        """
+        d: dict = {}
+        if self.role is not None:
+            d["role"] = self.role
+        if self.content is not None:
+            d["content"] = self.content
+        if self.reasoning_content is not None:
+            d["reasoning_content"] = self.reasoning_content
+        if self.tool_calls is not None:
+            d["tool_calls"] = self.tool_calls
+        return d
 
 
 class ChatCompletionChunkChoice(BaseModel):

@@ -46,6 +46,7 @@ import logging
 import os
 import re
 import secrets
+import socket as _socket
 import threading
 import time
 import uuid
@@ -418,7 +419,11 @@ def _prepare_chat_completion_invocation(
         chat_kwargs["enable_thinking"] = request.enable_thinking
 
     if request.tools and request.tool_choice != "none":
-        chat_kwargs["tools"] = convert_tools_for_template(request.tools)
+        template_tools = convert_tools_for_template(request.tools)
+        template_tools, messages = _apply_forced_tool_choice(
+            request.tool_choice, template_tools, messages, chat_kwargs
+        )
+        chat_kwargs["tools"] = template_tools
 
     parser_name = _tool_call_parser if _enable_auto_tool_choice else None
     merged_stop = get_parser_stop_tokens(parser_name, request.stop)
@@ -475,7 +480,11 @@ def _prepare_anthropic_invocation(
         chat_kwargs["chat_template_kwargs"] = resolved_chat_template_kwargs
 
     if openai_request.tools and openai_request.tool_choice != "none":
-        chat_kwargs["tools"] = convert_tools_for_template(openai_request.tools)
+        template_tools = convert_tools_for_template(openai_request.tools)
+        template_tools, messages = _apply_forced_tool_choice(
+            openai_request.tool_choice, template_tools, messages, chat_kwargs
+        )
+        chat_kwargs["tools"] = template_tools
 
     if json_logits_processor is not None:
         existing = chat_kwargs.get("logits_processors") or []
@@ -4060,6 +4069,79 @@ async def create_response(request: ResponsesRequest, raw_request: Request):
     return response_object
 
 
+def _get_forced_tool_name(tool_choice) -> str | None:
+    """Extract forced tool name from tool_choice, if any.
+
+    Returns the function name when tool_choice is a dict like
+    {"type": "function", "function": {"name": "X"}}, or None otherwise.
+    """
+    if not isinstance(tool_choice, dict):
+        return None
+    if tool_choice.get("type") != "function":
+        return None
+    func = tool_choice.get("function")
+    if isinstance(func, dict):
+        return func.get("name")
+    return None
+
+
+def _apply_forced_tool_choice(tool_choice, tools, messages, chat_kwargs=None):
+    """Apply forced tool_choice by filtering tools and injecting instructions.
+
+    Handles:
+    - tool_choice={"type":"function","function":{"name":"X"}} -> filter + instruct
+    - tool_choice="required" -> instruct model to call at least one tool
+
+    Args:
+        tool_choice: The tool_choice value from the request
+        tools: List of converted tools for the template
+        messages: The message list (will be copied if modified)
+        chat_kwargs: Optional dict to modify (e.g. disable thinking)
+
+    Returns:
+        Tuple of (tools, messages) - potentially filtered/modified
+    """
+    if not tools:
+        return tools, messages
+
+    forced_name = _get_forced_tool_name(tool_choice)
+    if forced_name:
+        # Filter tools to only the forced function
+        filtered = [t for t in tools if _tool_name(t) == forced_name]
+        if not filtered:
+            available = [_tool_name(t) for t in tools if _tool_name(t)]
+            raise ValueError(
+                f"tool_choice function '{forced_name}' not found in tools. "
+                f"Available: {available}"
+            )
+        tools = filtered
+        instruction = (
+            f"[IMPORTANT INSTRUCTION] You MUST call the `{forced_name}` function. "
+            f"Do NOT respond with plain text. Respond ONLY with a tool call to "
+            f"`{forced_name}`. This is mandatory."
+        )
+        messages = _inject_json_instruction(messages, instruction)
+        # Disable thinking to prevent model from reasoning its way out
+        if chat_kwargs is not None:
+            chat_kwargs["enable_thinking"] = False
+    elif tool_choice == "required":
+        instruction = (
+            "[IMPORTANT INSTRUCTION] You MUST call at least one of the available "
+            "tools. Do NOT respond with plain text only."
+        )
+        messages = _inject_json_instruction(messages, instruction)
+
+    return tools, messages
+
+
+def _tool_name(tool: dict) -> str | None:
+    """Extract function name from a tool definition dict."""
+    func = tool.get("function")
+    if isinstance(func, dict):
+        return func.get("name")
+    return None
+
+
 def _inject_json_instruction(messages: list, instruction: str) -> list:
     """
     Inject JSON instruction into messages.
@@ -5293,6 +5375,49 @@ async def init_mcp(config_path: str):
 
 
 # =============================================================================
+# TCP Keepalive
+# =============================================================================
+
+
+def _make_keepalive_http_protocol(idle=10, interval=5, count=3):
+    """Create a uvicorn HTTP protocol class with aggressive TCP keepalive.
+
+    When a client abruptly disconnects (power-off, network loss), the server
+    TCP stack won't notice for ~2 hours (default keepalive).  With aggressive
+    keepalive (idle=10s, interval=5s, count=3), dead connections are detected
+    in ~25 seconds, letting ``_wait_with_disconnect()`` abort the request and
+    stop wasting GPU cycles on tokens nobody will receive.
+    """
+    from uvicorn.protocols.http.h11_impl import H11Protocol
+
+    _Base = H11Protocol
+
+    class _KeepaliveProtocol(_Base):
+        def connection_made(self, transport):
+            super().connection_made(transport)
+            sock = transport.get_extra_info("socket")
+            if sock is None:
+                return
+            try:
+                sock.setsockopt(_socket.SOL_SOCKET, _socket.SO_KEEPALIVE, 1)
+                # macOS: TCP_KEEPALIVE (idle time), Linux: TCP_KEEPIDLE
+                if hasattr(_socket, "TCP_KEEPALIVE"):
+                    sock.setsockopt(_socket.IPPROTO_TCP, _socket.TCP_KEEPALIVE, idle)
+                elif hasattr(_socket, "TCP_KEEPIDLE"):
+                    sock.setsockopt(_socket.IPPROTO_TCP, _socket.TCP_KEEPIDLE, idle)
+                if hasattr(_socket, "TCP_KEEPINTVL"):
+                    sock.setsockopt(
+                        _socket.IPPROTO_TCP, _socket.TCP_KEEPINTVL, interval
+                    )
+                if hasattr(_socket, "TCP_KEEPCNT"):
+                    sock.setsockopt(_socket.IPPROTO_TCP, _socket.TCP_KEEPCNT, count)
+            except OSError:
+                pass  # best-effort; some platforms may not support all options
+
+    return _KeepaliveProtocol
+
+
+# =============================================================================
 # Main Entry Point
 # =============================================================================
 
@@ -5386,8 +5511,15 @@ def main():
         lazy_load_model=args.lazy_load_model,
     )
 
-    # Start server
-    uvicorn.run(app, host=args.host, port=args.port)
+    # Start server with TCP keepalive for fast dead-client detection.
+    # Without this, abrupt client disconnects (power-off, network loss) take
+    # 2+ hours to detect via default TCP keepalive, wasting GPU cycles.
+    uvicorn.run(
+        app,
+        host=args.host,
+        port=args.port,
+        http=_make_keepalive_http_protocol(),
+    )
 
 
 def create_parser() -> argparse.ArgumentParser:
