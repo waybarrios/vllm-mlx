@@ -251,7 +251,8 @@ class TestTrimCacheOffset:
 
         model = MagicMock()
         cache = MemoryAwarePrefixCache(
-            model, MemoryCacheConfig(max_memory_mb=64, max_entries=10)
+            model,
+            MemoryCacheConfig(max_memory_mb=64, max_entries=10, min_prefix_tokens=1),
         )
 
         # Stored: tokens [1..120] with 120 positions of KV data, the first 60
@@ -424,6 +425,7 @@ class TestDequantizeCacheSlice:
                 kv_bits=8,
                 kv_group_size=64,
                 kv_min_quantize_tokens=0,
+                min_prefix_tokens=1,
             ),
         )
 
