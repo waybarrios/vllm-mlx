@@ -208,7 +208,16 @@ class BatchedEngine(BaseEngine):
 
         try:
             if self._model is None:
-                await run_blocking_startup_work(self.prepare_for_start)
+                if self._uses_default_prepare_for_start():
+                    # Load inline on the event-loop thread so mlx-lm's
+                    # generation_stream (created at module import on this
+                    # thread) and model weights are owned by the same thread
+                    # that drives scheduler.step (issue #407).
+                    self.prepare_for_start()
+                else:
+                    # Test doubles and custom overrides may block; run them via
+                    # the shared cancellation-safe thread helper.
+                    await run_blocking_startup_work(self.prepare_for_start)
 
             if self._is_mllm:
                 await self._start_mllm()
@@ -222,6 +231,11 @@ class BatchedEngine(BaseEngine):
         except asyncio.CancelledError:
             await cleanup_startup_cancellation(self.stop)
             raise
+
+    def _uses_default_prepare_for_start(self) -> bool:
+        """Return True when prepare_for_start is the class implementation."""
+        method = getattr(self.prepare_for_start, "__func__", None)
+        return method is BatchedEngine.prepare_for_start
 
     def _prepare_mllm_model(self) -> None:
         """Load the MLLM model before scheduler startup."""
@@ -610,7 +624,7 @@ class BatchedEngine(BaseEngine):
                 for part in content:
                     if isinstance(part, dict) and part.get("type") == "image_url":
                         new_content.append({"type": "image"})
-                    elif isinstance(part, (dict, str)):
+                    elif isinstance(part, (dict | str)):
                         new_content.append(part)
                     # skip non-dict/non-str parts to avoid passing unexpected types
                 prepared.append({**msg, "content": new_content})
