@@ -22,6 +22,7 @@ import logging
 from typing import Any
 
 import mlx.core as mx
+import numpy as np
 
 from .cache import get_tokenizer_data
 
@@ -318,6 +319,24 @@ class JSONSchemaLogitsProcessor:
         # Lazy decode cache — populated on demand.
         self._token_decode_cache: dict[int, str | None] = {}
 
+        # Suffix decode cache keyed by length.  Full tokenizer.decode()
+        # is always used (incremental per-token decode is incorrect for
+        # BPE/SentencePiece tokenizers where whitespace is a token prefix).
+        self._cached_suffix_text: str = ""
+        self._cached_suffix_len: int = 0
+
+        # Incremental JSON context state — avoids re-scanning the full
+        # decoded text on every step.
+        self._json_ctx_in_string: bool = False
+        self._json_ctx_last_quote_pos: int = -1
+        self._json_ctx_scanned_len: int = 0
+
+        # Bracket/brace depth counters for fast _suffix_is_complete_json
+        # pre-check.  Updated by _get_json_context incrementally.  JSON
+        # is only potentially complete when both are zero.
+        self._brace_depth: int = 0
+        self._bracket_depth: int = 0
+
     # ------------------------------------------------------------------
 
     def _suffix(self, tokens_list: list[int]) -> list[int]:
@@ -343,18 +362,69 @@ class JSONSchemaLogitsProcessor:
         return result
 
     def _decode_suffix(self, suffix: list[int]) -> str | None:
-        """Decode suffix tokens to text."""
+        """Decode suffix tokens to text.
+
+        Always uses full ``tokenizer.decode(suffix)`` which is correct for
+        all tokenizer families (BPE, SentencePiece, etc.).  Per-token
+        concatenation is NOT safe because whitespace may be encoded as a
+        token prefix (e.g. ``decode([1526]) = "world"`` but in context
+        ``decode([22557, 1526]) = "Hello world"``).
+
+        Results are cached by suffix length to avoid redundant decodes
+        within the same generation step (``_get_json_context`` and
+        ``_suffix_is_complete_json`` both call this method).
+        """
         if not suffix:
+            self._cached_suffix_text = ""
+            self._cached_suffix_len = 0
             return ""
+
+        suffix_len = len(suffix)
+
+        # Fast path: already decoded this exact suffix length.
+        if suffix_len == self._cached_suffix_len:
+            return self._cached_suffix_text
+
+        # Full decode (correct for all tokenizer families).
         try:
             decoded = self._tokenizer.decode(list(suffix))
         except Exception:
             return None
-        return decoded if isinstance(decoded, str) else None
+        result = decoded if isinstance(decoded, str) else ""
+
+        # Validate prefix stability for incremental JSON context scanning.
+        # decode(tokens[:n]) must be a prefix of decode(tokens[:n+1]) for
+        # the incremental scanner in _get_json_context to be correct.
+        if (
+            suffix_len > self._cached_suffix_len
+            and self._cached_suffix_len > 0
+            and not result.startswith(self._cached_suffix_text)
+        ):
+            # Prefix changed — reset incremental context state.
+            self._json_ctx_scanned_len = 0
+            self._json_ctx_in_string = False
+            self._json_ctx_last_quote_pos = -1
+            self._brace_depth = 0
+            self._bracket_depth = 0
+
+        self._cached_suffix_text = result
+        self._cached_suffix_len = suffix_len
+        return result
 
     def _suffix_is_complete_json(self, suffix: list[int]) -> bool:
-        """Return True if the decoded ``suffix`` parses as a complete JSON value."""
+        """Return True if the decoded ``suffix`` parses as a complete JSON value.
+
+        Uses cached bracket/brace depth from ``_get_json_context`` as a
+        fast pre-check: JSON cannot be complete when brackets are
+        unbalanced or we are inside a string.  This avoids the expensive
+        ``json.loads`` call on ~99% of steps.
+        """
         if not suffix:
+            return False
+        # Fast pre-check using cached structural state.
+        if self._brace_depth != 0 or self._bracket_depth != 0:
+            return False
+        if self._json_ctx_in_string:
             return False
         text = self._decode_suffix(suffix)
         if not text:
@@ -371,48 +441,97 @@ class JSONSchemaLogitsProcessor:
     def _get_json_context(self, suffix: list[int]) -> str:
         """Determine the JSON structural context of the current suffix.
 
+        Processes only newly appended characters instead of re-scanning
+        the full decoded text on every call (O(1) amortised per step
+        instead of O(n)).
+
         Returns one of:
         - ``"key_start"``: expecting a new key (after ``{`` or ``,``)
         - ``"in_key"``: inside an open key string
         - ``"other"``: any other position
         """
         text = self._decode_suffix(suffix)
-        if text is None:
+        if text is None or not text:
             return "other"
-        if not text:
-            return "other"  # no output yet — need ``{`` first, not a key
 
-        # Walk through the text tracking open/close of JSON strings so
-        # we can tell whether the suffix ends inside a string.
-        in_string = False
-        i = 0
-        last_quote_pos = -1
-        while i < len(text):
-            ch = text[i]
-            if in_string:
-                if ch == "\\" and i + 1 < len(text):
-                    i += 2
-                    continue
-                if ch == '"':
-                    in_string = False
-            else:
-                if ch == '"':
-                    in_string = True
-                    last_quote_pos = i
-            i += 1
+        text_len = len(text)
 
-        if in_string:
-            # We're inside an open string.  Determine if it's a key or value.
-            # A key is opened right after ``{``/``,`` + optional whitespace.
-            # Check what was before the opening quote.
-            before = text[:last_quote_pos].rstrip()
+        if text_len > self._json_ctx_scanned_len and self._json_ctx_scanned_len > 0:
+            # Incremental scan: process only new characters.
+            in_string = self._json_ctx_in_string
+            last_quote_pos = self._json_ctx_last_quote_pos
+            brace_depth = self._brace_depth
+            bracket_depth = self._bracket_depth
+            i = self._json_ctx_scanned_len
+            while i < text_len:
+                ch = text[i]
+                if in_string:
+                    if ch == "\\" and i + 1 < text_len:
+                        i += 2
+                        continue
+                    if ch == '"':
+                        in_string = False
+                else:
+                    if ch == '"':
+                        in_string = True
+                        last_quote_pos = i
+                    elif ch == "{":
+                        brace_depth += 1
+                    elif ch == "}":
+                        brace_depth -= 1
+                    elif ch == "[":
+                        bracket_depth += 1
+                    elif ch == "]":
+                        bracket_depth -= 1
+                i += 1
+            self._json_ctx_in_string = in_string
+            self._json_ctx_last_quote_pos = last_quote_pos
+            self._json_ctx_scanned_len = text_len
+            self._brace_depth = brace_depth
+            self._bracket_depth = bracket_depth
+        else:
+            # Full scan (first call or text shrank/reset).
+            in_string = False
+            last_quote_pos = -1
+            brace_depth = 0
+            bracket_depth = 0
+            i = 0
+            while i < text_len:
+                ch = text[i]
+                if in_string:
+                    if ch == "\\" and i + 1 < text_len:
+                        i += 2
+                        continue
+                    if ch == '"':
+                        in_string = False
+                else:
+                    if ch == '"':
+                        in_string = True
+                        last_quote_pos = i
+                    elif ch == "{":
+                        brace_depth += 1
+                    elif ch == "}":
+                        brace_depth -= 1
+                    elif ch == "[":
+                        bracket_depth += 1
+                    elif ch == "]":
+                        bracket_depth -= 1
+                i += 1
+            self._json_ctx_in_string = in_string
+            self._json_ctx_last_quote_pos = last_quote_pos
+            self._json_ctx_scanned_len = text_len
+            self._brace_depth = brace_depth
+            self._bracket_depth = bracket_depth
+
+        if self._json_ctx_in_string:
+            before = text[: self._json_ctx_last_quote_pos].rstrip()
             if not before or before[-1] in ("{", ","):
                 return "in_key"
-            return "other"  # it's a value string
+            return "other"
 
         stripped = text.rstrip()
         if not stripped:
-            return "other"  # only whitespace → haven't started JSON yet
+            return "other"
         if stripped[-1] in ("{", ","):
             return "key_start"
         return "other"
@@ -541,20 +660,17 @@ class JSONSchemaLogitsProcessor:
         Build a 1-D mask of length ``vocab_size`` where allowed positions are
         ``0`` and disallowed positions are ``-inf``.
 
-        ``vocab_size`` is taken from the actual logits tensor so that models
-        whose embedding dimension exceeds the tokenizer vocabulary (e.g.
-        MiniMax-M2.7 with 200,064 vs tokenizer 200,000) are handled
-        correctly.
+        Uses numpy for mask construction (C-level speed) instead of a
+        Python loop over ``vocab_size`` elements.
         """
         if not allowed:
             return mx.full((vocab_size,), -float("inf"))
         allowed_clamped = [i for i in allowed if 0 <= i < vocab_size]
         if not allowed_clamped:
             return mx.full((vocab_size,), -float("inf"))
-        buf = [-float("inf")] * vocab_size
-        for i in allowed_clamped:
-            buf[i] = 0.0
-        return mx.array(buf, dtype=mx.float32)
+        buf = np.full(vocab_size, -np.inf, dtype=np.float32)
+        buf[allowed_clamped] = 0.0
+        return mx.array(buf)
 
     # ------------------------------------------------------------------
 
@@ -571,14 +687,23 @@ class JSONSchemaLogitsProcessor:
                 tokens_list = tokens_list[0]
 
             suffix = self._suffix(tokens_list)
-            allowed_result = self._enforcer.get_allowed_tokens(
-                tokens_list if suffix == tokens_list else suffix
-            )
+            # Use prompt_len directly instead of O(n) list comparison.
+            pass_to_enforcer = suffix if self._prompt_len else tokens_list
+            allowed_result = self._enforcer.get_allowed_tokens(pass_to_enforcer)
             allowed = getattr(allowed_result, "allowed_tokens", allowed_result)
             if allowed is None:
                 return logits
 
             allowed_list = list(allowed)
+
+            # --- Schema-aware key filter (before EOS guard so that the
+            # incremental JSON context state and bracket depth counters
+            # are up-to-date for the _suffix_is_complete_json pre-check).
+            context = self._get_json_context(suffix)
+            if context in ("key_start", "in_key"):
+                allowed_list = self._filter_at_key_context(
+                    context, suffix, allowed_list
+                )
 
             # --- EOS guard: only permit EOS when output is valid JSON ---
             if (
@@ -587,13 +712,6 @@ class JSONSchemaLogitsProcessor:
                 and not self._suffix_is_complete_json(suffix)
             ):
                 allowed_list = [t for t in allowed_list if t not in self._eos_set]
-
-            # --- Schema-aware key filter ---
-            context = self._get_json_context(suffix)
-            if context in ("key_start", "in_key"):
-                allowed_list = self._filter_at_key_context(
-                    context, suffix, allowed_list
-                )
 
             # --- Recovery: if enforcer returns empty set AND output is not
             # complete JSON, the schema is likely unsupported — disable the
