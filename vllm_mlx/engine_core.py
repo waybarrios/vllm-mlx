@@ -24,7 +24,6 @@ from .request import Request, RequestOutput, SamplingParams
 from .scheduler import Scheduler, SchedulerConfig
 from .output_collector import RequestOutputCollector, RequestStreamState
 from .model_registry import get_registry
-from .mlx_streams import bind_generation_streams
 
 logger = logging.getLogger(__name__)
 
@@ -139,28 +138,13 @@ class EngineCore:
     async def _engine_loop(self) -> None:
         """Main engine loop.
 
-        All scheduler steps run on one worker thread. MLX generation streams
-        are thread-local, so mixing prefill on a worker with decode on the
-        event-loop thread can reuse stream handles on the wrong thread.
+        mlx-lm's generation_stream is created at module import and is
+        thread-local, so scheduler.step must run on the same thread that
+        imported mlx_lm.generate. PR #399 took this route for the MLLM
+        scheduler; this does the same for the text-only engine.
         """
-        import concurrent.futures
-
-        # Single-thread executor ensures MLX calls are never concurrent and
-        # keeps mlx-lm generation streams bound to one thread for this engine.
-        _executor = concurrent.futures.ThreadPoolExecutor(
-            max_workers=1, thread_name_prefix="mlx-step"
-        )
-        loop = asyncio.get_running_loop()
-        worker_streams_bound = False
-
-        def _ensure_worker_streams_bound() -> None:
-            nonlocal worker_streams_bound
-            if not worker_streams_bound:
-                bind_generation_streams()
-                worker_streams_bound = True
 
         def _step_on_worker():
-            _ensure_worker_streams_bound()
             output = self.scheduler.step()
             self._steps_executed += 1
 
@@ -180,11 +164,9 @@ class EngineCore:
             return output
 
         def _clear_cache_on_worker() -> None:
-            _ensure_worker_streams_bound()
             mx.clear_cache()
 
         def _close_batch_generator_on_worker() -> None:
-            _ensure_worker_streams_bound()
             self.scheduler._close_batch_generator()
 
         step_interval = self.config.step_interval
@@ -206,8 +188,8 @@ class EngineCore:
             while self._running:
                 try:
                     if self.scheduler.has_requests():
-                        output = await loop.run_in_executor(_executor, _step_on_worker)
-                        # Yield to event loop after each worker step.
+                        output = _step_on_worker()
+                        # Yield to event loop after each step.
                         await asyncio.sleep(0)
 
                         # Fast path: distribute outputs to collectors
@@ -243,9 +225,7 @@ class EngineCore:
 
                             # Free Metal buffers after distributing finished outputs
                             if output.finished_request_ids:
-                                await loop.run_in_executor(
-                                    _executor, _clear_cache_on_worker
-                                )
+                                _clear_cache_on_worker()
 
                             # Always yield to prevent event loop starvation.
                             # Without this, orphaned requests (client disconnected but
@@ -264,16 +244,9 @@ class EngineCore:
                     logger.error(f"Engine loop error: {e}\n{traceback.format_exc()}")
                     await asyncio.sleep(0.1)
         finally:
-            # Close the batch generator on the same worker thread that owns the
-            # generation streams, then wait for any in-flight work to finish.
-            close_future = loop.run_in_executor(
-                _executor, _close_batch_generator_on_worker
-            )
-            try:
-                await asyncio.shield(close_future)
-            except BaseException:
-                pass
-            _executor.shutdown(wait=True)
+            # Close the batch generator on this (event-loop) thread, which owns
+            # mlx-lm's generation streams.
+            _close_batch_generator_on_worker()
 
     async def add_request(
         self,

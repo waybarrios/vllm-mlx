@@ -139,6 +139,17 @@ jobs:
             -m "not slow" \
             -k "not Integration"
 
+      - name: Run EngineCore stream-affinity regression tests
+        run: |
+          # Fresh process so globals like mlx_lm.generate.generation_stream
+          # are not rebound by earlier tests (see issue #407).
+          pytest \
+            tests/test_batching_deterministic.py \
+            tests/test_engine_core_stream_safety.py \
+            -v --tb=short \
+            -m "not slow" \
+            -k "not Integration"
+
   tests:
     needs: [test-matrix, test-apple-silicon]
     runs-on: ubuntu-latest
