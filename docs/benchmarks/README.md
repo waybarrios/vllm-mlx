@@ -37,6 +37,10 @@ qualification, where raw speed is not enough and every run needs provenance,
 quality checks, Prometheus metric deltas, and policy-timeout evidence.
 Use `--repetitions` to measure variance; workload summaries report per-case
 sample counts, failure rates, and min/median/max latency and throughput.
+`required_regex` and `forbidden_regex` entries are Python regular expressions;
+plain literal strings are valid regex patterns. Workload `cache_policy` accepts
+`preserve`, `before-run`, and `before-case`; JSON/YAML-style underscore
+spellings such as `before_case` are normalized to the same values.
 
 Example workload:
 
@@ -97,6 +101,10 @@ Workload output defaults to JSON for full provenance. Use `--format csv` for
 flat per-case rows, `--format sql` to emit importable SQL, or
 `--format sqlite --output bench.db` to append rows directly into a local
 benchmark database.
+
+`--request-timeout-s` is the HTTP transport ceiling for each request in
+workload mode. Product policy timeouts belong in the workload as
+`policy_timeout_ms` and are recorded as comparison evidence.
 
 ```bash
 vllm-mlx bench-serve --url http://localhost:8000 \

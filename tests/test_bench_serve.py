@@ -16,6 +16,7 @@ from vllm_mlx.bench_serve import (
     SweepConfig,
     Workload,
     WorkloadCase,
+    _validate_sql_identifier,
     compute_request_metrics,
     compute_summary_stats,
     detect_hardware_fingerprint,
@@ -1386,6 +1387,13 @@ class TestFormatters:
                 "SELECT case_id, repetition, quality_ok FROM bench_serve_workload"
             ).fetchone()
         assert row == ("resume-smoke", 0, 1)
+
+    def test_sqlite_identifier_validation_rejects_unsafe_names(self):
+        with pytest.raises(ValueError, match="invalid SQLite table identifier"):
+            _validate_sql_identifier("bench; DROP TABLE bench_serve", kind="table")
+
+        with pytest.raises(ValueError, match="invalid SQLite column identifier"):
+            _validate_sql_identifier("case-id", kind="column")
 
     def test_format_workload_payload_rejects_unknown_format(self):
         with pytest.raises(ValueError, match="Unsupported workload output format"):

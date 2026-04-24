@@ -44,6 +44,7 @@ from tabulate import tabulate as _tabulate
 
 _BUILTIN_DIR = Path(__file__).parent / "bench_serve_prompts"
 _BUILTIN_NAMES = {"short", "medium", "long", "thinking"}
+_SQL_IDENTIFIER_RE = re.compile(r"^[a-z_][a-z0-9_]*$")
 
 
 @dataclass
@@ -614,6 +615,11 @@ async def clear_runtime_cache(client: httpx.AsyncClient, base_url: str) -> dict:
 
 
 def _normalize_cache_policy(value: Optional[str]) -> str:
+    """Normalize cache-policy spelling from CLI or workload JSON.
+
+    CLI choices are hyphenated, but workload JSON may use underscores when it
+    follows common Python/YAML identifier style.
+    """
     policy = (value or "preserve").strip().lower().replace("_", "-")
     if policy not in {"preserve", "before-run", "before-case"}:
         raise ValueError(
@@ -1210,14 +1216,13 @@ def summarize_workload_results(results: list[dict]) -> dict:
     latencies = [r["metrics"]["e2e_latency_ms"] for r in results]
     ttft = [r["metrics"]["ttft_ms"] for r in results]
     gen_tps = [r["metrics"]["gen_tps"] for r in results]
-    quality_failures = [r for r in results if not r["quality"]["ok"]]
+    failures = [r for r in results if not r["quality"]["ok"]]
     policy_trials = [
         r for r in results if r["policy"].get("within_timeout") is not None
     ]
     policy_failures = [
         r for r in policy_trials if r["policy"].get("within_timeout") is False
     ]
-    failures = [r for r in results if not r["quality"]["ok"]]
     cases: dict[str, list[dict]] = {}
     for result in results:
         cases.setdefault(str(result.get("case_id", "")), []).append(result)
@@ -1277,8 +1282,8 @@ def summarize_workload_results(results: list[dict]) -> dict:
         "passed": not failures,
         "failure_count": len(failures),
         "failure_rate": round(len(failures) / len(results), 4) if results else 0.0,
-        "quality_passed": not quality_failures,
-        "quality_failure_count": len(quality_failures),
+        "quality_passed": not failures,
+        "quality_failure_count": len(failures),
         "policy_timeout_passed": not policy_failures if policy_trials else None,
         "policy_timeout_failure_count": (
             len(policy_failures) if policy_trials else None
@@ -1560,6 +1565,9 @@ def _write_sqlite_rows(
 ) -> None:
     """Append benchmark rows to a SQLite database."""
     db_path = Path(output_path).expanduser()
+    _validate_sql_identifier(table, kind="table")
+    for column in columns:
+        _validate_sql_identifier(column, kind="column")
     placeholders = ", ".join("?" for _ in columns)
     column_list = ", ".join(columns)
     values = [[row.get(col) for col in columns] for row in rows]
@@ -1571,6 +1579,12 @@ def _write_sqlite_rows(
                 values,
             )
         conn.commit()
+
+
+def _validate_sql_identifier(identifier: str, *, kind: str) -> None:
+    """Reject unsafe SQL identifiers before string interpolation."""
+    if not _SQL_IDENTIFIER_RE.fullmatch(identifier):
+        raise ValueError(f"invalid SQLite {kind} identifier: {identifier!r}")
 
 
 def write_sqlite(results: list[BenchServeResult], output_path: str) -> None:

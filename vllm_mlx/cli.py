@@ -703,13 +703,14 @@ def bench_serve_command(args):
         request_timeout_s = (
             None if args.request_timeout_s <= 0 else args.request_timeout_s
         )
+        output_format = "json" if args.format == "auto" else args.format
         asyncio.run(
             run_bench_serve_workload(
                 url=args.url,
                 workload_path=args.workload,
                 model=args.model,
                 output_path=args.output,
-                output_format=args.format or "json",
+                output_format=output_format,
                 scrape=args.scrape_metrics == "true",
                 include_content=args.include_content,
                 request_timeout_s=request_timeout_s,
@@ -751,6 +752,7 @@ def bench_serve_command(args):
             k, v = kv.split("=", 1)
             overrides[k] = v
 
+    output_format = "table" if args.format == "auto" else args.format
     asyncio.run(
         run_bench_serve(
             url=args.url,
@@ -764,7 +766,7 @@ def bench_serve_command(args):
             thinking_values=thinking_values,
             extra_bodies=extra_bodies,
             output_path=args.output,
-            fmt=args.format or "table",
+            fmt=output_format,
             do_validate=args.validate == "true",
             scrape=args.scrape_metrics == "true",
             tag=args.tag,
@@ -1453,9 +1455,12 @@ Examples:
     bench_serve_parser.add_argument(
         "--format",
         type=str,
-        default=None,
-        choices=["table", "json", "csv", "sql", "sqlite"],
-        help="Output format (default: table for prompt sweeps, json for workloads; sqlite requires --output)",
+        default="auto",
+        choices=["auto", "table", "json", "csv", "sql", "sqlite"],
+        help=(
+            "Output format (auto = table for prompt sweeps, json for workloads; "
+            "sqlite requires --output)"
+        ),
     )
     bench_serve_parser.add_argument(
         "--validate",
@@ -1492,7 +1497,8 @@ Examples:
         choices=["preserve", "before-run", "before-case"],
         help=(
             "Workload cache handling (default: workload defaults or preserve). "
-            "Use before-case for cold, uncontaminated per-case qualification."
+            "Use before-case for cold, uncontaminated per-case qualification. "
+            "Workload JSON may also spell these with underscores."
         ),
     )
     bench_serve_parser.add_argument(

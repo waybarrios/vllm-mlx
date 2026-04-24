@@ -162,8 +162,16 @@ vllm-mlx bench-serve --url http://localhost:8000 [options]
 | `--scrape-metrics` | Scrape `/metrics` before/after runs | `true` |
 | `--include-content` | Include full generated content in workload JSON | False |
 | `--request-timeout-s` | Workload HTTP transport timeout, `0` disables | `300` |
+| `--cache-policy` | Workload cache handling: `preserve`, `before-run`, `before-case` | Workload default or `preserve` |
 | `--output` | Output file | stdout |
-| `--format` | Output format: `table`, `json`, `csv`, `sql`, `sqlite` | `table` for prompt sweeps, `json` for workloads |
+| `--format` | Output format: `auto`, `table`, `json`, `csv`, `sql`, `sqlite` | `auto` = `table` for prompt sweeps, `json` for workloads |
+
+In workload mode, `--request-timeout-s` is the HTTP transport ceiling for each
+request. Product policy timeouts should live in the workload as
+`policy_timeout_ms`. Workload `required_regex` and `forbidden_regex` values are
+Python regex patterns, so literal strings are valid. Workload JSON may spell
+cache policy values with underscores, such as `before_case`; they normalize to
+the hyphenated CLI values.
 
 ### Examples
 
