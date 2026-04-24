@@ -816,7 +816,7 @@ class MLLMScheduler:
                 # thread-safe, so this is safe to offload.
                 bg = self.batch_generator
                 if bg is not None:
-                    for req in list(bg.unprocessed_requests):
+                    for req in list(getattr(bg, "unprocessed_requests", ())):
                         if req.input_ids is None and not req.images and not req.videos:
                             try:
                                 tic = time.perf_counter()
