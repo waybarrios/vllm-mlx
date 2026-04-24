@@ -23,7 +23,6 @@ from .base import (
     BaseEngine,
     GenerationOutput,
     cleanup_startup_cancellation,
-    run_blocking_startup_work,
 )
 
 logger = logging.getLogger(__name__)
@@ -208,7 +207,14 @@ class BatchedEngine(BaseEngine):
 
         try:
             if self._model is None:
-                await run_blocking_startup_work(self.prepare_for_start)
+                # Load inline on the event-loop thread so mlx-lm's
+                # generation_stream (created at module import on this thread)
+                # and the model weights end up on the same thread that drives
+                # scheduler.step. Running this via asyncio.to_thread puts
+                # weights on a worker thread whose stream ID the event loop
+                # does not register, which reproduces issue #407 reliably on
+                # dense Llama 3.x models.
+                self.prepare_for_start()
 
             if self._is_mllm:
                 await self._start_mllm()
