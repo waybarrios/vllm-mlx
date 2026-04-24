@@ -429,5 +429,191 @@ class TestSimplifySchema:
                 pytest.fail(f"Nested anyOf still present in branch: {branch!r}")
 
 
+# ---------------------------------------------------------------------------
+# Incremental caching — O(n) suffix decode + context tracking.
+# ---------------------------------------------------------------------------
+
+
+class _BPETokenizer(_FakeTokenizer):
+    """Fake tokenizer that simulates BPE whitespace-prefix behaviour.
+
+    In real BPE tokenizers (Mistral, Llama, Qwen), a token like ``world``
+    decodes to ``" world"`` (with leading space) when preceded by another
+    token, but ``"world"`` when decoded alone.  This means::
+
+        decode([tok_hello]) + decode([tok_world]) != decode([tok_hello, tok_world])
+
+    This tokenizer adds multi-character tokens with context-dependent
+    whitespace to exercise prefix-stability in ``_decode_suffix``.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        # Add multi-char tokens that simulate BPE merges.
+        # Token ids continue from the parent's vocab.
+        self._multi = {
+            self.vocab_size: "Hello",
+            self.vocab_size + 1: " world",  # note: leading space in context
+            self.vocab_size + 2: " value",
+        }
+        self._multi_alone = {
+            self.vocab_size: "Hello",
+            self.vocab_size + 1: "world",  # NO leading space when decoded alone
+            self.vocab_size + 2: "value",
+        }
+        self.vocab_size += len(self._multi)
+
+    def encode(self, text: str) -> list[int]:
+        # Simple: just use parent for JSON chars, multi tokens for words.
+        return super().encode(text)
+
+    def decode(self, ids: list[int]) -> str:
+        parts: list[str] = []
+        for idx, tok_id in enumerate(ids):
+            if tok_id in self._multi:
+                # Simulate BPE: leading space only when preceded by another token.
+                if idx > 0:
+                    parts.append(self._multi[tok_id])
+                else:
+                    parts.append(self._multi_alone[tok_id])
+            elif 0 <= tok_id < len(self._id_to_tok):
+                tok = self._id_to_tok[tok_id]
+                if not tok.startswith("<"):
+                    parts.append(tok)
+        return "".join(parts)
+
+
+@pytestmark_lmfe
+class TestIncrementalCaching:
+    """Verify that the incremental decode / context-tracking optimisations
+    produce correct results identical to a full re-scan on every step."""
+
+    def _make_processor(self, schema: dict | None = None, tokenizer=None):
+        from vllm_mlx.constrained import JSONSchemaLogitsProcessor
+
+        tok = tokenizer or _FakeTokenizer()
+        return JSONSchemaLogitsProcessor(schema, tok), tok
+
+    def test_incremental_decode_matches_full_decode(self):
+        """Growing suffix one token at a time should produce the same decoded
+        text as a full decode on each step."""
+        processor, tok = self._make_processor()
+        text = '{"a": 1}'
+        token_ids = tok.encode(text)
+
+        for step in range(1, len(token_ids) + 1):
+            suffix = token_ids[:step]
+            # Incremental path (cached).
+            inc_text = processor._decode_suffix(suffix)
+            # Full decode for reference.
+            full_text = tok.decode(suffix)
+            assert (
+                inc_text == full_text
+            ), f"Step {step}: incremental={inc_text!r} != full={full_text!r}"
+
+    def test_non_concatenative_tokenizer_decode(self):
+        """Regression test: BPE tokenizers where per-token decode differs
+        from full-sequence decode (whitespace as token prefix).
+
+        decode([tok_hello]) + decode([tok_world]) = "Helloworld"
+        decode([tok_hello, tok_world])             = "Hello world"
+
+        _decode_suffix must always match the full decode, never per-token concat.
+        """
+        bpe_tok = _BPETokenizer()
+        processor, _ = self._make_processor(tokenizer=bpe_tok)
+
+        # Token ids for the multi-char tokens.
+        hello_id = bpe_tok.vocab_size - 3  # "Hello"
+        world_id = bpe_tok.vocab_size - 2  # " world" in context
+
+        # Verify the tokenizer IS non-concatenative.
+        alone_concat = bpe_tok.decode([hello_id]) + bpe_tok.decode([world_id])
+        full_decode = bpe_tok.decode([hello_id, world_id])
+        assert alone_concat == "Helloworld"
+        assert full_decode == "Hello world"
+        assert alone_concat != full_decode, "Test tokenizer must be non-concatenative"
+
+        # Step through: _decode_suffix must match full decode at every step.
+        suffix = [hello_id]
+        result1 = processor._decode_suffix(suffix)
+        assert result1 == bpe_tok.decode([hello_id])
+
+        suffix = [hello_id, world_id]
+        result2 = processor._decode_suffix(suffix)
+        assert result2 == full_decode, (
+            f"_decode_suffix returned {result2!r}, expected {full_decode!r}. "
+            f"Per-token concat would give {alone_concat!r} — this is the bug."
+        )
+
+    def test_incremental_context_tracks_braces(self):
+        """Bracket/brace depth should update correctly through incremental
+        scanning, matching a full re-scan."""
+        processor, tok = self._make_processor(
+            {"type": "object", "properties": {"a": {"type": "integer"}}}
+        )
+        text = '{"a": 1}'
+        token_ids = tok.encode(text)
+
+        # Simulate stepping through generation.
+        processor._prompt_len = 0
+        for step in range(1, len(token_ids) + 1):
+            suffix = token_ids[:step]
+            ctx = processor._get_json_context(suffix)
+            decoded = tok.decode(suffix)
+
+            # Verify brace depth at key points.
+            if decoded == "{":
+                assert processor._brace_depth == 1
+            if decoded == '{"a": 1}':
+                assert processor._brace_depth == 0
+                assert ctx == "other"
+
+    def test_bracket_precheck_avoids_json_loads(self):
+        """When brackets are unbalanced, _suffix_is_complete_json should
+        return False without calling json.loads (fast pre-check)."""
+        processor, tok = self._make_processor()
+        # Feed partial JSON — braces are open.
+        partial = '{"a": '
+        token_ids = tok.encode(partial)
+
+        processor._prompt_len = 0
+        # Update context state.
+        processor._get_json_context(token_ids)
+        assert processor._brace_depth > 0
+
+        # Pre-check should short-circuit.
+        assert not processor._suffix_is_complete_json(token_ids)
+
+    def test_complete_json_detected(self):
+        processor, tok = self._make_processor()
+        text = '{"a": 1}'
+        token_ids = tok.encode(text)
+
+        processor._prompt_len = 0
+        # Must update context first (populates bracket counters).
+        processor._get_json_context(token_ids)
+        assert processor._brace_depth == 0
+        assert processor._suffix_is_complete_json(token_ids)
+
+    def test_numpy_mask_matches_original(self):
+        """The numpy-based _build_allow_mask should produce the same mask
+        as the old Python-list approach."""
+        import numpy as np
+
+        processor, tok = self._make_processor()
+        allowed = [0, 3, 7, 10]
+        vocab = tok.vocab_size
+
+        mask = processor._build_allow_mask(allowed, vocab)
+        arr = np.array(mask)
+
+        for i in range(vocab):
+            if i in allowed:
+                assert arr[i] == 0.0, f"Position {i} should be 0.0"
+            else:
+                assert arr[i] == -np.inf, f"Position {i} should be -inf"
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
