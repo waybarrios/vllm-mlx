@@ -193,7 +193,7 @@ class TestCompletionRequest:
 
 
 class TestRequestCancellationEndpoint:
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_cancel_request_routes_to_loaded_engine(self):
         import vllm_mlx.server as server
 
@@ -221,7 +221,7 @@ class TestRequestCancellationEndpoint:
             server._engine = old_engine
             server._model_name = old_model_name
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_cancel_request_404_for_unknown_request(self):
         import vllm_mlx.server as server
 
