@@ -1679,7 +1679,14 @@ async def _stream_responses_request(request: ResponsesRequest) -> AsyncIterator[
 
         content = SPECIAL_TOKENS_PATTERN.sub("", delta_text)
         if tool_parser and delta_text:
-            if not tool_markup_possible and "<" not in delta_text:
+            # Fast path: skip parsing until a tool-markup marker appears.
+            # Use _streaming_tool_markup_possible to catch all supported
+            # shapes (<tool_call>, <function=, [Calling tool:, [TOOL_CALLS],
+            # bare bracket [func({...})], etc.) — the old `"<" not in` check
+            # missed bracket formats and let Qwen3.6-style tool calls leak.
+            if not tool_markup_possible and not _streaming_tool_markup_possible(
+                tool_accumulated_text + delta_text
+            ):
                 tool_accumulated_text += delta_text
             else:
                 if not tool_markup_possible:

@@ -272,9 +272,11 @@ class QwenToolParser(ToolParser):
 
             return None
 
-        # If we're in a tool call, accumulate and parse at the end
-        # For simplicity, return None during accumulation
-        if "</tool_call>" in delta_text or ")]" in delta_text:
+        # If we're in a tool call, accumulate and parse at the end.
+        # Check current_text (accumulated), not delta_text — closing markers
+        # like ")]" or "</tool_call>" often span token boundaries and may
+        # never appear within a single delta chunk.
+        if "</tool_call>" in current_text or ")]" in current_text:
             # Tool call complete, parse the whole thing
             result = self.extract_tool_calls(current_text)
             if result.tools_called:
