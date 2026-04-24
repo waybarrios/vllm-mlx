@@ -80,7 +80,9 @@ def serve_command(args):
         server._default_temperature = args.default_temperature
     if args.default_top_p is not None:
         server._default_top_p = args.default_top_p
-    server._default_chat_template_kwargs = args.default_chat_template_kwargs
+    server._default_chat_template_kwargs = getattr(
+        args, "default_chat_template_kwargs", None
+    )
     if args.default_top_k is not None:
         server._default_top_k = args.default_top_k
     if args.default_min_p is not None:
@@ -1155,6 +1157,36 @@ Examples:
             "Default chat template kwargs to apply to all requests when request "
             "chat_template_kwargs is omitted or empty; empty request kwargs use "
             'existing server defaults (JSON object, e.g. {"enable_thinking": true})'
+        ),
+    )
+    serve_parser.add_argument(
+        "--default-top-k",
+        type=int,
+        default=None,
+        help="Override default top_k for all requests (default: use model default)",
+    )
+    serve_parser.add_argument(
+        "--default-min-p",
+        type=float,
+        default=None,
+        help="Override default min_p for all requests (default: use model default)",
+    )
+    serve_parser.add_argument(
+        "--default-presence-penalty",
+        type=float,
+        default=None,
+        help=(
+            "Override default presence_penalty for all requests "
+            "(default: use model default)"
+        ),
+    )
+    serve_parser.add_argument(
+        "--default-repetition-penalty",
+        type=float,
+        default=None,
+        help=(
+            "Override default repetition_penalty for all requests "
+            "(default: use model default)"
         ),
     )
     # Embedding model option
