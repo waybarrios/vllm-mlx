@@ -1286,6 +1286,29 @@ class TestQwenStreamingBuffering:
                 break
         assert tool_calls_found
 
+    def test_streaming_bracket_call_closing_marker_split(self, parser):
+        """Qwen bracket calls should complete when ')' and ']' split chunks."""
+        chunks = [
+            '[Calling tool: add({"a": 1, "b": 2})',
+            "]",
+        ]
+
+        accumulated = ""
+        emitted = None
+        for chunk in chunks:
+            previous = accumulated
+            accumulated += chunk
+            emitted = parser.extract_tool_calls_streaming(
+                previous_text=previous,
+                current_text=accumulated,
+                delta_text=chunk,
+            )
+
+        assert emitted is not None
+        assert "tool_calls" in emitted
+        assert emitted["tool_calls"][0]["function"]["name"] == "add"
+        assert emitted["tool_calls"][0]["function"]["arguments"] == ('{"a": 1, "b": 2}')
+
     def test_streaming_partial_marker_buffered(self, parser):
         """Test that partial '<function' is buffered (not leaked as content)."""
         r = parser.extract_tool_calls_streaming(

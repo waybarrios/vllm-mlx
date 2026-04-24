@@ -574,6 +574,68 @@ class TestResponsesEndpoint:
         assert created_payload["response"]["id"] == completed_payload["response"]["id"]
         assert completed_payload["response"]["output_text"] == "Hello stream"
 
+    def test_streaming_response_bracket_tool_call_does_not_leak_text(
+        self, client, monkeypatch
+    ):
+        import vllm_mlx.server as srv
+
+        engine = _mock_engine(_output("unused"))
+        engine.chat = AsyncMock(
+            side_effect=AssertionError("stream path should not call chat")
+        )
+        engine._stream_outputs = [
+            _stream_output('[Calling tool: add({"a": 1, "b": 2})'),
+            _stream_output("]", completion_tokens=2, finish_reason="stop"),
+        ]
+        srv._engine = engine
+        monkeypatch.setattr(srv, "_enable_auto_tool_choice", True)
+        monkeypatch.setattr(srv, "_tool_call_parser", "qwen3")
+        monkeypatch.setattr(srv, "_tool_parser_instance", None)
+        monkeypatch.setattr(srv, "_reasoning_parser", None)
+
+        with client.stream(
+            "POST",
+            "/v1/responses",
+            json={
+                "model": "test-model",
+                "input": "Add two numbers",
+                "stream": True,
+                "tools": [
+                    {
+                        "type": "function",
+                        "name": "add",
+                        "description": "Add two numbers",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "a": {"type": "integer"},
+                                "b": {"type": "integer"},
+                            },
+                            "required": ["a", "b"],
+                        },
+                    }
+                ],
+            },
+        ) as resp:
+            body = "".join(resp.iter_text())
+
+        assert resp.status_code == 200
+        events = _parse_sse_events(body)
+        output_text_deltas = [
+            payload["delta"]
+            for event_type, payload in events
+            if event_type == "response.output_text.delta"
+        ]
+        function_call_deltas = [
+            payload
+            for event_type, payload in events
+            if event_type == "response.function_call_arguments.delta"
+        ]
+
+        assert not any("[Calling tool:" in delta for delta in output_text_deltas)
+        assert len(function_call_deltas) == 1
+        assert function_call_deltas[0]["delta"] == '{"a": 1, "b": 2}'
+
     def test_json_object_response_format_is_rejected(self, client):
         import vllm_mlx.server as srv
 
