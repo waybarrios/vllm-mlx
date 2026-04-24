@@ -713,6 +713,7 @@ def bench_serve_command(args):
                 scrape=args.scrape_metrics == "true",
                 include_content=args.include_content,
                 request_timeout_s=request_timeout_s,
+                repetitions=args.repetitions,
             )
         )
         return
@@ -1422,7 +1423,7 @@ Examples:
         "--repetitions",
         type=int,
         default=3,
-        help="Number of repetitions per sweep configuration (default: 3)",
+        help="Number of repetitions per sweep configuration or workload case (default: 3)",
     )
     bench_serve_parser.add_argument(
         "--warmup",

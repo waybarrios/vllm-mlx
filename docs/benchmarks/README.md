@@ -35,6 +35,8 @@ vllm-mlx bench-serve --url http://localhost:8000 \
 running OpenAI-compatible server. This is intended for model and feature-stack
 qualification, where raw speed is not enough and every run needs provenance,
 quality checks, Prometheus metric deltas, and policy-timeout evidence.
+Use `--repetitions` to measure variance; workload summaries report per-case
+sample counts, failure rates, and min/median/max latency and throughput.
 
 Example workload:
 
@@ -94,6 +96,11 @@ policy?" after first measuring what the model and serving stack can actually do.
 Workload output defaults to JSON for full provenance. Use `--format csv` for
 flat per-case rows or `--format sql` to emit importable SQL for a local
 benchmark database.
+
+```bash
+vllm-mlx bench-serve --url http://localhost:8000 \
+  --workload ./workload.json --repetitions 5 --output workload-results.json
+```
 
 ## Standalone Test Defaults
 

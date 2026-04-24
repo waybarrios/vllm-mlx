@@ -1040,6 +1040,7 @@ async def run_workload_case(
     hardware: dict,
     run_id: str,
     timestamp: str,
+    repetition: int = 0,
     scrape: bool = True,
     include_content: bool = False,
 ) -> dict:
@@ -1114,6 +1115,7 @@ async def run_workload_case(
         "started_at": started_wall,
         "workload": workload.name,
         "case_id": case.case_id,
+        "repetition": repetition,
         "tags": list(case.tags),
         "model_id": model,
         "runtime": runtime,
@@ -1172,8 +1174,62 @@ def summarize_workload_results(results: list[dict]) -> dict:
         r for r in policy_trials if r["policy"].get("within_timeout") is False
     ]
     failures = [r for r in results if not r["quality"]["ok"]]
+    cases: dict[str, list[dict]] = {}
+    for result in results:
+        cases.setdefault(str(result.get("case_id", "")), []).append(result)
+
+    case_summaries = {}
+    for case_id, case_results in sorted(cases.items()):
+        case_quality_failures = [r for r in case_results if not r["quality"].get("ok")]
+        case_policy_trials = [
+            r for r in case_results if r["policy"].get("within_timeout") is not None
+        ]
+        case_policy_failures = [
+            r for r in case_policy_trials if r["policy"].get("within_timeout") is False
+        ]
+        case_summaries[case_id] = {
+            "sample_count": len(case_results),
+            "repetitions": sorted(
+                {
+                    int(r.get("repetition", 0))
+                    for r in case_results
+                    if r.get("repetition") is not None
+                }
+            ),
+            "passed": not case_quality_failures,
+            "failure_count": len(case_quality_failures),
+            "failure_rate": (
+                round(len(case_quality_failures) / len(case_results), 4)
+                if case_results
+                else 0.0
+            ),
+            "policy_timeout_passed": (
+                not case_policy_failures if case_policy_trials else None
+            ),
+            "policy_timeout_failure_count": (
+                len(case_policy_failures) if case_policy_trials else None
+            ),
+            "latency_ms": _summary_or_empty(
+                [r["metrics"]["e2e_latency_ms"] for r in case_results]
+            ),
+            "ttft_ms": _summary_or_empty(
+                [r["metrics"]["ttft_ms"] for r in case_results]
+            ),
+            "gen_tps": _summary_or_empty(
+                [r["metrics"]["gen_tps"] for r in case_results]
+            ),
+            "content_chars": _summary_or_empty(
+                [r["quality"].get("content_chars", 0) for r in case_results]
+            ),
+        }
+
     return {
         "case_count": len(results),
+        "unique_case_count": len(cases),
+        "repetition_count": max(
+            (len(summary["repetitions"]) for summary in case_summaries.values()),
+            default=0,
+        ),
         "passed": not failures,
         "failure_count": len(failures),
         "failure_rate": round(len(failures) / len(results), 4) if results else 0.0,
@@ -1186,6 +1242,7 @@ def summarize_workload_results(results: list[dict]) -> dict:
         "latency_ms": _summary_or_empty(latencies),
         "ttft_ms": _summary_or_empty(ttft),
         "gen_tps": _summary_or_empty(gen_tps),
+        "case_summaries": case_summaries,
     }
 
 
@@ -1199,6 +1256,7 @@ async def run_bench_serve_workload(
     scrape: bool = True,
     include_content: bool = False,
     request_timeout_s: Optional[float] = 300.0,
+    repetitions: int = 1,
 ) -> dict:
     """Run a declarative workload against a running server.
 
@@ -1206,6 +1264,9 @@ async def run_bench_serve_workload(
     policy knobs in the manifest, records them as evidence, and measures what
     the server actually does before anyone promotes a model or feature stack.
     """
+    if repetitions < 1:
+        raise ValueError("repetitions must be at least 1")
+
     workload = load_workload(workload_path)
     run_id = str(uuid.uuid4())[:8]
     timestamp = datetime.now(timezone.utc).isoformat()
@@ -1219,21 +1280,23 @@ async def run_bench_serve_workload(
             raise ValueError("could not determine model ID; pass --model")
 
         records = []
-        for case in workload.cases:
-            record = await run_workload_case(
-                client,
-                url,
-                workload=workload,
-                case=case,
-                model=model_id,
-                runtime=runtime,
-                hardware=hardware,
-                run_id=run_id,
-                timestamp=timestamp,
-                scrape=scrape,
-                include_content=include_content,
-            )
-            records.append(record)
+        for repetition in range(repetitions):
+            for case in workload.cases:
+                record = await run_workload_case(
+                    client,
+                    url,
+                    workload=workload,
+                    case=case,
+                    model=model_id,
+                    runtime=runtime,
+                    hardware=hardware,
+                    run_id=run_id,
+                    timestamp=timestamp,
+                    repetition=repetition,
+                    scrape=scrape,
+                    include_content=include_content,
+                )
+                records.append(record)
 
     payload = {
         "run_id": run_id,
@@ -1243,6 +1306,7 @@ async def run_bench_serve_workload(
             "description": workload.description,
             "path": str(Path(workload_path).expanduser()),
             "defaults": workload.defaults,
+            "repetitions": repetitions,
         },
         "transport": {
             "request_timeout_s": request_timeout_s,
@@ -1412,6 +1476,7 @@ WORKLOAD_RESULT_COLUMNS = [
     "timestamp",
     "workload",
     "case_id",
+    "repetition",
     "tags",
     "model_id",
     "chip",
@@ -1450,6 +1515,7 @@ WORKLOAD_RESULT_COLUMNS = [
 
 _WORKLOAD_TABLE_COLUMNS = [
     "case_id",
+    "repetition",
     "tags",
     "quality_ok",
     "within_policy_timeout",
@@ -1475,6 +1541,7 @@ def _workload_record_to_row(record: dict) -> dict:
         "timestamp": record.get("timestamp", ""),
         "workload": record.get("workload", ""),
         "case_id": record.get("case_id", ""),
+        "repetition": record.get("repetition", 0),
         "tags": ",".join(record.get("tags") or []),
         "model_id": record.get("model_id", ""),
         "chip": hardware.get("chip", ""),
@@ -1541,8 +1608,8 @@ def format_workload_csv(payload: dict) -> str:
 
 
 _WORKLOAD_SQL_SCHEMA = (
-    "run_id TEXT, timestamp TEXT, workload TEXT, case_id TEXT, tags TEXT, "
-    "model_id TEXT, chip TEXT, memory_gb REAL, os_version TEXT, "
+    "run_id TEXT, timestamp TEXT, workload TEXT, case_id TEXT, repetition INTEGER, "
+    "tags TEXT, model_id TEXT, chip TEXT, memory_gb REAL, os_version TEXT, "
     "engine_type TEXT, model_type TEXT, mtp_enabled BOOLEAN, specprefill BOOLEAN, "
     "kv_quant TEXT, cache_type TEXT, request_max_tokens INTEGER, "
     "request_enable_thinking BOOLEAN, request_extra_body TEXT, "

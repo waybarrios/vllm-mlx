@@ -32,6 +32,7 @@ from vllm_mlx.bench_serve import (
     parse_metrics_text,
     parse_sse_line,
     parse_status_response,
+    run_bench_serve_workload,
     run_workload_case,
     summarize_workload_results,
     validate_quality_checks,
@@ -793,8 +794,10 @@ class TestWorkloadSummary:
         results = [
             {
                 "ok": True,
+                "case_id": "case-a",
+                "repetition": 0,
                 "policy": {"within_timeout": True},
-                "quality": {"ok": True},
+                "quality": {"ok": True, "content_chars": 120},
                 "metrics": {
                     "e2e_latency_ms": 100.0,
                     "ttft_ms": 10.0,
@@ -803,8 +806,10 @@ class TestWorkloadSummary:
             },
             {
                 "ok": True,
+                "case_id": "case-a",
+                "repetition": 1,
                 "policy": {"within_timeout": False},
-                "quality": {"ok": True},
+                "quality": {"ok": True, "content_chars": 160},
                 "metrics": {
                     "e2e_latency_ms": 200.0,
                     "ttft_ms": 20.0,
@@ -820,6 +825,11 @@ class TestWorkloadSummary:
         assert summary["policy_timeout_passed"] is False
         assert summary["failure_rate"] == pytest.approx(0.0)
         assert summary["latency_ms"]["p50"] == pytest.approx(150.0)
+        assert summary["unique_case_count"] == 1
+        assert summary["repetition_count"] == 2
+        assert summary["case_summaries"]["case-a"]["repetitions"] == [0, 1]
+        assert summary["case_summaries"]["case-a"]["latency_ms"]["min"] == 100.0
+        assert summary["case_summaries"]["case-a"]["latency_ms"]["max"] == 200.0
 
 
 class TestWorkloadRunner:
@@ -909,6 +919,7 @@ class TestWorkloadRunner:
                 hardware={"chip": "test"},
                 run_id="run123",
                 timestamp="2026-04-23T00:00:00+00:00",
+                repetition=2,
                 scrape=True,
                 include_content=True,
             )
@@ -918,6 +929,7 @@ class TestWorkloadRunner:
         assert record["quality"]["ok"] is True
         assert record["quality"]["issues"] == []
         assert record["quality"]["content"].startswith("Dear team")
+        assert record["repetition"] == 2
         assert record["request"]["request_path"] == "/tmp/request.json"
         assert record["policy"]["within_timeout"] is False
         assert record["metrics"]["cache_hits"] == 2
@@ -925,6 +937,91 @@ class TestWorkloadRunner:
         assert record["metrics"]["tokens_saved"] == 40
         assert record["metrics"]["metal"]["metal_active_gb"] == pytest.approx(42.0)
         assert record["metrics"]["metal"]["cache_type"] == "paged"
+
+    def test_run_bench_serve_workload_repeats_each_case(self, tmp_path, monkeypatch):
+        workload_file = tmp_path / "workload.json"
+        workload_file.write_text(
+            json.dumps(
+                {
+                    "name": "repeat-contract",
+                    "cases": [
+                        {
+                            "id": "case-a",
+                            "messages": [{"role": "user", "content": "A"}],
+                        },
+                        {
+                            "id": "case-b",
+                            "messages": [{"role": "user", "content": "B"}],
+                        },
+                    ],
+                }
+            )
+        )
+        observed = []
+
+        async def fake_auto_detect_runtime(client, url):
+            return {"model_id": "test-model"}
+
+        def fake_detect_hardware_fingerprint():
+            return {"chip": "test"}
+
+        async def fake_run_workload_case(*args, **kwargs):
+            observed.append((kwargs["case"].case_id, kwargs["repetition"]))
+            return {
+                "run_id": kwargs["run_id"],
+                "timestamp": kwargs["timestamp"],
+                "workload": kwargs["workload"].name,
+                "case_id": kwargs["case"].case_id,
+                "repetition": kwargs["repetition"],
+                "tags": [],
+                "model_id": kwargs["model"],
+                "runtime": kwargs["runtime"],
+                "hardware": kwargs["hardware"],
+                "request": {},
+                "policy": {"within_timeout": None},
+                "metrics": {
+                    "e2e_latency_ms": 100.0 + kwargs["repetition"],
+                    "ttft_ms": 10.0,
+                    "gen_tps": 20.0,
+                },
+                "quality": {"ok": True, "content_chars": 20},
+                "ok": True,
+            }
+
+        monkeypatch.setattr(
+            "vllm_mlx.bench_serve.auto_detect_runtime", fake_auto_detect_runtime
+        )
+        monkeypatch.setattr(
+            "vllm_mlx.bench_serve.detect_hardware_fingerprint",
+            fake_detect_hardware_fingerprint,
+        )
+        monkeypatch.setattr(
+            "vllm_mlx.bench_serve.run_workload_case", fake_run_workload_case
+        )
+
+        payload = asyncio.run(
+            run_bench_serve_workload(
+                url="http://server",
+                workload_path=str(workload_file),
+                output_path=str(tmp_path / "results.json"),
+                output_format="json",
+                scrape=False,
+                request_timeout_s=None,
+                repetitions=3,
+            )
+        )
+
+        assert observed == [
+            ("case-a", 0),
+            ("case-b", 0),
+            ("case-a", 1),
+            ("case-b", 1),
+            ("case-a", 2),
+            ("case-b", 2),
+        ]
+        assert len(payload["results"]) == 6
+        assert payload["workload"]["repetitions"] == 3
+        assert payload["summary"]["case_summaries"]["case-a"]["sample_count"] == 3
 
 
 # ---------------------------------------------------------------------------
@@ -1018,6 +1115,7 @@ def _make_sample_workload_payload() -> dict:
                 "timestamp": "2026-04-23T00:00:00+00:00",
                 "workload": "writing-contract",
                 "case_id": "resume-smoke",
+                "repetition": 0,
                 "tags": ["resume", "quality"],
                 "model_id": "test-model",
                 "runtime": {
@@ -1133,12 +1231,14 @@ class TestFormatters:
         rows = list(csv.DictReader(output.splitlines()))
         assert len(rows) == 1
         assert rows[0]["case_id"] == "resume-smoke"
+        assert rows[0]["repetition"] == "0"
         assert rows[0]["model_id"] == "test-model"
         assert rows[0]["request_extra_body"] == '{"temperature": 0.6}'
 
     def test_format_workload_sql_valid(self):
         output = format_workload_sql(_make_sample_workload_payload())
         assert "CREATE TABLE IF NOT EXISTS bench_serve_workload" in output
+        assert "case_id TEXT, repetition INTEGER, tags TEXT" in output
         assert "INSERT INTO bench_serve_workload" in output
         assert "resume-smoke" in output
 
