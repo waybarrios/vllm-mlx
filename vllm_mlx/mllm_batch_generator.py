@@ -772,10 +772,17 @@ class MLLMBatchGenerator:
         3. Running vision encoder to get features
 
         Uses vision cache to skip processing for repeated images.
+        Idempotent: if input_ids is already set, returns immediately.
 
         Args:
             request: Request to preprocess
         """
+        # Already preprocessed (e.g. by early executor offloading in
+        # _process_loop).  Only skip for text-only requests; vision
+        # requests need pixel cache lookup even if input_ids was set.
+        if request.input_ids is not None and not request.images and not request.videos:
+            return
+
         from mlx_vlm.utils import prepare_inputs
 
         tic = time.perf_counter()
@@ -997,6 +1004,11 @@ class MLLMBatchGenerator:
                 return output.logits
             return output
 
+        logger.info(
+            f"[chunked_prefill] Starting {request.request_id[:12]}: "
+            f"{total} tokens, step={step}"
+        )
+
         # Process all chunks except the last
         processed = 0
         chunk_count = 0
@@ -1022,6 +1034,14 @@ class MLLMBatchGenerator:
             chunk_count += 1
             self._prefill_progress[request.request_id] = (processed, total)
 
+            # Log progress every 10 chunks so operators can see prefill
+            # is progressing (not hanging) during long prompts.
+            if chunk_count % 10 == 0:
+                logger.info(
+                    f"[chunked_prefill] {request.request_id[:12]}: "
+                    f"chunk {chunk_count}, {processed}/{total} tokens"
+                )
+
             # Release Metal buffer pool periodically.  Full-attention layers
             # produce attention score buffers that grow each chunk (1024 ×
             # growing_context).  Old smaller buffers can't be reused, so the
@@ -1034,6 +1054,12 @@ class MLLMBatchGenerator:
         output = self.language_model(last_chunk, cache=cache)
         request.vision_encoded = True
         self._prefill_progress[request.request_id] = (total, total)
+
+        if chunk_count > 0:
+            logger.info(
+                f"[chunked_prefill] Completed {request.request_id[:12]}: "
+                f"{total} tokens in {chunk_count + 1} chunks"
+            )
 
         if hasattr(output, "logits"):
             return output.logits

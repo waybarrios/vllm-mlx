@@ -789,6 +789,11 @@ class MLLMScheduler:
         arrays and cache state must be consumed on that same thread.  Unlike
         the text-only EngineCore path, moving MLLM prefill to a worker crosses
         MLX stream ownership and can fail with "no Stream in current thread".
+
+        Text-only preprocessing (Jinja2 template rendering + tokenization) is
+        run BEFORE ``step()`` with ``await asyncio.sleep(0)`` yields between
+        each request.  This prevents long preprocessing (10-30+ s for 40K+
+        token conversations) from blocking health checks and new connections.
         """
         streams_bound = False
 
@@ -798,12 +803,67 @@ class MLLMScheduler:
                 bind_generation_streams()
                 streams_bound = True
 
+        loop = asyncio.get_running_loop()
+
         while self._running:
             try:
+                # --- Early preprocessing phase ---
+                # Run text-only preprocessing (Jinja2 template rendering +
+                # tokenization) in a thread-pool executor so the event loop
+                # stays responsive for health checks, new connections, and
+                # active streaming requests.  Preprocessing is CPU-bound
+                # (no MLX GPU work) and HuggingFace tokenizers are
+                # thread-safe, so this is safe to offload.
+                bg = self.batch_generator
+                if bg is not None:
+                    for req in list(bg.unprocessed_requests):
+                        if req.input_ids is None and not req.images and not req.videos:
+                            try:
+                                tic = time.perf_counter()
+                                await loop.run_in_executor(
+                                    None, bg._preprocess_request, req
+                                )
+                                elapsed = time.perf_counter() - tic
+                                if elapsed > 1.0:
+                                    n_tok = (
+                                        req.input_ids.size
+                                        if req.input_ids is not None
+                                        else 0
+                                    )
+                                    logger.info(
+                                        f"Preprocessing {req.request_id[:12]}"
+                                        f": {n_tok} tokens in {elapsed:.2f}s"
+                                    )
+                            except Exception as e:
+                                logger.error(
+                                    f"Early preprocessing failed for "
+                                    f"{req.request_id}: {e}"
+                                )
+
+                # --- Step phase ---
                 if self.has_requests():
                     _ensure_streams_bound()
+                    tic = time.perf_counter()
                     self.step()
-                    await asyncio.sleep(0)
+                    elapsed = time.perf_counter() - tic
+                    if elapsed > 2.0:
+                        logger.warning(
+                            f"Slow MLLM step: {elapsed:.2f}s "
+                            f"(waiting={len(self.waiting)}, "
+                            f"running={len(self.running)})"
+                        )
+                    # Yield multiple event-loop cycles so that pending
+                    # HTTP health checks can complete.  A single
+                    # asyncio.sleep() gives only ONE _run_once() cycle,
+                    # but an HTTP request needs ~3 cycles minimum:
+                    #   1. accept TCP connection
+                    #   2. read HTTP request / parse headers
+                    #   3. run handler / write response
+                    # Using repeated asyncio.sleep(0) gives many cycles
+                    # with negligible wall-clock overhead (<1ms total).
+                    n_yields = 10 if elapsed > 1.0 else 5
+                    for _ in range(n_yields):
+                        await asyncio.sleep(0)
                 else:
                     # No work, wait a bit
                     await asyncio.sleep(0.01)
