@@ -25,6 +25,7 @@ import logging
 import math
 import platform
 import re
+import sqlite3
 import statistics
 import sys
 import time
@@ -1316,6 +1317,13 @@ async def run_bench_serve_workload(
         "results": records,
     }
 
+    if output_format == "sqlite":
+        if not output_path:
+            raise ValueError("--output is required when --format sqlite")
+        write_workload_sqlite(payload, output_path)
+        print(f"Workload SQLite results written to {output_path}")
+        return payload
+
     rendered = format_workload_payload(payload, output_format)
     if output_path:
         Path(output_path).expanduser().write_text(rendered)
@@ -1469,6 +1477,40 @@ def format_sql(results: list[BenchServeResult]) -> str:
         values = ", ".join(_sql_escape(d[col]) for col in RESULT_COLUMNS)
         lines.append(f"INSERT INTO bench_serve VALUES ({values});")
     return "\n".join(lines)
+
+
+def _write_sqlite_rows(
+    output_path: str,
+    *,
+    table: str,
+    schema: str,
+    columns: list[str],
+    rows: list[dict],
+) -> None:
+    """Append benchmark rows to a SQLite database."""
+    db_path = Path(output_path).expanduser()
+    placeholders = ", ".join("?" for _ in columns)
+    column_list = ", ".join(columns)
+    values = [[row.get(col) for col in columns] for row in rows]
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(f"CREATE TABLE IF NOT EXISTS {table} ({schema})")
+        if values:
+            conn.executemany(
+                f"INSERT INTO {table} ({column_list}) VALUES ({placeholders})",
+                values,
+            )
+        conn.commit()
+
+
+def write_sqlite(results: list[BenchServeResult], output_path: str) -> None:
+    rows = [_result_to_dict(r) for r in results]
+    _write_sqlite_rows(
+        output_path,
+        table="bench_serve",
+        schema=_SQL_SCHEMA,
+        columns=RESULT_COLUMNS,
+        rows=rows,
+    )
 
 
 WORKLOAD_RESULT_COLUMNS = [
@@ -1634,6 +1676,17 @@ def format_workload_sql(payload: dict) -> str:
     return "\n".join(lines)
 
 
+def write_workload_sqlite(payload: dict, output_path: str) -> None:
+    rows = [_workload_record_to_row(record) for record in payload.get("results") or []]
+    _write_sqlite_rows(
+        output_path,
+        table="bench_serve_workload",
+        schema=_WORKLOAD_SQL_SCHEMA,
+        columns=WORKLOAD_RESULT_COLUMNS,
+        rows=rows,
+    )
+
+
 def format_workload_payload(payload: dict, fmt: str = "json") -> str:
     if fmt == "json":
         return format_workload_json(payload)
@@ -1692,7 +1745,7 @@ async def run_bench_serve(
         output_path: File path to write results to. If ``None``, prints to
             stdout.
         fmt: Output format — one of ``"table"``, ``"json"``, ``"csv"``,
-            ``"sql"``.
+            ``"sql"``, or ``"sqlite"``.
         do_validate: Whether to validate each response.
         scrape: Whether to scrape ``/metrics`` before and after each run.
         tag: Optional tag string stored in every result row.
@@ -2046,6 +2099,13 @@ async def run_bench_serve(
             results.append(result_obj)
 
         # 12. Format output
+        if fmt == "sqlite":
+            if not output_path:
+                raise ValueError("--output is required when --format sqlite")
+            write_sqlite(results, output_path)
+            print(f"\nSQLite results written to {output_path}")
+            return results
+
         formatters = {
             "table": format_table,
             "json": format_json,

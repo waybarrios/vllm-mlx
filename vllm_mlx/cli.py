@@ -1915,8 +1915,8 @@ Examples:
         "--format",
         type=str,
         default=None,
-        choices=["table", "json", "csv", "sql"],
-        help="Output format (default: table for prompt sweeps, json for workloads)",
+        choices=["table", "json", "csv", "sql", "sqlite"],
+        help="Output format (default: table for prompt sweeps, json for workloads; sqlite requires --output)",
     )
     bench_serve_parser.add_argument(
         "--validate",

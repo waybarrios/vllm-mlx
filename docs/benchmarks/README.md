@@ -94,12 +94,16 @@ hardware capability claim. Use it to answer "would this run fit my product
 policy?" after first measuring what the model and serving stack can actually do.
 
 Workload output defaults to JSON for full provenance. Use `--format csv` for
-flat per-case rows or `--format sql` to emit importable SQL for a local
+flat per-case rows, `--format sql` to emit importable SQL, or
+`--format sqlite --output bench.db` to append rows directly into a local
 benchmark database.
 
 ```bash
 vllm-mlx bench-serve --url http://localhost:8000 \
   --workload ./workload.json --repetitions 5 --output workload-results.json
+
+vllm-mlx bench-serve --url http://localhost:8000 \
+  --workload ./workload.json --repetitions 5 --format sqlite --output bench.db
 ```
 
 ## Standalone Test Defaults

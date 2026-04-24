@@ -5,6 +5,7 @@ import asyncio
 import csv
 import json
 import os
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -37,6 +38,8 @@ from vllm_mlx.bench_serve import (
     summarize_workload_results,
     validate_quality_checks,
     validate_response,
+    write_sqlite,
+    write_workload_sqlite,
 )
 
 # ---------------------------------------------------------------------------
@@ -1220,6 +1223,15 @@ class TestFormatters:
         assert "inf" not in output.lower().split("'")[-1]
         assert "NULL" in output
 
+    def test_write_sqlite_creates_prompt_sweep_rows(self, tmp_path):
+        db_path = tmp_path / "bench.db"
+        write_sqlite([_make_sample_result(run_id="sqlite-run")], str(db_path))
+        with sqlite3.connect(db_path) as conn:
+            row = conn.execute(
+                "SELECT run_id, model_id, repetition FROM bench_serve"
+            ).fetchone()
+        assert row == ("sqlite-run", "mlx-community/gemma-3-4b-it-4bit", 0)
+
     def test_result_columns_match_dataclass(self):
         import dataclasses
 
@@ -1241,6 +1253,15 @@ class TestFormatters:
         assert "case_id TEXT, repetition INTEGER, tags TEXT" in output
         assert "INSERT INTO bench_serve_workload" in output
         assert "resume-smoke" in output
+
+    def test_write_workload_sqlite_creates_case_rows(self, tmp_path):
+        db_path = tmp_path / "workload.db"
+        write_workload_sqlite(_make_sample_workload_payload(), str(db_path))
+        with sqlite3.connect(db_path) as conn:
+            row = conn.execute(
+                "SELECT case_id, repetition, quality_ok FROM bench_serve_workload"
+            ).fetchone()
+        assert row == ("resume-smoke", 0, 1)
 
     def test_format_workload_payload_rejects_unknown_format(self):
         with pytest.raises(ValueError, match="Unsupported workload output format"):
