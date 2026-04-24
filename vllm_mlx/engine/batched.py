@@ -314,9 +314,12 @@ class BatchedEngine(BaseEngine):
             prefill_step_size = getattr(
                 self._scheduler_config, "prefill_step_size", None
             )
+        chunked_prefill = getattr(self._scheduler_config, "chunked_prefill_tokens", 0)
         mllm_extra = {}
         if prefill_step_size is not None:
             mllm_extra["prefill_step_size"] = prefill_step_size
+        if chunked_prefill:
+            mllm_extra["chunked_prefill_tokens"] = chunked_prefill
         mllm_config = MLLMSchedulerConfig(
             max_num_seqs=max_num_seqs,
             prefill_batch_size=prefill_batch_size,

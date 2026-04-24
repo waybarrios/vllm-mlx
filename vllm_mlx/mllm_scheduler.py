@@ -78,6 +78,8 @@ class MLLMSchedulerConfig:
     kv_cache_quantization: bool = False
     kv_cache_quantization_bits: int = 8
     kv_cache_quantization_group_size: int = 64
+    # Interleaved prefill/decode budget per step (0 = disabled, blocking prefill)
+    chunked_prefill_tokens: int = 0
 
 
 @dataclass
@@ -309,6 +311,16 @@ class MLLMScheduler:
                 prefill_step_size=self.config.prefill_step_size,
                 prefix_cache_config=prefix_cache_config,
             )
+
+            # Install chunked prefill BEFORE MTP (MTP wraps _next,
+            # chunked replaces it — MTP then wraps the chunked version)
+            if self.config.chunked_prefill_tokens > 0:
+                from .mllm_batch_generator import install_chunked_prefill_mllm
+
+                install_chunked_prefill_mllm(
+                    self.batch_generator,
+                    budget=self.config.chunked_prefill_tokens,
+                )
 
             # Install MTP if enabled and language model supports it
             if self.config.enable_mtp:
