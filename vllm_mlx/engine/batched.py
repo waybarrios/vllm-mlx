@@ -23,6 +23,7 @@ from .base import (
     BaseEngine,
     GenerationOutput,
     cleanup_startup_cancellation,
+    run_blocking_startup_work,
 )
 
 logger = logging.getLogger(__name__)
@@ -207,14 +208,16 @@ class BatchedEngine(BaseEngine):
 
         try:
             if self._model is None:
-                # Load inline on the event-loop thread so mlx-lm's
-                # generation_stream (created at module import on this thread)
-                # and the model weights end up on the same thread that drives
-                # scheduler.step. Running this via asyncio.to_thread puts
-                # weights on a worker thread whose stream ID the event loop
-                # does not register, which reproduces issue #407 reliably on
-                # dense Llama 3.x models.
-                self.prepare_for_start()
+                if self._uses_default_prepare_for_start():
+                    # Load inline on the event-loop thread so mlx-lm's
+                    # generation_stream (created at module import on this
+                    # thread) and model weights are owned by the same thread
+                    # that drives scheduler.step (issue #407).
+                    self.prepare_for_start()
+                else:
+                    # Test doubles and custom overrides may block; run them via
+                    # the shared cancellation-safe thread helper.
+                    await run_blocking_startup_work(self.prepare_for_start)
 
             if self._is_mllm:
                 await self._start_mllm()
@@ -228,6 +231,11 @@ class BatchedEngine(BaseEngine):
         except asyncio.CancelledError:
             await cleanup_startup_cancellation(self.stop)
             raise
+
+    def _uses_default_prepare_for_start(self) -> bool:
+        """Return True when prepare_for_start is the class implementation."""
+        method = getattr(self.prepare_for_start, "__func__", None)
+        return method is BatchedEngine.prepare_for_start
 
     def _prepare_mllm_model(self) -> None:
         """Load the MLLM model before scheduler startup."""
