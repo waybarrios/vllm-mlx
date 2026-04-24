@@ -5,6 +5,7 @@
 | Command | Description |
 |---------|-------------|
 | `vllm-mlx serve` | Start OpenAI-compatible server |
+| `vllm-mlx bench-serve` | Benchmark a running server with prompt sweeps or workload contracts |
 | `vllm-mlx-bench` | Run performance benchmarks |
 | `vllm-mlx-chat` | Start Gradio chat interface |
 
@@ -130,6 +131,47 @@ Or with curl:
 ```bash
 curl http://localhost:8000/v1/models \
   -H "Authorization: Bearer your-secret-key"
+```
+
+## `vllm-mlx bench-serve`
+
+Benchmark a running vllm-mlx server over HTTP. Prompt-sweep mode measures
+TTFT, TPOT, throughput, cache deltas, and Metal memory. Workload mode adds
+per-case quality checks and comparison-only product policy timeouts.
+
+### Usage
+
+```bash
+vllm-mlx bench-serve --url http://localhost:8000 [options]
+```
+
+### Options
+
+| Option | Description | Default |
+|--------|-------------|---------|
+| `--url` | Running server base URL | `http://127.0.0.1:8080` |
+| `--model` | API model id | Auto-detect |
+| `--prompts` | Comma-separated prompt sets or files for sweep mode | `short,medium,long` |
+| `--workload` | Declarative workload JSON for contract mode | None |
+| `--concurrency` | Comma-separated concurrency levels for sweep mode | `1,4` |
+| `--max-tokens` | Max tokens for sweep mode | `256` |
+| `--enable-thinking` | `true`, `false`, or `true,false` sweep | None |
+| `--scrape-metrics` | Scrape `/metrics` before/after runs | `true` |
+| `--include-content` | Include full generated content in workload JSON | False |
+| `--request-timeout-s` | Workload HTTP transport timeout, `0` disables | `300` |
+| `--output` | Output file | stdout |
+| `--format` | Output format: `table`, `json`, `csv`, `sql` | `table` for prompt sweeps, `json` for workloads |
+
+### Examples
+
+```bash
+# Prompt sweep
+vllm-mlx bench-serve --url http://localhost:8000 \
+  --prompts short,long --concurrency 1,4 --format json --output bench.json
+
+# Contract workload with quality checks and policy-timeout evidence
+vllm-mlx bench-serve --url http://localhost:8000 \
+  --workload workload.json --output workload-results.json
 ```
 
 ## `vllm-mlx-bench`

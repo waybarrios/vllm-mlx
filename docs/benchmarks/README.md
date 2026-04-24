@@ -19,7 +19,58 @@ vllm-mlx-bench --model mlx-community/Qwen3-VL-8B-Instruct-4bit
 
 # Video benchmark
 vllm-mlx-bench --model mlx-community/Qwen3-VL-8B-Instruct-4bit --video
+
+# Running-server prompt sweep with Prometheus metric deltas
+vllm-mlx bench-serve --url http://localhost:8000 --prompts short,long \
+  --concurrency 1,4 --output bench.json --format json
+
+# Running-server product-style workload with quality checks
+vllm-mlx bench-serve --url http://localhost:8000 \
+  --workload ./workload.json --output workload-results.json
 ```
+
+## Contract Workloads
+
+`vllm-mlx bench-serve --workload` runs declarative cases against an already
+running OpenAI-compatible server. This is intended for model and feature-stack
+qualification, where raw speed is not enough and every run needs provenance,
+quality checks, Prometheus metric deltas, and policy-timeout evidence.
+
+Example workload:
+
+```json
+{
+  "name": "writing-contract",
+  "description": "Representative long-form writing requests",
+  "defaults": {
+    "max_tokens": 32768,
+    "enable_thinking": true,
+    "policy_timeout_ms": 180000,
+    "checks": {
+      "finish_reason": "stop",
+      "forbidden_regex": ["<think>", "prompt leakage"],
+      "min_chars": 500
+    }
+  },
+  "cases": [
+    {
+      "id": "resume-golden-1",
+      "messages": [
+        {"role": "user", "content": "Write the requested artifact..."}
+      ],
+      "tags": ["resume", "quality-floor"]
+    }
+  ]
+}
+```
+
+`policy_timeout_ms` is recorded as comparison evidence. It is not treated as a
+hardware capability claim. Use it to answer "would this run fit my product
+policy?" after first measuring what the model and serving stack can actually do.
+
+Workload output defaults to JSON for full provenance. Use `--format csv` for
+flat per-case rows or `--format sql` to emit importable SQL for a local
+benchmark database.
 
 ## Standalone Test Defaults
 

@@ -13,6 +13,8 @@ from vllm_mlx.bench_serve import (
     RESULT_COLUMNS,
     BenchServeResult,
     SweepConfig,
+    Workload,
+    WorkloadCase,
     compute_request_metrics,
     compute_summary_stats,
     detect_hardware_fingerprint,
@@ -21,11 +23,18 @@ from vllm_mlx.bench_serve import (
     format_json,
     format_sql,
     format_table,
+    format_workload_csv,
+    format_workload_payload,
+    format_workload_sql,
     load_prompt_set,
+    load_workload,
     parse_health_response,
     parse_metrics_text,
     parse_sse_line,
     parse_status_response,
+    run_workload_case,
+    summarize_workload_results,
+    validate_quality_checks,
     validate_response,
 )
 
@@ -164,6 +173,54 @@ class TestPromptLoading:
         # At least one reasoning-heavy keyword should appear
         keywords = ["step", "deduc", "logic", "proof", "weighing", "clue"]
         assert any(kw in combined for kw in keywords)
+
+
+class TestWorkloadLoading:
+    """Tests for declarative contract workload loading."""
+
+    def test_load_workload_with_defaults(self, tmp_path: Path):
+        workload_file = tmp_path / "workload.json"
+        workload_file.write_text(
+            json.dumps(
+                {
+                    "name": "writing-contract",
+                    "defaults": {
+                        "max_tokens": 128,
+                        "enable_thinking": True,
+                        "policy_timeout_ms": 180000,
+                        "checks": {"forbidden_regex": ["<think>"]},
+                    },
+                    "cases": [
+                        {
+                            "id": "case-a",
+                            "messages": [
+                                {"role": "user", "content": "Write a short note."}
+                            ],
+                            "tags": ["quality"],
+                        }
+                    ],
+                }
+            )
+        )
+
+        workload = load_workload(workload_file)
+
+        assert workload.name == "writing-contract"
+        assert len(workload.cases) == 1
+        case = workload.cases[0]
+        assert case.case_id == "case-a"
+        assert case.max_tokens == 128
+        assert case.enable_thinking is True
+        assert case.policy_timeout_ms == 180000
+        assert case.checks == {"forbidden_regex": ["<think>"]}
+        assert case.tags == ("quality",)
+
+    def test_load_workload_rejects_missing_messages(self, tmp_path: Path):
+        workload_file = tmp_path / "workload.json"
+        workload_file.write_text(json.dumps({"cases": [{"id": "bad"}]}))
+
+        with pytest.raises(ValueError, match="messages"):
+            load_workload(workload_file)
 
 
 # ---------------------------------------------------------------------------
@@ -627,6 +684,190 @@ class TestValidation:
         assert "500" in msg
 
 
+class TestQualityChecks:
+    """Unit tests for workload quality checks."""
+
+    def test_required_and_forbidden_regex(self):
+        ok, issues = validate_quality_checks(
+            "stop",
+            "Dear team,\nThis is a clean response.\nSincerely",
+            {
+                "required_regex": ["Dear team", "Sincerely"],
+                "forbidden_regex": ["<think>", "unsupported claim"],
+                "min_chars": 20,
+                "finish_reason": "stop",
+            },
+        )
+
+        assert ok is True
+        assert issues == []
+
+    def test_forbidden_regex_failure(self):
+        ok, issues = validate_quality_checks(
+            "stop",
+            "Visible answer\n<think>hidden plan</think>",
+            {"forbidden_regex": ["<think>"]},
+        )
+
+        assert ok is False
+        assert any("forbidden_regex matched" in issue for issue in issues)
+
+    def test_json_check(self):
+        ok, issues = validate_quality_checks(
+            "stop",
+            '{"title": "Engineer", "priority": 1}',
+            {"json": True},
+        )
+
+        assert ok is True
+        assert issues == []
+
+    def test_json_check_failure(self):
+        ok, issues = validate_quality_checks("stop", "not json", {"json": True})
+
+        assert ok is False
+        assert any("not valid JSON" in issue for issue in issues)
+
+
+class TestWorkloadSummary:
+    """Unit tests for workload summary aggregation."""
+
+    def test_summarize_workload_results_tracks_quality_and_policy(self):
+        results = [
+            {
+                "ok": True,
+                "policy": {"within_timeout": True},
+                "quality": {"ok": True},
+                "metrics": {
+                    "e2e_latency_ms": 100.0,
+                    "ttft_ms": 10.0,
+                    "gen_tps": 20.0,
+                },
+            },
+            {
+                "ok": True,
+                "policy": {"within_timeout": False},
+                "quality": {"ok": True},
+                "metrics": {
+                    "e2e_latency_ms": 200.0,
+                    "ttft_ms": 20.0,
+                    "gen_tps": 10.0,
+                },
+            },
+        ]
+
+        summary = summarize_workload_results(results)
+
+        assert summary["passed"] is True
+        assert summary["quality_passed"] is True
+        assert summary["policy_timeout_passed"] is False
+        assert summary["failure_rate"] == pytest.approx(0.0)
+        assert summary["latency_ms"]["p50"] == pytest.approx(150.0)
+
+
+class TestWorkloadRunner:
+    """Unit tests for contract workload execution records."""
+
+    def test_run_workload_case_records_metrics_policy_and_quality(self, monkeypatch):
+        metrics_responses = iter(
+            [
+                {"cache_hits": 10, "cache_misses": 3, "tokens_saved": 100},
+                {"cache_hits": 12, "cache_misses": 4, "tokens_saved": 140},
+            ]
+        )
+
+        async def fake_scrape_metrics(client, base_url):
+            return next(metrics_responses)
+
+        async def fake_stream_chat_completion(**kwargs):
+            assert kwargs["max_tokens"] == 64
+            assert kwargs["enable_thinking"] is True
+            assert kwargs["extra_body"] == {"temperature": 0.6}
+            return {
+                "ttft_ms": 25.0,
+                "tpot_ms": 3.0,
+                "e2e_latency_ms": 2500.0,
+                "gen_tps": 12.5,
+                "prompt_tps": 500.0,
+                "prompt_tokens": 200,
+                "completion_tokens": 100,
+                "finish_reason": "stop",
+                "content": "Dear team,\nA clean benchmark artifact.\nSincerely",
+            }
+
+        class FakeResponse:
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return {
+                    "cache": {"type": "paged"},
+                    "metal": {
+                        "active_gb": 42.0,
+                        "peak_gb": 45.0,
+                        "cache_gb": 4.0,
+                    },
+                }
+
+        class FakeClient:
+            async def get(self, url):
+                return FakeResponse()
+
+        monkeypatch.setattr("vllm_mlx.bench_serve.scrape_metrics", fake_scrape_metrics)
+        monkeypatch.setattr(
+            "vllm_mlx.bench_serve.stream_chat_completion",
+            fake_stream_chat_completion,
+        )
+
+        workload = Workload(
+            name="writing-contract",
+            description="",
+            defaults={"max_tokens": 64},
+            cases=[],
+        )
+        case = WorkloadCase(
+            case_id="resume-smoke",
+            messages=[{"role": "user", "content": "Write the artifact."}],
+            max_tokens=64,
+            enable_thinking=True,
+            extra_body={"temperature": 0.6},
+            policy_timeout_ms=1800,
+            checks={
+                "finish_reason": "stop",
+                "required_regex": ["Dear team", "Sincerely"],
+                "forbidden_regex": ["<think>"],
+            },
+            tags=("resume",),
+        )
+
+        record = asyncio.run(
+            run_workload_case(
+                FakeClient(),
+                "http://server",
+                workload=workload,
+                case=case,
+                model="test-model",
+                runtime={"engine_type": "mllm"},
+                hardware={"chip": "test"},
+                run_id="run123",
+                timestamp="2026-04-23T00:00:00+00:00",
+                scrape=True,
+                include_content=True,
+            )
+        )
+
+        assert record["ok"] is True
+        assert record["quality"]["ok"] is True
+        assert record["quality"]["issues"] == []
+        assert record["quality"]["content"].startswith("Dear team")
+        assert record["policy"]["within_timeout"] is False
+        assert record["metrics"]["cache_hits"] == 2
+        assert record["metrics"]["cache_misses"] == 1
+        assert record["metrics"]["tokens_saved"] == 40
+        assert record["metrics"]["metal"]["metal_active_gb"] == pytest.approx(42.0)
+        assert record["metrics"]["metal"]["cache_type"] == "paged"
+
+
 # ---------------------------------------------------------------------------
 # TestSummaryStats  (Task 5)
 # ---------------------------------------------------------------------------
@@ -707,6 +948,68 @@ def _make_sample_result(**overrides) -> BenchServeResult:
     return BenchServeResult(**defaults)
 
 
+def _make_sample_workload_payload() -> dict:
+    return {
+        "run_id": "run123",
+        "timestamp": "2026-04-23T00:00:00+00:00",
+        "summary": {"passed": True},
+        "results": [
+            {
+                "run_id": "run123",
+                "timestamp": "2026-04-23T00:00:00+00:00",
+                "workload": "writing-contract",
+                "case_id": "resume-smoke",
+                "tags": ["resume", "quality"],
+                "model_id": "test-model",
+                "runtime": {
+                    "engine_type": "mllm",
+                    "model_type": "mllm",
+                    "mtp_enabled": False,
+                    "specprefill": False,
+                    "kv_quant": "",
+                    "cache_type": "paged",
+                },
+                "hardware": {
+                    "chip": "M4 Ultra",
+                    "memory_gb": 256.0,
+                    "os_version": "macOS-test",
+                },
+                "request": {
+                    "max_tokens": 32768,
+                    "enable_thinking": True,
+                    "extra_body": {"temperature": 0.6},
+                },
+                "policy": {"timeout_ms": 180000, "within_timeout": True},
+                "metrics": {
+                    "ttft_ms": 25.0,
+                    "tpot_ms": 3.0,
+                    "e2e_latency_ms": 2500.0,
+                    "gen_tps": 12.5,
+                    "prompt_tps": 500.0,
+                    "prompt_tokens": 200,
+                    "completion_tokens": 100,
+                    "cache_hits": 2,
+                    "cache_misses": 1,
+                    "tokens_saved": 40,
+                    "metal": {
+                        "metal_active_gb": 42.0,
+                        "metal_peak_gb": 45.0,
+                        "metal_cache_gb": 4.0,
+                    },
+                },
+                "quality": {
+                    "ok": True,
+                    "issues": [],
+                    "finish_reason": "stop",
+                    "content_chars": 512,
+                    "content_preview": "Clean artifact",
+                },
+                "ok": True,
+            }
+        ],
+    }
+
+
 # ---------------------------------------------------------------------------
 # TestFormatters  (Task 6)
 # ---------------------------------------------------------------------------
@@ -766,6 +1069,24 @@ class TestFormatters:
         field_names = {f.name for f in dataclasses.fields(BenchServeResult)}
         assert set(RESULT_COLUMNS) == field_names
 
+    def test_format_workload_csv_parseable(self):
+        output = format_workload_csv(_make_sample_workload_payload())
+        rows = list(csv.DictReader(output.splitlines()))
+        assert len(rows) == 1
+        assert rows[0]["case_id"] == "resume-smoke"
+        assert rows[0]["model_id"] == "test-model"
+        assert rows[0]["request_extra_body"] == '{"temperature": 0.6}'
+
+    def test_format_workload_sql_valid(self):
+        output = format_workload_sql(_make_sample_workload_payload())
+        assert "CREATE TABLE IF NOT EXISTS bench_serve_workload" in output
+        assert "INSERT INTO bench_serve_workload" in output
+        assert "resume-smoke" in output
+
+    def test_format_workload_payload_rejects_unknown_format(self):
+        with pytest.raises(ValueError, match="Unsupported workload output format"):
+            format_workload_payload(_make_sample_workload_payload(), "xml")
+
 
 # ---------------------------------------------------------------------------
 # TestBenchServeIntegration  (Task 8)
@@ -807,7 +1128,7 @@ class TestBenchServeIntegration:
 
     def test_sql_output_is_valid(self):
         """Verify SQL output contains CREATE TABLE and INSERT."""
-        from vllm_mlx.bench_serve import run_bench_serve, format_sql
+        from vllm_mlx.bench_serve import format_sql, run_bench_serve
 
         results = asyncio.run(
             run_bench_serve(
