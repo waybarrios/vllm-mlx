@@ -7,8 +7,9 @@ Run with: pytest tests/test_batching_deterministic.py -v
 """
 
 import asyncio
-import pytest
 import time
+
+import pytest
 
 # Model to use for tests - small model for fast testing
 TEST_MODEL = "mlx-community/Llama-3.2-1B-Instruct-4bit"
@@ -164,7 +165,7 @@ class TestDeterministicConcurrentRequests:
 
         # Run twice to verify determinism
         all_results = []
-        for run in range(2):
+        for _run in range(2):
             async with AsyncEngineCore(model, tokenizer, config) as engine:
                 await asyncio.sleep(0.05)
 
@@ -246,6 +247,12 @@ class TestBatchingPerformance:
                 tokens = await asyncio.gather(*[get_output(r) for r in request_ids])
                 return sum(tokens)
 
+        # Warm-up: run once each to compile kernels and prime caches.
+        # Without this, the first timed run pays one-time compilation
+        # overhead, causing spurious failures on loaded machines.
+        await run_sequential()
+        await run_batched()
+
         # Time sequential
         start = time.perf_counter()
         seq_tokens = await run_sequential()
@@ -255,8 +262,6 @@ class TestBatchingPerformance:
         start = time.perf_counter()
         batch_tokens = await run_batched()
         batch_time = time.perf_counter() - start
-
-        # Batched should be faster (at least 1.5x)
         seq_throughput = seq_tokens / seq_time
         batch_throughput = batch_tokens / batch_time
 
