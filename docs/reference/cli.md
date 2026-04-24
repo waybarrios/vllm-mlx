@@ -163,7 +163,7 @@ vllm-mlx bench-serve --url http://localhost:8000 [options]
 | `--include-content` | Include full generated content in workload JSON | False |
 | `--request-timeout-s` | Workload HTTP transport timeout, `0` disables | `300` |
 | `--output` | Output file | stdout |
-| `--format` | Output format: `table`, `json`, `csv`, `sql` | `table` for prompt sweeps, `json` for workloads |
+| `--format` | Output format: `table`, `json`, `csv`, `sql`, `sqlite` | `table` for prompt sweeps, `json` for workloads |
 
 ### Examples
 
@@ -175,6 +175,10 @@ vllm-mlx bench-serve --url http://localhost:8000 \
 # Contract workload with quality checks and policy-timeout evidence
 vllm-mlx bench-serve --url http://localhost:8000 \
   --workload workload.json --repetitions 5 --output workload-results.json
+
+# Append contract rows directly into SQLite for longitudinal comparisons
+vllm-mlx bench-serve --url http://localhost:8000 \
+  --workload workload.json --repetitions 5 --format sqlite --output bench.db
 ```
 
 ## `vllm-mlx-bench`
