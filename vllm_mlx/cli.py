@@ -1145,6 +1145,36 @@ Examples:
         default=None,
         help="Override default top_p for all requests (default: use model default)",
     )
+    serve_parser.add_argument(
+        "--default-top-k",
+        type=int,
+        default=None,
+        help="Override default top_k for all requests (default: use model default)",
+    )
+    serve_parser.add_argument(
+        "--default-min-p",
+        type=float,
+        default=None,
+        help="Override default min_p for all requests (default: use model default)",
+    )
+    serve_parser.add_argument(
+        "--default-presence-penalty",
+        type=float,
+        default=None,
+        help=(
+            "Override default presence_penalty for all requests "
+            "(default: use model default)"
+        ),
+    )
+    serve_parser.add_argument(
+        "--default-repetition-penalty",
+        type=float,
+        default=None,
+        help=(
+            "Override default repetition_penalty for all requests "
+            "(default: use model default)"
+        ),
+    )
     # Embedding model option
     serve_parser.add_argument(
         "--embedding-model",

@@ -4,6 +4,7 @@ from types import SimpleNamespace
 def _serve_args(**overrides):
     args = {
         "api_key": None,
+        "auto_unload_idle_seconds": 0.0,
         "cache_memory_mb": None,
         "cache_memory_percent": 0.2,
         "chunked_prefill_tokens": 0,
@@ -19,6 +20,7 @@ def _serve_args(**overrides):
         "download_timeout": 1,
         "embedding_model": None,
         "enable_auto_tool_choice": False,
+        "enable_metrics": False,
         "enable_mtp": False,
         "enable_prefix_cache": True,
         "gpu_memory_utilization": 0.9,
@@ -31,6 +33,7 @@ def _serve_args(**overrides):
         "max_num_seqs": 32,
         "max_tokens": 16,
         "mcp_config": None,
+        "mllm_prefill_step_size": None,
         "mllm": False,
         "model": "local-test-model",
         "mtp_num_draft_tokens": 1,
@@ -53,6 +56,7 @@ def _serve_args(**overrides):
         "stream_interval": 1,
         "tool_call_parser": None,
         "timeout": 300,
+        "lazy_load_model": False,
         "use_paged_cache": False,
     }
     args.update(overrides)

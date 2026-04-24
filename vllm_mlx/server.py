@@ -178,6 +178,10 @@ _max_request_tokens: int = 32768
 _default_timeout: float = 300.0  # Default request timeout in seconds (5 minutes)
 _default_temperature: float | None = None  # Set via --default-temperature
 _default_top_p: float | None = None  # Set via --default-top-p
+_default_top_k: int | None = None  # Set via --default-top-k
+_default_min_p: float | None = None  # Set via --default-min-p
+_default_presence_penalty: float | None = None  # Set via --default-presence-penalty
+_default_repetition_penalty: float | None = None  # Set via --default-repetition-penalty
 _metrics_enabled = False
 _max_audio_upload_bytes: int = DEFAULT_MAX_AUDIO_UPLOAD_BYTES
 _max_tts_input_chars: int = DEFAULT_MAX_TTS_INPUT_CHARS
@@ -190,6 +194,10 @@ _lifespan_active: bool = False
 
 _FALLBACK_TEMPERATURE = 0.7
 _FALLBACK_TOP_P = 0.9
+_FALLBACK_TOP_K = 0
+_FALLBACK_MIN_P = 0.0
+_FALLBACK_PRESENCE_PENALTY = 0.0
+_FALLBACK_REPETITION_PENALTY = 1.0
 
 
 def _resolve_temperature(request_value: float | None) -> float:
@@ -208,6 +216,42 @@ def _resolve_top_p(request_value: float | None) -> float:
     if _default_top_p is not None:
         return _default_top_p
     return _FALLBACK_TOP_P
+
+
+def _resolve_top_k(request_value: int | None) -> int:
+    """Resolve top_k: request > CLI default > fallback."""
+    if request_value is not None:
+        return request_value
+    if _default_top_k is not None:
+        return _default_top_k
+    return _FALLBACK_TOP_K
+
+
+def _resolve_min_p(request_value: float | None) -> float:
+    """Resolve min_p: request > CLI default > fallback."""
+    if request_value is not None:
+        return request_value
+    if _default_min_p is not None:
+        return _default_min_p
+    return _FALLBACK_MIN_P
+
+
+def _resolve_presence_penalty(request_value: float | None) -> float:
+    """Resolve presence_penalty: request > CLI default > fallback."""
+    if request_value is not None:
+        return request_value
+    if _default_presence_penalty is not None:
+        return _default_presence_penalty
+    return _FALLBACK_PRESENCE_PENALTY
+
+
+def _resolve_repetition_penalty(request_value: float | None) -> float:
+    """Resolve repetition_penalty: request > CLI default > fallback."""
+    if request_value is not None:
+        return request_value
+    if _default_repetition_penalty is not None:
+        return _default_repetition_penalty
+    return _FALLBACK_REPETITION_PENALTY
 
 
 def _resolve_request_max_tokens(requested_value: int | None) -> int:
@@ -3418,13 +3462,14 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
                 "max_tokens": effective_max_tokens,
                 "temperature": _resolve_temperature(request.temperature),
                 "top_p": _resolve_top_p(request.top_p),
-                "top_k": request.top_k or 0,
-                "min_p": request.min_p or 0.0,
-                "presence_penalty": request.presence_penalty or 0.0,
+                "top_k": _resolve_top_k(request.top_k),
+                "min_p": _resolve_min_p(request.min_p),
+                "presence_penalty": _resolve_presence_penalty(request.presence_penalty),
                 "stop": request.stop,
             }
-            if comp_rep_penalty is not None:
-                generate_kwargs["repetition_penalty"] = comp_rep_penalty
+            generate_kwargs["repetition_penalty"] = _resolve_repetition_penalty(
+                comp_rep_penalty
+            )
             if request.specprefill is not None:
                 generate_kwargs["specprefill"] = request.specprefill
             if request.specprefill_keep_pct is not None:
@@ -3670,20 +3715,18 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
                         )
 
         # Resolve repetition penalty
-        rep_penalty = request.repetition_penalty
-
         # Prepare kwargs
         chat_kwargs = {
             "max_tokens": effective_max_tokens,
             "temperature": _resolve_temperature(request.temperature),
             "top_p": _resolve_top_p(request.top_p),
-            "top_k": request.top_k or 0,
-            "min_p": request.min_p or 0.0,
-            "presence_penalty": request.presence_penalty or 0.0,
-            "repetition_penalty": request.repetition_penalty or 1.0,
+            "top_k": _resolve_top_k(request.top_k),
+            "min_p": _resolve_min_p(request.min_p),
+            "presence_penalty": _resolve_presence_penalty(request.presence_penalty),
+            "repetition_penalty": _resolve_repetition_penalty(
+                request.repetition_penalty
+            ),
         }
-        if rep_penalty is not None:
-            chat_kwargs["repetition_penalty"] = rep_penalty
 
         # Add multimodal content
         if has_media:
@@ -4101,12 +4144,16 @@ async def create_anthropic_message(
 
         chat_kwargs = {
             "max_tokens": effective_max_tokens,
-            "temperature": openai_request.temperature,
-            "top_p": openai_request.top_p,
-            "top_k": openai_request.top_k or 0,
-            "min_p": openai_request.min_p or 0.0,
-            "presence_penalty": openai_request.presence_penalty or 0.0,
-            "repetition_penalty": openai_request.repetition_penalty or 1.0,
+            "temperature": _resolve_temperature(openai_request.temperature),
+            "top_p": _resolve_top_p(openai_request.top_p),
+            "top_k": _resolve_top_k(openai_request.top_k),
+            "min_p": _resolve_min_p(openai_request.min_p),
+            "presence_penalty": _resolve_presence_penalty(
+                openai_request.presence_penalty
+            ),
+            "repetition_penalty": _resolve_repetition_penalty(
+                openai_request.repetition_penalty
+            ),
         }
 
         if openai_request.tools and openai_request.tool_choice != "none":
@@ -4402,12 +4449,14 @@ async def _stream_anthropic_messages(
 
     chat_kwargs = {
         "max_tokens": max_tokens,
-        "temperature": openai_request.temperature,
-        "top_p": openai_request.top_p,
-        "top_k": openai_request.top_k or 0,
-        "min_p": openai_request.min_p or 0.0,
-        "presence_penalty": openai_request.presence_penalty or 0.0,
-        "repetition_penalty": openai_request.repetition_penalty or 1.0,
+        "temperature": _resolve_temperature(openai_request.temperature),
+        "top_p": _resolve_top_p(openai_request.top_p),
+        "top_k": _resolve_top_k(openai_request.top_k),
+        "min_p": _resolve_min_p(openai_request.min_p),
+        "presence_penalty": _resolve_presence_penalty(openai_request.presence_penalty),
+        "repetition_penalty": _resolve_repetition_penalty(
+            openai_request.repetition_penalty
+        ),
     }
 
     if openai_request.tools and openai_request.tool_choice != "none":
@@ -4694,13 +4743,14 @@ async def stream_completion(
         "max_tokens": max_tokens,
         "temperature": _resolve_temperature(request.temperature),
         "top_p": _resolve_top_p(request.top_p),
-        "top_k": request.top_k or 0,
-        "min_p": request.min_p or 0.0,
-        "presence_penalty": request.presence_penalty or 0.0,
+        "top_k": _resolve_top_k(request.top_k),
+        "min_p": _resolve_min_p(request.min_p),
+        "presence_penalty": _resolve_presence_penalty(request.presence_penalty),
         "stop": request.stop,
     }
-    if repetition_penalty is not None:
-        generate_kwargs["repetition_penalty"] = repetition_penalty
+    generate_kwargs["repetition_penalty"] = _resolve_repetition_penalty(
+        repetition_penalty
+    )
     if request.specprefill is not None:
         generate_kwargs["specprefill"] = request.specprefill
     if request.specprefill_keep_pct is not None:
@@ -5253,6 +5303,8 @@ def main():
     # Set global configuration
     global _api_key, _default_timeout, _rate_limiter, _metrics_enabled
     global _default_temperature, _default_top_p
+    global _default_top_k, _default_min_p
+    global _default_presence_penalty, _default_repetition_penalty
     global _max_audio_upload_bytes, _max_tts_input_chars
     _api_key = args.api_key
     _default_timeout = args.timeout
@@ -5262,6 +5314,14 @@ def main():
         _default_temperature = args.default_temperature
     if args.default_top_p is not None:
         _default_top_p = args.default_top_p
+    if args.default_top_k is not None:
+        _default_top_k = args.default_top_k
+    if args.default_min_p is not None:
+        _default_min_p = args.default_min_p
+    if args.default_presence_penalty is not None:
+        _default_presence_penalty = args.default_presence_penalty
+    if args.default_repetition_penalty is not None:
+        _default_repetition_penalty = args.default_repetition_penalty
     _max_audio_upload_bytes = args.max_audio_upload_mb * 1024 * 1024
     _max_tts_input_chars = args.max_tts_input_chars
 
@@ -5470,6 +5530,32 @@ Examples:
         type=float,
         default=None,
         help="Default top_p for generation when not specified in request",
+    )
+    parser.add_argument(
+        "--default-top-k",
+        type=int,
+        default=None,
+        help="Default top_k for generation when not specified in request",
+    )
+    parser.add_argument(
+        "--default-min-p",
+        type=float,
+        default=None,
+        help="Default min_p for generation when not specified in request",
+    )
+    parser.add_argument(
+        "--default-presence-penalty",
+        type=float,
+        default=None,
+        help="Default presence_penalty for generation when not specified in request",
+    )
+    parser.add_argument(
+        "--default-repetition-penalty",
+        type=float,
+        default=None,
+        help=(
+            "Default repetition_penalty for generation when not specified in request"
+        ),
     )
     parser.add_argument(
         "--max-audio-upload-mb",
