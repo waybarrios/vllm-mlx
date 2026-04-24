@@ -1623,7 +1623,7 @@ class TestStreamChatCompletion:
         assert delta["tool_calls"][0]["function"]["arguments"] == (
             '{"path": "/Users/testuser"}'
         )
-        assert delta["content"] is None
+        assert delta.get("content") is None
         assert tool_payloads[0]["choices"][0]["finish_reason"] == "tool_calls"
         assert tool_payloads[0]["usage"] == {
             "prompt_tokens": 5,
@@ -1782,7 +1782,7 @@ class TestStreamChatCompletion:
         assert delta["tool_calls"][0]["function"]["arguments"] == (
             '{"file_path": "/tmp/test.py"}'
         )
-        assert delta["content"] is None
+        assert delta.get("content") is None
         assert tool_payloads[0]["choices"][0]["finish_reason"] == "tool_calls"
 
     @pytest.mark.anyio
