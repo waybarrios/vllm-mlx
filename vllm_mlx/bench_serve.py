@@ -581,6 +581,38 @@ async def scrape_metrics(client: httpx.AsyncClient, base_url: str) -> dict:
         return {}
 
 
+async def clear_runtime_cache(client: httpx.AsyncClient, base_url: str) -> dict:
+    """Clear server-side runtime caches and return a JSON-serializable event."""
+    event: dict[str, Any] = {
+        "attempted": True,
+        "ok": False,
+        "status_code": 0,
+        "response": {},
+        "error": "",
+    }
+    try:
+        resp = await client.delete(f"{base_url}/v1/cache")
+        event["status_code"] = resp.status_code
+        try:
+            event["response"] = resp.json()
+        except ValueError:
+            event["response"] = {"text": resp.text}
+        resp.raise_for_status()
+        event["ok"] = True
+    except Exception as exc:
+        event["error"] = str(exc)
+    return event
+
+
+def _normalize_cache_policy(value: Optional[str]) -> str:
+    policy = (value or "preserve").strip().lower().replace("_", "-")
+    if policy not in {"preserve", "before-run", "before-case"}:
+        raise ValueError(
+            "cache policy must be one of: preserve, before-run, before-case"
+        )
+    return policy
+
+
 # ---------------------------------------------------------------------------
 # Task 4: SSE streaming core + token counting + request timing
 # ---------------------------------------------------------------------------
@@ -1044,6 +1076,7 @@ async def run_workload_case(
     repetition: int = 0,
     scrape: bool = True,
     include_content: bool = False,
+    cache_reset: Optional[dict] = None,
 ) -> dict:
     """Run one workload case and return a JSON-serializable result."""
     metrics_before = await scrape_metrics(client, base_url) if scrape else {}
@@ -1135,6 +1168,7 @@ async def run_workload_case(
             "within_timeout": within_policy_timeout,
             "note": "comparison-only unless your product contract explicitly requires it",
         },
+        "cache_reset": cache_reset or {"attempted": False},
         "metrics": {
             "ttft_ms": result["ttft_ms"],
             "tpot_ms": result["tpot_ms"],
@@ -1258,6 +1292,7 @@ async def run_bench_serve_workload(
     include_content: bool = False,
     request_timeout_s: Optional[float] = 300.0,
     repetitions: int = 1,
+    cache_policy: Optional[str] = None,
 ) -> dict:
     """Run a declarative workload against a running server.
 
@@ -1269,6 +1304,9 @@ async def run_bench_serve_workload(
         raise ValueError("repetitions must be at least 1")
 
     workload = load_workload(workload_path)
+    resolved_cache_policy = _normalize_cache_policy(
+        cache_policy or workload.defaults.get("cache_policy")
+    )
     run_id = str(uuid.uuid4())[:8]
     timestamp = datetime.now(timezone.utc).isoformat()
     timeout = httpx.Timeout(request_timeout_s) if request_timeout_s else None
@@ -1281,8 +1319,27 @@ async def run_bench_serve_workload(
             raise ValueError("could not determine model ID; pass --model")
 
         records = []
+        cache_events = []
+        if resolved_cache_policy == "before-run":
+            cache_events.append(
+                {
+                    "scope": "before-run",
+                    "event": await clear_runtime_cache(client, url),
+                }
+            )
         for repetition in range(repetitions):
             for case in workload.cases:
+                cache_reset = None
+                if resolved_cache_policy == "before-case":
+                    cache_reset = await clear_runtime_cache(client, url)
+                    cache_events.append(
+                        {
+                            "scope": "before-case",
+                            "case_id": case.case_id,
+                            "repetition": repetition,
+                            "event": cache_reset,
+                        }
+                    )
                 record = await run_workload_case(
                     client,
                     url,
@@ -1296,6 +1353,7 @@ async def run_bench_serve_workload(
                     repetition=repetition,
                     scrape=scrape,
                     include_content=include_content,
+                    cache_reset=cache_reset,
                 )
                 records.append(record)
 
@@ -1312,6 +1370,10 @@ async def run_bench_serve_workload(
         "transport": {
             "request_timeout_s": request_timeout_s,
             "note": "transport safety only; product policy timeouts live in workload cases",
+        },
+        "cache_policy": {
+            "mode": resolved_cache_policy,
+            "events": cache_events,
         },
         "summary": summarize_workload_results(records),
         "results": records,

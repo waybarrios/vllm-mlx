@@ -935,6 +935,7 @@ class TestWorkloadRunner:
         assert record["repetition"] == 2
         assert record["request"]["request_path"] == "/tmp/request.json"
         assert record["policy"]["within_timeout"] is False
+        assert record["cache_reset"] == {"attempted": False}
         assert record["metrics"]["cache_hits"] == 2
         assert record["metrics"]["cache_misses"] == 1
         assert record["metrics"]["tokens_saved"] == 40
@@ -1025,6 +1026,106 @@ class TestWorkloadRunner:
         assert len(payload["results"]) == 6
         assert payload["workload"]["repetitions"] == 3
         assert payload["summary"]["case_summaries"]["case-a"]["sample_count"] == 3
+
+    def test_run_bench_serve_workload_clears_cache_before_case(
+        self, tmp_path, monkeypatch
+    ):
+        workload_file = tmp_path / "workload.json"
+        workload_file.write_text(
+            json.dumps(
+                {
+                    "name": "cache-contract",
+                    "cases": [
+                        {
+                            "id": "case-a",
+                            "messages": [{"role": "user", "content": "A"}],
+                        },
+                        {
+                            "id": "case-b",
+                            "messages": [{"role": "user", "content": "B"}],
+                        },
+                    ],
+                }
+            )
+        )
+        clear_events = []
+        observed_resets = []
+
+        async def fake_auto_detect_runtime(client, url):
+            return {"model_id": "test-model"}
+
+        def fake_detect_hardware_fingerprint():
+            return {"chip": "test"}
+
+        async def fake_clear_runtime_cache(client, url):
+            event = {
+                "attempted": True,
+                "ok": True,
+                "status_code": 200,
+                "response": {"sequence": len(clear_events)},
+                "error": "",
+            }
+            clear_events.append(event)
+            return event
+
+        async def fake_run_workload_case(*args, **kwargs):
+            observed_resets.append(kwargs["cache_reset"])
+            return {
+                "run_id": kwargs["run_id"],
+                "timestamp": kwargs["timestamp"],
+                "workload": kwargs["workload"].name,
+                "case_id": kwargs["case"].case_id,
+                "repetition": kwargs["repetition"],
+                "tags": [],
+                "model_id": kwargs["model"],
+                "runtime": kwargs["runtime"],
+                "hardware": kwargs["hardware"],
+                "request": {},
+                "policy": {"within_timeout": None},
+                "metrics": {
+                    "e2e_latency_ms": 100.0,
+                    "ttft_ms": 10.0,
+                    "gen_tps": 20.0,
+                },
+                "quality": {"ok": True, "content_chars": 20},
+                "ok": True,
+            }
+
+        monkeypatch.setattr(
+            "vllm_mlx.bench_serve.auto_detect_runtime", fake_auto_detect_runtime
+        )
+        monkeypatch.setattr(
+            "vllm_mlx.bench_serve.detect_hardware_fingerprint",
+            fake_detect_hardware_fingerprint,
+        )
+        monkeypatch.setattr(
+            "vllm_mlx.bench_serve.clear_runtime_cache", fake_clear_runtime_cache
+        )
+        monkeypatch.setattr(
+            "vllm_mlx.bench_serve.run_workload_case", fake_run_workload_case
+        )
+
+        payload = asyncio.run(
+            run_bench_serve_workload(
+                url="http://server",
+                workload_path=str(workload_file),
+                output_format="json",
+                scrape=False,
+                request_timeout_s=None,
+                repetitions=2,
+                cache_policy="before-case",
+            )
+        )
+
+        assert len(clear_events) == 4
+        assert observed_resets == clear_events
+        assert payload["cache_policy"]["mode"] == "before-case"
+        assert [event["scope"] for event in payload["cache_policy"]["events"]] == [
+            "before-case",
+            "before-case",
+            "before-case",
+            "before-case",
+        ]
 
 
 # ---------------------------------------------------------------------------

@@ -714,6 +714,7 @@ def bench_serve_command(args):
                 include_content=args.include_content,
                 request_timeout_s=request_timeout_s,
                 repetitions=args.repetitions,
+                cache_policy=args.cache_policy,
             )
         )
         return
@@ -1482,6 +1483,16 @@ Examples:
         help=(
             "HTTP transport timeout for workload mode in seconds (default: 300). "
             "Use 0 to disable; product policy timeouts belong in the workload."
+        ),
+    )
+    bench_serve_parser.add_argument(
+        "--cache-policy",
+        type=str,
+        default=None,
+        choices=["preserve", "before-run", "before-case"],
+        help=(
+            "Workload cache handling (default: workload defaults or preserve). "
+            "Use before-case for cold, uncontaminated per-case qualification."
         ),
     )
     bench_serve_parser.add_argument(
