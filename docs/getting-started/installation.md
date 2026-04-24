@@ -81,6 +81,13 @@ Check your internet connection and HuggingFace access. Some models require authe
 huggingface-cli login
 ```
 
+You can inspect and stage models before serving:
+```bash
+vllm-mlx model inspect mlx-community/Llama-3.2-3B-Instruct-4bit
+vllm-mlx model acquire mlx-community/Llama-3.2-3B-Instruct-4bit \
+  --target-dir ./models/llama-3b-4bit
+```
+
 ### Out of memory
 
 Use a smaller quantized model:
