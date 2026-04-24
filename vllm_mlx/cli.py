@@ -81,6 +81,14 @@ def serve_command(args):
     if args.default_top_p is not None:
         server._default_top_p = args.default_top_p
     server._default_chat_template_kwargs = args.default_chat_template_kwargs
+    if args.default_top_k is not None:
+        server._default_top_k = args.default_top_k
+    if args.default_min_p is not None:
+        server._default_min_p = args.default_min_p
+    if args.default_presence_penalty is not None:
+        server._default_presence_penalty = args.default_presence_penalty
+    if args.default_repetition_penalty is not None:
+        server._default_repetition_penalty = args.default_repetition_penalty
     max_audio_upload_mb = getattr(args, "max_audio_upload_mb", 25)
     max_tts_input_chars = getattr(args, "max_tts_input_chars", 4096)
     server._max_audio_upload_bytes = max_audio_upload_mb * 1024 * 1024
