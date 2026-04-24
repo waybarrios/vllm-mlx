@@ -219,6 +219,29 @@ class TestWorkloadLoading:
         assert case.checks == {"forbidden_regex": ["<think>"]}
         assert case.tags == ("quality",)
 
+    def test_load_workload_null_policy_timeout_falls_back_to_default(
+        self, tmp_path: Path
+    ):
+        workload_file = tmp_path / "workload.json"
+        workload_file.write_text(
+            json.dumps(
+                {
+                    "defaults": {"policy_timeout_ms": 180000},
+                    "cases": [
+                        {
+                            "id": "case-a",
+                            "messages": [{"role": "user", "content": "A"}],
+                            "policy_timeout_ms": None,
+                        }
+                    ],
+                }
+            )
+        )
+
+        workload = load_workload(workload_file)
+
+        assert workload.cases[0].policy_timeout_ms == 180000
+
     def test_load_workload_rejects_missing_messages(self, tmp_path: Path):
         workload_file = tmp_path / "workload.json"
         workload_file.write_text(json.dumps({"cases": [{"id": "bad"}]}))
