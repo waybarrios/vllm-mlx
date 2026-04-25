@@ -118,9 +118,23 @@ class _ToolDef:
 
 
 class StreamingXMLToolCallParser:
-    """
-    Simplified streaming XML tool call parser
-    Supports streaming input, parsing, and output
+    """Streaming XML parser for Qwen 3.5 ``<tool_call>`` format.
+
+    Architecture:
+      1. **Preprocessing** (``_preprocess_before_xml_parse``): scans raw text
+         for ``<parameter=name>`` tags, extracts type hints from tool schemas,
+         and rewrites the XML into expat-parseable form.
+      2. **Expat parsing**: an incremental ``xml.parsers.expat`` parser fires
+         ``start_element`` / ``end_element`` / ``character_data`` callbacks.
+      3. **Type coercion** (``_coerce_param_value``): converts string values to
+         int/float/bool/object/array based on JSON Schema type hints. Complex
+         types use a deferred ``ast.literal_eval`` + ``json.loads`` fallback.
+      4. **Auto-closing**: if the model truncates output mid-tag, the parser
+         synthesizes closing tags so partial tool calls are still extractable.
+
+    Streaming: ``update(delta)`` feeds incremental text. Completed tool calls
+    are emitted via ``get_streaming_output()`` as they close. State resets
+    between tool calls within the same response.
     """
 
     def __init__(self):
