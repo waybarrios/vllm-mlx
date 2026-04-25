@@ -154,6 +154,7 @@ class BaseEngine(ABC):
         temperature: float = 0.7,
         top_p: float = 0.9,
         stop: list[str] | None = None,
+        raw_output: bool = False,
         **kwargs,
     ) -> GenerationOutput:
         """
@@ -180,6 +181,7 @@ class BaseEngine(ABC):
         temperature: float = 0.7,
         top_p: float = 0.9,
         stop: list[str] | None = None,
+        raw_output: bool = False,
         **kwargs,
     ) -> AsyncIterator[GenerationOutput]:
         """
@@ -208,6 +210,7 @@ class BaseEngine(ABC):
         tools: list[dict] | None = None,
         images: list[str] | None = None,
         videos: list[str] | None = None,
+        raw_output: bool = False,
         **kwargs,
     ) -> GenerationOutput:
         """
@@ -238,6 +241,7 @@ class BaseEngine(ABC):
         tools: list[dict] | None = None,
         images: list[str] | None = None,
         videos: list[str] | None = None,
+        raw_output: bool = False,
         **kwargs,
     ) -> AsyncIterator[GenerationOutput]:
         """

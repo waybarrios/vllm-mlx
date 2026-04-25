@@ -1715,7 +1715,7 @@ async def _run_responses_request(
 
     timeout = _default_timeout
     output = await _wait_with_disconnect(
-        engine.chat(messages=messages, **chat_kwargs),
+        engine.chat(messages=messages, raw_output=True, **chat_kwargs),
         raw_request,
         timeout=timeout,
     )
@@ -3897,7 +3897,11 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
 
         try:
             output = await _wait_with_disconnect(
-                engine.chat(messages=prepared.messages, **prepared.chat_kwargs),
+                engine.chat(
+                    messages=prepared.messages,
+                    raw_output=True,
+                    **prepared.chat_kwargs,
+                ),
                 raw_request,
                 timeout=_remaining_request_timeout(total_timeout, deadline),
                 timeout_detail_seconds=total_timeout,
@@ -4295,7 +4299,11 @@ async def create_anthropic_message(
         start_time = time.perf_counter()
         try:
             output = await _wait_with_disconnect(
-                engine.chat(messages=prepared.messages, **prepared.chat_kwargs),
+                engine.chat(
+                    messages=prepared.messages,
+                    raw_output=True,
+                    **prepared.chat_kwargs,
+                ),
                 request,
                 timeout=_remaining_request_timeout(total_timeout, deadline),
                 timeout_detail_seconds=total_timeout,

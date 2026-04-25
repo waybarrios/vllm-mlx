@@ -359,6 +359,7 @@ class SimpleEngine(BaseEngine):
         temperature: float = 0.7,
         top_p: float = 0.9,
         stop: list[str] | None = None,
+        raw_output: bool = False,
         **kwargs,
     ) -> GenerationOutput:
         """
@@ -399,6 +400,7 @@ class SimpleEngine(BaseEngine):
             temperature=temperature,
             top_p=top_p,
             stop=stop,
+            raw_output=raw_output,
             **kwargs,
         ):
             last_output = output
@@ -406,7 +408,7 @@ class SimpleEngine(BaseEngine):
         if last_output is None:
             return GenerationOutput(text="", finish_reason="stop")
 
-        text = clean_output_text(last_output.text)
+        text = last_output.text if raw_output else clean_output_text(last_output.text)
         return GenerationOutput(
             text=text,
             tokens=list(last_output.tokens),
@@ -423,6 +425,7 @@ class SimpleEngine(BaseEngine):
         temperature: float = 0.7,
         top_p: float = 0.9,
         stop: list[str] | None = None,
+        raw_output: bool = False,
         **kwargs,
     ) -> AsyncIterator[GenerationOutput]:
         """
@@ -555,6 +558,7 @@ class SimpleEngine(BaseEngine):
         tools: list[dict] | None = None,
         images: list[str] | None = None,
         videos: list[str] | None = None,
+        raw_output: bool = False,
         **kwargs,
     ) -> GenerationOutput:
         """
@@ -588,11 +592,16 @@ class SimpleEngine(BaseEngine):
                 tools=tools,
                 images=images,
                 videos=videos,
+                raw_output=raw_output,
                 chat_template_kwargs=chat_template_kwargs,
                 **kwargs,
             ):
                 final_output = output
-            text = clean_output_text(final_output.text)
+            text = (
+                final_output.text
+                if raw_output
+                else clean_output_text(final_output.text)
+            )
             return GenerationOutput(
                 text=text,
                 tokens=list(final_output.tokens),
@@ -633,7 +642,7 @@ class SimpleEngine(BaseEngine):
                 tools=template_tools,
                 **kwargs,
             )
-            text = clean_output_text(output.text)
+            text = output.text if raw_output else clean_output_text(output.text)
             return GenerationOutput(
                 text=text,
                 prompt_tokens=output.prompt_tokens,
@@ -651,7 +660,7 @@ class SimpleEngine(BaseEngine):
                 chat_template_kwargs=chat_template_kwargs,
                 **kwargs,
             )
-            text = clean_output_text(output.text)
+            text = output.text if raw_output else clean_output_text(output.text)
             # Preserve upstream prompt accounting while routing the blocking
             # chat call through the cancellation-safe serialized runner.
             tokenizer = self._model.tokenizer
@@ -680,6 +689,7 @@ class SimpleEngine(BaseEngine):
         tools: list[dict] | None = None,
         images: list[str] | None = None,
         videos: list[str] | None = None,
+        raw_output: bool = False,
         **kwargs,
     ) -> AsyncIterator[GenerationOutput]:
         """
@@ -811,6 +821,7 @@ class SimpleEngine(BaseEngine):
             max_tokens=max_tokens,
             temperature=temperature,
             top_p=top_p,
+            raw_output=raw_output,
             **kwargs,
         ):
             yield output

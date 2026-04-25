@@ -641,6 +641,7 @@ class BatchedEngine(BaseEngine):
         stop: list[str] | None = None,
         images: list[str] | None = None,
         videos: list[str] | None = None,
+        raw_output: bool = False,
         **kwargs,
     ) -> GenerationOutput:
         """
@@ -681,7 +682,11 @@ class BatchedEngine(BaseEngine):
             )
 
             return GenerationOutput(
-                text=clean_output_text(output.output_text),
+                text=(
+                    output.output_text
+                    if raw_output
+                    else clean_output_text(output.output_text)
+                ),
                 tokens=output.output_token_ids,
                 prompt_tokens=output.prompt_tokens,
                 completion_tokens=output.completion_tokens,
@@ -708,7 +713,9 @@ class BatchedEngine(BaseEngine):
             sampling_params=sampling_params,
         )
 
-        text = clean_output_text(output.output_text)
+        text = (
+            output.output_text if raw_output else clean_output_text(output.output_text)
+        )
 
         return GenerationOutput(
             text=text,
@@ -727,6 +734,7 @@ class BatchedEngine(BaseEngine):
         stop: list[str] | None = None,
         images: list[str] | None = None,
         videos: list[str] | None = None,
+        raw_output: bool = False,
         **kwargs,
     ) -> AsyncIterator[GenerationOutput]:
         """
@@ -766,7 +774,11 @@ class BatchedEngine(BaseEngine):
 
             async for output in self._mllm_scheduler.stream_outputs(request_id):
                 yield GenerationOutput(
-                    text=clean_output_text(output.output_text),
+                    text=(
+                        output.output_text
+                        if raw_output
+                        else clean_output_text(output.output_text)
+                    ),
                     new_text=output.new_text,
                     prompt_tokens=output.prompt_tokens,
                     completion_tokens=output.completion_tokens,
@@ -798,7 +810,11 @@ class BatchedEngine(BaseEngine):
         )
 
         async for output in self._engine.stream_outputs(request_id):
-            text = clean_output_text(output.output_text)
+            text = (
+                output.output_text
+                if raw_output
+                else clean_output_text(output.output_text)
+            )
 
             yield GenerationOutput(
                 text=text,
@@ -818,6 +834,7 @@ class BatchedEngine(BaseEngine):
         tools: list[dict] | None = None,
         images: list[str] | None = None,
         videos: list[str] | None = None,
+        raw_output: bool = False,
         **kwargs,
     ) -> GenerationOutput:
         """
@@ -872,6 +889,7 @@ class BatchedEngine(BaseEngine):
             top_p=top_p,
             images=all_images if all_images else None,
             videos=all_videos if all_videos else None,
+            raw_output=raw_output,
             **kwargs,
         )
 
@@ -946,6 +964,7 @@ class BatchedEngine(BaseEngine):
         tools: list[dict] | None = None,
         images: list[str] | None = None,
         videos: list[str] | None = None,
+        raw_output: bool = False,
         **kwargs,
     ) -> AsyncIterator[GenerationOutput]:
         """
@@ -1009,6 +1028,7 @@ class BatchedEngine(BaseEngine):
             top_p=top_p,
             images=all_images if all_images else None,
             videos=all_videos if all_videos else None,
+            raw_output=raw_output,
             **kwargs,
         ):
             yield output
