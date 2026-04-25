@@ -49,7 +49,7 @@ def _parse_param_value(val: str) -> Any:
         return val
 
 
-@ToolParserManager.register_module(["hermes", "nous", "qwen3_coder"])
+@ToolParserManager.register_module(["hermes", "nous"])
 class HermesToolParser(ToolParser):
     """
     Tool call parser for Hermes/Nous models.

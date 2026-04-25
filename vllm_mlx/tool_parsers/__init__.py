@@ -61,6 +61,7 @@ from .xlam_tool_parser import xLAMToolParser
 from .glm47_tool_parser import Glm47ToolParser
 from .harmony_tool_parser import HarmonyToolParser
 from .minimax_tool_parser import MiniMaxToolParser
+from .qwen3_xml_tool_parser import Qwen3XMLToolParser
 
 
 def get_parser_stop_tokens(
@@ -98,6 +99,7 @@ __all__ = [
     "Gemma4ToolParser",
     "MistralToolParser",
     "QwenToolParser",
+    "Qwen3XMLToolParser",
     "LlamaToolParser",
     "HermesToolParser",
     "DeepSeekToolParser",
