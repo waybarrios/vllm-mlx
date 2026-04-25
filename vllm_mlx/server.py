@@ -186,6 +186,9 @@ _metrics_enabled = False
 _max_audio_upload_bytes: int = DEFAULT_MAX_AUDIO_UPLOAD_BYTES
 _max_tts_input_chars: int = DEFAULT_MAX_TTS_INPUT_CHARS
 _force_mllm_model: bool = False
+_default_thinking_token_budget: int | None = (
+    None  # Set via --default-thinking-token-budget
+)
 _auto_unload_idle_seconds: float = 0.0
 _lazy_load_model: bool = False
 _residency_manager: ResidencyManager | None = None
@@ -364,6 +367,49 @@ def _prepare_json_logits_processor(
     return messages, json_logits_processor
 
 
+def _build_thinking_processor(
+    engine: BaseEngine,
+    thinking_token_budget: int,
+    *,
+    inner: object | None = None,
+) -> object | None:
+    """Build a ThinkingAwareLogitsProcessor if the tokenizer has think tokens."""
+    from .constrained.thinking_processor import ThinkingAwareLogitsProcessor
+
+    tokenizer = _get_engine_tokenizer(engine)
+    if tokenizer is None:
+        return None
+
+    # Resolve <think> and </think> token IDs from the tokenizer.
+    try:
+        start_ids = tokenizer.encode("<think>", add_special_tokens=False)
+        end_ids = tokenizer.encode("</think>", add_special_tokens=False)
+    except Exception:
+        logger.debug("Tokenizer cannot encode think tags; skipping thinking processor")
+        return None
+
+    if not start_ids or not end_ids:
+        return None
+
+    vocab_size = getattr(tokenizer, "vocab_size", 152064)
+
+    proc = ThinkingAwareLogitsProcessor(
+        start_token_ids=start_ids,
+        end_token_ids=end_ids,
+        thinking_token_budget=thinking_token_budget,
+        inner=inner,
+        vocab_size=vocab_size,
+        prompt_has_think_tag=True,
+    )
+    logger.info(
+        "Thinking processor enabled: budget=%d, start=%s, end=%s",
+        thinking_token_budget,
+        start_ids,
+        end_ids,
+    )
+    return proc
+
+
 def _prepare_chat_completion_invocation(
     engine: BaseEngine,
     request: ChatCompletionRequest,
@@ -438,6 +484,17 @@ def _prepare_chat_completion_invocation(
         if request.enable_thinking is None:
             request.enable_thinking = False
             chat_kwargs["enable_thinking"] = False
+
+    # Thinking-aware logits processor: cap reasoning tokens when a budget is set.
+    thinking_budget = request.thinking_token_budget or _default_thinking_token_budget
+    if thinking_budget is not None:
+        thinking_proc = _build_thinking_processor(
+            engine, thinking_budget, inner=json_logits_processor
+        )
+        if thinking_proc is not None:
+            # Replace the logits_processors list: the thinking processor wraps
+            # the JSON processor as its inner delegate, so we don't double-add.
+            chat_kwargs["logits_processors"] = [thinking_proc]
 
     return PreparedChatInvocation(
         messages=messages,

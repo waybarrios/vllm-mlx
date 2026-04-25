@@ -189,6 +189,9 @@ class ChatCompletionRequest(BaseModel):
     specprefill_keep_pct: float | None = None
     # Enable/disable thinking mode (None = server default, typically True)
     enable_thinking: bool | None = None
+    # Thinking token budget: cap reasoning tokens by forcing </think> when
+    # budget exhausted (None = no budget, unlimited reasoning)
+    thinking_token_budget: int | None = Field(default=None, gt=0)
 
 
 class AssistantMessage(BaseModel):
@@ -235,6 +238,7 @@ class Usage(BaseModel):
     prompt_tokens: int = 0
     completion_tokens: int = 0
     total_tokens: int = 0
+    reasoning_tokens: int | None = None
 
 
 class ChatCompletionResponse(BaseModel):

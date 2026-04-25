@@ -86,6 +86,10 @@ def serve_command(args):
     server._max_audio_upload_bytes = max_audio_upload_mb * 1024 * 1024
     server._max_tts_input_chars = max_tts_input_chars
 
+    # Configure thinking token budget
+    if args.default_thinking_token_budget is not None:
+        server._default_thinking_token_budget = args.default_thinking_token_budget
+
     # Configure reasoning parser
     if args.reasoning_parser:
         try:
@@ -142,6 +146,8 @@ def serve_command(args):
         print(f"  Reasoning: ENABLED (parser: {args.reasoning_parser})")
     else:
         print("  Reasoning: Use --reasoning-parser to enable")
+    if args.default_thinking_token_budget is not None:
+        print(f"  Thinking budget: {args.default_thinking_token_budget} tokens")
     print(
         f"  Audio upload limit: {max_audio_upload_mb} MiB, "
         f"TTS input limit: {max_tts_input_chars} chars"
@@ -1138,6 +1144,16 @@ Examples:
         type=float,
         default=None,
         help="Override default top_p for all requests (default: use model default)",
+    )
+    serve_parser.add_argument(
+        "--default-thinking-token-budget",
+        type=int,
+        default=None,
+        help=(
+            "Default thinking token budget for reasoning models. Caps reasoning "
+            "tokens by forcing the end-think sequence when the budget is exhausted. "
+            "Per-request thinking_token_budget overrides this. (default: None = unlimited)"
+        ),
     )
     serve_parser.add_argument(
         "--default-chat-template-kwargs",

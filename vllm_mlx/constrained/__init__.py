@@ -13,9 +13,11 @@ from .json_schema_processor import (
     LMFormatEnforcerNotAvailableError,
     is_available,
 )
+from .thinking_processor import ThinkingAwareLogitsProcessor
 
 __all__ = [
     "JSONSchemaLogitsProcessor",
     "LMFormatEnforcerNotAvailableError",
+    "ThinkingAwareLogitsProcessor",
     "is_available",
 ]
