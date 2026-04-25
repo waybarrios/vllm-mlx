@@ -792,9 +792,11 @@ class TestQwen3CoderParser:
     """Test Qwen3-Coder tool call parsing (Issue #47)."""
 
     def test_qwen3_coder_alias_registered(self):
-        """Test that qwen3_coder is registered as an alias for HermesToolParser."""
+        """Test that qwen3_coder is registered as an alias for Qwen3XMLToolParser."""
+        from vllm_mlx.tool_parsers.qwen3_xml_tool_parser import Qwen3XMLToolParser
+
         parser_cls = ToolParserManager.get_tool_parser("qwen3_coder")
-        assert parser_cls == HermesToolParser
+        assert parser_cls == Qwen3XMLToolParser
 
     def test_qwen3_coder_xml_format(self):
         """Test parsing Qwen3-Coder XML format (Nemotron-style)."""
