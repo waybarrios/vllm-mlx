@@ -858,9 +858,7 @@ class TestQwen3CoderParser:
     def test_bare_function_without_tool_call_wrapper(self):
         """Test bare <function=...> blocks without <tool_call> wrapper."""
         parser = HermesToolParser()
-        text = (
-            "<function=get_weather>" "<parameter=city>Berlin</parameter>" "</function>"
-        )
+        text = "<function=get_weather><parameter=city>Berlin</parameter></function>"
         result = parser.extract_tool_calls(text)
 
         assert result.tools_called
