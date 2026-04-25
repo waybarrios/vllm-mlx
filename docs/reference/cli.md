@@ -156,6 +156,8 @@ manifest recording, and `hf_transfer` support but does not include retry logic.
 vllm-mlx model inspect <path-or-hf-model-id>
 vllm-mlx model acquire <hf-model-id> [--target-dir <path>]
 vllm-mlx model convert <path-or-hf-model-id> --output <path> [--quantize]
+vllm-mlx model register <artifact-dir> [--model-id <id>] [--mllm]
+vllm-mlx model qualify <model-id> [--workload <path>] [--dry-run]
 ```
 
 ### Options
@@ -173,6 +175,18 @@ vllm-mlx model convert <path-or-hf-model-id> --output <path> [--quantize]
 | `convert` | `--quant-predicate` | `mlx-lm` mixed-bit quantization recipe |
 | `convert` | `--dtype` | Dtype for non-quantized parameters |
 | `convert` | `--dry-run` | Print command and manifest without executing conversion |
+| `register` | `--model-id` | Model identifier (defaults to directory name) |
+| `register` | `--served-model-name` | Name for the /v1/models endpoint |
+| `register` | `--mllm` / `--no-mllm` | Mark as multimodal or text-only |
+| `register` | `--default-temperature`, `--default-top-p`, ... | Serving defaults |
+| `register` | `--tool-call-parser`, `--reasoning-parser` | Parser policy |
+| `register` | `--feature-flag` | Feature flag (repeatable) |
+| `qualify` | `--url` | Server URL (default: `http://127.0.0.1:8080`) |
+| `qualify` | `--workload` | bench-serve workload contract path |
+| `qualify` | `--repetitions` | bench-serve repetitions |
+| `qualify` | `--timeout` | Max seconds before aborting |
+| `qualify` | `--dry-run` | Print command without executing |
+| `qualify` | `--extra-arg` | Extra arg passed to bench-serve (repeatable) |
 
 ### Examples
 
@@ -185,6 +199,13 @@ vllm-mlx model acquire mlx-community/Llama-3.2-3B-Instruct-4bit \
 vllm-mlx model convert meta-llama/Llama-3.2-3B-Instruct \
   --output ./models/llama-3b-mlx-q4 \
   --quantize --q-bits 4 --q-group-size 64 --q-mode affine
+
+vllm-mlx model register ./models/llama-3b-mlx-q4 \
+  --model-id llama-3b-q4 --mllm \
+  --default-temperature 0.6 --default-top-p 0.95
+
+vllm-mlx model qualify llama-3b-q4 \
+  --workload ./config/workload.json --repetitions 5 --dry-run
 ```
 
 ## `vllm-mlx-bench`

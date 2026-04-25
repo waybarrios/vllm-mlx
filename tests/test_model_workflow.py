@@ -10,11 +10,18 @@ from unittest.mock import patch
 from vllm_mlx.model_workflow import (
     CONVERSION_MANIFEST_NAME,
     MODEL_MANIFEST_NAME,
+    QUALIFICATION_REQUEST_NAME,
+    REGISTRATION_MANIFEST_NAME,
     AcquisitionOptions,
     ConversionOptions,
+    QualificationOptions,
+    RegistrationOptions,
+    _drop_none,
     acquire_model,
     convert_model,
     inspect_model,
+    qualify_model,
+    register_model,
 )
 
 
@@ -284,3 +291,189 @@ def test_read_json_handles_malformed_json(tmp_path):
     bad = tmp_path / "bad.json"
     bad.write_text("{not valid json")
     assert _read_json(bad) == {}
+
+
+# --- Registration tests ---
+
+
+def test_register_model_writes_manifest_from_artifact(tmp_path):
+    artifact = tmp_path / "artifact-model"
+    artifact.mkdir()
+    (artifact / "config.json").write_text(
+        json.dumps({"model_type": "qwen3", "quantization": {"bits": 4}})
+    )
+    (artifact / MODEL_MANIFEST_NAME).write_text(
+        json.dumps({"kind": "vllm-mlx-model-artifact", "model_id": "org/model"})
+    )
+
+    payload = register_model(
+        RegistrationOptions(
+            artifact_path=str(artifact),
+            model_id="qwen-test",
+            served_model_name="qwen-test-served",
+            preset_alias="fast-qwen",
+            mllm=True,
+            tool_call_parser="qwen3_coder",
+            reasoning_parser="qwen3",
+            default_temperature=0.6,
+            default_top_p=0.95,
+            default_top_k=20,
+            default_min_p=0.0,
+            default_presence_penalty=0.0,
+            default_repetition_penalty=1.0,
+            chat_template_kwargs={"enable_thinking": True},
+            feature_flags=["prefix_cache"],
+        )
+    )
+
+    assert payload["kind"] == "vllm-mlx-model-registration"
+    assert payload["model_id"] == "qwen-test"
+    assert payload["served_model_name"] == "qwen-test-served"
+    assert payload["preset_alias"] == "fast-qwen"
+    assert payload["mllm"] is True
+    assert payload["production_ready"] is False
+    assert payload["qualification_required"] is True
+    assert payload["serving_defaults"]["top_k"] == 20
+    assert payload["serving_defaults"]["chat_template_kwargs"] == {
+        "enable_thinking": True
+    }
+    assert payload["parser_policy"]["reasoning_parser"] == "qwen3"
+    assert payload["source_manifests"]["acquisition"]["payload"]["model_id"] == (
+        "org/model"
+    )
+    assert (artifact / REGISTRATION_MANIFEST_NAME).exists()
+
+
+def test_register_model_with_minimal_defaults(tmp_path):
+    """register_model with only artifact_path must produce a valid manifest."""
+    artifact = tmp_path / "minimal-model"
+    artifact.mkdir()
+    (artifact / "config.json").write_text(json.dumps({"model_type": "llama"}))
+
+    payload = register_model(RegistrationOptions(artifact_path=str(artifact)))
+
+    assert payload["kind"] == "vllm-mlx-model-registration"
+    assert payload["model_id"] == "minimal-model"
+    assert payload["served_model_name"] == "minimal-model"
+    assert payload["mllm"] is None
+    assert payload["preset_alias"] is None
+    assert payload["serving_defaults"] == {}
+    assert payload["parser_policy"] == {}
+    assert payload["feature_flags"] == []
+    assert payload["production_ready"] is False
+    assert (artifact / REGISTRATION_MANIFEST_NAME).exists()
+
+
+def test_register_model_requires_local_directory(tmp_path):
+    missing = tmp_path / "missing"
+
+    try:
+        register_model(RegistrationOptions(artifact_path=str(missing)))
+    except FileNotFoundError:
+        pass
+    else:
+        raise AssertionError("expected FileNotFoundError")
+
+
+def test_register_model_rejects_file_path(tmp_path):
+    """artifact_path must be a directory, not a file."""
+    a_file = tmp_path / "not-a-dir.txt"
+    a_file.write_text("hello")
+
+    try:
+        register_model(RegistrationOptions(artifact_path=str(a_file)))
+    except NotADirectoryError:
+        pass
+    else:
+        raise AssertionError("expected NotADirectoryError")
+
+
+# --- Qualification tests ---
+
+
+def test_qualify_model_dry_run_records_bench_command(tmp_path):
+    output = tmp_path / QUALIFICATION_REQUEST_NAME
+
+    payload = qualify_model(
+        QualificationOptions(
+            model_id="qwen-test",
+            server_url="http://127.0.0.1:8090",
+            workload_path="/tmp/workload.json",
+            output_path=str(output),
+            result_path="/tmp/results.json",
+            repetitions=3,
+            dry_run=True,
+            extra_args=["--tag", "nightly"],
+        )
+    )
+
+    assert payload["status"] == "dry_run"
+    assert payload["production_ready"] is False
+    assert "--workload" in payload["command"]
+    assert "/tmp/workload.json" in payload["command"]
+    assert "--tag" in payload["command"]
+    assert "environment" in payload
+    assert "python" in payload["environment"]
+    assert output.exists()
+
+
+def test_qualify_model_runs_command_and_records_failure(tmp_path):
+    def fake_run(*args, **kwargs):
+        return SimpleNamespace(returncode=7, stdout="", stderr="bad workload")
+
+    with patch("vllm_mlx.model_workflow.subprocess.run", side_effect=fake_run):
+        payload = qualify_model(
+            QualificationOptions(
+                model_id="qwen-test",
+                workload_path="/tmp/workload.json",
+            )
+        )
+
+    assert payload["status"] == "failed"
+    assert payload["returncode"] == 7
+    assert payload["stderr"] == "bad workload"
+
+
+def test_qualify_model_success_path(tmp_path):
+    """qualification with returncode=0 should report succeeded."""
+    output = tmp_path / "qual-result.json"
+
+    def fake_run(*args, **kwargs):
+        return SimpleNamespace(returncode=0, stdout="ok", stderr="")
+
+    with patch("vllm_mlx.model_workflow.subprocess.run", side_effect=fake_run):
+        payload = qualify_model(
+            QualificationOptions(
+                model_id="qwen-test",
+                output_path=str(output),
+            )
+        )
+
+    assert payload["status"] == "succeeded"
+    assert payload["returncode"] == 0
+    assert payload["production_ready"] is False
+    assert output.exists()
+
+
+# --- _drop_none tests ---
+
+
+def test_drop_none_preserves_zero_values():
+    """Zero-valued defaults (0, 0.0, False, empty string) must survive _drop_none."""
+    result = _drop_none(
+        {
+            "temperature": 0.0,
+            "top_k": 0,
+            "presence_penalty": 0.0,
+            "flag": False,
+            "name": "",
+            "removed": None,
+        }
+    )
+    assert result == {
+        "temperature": 0.0,
+        "top_k": 0,
+        "presence_penalty": 0.0,
+        "flag": False,
+        "name": "",
+    }

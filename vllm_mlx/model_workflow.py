@@ -37,6 +37,8 @@ from .utils.download import LLM_ALLOW_PATTERNS, MLLM_ALLOW_PATTERNS
 
 MODEL_MANIFEST_NAME = "vllm_mlx_model_manifest.json"
 CONVERSION_MANIFEST_NAME = "vllm_mlx_conversion_manifest.json"
+REGISTRATION_MANIFEST_NAME = "vllm_mlx_registration_manifest.json"
+QUALIFICATION_REQUEST_NAME = "vllm_mlx_qualification_request.json"
 
 _MODEL_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*$")
 
@@ -72,6 +74,48 @@ class ConversionOptions:
     dtype: str | None = None
     trust_remote_code: bool = False
     dry_run: bool = False
+
+
+@dataclass(frozen=True)
+class RegistrationOptions:
+    """Options for generating a portable model registration manifest.
+
+    ``artifact_path`` is stored as an absolute path.  The manifest is
+    intended as a local handoff artifact; move or copy the artifact
+    directory and re-register if portability across machines is needed.
+    """
+
+    artifact_path: str
+    model_id: str | None = None
+    served_model_name: str | None = None
+    preset_alias: str | None = None
+    output_path: str | None = None
+    mllm: bool | None = None
+    tool_call_parser: str | None = None
+    reasoning_parser: str | None = None
+    default_temperature: float | None = None
+    default_top_p: float | None = None
+    default_top_k: int | None = None
+    default_min_p: float | None = None
+    default_presence_penalty: float | None = None
+    default_repetition_penalty: float | None = None
+    chat_template_kwargs: dict[str, Any] | None = None
+    feature_flags: list[str] | None = None
+
+
+@dataclass(frozen=True)
+class QualificationOptions:
+    """Options for creating or running a bench-serve qualification handoff."""
+
+    model_id: str
+    server_url: str = "http://127.0.0.1:8080"
+    workload_path: str | None = None
+    output_path: str | None = None
+    result_path: str | None = None
+    repetitions: int | None = None
+    timeout: int | None = None
+    dry_run: bool = False
+    extra_args: list[str] | None = None
 
 
 def _now_iso() -> str:
@@ -486,3 +530,176 @@ def convert_model(options: ConversionOptions) -> dict[str, Any]:
     _write_json(manifest_path, result)
     result["manifest_path"] = str(manifest_path)
     return result
+
+
+def _existing_manifests(path: Path) -> dict[str, Any]:
+    manifests: dict[str, Any] = {}
+    for name, key in (
+        (MODEL_MANIFEST_NAME, "acquisition"),
+        (CONVERSION_MANIFEST_NAME, "conversion"),
+    ):
+        manifest_path = path / name
+        if manifest_path.exists():
+            manifests[key] = {
+                "path": str(manifest_path),
+                "payload": _read_json(manifest_path),
+            }
+    return manifests
+
+
+def _drop_none(payload: dict[str, Any]) -> dict[str, Any]:
+    return {key: value for key, value in payload.items() if value is not None}
+
+
+def _environment_metadata() -> dict[str, Any]:
+    """Collect Python, vllm-mlx, and MLX version metadata."""
+    env: dict[str, Any] = {
+        "python": sys.version.split()[0],
+        "platform": platform.platform(),
+    }
+    try:
+        import importlib.metadata as _meta
+
+        env["vllm_mlx"] = _meta.version("vllm-mlx")
+    except Exception:
+        pass
+    try:
+        import importlib.metadata as _meta
+
+        env["mlx"] = _meta.version("mlx")
+    except Exception:
+        pass
+    return env
+
+
+def register_model(options: RegistrationOptions) -> dict[str, Any]:
+    """Write a portable registration manifest for a finalized local artifact.
+
+    This deliberately does not mutate a production registry. The manifest is a
+    handoff artifact that Ops or a deployment tool can apply after qualification.
+    """
+    artifact = Path(options.artifact_path).expanduser()
+    if not artifact.exists():
+        raise FileNotFoundError(f"artifact path does not exist: {artifact}")
+    if not artifact.is_dir():
+        raise NotADirectoryError(f"artifact path must be a directory: {artifact}")
+
+    inspection = inspect_model(str(artifact))
+    model_id = options.model_id or artifact.name
+    serving_defaults = _drop_none(
+        {
+            "temperature": options.default_temperature,
+            "top_p": options.default_top_p,
+            "top_k": options.default_top_k,
+            "min_p": options.default_min_p,
+            "presence_penalty": options.default_presence_penalty,
+            "repetition_penalty": options.default_repetition_penalty,
+            "chat_template_kwargs": options.chat_template_kwargs,
+        }
+    )
+    parser_policy = _drop_none(
+        {
+            "tool_call_parser": options.tool_call_parser,
+            "reasoning_parser": options.reasoning_parser,
+        }
+    )
+    payload = {
+        "kind": "vllm-mlx-model-registration",
+        "schema_version": 1,
+        "created_at": _now_iso(),
+        "model_id": model_id,
+        "served_model_name": options.served_model_name or model_id,
+        "preset_alias": options.preset_alias,
+        "artifact_path": str(artifact),
+        "mllm": options.mllm,
+        "feature_flags": options.feature_flags or [],
+        "serving_defaults": serving_defaults,
+        "parser_policy": parser_policy,
+        "inspection": inspection,
+        "source_manifests": _existing_manifests(artifact),
+        "qualification_required": True,
+        "production_ready": False,
+    }
+
+    output = (
+        Path(options.output_path).expanduser()
+        if options.output_path
+        else artifact / REGISTRATION_MANIFEST_NAME
+    )
+    _write_json(output, payload)
+    payload["manifest_path"] = str(output)
+    return payload
+
+
+def _qualification_command(options: QualificationOptions) -> list[str]:
+    command = [
+        sys.executable,
+        "-m",
+        "vllm_mlx.cli",
+        "bench-serve",
+        "--url",
+        options.server_url,
+        "--model",
+        options.model_id,
+        "--format",
+        "json",
+    ]
+    if options.workload_path:
+        command.extend(["--workload", options.workload_path])
+    if options.repetitions is not None:
+        command.extend(["--repetitions", str(options.repetitions)])
+    if options.result_path:
+        command.extend(["--output", options.result_path])
+    if options.extra_args:
+        command.extend(options.extra_args)
+    return command
+
+
+def qualify_model(options: QualificationOptions) -> dict[str, Any]:
+    """Create or run a bench-serve qualification handoff."""
+    command = _qualification_command(options)
+    payload: dict[str, Any] = {
+        "kind": "vllm-mlx-model-qualification",
+        "schema_version": 1,
+        "created_at": _now_iso(),
+        "model_id": options.model_id,
+        "server_url": options.server_url,
+        "workload_path": options.workload_path,
+        "result_path": options.result_path,
+        "repetitions": options.repetitions,
+        "dry_run": options.dry_run,
+        "command": command,
+        "environment": _environment_metadata(),
+        "production_ready": False,
+    }
+
+    if not options.dry_run:
+        timeout = options.timeout
+        try:
+            completed = subprocess.run(
+                command,
+                text=True,
+                capture_output=True,
+                check=False,
+                timeout=timeout,
+            )
+        except subprocess.TimeoutExpired:
+            payload["status"] = "timeout"
+            payload["completed_at"] = _now_iso()
+            if options.output_path:
+                _write_json(Path(options.output_path).expanduser(), payload)
+                payload["manifest_path"] = str(Path(options.output_path).expanduser())
+            return payload
+        payload["returncode"] = completed.returncode
+        payload["stdout"] = completed.stdout
+        payload["stderr"] = completed.stderr
+        payload["completed_at"] = _now_iso()
+        payload["status"] = "succeeded" if completed.returncode == 0 else "failed"
+    else:
+        payload["status"] = "dry_run"
+
+    if options.output_path:
+        output = Path(options.output_path).expanduser()
+        _write_json(output, payload)
+        payload["manifest_path"] = str(output)
+    return payload
