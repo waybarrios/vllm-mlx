@@ -15,6 +15,7 @@ import asyncio
 import logging
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any, AsyncIterator, Dict, List, Optional, Union
 
@@ -24,8 +25,15 @@ from .request import Request, RequestOutput, SamplingParams
 from .scheduler import Scheduler, SchedulerConfig
 from .output_collector import RequestOutputCollector, RequestStreamState
 from .model_registry import get_registry
+from .mlx_streams import bind_generation_streams
 
 logger = logging.getLogger(__name__)
+
+
+def _is_stream_thread_error(error: Exception) -> bool:
+    """True when MLX reports stream ownership mismatch across threads."""
+    message = str(error)
+    return "no Stream(" in message or "no Stream(gpu" in message
 
 
 @dataclass
@@ -125,6 +133,10 @@ class EngineCore:
             except asyncio.CancelledError:
                 pass
             self._task = None
+        # Safety net: close batch generator if _engine_loop didn't get a
+        # chance to clean up (e.g. it was never started).  The call is
+        # idempotent — _close_batch_generator checks for None.
+        self.scheduler._close_batch_generator()
         logger.info("Engine stopped")
 
     def is_running(self) -> bool:
@@ -132,20 +144,83 @@ class EngineCore:
         return self._running
 
     async def _engine_loop(self) -> None:
-        """Main engine loop - hybrid executor for prefill vs generation.
+        """Main engine loop.
 
-        Prefill steps (long prompts) are run in a thread executor to keep
-        the asyncio event loop responsive.  Generation-only steps (~1-3ms)
-        are called directly to avoid ~0.5-2ms context switch overhead,
-        giving ~5-10% throughput improvement during sustained generation.
+        scheduler.step runs on one dedicated worker thread. MLX streams are
+        thread-local, so we rebind generation streams inside that worker.
         """
-        import concurrent.futures
 
-        # Single-thread executor ensures MLX calls are never concurrent
-        _executor = concurrent.futures.ThreadPoolExecutor(
-            max_workers=1, thread_name_prefix="mlx-step"
-        )
         loop = asyncio.get_running_loop()
+        worker = ThreadPoolExecutor(max_workers=1, thread_name_prefix="engine-core")
+        worker_stream_bound = False
+        model_thread_stream_bound = False
+        use_worker_thread = True
+        stream_thread_fallback_used = False
+
+        def _bind_worker_streams_once() -> None:
+            nonlocal worker_stream_bound
+            if not worker_stream_bound:
+                bind_generation_streams()
+                worker_stream_bound = True
+
+        def _bind_model_streams_once() -> None:
+            nonlocal model_thread_stream_bound
+            if not model_thread_stream_bound:
+                bind_generation_streams()
+                model_thread_stream_bound = True
+
+        def _step_on_worker():
+            _bind_worker_streams_once()
+            output = self.scheduler.step()
+            self._steps_executed += 1
+
+            if self._steps_executed % _memory_check_interval == 0:
+                try:
+                    active_mem = mx.get_active_memory()
+                    if active_mem > _memory_pressure_threshold:
+                        mx.clear_cache()
+                        logger.warning(
+                            f"[Memory pressure] {active_mem / 1e9:.1f}GB > "
+                            f"{_memory_pressure_threshold / 1e9:.0f}GB threshold, "
+                            f"forced cache clear"
+                        )
+                except Exception:
+                    pass
+
+            return output
+
+        def _step_on_model_thread():
+            _bind_model_streams_once()
+            output = self.scheduler.step()
+            self._steps_executed += 1
+
+            if self._steps_executed % _memory_check_interval == 0:
+                try:
+                    active_mem = mx.get_active_memory()
+                    if active_mem > _memory_pressure_threshold:
+                        mx.clear_cache()
+                        logger.warning(
+                            f"[Memory pressure] {active_mem / 1e9:.1f}GB > "
+                            f"{_memory_pressure_threshold / 1e9:.0f}GB threshold, "
+                            f"forced cache clear"
+                        )
+                except Exception:
+                    pass
+
+            return output
+
+        def _recover_stream_thread_error_on_worker() -> None:
+            _bind_worker_streams_once()
+            self.scheduler._recover_from_cache_error()
+            self.scheduler._reschedule_running_requests()
+
+        def _clear_cache_on_worker() -> None:
+            _bind_worker_streams_once()
+            mx.clear_cache()
+
+        def _close_batch_generator_on_worker() -> None:
+            _bind_worker_streams_once()
+            self.scheduler._close_batch_generator()
 
         step_interval = self.config.step_interval
         stream_interval = self.config.stream_interval
@@ -162,94 +237,101 @@ class EngineCore:
             _memory_pressure_threshold = 200 * 1024 * 1024 * 1024
         _memory_check_interval = 64
 
-        while self._running:
-            try:
-                if self.scheduler.has_requests():
-                    # Hybrid approach: use executor only when prefill is likely.
-                    # Prefill happens when there are waiting requests that need
-                    # to be inserted into the batch (may block for seconds).
-                    # Generation-only steps are fast (<3ms) and can run inline.
-                    has_waiting = self.scheduler.get_num_waiting() > 0
-                    has_partial = (
-                        self.scheduler.batch_generator is not None
-                        and getattr(self.scheduler.batch_generator, "_partial", None)
-                        is not None
-                    )
-                    needs_executor = has_waiting or has_partial
-
-                    if needs_executor:
-                        output = await loop.run_in_executor(
-                            _executor, self.scheduler.step
-                        )
-                    else:
-                        output = self.scheduler.step()
-                        # Yield to event loop after inline step
-                        await asyncio.sleep(0)
-                    self._steps_executed += 1
-
-                    # Emergency memory pressure check
-                    if self._steps_executed % _memory_check_interval == 0:
-                        try:
-                            active_mem = mx.get_active_memory()
-                            if active_mem > _memory_pressure_threshold:
-                                mx.clear_cache()
-                                logger.warning(
-                                    f"[Memory pressure] {active_mem / 1e9:.1f}GB > "
-                                    f"{_memory_pressure_threshold / 1e9:.0f}GB threshold, "
-                                    f"forced cache clear"
+        try:
+            while self._running:
+                try:
+                    if self.scheduler.has_requests():
+                        if use_worker_thread:
+                            try:
+                                output = await loop.run_in_executor(
+                                    worker, _step_on_worker
                                 )
-                        except Exception:
-                            pass
-
-                    # Fast path: distribute outputs to collectors
-                    outputs = output.outputs
-                    if outputs:
-                        collectors = self._output_collectors
-                        states = self._stream_states
-                        events = self._finished_events
-
-                        for req_output in outputs:
-                            rid = req_output.request_id
-                            collector = collectors.get(rid)
-
-                            if collector is not None:
-                                # Optimized: skip stream_interval check when interval=1
-                                if use_simple_streaming:
-                                    collector.put(req_output)
-                                else:
-                                    state = states.get(rid)
-                                    if state and state.should_send(
-                                        req_output.completion_tokens,
-                                        req_output.finished,
-                                    ):
-                                        collector.put(req_output)
-                                        state.mark_sent(req_output.completion_tokens)
-
-                            if req_output.finished:
-                                event = events.get(rid)
-                                if event:
-                                    event.set()
-
-                        # Free Metal buffers after distributing finished outputs
-                        if output.finished_request_ids:
-                            mx.clear_cache()
-
-                        # Always yield to prevent event loop starvation.
-                        # Without this, orphaned requests (client disconnected but
-                        # request still in scheduler) block the entire event loop,
-                        # making the server unresponsive to all HTTP requests.
+                            except Exception as e:
+                                if (
+                                    _is_stream_thread_error(e)
+                                    and not stream_thread_fallback_used
+                                ):
+                                    await loop.run_in_executor(
+                                        worker, _recover_stream_thread_error_on_worker
+                                    )
+                                    use_worker_thread = False
+                                    stream_thread_fallback_used = True
+                                    _bind_model_streams_once()
+                                    logger.warning(
+                                        "Detected MLX stream/thread mismatch on worker "
+                                        "step; switched this engine to model-thread stepping"
+                                    )
+                                    continue
+                                raise
+                        else:
+                            output = _step_on_model_thread()
+                        # Yield to event loop after each step.
                         await asyncio.sleep(0)
+
+                        # Fast path: distribute outputs to collectors
+                        outputs = output.outputs
+                        if outputs:
+                            collectors = self._output_collectors
+                            states = self._stream_states
+                            events = self._finished_events
+
+                            for req_output in outputs:
+                                rid = req_output.request_id
+                                collector = collectors.get(rid)
+
+                                if collector is not None:
+                                    # Optimized: skip stream_interval check when interval=1
+                                    if use_simple_streaming:
+                                        collector.put(req_output)
+                                    else:
+                                        state = states.get(rid)
+                                        if state and state.should_send(
+                                            req_output.completion_tokens,
+                                            req_output.finished,
+                                        ):
+                                            collector.put(req_output)
+                                            state.mark_sent(
+                                                req_output.completion_tokens
+                                            )
+
+                                if req_output.finished:
+                                    event = events.get(rid)
+                                    if event:
+                                        event.set()
+
+                            # Free Metal buffers after distributing finished outputs
+                            if output.finished_request_ids:
+                                if use_worker_thread:
+                                    await loop.run_in_executor(
+                                        worker, _clear_cache_on_worker
+                                    )
+                                else:
+                                    mx.clear_cache()
+
+                            # Always yield to prevent event loop starvation.
+                            # Without this, orphaned requests (client disconnected but
+                            # request still in scheduler) block the entire event loop,
+                            # making the server unresponsive to all HTTP requests.
+                            await asyncio.sleep(0)
+                    else:
+                        # No work, yield control
+                        await asyncio.sleep(step_interval)
+
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    import traceback
+
+                    logger.error(f"Engine loop error: {e}\n{traceback.format_exc()}")
+                    await asyncio.sleep(0.1)
+        finally:
+            try:
+                if use_worker_thread:
+                    await loop.run_in_executor(worker, _close_batch_generator_on_worker)
                 else:
-                    # No work, yield control
-                    await asyncio.sleep(step_interval)
-
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                import traceback
-
-                logger.error(f"Engine loop error: {e}\n{traceback.format_exc()}")
-                await asyncio.sleep(0.1)
+                    self.scheduler._close_batch_generator()
+            finally:
+                worker.shutdown(wait=True)
 
     async def add_request(
         self,
@@ -368,15 +450,16 @@ class EngineCore:
                             f"{_time.monotonic() - _t0:.1f}s"
                         )
 
-                    yield output
-
                     if output.finished:
                         finished_normally = True
                         logger.info(
                             f"[stream_outputs] {request_id[:12]} finished normally, "
                             f"{_token_count} tokens in {_time.monotonic() - _t0:.1f}s"
                         )
+                        yield output
                         break
+
+                    yield output
 
                 except asyncio.TimeoutError:
                     logger.warning(
@@ -547,6 +630,15 @@ class EngineCore:
         """Load prefix cache from disk."""
         return self.scheduler.load_cache_from_disk(cache_dir)
 
+    def clear_runtime_caches(self) -> Dict[str, Any] | None:
+        """Clear scheduler-managed runtime caches."""
+        return self.scheduler.clear_runtime_caches()
+
+    def clear_prefix_cache(self) -> None:
+        """Clear the prefix cache (delegates to scheduler)."""
+        if hasattr(self.scheduler, "clear_prefix_cache"):
+            self.scheduler.clear_prefix_cache()
+
     def _release_model(self) -> None:
         """Release model ownership."""
         if self._owns_model and not self._closed:
@@ -629,7 +721,7 @@ class AsyncEngineCore:
 
     def start(self) -> None:
         """Start engine (creates task in current loop)."""
-        asyncio.create_task(self.engine.start())
+        self._start_task = asyncio.create_task(self.engine.start())
 
     async def stop(self) -> None:
         """Stop the engine."""
@@ -691,3 +783,7 @@ class AsyncEngineCore:
     def load_cache_from_disk(self, cache_dir: str) -> int:
         """Load prefix cache from disk."""
         return self.engine.load_cache_from_disk(cache_dir)
+
+    def clear_runtime_caches(self) -> Dict[str, Any] | None:
+        """Clear scheduler-managed runtime caches."""
+        return self.engine.clear_runtime_caches()

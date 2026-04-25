@@ -9,7 +9,7 @@ request management system, simplified for MLX backend.
 import enum
 import time
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Union
 
 if TYPE_CHECKING:
     from .paged_cache import BlockTable
@@ -61,6 +61,10 @@ class SamplingParams:
     repetition_penalty: float = 1.0
     stop: Optional[List[str]] = None
     stop_token_ids: Optional[List[int]] = None
+    # Extra per-request logits processors (e.g. JSON schema constrained
+    # decoding via ``lm-format-enforcer``).  These are merged with any
+    # built-in processors (repetition/presence penalty) at batch time.
+    logits_processors: Optional[List[Callable]] = None
 
     def __post_init__(self):
         if self.stop is None:

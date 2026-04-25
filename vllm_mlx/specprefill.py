@@ -155,32 +155,48 @@ def _unpatch_attention_capture(model, originals):
         _set_attn_module(model.layers[layer_idx], orig)
 
 
-def _prefill_draft(model, tokens, cache, step_size=2048):
+def _prefill_draft(model, tokens, cache, step_size=2048, cancel_check=None):
     """Prefill prompt tokens into cache. Returns logits from last token."""
     prompt = mx.array(tokens) if not isinstance(tokens, mx.array) else tokens
     n = len(tokens)
     processed = 0
     while n - processed > 1:
+        if cancel_check is not None:
+            cancel_check()
         chunk = min(step_size, n - processed - 1)
         model(prompt[processed : processed + chunk][None], cache=cache)
         mx.eval([c.state for c in cache])
         processed += chunk
         mx.clear_cache()
+    if cancel_check is not None:
+        cancel_check()
     logits = model(prompt[processed:][None], cache=cache)
     mx.eval(logits)
     return logits
 
 
-def _lookahead_decode(model, first_logits, cache, n_steps, temp=0.6, top_p=0.95):
+def _lookahead_decode(
+    model,
+    first_logits,
+    cache,
+    n_steps,
+    temp=0.6,
+    top_p=0.95,
+    cancel_check=None,
+):
     """Run n_steps autoregressive decode, returning generated token ids.
 
     Query vectors are captured by the monkey-patched attention layers.
     """
     sampler = make_sampler(temp=temp, top_p=top_p)
+    if cancel_check is not None:
+        cancel_check()
     y = sampler(first_logits[:, -1, :])
     mx.eval(y)
     generated = [y.item()]
     for _ in range(n_steps):
+        if cancel_check is not None:
+            cancel_check()
         logits = model(y.reshape(1, -1), cache=cache)
         y = sampler(logits[:, -1, :])
         mx.eval(y)
@@ -264,6 +280,7 @@ def score_tokens(
     top_p=0.95,
     prefill_step_size=2048,
     query_extractor=None,
+    cancel_check=None,
 ):
     """Score token importance using attention-based analysis on a draft model.
 
@@ -320,7 +337,13 @@ def score_tokens(
 
     # Phase 1: Prefill
     cache = make_prompt_cache(model)
-    logits = _prefill_draft(model, tokens, cache, step_size=prefill_step_size)
+    logits = _prefill_draft(
+        model,
+        tokens,
+        cache,
+        step_size=prefill_step_size,
+        cancel_check=cancel_check,
+    )
 
     # Phase 2: Lookahead decode with query capture
     query_buffer = [[] for _ in range(n_attn_layers)]
@@ -328,7 +351,15 @@ def score_tokens(
         model, query_buffer, query_extractor=query_extractor
     )
     try:
-        _lookahead_decode(model, logits, cache, n_lookahead, temp=temp, top_p=top_p)
+        _lookahead_decode(
+            model,
+            logits,
+            cache,
+            n_lookahead,
+            temp=temp,
+            top_p=top_p,
+            cancel_check=cancel_check,
+        )
         mx.eval(query_buffer)
     finally:
         _unpatch_attention_capture(model, patches)
@@ -338,6 +369,8 @@ def score_tokens(
     # compacted for Nemotron-H where only M/* layers have cache entries)
     layer_to_cache = _build_layer_to_cache_map(model)
     attn_caches = [cache[layer_to_cache[i]] for i in attn_indices]
+    if cancel_check is not None:
+        cancel_check()
     importance = _compute_importance(
         query_buffer,
         attn_caches,
@@ -606,7 +639,13 @@ def _build_layer_to_cache_map(model):
 
 
 def sparse_prefill(
-    model, tokens, selected_indices, cache, step_size=2048, position_offset=0
+    model,
+    tokens,
+    selected_indices,
+    cache,
+    step_size=2048,
+    position_offset=0,
+    cancel_check=None,
 ):
     """Prefill the model cache with selected tokens at their original positions.
 
@@ -692,6 +731,8 @@ def sparse_prefill(
         processed = 0
 
         while n - processed > 1:
+            if cancel_check is not None:
+                cancel_check()
             chunk = min(step_size, n - processed - 1)
             model(prompt[processed : processed + chunk][None], cache=cache)
             mx.eval([c.state for c in cache])
@@ -699,6 +740,8 @@ def sparse_prefill(
             mx.clear_cache()
 
         # Last token → logits
+        if cancel_check is not None:
+            cancel_check()
         logits = model(prompt[processed:][None], cache=cache)
         mx.eval(logits)
 

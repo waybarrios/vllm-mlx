@@ -19,7 +19,6 @@ Architecture:
 """
 
 import asyncio
-import concurrent.futures
 import logging
 import time
 import uuid
@@ -36,6 +35,7 @@ from .mllm_batch_generator import (
     MLLMBatchRequest,
     MLLMBatchResponse,
 )
+from .mlx_streams import bind_generation_streams
 from .multimodal_processor import MultimodalProcessor
 from .request import RequestOutput, RequestStatus, SamplingParams
 
@@ -346,7 +346,9 @@ class MLLMScheduler:
             temperature: Sampling temperature
             top_p: Top-p sampling
             request_id: Optional custom request ID
-            **kwargs: Additional generation parameters
+            **kwargs: Additional generation parameters.  ``logits_processors``
+                — list of callables ``(tokens, logits) -> logits`` applied
+                during sampling (e.g. constrained JSON decoding).
 
         Returns:
             Request ID for tracking
@@ -362,6 +364,7 @@ class MLLMScheduler:
             min_p=kwargs.pop("min_p", 0.0),
             presence_penalty=kwargs.pop("presence_penalty", 0.0),
             repetition_penalty=kwargs.pop("repetition_penalty", 1.0),
+            logits_processors=kwargs.pop("logits_processors", None),
         )
 
         request = MLLMRequest(
@@ -509,6 +512,7 @@ class MLLMScheduler:
                 min_p=request.sampling_params.min_p,
                 presence_penalty=request.sampling_params.presence_penalty,
                 repetition_penalty=request.sampling_params.repetition_penalty,
+                logits_processors=request.sampling_params.logits_processors,
             )
             batch_requests.append(batch_req)
 
@@ -781,37 +785,91 @@ class MLLMScheduler:
     async def _process_loop(self) -> None:
         """Main async processing loop.
 
-        Uses a thread pool executor for steps that involve prefill
-        (waiting requests or partial prefill in progress) so that the
-        event loop stays responsive for health checks and other HTTP
-        endpoints.  Decode-only steps are fast (<3 ms) and run inline.
+        MLLM models are loaded on the server/event-loop thread, so their MLX
+        arrays and cache state must be consumed on that same thread.  Unlike
+        the text-only EngineCore path, moving MLLM prefill to a worker crosses
+        MLX stream ownership and can fail with "no Stream in current thread".
+
+        Text-only preprocessing (Jinja2 template rendering + tokenization) is
+        run BEFORE ``step()`` with ``await asyncio.sleep(0)`` yields between
+        each request.  This prevents long preprocessing (10-30+ s for 40K+
+        token conversations) from blocking health checks and new connections.
         """
-        _executor = concurrent.futures.ThreadPoolExecutor(
-            max_workers=1, thread_name_prefix="mllm-step"
-        )
+        streams_bound = False
+
+        def _ensure_streams_bound() -> None:
+            nonlocal streams_bound
+            if not streams_bound:
+                bind_generation_streams()
+                streams_bound = True
+
         loop = asyncio.get_running_loop()
 
         while self._running:
             try:
-                if self.has_requests():
-                    has_waiting = self.get_num_waiting() > 0
-                    has_partial = (
-                        self.batch_generator is not None
-                        and getattr(self.batch_generator, "_partial", None) is not None
-                    )
-                    needs_executor = has_waiting or has_partial
+                # --- Early preprocessing phase ---
+                # Run text-only preprocessing (Jinja2 template rendering +
+                # tokenization) in a thread-pool executor so the event loop
+                # stays responsive for health checks, new connections, and
+                # active streaming requests.  Preprocessing is CPU-bound
+                # (no MLX GPU work) and HuggingFace tokenizers are
+                # thread-safe, so this is safe to offload.
+                bg = self.batch_generator
+                if bg is not None:
+                    for req in list(getattr(bg, "unprocessed_requests", ())):
+                        if req.input_ids is None and not req.images and not req.videos:
+                            try:
+                                tic = time.perf_counter()
+                                await loop.run_in_executor(
+                                    None, bg._preprocess_request, req
+                                )
+                                elapsed = time.perf_counter() - tic
+                                if elapsed > 1.0:
+                                    n_tok = (
+                                        req.input_ids.size
+                                        if req.input_ids is not None
+                                        else 0
+                                    )
+                                    logger.info(
+                                        f"Preprocessing {req.request_id[:12]}"
+                                        f": {n_tok} tokens in {elapsed:.2f}s"
+                                    )
+                            except Exception as e:
+                                logger.error(
+                                    f"Early preprocessing failed for "
+                                    f"{req.request_id}: {e}"
+                                )
 
-                    if needs_executor:
-                        await loop.run_in_executor(_executor, self.step)
-                    else:
-                        self.step()
+                # --- Step phase ---
+                if self.has_requests():
+                    _ensure_streams_bound()
+                    tic = time.perf_counter()
+                    self.step()
+                    elapsed = time.perf_counter() - tic
+                    if elapsed > 2.0:
+                        logger.warning(
+                            f"Slow MLLM step: {elapsed:.2f}s "
+                            f"(waiting={len(self.waiting)}, "
+                            f"running={len(self.running)})"
+                        )
+                    # Yield multiple event-loop cycles so that pending
+                    # HTTP health checks can complete.  A single
+                    # asyncio.sleep() gives only ONE _run_once() cycle,
+                    # but an HTTP request needs ~3 cycles minimum:
+                    #   1. accept TCP connection
+                    #   2. read HTTP request / parse headers
+                    #   3. run handler / write response
+                    # Using repeated asyncio.sleep(0) gives many cycles
+                    # with negligible wall-clock overhead (<1ms total).
+                    n_yields = 10 if elapsed > 1.0 else 5
+                    for _ in range(n_yields):
                         await asyncio.sleep(0)
                 else:
                     # No work, wait a bit
                     await asyncio.sleep(0.01)
 
             except asyncio.CancelledError:
-                break
+                raise
             except Exception as e:
                 logger.error(f"Error in MLLM process loop: {e}", exc_info=True)
                 await asyncio.sleep(0.1)
@@ -880,10 +938,11 @@ class MLLMScheduler:
                 if output is None:
                     finished_normally = True
                     break
-                yield output
                 if output.finished:
                     finished_normally = True
+                    yield output
                     break
+                yield output
         finally:
             if not finished_normally:
                 logger.info(f"Aborting orphaned MLLM request {request_id}")
@@ -1063,6 +1122,23 @@ class MLLMScheduler:
         stats["memory_aware_cache"] = prefix_stats
 
         return stats
+
+    def clear_runtime_caches(self) -> Dict[str, bool]:
+        """Clear runtime caches without resetting scheduler/request state."""
+        cleared = {
+            "vision_cache": False,
+            "prefix_cache": False,
+        }
+        if self.vision_cache:
+            self.vision_cache.clear()
+            cleared["vision_cache"] = True
+        if (
+            self.batch_generator is not None
+            and self.batch_generator.prefix_cache is not None
+        ):
+            self.batch_generator.prefix_cache.clear()
+            cleared["prefix_cache"] = True
+        return cleared
 
     def reset(self) -> None:
         """Reset the scheduler state."""

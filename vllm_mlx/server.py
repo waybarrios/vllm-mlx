@@ -39,22 +39,26 @@ The server provides:
 
 import argparse
 import asyncio
+import copy
+from dataclasses import dataclass
 import json
 import logging
 import os
 import re
 import secrets
-import tempfile
+import socket as _socket
 import threading
 import time
 import uuid
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 from collections.abc import AsyncIterator
+from contextlib import suppress
 
 import uvicorn
 from fastapi import Depends, FastAPI, HTTPException, Request, UploadFile
 from fastapi.responses import Response, StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from pydantic import BaseModel
 from starlette.routing import Match
 
 # Import from new modular API
@@ -93,11 +97,42 @@ from .api.models import (
     Message,  # noqa: F401
     ModelInfo,  # noqa: F401
     ModelsResponse,
+    RerankRequest,
+    RerankResponse,
+    RerankResult,
+    RerankUsage,
     ToolCall,
     Usage,  # noqa: F401
     VideoUrl,  # noqa: F401
 )
+from .api.responses_models import (
+    ResponseCompletedEvent,
+    ResponseContentPartAddedEvent,
+    ResponseContentPartDoneEvent,
+    ResponseCreatedEvent,
+    ResponseFunctionCallArgumentsDeltaEvent,
+    ResponseFunctionCallItem,
+    ResponseFunctionCallOutputItem,
+    ResponseFunctionTool,
+    ResponseIncompleteDetails,
+    ResponseInProgressEvent,
+    ResponseMessageItem,
+    ResponseObject,
+    ResponseOutputItemAddedEvent,
+    ResponseOutputItemDoneEvent,
+    ResponseOutputTextDeltaEvent,
+    ResponseOutputTextDoneEvent,
+    ResponseReasoningItem,
+    ResponseReasoningTextDeltaEvent,
+    ResponseReasoningTextDoneEvent,
+    ResponseReasoningTextPart,
+    ResponseTextContentPart,
+    ResponsesRequest,
+    ResponsesUsage,
+)
 from .api.tool_calling import (
+    StreamingJsonFenceStripper,
+    build_json_logits_processor,
     build_json_system_prompt,
     convert_tools_for_template,
     parse_json_output,
@@ -109,12 +144,29 @@ from .api.utils import (
     extract_multimodal_content,
     is_mllm_model,  # noqa: F401
 )
+from .audio_limits import (
+    DEFAULT_MAX_AUDIO_UPLOAD_BYTES,
+    DEFAULT_MAX_AUDIO_UPLOAD_MB,
+    DEFAULT_MAX_TTS_INPUT_CHARS,
+    save_upload_with_limit,
+    validate_tts_input_length,
+)
+from .cli_arg_types import make_json_object_arg_parser
 from .engine import BaseEngine, BatchedEngine, GenerationOutput, SimpleEngine
+from .endpoint_model_policies import (
+    resolve_embedding_model_name,
+    resolve_stt_model_name,
+    resolve_tts_model_name,
+)
+from .engine.base import suspend_cancellation
+from .lifecycle import ModelSpec, ResidencyManager
 from .metrics import metrics as _metrics
-from .tool_parsers import ToolParserManager
+from .tool_parsers import ToolParserManager, get_parser_stop_tokens
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+_IMPORTED_SIMPLE_ENGINE = SimpleEngine
 
 # Global engine instance
 _engine: BaseEngine | None = None
@@ -122,11 +174,23 @@ _model_name: str | None = None
 _model_path: str | None = (
     None  # Actual model path (for cache dir, not affected by --served-model-name)
 )
+_warm_prompts_path: str | None = None  # Path to JSON of prompts to pre-warm at startup
+_default_model_key: str | None = None
 _default_max_tokens: int = 32768
+_max_request_tokens: int = 32768
 _default_timeout: float = 300.0  # Default request timeout in seconds (5 minutes)
 _default_temperature: float | None = None  # Set via --default-temperature
 _default_top_p: float | None = None  # Set via --default-top-p
+_default_chat_template_kwargs: dict[str, object] | None = None
 _metrics_enabled = False
+_max_audio_upload_bytes: int = DEFAULT_MAX_AUDIO_UPLOAD_BYTES
+_max_tts_input_chars: int = DEFAULT_MAX_TTS_INPUT_CHARS
+_force_mllm_model: bool = False
+_auto_unload_idle_seconds: float = 0.0
+_lazy_load_model: bool = False
+_residency_manager: ResidencyManager | None = None
+_lifecycle_task: asyncio.Task | None = None
+_lifespan_active: bool = False
 
 _FALLBACK_TEMPERATURE = 0.7
 _FALLBACK_TOP_P = 0.9
@@ -150,6 +214,292 @@ def _resolve_top_p(request_value: float | None) -> float:
     return _FALLBACK_TOP_P
 
 
+def _resolve_request_max_tokens(requested_value: int | None) -> int:
+    """Resolve and validate a request's max_tokens budget."""
+    if requested_value is None:
+        return _default_max_tokens
+    if requested_value > _max_request_tokens:
+        raise HTTPException(
+            status_code=400,
+            detail=f"max_tokens exceeds server limit ({_max_request_tokens})",
+        )
+    return requested_value
+
+
+def _resolve_chat_template_kwargs(
+    request_value: dict[str, object] | None,
+) -> dict[str, object]:
+    """Resolve chat template kwargs: request > server default > empty dict."""
+    resolved: dict[str, object] = {}
+    if _default_chat_template_kwargs:
+        resolved.update(_default_chat_template_kwargs)
+    if request_value:
+        resolved.update(request_value)
+    return resolved
+
+
+@dataclass
+class PreparedChatInvocation:
+    """Fully prepared inputs for a single engine.chat/stream_chat call."""
+
+    messages: list[dict]
+    chat_kwargs: dict[str, object]
+    response_format: object | None
+    json_logits_processor: object | None
+
+
+def _prepare_chat_messages(
+    engine: BaseEngine,
+    request_messages: list[Message | dict],
+) -> tuple[list[dict], list, list, bool]:
+    """Normalize messages and collect media once for both stream/non-stream paths."""
+    is_mllm = bool(getattr(engine, "is_mllm", False))
+    preserve_native = bool(getattr(engine, "preserve_native_tool_format", False))
+
+    if is_mllm:
+        # For MLLM models, keep original messages with embedded images
+        # (MLLM.chat() extracts images from message content internally)
+        messages = []
+        for msg in request_messages:
+            if hasattr(msg, "model_dump"):
+                msg_dict = msg.model_dump(exclude_none=True)
+            else:
+                raw = dict(msg)
+                msg_dict = {k: v for k, v in raw.items() if v is not None}
+            messages.append(msg_dict)
+        images, videos = [], []  # MLLM extracts these from messages
+        logger.debug(f"MLLM: Processing {len(messages)} messages")
+        # Convert tool_call arguments from JSON string to dict so that
+        # chat templates can iterate them (e.g. GLM-4.6V calls .items()).
+        # The LLM path does this inside extract_multimodal_content(), but
+        # the MLLM path bypasses that function.
+        if preserve_native:
+            for msg_dict in messages:
+                for tc in msg_dict.get("tool_calls") or []:
+                    func = tc.get("function") or {}
+                    args = func.get("arguments")
+                    if isinstance(args, str):
+                        try:
+                            func["arguments"] = json.loads(args)
+                        except (json.JSONDecodeError, ValueError):
+                            pass
+        messages = _normalize_messages(messages)
+    else:
+        # For LLM, extract text, images, and videos separately
+        messages, images, videos = extract_multimodal_content(
+            request_messages,
+            preserve_native_format=preserve_native,
+        )
+        messages = _normalize_messages(messages)
+
+    has_media = bool(images or videos)
+    if is_mllm and not has_media:
+        # MLLM extracts media from messages directly, so images/videos are
+        # always empty. Check message content for video/image types instead.
+        for msg in request_messages:
+            content = msg.content if hasattr(msg, "content") else msg.get("content", "")
+            if isinstance(content, list):
+                for item in content:
+                    item_type = (
+                        item.type
+                        if hasattr(item, "type")
+                        else (item.get("type", "") if isinstance(item, dict) else "")
+                    )
+                    if item_type in ("image_url", "image", "video", "video_url"):
+                        has_media = True
+                        break
+            if has_media:
+                break
+
+    return messages, images, videos, has_media
+
+
+def _prepare_json_logits_processor(
+    engine: BaseEngine,
+    messages: list[dict],
+    response_format: object | None,
+    *,
+    tools: list | None,
+    tool_choice: object | None,
+    log_context: str | None = None,
+) -> tuple[list[dict], object | None]:
+    """Inject response_format instruction and build constrained decoding processor."""
+    json_logits_processor = None
+    if not response_format:
+        return messages, json_logits_processor
+
+    json_instruction = build_json_system_prompt(response_format)
+    if json_instruction:
+        messages = _inject_json_instruction(messages, json_instruction)
+
+    # ``tools`` + ``response_format`` is undefined in OpenAI; skip constraints
+    # when tools are active so tool-call markup can still be emitted.
+    if tools and tool_choice != "none":
+        return messages, json_logits_processor
+
+    tokenizer_obj = _get_engine_tokenizer(engine)
+    if tokenizer_obj is None:
+        return messages, json_logits_processor
+
+    try:
+        json_logits_processor = build_json_logits_processor(
+            response_format, tokenizer_obj
+        )
+    except Exception as exc:
+        logger.warning("Failed to build JSON logits processor: %s", exc)
+        json_logits_processor = None
+
+    if json_logits_processor is not None:
+        log_label = f" for {log_context}" if log_context else ""
+        logger.info(
+            "Constrained decoding enabled%s response_format.type=%s",
+            log_label,
+            (
+                getattr(response_format, "type", None)
+                if not isinstance(response_format, dict)
+                else response_format.get("type")
+            ),
+        )
+
+    return messages, json_logits_processor
+
+
+def _prepare_chat_completion_invocation(
+    engine: BaseEngine,
+    request: ChatCompletionRequest,
+    effective_max_tokens: int,
+) -> PreparedChatInvocation:
+    """Precompute messages, kwargs, and decoding constraints for chat completions."""
+    messages, images, videos, has_media = _prepare_chat_messages(
+        engine, request.messages
+    )
+    response_format = request.response_format
+    messages, json_logits_processor = _prepare_json_logits_processor(
+        engine,
+        messages,
+        response_format,
+        tools=request.tools,
+        tool_choice=request.tool_choice,
+    )
+
+    rep_penalty = request.repetition_penalty
+    chat_kwargs = {
+        "max_tokens": effective_max_tokens,
+        "temperature": _resolve_temperature(request.temperature),
+        "top_p": _resolve_top_p(request.top_p),
+        "top_k": request.top_k or 0,
+        "min_p": request.min_p or 0.0,
+        "presence_penalty": request.presence_penalty or 0.0,
+        "repetition_penalty": request.repetition_penalty or 1.0,
+    }
+    if rep_penalty is not None:
+        chat_kwargs["repetition_penalty"] = rep_penalty
+
+    if has_media:
+        chat_kwargs["images"] = images if images else None
+        chat_kwargs["videos"] = videos if videos else None
+        video_fps = getattr(request, "video_fps", None)
+        if video_fps:
+            chat_kwargs["video_fps"] = video_fps
+        video_max_frames = getattr(request, "video_max_frames", None)
+        if video_max_frames:
+            chat_kwargs["video_max_frames"] = video_max_frames
+
+    if request.specprefill is not None:
+        chat_kwargs["specprefill"] = request.specprefill
+    if request.specprefill_keep_pct is not None:
+        chat_kwargs["specprefill_keep_pct"] = request.specprefill_keep_pct
+    resolved_chat_template_kwargs = _resolve_chat_template_kwargs(
+        request.chat_template_kwargs
+    )
+    if resolved_chat_template_kwargs:
+        chat_kwargs["chat_template_kwargs"] = resolved_chat_template_kwargs
+
+    if request.enable_thinking is not None:
+        chat_kwargs["enable_thinking"] = request.enable_thinking
+
+    if request.tools and request.tool_choice != "none":
+        template_tools = convert_tools_for_template(request.tools)
+        template_tools, messages = _apply_forced_tool_choice(
+            request.tool_choice, template_tools, messages, chat_kwargs
+        )
+        chat_kwargs["tools"] = template_tools
+
+    parser_name = _tool_call_parser if _enable_auto_tool_choice else None
+    merged_stop = get_parser_stop_tokens(parser_name, request.stop)
+    if merged_stop:
+        chat_kwargs["stop"] = merged_stop
+
+    if json_logits_processor is not None:
+        existing = chat_kwargs.get("logits_processors") or []
+        chat_kwargs["logits_processors"] = list(existing) + [json_logits_processor]
+        # Constrained decoding is incompatible with reasoning parsers:
+        # suppress implicit thinking if caller didn't explicitly set it.
+        if request.enable_thinking is None:
+            request.enable_thinking = False
+            chat_kwargs["enable_thinking"] = False
+
+    return PreparedChatInvocation(
+        messages=messages,
+        chat_kwargs=chat_kwargs,
+        response_format=response_format,
+        json_logits_processor=json_logits_processor,
+    )
+
+
+def _prepare_anthropic_invocation(
+    engine: BaseEngine,
+    openai_request: ChatCompletionRequest,
+    effective_max_tokens: int,
+) -> PreparedChatInvocation:
+    """Precompute messages, kwargs, and decoding constraints for Anthropic API."""
+    messages, _, _, _ = _prepare_chat_messages(engine, openai_request.messages)
+    response_format = openai_request.response_format
+    messages, json_logits_processor = _prepare_json_logits_processor(
+        engine,
+        messages,
+        response_format,
+        tools=openai_request.tools,
+        tool_choice=openai_request.tool_choice,
+        log_context="Anthropic",
+    )
+
+    chat_kwargs = {
+        "max_tokens": effective_max_tokens,
+        "temperature": openai_request.temperature,
+        "top_p": openai_request.top_p,
+        "top_k": openai_request.top_k or 0,
+        "min_p": openai_request.min_p or 0.0,
+        "presence_penalty": openai_request.presence_penalty or 0.0,
+        "repetition_penalty": openai_request.repetition_penalty or 1.0,
+    }
+    resolved_chat_template_kwargs = _resolve_chat_template_kwargs(
+        openai_request.chat_template_kwargs
+    )
+    if resolved_chat_template_kwargs:
+        chat_kwargs["chat_template_kwargs"] = resolved_chat_template_kwargs
+
+    if openai_request.tools and openai_request.tool_choice != "none":
+        template_tools = convert_tools_for_template(openai_request.tools)
+        template_tools, messages = _apply_forced_tool_choice(
+            openai_request.tool_choice, template_tools, messages, chat_kwargs
+        )
+        chat_kwargs["tools"] = template_tools
+
+    if json_logits_processor is not None:
+        existing = chat_kwargs.get("logits_processors") or []
+        chat_kwargs["logits_processors"] = list(existing) + [json_logits_processor]
+        # Suppress thinking: constrained decoding prevents <think> tags.
+        chat_kwargs["enable_thinking"] = False
+
+    return PreparedChatInvocation(
+        messages=messages,
+        chat_kwargs=chat_kwargs,
+        response_format=response_format,
+        json_logits_processor=json_logits_processor,
+    )
+
+
 # Global MCP manager
 _mcp_manager = None
 _mcp_executor = None
@@ -157,6 +507,10 @@ _mcp_executor = None
 # Global embedding engine (lazy loaded)
 _embedding_engine = None
 _embedding_model_locked: str | None = None  # Set when --embedding-model is used
+
+# Global reranker engine (lazy loaded)
+_rerank_engine = None
+_rerank_model_locked: str | None = None  # Set when --rerank-model is used
 
 # API key authentication
 _api_key: str | None = None
@@ -169,39 +523,135 @@ _reasoning_parser = None  # ReasoningParser instance when enabled
 _enable_auto_tool_choice: bool = False
 _tool_call_parser: str | None = None  # Parser name: auto, mistral, qwen, llama, hermes
 _tool_parser_instance = None  # Instantiated parser
+_responses_store: OrderedDict[str, dict] = OrderedDict()
+_RESPONSES_STORE_MAX_SIZE: int = 1000
 
 # Pattern to strip leaked tool call markup from content output.
 # Safety net: the tool parser should consume these, but if it doesn't
 # (e.g. malformed JSON, stray closing tags), strip them before emitting.
 _TOOL_MARKUP_PATTERN = re.compile(r"</?tool_call>|</?tool_call_reasoning>")
+_STREAMING_TOOL_MARKERS = (
+    "<tool_call>",
+    "<|tool_call>",
+    "<function=",
+    "[Calling tool:",
+    "[TOOL_CALLS]",
+    "<minimax:tool_call>",
+    '<invoke name="',
+)
+_STREAMING_BARE_BRACKET_MARKER = re.compile(r"\[\w+\(\{")
+_STREAMING_BARE_BRACKET_PARTIAL = re.compile(r"\[\w+\($")
 
 
-def _load_prefix_cache_from_disk() -> None:
+def _sanitize_log_text(value: object, limit: int | None = None) -> str:
+    """Escape control characters before logging untrusted text."""
+    text = str(value)
+    escaped: list[str] = []
+    for ch in text:
+        if ch == "\n":
+            escaped.append("\\n")
+        elif ch == "\r":
+            escaped.append("\\r")
+        elif ch == "\t":
+            escaped.append("\\t")
+        elif ch.isprintable():
+            escaped.append(ch)
+        else:
+            code = ord(ch)
+            if code <= 0xFF:
+                escaped.append(f"\\x{code:02x}")
+            else:
+                escaped.append(f"\\u{code:04x}")
+    sanitized = "".join(escaped)
+    if limit is not None and len(sanitized) > limit:
+        return sanitized[:limit] + "..."
+    return sanitized
+
+
+def _log_and_raise_internal_error(log_prefix: str, exc: Exception, detail: str) -> None:
+    """Log a sanitized exception string and raise a generic 500 response."""
+    logger.error("%s: %s", log_prefix, _sanitize_log_text(exc, limit=500))
+    raise HTTPException(status_code=500, detail=detail)
+
+
+# Lifecycle startup coordination — an Event lets the lifecycle loop block
+# efficiently instead of polling with short sleeps.  Created lazily so
+# it binds to the correct event loop at runtime rather than import time.
+#
+# Important: the Event is bound to the loop that was running when
+# _get_idle_unload_event() is first called.  In production this is always
+# the single uvicorn event loop, but test fixtures must reset this to None
+# between tests to avoid cross-loop contamination when pytest creates
+# fresh loops per test.
+_idle_unload_enabled: asyncio.Event | None = None
+
+
+def _get_idle_unload_event() -> asyncio.Event:
+    """Return the idle-unload gate event, creating it on first use.
+
+    The returned Event is bound to the running loop at creation time.
+    Reset ``_idle_unload_enabled`` to ``None`` when tearing down the
+    server or switching event loops (e.g. in test fixtures).
+    """
+    global _idle_unload_enabled
+    if _idle_unload_enabled is None:
+        _idle_unload_enabled = asyncio.Event()
+        _idle_unload_enabled.set()
+    return _idle_unload_enabled
+
+
+def _invalidate_tool_parser_cache(reason: str | None = None) -> None:
+    """Drop cached parser state when the serving tokenizer changes."""
+    global _tool_parser_instance
+
+    if _tool_parser_instance is None:
+        return
+
+    if reason:
+        logger.debug(f"Invalidating tool parser cache: {reason}")
+    _tool_parser_instance = None
+
+
+def _load_prefix_cache_from_disk(engine: BaseEngine | None = None) -> None:
     """Load prefix cache from disk during startup."""
+    target_engine = engine or _engine
+    if target_engine is None:
+        return
+
     try:
         d = _get_cache_dir()
         logger.info(f"[lifespan] Loading prefix cache from {d}")
-        loaded = _engine.load_cache_from_disk(d)
+        loaded = target_engine.load_cache_from_disk(d)
         if loaded > 0:
             logger.info(f"[lifespan] Loaded {loaded} prefix cache entries")
         else:
             logger.info("[lifespan] No prefix cache entries found on disk")
     except Exception as e:
-        logger.warning(f"[lifespan] Failed to load cache from disk: {e}", exc_info=True)
+        logger.warning(
+            "[lifespan] Failed to load cache from disk: %s",
+            _sanitize_log_text(e, limit=500),
+        )
 
 
-def _save_prefix_cache_to_disk() -> None:
+def _save_prefix_cache_to_disk(engine: BaseEngine | None = None) -> None:
     """Save prefix cache to disk during shutdown."""
+    target_engine = engine or _engine
+    if target_engine is None:
+        return
+
     try:
         d = _get_cache_dir()
         logger.info(f"[lifespan] Saving prefix cache to {d}")
-        saved = _engine.save_cache_to_disk(d)
+        saved = target_engine.save_cache_to_disk(d)
         if saved:
             logger.info(f"[lifespan] Saved prefix cache to {d}")
         else:
             logger.info("[lifespan] No cache to save")
     except Exception as e:
-        logger.warning(f"[lifespan] Failed to save cache to disk: {e}", exc_info=True)
+        logger.warning(
+            "[lifespan] Failed to save cache to disk: %s",
+            _sanitize_log_text(e, limit=500),
+        )
 
 
 def _get_cache_dir() -> str:
@@ -223,42 +673,298 @@ def _get_cache_dir() -> str:
     return cache_dir
 
 
+def _build_engine(spec: ModelSpec) -> BaseEngine:
+    """Construct an engine instance from a model spec without starting it."""
+    if spec.use_batching:
+        from .engine.batched import BatchedEngine
+
+        logger.info(f"Preparing BatchedEngine for residency: {spec.model_name}")
+        return BatchedEngine(
+            model_name=spec.model_name,
+            scheduler_config=spec.scheduler_config,
+            stream_interval=spec.stream_interval,
+            force_mllm=spec.force_mllm,
+        )
+
+    from .engine.simple import SimpleEngine
+
+    logger.info(f"Preparing SimpleEngine for residency: {spec.model_name}")
+    return SimpleEngine(
+        model_name=spec.model_name,
+        force_mllm=spec.force_mllm,
+        mtp=spec.mtp,
+        prefill_step_size=spec.prefill_step_size,
+        specprefill_enabled=spec.specprefill_enabled,
+        specprefill_threshold=spec.specprefill_threshold,
+        specprefill_keep_pct=spec.specprefill_keep_pct,
+        specprefill_draft_model=spec.specprefill_draft_model,
+    )
+
+
+async def _engine_factory(spec: ModelSpec) -> BaseEngine:
+    """Async engine factory used by the residency manager."""
+    return _build_engine(spec)
+
+
+async def _run_blocking_engine_cache_io(io_fn, engine: BaseEngine) -> None:
+    """Run blocking cache persistence off the event loop.
+
+    If the caller is canceled while waiting, finish the in-flight thread before
+    propagating cancellation so engine state cannot keep mutating in the
+    background after lifecycle cleanup has started.
+    """
+    task = asyncio.create_task(asyncio.to_thread(io_fn, engine))
+    try:
+        await asyncio.shield(task)
+    except asyncio.CancelledError:
+        with suspend_cancellation():
+            while not task.done():
+                try:
+                    await asyncio.shield(task)
+                except asyncio.CancelledError:
+                    continue
+                except Exception:
+                    break
+        raise
+
+
+async def _restore_engine_state(spec: ModelSpec, engine: BaseEngine) -> None:
+    """Restore engine-local state, such as prefix cache, after a cold load."""
+    if hasattr(engine, "load_cache_from_disk"):
+        await _run_blocking_engine_cache_io(_load_prefix_cache_from_disk, engine)
+
+
+async def _persist_engine_state(spec: ModelSpec, engine: BaseEngine) -> None:
+    """Persist engine-local state before an idle unload or shutdown unload."""
+    if hasattr(engine, "save_cache_to_disk"):
+        await _run_blocking_engine_cache_io(_save_prefix_cache_to_disk, engine)
+
+
+def _activate_engine(engine: BaseEngine | None) -> BaseEngine | None:
+    """Set the global engine pointer and refresh parser-sensitive state."""
+    global _engine
+
+    if engine is not _engine:
+        _invalidate_tool_parser_cache("resident engine changed")
+    _engine = engine
+    if _engine is not None:
+        _engine.preserve_native_tool_format = _detect_native_tool_support()
+    return _engine
+
+
+def _sync_engine_from_residency() -> BaseEngine | None:
+    """Sync the global engine pointer from the residency manager state.
+
+    Safety: all callers run on the single-threaded asyncio event loop and do not
+    yield between reading the residency state and writing ``_engine``, so no
+    additional locking is required.
+    """
+    if _residency_manager is None or _default_model_key is None:
+        return _engine
+
+    return _activate_engine(_residency_manager.get_engine(_default_model_key))
+
+
+def _get_lifecycle_status() -> dict | None:
+    """Get lifecycle status for the default resident if lifecycle is enabled."""
+    if _residency_manager is None or _default_model_key is None:
+        return None
+    return _residency_manager.get_status(_default_model_key)
+
+
+def _public_lifecycle_status(lifecycle: dict | None) -> dict | None:
+    """Return residency status safe for unauthenticated public endpoints."""
+    if lifecycle is None:
+        return None
+    public = dict(lifecycle)
+    if _model_name:
+        public["model_name"] = _model_name
+    # Surface a generic error indicator without exposing raw exception text.
+    if "last_error" in public:
+        public["last_error"] = (
+            "model_load_failed" if public["last_error"] is not None else None
+        )
+    return public
+
+
+async def _lifecycle_loop() -> None:
+    """Background idle-unload loop for the default resident."""
+    while True:
+        if _residency_manager is None or _default_model_key is None:
+            await asyncio.sleep(1.0)
+            continue
+
+        # Block until idle-unload is enabled instead of polling.
+        await _get_idle_unload_event().wait()
+
+        try:
+            await _residency_manager.unload_if_idle(_default_model_key)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Idle unload iteration failed")
+        finally:
+            _sync_engine_from_residency()
+
+        sleep_for = min(_auto_unload_idle_seconds / 2, 5.0)
+        await asyncio.sleep(sleep_for)
+
+
+async def _acquire_default_engine(*, count_activity: bool = True) -> BaseEngine:
+    """Acquire the default engine, auto-loading via the residency manager if needed."""
+    if _residency_manager is None or _default_model_key is None:
+        return get_engine()
+
+    if count_activity:
+        engine = await _residency_manager.acquire(_default_model_key)
+    else:
+        engine = await _residency_manager.acquire(
+            _default_model_key,
+            count_activity=False,
+        )
+    activated_engine = _activate_engine(engine)
+    if activated_engine is None:
+        raise HTTPException(status_code=503, detail="Model not loaded")
+    return activated_engine
+
+
+async def _release_default_engine(*, count_activity: bool = True) -> None:
+    """Release the default engine after request processing."""
+    if _residency_manager is None or _default_model_key is None:
+        return
+
+    if count_activity:
+        await _residency_manager.release(_default_model_key)
+    else:
+        await _residency_manager.release(_default_model_key, count_activity=False)
+    _sync_engine_from_residency()
+
+
 async def lifespan(app: FastAPI):
     """FastAPI lifespan for startup/shutdown events."""
-    global _engine, _mcp_manager
+    global _engine, _mcp_manager, _lifecycle_task, _lifespan_active
+    primary_exc: BaseException | None = None
+    try:
+        _get_idle_unload_event().clear()
 
-    # Startup: Start engine if loaded (needed for BatchedEngine in uvicorn's event loop)
-    if _engine is not None and hasattr(_engine, "_loaded") and not _engine._loaded:
-        await _engine.start()
+        # Startup: ensure resident is loaded on the serving event loop when lifecycle
+        # management is enabled, unless lazy startup is requested.
+        if _residency_manager is not None and _default_model_key is not None:
+            if not _lazy_load_model:
+                await _residency_manager.ensure_loaded(_default_model_key)
+            _sync_engine_from_residency()
+        elif (
+            _engine is not None and hasattr(_engine, "_loaded") and not _engine._loaded
+        ):
+            await _engine.start()
 
-    # Load persisted cache from disk (AFTER engine start — AsyncEngineCore must exist)
-    if _engine is not None and hasattr(_engine, "load_cache_from_disk"):
-        _load_prefix_cache_from_disk()
+        # Load persisted cache from disk (AFTER engine start — AsyncEngineCore must exist)
+        if (
+            _residency_manager is None
+            and _engine is not None
+            and hasattr(_engine, "load_cache_from_disk")
+        ):
+            _load_prefix_cache_from_disk()
 
-    # Initialize MCP if config provided
-    mcp_config = os.environ.get("VLLM_MLX_MCP_CONFIG")
-    if mcp_config:
-        await init_mcp(mcp_config)
+        # Warm up prefix cache with user-provided prompts (AFTER disk cache load,
+        # so any already-persisted entries are preserved and warm-up only fills
+        # gaps).
+        if (
+            _warm_prompts_path
+            and _engine is not None
+            and hasattr(_engine, "stream_chat")
+        ):
+            try:
+                from vllm_mlx.prompt_warmup import load_warmup_file, warm_prefix_cache
 
-    yield
+                prompts = load_warmup_file(_warm_prompts_path)
+                logger.info(
+                    "[lifespan] Warming prefix cache with %d prompts from %s",
+                    len(prompts),
+                    _warm_prompts_path,
+                )
+                result = await warm_prefix_cache(_engine, prompts)
+                logger.info(
+                    "[lifespan] Warm-up done (%s): %d completed, %d skipped, %d prompt tokens in %.1fs",
+                    result.get("mode", "?"),
+                    result["count"],
+                    result["skipped"],
+                    result["total_prompt_tokens"],
+                    result["elapsed_ms"] / 1000,
+                )
+            except Exception as e:
+                logger.warning(
+                    "[lifespan] Warm-up failed: %s",
+                    _sanitize_log_text(e, limit=500),
+                )
 
-    # Shutdown: Save cache to disk BEFORE stopping engine
-    if _engine is not None and hasattr(_engine, "save_cache_to_disk"):
-        _save_prefix_cache_to_disk()
+        if _residency_manager is not None and _auto_unload_idle_seconds > 0:
+            _lifecycle_task = asyncio.create_task(_lifecycle_loop())
 
-    # Shutdown: Close MCP connections and stop engine
-    if _mcp_manager is not None:
-        await _mcp_manager.stop()
-        logger.info("MCP manager stopped")
-    if _engine is not None:
-        await _engine.stop()
-        logger.info("Engine stopped")
+        # Initialize MCP if config provided
+        mcp_config = os.environ.get("VLLM_MLX_MCP_CONFIG")
+        if mcp_config:
+            await init_mcp(mcp_config)
+
+        _get_idle_unload_event().set()
+        _lifespan_active = True
+        yield
+    except BaseException as exc:
+        primary_exc = exc
+
+    cleanup_exc: BaseException | None = None
+    try:
+        # Shutdown: Save cache to disk BEFORE stopping engine
+        if (
+            _residency_manager is None
+            and _engine is not None
+            and hasattr(_engine, "save_cache_to_disk")
+        ):
+            _save_prefix_cache_to_disk()
+
+        # Shutdown: Close MCP connections and stop engine
+        if _lifecycle_task is not None:
+            _lifecycle_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await _lifecycle_task
+            _lifecycle_task = None
+        if _mcp_manager is not None:
+            await _mcp_manager.stop()
+            logger.info("MCP manager stopped")
+        if _residency_manager is not None:
+            await _residency_manager.shutdown()
+            _sync_engine_from_residency()
+            logger.info("Lifecycle manager shut down")
+        elif _engine is not None:
+            await _engine.stop()
+            _engine = None
+            logger.info("Engine stopped")
+    except BaseException as exc:
+        cleanup_exc = exc
+    finally:
+        _get_idle_unload_event().set()
+        _lifespan_active = False
+
+    if primary_exc is not None:
+        if cleanup_exc is not None:
+            logger.error(
+                "Lifecycle cleanup failed while preserving the original exception",
+                exc_info=(
+                    type(cleanup_exc),
+                    cleanup_exc,
+                    cleanup_exc.__traceback__,
+                ),
+            )
+        raise primary_exc
+
+    if cleanup_exc is not None:
+        raise cleanup_exc
 
 
 app = FastAPI(
     title="vllm-mlx API",
     description="OpenAI-compatible API for MLX LLM/MLLM inference on Apple Silicon",
-    version="0.2.1",
+    version="0.2.9",
     lifespan=lifespan,
 )
 
@@ -472,8 +1178,33 @@ def _validate_model_name(request_model: str) -> None:
         )
 
 
+def _get_engine_tokenizer(engine: BaseEngine | None) -> object | None:
+    """Return tokenizer-like parser state from the active engine."""
+    if engine is None:
+        return None
+    tokenizer = getattr(engine, "tokenizer", None)
+    if tokenizer is not None:
+        return tokenizer
+    return getattr(engine, "_tokenizer", None)
+
+
+def _get_or_init_tool_parser(engine: BaseEngine | None = None):
+    """Return the cached tool parser, initializing it from the given engine."""
+    global _tool_parser_instance
+
+    if _tool_parser_instance is None:
+        parser_cls = ToolParserManager.get_tool_parser(_tool_call_parser)
+        tokenizer = _get_engine_tokenizer(engine if engine is not None else _engine)
+        _tool_parser_instance = parser_cls(tokenizer)
+        logger.info(f"Initialized tool call parser: {_tool_call_parser}")
+
+    return _tool_parser_instance
+
+
 def _parse_tool_calls_with_parser(
-    output_text: str, request: ChatCompletionRequest | None = None
+    output_text: str,
+    request: ChatCompletionRequest | None = None,
+    engine: BaseEngine | None = None,
 ) -> tuple[str, list | None]:
     """
     Parse tool calls from model output using the configured parser.
@@ -484,6 +1215,7 @@ def _parse_tool_calls_with_parser(
     Args:
         output_text: The model output text
         request: The original request (for context)
+        engine: The request-local engine to use for parser initialization
 
     Returns:
         Tuple of (cleaned_text, tool_calls)
@@ -507,16 +1239,12 @@ def _parse_tool_calls_with_parser(
     # Initialize parser if needed
     if _tool_parser_instance is None:
         try:
-            parser_cls = ToolParserManager.get_tool_parser(_tool_call_parser)
-            # Get tokenizer from engine if available
-            tokenizer = None
-            if _engine is not None and hasattr(_engine, "_tokenizer"):
-                tokenizer = _engine._tokenizer
-            _tool_parser_instance = parser_cls(tokenizer)
-            logger.info(f"Initialized tool call parser: {_tool_call_parser}")
+            _get_or_init_tool_parser(engine)
         except Exception as e:
             logger.warning(
-                f"Failed to initialize tool parser '{_tool_call_parser}': {e}"
+                "Failed to initialize tool parser '%s': %s",
+                _tool_call_parser,
+                _sanitize_log_text(e, limit=500),
             )
             logger.warning("Falling back to generic parser")
             return parse_tool_calls(output_text, request_dict)
@@ -547,8 +1275,957 @@ def _parse_tool_calls_with_parser(
             # try generic parser which handles more formats (e.g. Nemotron XML)
             return parse_tool_calls(output_text, request_dict)
     except Exception as e:
-        logger.warning(f"Tool parser error: {e}")
+        logger.warning("Tool parser error: %s", _sanitize_log_text(e, limit=500))
         return parse_tool_calls(output_text, request_dict)
+
+
+def _new_response_item_id(prefix: str) -> str:
+    """Generate stable OpenAI-style item ids."""
+    return f"{prefix}_{uuid.uuid4().hex}"
+
+
+def _response_content_to_text(content) -> str:
+    """Normalize Responses API content items into plain text."""
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+
+    text_parts = []
+    for part in content:
+        if isinstance(part, dict):
+            part_type = part.get("type")
+            text = part.get("text", "")
+        else:
+            part_type = getattr(part, "type", None)
+            text = getattr(part, "text", "")
+        if part_type in {"text", "input_text", "output_text"}:
+            text_parts.append(text)
+    return "\n".join(part for part in text_parts if part)
+
+
+def _responses_tools_to_chat_tools(
+    tools: list[ResponseFunctionTool | dict],
+) -> tuple[list[dict] | None, list[str]]:
+    """Convert supported Responses tools and report unsupported tool types."""
+    if not tools:
+        return None, []
+
+    supported: list[dict] = []
+    unsupported: list[str] = []
+
+    for tool in tools:
+        if isinstance(tool, ResponseFunctionTool):
+            tool_type = tool.type
+            tool_name = tool.name
+            tool_description = tool.description or ""
+            tool_parameters = tool.parameters
+        elif isinstance(tool, dict):
+            tool_type = tool.get("type", "unknown")
+            tool_name = tool.get("name", "")
+            tool_description = tool.get("description", "")
+            tool_parameters = tool.get("parameters", {})
+        else:
+            unsupported.append(type(tool).__name__)
+            continue
+
+        if tool_type == "function":
+            supported.append(
+                {
+                    "type": "function",
+                    "function": {
+                        "name": tool_name,
+                        "description": tool_description,
+                        "parameters": tool_parameters
+                        or {"type": "object", "properties": {}},
+                    },
+                }
+            )
+        else:
+            unsupported.append(tool_type)
+
+    return supported or None, unsupported
+
+
+def _responses_input_to_chat_messages(request: ResponsesRequest) -> list[dict]:
+    """Convert Responses API input items into chat-completions-style messages."""
+    messages: list[dict] = []
+
+    if request.previous_response_id:
+        previous = _responses_store.get(request.previous_response_id)
+        if previous is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Previous response `{request.previous_response_id}` not found",
+            )
+        messages.extend(copy.deepcopy(previous["messages"]))
+
+    if request.instructions:
+        messages.append({"role": "system", "content": request.instructions})
+
+    if isinstance(request.input, str):
+        messages.append({"role": "user", "content": request.input})
+        return messages
+
+    for item in request.input:
+        if isinstance(item, dict):
+            item_type = item.get("type", "")
+            if item_type == "message":
+                role = item.get("role", "user")
+                if role == "developer":
+                    role = "system"
+                messages.append(
+                    {
+                        "role": role,
+                        "content": _response_content_to_text(item.get("content")),
+                    }
+                )
+            elif item_type == "function_call":
+                messages.append(
+                    {
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [
+                            {
+                                "id": item.get(
+                                    "call_id", _new_response_item_id("call")
+                                ),
+                                "type": "function",
+                                "function": {
+                                    "name": item.get("name", ""),
+                                    "arguments": item.get("arguments", ""),
+                                },
+                            }
+                        ],
+                    }
+                )
+            elif item_type == "function_call_output":
+                messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": item.get("call_id", ""),
+                        "content": item.get("output", ""),
+                    }
+                )
+            elif item_type == "reasoning":
+                parts = item.get("content", [])
+                reasoning_text = "\n".join(
+                    p.get("text", "") for p in parts if isinstance(p, dict)
+                )
+                if reasoning_text:
+                    messages.append({"role": "assistant", "content": reasoning_text})
+            else:
+                logger.info(
+                    "Skipping unsupported Responses input item type %r", item_type
+                )
+            continue
+
+        if isinstance(item, ResponseMessageItem):
+            role = item.role
+            if role == "developer":
+                role = "system"
+            messages.append(
+                {
+                    "role": role,
+                    "content": _response_content_to_text(item.content),
+                }
+            )
+        elif isinstance(item, ResponseFunctionCallItem):
+            messages.append(
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": item.call_id,
+                            "type": "function",
+                            "function": {
+                                "name": item.name,
+                                "arguments": item.arguments,
+                            },
+                        }
+                    ],
+                }
+            )
+        elif isinstance(item, ResponseFunctionCallOutputItem):
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": item.call_id,
+                    "content": item.output,
+                }
+            )
+        elif isinstance(item, ResponseReasoningItem):
+            reasoning_text = "\n".join(part.text for part in (item.content or []))
+            if reasoning_text:
+                messages.append({"role": "assistant", "content": reasoning_text})
+        else:
+            logger.info(
+                "Skipping unsupported Responses input item type %r",
+                getattr(item, "type", type(item).__name__),
+            )
+
+    return messages
+
+
+def _responses_request_to_new_persisted_messages(
+    request: ResponsesRequest,
+) -> list[dict]:
+    """Persist only the current request's replayable input items."""
+    request_without_history = request.model_copy(
+        update={"previous_response_id": None, "instructions": None},
+        deep=True,
+    )
+    return _responses_input_to_chat_messages(request_without_history)
+
+
+def _responses_request_to_persisted_messages(request: ResponsesRequest) -> list[dict]:
+    """Persist replayable history for chained previous_response_id requests.
+
+    Responses `instructions` are intentionally not replayed across
+    `previous_response_id`, but replayable message items are.
+    """
+    messages: list[dict] = []
+    if request.previous_response_id:
+        previous = _responses_store.get(request.previous_response_id)
+        if previous is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Previous response `{request.previous_response_id}` not found",
+            )
+        messages.extend(copy.deepcopy(previous["messages"]))
+    messages.extend(_responses_request_to_new_persisted_messages(request))
+    return messages
+
+
+def _responses_request_to_chat_request(
+    request: ResponsesRequest,
+) -> ChatCompletionRequest:
+    """Build a ChatCompletionRequest from a ResponsesRequest."""
+    if request.text.format.type == "json_object":
+        raise HTTPException(
+            status_code=400,
+            detail="Responses text.format.type='json_object' is not supported on this backend",
+        )
+    if request.reasoning is not None:
+        logger.debug("Ignoring reasoning configuration (not supported on this backend)")
+
+    tools, unsupported_tools = _responses_tools_to_chat_tools(request.tools)
+    messages = _responses_input_to_chat_messages(request)
+    if unsupported_tools:
+        tool_list = ", ".join(sorted(set(unsupported_tools)))
+        messages.insert(
+            0,
+            {
+                "role": "system",
+                "content": (
+                    "The following requested tool types are not available on this "
+                    f"backend: {tool_list}. Do not call them."
+                ),
+            },
+        )
+
+    system_messages = [msg for msg in messages if msg.get("role") == "system"]
+    non_system_messages = [msg for msg in messages if msg.get("role") != "system"]
+    merged_system_content = "\n\n".join(
+        str(msg.get("content", "")).strip()
+        for msg in system_messages
+        if str(msg.get("content", "")).strip()
+    )
+    messages = (
+        [{"role": "system", "content": merged_system_content}]
+        if merged_system_content
+        else []
+    ) + non_system_messages
+
+    return ChatCompletionRequest(
+        model=request.model,
+        messages=[Message(**msg) for msg in messages],
+        temperature=request.temperature,
+        top_p=request.top_p,
+        max_tokens=request.max_output_tokens,
+        stream=False,
+        tools=tools,
+        tool_choice=request.tool_choice,
+        chat_template_kwargs=request.chat_template_kwargs,
+    )
+
+
+def _build_responses_output_items(
+    text: str | None,
+    reasoning: str | None,
+    tool_calls: list[ToolCall] | None,
+) -> list[ResponseMessageItem | ResponseReasoningItem | ResponseFunctionCallItem]:
+    """Convert parsed assistant output into Responses API output items."""
+    output_items: list[
+        ResponseMessageItem | ResponseReasoningItem | ResponseFunctionCallItem
+    ] = []
+
+    if reasoning:
+        output_items.append(
+            ResponseReasoningItem(
+                id=_new_response_item_id("rs"),
+                content=[ResponseReasoningTextPart(text=reasoning)],
+            )
+        )
+
+    if text:
+        output_items.append(
+            ResponseMessageItem(
+                id=_new_response_item_id("msg"),
+                role="assistant",
+                content=[ResponseTextContentPart(type="output_text", text=text)],
+            )
+        )
+
+    for tool_call in tool_calls or []:
+        output_items.append(
+            ResponseFunctionCallItem(
+                id=_new_response_item_id("fc"),
+                call_id=tool_call.id,
+                name=tool_call.function.name,
+                arguments=tool_call.function.arguments,
+            )
+        )
+
+    return output_items
+
+
+def _response_output_items_to_chat_messages(output_items: list) -> list[dict]:
+    """Persist assistant output in chat-completions form for previous_response_id."""
+    assistant_text_parts: list[str] = []
+    assistant_tool_calls: list[dict] = []
+
+    for item in output_items:
+        if isinstance(item, ResponseMessageItem):
+            assistant_text_parts.append(_response_content_to_text(item.content))
+        elif isinstance(item, ResponseFunctionCallItem):
+            assistant_tool_calls.append(
+                {
+                    "id": item.call_id,
+                    "type": "function",
+                    "function": {
+                        "name": item.name,
+                        "arguments": item.arguments,
+                    },
+                }
+            )
+
+    if not assistant_text_parts and not assistant_tool_calls:
+        return []
+
+    return [
+        {
+            "role": "assistant",
+            "content": "".join(assistant_text_parts),
+            "tool_calls": assistant_tool_calls or None,
+        }
+    ]
+
+
+def _build_response_object(
+    request: ResponsesRequest,
+    output_items: list[
+        ResponseMessageItem | ResponseReasoningItem | ResponseFunctionCallItem
+    ],
+    prompt_tokens: int,
+    completion_tokens: int,
+    finish_reason: str | None,
+    response_id: str | None = None,
+) -> ResponseObject:
+    """Build a full Responses API object."""
+    response = ResponseObject(
+        id=response_id or _new_response_item_id("resp"),
+        model=_model_name or request.model,
+        instructions=request.instructions,
+        max_output_tokens=request.max_output_tokens,
+        metadata=request.metadata,
+        output=output_items,
+        parallel_tool_calls=request.parallel_tool_calls,
+        previous_response_id=request.previous_response_id,
+        text=request.text,
+        tool_choice=request.tool_choice,
+        tools=request.tools,
+        top_p=_resolve_top_p(request.top_p),
+        temperature=_resolve_temperature(request.temperature),
+        truncation=request.truncation,
+        user=request.user,
+        store=request.store,
+        usage=ResponsesUsage(
+            input_tokens=prompt_tokens,
+            output_tokens=completion_tokens,
+            total_tokens=prompt_tokens + completion_tokens,
+        ),
+    )
+    if finish_reason == "length":
+        response.status = "incomplete"
+        response.incomplete_details = ResponseIncompleteDetails(
+            reason="max_output_tokens"
+        )
+    return response
+
+
+def _prepare_responses_request(
+    request: ResponsesRequest,
+) -> tuple[BaseEngine, ChatCompletionRequest, list[dict], dict]:
+    """Prepare a Responses request for execution on the chat engine."""
+    _validate_model_name(request.model)
+    engine = get_engine()
+    chat_request = _responses_request_to_chat_request(request)
+
+    if chat_request.messages:
+        logger.info(
+            f"[REQUEST] POST /v1/responses stream={request.stream} "
+            f"model={request.model!r} items="
+            f"{len(request.input) if isinstance(request.input, list) else 1} "
+            f"tools={len(request.tools)}"
+        )
+
+    messages, images, videos = extract_multimodal_content(
+        chat_request.messages,
+        preserve_native_format=engine.preserve_native_tool_format,
+    )
+
+    chat_kwargs = {
+        "max_tokens": chat_request.max_tokens or _default_max_tokens,
+        "temperature": _resolve_temperature(chat_request.temperature),
+        "top_p": _resolve_top_p(chat_request.top_p),
+    }
+    resolved_chat_template_kwargs = _resolve_chat_template_kwargs(
+        chat_request.chat_template_kwargs
+    )
+    if resolved_chat_template_kwargs:
+        chat_kwargs["chat_template_kwargs"] = resolved_chat_template_kwargs
+    if request.tools:
+        chat_kwargs["tools"] = convert_tools_for_template(chat_request.tools)
+    if images:
+        chat_kwargs["images"] = images
+    if videos:
+        chat_kwargs["videos"] = videos
+
+    return engine, chat_request, messages, chat_kwargs
+
+
+async def _run_responses_request(
+    request: ResponsesRequest,
+    raw_request: Request,
+) -> tuple[ResponseObject | None, list[dict]]:
+    """Execute a Responses API request against the backend chat engine."""
+    engine, chat_request, messages, chat_kwargs = _prepare_responses_request(request)
+
+    timeout = _default_timeout
+    output = await _wait_with_disconnect(
+        engine.chat(messages=messages, **chat_kwargs),
+        raw_request,
+        timeout=timeout,
+    )
+    if output is None:
+        return None, []
+
+    cleaned_text, tool_calls = _parse_tool_calls_with_parser(output.text, chat_request)
+    reasoning_text = None
+    if _reasoning_parser:
+        reasoning_text, remaining_text = _reasoning_parser.extract_reasoning(
+            output.text
+        )
+        if not tool_calls:
+            cleaned_text = remaining_text
+        else:
+            # Tool parser already stripped tool markup from cleaned_text,
+            # but reasoning markers (e.g. <|channel>thought...<channel|>)
+            # remain. Run reasoning parser on cleaned_text to strip them.
+            _, cleaned_text = _reasoning_parser.extract_reasoning(cleaned_text or "")
+
+    output_items = _build_responses_output_items(
+        clean_output_text(cleaned_text) if cleaned_text else None,
+        reasoning_text,
+        tool_calls,
+    )
+    response_object = _build_response_object(
+        request=request,
+        output_items=output_items,
+        prompt_tokens=output.prompt_tokens,
+        completion_tokens=output.completion_tokens,
+        finish_reason=output.finish_reason,
+    )
+
+    persisted_messages = _responses_request_to_persisted_messages(request)
+    persisted_messages.extend(_response_output_items_to_chat_messages(output_items))
+    if request.store:
+        _responses_store[response_object.id] = {
+            "messages": copy.deepcopy(persisted_messages),
+            "response": response_object.model_copy(deep=True),
+        }
+        while len(_responses_store) > _RESPONSES_STORE_MAX_SIZE:
+            _responses_store.popitem(last=False)
+
+    return response_object, persisted_messages
+
+
+async def _stream_responses_request(request: ResponsesRequest) -> AsyncIterator[str]:
+    """Execute a Responses API request and stream SSE events incrementally."""
+    engine, chat_request, messages, chat_kwargs = _prepare_responses_request(request)
+
+    response_id = _new_response_item_id("resp")
+    sequence = 1
+    base_response = _build_response_object(
+        request=request,
+        output_items=[],
+        prompt_tokens=0,
+        completion_tokens=0,
+        finish_reason=None,
+        response_id=response_id,
+    )
+    base_response.status = "in_progress"
+    base_response.usage = None
+
+    yield _responses_sse_event(
+        "response.created",
+        ResponseCreatedEvent(sequence_number=sequence, response=base_response),
+    )
+    sequence += 1
+    yield _responses_sse_event(
+        "response.in_progress",
+        ResponseInProgressEvent(sequence_number=sequence, response=base_response),
+    )
+    sequence += 1
+
+    prompt_tokens = 0
+    completion_tokens = 0
+    finish_reason = None
+    last_output = None
+    raw_accumulated_text = ""
+    accumulated_text = ""
+    accumulated_reasoning = ""
+
+    text_item_id: str | None = None
+    text_output_index: int | None = None
+    reasoning_item_id: str | None = None
+    reasoning_output_index: int | None = None
+    next_output_index = 0
+
+    def _start_text_item() -> list[str]:
+        nonlocal text_item_id, text_output_index, next_output_index, sequence
+        events: list[str] = []
+        if text_item_id is None:
+            text_item_id = _new_response_item_id("msg")
+            text_output_index = next_output_index
+            next_output_index += 1
+            events.append(
+                _responses_sse_event(
+                    "response.output_item.added",
+                    ResponseOutputItemAddedEvent(
+                        sequence_number=sequence,
+                        output_index=text_output_index,
+                        item=ResponseMessageItem(
+                            id=text_item_id,
+                            role="assistant",
+                            status="in_progress",
+                            content=[],
+                        ),
+                    ),
+                )
+            )
+            sequence += 1
+            events.append(
+                _responses_sse_event(
+                    "response.content_part.added",
+                    ResponseContentPartAddedEvent(
+                        sequence_number=sequence,
+                        item_id=text_item_id,
+                        output_index=text_output_index,
+                        content_index=0,
+                        part=ResponseTextContentPart(type="output_text", text=""),
+                    ),
+                )
+            )
+            sequence += 1
+        return events
+
+    def _start_reasoning_item() -> list[str]:
+        nonlocal reasoning_item_id, reasoning_output_index, next_output_index, sequence
+        events: list[str] = []
+        if reasoning_item_id is None:
+            reasoning_item_id = _new_response_item_id("rs")
+            reasoning_output_index = next_output_index
+            next_output_index += 1
+            events.append(
+                _responses_sse_event(
+                    "response.output_item.added",
+                    ResponseOutputItemAddedEvent(
+                        sequence_number=sequence,
+                        output_index=reasoning_output_index,
+                        item=ResponseReasoningItem(
+                            id=reasoning_item_id,
+                            status="in_progress",
+                            content=[],
+                        ),
+                    ),
+                )
+            )
+            sequence += 1
+            events.append(
+                _responses_sse_event(
+                    "response.content_part.added",
+                    ResponseContentPartAddedEvent(
+                        sequence_number=sequence,
+                        item_id=reasoning_item_id,
+                        output_index=reasoning_output_index,
+                        content_index=0,
+                        part=ResponseReasoningTextPart(text=""),
+                    ),
+                )
+            )
+            sequence += 1
+        return events
+
+    if _reasoning_parser:
+        _reasoning_parser.reset_state()
+
+    global _tool_parser_instance
+    tool_parser = None
+    tool_accumulated_text = ""
+    tool_markup_possible = False
+    if _enable_auto_tool_choice and _tool_call_parser:
+        if _tool_parser_instance is None:
+            try:
+                parser_cls = ToolParserManager.get_tool_parser(_tool_call_parser)
+                tokenizer = None
+                if _engine is not None and hasattr(_engine, "_tokenizer"):
+                    tokenizer = _engine._tokenizer
+                _tool_parser_instance = parser_cls(tokenizer)
+                logger.info(
+                    "Initialized tool call parser for responses streaming: %s",
+                    _tool_call_parser,
+                )
+            except Exception as e:
+                logger.warning(
+                    "Failed to init tool parser for responses streaming: %s", e
+                )
+        if _tool_parser_instance is not None:
+            tool_parser = _tool_parser_instance
+            tool_parser.reset()
+
+    async for output in engine.stream_chat(messages=messages, **chat_kwargs):
+        last_output = output
+        finish_reason = output.finish_reason
+        if hasattr(output, "prompt_tokens") and output.prompt_tokens:
+            prompt_tokens = output.prompt_tokens
+        if hasattr(output, "completion_tokens") and output.completion_tokens:
+            completion_tokens = output.completion_tokens
+
+        delta_text = output.new_text or ""
+        if not delta_text:
+            continue
+
+        previous_text = raw_accumulated_text
+        raw_accumulated_text += delta_text
+
+        if _reasoning_parser:
+            delta_msg = _reasoning_parser.extract_reasoning_streaming(
+                previous_text, raw_accumulated_text, delta_text
+            )
+            if delta_msg is None:
+                continue
+
+            if delta_msg.reasoning:
+                for event in _start_reasoning_item():
+                    yield event
+                accumulated_reasoning += delta_msg.reasoning
+                yield _responses_sse_event(
+                    "response.reasoning_text.delta",
+                    ResponseReasoningTextDeltaEvent(
+                        sequence_number=sequence,
+                        item_id=reasoning_item_id,
+                        output_index=reasoning_output_index,
+                        content_index=0,
+                        delta=delta_msg.reasoning,
+                    ),
+                )
+                sequence += 1
+
+            if delta_msg.content:
+                for event in _start_text_item():
+                    yield event
+                accumulated_text += delta_msg.content
+                yield _responses_sse_event(
+                    "response.output_text.delta",
+                    ResponseOutputTextDeltaEvent(
+                        sequence_number=sequence,
+                        item_id=text_item_id,
+                        output_index=text_output_index,
+                        content_index=0,
+                        delta=delta_msg.content,
+                    ),
+                )
+                sequence += 1
+            continue
+
+        content = SPECIAL_TOKENS_PATTERN.sub("", delta_text)
+        if tool_parser and delta_text:
+            # Fast path: skip parsing until a tool-markup marker appears.
+            # Use _streaming_tool_markup_possible to catch all supported
+            # shapes (<tool_call>, <function=, [Calling tool:, [TOOL_CALLS],
+            # bare bracket [func({...})], etc.) — the old `"<" not in` check
+            # missed bracket formats and let Qwen3.6-style tool calls leak.
+            if not tool_markup_possible and not _streaming_tool_markup_possible(
+                tool_accumulated_text + delta_text
+            ):
+                tool_accumulated_text += delta_text
+            else:
+                if not tool_markup_possible:
+                    tool_markup_possible = True
+                tool_result = tool_parser.extract_tool_calls_streaming(
+                    tool_accumulated_text,
+                    tool_accumulated_text + delta_text,
+                    delta_text,
+                )
+                tool_accumulated_text += delta_text
+                if tool_result is None:
+                    continue
+                if "tool_calls" in tool_result:
+                    continue
+                content = tool_result.get("content", "")
+
+        if not content:
+            continue
+
+        for event in _start_text_item():
+            yield event
+        accumulated_text += content
+        yield _responses_sse_event(
+            "response.output_text.delta",
+            ResponseOutputTextDeltaEvent(
+                sequence_number=sequence,
+                item_id=text_item_id,
+                output_index=text_output_index,
+                content_index=0,
+                delta=content,
+            ),
+        )
+        sequence += 1
+
+    cleaned_text, tool_calls = _parse_tool_calls_with_parser(
+        raw_accumulated_text, chat_request
+    )
+    final_text = accumulated_text
+    if cleaned_text is not None and not final_text and not tool_calls:
+        final_text = clean_output_text(cleaned_text)
+
+    reasoning_item = None
+    if reasoning_item_id is not None:
+        reasoning_item = ResponseReasoningItem(
+            id=reasoning_item_id,
+            status="completed",
+            content=[ResponseReasoningTextPart(text=accumulated_reasoning)],
+        )
+        yield _responses_sse_event(
+            "response.reasoning_text.done",
+            ResponseReasoningTextDoneEvent(
+                sequence_number=sequence,
+                item_id=reasoning_item_id,
+                output_index=reasoning_output_index,
+                content_index=0,
+                text=accumulated_reasoning,
+            ),
+        )
+        sequence += 1
+        yield _responses_sse_event(
+            "response.content_part.done",
+            ResponseContentPartDoneEvent(
+                sequence_number=sequence,
+                item_id=reasoning_item_id,
+                output_index=reasoning_output_index,
+                content_index=0,
+                part=reasoning_item.content[0],
+            ),
+        )
+        sequence += 1
+        yield _responses_sse_event(
+            "response.output_item.done",
+            ResponseOutputItemDoneEvent(
+                sequence_number=sequence,
+                output_index=reasoning_output_index,
+                item=reasoning_item,
+            ),
+        )
+        sequence += 1
+
+    text_item = None
+    if text_item_id is not None or final_text:
+        if text_item_id is None:
+            for event in _start_text_item():
+                yield event
+        text_item = ResponseMessageItem(
+            id=text_item_id,
+            role="assistant",
+            status="completed",
+            content=[ResponseTextContentPart(type="output_text", text=final_text)],
+        )
+        yield _responses_sse_event(
+            "response.output_text.done",
+            ResponseOutputTextDoneEvent(
+                sequence_number=sequence,
+                item_id=text_item_id,
+                output_index=text_output_index,
+                content_index=0,
+                text=final_text,
+            ),
+        )
+        sequence += 1
+        yield _responses_sse_event(
+            "response.content_part.done",
+            ResponseContentPartDoneEvent(
+                sequence_number=sequence,
+                item_id=text_item_id,
+                output_index=text_output_index,
+                content_index=0,
+                part=text_item.content[0],
+            ),
+        )
+        sequence += 1
+        yield _responses_sse_event(
+            "response.output_item.done",
+            ResponseOutputItemDoneEvent(
+                sequence_number=sequence,
+                output_index=text_output_index,
+                item=text_item,
+            ),
+        )
+        sequence += 1
+
+    function_call_items: list[ResponseFunctionCallItem] = []
+    for tool_call in tool_calls or []:
+        output_index = next_output_index
+        next_output_index += 1
+        item = ResponseFunctionCallItem(
+            id=_new_response_item_id("fc"),
+            call_id=tool_call.id,
+            name=tool_call.function.name,
+            arguments=tool_call.function.arguments,
+        )
+        function_call_items.append(item)
+        yield _responses_sse_event(
+            "response.output_item.added",
+            ResponseOutputItemAddedEvent(
+                sequence_number=sequence,
+                output_index=output_index,
+                item=item.model_copy(update={"status": "in_progress"}),
+            ),
+        )
+        sequence += 1
+        yield _responses_sse_event(
+            "response.function_call_arguments.delta",
+            ResponseFunctionCallArgumentsDeltaEvent(
+                sequence_number=sequence,
+                item_id=item.id,
+                output_index=output_index,
+                delta=item.arguments,
+            ),
+        )
+        sequence += 1
+        yield _responses_sse_event(
+            "response.output_item.done",
+            ResponseOutputItemDoneEvent(
+                sequence_number=sequence,
+                output_index=output_index,
+                item=item,
+            ),
+        )
+        sequence += 1
+
+    output_items: list[
+        ResponseMessageItem | ResponseReasoningItem | ResponseFunctionCallItem
+    ] = []
+    if reasoning_item is not None:
+        output_items.append(reasoning_item)
+    if text_item is not None:
+        output_items.append(text_item)
+    output_items.extend(function_call_items)
+
+    response_object = _build_response_object(
+        request=request,
+        output_items=output_items,
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+        finish_reason=finish_reason,
+        response_id=response_id,
+    )
+
+    if request.store and last_output is not None:
+        persisted_messages = _responses_request_to_persisted_messages(request)
+        persisted_messages.extend(_response_output_items_to_chat_messages(output_items))
+        _responses_store[response_object.id] = {
+            "messages": copy.deepcopy(persisted_messages),
+            "response": response_object.model_copy(deep=True),
+        }
+        while len(_responses_store) > _RESPONSES_STORE_MAX_SIZE:
+            _responses_store.popitem(last=False)
+
+    yield _responses_sse_event(
+        "response.completed",
+        ResponseCompletedEvent(sequence_number=sequence, response=response_object),
+    )
+
+
+def _responses_sse_event(event_type: str, payload: BaseModel | dict) -> str:
+    """Encode a Responses API SSE event."""
+    data = (
+        payload.model_dump_json()
+        if isinstance(payload, BaseModel)
+        else json.dumps(payload)
+    )
+    return f"event: {event_type}\ndata: {data}\n\n"
+
+
+def _extract_reasoning_and_tool_calls(
+    output_text: str,
+    request: ChatCompletionRequest | None = None,
+    *,
+    allow_reasoning: bool = True,
+    engine: BaseEngine | None = None,
+) -> tuple[str | None, str | None, list[ToolCall] | None]:
+    """
+    Extract reasoning first, then parse tool calls from the cleaned content.
+
+    Non-streaming responses can contain both a reasoning block and structured
+    tool calls in the same final output. If tool parsing runs first and the
+    response contains tools, the caller can no longer reliably recover the
+    reasoning segment because the usual response path skips reasoning parsing
+    once tool_calls is truthy.
+    """
+    reasoning_text = None
+    text_for_tool_parse = output_text
+
+    if _reasoning_parser and allow_reasoning:
+        reasoning_text, cleaned_reasoning_text = _reasoning_parser.extract_reasoning(
+            output_text
+        )
+        if cleaned_reasoning_text is not None:
+            text_for_tool_parse = cleaned_reasoning_text
+        elif reasoning_text is not None:
+            text_for_tool_parse = ""
+
+    # Skip tool parsing when the request defines no tools — otherwise the
+    # parser can misinterpret JSON output (e.g. response_format) as tool calls.
+    if request is not None and getattr(request, "tools", None):
+        try:
+            cleaned_text, tool_calls = _parse_tool_calls_with_parser(
+                text_for_tool_parse or "",
+                request,
+                engine=engine,
+            )
+        except TypeError as exc:
+            if "unexpected keyword argument 'engine'" not in str(exc):
+                raise
+            cleaned_text, tool_calls = _parse_tool_calls_with_parser(
+                text_for_tool_parse or "",
+                request,
+            )
+    else:
+        cleaned_text, tool_calls = text_for_tool_parse, None
+
+    return reasoning_text, cleaned_text, tool_calls
 
 
 def _detect_native_tool_support() -> bool:
@@ -576,8 +2253,77 @@ def _detect_native_tool_support() -> bool:
         return False
     except Exception as e:
         # Unexpected error during detection
-        logger.warning(f"Failed to detect native tool support: {e}")
+        logger.warning(
+            "Failed to detect native tool support: %s",
+            _sanitize_log_text(e, limit=500),
+        )
         return False
+
+
+def _tool_choice_disabled(request: ChatCompletionRequest | None) -> bool:
+    """Return True when tool_choice explicitly disables tool calling."""
+    if request is None:
+        return False
+
+    tool_choice = getattr(request, "tool_choice", None)
+    if tool_choice is None:
+        request_dict = request.model_dump()
+        tool_choice = request_dict.get("tool_choice")
+    return tool_choice == "none"
+
+
+def _get_streaming_tool_parser(
+    request: ChatCompletionRequest | None,
+    engine: BaseEngine | None = None,
+):
+    """Get a streaming-capable tool parser for this request.
+
+    Uses the configured parser when auto tool choice is enabled, otherwise falls
+    back to the generic auto parser so streaming still matches the generic
+    non-streaming tool parsing behavior.
+    """
+    global _tool_parser_instance
+
+    if request is None:
+        return None
+    if _tool_choice_disabled(request):
+        return None
+
+    tokenizer = _get_engine_tokenizer(engine if engine is not None else _engine)
+
+    if _enable_auto_tool_choice and _tool_call_parser:
+        if _tool_parser_instance is None:
+            try:
+                _get_or_init_tool_parser(engine)
+            except Exception as e:
+                logger.warning(
+                    "Failed to init tool parser for streaming: %s",
+                    _sanitize_log_text(e, limit=500),
+                )
+                return None
+        _tool_parser_instance.reset()
+        return _tool_parser_instance
+
+    if not getattr(request, "tools", None):
+        return None
+
+    try:
+        parser_cls = ToolParserManager.get_tool_parser("auto")
+        parser = parser_cls(tokenizer)
+        parser.reset()
+        return parser
+    except Exception as e:
+        logger.warning(f"Failed to init generic streaming tool parser: {e}")
+        return None
+
+
+def _streaming_tool_markup_possible(text: str) -> bool:
+    """Heuristic marker check to avoid parser work on ordinary text chunks."""
+    return (
+        any(marker in text for marker in _STREAMING_TOOL_MARKERS)
+        or _STREAMING_BARE_BRACKET_MARKER.search(text) is not None
+        or _STREAMING_BARE_BRACKET_PARTIAL.search(text) is not None
+    )
 
 
 def load_embedding_model(
@@ -608,21 +2354,54 @@ def load_embedding_model(
     _embedding_engine.load()
 
 
+def load_reranker_model(
+    model_name: str | None,
+    *,
+    lock: bool = False,
+    reuse_existing: bool = True,
+) -> None:
+    """Load or reuse the reranker model engine when configured."""
+    global _rerank_engine, _rerank_model_locked
+
+    if not model_name:
+        return
+
+    if lock:
+        _rerank_model_locked = model_name
+
+    if (
+        reuse_existing
+        and _rerank_engine is not None
+        and _rerank_engine.model_name == model_name
+    ):
+        return
+
+    from .rerank import RerankEngine
+
+    _rerank_engine = RerankEngine(model_name)
+    _rerank_engine.load()
+
+
 def load_model(
     model_name: str,
     use_batching: bool = False,
     scheduler_config=None,
     stream_interval: int = 1,
     max_tokens: int = 32768,
+    max_request_tokens: int = 32768,
     force_mllm: bool = False,
     gpu_memory_utilization: float = 0.90,
     served_model_name: str | None = None,
+    trust_remote_code: bool = False,
     mtp: bool = False,
     prefill_step_size: int = 2048,
     specprefill_enabled: bool = False,
     specprefill_threshold: int = 8192,
     specprefill_keep_pct: float = 0.3,
     specprefill_draft_model: str = None,
+    warm_prompts_path: str | None = None,
+    auto_unload_idle_seconds: float = 0.0,
+    lazy_load_model: bool = False,
 ):
     """
     Load a model (auto-detects MLLM vs LLM).
@@ -633,29 +2412,121 @@ def load_model(
         scheduler_config: Scheduler config for batched mode
         stream_interval: Tokens to batch before streaming (batched mode only)
         max_tokens: Default max tokens for generation
+        max_request_tokens: Maximum max_tokens accepted from API clients
         force_mllm: Force loading as MLLM even if not auto-detected
+        trust_remote_code: Allow HuggingFace remote code execution during model/tokenizer loading
         mtp: Enable native MTP speculative decoding (SimpleEngine only)
         prefill_step_size: Chunk size for prompt prefill processing (default: 2048)
         specprefill_enabled: Enable SpecPrefill (SimpleEngine only)
         specprefill_threshold: Minimum suffix tokens to trigger SpecPrefill (default: 8192)
         specprefill_keep_pct: Fraction of tokens to keep (default: 0.3)
         specprefill_draft_model: Path to small draft model for SpecPrefill scoring
+        auto_unload_idle_seconds: Idle time before auto-unloading the main model.
+            When non-zero, the main model is managed through lifecycle
+            residency instead of being loaded immediately in this function.
+        lazy_load_model: When lifecycle residency is enabled, defer the first
+            resident load until the first request instead of FastAPI lifespan
+            startup.
     """
-    global _engine, _model_name, _model_path, _default_max_tokens, _tool_parser_instance
+    global _engine, _model_name, _model_path, _default_max_tokens
+    global _max_request_tokens, _tool_parser_instance, _warm_prompts_path
+    global _default_model_key, _auto_unload_idle_seconds, _residency_manager
+    global _force_mllm_model, _lazy_load_model, _lifespan_active
+
+    _warm_prompts_path = warm_prompts_path
+
+    if max_tokens < 1:
+        raise ValueError("Default max tokens must be at least 1")
+    if max_request_tokens < 1:
+        raise ValueError("Max request tokens must be at least 1")
+    if max_tokens > max_request_tokens:
+        raise ValueError("Default max tokens cannot exceed max request tokens")
+
+    if _lifespan_active:
+        raise RuntimeError(
+            "Cannot call load_model() after FastAPI lifespan startup; "
+            "restart the server to reconfigure the main model"
+        )
+
+    if _residency_manager is None and _engine is not None:
+        existing_loaded_attr = getattr(_engine, "_loaded", False)
+        existing_stopped_attr = getattr(_engine, "stopped", False)
+        existing_loaded = (
+            existing_loaded_attr if isinstance(existing_loaded_attr, bool) else False
+        )
+        existing_stopped = (
+            existing_stopped_attr if isinstance(existing_stopped_attr, bool) else None
+        )
+        existing_live = existing_loaded or existing_stopped is False
+        if auto_unload_idle_seconds > 0 or lazy_load_model or existing_live:
+            raise RuntimeError("Cannot replace an existing engine while it is live")
+
+    if _residency_manager is not None and _default_model_key is not None:
+        existing_engine = _residency_manager.get_engine(_default_model_key)
+        existing_status = _residency_manager.get_status(_default_model_key)
+        existing_state = existing_status.get("state")
+        if (
+            existing_engine is not None
+            or existing_status.get("active_requests", 0) > 0
+            or existing_state in {"loading", "loaded", "unloading"}
+        ):
+            raise RuntimeError(
+                "Cannot replace an existing residency manager while it is live"
+            )
 
     _default_max_tokens = max_tokens
+    _max_request_tokens = max_request_tokens
     _model_path = model_name
     _model_name = served_model_name or model_name
+    _default_model_key = "default"
+    _force_mllm_model = force_mllm
+    _auto_unload_idle_seconds = auto_unload_idle_seconds
+    _lazy_load_model = lazy_load_model
     # Reset tool parser instance when model is reloaded (tokenizer may change)
-    _tool_parser_instance = None
+    _invalidate_tool_parser_cache("model reloaded")
 
     if force_mllm:
         logger.info("Force MLLM mode enabled via --mllm flag")
+
+    if auto_unload_idle_seconds > 0 or lazy_load_model:
+        spec = ModelSpec(
+            model_key=_default_model_key,
+            model_name=model_name,
+            use_batching=use_batching,
+            scheduler_config=scheduler_config,
+            stream_interval=stream_interval if use_batching else 1,
+            max_tokens=max_tokens,
+            force_mllm=force_mllm,
+            mtp=mtp,
+            prefill_step_size=prefill_step_size,
+            specprefill_enabled=specprefill_enabled,
+            specprefill_threshold=specprefill_threshold,
+            specprefill_keep_pct=specprefill_keep_pct,
+            specprefill_draft_model=specprefill_draft_model,
+        )
+        _residency_manager = ResidencyManager(
+            _engine_factory,
+            on_engine_loaded=_restore_engine_state,
+            on_engine_unloading=_persist_engine_state,
+            auto_unload_idle_seconds=auto_unload_idle_seconds,
+        )
+        _residency_manager.register_model(spec)
+        _engine = None
+        logger.info(
+            "Lifecycle manager enabled: auto_unload_idle_seconds=%.1f",
+            auto_unload_idle_seconds,
+        )
+        return
+
+    _residency_manager = None
+    _auto_unload_idle_seconds = 0.0
+    _lazy_load_model = False
 
     if use_batching:
         logger.info(f"Loading model with BatchedEngine: {model_name}")
         _engine = BatchedEngine(
             model_name=model_name,
+            trust_remote_code=trust_remote_code,
             scheduler_config=scheduler_config,
             stream_interval=stream_interval,
             force_mllm=force_mllm,
@@ -665,9 +2536,16 @@ def load_model(
         # Just log for now
         logger.info(f"Model loaded (batched mode): {model_name}")
     else:
+        simple_engine_cls = SimpleEngine
+        if simple_engine_cls is _IMPORTED_SIMPLE_ENGINE:
+            from .engine import simple as simple_mod
+
+            simple_engine_cls = simple_mod.SimpleEngine
+
         logger.info(f"Loading model with SimpleEngine: {model_name}")
-        _engine = SimpleEngine(
+        _engine = simple_engine_cls(
             model_name=model_name,
+            trust_remote_code=trust_remote_code,
             force_mllm=force_mllm,
             mtp=mtp,
             prefill_step_size=prefill_step_size,
@@ -678,9 +2556,23 @@ def load_model(
         )
         # Start SimpleEngine synchronously (no background loop)
         # Use new_event_loop() for Python 3.10+ compatibility (get_event_loop() is deprecated)
+        previous_loop = None
+        try:
+            previous_loop = asyncio.get_event_loop()
+        except RuntimeError:
+            previous_loop = None
         loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        loop.run_until_complete(_engine.start())
+        try:
+            asyncio.set_event_loop(loop)
+            loop.run_until_complete(_engine.start())
+        finally:
+            with suppress(Exception):
+                loop.run_until_complete(loop.shutdown_default_executor())
+            loop.close()
+            if previous_loop is not None and not previous_loop.is_closed():
+                asyncio.set_event_loop(previous_loop)
+            else:
+                asyncio.set_event_loop(None)
         model_type = "MLLM" if _engine.is_mllm else "LLM"
         logger.info(f"{model_type} model loaded (simple mode): {model_name}")
 
@@ -690,6 +2582,7 @@ def load_model(
         logger.info(f"Native tool format enabled for parser: {_tool_call_parser}")
 
     logger.info(f"Default max tokens: {_default_max_tokens}")
+    logger.info(f"Max request tokens: {_max_request_tokens}")
 
 
 def get_usage(output: GenerationOutput) -> Usage:
@@ -736,26 +2629,66 @@ async def health():
             "tools_available": len(_mcp_manager.get_all_tools()),
         }
 
-    return {
-        "status": "healthy",
+    engine_stats = _engine.get_stats() if _engine else {}
+    lifecycle = _get_lifecycle_status()
+    health_status = (
+        "unhealthy"
+        if lifecycle is not None and lifecycle.get("state") == "failed"
+        else "healthy"
+    )
+
+    payload = {
+        "status": health_status,
         "model_loaded": _engine is not None,
         "model_name": _model_name,
-        "model_type": "mllm" if (_engine and _engine.is_mllm) else "llm",
+        "model_type": (
+            "mllm"
+            if (_engine and _engine.is_mllm)
+            or _force_mllm_model
+            or (
+                _engine is None
+                and (_model_path or _model_name)
+                and is_mllm_model(_model_path or _model_name)
+            )
+            else "llm"
+        ),
+        "engine_type": engine_stats.get("engine_type", "unknown"),
         "mcp": mcp_info,
     }
+    if lifecycle is not None:
+        lifecycle_fields = {
+            "residency_state": lifecycle["state"],
+            "active_requests": lifecycle["active_requests"],
+            "last_used_at": lifecycle["last_used_at"],
+            "loaded_at": lifecycle["loaded_at"],
+            "auto_unload_idle_seconds": lifecycle["auto_unload_idle_seconds"],
+        }
+        if lifecycle.get("state") == "failed":
+            lifecycle_fields["last_error"] = (
+                "model_load_failed" if lifecycle.get("last_error") is not None else None
+            )
+        payload.update(lifecycle_fields)
+    return payload
 
 
-@app.get("/v1/status")
+@app.get("/v1/status", dependencies=[Depends(verify_api_key)])
 async def status():
     """Real-time status with per-request details for debugging and monitoring."""
+    lifecycle = _public_lifecycle_status(_get_lifecycle_status())
     if _engine is None:
-        return {"status": "not_loaded", "model": None, "requests": []}
+        return {
+            "status": "not_loaded",
+            "model": _model_name,
+            "residency": lifecycle,
+            "requests": [],
+        }
 
     stats = _engine.get_stats()
 
     return {
         "status": "running" if stats.get("running") else "stopped",
         "model": _model_name,
+        "residency": lifecycle,
         "uptime_s": round(stats.get("uptime_seconds", 0), 1),
         "steps_executed": stats.get("steps_executed", 0),
         "num_running": stats.get("num_running", 0),
@@ -775,9 +2708,16 @@ async def status():
     }
 
 
-@app.get("/v1/cache/stats")
+@app.get("/v1/cache/stats", dependencies=[Depends(verify_api_key)])
 async def cache_stats():
     """Get cache statistics for debugging and monitoring."""
+    engine_cache = None
+    if _engine is not None and hasattr(_engine, "get_cache_stats"):
+        try:
+            engine_cache = _engine.get_cache_stats()
+        except Exception as exc:
+            engine_cache = {"error": f"engine cache stats failed: {exc}"}
+
     try:
         from mlx_vlm.utils import (
             get_multimodal_kv_cache_stats,
@@ -786,17 +2726,29 @@ async def cache_stats():
         )
 
         return {
+            "engine_cache": engine_cache,
             "multimodal_kv_cache": get_multimodal_kv_cache_stats(),
             "pixel_values_cache": get_pixel_values_cache_stats(),
             "pil_image_cache": get_pil_cache_stats(),
         }
     except ImportError:
-        return {"error": "Cache stats not available (mlx_vlm not loaded)"}
+        return {
+            "engine_cache": engine_cache,
+            "error": "Cache stats not available (mlx_vlm not loaded)",
+        }
 
 
-@app.delete("/v1/cache")
+@app.delete("/v1/cache", dependencies=[Depends(verify_api_key)])
 async def clear_cache():
     """Clear all caches."""
+    cleared_engine = None
+    if _engine is not None and hasattr(_engine, "clear_runtime_caches"):
+        try:
+            cleared_engine = _engine.clear_runtime_caches()
+        except Exception as exc:
+            logger.warning("Failed to clear engine caches: %s", exc, exc_info=True)
+            cleared_engine = {"error": str(exc)}
+
     try:
         from mlx_vlm.utils import (
             clear_multimodal_kv_cache,
@@ -807,10 +2759,69 @@ async def clear_cache():
         clear_pixel_values_cache()
         return {
             "status": "cleared",
+            "engine_cache": cleared_engine,
             "caches": ["multimodal_kv", "pixel_values", "pil_image"],
         }
     except ImportError:
-        return {"error": "Cache clear not available (mlx_vlm not loaded)"}
+        return {
+            "status": "cleared",
+            "engine_cache": cleared_engine,
+            "error": "Cache clear not available (mlx_vlm not loaded)",
+        }
+
+
+@app.delete("/v1/cache/prefix", dependencies=[Depends(verify_api_key)])
+async def clear_prefix_cache():
+    """Clear the text prefix cache used for KV reuse in continuous batching.
+
+    If the server was started with ``--warm-prompts``, the warm-up is
+    re-run in the background after clear so the next real request still
+    hits the cache. Response returns immediately without waiting for
+    the re-warm to finish.
+    """
+    if _engine is None:
+        return {"status": "no_engine"}
+    cleared = False
+    if hasattr(_engine, "clear_prefix_cache"):
+        try:
+            _engine.clear_prefix_cache()
+            cleared = True
+        except Exception as e:
+            logger.warning(
+                "[clear_prefix_cache] engine.clear_prefix_cache failed: %s",
+                _sanitize_log_text(e, limit=500),
+            )
+
+    # Auto re-warm in background if warm-prompts was configured.
+    rewarm_scheduled = False
+    if cleared and _warm_prompts_path and hasattr(_engine, "stream_chat"):
+
+        async def _rewarm():
+            try:
+                from vllm_mlx.prompt_warmup import (
+                    load_warmup_file,
+                    warm_prefix_cache,
+                )
+
+                prompts = load_warmup_file(_warm_prompts_path)
+                result = await warm_prefix_cache(_engine, prompts)
+                logger.info(
+                    "[clear_prefix_cache] re-warm done: %d completed, %d skipped, %.1fs",
+                    result["count"],
+                    result["skipped"],
+                    result["elapsed_ms"] / 1000,
+                )
+            except Exception as e:
+                logger.warning(
+                    "[clear_prefix_cache] re-warm failed: %s",
+                    _sanitize_log_text(e, limit=500),
+                )
+
+        asyncio.create_task(_rewarm())
+        rewarm_scheduled = True
+
+    status = "cleared" if cleared else "not_supported"
+    return {"status": status, "rewarm_scheduled": rewarm_scheduled}
 
 
 @app.get("/v1/models", dependencies=[Depends(verify_api_key)])
@@ -819,6 +2830,14 @@ async def list_models() -> ModelsResponse:
     models = []
     if _model_name:
         models.append(ModelInfo(id=_model_name))
+    if _embedding_engine is not None:
+        models.append(
+            ModelInfo(id=_embedding_engine.model_name, owned_by="vllm-mlx-embedding")
+        )
+    if _rerank_engine is not None:
+        models.append(
+            ModelInfo(id=_rerank_engine.model_name, owned_by="vllm-mlx-reranker")
+        )
     return ModelsResponse(data=models)
 
 
@@ -871,33 +2890,27 @@ async def create_embeddings(request: EmbeddingRequest) -> EmbeddingResponse:
     }
     ```
 
-    Supported models:
+    Supported request-time models:
     - mlx-community/all-MiniLM-L6-v2-4bit (fast, compact)
     - mlx-community/embeddinggemma-300m-6bit (high quality)
     - mlx-community/bge-large-en-v1.5-4bit (best for English)
-    - Any BERT/XLM-RoBERTa/ModernBERT model from HuggingFace
+    - mlx-community/multilingual-e5-small-mlx
+    - mlx-community/multilingual-e5-large-mlx
+    - mlx-community/bert-base-uncased-mlx
+    - mlx-community/ModernBERT-base-mlx
+
+    Other embedding models must be pinned explicitly with --embedding-model at
+    server startup.
     """
     global _embedding_engine
     tracker = _metrics.track_inference("embeddings", stream=False)
 
     try:
-        # Resolve model name
-        model_name = request.model
-
-        # If an embedding model was pre-configured at startup, only allow that model
-        if (
-            _embedding_model_locked is not None
-            and model_name != _embedding_model_locked
-        ):
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    f"Embedding model '{model_name}' is not available. "
-                    f"This server was started with --embedding-model {_embedding_model_locked}. "
-                    f"Only '{_embedding_model_locked}' can be used for embeddings. "
-                    f"Restart the server with a different --embedding-model to use '{model_name}'."
-                ),
-            )
+        # Resolve model name before any lazy-load path is reached.
+        model_name = resolve_embedding_model_name(
+            request.model,
+            locked_model=_embedding_model_locked,
+        )
 
         # Lazy-load or swap embedding engine
         load_embedding_model(model_name, lock=False, reuse_existing=True)
@@ -954,7 +2967,140 @@ async def create_embeddings(request: EmbeddingRequest) -> EmbeddingResponse:
         raise
     except Exception as e:
         tracker.finish(result="error")
-        logger.error(f"Embedding generation failed: {e}")
+        _log_and_raise_internal_error(
+            "Embedding generation failed",
+            e,
+            "Embedding generation failed",
+        )
+
+
+# =============================================================================
+# Reranking Endpoint
+# =============================================================================
+
+
+@app.post(
+    "/v1/rerank",
+    dependencies=[Depends(verify_api_key), Depends(check_rate_limit)],
+)
+async def rerank_documents(request: RerankRequest) -> RerankResponse:
+    """
+    Rerank documents against a query using a cross-encoder model.
+
+    Jina/Cohere-compatible reranking API. Accepts a query and a list of
+    documents (strings or {text: ...} objects), returns results sorted
+    by relevance score descending.
+    """
+    global _rerank_engine
+
+    try:
+        model_name = request.model
+
+        # If a reranker model was pre-configured at startup, only allow that model
+        if _rerank_model_locked is not None and model_name != _rerank_model_locked:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Reranker model '{model_name}' is not available. "
+                    f"This server was started with --rerank-model {_rerank_model_locked}. "
+                    f"Only '{_rerank_model_locked}' can be used for reranking. "
+                    f"Restart the server with a different --rerank-model to use '{model_name}'."
+                ),
+            )
+
+        # Validate query
+        if not request.query or not request.query.strip():
+            raise HTTPException(status_code=400, detail="Query must not be empty")
+
+        # Validate documents
+        if not request.documents:
+            raise HTTPException(
+                status_code=400, detail="Documents list must not be empty"
+            )
+
+        # Validate top_n
+        if request.top_n is not None and request.top_n > len(request.documents):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"top_n ({request.top_n}) must not exceed the number of "
+                    f"documents ({len(request.documents)})"
+                ),
+            )
+
+        # Require --rerank-model at startup; no unconstrained lazy loading
+        if _rerank_engine is None:
+            raise HTTPException(
+                status_code=404,
+                detail=(
+                    "No reranker model loaded. Start the server with "
+                    "--rerank-model to enable the /v1/rerank endpoint."
+                ),
+            )
+
+        # Extract text from documents (handle both string and object formats)
+        doc_texts = []
+        original_docs = []
+        for doc in request.documents:
+            if isinstance(doc, str):
+                doc_texts.append(doc)
+                original_docs.append({"text": doc})
+            elif isinstance(doc, dict) and "text" in doc:
+                doc_texts.append(doc["text"])
+                original_docs.append(doc)
+            else:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"Each document must be a string or an object with a 'text' field. "
+                        f"Got: {type(doc).__name__}"
+                    ),
+                )
+
+        start_time = time.perf_counter()
+
+        # Run scoring off the event loop with concurrency limit.
+        # score_pairs returns (scores, total_tokens) from the same
+        # tokenization pass used for scoring — no double tokenization.
+        import asyncio
+
+        async with _rerank_engine._semaphore:
+            scores, total_tokens = await asyncio.to_thread(
+                _rerank_engine.score_pairs, request.query, doc_texts
+            )
+
+        elapsed = time.perf_counter() - start_time
+        logger.info(
+            f"Rerank: {len(doc_texts)} documents, {total_tokens} tokens in {elapsed:.2f}s"
+        )
+
+        # Build results with original index and optional document
+        results = []
+        for i, score in enumerate(scores):
+            result = RerankResult(
+                index=i,
+                relevance_score=score,
+                document=original_docs[i] if request.return_documents else None,
+            )
+            results.append(result)
+
+        # Sort by relevance score descending
+        results.sort(key=lambda r: r.relevance_score, reverse=True)
+
+        # Apply top_n limit
+        if request.top_n is not None:
+            results = results[: request.top_n]
+
+        return RerankResponse(
+            model=model_name,
+            results=results,
+            usage=RerankUsage(total_tokens=total_tokens),
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Reranking failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -1007,15 +3153,27 @@ async def list_mcp_servers() -> MCPServersResponse:
 @app.post("/v1/mcp/execute", dependencies=[Depends(verify_api_key)])
 async def execute_mcp_tool(request: MCPExecuteRequest) -> MCPExecuteResponse:
     """Execute an MCP tool."""
+    global _mcp_executor
+
     if _mcp_manager is None:
         raise HTTPException(
             status_code=503, detail="MCP not configured. Start server with --mcp-config"
         )
 
-    result = await _mcp_manager.execute_tool(
-        request.tool_name,
-        request.arguments,
-    )
+    if _mcp_executor is None:
+        from vllm_mlx.mcp import ToolExecutor
+
+        _mcp_executor = ToolExecutor(_mcp_manager)
+
+    tool_call = {
+        "id": f"mcp-{uuid.uuid4().hex[:8]}",
+        "type": "function",
+        "function": {
+            "name": request.tool_name,
+            "arguments": request.arguments,
+        },
+    }
+    result, _ = (await _mcp_executor.execute_tool_calls([tool_call], parallel=False))[0]
 
     return MCPExecuteResponse(
         tool_name=result.tool_name,
@@ -1056,27 +3214,19 @@ async def create_transcription(
     try:
         from .audio.stt import STTEngine  # Lazy import - optional feature
 
-        # Map model aliases to full names
-        model_map = {
-            "whisper-large-v3": "mlx-community/whisper-large-v3-mlx",
-            "whisper-large-v3-turbo": "mlx-community/whisper-large-v3-turbo",
-            "whisper-medium": "mlx-community/whisper-medium-mlx",
-            "whisper-small": "mlx-community/whisper-small-mlx",
-            "parakeet": "mlx-community/parakeet-tdt-0.6b-v2",
-            "parakeet-v3": "mlx-community/parakeet-tdt-0.6b-v3",
-        }
-        model_name = model_map.get(model, model)
+        model_name = resolve_stt_model_name(model)
 
         # Load engine if needed
         if _stt_engine is None or _stt_engine.model_name != model_name:
             _stt_engine = STTEngine(model_name)
             _stt_engine.load()
 
-        # Save uploaded file temporarily
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
-            content = await file.read()
-            tmp.write(content)
-            tmp_path = tmp.name
+        # Stream uploaded file to disk under a hard size cap.
+        tmp_path = await save_upload_with_limit(
+            file,
+            max_bytes=_max_audio_upload_bytes,
+            default_suffix=".wav",
+        )
 
         try:
             result = _stt_engine.transcribe(tmp_path, language=language)
@@ -1105,8 +3255,11 @@ async def create_transcription(
         raise
     except Exception as e:
         tracker.finish(result="error")
-        logger.error(f"Transcription failed: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        _log_and_raise_internal_error(
+            "Transcription failed",
+            e,
+            "Transcription failed",
+        )
 
 
 @app.post("/v1/audio/speech", dependencies=[Depends(verify_api_key)])
@@ -1132,16 +3285,8 @@ async def create_speech(
     try:
         from .audio.tts import TTSEngine  # Lazy import - optional feature
 
-        # Map model aliases to full names
-        model_map = {
-            "kokoro": "mlx-community/Kokoro-82M-bf16",
-            "kokoro-4bit": "mlx-community/Kokoro-82M-4bit",
-            "chatterbox": "mlx-community/chatterbox-turbo-fp16",
-            "chatterbox-4bit": "mlx-community/chatterbox-turbo-4bit",
-            "vibevoice": "mlx-community/VibeVoice-Realtime-0.5B-4bit",
-            "voxcpm": "mlx-community/VoxCPM1.5",
-        }
-        model_name = model_map.get(model, model)
+        model_name = resolve_tts_model_name(model)
+        validate_tts_input_length(input, max_chars=_max_tts_input_chars)
 
         # Load engine if needed
         if _tts_engine is None or _tts_engine.model_name != model_name:
@@ -1168,8 +3313,11 @@ async def create_speech(
         raise
     except Exception as e:
         tracker.finish(result="error")
-        logger.error(f"TTS generation failed: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        _log_and_raise_internal_error(
+            "TTS generation failed",
+            e,
+            "Speech generation failed",
+        )
 
 
 @app.get("/v1/audio/voices", dependencies=[Depends(verify_api_key)])
@@ -1190,11 +3338,36 @@ async def list_voices(model: str = "kokoro"):
 # =============================================================================
 
 
+async def _ensure_sse_terminal(
+    generator: AsyncIterator[str],
+    terminal_frame: str,
+) -> AsyncIterator[str]:
+    """Guarantee that *terminal_frame* is emitted exactly once at the end of
+    *generator*, even if the generator raises mid-stream.
+
+    If the inner generator already yields the terminal frame on its happy path,
+    the wrapper detects it and avoids double-emission.  If the generator raises
+    before reaching the terminal, the wrapper emits it in the ``finally`` block.
+    """
+    emitted = False
+    try:
+        async for chunk in generator:
+            if chunk == terminal_frame:
+                emitted = True
+            yield chunk
+    except Exception as e:
+        logger.error(f"Streaming error, ensuring terminal frame: {e}")
+    finally:
+        if not emitted:
+            yield terminal_frame
+
+
 async def _disconnect_guard(
     generator: AsyncIterator[str],
     raw_request: Request,
     poll_interval: float = 0.5,
     heartbeat_interval: float = 5.0,
+    cleanup=None,
 ) -> AsyncIterator[str]:
     """Wrap streaming generator to abort on client disconnect.
 
@@ -1273,6 +3446,12 @@ async def _disconnect_guard(
                         f"{chunk_count} chunks, elapsed={_elapsed()}"
                     )
                     break
+                except Exception as exc:
+                    logger.error(
+                        f"[disconnect_guard] generator raised {type(exc).__name__}: {exc}, "
+                        f"after {chunk_count} chunks, elapsed={_elapsed()}"
+                    )
+                    break
                 chunk_count += 1
                 if chunk_count == 1:
                     logger.info(
@@ -1307,6 +3486,10 @@ async def _disconnect_guard(
         # Instead, rely on the task cancellation propagation:
         #   anext_task.cancel() → CancelledError in stream_outputs()
         #   → finally block → abort_request() → request removed from scheduler
+        if cleanup is not None:
+            result = cleanup()
+            if asyncio.iscoroutine(result):
+                await result
         logger.info(
             f"[disconnect_guard] CLEANUP done, {chunk_count} chunks, "
             f"{heartbeat_count} heartbeats, elapsed={_elapsed()}"
@@ -1318,6 +3501,8 @@ async def _wait_with_disconnect(
     raw_request: Request,
     timeout: float,
     poll_interval: float = 0.5,
+    timeout_detail_seconds: float | None = None,
+    cleanup_result=None,
 ):
     """Run a coroutine with both timeout and client disconnect detection.
 
@@ -1363,7 +3548,10 @@ async def _wait_with_disconnect(
                 pass
             raise HTTPException(
                 status_code=504,
-                detail=f"Request timed out after {timeout:.1f} seconds",
+                detail=(
+                    "Request timed out after "
+                    f"{(timeout_detail_seconds or timeout):.1f} seconds"
+                ),
             )
 
         if disconnect_task in done:
@@ -1372,11 +3560,22 @@ async def _wait_with_disconnect(
                 f"[disconnect_guard] CLIENT DISCONNECTED (non-stream) "
                 f"elapsed={_time.monotonic() - _t0:.1f}s"
             )
-            task.cancel()
-            try:
-                await task
-            except (asyncio.CancelledError, Exception):
-                pass
+            if task in done:
+                try:
+                    result = task.result()
+                except (asyncio.CancelledError, Exception):
+                    pass
+                else:
+                    if cleanup_result is not None:
+                        cleanup = cleanup_result(result)
+                        if asyncio.iscoroutine(cleanup):
+                            await cleanup
+            else:
+                task.cancel()
+                try:
+                    await task
+                except (asyncio.CancelledError, Exception):
+                    pass
             return None  # Signal to caller that client disconnected
 
         # Task completed
@@ -1387,6 +3586,50 @@ async def _wait_with_disconnect(
             disconnect_task.cancel()
         if not task.done():
             task.cancel()
+
+
+def _start_request_budget(timeout: float | None) -> tuple[float, float]:
+    """Return the total timeout and absolute deadline for a request."""
+    total_timeout = timeout or _default_timeout
+    return total_timeout, time.monotonic() + total_timeout
+
+
+def _remaining_request_timeout(total_timeout: float, deadline: float) -> float:
+    """Compute remaining request budget or raise the standard timeout error."""
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise HTTPException(
+            status_code=504,
+            detail=f"Request timed out after {total_timeout:.1f} seconds",
+        )
+    return remaining
+
+
+async def _acquire_default_engine_for_request(
+    raw_request: Request,
+    *,
+    total_timeout: float,
+    deadline: float,
+    count_activity: bool = True,
+) -> BaseEngine | None:
+    """Acquire the default engine inside the request guardrails."""
+    if count_activity:
+        acquire_coro = _acquire_default_engine()
+        cleanup = lambda _result: _release_default_engine()
+    else:
+        acquire_coro = _acquire_default_engine(count_activity=False)
+        cleanup = lambda _result: _release_default_engine(count_activity=False)
+
+    if raw_request is None:
+        return await acquire_coro
+
+    return await _wait_with_disconnect(
+        acquire_coro,
+        raw_request,
+        timeout=_remaining_request_timeout(total_timeout, deadline),
+        timeout_detail_seconds=total_timeout,
+        cleanup_result=cleanup,
+    )
 
 
 # =============================================================================
@@ -1400,11 +3643,12 @@ async def _wait_with_disconnect(
 async def create_completion(request: CompletionRequest, raw_request: Request):
     """Create a text completion."""
     _validate_model_name(request.model)
-    engine = get_engine()
+    effective_max_tokens = _resolve_request_max_tokens(request.max_tokens)
     tracker = _metrics.track_inference("completions", stream=request.stream)
 
     # Handle single prompt or list of prompts
     prompts = request.prompt if isinstance(request.prompt, list) else [request.prompt]
+    total_timeout, deadline = _start_request_budget(request.timeout)
 
     # --- Detailed request logging ---
     prompt_preview = prompts[0][:200] if prompts else "(empty)"
@@ -1415,101 +3659,123 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
         f"top_p={request.top_p} top_k={request.top_k} min_p={request.min_p} "
         f"presence_penalty={request.presence_penalty} "
         f"repetition_penalty={request.repetition_penalty} "
-        f"prompt_chars={prompt_len} prompt_preview={prompt_preview!r}"
+        f"prompt_chars={prompt_len} "
+        f"prompt_preview={_sanitize_log_text(prompt_preview, limit=200)}"
     )
 
     # Resolve repetition penalty for completions
     comp_rep_penalty = request.repetition_penalty
 
-    if request.stream:
-        return StreamingResponse(
-            _disconnect_guard(
-                stream_completion(
-                    engine,
-                    prompts[0],
-                    request,
-                    repetition_penalty=comp_rep_penalty,
-                    metrics_tracker=tracker,
+    engine = await _acquire_default_engine_for_request(
+        raw_request,
+        total_timeout=total_timeout,
+        deadline=deadline,
+    )
+    if engine is None:
+        return Response(status_code=499)
+    release_on_exit = True
+
+    try:
+        if request.stream:
+            response = StreamingResponse(
+                _disconnect_guard(
+                    _ensure_sse_terminal(
+                        stream_completion(
+                            engine,
+                            prompts[0],
+                            request,
+                            effective_max_tokens,
+                            repetition_penalty=comp_rep_penalty,
+                            metrics_tracker=tracker,
+                        ),
+                        "data: [DONE]\n\n",
+                    ),
+                    raw_request,
+                    cleanup=_release_default_engine,
                 ),
-                raw_request,
-            ),
-            media_type="text/event-stream",
+                media_type="text/event-stream",
+            )
+            release_on_exit = False
+            return response
+
+        # Non-streaming response with timing and timeout
+        start_time = time.perf_counter()
+        choices = []
+        total_completion_tokens = 0
+        total_prompt_tokens = 0
+        for i, prompt in enumerate(prompts):
+            generate_kwargs = {
+                "prompt": prompt,
+                "max_tokens": effective_max_tokens,
+                "temperature": _resolve_temperature(request.temperature),
+                "top_p": _resolve_top_p(request.top_p),
+                "top_k": request.top_k or 0,
+                "min_p": request.min_p or 0.0,
+                "presence_penalty": request.presence_penalty or 0.0,
+                "stop": request.stop,
+            }
+            if comp_rep_penalty is not None:
+                generate_kwargs["repetition_penalty"] = comp_rep_penalty
+            if request.specprefill is not None:
+                generate_kwargs["specprefill"] = request.specprefill
+            if request.specprefill_keep_pct is not None:
+                generate_kwargs["specprefill_keep_pct"] = request.specprefill_keep_pct
+            try:
+                if raw_request is None:
+                    output = await engine.generate(**generate_kwargs)
+                else:
+                    output = await _wait_with_disconnect(
+                        engine.generate(**generate_kwargs),
+                        raw_request,
+                        timeout=_remaining_request_timeout(total_timeout, deadline),
+                        timeout_detail_seconds=total_timeout,
+                    )
+            except HTTPException as exc:
+                tracker.finish(result=_metrics_result_from_status(exc.status_code))
+                raise
+            if output is None:
+                tracker.finish(
+                    result="client_closed",
+                    prompt_tokens=total_prompt_tokens,
+                    completion_tokens=total_completion_tokens,
+                )
+                return Response(status_code=499)  # Client closed request
+
+            choices.append(
+                CompletionChoice(
+                    index=i,
+                    text=output.text,
+                    finish_reason=output.finish_reason,
+                )
+            )
+            total_completion_tokens += output.completion_tokens
+            total_prompt_tokens += (
+                output.prompt_tokens if hasattr(output, "prompt_tokens") else 0
+            )
+
+        elapsed = time.perf_counter() - start_time
+        tokens_per_sec = total_completion_tokens / elapsed if elapsed > 0 else 0
+        logger.info(
+            f"Completion: {total_prompt_tokens} prompt + {total_completion_tokens} completion tokens in {elapsed:.2f}s ({tokens_per_sec:.1f} tok/s)"
         )
 
-    # Non-streaming response with timing and timeout
-    start_time = time.perf_counter()
-    timeout = request.timeout or _default_timeout
-    choices = []
-    total_completion_tokens = 0
-    total_prompt_tokens = 0
-
-    for i, prompt in enumerate(prompts):
-        generate_kwargs = {
-            "prompt": prompt,
-            "max_tokens": request.max_tokens or _default_max_tokens,
-            "temperature": _resolve_temperature(request.temperature),
-            "top_p": _resolve_top_p(request.top_p),
-            "top_k": request.top_k or 0,
-            "min_p": request.min_p or 0.0,
-            "presence_penalty": request.presence_penalty or 0.0,
-            "stop": request.stop,
-        }
-        if comp_rep_penalty is not None:
-            generate_kwargs["repetition_penalty"] = comp_rep_penalty
-        if request.specprefill is not None:
-            generate_kwargs["specprefill"] = request.specprefill
-        if request.specprefill_keep_pct is not None:
-            generate_kwargs["specprefill_keep_pct"] = request.specprefill_keep_pct
-
-        try:
-            output = await _wait_with_disconnect(
-                engine.generate(**generate_kwargs),
-                raw_request,
-                timeout=timeout,
-            )
-        except HTTPException as exc:
-            tracker.finish(result=_metrics_result_from_status(exc.status_code))
-            raise
-        if output is None:
-            tracker.finish(
-                result="client_closed",
-                prompt_tokens=total_prompt_tokens,
-                completion_tokens=total_completion_tokens,
-            )
-            return Response(status_code=499)  # Client closed request
-
-        choices.append(
-            CompletionChoice(
-                index=i,
-                text=output.text,
-                finish_reason=output.finish_reason,
-            )
-        )
-        total_completion_tokens += output.completion_tokens
-        total_prompt_tokens += (
-            output.prompt_tokens if hasattr(output, "prompt_tokens") else 0
-        )
-
-    elapsed = time.perf_counter() - start_time
-    tokens_per_sec = total_completion_tokens / elapsed if elapsed > 0 else 0
-    logger.info(
-        f"Completion: {total_prompt_tokens} prompt + {total_completion_tokens} completion tokens in {elapsed:.2f}s ({tokens_per_sec:.1f} tok/s)"
-    )
-
-    tracker.finish(
-        result="success",
-        prompt_tokens=total_prompt_tokens,
-        completion_tokens=total_completion_tokens,
-    )
-    return CompletionResponse(
-        model=_model_name,
-        choices=choices,
-        usage=Usage(
+        tracker.finish(
+            result="success",
             prompt_tokens=total_prompt_tokens,
             completion_tokens=total_completion_tokens,
-            total_tokens=total_prompt_tokens + total_completion_tokens,
-        ),
-    )
+        )
+        return CompletionResponse(
+            model=_model_name,
+            choices=choices,
+            usage=Usage(
+                prompt_tokens=total_prompt_tokens,
+                completion_tokens=total_completion_tokens,
+                total_tokens=total_prompt_tokens + total_completion_tokens,
+            ),
+        )
+    finally:
+        if release_on_exit:
+            await _release_default_engine()
 
 
 @app.post(
@@ -1559,8 +3825,9 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
     ```
     """
     _validate_model_name(request.model)
-    engine = get_engine()
+    effective_max_tokens = _resolve_request_max_tokens(request.max_tokens)
     tracker = _metrics.track_inference("chat_completions", stream=request.stream)
+    total_timeout, deadline = _start_request_budget(request.timeout)
 
     # --- Detailed request logging ---
     n_msgs = len(request.messages)
@@ -1572,7 +3839,6 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
         total_chars += len(content)
         if m.role == "user":
             last_user_preview = content[:300]
-    has_tools = bool(request.tools)
     n_tools = len(request.tools) if request.tools else 0
     logger.info(
         f"[REQUEST] POST /v1/chat/completions stream={request.stream} "
@@ -1585,210 +3851,128 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
         f"total_chars={total_chars} tools={n_tools} "
         f"response_format={request.response_format}"
     )
-    logger.info(f"[REQUEST] last user message preview: {last_user_preview!r}")
-
-    # For MLLM models, keep original messages with embedded images
-    # (MLLM.chat() extracts images from message content internally)
-    if engine.is_mllm:
-        # Convert Pydantic messages to dicts, excluding None fields
-        # to prevent chat templates from misinterpreting key presence
-        # (e.g. image_url: null on text parts triggers Qwen3-VL crash)
-        messages = []
-        for msg in request.messages:
-            if hasattr(msg, "model_dump"):
-                msg_dict = msg.model_dump(exclude_none=True)
-            else:
-                raw = dict(msg)
-                msg_dict = {k: v for k, v in raw.items() if v is not None}
-            messages.append(msg_dict)
-        images, videos = [], []  # MLLM extracts these from messages
-        logger.debug(f"MLLM: Processing {len(messages)} messages")
-        # Convert tool_call arguments from JSON string to dict so that
-        # chat templates can iterate them (e.g. GLM-4.6V calls .items()).
-        # The LLM path does this inside extract_multimodal_content(), but
-        # the MLLM path bypasses that function.
-        if engine.preserve_native_tool_format:
-            for msg_dict in messages:
-                for tc in msg_dict.get("tool_calls") or []:
-                    func = tc.get("function") or {}
-                    args = func.get("arguments")
-                    if isinstance(args, str):
-                        try:
-                            func["arguments"] = json.loads(args)
-                        except (json.JSONDecodeError, ValueError):
-                            pass
-        messages = _normalize_messages(messages)
-    else:
-        # For LLM, extract text, images, and videos separately
-        messages, images, videos = extract_multimodal_content(
-            request.messages,
-            preserve_native_format=engine.preserve_native_tool_format,
-        )
-        messages = _normalize_messages(messages)
-
-    has_media = bool(images or videos)
-    if engine.is_mllm and not has_media:
-        # MLLM extracts media from messages directly, so images/videos are
-        # always empty. Check message content for video/image types instead.
-        for msg in request.messages:
-            content = msg.content if hasattr(msg, "content") else msg.get("content", "")
-            if isinstance(content, list):
-                for item in content:
-                    item_type = (
-                        item.type
-                        if hasattr(item, "type")
-                        else (item.get("type", "") if isinstance(item, dict) else "")
-                    )
-                    if item_type in ("image_url", "image", "video", "video_url"):
-                        has_media = True
-                        break
-            if has_media:
-                break
-
-    # Handle response_format - inject system prompt if needed
-    response_format = request.response_format
-    if response_format:
-        json_instruction = build_json_system_prompt(response_format)
-        if json_instruction:
-            # Inject JSON instruction into messages
-            messages = _inject_json_instruction(messages, json_instruction)
-
-    # Resolve repetition penalty
-    rep_penalty = request.repetition_penalty
-
-    # Prepare kwargs
-    chat_kwargs = {
-        "max_tokens": request.max_tokens or _default_max_tokens,
-        "temperature": _resolve_temperature(request.temperature),
-        "top_p": _resolve_top_p(request.top_p),
-        "top_k": request.top_k or 0,
-        "min_p": request.min_p or 0.0,
-        "presence_penalty": request.presence_penalty or 0.0,
-        "repetition_penalty": request.repetition_penalty or 1.0,
-    }
-    if rep_penalty is not None:
-        chat_kwargs["repetition_penalty"] = rep_penalty
-
-    # Add multimodal content
-    if has_media:
-        chat_kwargs["images"] = images if images else None
-        chat_kwargs["videos"] = videos if videos else None
-        if request.video_fps:
-            chat_kwargs["video_fps"] = request.video_fps
-        if request.video_max_frames:
-            chat_kwargs["video_max_frames"] = request.video_max_frames
-
-    # SpecPrefill: per-request overrides
-    if request.specprefill is not None:
-        chat_kwargs["specprefill"] = request.specprefill
-    if request.specprefill_keep_pct is not None:
-        chat_kwargs["specprefill_keep_pct"] = request.specprefill_keep_pct
-
-    # Enable/disable thinking mode per request
-    if request.enable_thinking is not None:
-        chat_kwargs["enable_thinking"] = request.enable_thinking
-
-    # Add tools if provided
-    if request.tools and request.tool_choice != "none":
-        chat_kwargs["tools"] = convert_tools_for_template(request.tools)
-
-    if request.stream:
-        return StreamingResponse(
-            _disconnect_guard(
-                stream_chat_completion(
-                    engine,
-                    messages,
-                    request,
-                    metrics_tracker=tracker,
-                    **chat_kwargs,
-                ),
-                raw_request,
-            ),
-            media_type="text/event-stream",
-        )
-
-    # Non-streaming response with timing and timeout
-    start_time = time.perf_counter()
-    timeout = request.timeout or _default_timeout
-
-    try:
-        output = await _wait_with_disconnect(
-            engine.chat(messages=messages, **chat_kwargs),
-            raw_request,
-            timeout=timeout,
-        )
-    except HTTPException as exc:
-        tracker.finish(result=_metrics_result_from_status(exc.status_code))
-        raise
-    if output is None:
-        tracker.finish(result="client_closed")
-        return Response(status_code=499)  # Client closed request
-
-    elapsed = time.perf_counter() - start_time
-    tokens_per_sec = output.completion_tokens / elapsed if elapsed > 0 else 0
     logger.info(
-        f"Chat completion: {output.completion_tokens} tokens in {elapsed:.2f}s ({tokens_per_sec:.1f} tok/s)"
+        "[REQUEST] last user message preview: %s",
+        _sanitize_log_text(last_user_preview, limit=300),
     )
 
-    # Parse tool calls from output using configured parser
-    # Skip tool parsing when request has no tools — otherwise the parser
-    # can misinterpret JSON output (e.g. response_format) as tool calls.
-    if request.tools:
-        cleaned_text, tool_calls = _parse_tool_calls_with_parser(output.text, request)
-    else:
-        cleaned_text, tool_calls = output.text, None
+    engine = await _acquire_default_engine_for_request(
+        raw_request,
+        total_timeout=total_timeout,
+        deadline=deadline,
+    )
+    if engine is None:
+        return Response(status_code=499)
 
-    # Extract reasoning content (strips channel tokens before JSON extraction)
-    # Skip reasoning parser when enable_thinking=False (no think tags expected)
-    reasoning_text = None
-    if _reasoning_parser and request.enable_thinking is not False:
-        # Always use original output.text for reasoning extraction so
-        # <think> content is preserved even when tool calls are present.
-        text_to_parse = output.text
-        reasoning_text, remaining_text = _reasoning_parser.extract_reasoning(
-            text_to_parse
+    release_on_exit = True
+    try:
+        prepared = _prepare_chat_completion_invocation(
+            engine,
+            request,
+            effective_max_tokens,
         )
-        # Only update cleaned_text from reasoning parser when no tool calls
-        # (tool parser already set cleaned_text appropriately)
-        if not tool_calls:
-            cleaned_text = remaining_text
 
-    # Process response_format if specified (after reasoning parser cleaned the text)
-    if response_format and not tool_calls:
-        json_input = cleaned_text or output.text
-        _, parsed_json, is_valid, error = parse_json_output(json_input, response_format)
-        if parsed_json is not None:
-            # Return JSON as string
-            cleaned_text = json.dumps(parsed_json)
-        if not is_valid:
-            logger.warning(f"JSON validation failed: {error}")
-
-    # Determine finish reason
-    finish_reason = "tool_calls" if tool_calls else output.finish_reason
-
-    tracker.finish(
-        result="success",
-        prompt_tokens=output.prompt_tokens,
-        completion_tokens=output.completion_tokens,
-    )
-    return ChatCompletionResponse(
-        model=_model_name,
-        choices=[
-            ChatCompletionChoice(
-                message=AssistantMessage(
-                    content=clean_output_text(cleaned_text) if cleaned_text else None,
-                    reasoning=reasoning_text,
-                    tool_calls=tool_calls,
+        if request.stream:
+            response = StreamingResponse(
+                _disconnect_guard(
+                    _ensure_sse_terminal(
+                        stream_chat_completion(
+                            engine,
+                            prepared.messages,
+                            request,
+                            metrics_tracker=tracker,
+                            **prepared.chat_kwargs,
+                        ),
+                        "data: [DONE]\n\n",
+                    ),
+                    raw_request,
+                    cleanup=_release_default_engine,
                 ),
-                finish_reason=finish_reason,
+                media_type="text/event-stream",
             )
-        ],
-        usage=Usage(
+            release_on_exit = False
+            return response
+
+        start_time = time.perf_counter()
+
+        try:
+            output = await _wait_with_disconnect(
+                engine.chat(messages=prepared.messages, **prepared.chat_kwargs),
+                raw_request,
+                timeout=_remaining_request_timeout(total_timeout, deadline),
+                timeout_detail_seconds=total_timeout,
+            )
+        except HTTPException as exc:
+            tracker.finish(result=_metrics_result_from_status(exc.status_code))
+            raise
+        if output is None:
+            tracker.finish(result="client_closed")
+            return Response(status_code=499)  # Client closed request
+
+        elapsed = time.perf_counter() - start_time
+        tokens_per_sec = output.completion_tokens / elapsed if elapsed > 0 else 0
+        logger.info(
+            f"Chat completion: {output.completion_tokens} tokens in {elapsed:.2f}s ({tokens_per_sec:.1f} tok/s)"
+        )
+
+        reasoning_text, cleaned_text, tool_calls = _extract_reasoning_and_tool_calls(
+            output.text,
+            request,
+            allow_reasoning=(
+                getattr(request, "enable_thinking", None) is not False
+                and prepared.json_logits_processor is None
+            ),
+            engine=engine,
+        )
+
+        # Process response_format if specified (after reasoning parser cleaned the text)
+        if prepared.response_format and not tool_calls:
+            json_input = cleaned_text or output.text
+            _, parsed_json, is_valid, error = parse_json_output(
+                json_input, prepared.response_format
+            )
+            if parsed_json is not None:
+                # Return JSON as string
+                cleaned_text = json.dumps(parsed_json)
+            if not is_valid:
+                if prepared.json_logits_processor is not None:
+                    logger.error(
+                        "Constrained decoding produced invalid JSON: %s", error
+                    )
+                else:
+                    logger.warning(f"JSON validation failed: {error}")
+
+        # Determine finish reason
+        finish_reason = "tool_calls" if tool_calls else output.finish_reason
+
+        tracker.finish(
+            result="success",
             prompt_tokens=output.prompt_tokens,
             completion_tokens=output.completion_tokens,
-            total_tokens=output.prompt_tokens + output.completion_tokens,
-        ),
-    )
+        )
+        return ChatCompletionResponse(
+            model=_model_name,
+            choices=[
+                ChatCompletionChoice(
+                    message=AssistantMessage(
+                        content=(
+                            clean_output_text(cleaned_text) if cleaned_text else None
+                        ),
+                        reasoning=reasoning_text,
+                        tool_calls=tool_calls,
+                    ),
+                    finish_reason=finish_reason,
+                )
+            ],
+            usage=Usage(
+                prompt_tokens=output.prompt_tokens,
+                completion_tokens=output.completion_tokens,
+                total_tokens=output.prompt_tokens + output.completion_tokens,
+            ),
+        )
+    finally:
+        if release_on_exit:
+            await _release_default_engine()
 
 
 def _normalize_messages(messages: list[dict]) -> list[dict]:
@@ -1849,6 +4033,115 @@ def _normalize_messages(messages: list[dict]) -> list[dict]:
     return merged
 
 
+def _get_engine_tokenizer(engine) -> object | None:
+    """
+    Return the tokenizer backing ``engine``, if exposed.
+
+    Different engine classes store the tokenizer under different attributes.
+    We try the common ones and return ``None`` if nothing matches, so that
+    optional features like constrained decoding can degrade gracefully.
+    """
+    for attr in ("_tokenizer", "tokenizer", "_processor", "processor"):
+        tok = getattr(engine, attr, None)
+        if tok is not None:
+            return tok
+    return None
+
+
+@app.post(
+    "/v1/responses",
+    dependencies=[Depends(verify_api_key), Depends(check_rate_limit)],
+)
+async def create_response(request: ResponsesRequest, raw_request: Request):
+    """Create a Responses API response."""
+    if request.stream:
+        return StreamingResponse(
+            _disconnect_guard(_stream_responses_request(request), raw_request),
+            media_type="text/event-stream",
+        )
+
+    response_object, _persisted_messages = await _run_responses_request(
+        request, raw_request
+    )
+    if response_object is None:
+        return Response(status_code=499)
+
+    return response_object
+
+
+def _get_forced_tool_name(tool_choice) -> str | None:
+    """Extract forced tool name from tool_choice, if any.
+
+    Returns the function name when tool_choice is a dict like
+    {"type": "function", "function": {"name": "X"}}, or None otherwise.
+    """
+    if not isinstance(tool_choice, dict):
+        return None
+    if tool_choice.get("type") != "function":
+        return None
+    func = tool_choice.get("function")
+    if isinstance(func, dict):
+        return func.get("name")
+    return None
+
+
+def _apply_forced_tool_choice(tool_choice, tools, messages, chat_kwargs=None):
+    """Apply forced tool_choice by filtering tools and injecting instructions.
+
+    Handles:
+    - tool_choice={"type":"function","function":{"name":"X"}} -> filter + instruct
+    - tool_choice="required" -> instruct model to call at least one tool
+
+    Args:
+        tool_choice: The tool_choice value from the request
+        tools: List of converted tools for the template
+        messages: The message list (will be copied if modified)
+        chat_kwargs: Optional dict to modify (e.g. disable thinking)
+
+    Returns:
+        Tuple of (tools, messages) - potentially filtered/modified
+    """
+    if not tools:
+        return tools, messages
+
+    forced_name = _get_forced_tool_name(tool_choice)
+    if forced_name:
+        # Filter tools to only the forced function
+        filtered = [t for t in tools if _tool_name(t) == forced_name]
+        if not filtered:
+            available = [_tool_name(t) for t in tools if _tool_name(t)]
+            raise ValueError(
+                f"tool_choice function '{forced_name}' not found in tools. "
+                f"Available: {available}"
+            )
+        tools = filtered
+        instruction = (
+            f"[IMPORTANT INSTRUCTION] You MUST call the `{forced_name}` function. "
+            f"Do NOT respond with plain text. Respond ONLY with a tool call to "
+            f"`{forced_name}`. This is mandatory."
+        )
+        messages = _inject_json_instruction(messages, instruction)
+        # Disable thinking to prevent model from reasoning its way out
+        if chat_kwargs is not None:
+            chat_kwargs["enable_thinking"] = False
+    elif tool_choice == "required":
+        instruction = (
+            "[IMPORTANT INSTRUCTION] You MUST call at least one of the available "
+            "tools. Do NOT respond with plain text only."
+        )
+        messages = _inject_json_instruction(messages, instruction)
+
+    return tools, messages
+
+
+def _tool_name(tool: dict) -> str | None:
+    """Extract function name from a tool definition dict."""
+    func = tool.get("function")
+    if isinstance(func, dict):
+        return func.get("name")
+    return None
+
+
 def _inject_json_instruction(messages: list, instruction: str) -> list:
     """
     Inject JSON instruction into messages.
@@ -1897,7 +4190,9 @@ def _convert_anthropic_stop_reason(openai_reason: str | None) -> str:
     return mapping.get(openai_reason or "", "end_turn")
 
 
-@app.post("/v1/messages")
+@app.post(
+    "/v1/messages", dependencies=[Depends(verify_api_key), Depends(check_rate_limit)]
+)
 async def create_anthropic_message(
     request: Request,
 ):
@@ -1909,7 +4204,6 @@ async def create_anthropic_message(
 
     Supports both streaming and non-streaming modes.
     """
-    engine = get_engine()
     tracker = _metrics.track_inference("anthropic_messages", stream=False)
 
     # Parse the raw body to handle Anthropic request format.
@@ -1928,6 +4222,7 @@ async def create_anthropic_message(
     anthropic_request = AnthropicRequest(**body)
 
     _validate_model_name(anthropic_request.model)
+    effective_max_tokens = _resolve_request_max_tokens(anthropic_request.max_tokens)
 
     # --- Detailed request logging ---
     n_msgs = len(anthropic_request.messages)
@@ -1946,148 +4241,173 @@ async def create_anthropic_message(
         f"msgs={n_msgs} total_chars={total_chars} system_chars={sys_chars} "
         f"tools={n_tools}"
     )
-    logger.info(f"[REQUEST] last user message preview: {last_user_preview!r}")
+    logger.info(
+        "[REQUEST] last user message preview: %s",
+        _sanitize_log_text(last_user_preview, limit=300),
+    )
 
     # Convert Anthropic request -> OpenAI request
     openai_request = anthropic_to_openai(anthropic_request)
-
-    if anthropic_request.stream:
-        return StreamingResponse(
-            _disconnect_guard(
-                _stream_anthropic_messages(
-                    engine,
-                    openai_request,
-                    anthropic_request,
-                    metrics_tracker=tracker,
-                ),
-                request,
-            ),
-            media_type="text/event-stream",
-            headers={
-                "Cache-Control": "no-cache",
-                "Connection": "keep-alive",
-            },
-        )
-
-    # Non-streaming: run inference through existing engine
-    messages, images, videos = extract_multimodal_content(
-        openai_request.messages,
-        preserve_native_format=engine.preserve_native_tool_format,
+    total_timeout, deadline = _start_request_budget(None)
+    engine = await _acquire_default_engine_for_request(
+        request,
+        total_timeout=total_timeout,
+        deadline=deadline,
     )
-    messages = _normalize_messages(messages)
-
-    chat_kwargs = {
-        "max_tokens": openai_request.max_tokens or _default_max_tokens,
-        "temperature": openai_request.temperature,
-        "top_p": openai_request.top_p,
-        "top_k": openai_request.top_k or 0,
-        "min_p": openai_request.min_p or 0.0,
-        "presence_penalty": openai_request.presence_penalty or 0.0,
-        "repetition_penalty": openai_request.repetition_penalty or 1.0,
-    }
-
-    if openai_request.tools and openai_request.tool_choice != "none":
-        chat_kwargs["tools"] = convert_tools_for_template(openai_request.tools)
-
-    start_time = time.perf_counter()
-    timeout = _default_timeout
+    if engine is None:
+        return Response(status_code=499)
+    release_on_exit = True
+    prepared = _prepare_anthropic_invocation(
+        engine,
+        openai_request,
+        effective_max_tokens,
+    )
 
     try:
-        output = await _wait_with_disconnect(
-            engine.chat(messages=messages, **chat_kwargs),
-            request,
-            timeout=timeout,
-        )
-    except HTTPException as exc:
-        tracker.finish(result=_metrics_result_from_status(exc.status_code))
-        raise
-    if output is None:
-        tracker.finish(result="client_closed")
-        return Response(status_code=499)  # Client closed request
+        if anthropic_request.stream:
+            anthropic_terminal = (
+                f"event: message_stop\ndata: {json.dumps({'type': 'message_stop'})}\n\n"
+            )
+            response = StreamingResponse(
+                _disconnect_guard(
+                    _ensure_sse_terminal(
+                        _stream_anthropic_messages(
+                            engine,
+                            openai_request,
+                            anthropic_request,
+                            prepared,
+                            metrics_tracker=tracker,
+                        ),
+                        anthropic_terminal,
+                    ),
+                    request,
+                    cleanup=_release_default_engine,
+                ),
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "Connection": "keep-alive",
+                },
+            )
+            release_on_exit = False
+            return response
 
-    elapsed = time.perf_counter() - start_time
-    tokens_per_sec = output.completion_tokens / elapsed if elapsed > 0 else 0
-    logger.info(
-        f"Anthropic messages: {output.completion_tokens} tokens in {elapsed:.2f}s ({tokens_per_sec:.1f} tok/s)"
-    )
+        start_time = time.perf_counter()
+        try:
+            output = await _wait_with_disconnect(
+                engine.chat(messages=prepared.messages, **prepared.chat_kwargs),
+                request,
+                timeout=_remaining_request_timeout(total_timeout, deadline),
+                timeout_detail_seconds=total_timeout,
+            )
+        except HTTPException as exc:
+            tracker.finish(result=_metrics_result_from_status(exc.status_code))
+            raise
+        if output is None:
+            tracker.finish(result="client_closed")
+            return Response(status_code=499)  # Client closed request
 
-    # Parse tool calls (skip when no tools to avoid misinterpreting output)
-    if openai_request.tools:
-        cleaned_text, tool_calls = _parse_tool_calls_with_parser(
-            output.text, openai_request
-        )
-    else:
-        cleaned_text, tool_calls = output.text, None
-
-    # Extract reasoning if parser is configured
-    reasoning_text = None
-    if _reasoning_parser and not tool_calls:
-        text_to_parse = cleaned_text or output.text
-        reasoning_text, cleaned_text = _reasoning_parser.extract_reasoning(
-            text_to_parse
-        )
-
-    # Clean output text
-    final_content = None
-    if cleaned_text:
-        final_content = clean_output_text(cleaned_text)
-
-    # Build Anthropic content blocks directly (with thinking support)
-    content_blocks = []
-
-    if reasoning_text:
-        content_blocks.append(
-            AnthropicResponseContentBlock(type="thinking", thinking=reasoning_text)
-        )
-
-    if final_content:
-        content_blocks.append(
-            AnthropicResponseContentBlock(type="text", text=final_content)
+        elapsed = time.perf_counter() - start_time
+        tokens_per_sec = output.completion_tokens / elapsed if elapsed > 0 else 0
+        logger.info(
+            f"Anthropic messages: {output.completion_tokens} tokens in {elapsed:.2f}s ({tokens_per_sec:.1f} tok/s)"
         )
 
-    if tool_calls:
-        for tc in tool_calls:
-            try:
-                tool_input = json.loads(tc.function.arguments)
-            except (json.JSONDecodeError, AttributeError):
-                tool_input = {}
+        reasoning_text, cleaned_text, tool_calls = _extract_reasoning_and_tool_calls(
+            output.text,
+            openai_request,
+            allow_reasoning=prepared.json_logits_processor is None,
+            engine=engine,
+        )
+
+        if prepared.response_format and not tool_calls:
+            json_input = cleaned_text or output.text
+            _, parsed_json, is_valid, error = parse_json_output(
+                json_input, prepared.response_format
+            )
+            if parsed_json is not None:
+                cleaned_text = json.dumps(parsed_json)
+            if not is_valid:
+                if prepared.json_logits_processor is not None:
+                    logger.error(
+                        "Constrained decoding produced invalid JSON on Anthropic endpoint: %s",
+                        error,
+                    )
+                else:
+                    logger.warning(
+                        "JSON validation failed on Anthropic endpoint: %s", error
+                    )
+
+        # Clean output text
+        final_content = None
+        if cleaned_text:
+            final_content = clean_output_text(cleaned_text)
+
+        # Determine finish reason
+        finish_reason = "tool_calls" if tool_calls else output.finish_reason
+
+        # Build Anthropic content blocks directly (with thinking support)
+        content_blocks = []
+
+        if reasoning_text:
             content_blocks.append(
-                AnthropicResponseContentBlock(
-                    type="tool_use",
-                    id=tc.id,
-                    name=tc.function.name,
-                    input=tool_input,
-                )
+                AnthropicResponseContentBlock(type="thinking", thinking=reasoning_text)
             )
 
-    if not content_blocks:
-        content_blocks.append(AnthropicResponseContentBlock(type="text", text=""))
+        if final_content:
+            content_blocks.append(
+                AnthropicResponseContentBlock(type="text", text=final_content)
+            )
 
-    stop_reason = _convert_anthropic_stop_reason(
-        "tool_calls" if tool_calls else output.finish_reason
-    )
+        if tool_calls:
+            for tc in tool_calls:
+                try:
+                    tool_input = json.loads(tc.function.arguments)
+                except (json.JSONDecodeError, AttributeError):
+                    tool_input = {}
+                content_blocks.append(
+                    AnthropicResponseContentBlock(
+                        type="tool_use",
+                        id=tc.id,
+                        name=tc.function.name,
+                        input=tool_input,
+                    )
+                )
 
-    anthropic_response = AnthropicResponse(
-        model=_model_name,
-        content=content_blocks,
-        stop_reason=stop_reason,
-        usage=AnthropicUsage(
-            input_tokens=output.prompt_tokens,
-            output_tokens=output.completion_tokens,
-        ),
-    )
-    tracker.finish(
-        result="success",
-        prompt_tokens=output.prompt_tokens,
-        completion_tokens=output.completion_tokens,
-    )
-    return Response(
-        content=anthropic_response.model_dump_json(exclude_none=True),
-        media_type="application/json",
-    )
+        if not content_blocks:
+            content_blocks.append(AnthropicResponseContentBlock(type="text", text=""))
+
+        stop_reason = _convert_anthropic_stop_reason(
+            "tool_calls" if tool_calls else output.finish_reason
+        )
+
+        anthropic_response = AnthropicResponse(
+            model=_model_name,
+            content=content_blocks,
+            stop_reason=stop_reason,
+            usage=AnthropicUsage(
+                input_tokens=output.prompt_tokens,
+                output_tokens=output.completion_tokens,
+            ),
+        )
+        tracker.finish(
+            result="success",
+            prompt_tokens=output.prompt_tokens,
+            completion_tokens=output.completion_tokens,
+        )
+        return Response(
+            content=anthropic_response.model_dump_json(exclude_none=True),
+            media_type="application/json",
+        )
+    finally:
+        if release_on_exit:
+            await _release_default_engine()
 
 
-@app.post("/v1/messages/count_tokens")
+@app.post(
+    "/v1/messages/count_tokens",
+    dependencies=[Depends(verify_api_key), Depends(check_rate_limit)],
+)
 async def count_anthropic_tokens(request: Request):
     """
     Count tokens for an Anthropic Messages API request.
@@ -2098,63 +4418,77 @@ async def count_anthropic_tokens(request: Request):
     from Claude Code don't include max_tokens.
     """
     body = await request.json()
+    request_model = body.get("model")
+    if isinstance(request_model, str) and request_model:
+        _validate_model_name(request_model)
+    total_timeout, deadline = _start_request_budget(None)
+    engine = await _acquire_default_engine_for_request(
+        request,
+        total_timeout=total_timeout,
+        deadline=deadline,
+        count_activity=False,
+    )
+    if engine is None:
+        return Response(status_code=499)
 
-    engine = get_engine()
     tokenizer = engine.tokenizer
 
     total_tokens = 0
 
-    # System message
-    system = body.get("system", "")
-    if isinstance(system, str) and system:
-        total_tokens += len(tokenizer.encode(system))
-    elif isinstance(system, list):
-        for block in system:
-            if isinstance(block, dict):
-                text = block.get("text", "")
-                if text:
-                    total_tokens += len(tokenizer.encode(text))
-
-    # Messages
-    for msg in body.get("messages", []):
-        content = msg.get("content", "")
-        if isinstance(content, str):
-            if content:
-                total_tokens += len(tokenizer.encode(content))
-        elif isinstance(content, list):
-            for block in content:
+    try:
+        # System message
+        system = body.get("system", "")
+        if isinstance(system, str) and system:
+            total_tokens += len(tokenizer.encode(system))
+        elif isinstance(system, list):
+            for block in system:
                 if isinstance(block, dict):
                     text = block.get("text", "")
                     if text:
                         total_tokens += len(tokenizer.encode(text))
-                    # tool_use input
-                    if block.get("input"):
-                        total_tokens += len(
-                            tokenizer.encode(json.dumps(block["input"]))
-                        )
-                    # tool_result content
-                    sub_content = block.get("content", "")
-                    if isinstance(sub_content, str) and sub_content:
-                        total_tokens += len(tokenizer.encode(sub_content))
-                    elif isinstance(sub_content, list):
-                        for item in sub_content:
-                            if isinstance(item, dict):
-                                item_text = item.get("text", "")
-                                if item_text:
-                                    total_tokens += len(tokenizer.encode(item_text))
 
-    # Tools
-    for tool in body.get("tools", []):
-        name = tool.get("name", "")
-        if name:
-            total_tokens += len(tokenizer.encode(name))
-        desc = tool.get("description", "")
-        if desc:
-            total_tokens += len(tokenizer.encode(desc))
-        if tool.get("input_schema"):
-            total_tokens += len(tokenizer.encode(json.dumps(tool["input_schema"])))
+        # Messages
+        for msg in body.get("messages", []):
+            content = msg.get("content", "")
+            if isinstance(content, str):
+                if content:
+                    total_tokens += len(tokenizer.encode(content))
+            elif isinstance(content, list):
+                for block in content:
+                    if isinstance(block, dict):
+                        text = block.get("text", "")
+                        if text:
+                            total_tokens += len(tokenizer.encode(text))
+                        # tool_use input
+                        if block.get("input"):
+                            total_tokens += len(
+                                tokenizer.encode(json.dumps(block["input"]))
+                            )
+                        # tool_result content
+                        sub_content = block.get("content", "")
+                        if isinstance(sub_content, str) and sub_content:
+                            total_tokens += len(tokenizer.encode(sub_content))
+                        elif isinstance(sub_content, list):
+                            for item in sub_content:
+                                if isinstance(item, dict):
+                                    item_text = item.get("text", "")
+                                    if item_text:
+                                        total_tokens += len(tokenizer.encode(item_text))
 
-    return {"input_tokens": total_tokens}
+        # Tools
+        for tool in body.get("tools", []):
+            name = tool.get("name", "")
+            if name:
+                total_tokens += len(tokenizer.encode(name))
+            desc = tool.get("description", "")
+            if desc:
+                total_tokens += len(tokenizer.encode(desc))
+            if tool.get("input_schema"):
+                total_tokens += len(tokenizer.encode(json.dumps(tool["input_schema"])))
+
+        return {"input_tokens": total_tokens}
+    finally:
+        await _release_default_engine(count_activity=False)
 
 
 def _emit_content_pieces(
@@ -2214,6 +4548,7 @@ async def _stream_anthropic_messages(
     engine: BaseEngine,
     openai_request: ChatCompletionRequest,
     anthropic_request: AnthropicRequest,
+    prepared: PreparedChatInvocation,
     metrics_tracker=None,
 ) -> AsyncIterator[str]:
     """
@@ -2232,25 +4567,8 @@ async def _stream_anthropic_messages(
     result_label = "success"
     prompt_tokens = 0
 
-    # Extract messages for engine
-    messages, images, videos = extract_multimodal_content(
-        openai_request.messages,
-        preserve_native_format=engine.preserve_native_tool_format,
-    )
-    messages = _normalize_messages(messages)
-
-    chat_kwargs = {
-        "max_tokens": openai_request.max_tokens or _default_max_tokens,
-        "temperature": openai_request.temperature,
-        "top_p": openai_request.top_p,
-        "top_k": openai_request.top_k or 0,
-        "min_p": openai_request.min_p or 0.0,
-        "presence_penalty": openai_request.presence_penalty or 0.0,
-        "repetition_penalty": openai_request.repetition_penalty or 1.0,
-    }
-
-    if openai_request.tools and openai_request.tool_choice != "none":
-        chat_kwargs["tools"] = convert_tools_for_template(openai_request.tools)
+    messages = prepared.messages
+    chat_kwargs = dict(prepared.chat_kwargs)
 
     # Emit message_start
     message_start = {
@@ -2271,7 +4589,9 @@ async def _stream_anthropic_messages(
     }
     yield f"event: message_start\ndata: {json.dumps(message_start)}\n\n"
 
-    use_reasoning = _reasoning_parser is not None
+    use_reasoning = _reasoning_parser is not None and not chat_kwargs.get(
+        "logits_processors"
+    )
 
     if use_reasoning:
         _reasoning_parser.reset_state()
@@ -2294,24 +4614,10 @@ async def _stream_anthropic_messages(
 
     # Tool call streaming suppression — prevents raw tool markup from leaking
     # as text_delta events. Mirrors the OpenAI streaming path logic.
-    global _tool_parser_instance
     tool_parser = None
     tool_accumulated_text = ""
     tool_markup_possible = False
-    tool_choice = getattr(openai_request, "tool_choice", None)
-    if _enable_auto_tool_choice and _tool_call_parser and tool_choice != "none":
-        if _tool_parser_instance is None:
-            try:
-                parser_cls = ToolParserManager.get_tool_parser(_tool_call_parser)
-                tokenizer = None
-                if _engine is not None and hasattr(_engine, "_tokenizer"):
-                    tokenizer = _engine._tokenizer
-                _tool_parser_instance = parser_cls(tokenizer)
-            except Exception:
-                pass
-        if _tool_parser_instance is not None:
-            tool_parser = _tool_parser_instance
-            tool_parser.reset()
+    tool_parser = _get_streaming_tool_parser(openai_request, engine)
 
     try:
         async for output in engine.stream_chat(messages=messages, **chat_kwargs):
@@ -2341,7 +4647,12 @@ async def _stream_anthropic_messages(
 
                 # Filter tool call markup during streaming
                 if tool_parser and content_to_emit:
-                    if not tool_markup_possible and "<" not in content_to_emit:
+                    if (
+                        not tool_markup_possible
+                        and not _streaming_tool_markup_possible(
+                            tool_accumulated_text + content_to_emit
+                        )
+                    ):
                         tool_accumulated_text += content_to_emit
                     else:
                         if not tool_markup_possible:
@@ -2386,7 +4697,12 @@ async def _stream_anthropic_messages(
 
                 # Filter tool call markup during streaming
                 if tool_parser and content_to_emit:
-                    if not tool_markup_possible and "<" not in content_to_emit:
+                    if (
+                        not tool_markup_possible
+                        and not _streaming_tool_markup_possible(
+                            tool_accumulated_text + content_to_emit
+                        )
+                    ):
                         tool_accumulated_text += content_to_emit
                     else:
                         if not tool_markup_possible:
@@ -2428,7 +4744,11 @@ async def _stream_anthropic_messages(
             text_block_started = True
 
         # Check for tool calls in accumulated text
-        _, tool_calls = _parse_tool_calls_with_parser(accumulated_text, openai_request)
+        _, tool_calls = _parse_tool_calls_with_parser(
+            accumulated_text,
+            openai_request,
+            engine=engine,
+        )
 
         # Close text block
         if text_block_started:
@@ -2495,6 +4815,7 @@ async def stream_completion(
     engine: BaseEngine,
     prompt: str,
     request: CompletionRequest,
+    max_tokens: int,
     repetition_penalty: float | None = None,
     metrics_tracker=None,
 ) -> AsyncIterator[str]:
@@ -2504,7 +4825,7 @@ async def stream_completion(
     completion_tokens = 0
     generate_kwargs = {
         "prompt": prompt,
-        "max_tokens": request.max_tokens or _default_max_tokens,
+        "max_tokens": max_tokens,
         "temperature": _resolve_temperature(request.temperature),
         "top_p": _resolve_top_p(request.top_p),
         "top_k": request.top_k or 0,
@@ -2551,8 +4872,6 @@ async def stream_completion(
             if output.finished:
                 data["usage"] = get_usage(output).model_dump()
             yield f"data: {json.dumps(data)}\n\n"
-
-        yield "data: [DONE]\n\n"
     except HTTPException as exc:
         result = _metrics_result_from_status(exc.status_code)
         raise
@@ -2563,6 +4882,7 @@ async def stream_completion(
         result = "error"
         raise
     finally:
+        yield "data: [DONE]\n\n"
         if metrics_tracker is not None:
             metrics_tracker.finish(
                 result=result,
@@ -2617,28 +4937,27 @@ async def stream_chat_completion(
     completion_tokens = 0
     last_output = None
 
+    # Response-format streaming filter — strip markdown code fences from
+    # content when client asked for JSON. Non-streaming path strips fences
+    # via ``parse_json_output``; without this, streaming clients see
+    # ``"```json{...}```"`` instead of ``"{...}"`` for models that wrap
+    # their structured output in markdown (e.g. Gemma 4).
+    fence_stripper: StreamingJsonFenceStripper | None = None
+    _rf = getattr(request, "response_format", None)
+    _rf_type = None
+    if _rf is not None:
+        _rf_type = getattr(_rf, "type", None)
+        if _rf_type is None and isinstance(_rf, dict):
+            _rf_type = _rf.get("type")
+    if _rf_type in ("json_object", "json_schema"):
+        fence_stripper = StreamingJsonFenceStripper()
+
     # Tool call streaming state
-    global _tool_parser_instance
     tool_parser = None
     tool_accumulated_text = ""
     tool_calls_detected = False
-    tool_markup_possible = False  # Fast path: skip parsing until '<' seen
-    tool_choice = getattr(request, "tool_choice", None)
-    if _enable_auto_tool_choice and _tool_call_parser and tool_choice != "none":
-        # Initialize parser if needed (same as _parse_tool_calls_with_parser)
-        if _tool_parser_instance is None:
-            try:
-                parser_cls = ToolParserManager.get_tool_parser(_tool_call_parser)
-                tokenizer = None
-                if _engine is not None and hasattr(_engine, "_tokenizer"):
-                    tokenizer = _engine._tokenizer
-                _tool_parser_instance = parser_cls(tokenizer)
-                logger.info(f"Initialized tool call parser: {_tool_call_parser}")
-            except Exception as e:
-                logger.warning(f"Failed to init tool parser for streaming: {e}")
-        if _tool_parser_instance is not None:
-            tool_parser = _tool_parser_instance
-            tool_parser.reset()
+    tool_markup_possible = False  # Fast path: skip parsing until markers appear
+    tool_parser = _get_streaming_tool_parser(request, engine)
 
     try:
         # Stream content
@@ -2689,7 +5008,12 @@ async def stream_chat_completion(
 
                 # Tool call parsing on content portion
                 if tool_parser and content:
-                    if not tool_markup_possible and "<" not in content:
+                    if (
+                        not tool_markup_possible
+                        and not _streaming_tool_markup_possible(
+                            tool_accumulated_text + content
+                        )
+                    ):
                         tool_accumulated_text += content
                         # Suppress whitespace-only content when tools are active;
                         # avoids emitting stray newlines before tool call XML.
@@ -2765,6 +5089,14 @@ async def stream_chat_completion(
                         if content:
                             content = _TOOL_MARKUP_PATTERN.sub("", content)
 
+                # Strip markdown code fences when response_format is set.
+                if fence_stripper is not None and not tool_calls_detected:
+                    content = fence_stripper.feed(content) if content else ""
+                    if output.finished:
+                        flush = fence_stripper.finalize()
+                        if flush:
+                            content = content + flush
+
                 chunk = ChatCompletionChunk(
                     id=response_id,
                     model=_model_name,
@@ -2799,10 +5131,16 @@ async def stream_chat_completion(
 
                 # Tool call streaming parsing
                 if tool_parser and delta_text:
-                    # Fast path: skip full parsing until '<' is seen in the stream,
-                    # which could start tool markup (e.g. <tool_call>). This avoids
-                    # per-token string scanning on the growing accumulated text.
-                    if not tool_markup_possible and "<" not in delta_text:
+                    # Fast path: skip full parsing until likely tool markup appears.
+                    # This preserves the cheap path for ordinary text while still
+                    # allowing generic streaming tool parsing when no explicit
+                    # parser flags are configured.
+                    if (
+                        not tool_markup_possible
+                        and not _streaming_tool_markup_possible(
+                            tool_accumulated_text + delta_text
+                        )
+                    ):
                         tool_accumulated_text += delta_text
                         # No tool markup yet, fall through to normal chunk emission
                     else:
@@ -2858,6 +5196,14 @@ async def stream_chat_completion(
                         if content:
                             content = _TOOL_MARKUP_PATTERN.sub("", content)
 
+                # Strip markdown code fences when response_format is set.
+                if fence_stripper is not None and not tool_calls_detected:
+                    content = fence_stripper.feed(content) if content else ""
+                    if output.finished:
+                        flush = fence_stripper.finalize()
+                        if flush:
+                            content = content + flush
+
                 chunk = ChatCompletionChunk(
                     id=response_id,
                     model=_model_name,
@@ -2883,11 +5229,7 @@ async def stream_chat_completion(
             tool_parser
             and tool_accumulated_text
             and not tool_calls_detected
-            and (
-                "<tool_call>" in tool_accumulated_text
-                or "<|tool_call>" in tool_accumulated_text
-                or "<function" in tool_accumulated_text
-            )
+            and _streaming_tool_markup_possible(tool_accumulated_text)
         ):
             final_parse_result = tool_parser.extract_tool_calls(tool_accumulated_text)
             if final_parse_result.tools_called:
@@ -2924,6 +5266,39 @@ async def stream_chat_completion(
                     ],
                 )
                 yield f"data: {tool_chunk.model_dump_json()}\n\n"
+
+        # Safety-net validation: if response_format was requested, verify the
+        # accumulated output still parses.  When constrained decoding is active
+        # this should always succeed; if it fails we log loudly (error) so we
+        # notice grammar-integration regressions.  When constrained decoding was
+        # *not* active (optional dep missing, incompatible tokenizer, combined
+        # with tools), we log at warning level only — the prompt-only path is
+        # best-effort.
+        if (
+            getattr(request, "response_format", None) is not None
+            and not tool_calls_detected
+        ):
+            try:
+                _, _parsed, _is_valid, _err = parse_json_output(
+                    accumulated_text, request.response_format
+                )
+                if not _is_valid:
+                    # Determine whether constrained decoding was wired up.  We
+                    # passed the processor through ``kwargs`` so its presence is
+                    # the signal.
+                    has_constrained = any(
+                        p.__class__.__name__ == "JSONSchemaLogitsProcessor"
+                        for p in (kwargs.get("logits_processors") or [])
+                    )
+                    if has_constrained:
+                        logger.error(
+                            "Streaming constrained decoding produced invalid JSON: %s",
+                            _err,
+                        )
+                    else:
+                        logger.warning("Streaming JSON validation failed: %s", _err)
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.warning("Streaming JSON validation raised: %s", exc)
 
         # Log throughput
         elapsed = time.perf_counter() - start_time
@@ -2975,13 +5350,19 @@ async def init_mcp(config_path: str):
     global _mcp_manager, _mcp_executor
 
     try:
-        from vllm_mlx.mcp import MCPClientManager, ToolExecutor, load_mcp_config
+        from vllm_mlx.mcp import (
+            MCPClientManager,
+            ToolExecutor,
+            ToolSandbox,
+            load_mcp_config,
+        )
 
         config = load_mcp_config(config_path)
         _mcp_manager = MCPClientManager(config)
         await _mcp_manager.start()
 
-        _mcp_executor = ToolExecutor(_mcp_manager)
+        sandbox = ToolSandbox(allowed_high_risk_tools=config.allowed_high_risk_tools)
+        _mcp_executor = ToolExecutor(_mcp_manager, sandbox=sandbox)
 
         logger.info(f"MCP initialized with {len(_mcp_manager.get_all_tools())} tools")
 
@@ -2989,8 +5370,51 @@ async def init_mcp(config_path: str):
         logger.error("MCP SDK not installed. Install with: pip install mcp")
         raise
     except Exception as e:
-        logger.error(f"Failed to initialize MCP: {e}")
+        logger.error("Failed to initialize MCP: %s", _sanitize_log_text(e, limit=500))
         raise
+
+
+# =============================================================================
+# TCP Keepalive
+# =============================================================================
+
+
+def _make_keepalive_http_protocol(idle=10, interval=5, count=3):
+    """Create a uvicorn HTTP protocol class with aggressive TCP keepalive.
+
+    When a client abruptly disconnects (power-off, network loss), the server
+    TCP stack won't notice for ~2 hours (default keepalive).  With aggressive
+    keepalive (idle=10s, interval=5s, count=3), dead connections are detected
+    in ~25 seconds, letting ``_wait_with_disconnect()`` abort the request and
+    stop wasting GPU cycles on tokens nobody will receive.
+    """
+    from uvicorn.protocols.http.h11_impl import H11Protocol
+
+    _Base = H11Protocol
+
+    class _KeepaliveProtocol(_Base):
+        def connection_made(self, transport):
+            super().connection_made(transport)
+            sock = transport.get_extra_info("socket")
+            if sock is None:
+                return
+            try:
+                sock.setsockopt(_socket.SOL_SOCKET, _socket.SO_KEEPALIVE, 1)
+                # macOS: TCP_KEEPALIVE (idle time), Linux: TCP_KEEPIDLE
+                if hasattr(_socket, "TCP_KEEPALIVE"):
+                    sock.setsockopt(_socket.IPPROTO_TCP, _socket.TCP_KEEPALIVE, idle)
+                elif hasattr(_socket, "TCP_KEEPIDLE"):
+                    sock.setsockopt(_socket.IPPROTO_TCP, _socket.TCP_KEEPIDLE, idle)
+                if hasattr(_socket, "TCP_KEEPINTVL"):
+                    sock.setsockopt(
+                        _socket.IPPROTO_TCP, _socket.TCP_KEEPINTVL, interval
+                    )
+                if hasattr(_socket, "TCP_KEEPCNT"):
+                    sock.setsockopt(_socket.IPPROTO_TCP, _socket.TCP_KEEPCNT, count)
+            except OSError:
+                pass  # best-effort; some platforms may not support all options
+
+    return _KeepaliveProtocol
 
 
 # =============================================================================
@@ -3000,6 +5424,106 @@ async def init_mcp(config_path: str):
 
 def main():
     """Run the server."""
+    parser = create_parser()
+    args = parser.parse_args()
+
+    # Set global configuration
+    global _api_key, _default_timeout, _rate_limiter, _metrics_enabled
+    global _default_temperature, _default_top_p, _default_chat_template_kwargs
+    global _max_audio_upload_bytes, _max_tts_input_chars
+    _api_key = args.api_key
+    _default_timeout = args.timeout
+    _metrics_enabled = args.enable_metrics
+    _metrics.configure(enabled=args.enable_metrics)
+    if args.default_temperature is not None:
+        _default_temperature = args.default_temperature
+    if args.default_top_p is not None:
+        _default_top_p = args.default_top_p
+    _default_chat_template_kwargs = args.default_chat_template_kwargs
+    _max_audio_upload_bytes = args.max_audio_upload_mb * 1024 * 1024
+    _max_tts_input_chars = args.max_tts_input_chars
+
+    # Configure rate limiter
+    if args.rate_limit > 0:
+        _rate_limiter = RateLimiter(requests_per_minute=args.rate_limit, enabled=True)
+        logger.info(
+            f"Rate limiting enabled: {args.rate_limit} requests/minute per client"
+        )
+
+    # Security summary at startup
+    logger.info("=" * 60)
+    logger.info("SECURITY CONFIGURATION")
+    logger.info("=" * 60)
+    if _api_key:
+        logger.info("  Authentication: ENABLED (API key required)")
+    else:
+        logger.warning("  Authentication: DISABLED - Use --api-key to enable")
+    if args.rate_limit > 0:
+        logger.info(f"  Rate limiting: ENABLED ({args.rate_limit} req/min)")
+    else:
+        logger.warning("  Rate limiting: DISABLED - Use --rate-limit to enable")
+    logger.info(f"  Request timeout: {args.timeout}s")
+    if args.enable_metrics:
+        logger.info("  Metrics: ENABLED (/metrics, unauthenticated)")
+    else:
+        logger.info("  Metrics: DISABLED - Use --enable-metrics to expose /metrics")
+    if args.auto_unload_idle_seconds > 0:
+        logger.info(
+            "  Idle auto-unload: ENABLED (%.0fs)", args.auto_unload_idle_seconds
+        )
+    else:
+        logger.info("  Idle auto-unload: DISABLED")
+    if args.trust_remote_code:
+        logger.warning("  Remote code loading: ENABLED (--trust-remote-code)")
+    else:
+        logger.info("  Remote code loading: DISABLED (default)")
+    logger.info(
+        f"  Audio upload limit: {args.max_audio_upload_mb} MiB, "
+        f"TTS input limit: {args.max_tts_input_chars} chars"
+    )
+    logger.info("=" * 60)
+
+    # Set MCP config for lifespan
+    if args.mcp_config:
+        os.environ["VLLM_MLX_MCP_CONFIG"] = args.mcp_config
+
+    # Initialize reasoning parser if specified
+    if args.reasoning_parser:
+        global _reasoning_parser
+        from .reasoning import get_parser
+
+        parser_cls = get_parser(args.reasoning_parser)
+        _reasoning_parser = parser_cls()
+        logger.info(f"Reasoning parser enabled: {args.reasoning_parser}")
+
+    # Pre-load embedding model if specified
+    load_embedding_model(args.embedding_model, lock=True)
+
+    # Load model before starting server
+    load_model(
+        args.model,
+        use_batching=args.continuous_batching,
+        max_tokens=args.max_tokens,
+        max_request_tokens=args.max_request_tokens,
+        force_mllm=args.mllm,
+        trust_remote_code=args.trust_remote_code,
+        auto_unload_idle_seconds=args.auto_unload_idle_seconds,
+        lazy_load_model=args.lazy_load_model,
+    )
+
+    # Start server with TCP keepalive for fast dead-client detection.
+    # Without this, abrupt client disconnects (power-off, network loss) take
+    # 2+ hours to detect via default TCP keepalive, wasting GPU cycles.
+    uvicorn.run(
+        app,
+        host=args.host,
+        port=args.port,
+        http=_make_keepalive_http_protocol(),
+    )
+
+
+def create_parser() -> argparse.ArgumentParser:
+    """Create the standalone server CLI parser."""
     parser = argparse.ArgumentParser(
         description="vllm-mlx OpenAI-compatible server for LLM and MLLM inference",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -3024,8 +5548,8 @@ Examples:
     parser.add_argument(
         "--host",
         type=str,
-        default="0.0.0.0",
-        help="Host to bind to",
+        default="127.0.0.1",
+        help="Host to bind to (default: localhost; use 0.0.0.0 to expose externally)",
     )
     parser.add_argument(
         "--port",
@@ -3037,6 +5561,11 @@ Examples:
         "--mllm",
         action="store_true",
         help="Force loading as MLLM (multimodal language model)",
+    )
+    parser.add_argument(
+        "--trust-remote-code",
+        action="store_true",
+        help="Allow HuggingFace remote code execution during model/tokenizer loading",
     )
     parser.add_argument(
         "--continuous-batching",
@@ -3056,6 +5585,12 @@ Examples:
         help="Default max tokens for generation",
     )
     parser.add_argument(
+        "--max-request-tokens",
+        type=int,
+        default=32768,
+        help="Maximum max_tokens accepted from API clients (default: 32768)",
+    )
+    parser.add_argument(
         "--api-key",
         type=str,
         default=None,
@@ -3071,6 +5606,17 @@ Examples:
         "--enable-metrics",
         action="store_true",
         help="Expose Prometheus metrics on /metrics (disabled by default)",
+    )
+    parser.add_argument(
+        "--auto-unload-idle-seconds",
+        type=float,
+        default=0.0,
+        help="Unload the main model after this many idle seconds (0 = disabled)",
+    )
+    parser.add_argument(
+        "--lazy-load-model",
+        action="store_true",
+        help="Register the main model at startup but defer loading until first request",
     )
     parser.add_argument(
         "--rate-limit",
@@ -3110,73 +5656,29 @@ Examples:
         default=None,
         help="Default top_p for generation when not specified in request",
     )
-
-    args = parser.parse_args()
-
-    # Set global configuration
-    global _api_key, _default_timeout, _rate_limiter, _metrics_enabled
-    global _default_temperature, _default_top_p
-    _api_key = args.api_key
-    _default_timeout = args.timeout
-    _metrics_enabled = args.enable_metrics
-    _metrics.configure(enabled=args.enable_metrics)
-    if args.default_temperature is not None:
-        _default_temperature = args.default_temperature
-    if args.default_top_p is not None:
-        _default_top_p = args.default_top_p
-
-    # Configure rate limiter
-    if args.rate_limit > 0:
-        _rate_limiter = RateLimiter(requests_per_minute=args.rate_limit, enabled=True)
-        logger.info(
-            f"Rate limiting enabled: {args.rate_limit} requests/minute per client"
-        )
-
-    # Security summary at startup
-    logger.info("=" * 60)
-    logger.info("SECURITY CONFIGURATION")
-    logger.info("=" * 60)
-    if _api_key:
-        logger.info("  Authentication: ENABLED (API key required)")
-    else:
-        logger.warning("  Authentication: DISABLED - Use --api-key to enable")
-    if args.rate_limit > 0:
-        logger.info(f"  Rate limiting: ENABLED ({args.rate_limit} req/min)")
-    else:
-        logger.warning("  Rate limiting: DISABLED - Use --rate-limit to enable")
-    logger.info(f"  Request timeout: {args.timeout}s")
-    if args.enable_metrics:
-        logger.info("  Metrics: ENABLED (/metrics, unauthenticated)")
-    else:
-        logger.info("  Metrics: DISABLED - Use --enable-metrics to expose /metrics")
-    logger.info("=" * 60)
-
-    # Set MCP config for lifespan
-    if args.mcp_config:
-        os.environ["VLLM_MLX_MCP_CONFIG"] = args.mcp_config
-
-    # Initialize reasoning parser if specified
-    if args.reasoning_parser:
-        global _reasoning_parser
-        from .reasoning import get_parser
-
-        parser_cls = get_parser(args.reasoning_parser)
-        _reasoning_parser = parser_cls()
-        logger.info(f"Reasoning parser enabled: {args.reasoning_parser}")
-
-    # Pre-load embedding model if specified
-    load_embedding_model(args.embedding_model, lock=True)
-
-    # Load model before starting server
-    load_model(
-        args.model,
-        use_batching=args.continuous_batching,
-        max_tokens=args.max_tokens,
-        force_mllm=args.mllm,
+    parser.add_argument(
+        "--default-chat-template-kwargs",
+        type=make_json_object_arg_parser("--default-chat-template-kwargs"),
+        default=None,
+        help=(
+            "Default chat template kwargs to apply to all requests when request "
+            "chat_template_kwargs is omitted or empty; empty request kwargs use "
+            'existing server defaults (JSON object, e.g. {"enable_thinking": false})'
+        ),
     )
-
-    # Start server
-    uvicorn.run(app, host=args.host, port=args.port)
+    parser.add_argument(
+        "--max-audio-upload-mb",
+        type=int,
+        default=DEFAULT_MAX_AUDIO_UPLOAD_MB,
+        help="Maximum size of uploaded audio files in MiB (default: 25)",
+    )
+    parser.add_argument(
+        "--max-tts-input-chars",
+        type=int,
+        default=DEFAULT_MAX_TTS_INPUT_CHARS,
+        help="Maximum number of characters accepted by /v1/audio/speech (default: 4096)",
+    )
+    return parser
 
 
 if __name__ == "__main__":

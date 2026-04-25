@@ -25,6 +25,36 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
+_QWEN_MTP_RMSNORM_WEIGHT_SUFFIXES = (
+    "input_layernorm.weight",
+    "post_attention_layernorm.weight",
+    "q_norm.weight",
+    "k_norm.weight",
+    "pre_fc_norm_hidden.weight",
+    "pre_fc_norm_embedding.weight",
+    "norm.weight",
+)
+
+
+def _is_qwen_mtp_rmsnorm_weight(key: str, weight) -> bool:
+    """Return True for MTP RMSNorm weights that use Qwen's offset convention."""
+    return weight.ndim == 1 and any(
+        key.endswith(suffix) for suffix in _QWEN_MTP_RMSNORM_WEIGHT_SUFFIXES
+    )
+
+
+def _apply_qwen_mtp_rmsnorm_offset_fixups(mtp_weights: dict) -> int:
+    """Apply Qwen raw-offset RMSNorm fixups without double-shifting MLX weights."""
+    norm_fixup_count = 0
+    for key, weight in list(mtp_weights.items()):
+        if not _is_qwen_mtp_rmsnorm_weight(key, weight):
+            continue
+        mean_val = weight.mean().item()
+        if mean_val < 0.5:
+            mtp_weights[key] = weight + 1.0
+            norm_fixup_count += 1
+    return norm_fixup_count
+
 
 def _fixup_moe_mtp(mtp, inner_model, loaded_keys: set, mx) -> None:
     """Fix missing weights in MoE MTP module.
@@ -217,7 +247,7 @@ def inject_mtp_support(model: Any, model_path, config: dict) -> bool:
         scales_key = key.replace(".weight", ".scales")
         biases_key = key.replace(".weight", ".biases")
 
-        if scales_key in raw_mtp and biases_key in raw_mtp:
+        if scales_key != key and scales_key in raw_mtp and biases_key in raw_mtp:
             # Quantized triplet → dequantize to BF16
             dq = mx.dequantize(
                 raw_mtp[key],
@@ -233,6 +263,48 @@ def inject_mtp_support(model: Any, model_path, config: dict) -> bool:
             mtp_weights[key] = raw_mtp[key]
             processed.add(key)
     del raw_mtp
+
+    # --- Convert fused expert format to split format ---
+    # Qwen3.6 MTP uses fused expert keys:
+    #   layers.X.mlp.experts.gate_up_proj  [n_experts, 2*intermediate, hidden]
+    #   layers.X.mlp.experts.down_proj     [n_experts, hidden, intermediate]
+    # but mlx_lm's DecoderLayer expects split switch_mlp keys:
+    #   layers.X.mlp.switch_mlp.gate_proj.weight  [n_experts, intermediate, hidden]
+    #   layers.X.mlp.switch_mlp.up_proj.weight    [n_experts, intermediate, hidden]
+    #   layers.X.mlp.switch_mlp.down_proj.weight  [n_experts, hidden, intermediate]
+    for key in list(mtp_weights.keys()):
+        if ".mlp.experts.gate_up_proj" in key:
+            prefix = key.replace(".mlp.experts.gate_up_proj", "")
+            w = mtp_weights.pop(key)
+            intermediate = w.shape[1] // 2
+            gate_key = f"{prefix}.mlp.switch_mlp.gate_proj.weight"
+            up_key = f"{prefix}.mlp.switch_mlp.up_proj.weight"
+            mtp_weights[gate_key] = w[:, :intermediate, :]
+            mtp_weights[up_key] = w[:, intermediate:, :]
+            logger.info(
+                "[MTP inject] Split fused experts.gate_up_proj -> "
+                "switch_mlp.{gate_proj,up_proj}"
+            )
+        elif ".mlp.experts.down_proj" in key:
+            prefix = key.replace(".mlp.experts.down_proj", "")
+            w = mtp_weights.pop(key)
+            down_key = f"{prefix}.mlp.switch_mlp.down_proj.weight"
+            mtp_weights[down_key] = w
+            logger.info(
+                "[MTP inject] Renamed experts.down_proj -> switch_mlp.down_proj"
+            )
+
+    # --- Fixup RMSNorm weights: HuggingFace offset convention ---
+    # Qwen3.5/3.6 models store RMSNorm weights as offsets (actual = 1 + stored).
+    # The main model's sanitize() handles this, but MTP weights bypass sanitize.
+    # Detect raw-offset weights (mean < 0.5) and apply +1.0; skip if already
+    # in actual-gamma space (as produced by add_mtp_weights_qwen35.py).
+    norm_fixup_count = _apply_qwen_mtp_rmsnorm_offset_fixups(mtp_weights)
+    if norm_fixup_count > 0:
+        logger.info(
+            f"[MTP inject] Applied +1.0 RMSNorm offset to {norm_fixup_count} "
+            f"norm weights (raw HF offset detected)"
+        )
 
     mtp.load_weights(list(mtp_weights.items()), strict=False)
     mx.eval(mtp.parameters())

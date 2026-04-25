@@ -98,7 +98,16 @@ class TestMCPCommandValidator:
         with pytest.raises(MCPSecurityError) as exc_info:
             validator.validate_command("../../../bin/bash", "test-server")
 
-        assert "dangerous pattern" in str(exc_info.value)
+        assert "path traversal" in str(exc_info.value)
+
+    def test_command_newline_blocked(self):
+        """Test that newline separators in commands are rejected."""
+        validator = MCPCommandValidator(check_path_exists=False)
+
+        with pytest.raises(MCPSecurityError) as exc_info:
+            validator.validate_command("npx\ncat /etc/passwd", "test-server")
+
+        assert "newline characters" in str(exc_info.value)
 
 
 class TestArgumentValidation:
@@ -141,6 +150,72 @@ class TestArgumentValidation:
             validator.validate_args(["--cmd", "$(whoami)"], "test-server")
 
         assert "dangerous pattern" in str(exc_info.value)
+
+    def test_python_inline_code_flag_blocked(self):
+        """Test that python -c is rejected even though python is whitelisted."""
+        validator = MCPCommandValidator(check_path_exists=False)
+
+        with pytest.raises(MCPSecurityError) as exc_info:
+            validator.validate_command_args("python3", ["-c", "print('owned')"], "test")
+
+        assert "inline Python execution" in str(exc_info.value)
+
+    def test_node_eval_flag_blocked(self):
+        """Test that node --eval is rejected."""
+        validator = MCPCommandValidator(check_path_exists=False)
+
+        with pytest.raises(MCPSecurityError) as exc_info:
+            validator.validate_command_args(
+                "node",
+                ["--eval=console.log('owned')"],
+                "test",
+            )
+
+        assert "inline JavaScript evaluation" in str(exc_info.value)
+
+    def test_npx_call_flag_blocked(self):
+        """Test that npx -c shell execution is rejected."""
+        validator = MCPCommandValidator(check_path_exists=False)
+
+        with pytest.raises(MCPSecurityError) as exc_info:
+            validator.validate_command_args("npx", ["-c", "echo owned"], "test")
+
+        assert "shell command execution" in str(exc_info.value)
+
+    def test_interpreter_normal_launch_args_still_pass(self):
+        """Test that standard MCP launches are unaffected."""
+        validator = MCPCommandValidator(check_path_exists=False)
+
+        validator.validate_command_args(
+            "npx",
+            ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"],
+            "filesystem",
+        )
+        validator.validate_command_args(
+            "uvx",
+            ["mcp-server-sqlite", "--db-path", "data.db"],
+            "sqlite",
+        )
+
+    def test_newline_in_args_blocked(self):
+        """Test that newline command separators in args are blocked."""
+        validator = MCPCommandValidator(check_path_exists=False)
+
+        with pytest.raises(MCPSecurityError) as exc_info:
+            validator.validate_args(["safe", "line1\nline2"], "test-server")
+
+        assert "newline characters" in str(exc_info.value)
+
+    def test_url_encoded_path_traversal_in_args_blocked(self):
+        """Test that encoded traversal in args is rejected."""
+        validator = MCPCommandValidator(check_path_exists=False)
+
+        with pytest.raises(MCPSecurityError) as exc_info:
+            validator.validate_args(
+                ["--path", "%2e%2e/%2e%2e/etc/passwd"], "test-server"
+            )
+
+        assert "path traversal" in str(exc_info.value)
 
 
 class TestEnvironmentValidation:
@@ -189,6 +264,15 @@ class TestEnvironmentValidation:
 
         assert "dangerous pattern" in str(exc_info.value)
 
+    def test_newline_in_env_value_blocked(self):
+        """Test that newlines in environment values are rejected."""
+        validator = MCPCommandValidator(check_path_exists=False)
+
+        with pytest.raises(MCPSecurityError) as exc_info:
+            validator.validate_env({"SAFE_VAR": "line1\rline2"}, "test-server")
+
+        assert "newline characters" in str(exc_info.value)
+
 
 class TestURLValidation:
     """Tests for SSE URL validation."""
@@ -235,6 +319,29 @@ class TestURLValidation:
             validator.validate_url("https://example.com/sse; rm -rf /", "test-server")
 
         assert "dangerous pattern" in str(exc_info.value)
+
+    def test_newline_in_url_blocked(self):
+        """Test that newlines in URLs are rejected."""
+        validator = MCPCommandValidator(check_path_exists=False)
+
+        with pytest.raises(MCPSecurityError) as exc_info:
+            validator.validate_url(
+                "https://example.com/sse\ncurl attacker", "test-server"
+            )
+
+        assert "newline characters" in str(exc_info.value)
+
+    def test_url_encoded_path_traversal_in_url_blocked(self):
+        """Test that encoded traversal in URL paths is rejected."""
+        validator = MCPCommandValidator(check_path_exists=False)
+
+        with pytest.raises(MCPSecurityError) as exc_info:
+            validator.validate_url(
+                "https://example.com/%2e%2e/%2e%2e/private",
+                "test-server",
+            )
+
+        assert "path traversal" in str(exc_info.value)
 
 
 class TestUnsafeMode:
@@ -322,6 +429,30 @@ class TestMCPServerConfigSecurity:
 
         assert "not in the allowed commands whitelist" in str(exc_info.value)
 
+    def test_inline_python_execution_in_config_rejected(self):
+        """Test that interpreter eval forms are rejected in config."""
+        with pytest.raises(ValueError) as exc_info:
+            MCPServerConfig(
+                name="inline-python",
+                transport=MCPTransport.STDIO,
+                command="python3",
+                args=["-c", "print('owned')"],
+            )
+
+        assert "inline Python execution" in str(exc_info.value)
+
+    def test_node_eval_in_config_rejected(self):
+        """Test that node eval forms are rejected in config."""
+        with pytest.raises(ValueError) as exc_info:
+            MCPServerConfig(
+                name="inline-node",
+                transport=MCPTransport.STDIO,
+                command="node",
+                args=["--eval=console.log('owned')"],
+            )
+
+        assert "inline JavaScript evaluation" in str(exc_info.value)
+
     def test_command_injection_in_config_rejected(self):
         """Test that command injection in config is rejected."""
         with pytest.raises(ValueError) as exc_info:
@@ -333,6 +464,18 @@ class TestMCPServerConfigSecurity:
 
         assert "dangerous pattern" in str(exc_info.value)
 
+    def test_encoded_path_traversal_in_config_rejected(self):
+        """Test that encoded traversal in config args is rejected."""
+        with pytest.raises(ValueError) as exc_info:
+            MCPServerConfig(
+                name="encoded-traversal",
+                transport=MCPTransport.STDIO,
+                command="npx",
+                args=["-y", "@modelcontextprotocol/server-filesystem", "%2e%2e/%2e%2e"],
+            )
+
+        assert "path traversal" in str(exc_info.value)
+
     def test_valid_sse_config(self):
         """Test that valid SSE config passes validation."""
         config = MCPServerConfig(
@@ -341,6 +484,34 @@ class TestMCPServerConfigSecurity:
             url="https://api.example.com/mcp",
         )
         assert config.url == "https://api.example.com/mcp"
+
+    def test_config_parses_allowed_high_risk_tools(self):
+        """Root MCP config should accept explicit high-risk tool allowlists."""
+        from vllm_mlx.mcp.config import validate_config
+
+        config = validate_config(
+            {
+                "servers": {},
+                "allowed_high_risk_tools": [
+                    "trusted__execute_command",
+                    "run_shell",
+                ],
+            }
+        )
+
+        assert config.allowed_high_risk_tools == {
+            "trusted__execute_command",
+            "run_shell",
+        }
+
+    def test_config_rejects_invalid_allowed_high_risk_tools(self):
+        """High-risk allowlists must be a list of non-empty strings."""
+        from vllm_mlx.mcp.config import validate_config
+
+        with pytest.raises(ValueError) as exc_info:
+            validate_config({"servers": {}, "allowed_high_risk_tools": ["ok", ""]})
+
+        assert "allowed_high_risk_tools" in str(exc_info.value)
 
     def test_skip_security_validation_field_rejected(self):
         """Test that config-file security bypass is rejected explicitly."""
@@ -802,27 +973,25 @@ class TestToolSandboxAuditLogging:
 class TestToolSandboxHighRiskTools:
     """Tests for high-risk tool detection."""
 
-    def test_high_risk_tool_warning(self, caplog):
-        """Test that high-risk tools trigger warning."""
-        import logging
-
+    def test_high_risk_tool_blocked_by_default(self):
+        """High-risk tools should be blocked unless explicitly allowlisted."""
         sandbox = ToolSandbox()
 
-        with caplog.at_level(logging.WARNING):
+        with pytest.raises(MCPSecurityError) as exc_info:
             sandbox.validate_tool_execution(
                 tool_name="execute_command",
                 server_name="test",
                 arguments={"cmd": "ls"},
             )
 
-        assert "High-risk tool detected" in caplog.text
-        assert "execute" in caplog.text
+        assert "High-risk tool 'execute_command' is blocked" in str(exc_info.value)
+        assert "allowed_high_risk_tools" in str(exc_info.value)
 
-    def test_high_risk_shell_tool(self, caplog):
-        """Test that shell tools trigger warning."""
+    def test_high_risk_tool_allowed_by_short_name(self, caplog):
+        """Short-name allowlist entries should permit trusted high-risk tools."""
         import logging
 
-        sandbox = ToolSandbox()
+        sandbox = ToolSandbox(allowed_high_risk_tools={"run_shell"})
 
         with caplog.at_level(logging.WARNING):
             sandbox.validate_tool_execution(
@@ -831,7 +1000,22 @@ class TestToolSandboxHighRiskTools:
                 arguments={},
             )
 
-        assert "High-risk tool detected" in caplog.text
+        assert "Allowing high-risk tool 'test__run_shell'" in caplog.text
+
+    def test_high_risk_tool_allowed_by_full_name(self, caplog):
+        """Full-name allowlist entries should permit trusted high-risk tools."""
+        import logging
+
+        sandbox = ToolSandbox(allowed_high_risk_tools={"trusted__execute_command"})
+
+        with caplog.at_level(logging.WARNING):
+            sandbox.validate_tool_execution(
+                tool_name="execute_command",
+                server_name="trusted",
+                arguments={"cmd": "ls"},
+            )
+
+        assert "Allowing high-risk tool 'trusted__execute_command'" in caplog.text
 
 
 class TestCustomBlockedPatterns:

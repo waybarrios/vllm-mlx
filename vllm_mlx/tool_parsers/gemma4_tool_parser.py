@@ -45,6 +45,15 @@ _CALL_PREFIX = re.compile(r"call:(\w+)\s*\{")
 # Pattern to quote bare keys: word followed by : at start or after , or {
 _BARE_KEY = re.compile(r"(?<=[{,])\s*(\w+)\s*:")
 
+# Pattern to quote bare string VALUES that the template omitted <|"|> around.
+# This fires when a schema uses a nullable type like ["string","null"] or an
+# enum field without explicit "type": the template takes the non-STRING branch
+# and emits the value raw. Preceded by a value-position separator (: [ ,), a
+# word starting with a letter, followed by ,/}/]. JSON literals true/false/null
+# are filtered out inside the substitution. Ref: llama.cpp PR #21327.
+_BARE_VALUE = re.compile(r"(?<=[:\[,])(\s*)([A-Za-z_][\w\-]*)(?=\s*[,}\]])")
+_JSON_LITERALS = frozenset({"true", "false", "null"})
+
 # Max arg block length to prevent runaway parsing on malformed input (1 MB)
 _MAX_ARG_BLOCK_LEN = 1_048_576
 
@@ -85,15 +94,27 @@ def _find_balanced_brace(text: str, start: int) -> int:
     return -1
 
 
+def _quote_bare_value(m: re.Match) -> str:
+    """Substitution callback for _BARE_VALUE — quotes bare identifiers that
+    are not JSON literals (true/false/null)."""
+    ws, word = m.group(1), m.group(2)
+    if word in _JSON_LITERALS:
+        return m.group(0)
+    return f'{ws}"{word}"'
+
+
 def _gemma4_args_to_json(text: str) -> str:
     """Convert Gemma 4 tool call args to valid JSON.
 
-    Three-step conversion (ORDER MATTERS):
+    Four-step conversion (ORDER MATTERS):
     1. Extract <|"|>-delimited strings into numbered \\x00N\\x00 placeholders.
        This protects string contents from step 2's bare-key quoting -- without
        this, a string value like "key: value" would be corrupted.
     2. Quote bare keys (word: -> "word":) now that strings are safe.
-    3. Restore placeholders as properly JSON-escaped strings via json.dumps().
+    3. Quote bare string VALUES that the template emitted without <|"|>
+       wrappers. Happens with nullable/enum schemas where the STRING branch
+       of the template isn't taken.
+    4. Restore placeholders as properly JSON-escaped strings via json.dumps().
        Uses a single re.sub pass (O(len(text))) instead of per-placeholder replace.
     """
     strings: list[str] = []
@@ -108,7 +129,10 @@ def _gemma4_args_to_json(text: str) -> str:
     # Step 2: Quote bare keys
     text = _BARE_KEY.sub(r'"\1":', text)
 
-    # Step 3: Restore captured strings as properly escaped JSON strings
+    # Step 3: Quote bare string values (nullable / enum-without-type schemas)
+    text = _BARE_VALUE.sub(_quote_bare_value, text)
+
+    # Step 4: Restore captured strings as properly escaped JSON strings
     def _restore(m: re.Match) -> str:
         idx = int(m.group(1))
         return json.dumps(strings[idx]) if idx < len(strings) else m.group(0)
@@ -132,6 +156,13 @@ class Gemma4ToolParser(ToolParser):
 
     Used when --enable-auto-tool-choice --tool-call-parser gemma4 are set.
     """
+
+    # The chat template renders <|tool_response> (token 50) when the assistant
+    # emits a tool call without its own tool_responses block — it's the signal
+    # that it's the runtime's turn, not the model's. Treat it as EOG so the
+    # model doesn't keep generating past the tool call.
+    # Ref: llama.cpp PR #21418.
+    extra_stop_tokens = ["<|tool_response>"]
 
     def extract_tool_calls(
         self, model_output: str, request: dict[str, Any] | None = None

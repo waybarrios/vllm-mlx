@@ -11,8 +11,9 @@ These models define the request and response schemas for:
 
 import time
 import uuid
+from typing import Any
 
-from pydantic import AliasChoices, BaseModel, Field
+from pydantic import AliasChoices, BaseModel, Field, model_serializer
 
 # =============================================================================
 # Content Types (for multimodal messages)
@@ -162,7 +163,7 @@ class ChatCompletionRequest(BaseModel):
     min_p: float | None = None
     presence_penalty: float | None = None
     repetition_penalty: float | None = None
-    max_tokens: int | None = None
+    max_tokens: int | None = Field(default=None, gt=0)
     stream: bool = False
     stream_options: StreamOptions | None = (
         None  # Streaming options (include_usage, etc.)
@@ -173,6 +174,8 @@ class ChatCompletionRequest(BaseModel):
     tool_choice: str | dict | None = None  # "auto", "none", or specific tool
     # Structured output
     response_format: ResponseFormat | dict | None = None
+    # Extra kwargs forwarded to tokenizer.apply_chat_template
+    chat_template_kwargs: dict[str, Any] | None = None
     # MLLM-specific parameters
     video_fps: float | None = None
     video_max_frames: int | None = None
@@ -202,6 +205,20 @@ class AssistantMessage(BaseModel):
     @property
     def reasoning(self) -> str | None:
         return self.reasoning_content
+
+    @model_serializer
+    def _serialize(self) -> dict:
+        """Serialize with OpenAI-compatible schema.
+
+        - ``tool_calls`` and ``reasoning_content`` are omitted when None.
+        - ``content`` is always included (even as null) per OpenAI spec.
+        """
+        d: dict = {"role": self.role, "content": self.content}
+        if self.reasoning_content is not None:
+            d["reasoning_content"] = self.reasoning_content
+        if self.tool_calls is not None:
+            d["tool_calls"] = [tc.model_dump() for tc in self.tool_calls]
+        return d
 
 
 class ChatCompletionChoice(BaseModel):
@@ -247,7 +264,7 @@ class CompletionRequest(BaseModel):
     min_p: float | None = None
     presence_penalty: float | None = None
     repetition_penalty: float | None = None
-    max_tokens: int | None = None
+    max_tokens: int | None = Field(default=None, gt=0)
     stream: bool = False
     stop: list[str] | None = None
     # Sampling penalties
@@ -432,6 +449,43 @@ class EmbeddingResponse(BaseModel):
 
 
 # =============================================================================
+# Reranking
+# =============================================================================
+
+
+class RerankRequest(BaseModel):
+    """Request for reranking documents against a query (Jina/Cohere convention)."""
+
+    model: str
+    query: str
+    documents: list[str | dict]
+    top_n: int | None = None
+    return_documents: bool = True
+
+
+class RerankResult(BaseModel):
+    """A single reranked document result."""
+
+    index: int
+    relevance_score: float
+    document: dict | None = None
+
+
+class RerankUsage(BaseModel):
+    """Token usage for rerank requests."""
+
+    total_tokens: int = 0
+
+
+class RerankResponse(BaseModel):
+    """Response for reranking endpoint (Jina/Cohere convention)."""
+
+    model: str
+    results: list[RerankResult]
+    usage: RerankUsage = Field(default_factory=RerankUsage)
+
+
+# =============================================================================
 # Streaming (for SSE responses)
 # =============================================================================
 
@@ -450,6 +504,24 @@ class ChatCompletionChunkDelta(BaseModel):
     @property
     def reasoning(self) -> str | None:
         return self.reasoning_content
+
+    @model_serializer
+    def _serialize(self) -> dict:
+        """Serialize delta with only non-None fields.
+
+        Per OpenAI streaming spec, delta objects only include fields that
+        carry new content.
+        """
+        d: dict = {}
+        if self.role is not None:
+            d["role"] = self.role
+        if self.content is not None:
+            d["content"] = self.content
+        if self.reasoning_content is not None:
+            d["reasoning_content"] = self.reasoning_content
+        if self.tool_calls is not None:
+            d["tool_calls"] = self.tool_calls
+        return d
 
 
 class ChatCompletionChunkChoice(BaseModel):
