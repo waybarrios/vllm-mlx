@@ -389,6 +389,25 @@ class TestServeCli:
 
         assert args.tool_call_parser == "gpt-oss"
 
+    def test_models_config_allows_registry_backed_serve(self):
+        """Registry-backed serving should not require a positional model."""
+        from vllm_mlx.cli import create_parser
+
+        parser = create_parser()
+        args = parser.parse_args(
+            [
+                "serve",
+                "--models-config",
+                "/tmp/models.yaml",
+                "--continuous-batching",
+            ]
+        )
+
+        assert args.command == "serve"
+        assert args.model is None
+        assert args.models_config == "/tmp/models.yaml"
+        assert args.continuous_batching is True
+
     def test_default_chat_template_kwargs_accepts_json_object(self):
         """Serve CLI should parse default chat template kwargs from a JSON object."""
         from vllm_mlx.cli import create_parser
@@ -613,6 +632,73 @@ class TestLoadModelTrustRemoteCode:
 
 class TestHelperFunctions:
     """Test server helper functions."""
+
+    def test_list_models_prefers_model_manager_registry(self, monkeypatch):
+        """Registry-backed mode should expose configured models through /v1/models."""
+        import asyncio
+        import vllm_mlx.server as server
+
+        class FakeManager:
+            def list_models(self):
+                return [
+                    {"id": "fast", "status": "loaded"},
+                    {"id": "smart", "status": "unloaded"},
+                ]
+
+        monkeypatch.setattr(server, "_model_manager", FakeManager())
+        monkeypatch.setattr(server, "_model_name", None)
+
+        response = asyncio.run(server.list_models())
+
+        assert [model.id for model in response.data] == ["fast", "smart"]
+
+    def test_validate_model_name_checks_registry_when_present(self, monkeypatch):
+        """Registry-backed validation should accept registered names and reject unknown ones."""
+        from fastapi import HTTPException
+        import vllm_mlx.server as server
+
+        class FakeManager:
+            _registry = {"fast": object(), "smart": object()}
+
+            @property
+            def registered_model_names(self):
+                return sorted(self._registry.keys())
+
+            def has_model(self, name):
+                return name in self._registry
+
+        monkeypatch.setattr(server, "_model_manager", FakeManager())
+        monkeypatch.setattr(server, "_model_name", None)
+
+        server._validate_model_name("fast")
+
+        with pytest.raises(HTTPException) as exc_info:
+            server._validate_model_name("missing")
+
+        assert exc_info.value.status_code == 404
+        assert "fast" in exc_info.value.detail
+
+    def test_build_reasoning_parser_uses_configured_name_and_engine_tokenizer(
+        self, monkeypatch
+    ):
+        """Per-request reasoning parser instances should be built from the configured parser name."""
+        import vllm_mlx.server as server
+
+        class FakeParser:
+            def __init__(self, tokenizer=None):
+                self.tokenizer = tokenizer
+
+        class FakeEngine:
+            tokenizer = object()
+
+        monkeypatch.setattr(server, "_reasoning_parser_name", "fake")
+        monkeypatch.setattr(server, "_reasoning_parser", None)
+        monkeypatch.setattr(server, "get_reasoning_parser", lambda name: FakeParser)
+
+        parser = server._build_reasoning_parser(FakeEngine())
+
+        assert isinstance(parser, FakeParser)
+        assert parser.tokenizer is FakeEngine.tokenizer
 
     def test_is_mllm_model_patterns(self):
         """Test MLLM model detection patterns."""

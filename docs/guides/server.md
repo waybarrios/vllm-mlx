@@ -30,6 +30,16 @@ Memory-efficient caching for production:
 vllm-mlx serve mlx-community/Llama-3.2-3B-Instruct-4bit --port 8000 --continuous-batching --use-paged-cache
 ```
 
+### Registry-Backed Multi-Model Serving
+
+Serve a named registry of models behind one endpoint:
+
+```bash
+vllm-mlx serve --models-config /etc/vllm-mlx/models.yaml --port 8000
+```
+
+Clients route requests by setting the OpenAI `model` field to one of the configured registry names. See [Multi-Model Serving](model-registry.md) for the registry file format, eviction policy, and rollout guidance.
+
 ### With Server-Wide Chat Template Defaults
 
 Set server defaults for chat template kwargs. Request-level `chat_template_kwargs`
@@ -66,6 +76,7 @@ vllm-mlx serve mlx-community/Qwen3-8B-4bit \
 | `--embedding-model` | Pre-load an embedding model at startup | None |
 | `--enable-auto-tool-choice` | Enable automatic tool calling | False |
 | `--tool-call-parser` | Tool call parser (see [Tool Calling](tool-calling.md)) | None |
+| `--models-config` | YAML registry file for multi-model serving | None |
 
 ## API Endpoints
 

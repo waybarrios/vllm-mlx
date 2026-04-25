@@ -17,6 +17,7 @@ Start the OpenAI-compatible API server.
 
 ```bash
 vllm-mlx serve <model> [options]
+vllm-mlx serve --models-config <yaml> [options]
 ```
 
 ### Options
@@ -51,6 +52,7 @@ vllm-mlx serve <model> [options]
 | `--embedding-model` | Pre-load an embedding model at startup | None |
 | `--enable-auto-tool-choice` | Enable automatic tool calling | False |
 | `--tool-call-parser` | Tool call parser (`auto`, `mistral`, `qwen`, `llama`, `hermes`, `deepseek`, `kimi`, `granite`, `nemotron`, `xlam`, `functionary`, `glm47`) | None |
+| `--models-config` | YAML registry file for multi-model serving | None |
 
 ### Examples
 
@@ -108,6 +110,9 @@ vllm-mlx serve mlx-community/granite-4.0-tiny-preview-4bit \
 # With API key authentication
 vllm-mlx serve mlx-community/Llama-3.2-3B-Instruct-4bit --api-key your-secret-key
 
+# Registry-backed multi-model serving
+vllm-mlx serve --models-config /etc/vllm-mlx/models.yaml --continuous-batching
+
 # Expose Prometheus metrics
 vllm-mlx serve mlx-community/Llama-3.2-3B-Instruct-4bit --enable-metrics
 
@@ -118,6 +123,8 @@ vllm-mlx serve mlx-community/Qwen3-4B-4bit \
   --timeout 120 \
   --continuous-batching
 ```
+
+For registry-backed serving, see [Multi-Model Serving](../guides/model-registry.md).
 
 ### Security
 

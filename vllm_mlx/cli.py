@@ -29,9 +29,20 @@ def serve_command(args):
 
     # Import unified server
     from . import server
-    from .server import RateLimiter, app, load_model
+    from .model_registry import RegistryServeDefaults
+    from .server import RateLimiter, app, load_model, load_model_registry
 
     logger = logging.getLogger(__name__)
+
+    if args.models_config and args.model:
+        print("Error: use either positional MODEL or --models-config, not both")
+        sys.exit(1)
+    if not args.models_config and not args.model:
+        print("Error: MODEL is required unless --models-config is provided")
+        sys.exit(1)
+    if args.models_config and args.served_model_name:
+        print("Error: --served-model-name cannot be used with --models-config")
+        sys.exit(1)
 
     # Validate tool calling arguments
     if args.enable_auto_tool_choice and not args.tool_call_parser:
@@ -98,6 +109,7 @@ def serve_command(args):
 
             parser_cls = get_parser(args.reasoning_parser)
             server._reasoning_parser = parser_cls()
+            server._reasoning_parser_name = args.reasoning_parser
             logger.info(f"Reasoning parser enabled: {args.reasoning_parser}")
         except KeyError as e:
             print(f"Error: {e}")
@@ -113,6 +125,7 @@ def serve_command(args):
             sys.exit(1)
     else:
         server._reasoning_parser = None
+        server._reasoning_parser_name = None
 
     # Security summary at startup
     print("=" * 60)
@@ -164,17 +177,19 @@ def serve_command(args):
         max_retries=args.download_retries,
         offline=getattr(args, "offline", False),
     )
-    ensure_model_downloaded(
-        args.model,
-        config=download_config,
-        is_mllm=is_mllm_model(args.model),
-    )
-
-    if args.lazy_load_model:
-        print(f"Registering model for lazy load: {args.model}")
-        print("Model will load on the first request.")
+    if args.model:
+        ensure_model_downloaded(
+            args.model,
+            config=download_config,
+            is_mllm=is_mllm_model(args.model),
+        )
+        if args.lazy_load_model:
+            print(f"Registering model for lazy load: {args.model}")
+            print("Model will load on the first request.")
+        else:
+            print(f"Loading model: {args.model}")
     else:
-        print(f"Loading model: {args.model}")
+        print(f"Loading models config: {args.models_config}")
     print(f"Default max tokens: {args.max_tokens}")
     print(f"Max request tokens: {max_request_tokens}")
     if args.max_kv_size is not None:
@@ -279,28 +294,46 @@ def serve_command(args):
                 f"keep={args.specprefill_keep_pct*100:.0f}%)"
             )
 
-    # Load model with unified server
-    load_model(
-        args.model,
-        use_batching=args.continuous_batching,
-        scheduler_config=scheduler_config,
-        stream_interval=args.stream_interval if args.continuous_batching else 1,
-        max_tokens=args.max_tokens,
-        max_request_tokens=max_request_tokens,
-        force_mllm=getattr(args, "mllm", False),
-        gpu_memory_utilization=args.gpu_memory_utilization,
-        served_model_name=args.served_model_name,
-        trust_remote_code=trust_remote_code,
-        mtp=args.enable_mtp,
-        prefill_step_size=args.prefill_step_size,
-        specprefill_enabled=args.specprefill,
-        specprefill_threshold=args.specprefill_threshold,
-        specprefill_keep_pct=args.specprefill_keep_pct,
-        specprefill_draft_model=args.specprefill_draft_model,
-        warm_prompts_path=getattr(args, "warm_prompts", None),
-        auto_unload_idle_seconds=args.auto_unload_idle_seconds,
-        lazy_load_model=args.lazy_load_model,
-    )
+    if args.models_config:
+        defaults = RegistryServeDefaults(
+            continuous_batching=args.continuous_batching,
+            force_mllm=getattr(args, "mllm", False),
+            enable_mtp=args.enable_mtp,
+            prefill_step_size=args.prefill_step_size,
+            specprefill_enabled=args.specprefill,
+            specprefill_threshold=args.specprefill_threshold,
+            specprefill_keep_pct=args.specprefill_keep_pct,
+            specprefill_draft_model=args.specprefill_draft_model,
+            stream_interval=args.stream_interval if args.continuous_batching else 1,
+            gpu_memory_utilization=args.gpu_memory_utilization,
+            scheduler_config=scheduler_config,
+            max_tokens=args.max_tokens,
+            download_config=download_config,
+        )
+        load_model_registry(args.models_config, defaults=defaults)
+    else:
+        # Load model with unified server
+        load_model(
+            args.model,
+            use_batching=args.continuous_batching,
+            scheduler_config=scheduler_config,
+            stream_interval=args.stream_interval if args.continuous_batching else 1,
+            max_tokens=args.max_tokens,
+            max_request_tokens=max_request_tokens,
+            force_mllm=getattr(args, "mllm", False),
+            gpu_memory_utilization=args.gpu_memory_utilization,
+            served_model_name=args.served_model_name,
+            trust_remote_code=trust_remote_code,
+            mtp=args.enable_mtp,
+            prefill_step_size=args.prefill_step_size,
+            specprefill_enabled=args.specprefill,
+            specprefill_threshold=args.specprefill_threshold,
+            specprefill_keep_pct=args.specprefill_keep_pct,
+            specprefill_draft_model=args.specprefill_draft_model,
+            warm_prompts_path=getattr(args, "warm_prompts", None),
+            auto_unload_idle_seconds=args.auto_unload_idle_seconds,
+            lazy_load_model=args.lazy_load_model,
+        )
 
     # Start server
     print(f"Starting server at http://{args.host}:{args.port}")
@@ -841,7 +874,13 @@ Examples:
 
     # Serve command
     serve_parser = subparsers.add_parser("serve", help="Start OpenAI-compatible server")
-    serve_parser.add_argument("model", type=str, help="Model to serve")
+    serve_parser.add_argument("model", nargs="?", type=str, help="Model to serve")
+    serve_parser.add_argument(
+        "--models-config",
+        type=str,
+        default=None,
+        help="YAML file describing a registry of models for lazy multi-model serving",
+    )
     serve_parser.add_argument(
         "--served-model-name",
         type=str,
