@@ -62,11 +62,37 @@ from .glm47_tool_parser import Glm47ToolParser
 from .harmony_tool_parser import HarmonyToolParser
 from .minimax_tool_parser import MiniMaxToolParser
 
+
+def get_parser_stop_tokens(
+    parser_name: str | None,
+    user_stops: list[str] | None,
+) -> list[str]:
+    """Merge user-supplied stops with parser-declared extras (deduped).
+
+    Some models declare end-of-generation tokens beyond the tokenizer's default
+    eos set — e.g. Gemma 4's ``<|tool_response>`` which signals the runtime's
+    turn after a tool call. Parsers expose those via ``extra_stop_tokens``.
+    """
+    stops = list(user_stops or [])
+    if not parser_name:
+        return stops
+    try:
+        parser_cls = ToolParserManager.get_tool_parser(parser_name)
+    except (KeyError, ImportError):
+        return stops
+    for s in getattr(parser_cls, "extra_stop_tokens", []):
+        if s not in stops:
+            stops.append(s)
+    return stops
+
+
 __all__ = [
     # Base classes
     "ToolParser",
     "ToolParserManager",
     "ExtractedToolCallInformation",
+    # Helpers
+    "get_parser_stop_tokens",
     # Specific parsers
     "AutoToolParser",
     "Gemma4ToolParser",

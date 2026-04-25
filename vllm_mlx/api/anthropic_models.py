@@ -56,7 +56,7 @@ class AnthropicRequest(BaseModel):
     model: str
     messages: list[AnthropicMessage]
     system: str | list[dict] | None = None
-    max_tokens: int  # Required in Anthropic API
+    max_tokens: int = Field(gt=0)  # Required in Anthropic API
     temperature: float | None = None
     top_p: float | None = None
     stream: bool = False
@@ -65,6 +65,12 @@ class AnthropicRequest(BaseModel):
     tool_choice: dict | None = None
     metadata: dict | None = None
     top_k: int | None = None
+    # OpenAI-compatible extension (not in the official Anthropic spec, but
+    # clients commonly forward it via extra_body or top-level for structured
+    # output / constrained decoding on this endpoint).
+    response_format: dict | None = None
+    # OpenAI-compatible extension for tokenizer chat template kwargs.
+    chat_template_kwargs: dict[str, Any] | None = None
 
 
 # =============================================================================

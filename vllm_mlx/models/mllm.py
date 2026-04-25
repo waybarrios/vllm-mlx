@@ -15,15 +15,17 @@ Features:
 
 import atexit
 import base64
+import ipaddress
 import logging
 import math
 import os
+import socket
 import tempfile
 import threading
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
 import numpy as np
 import requests
@@ -115,6 +117,12 @@ class FileSizeExceededError(Exception):
     pass
 
 
+class UnsafeRemoteURLError(ValueError):
+    """Raised when a remote media URL targets an unsafe destination."""
+
+    pass
+
+
 @dataclass
 class MultimodalInput:
     """Input for multimodal generation."""
@@ -182,6 +190,83 @@ def decode_base64_image(
     return base64.b64decode(base64_string)
 
 
+def _validate_url_safety(url: str) -> None:
+    """Reject remote URLs that target local or private network resources."""
+    parsed = urlparse(url)
+    if parsed.scheme not in {"http", "https"}:
+        raise UnsafeRemoteURLError(
+            f"Unsupported remote media URL scheme: {parsed.scheme or '<missing>'}"
+        )
+
+    hostname = parsed.hostname
+    if not hostname:
+        raise UnsafeRemoteURLError("Remote media URL must include a hostname")
+
+    if hostname == "localhost" or hostname.endswith(".localhost"):
+        raise UnsafeRemoteURLError(
+            f"Remote media URL targets a blocked host: {hostname}"
+        )
+
+    try:
+        resolved_ips = [ipaddress.ip_address(hostname)]
+    except ValueError:
+        try:
+            addrinfo = socket.getaddrinfo(
+                hostname,
+                parsed.port or (443 if parsed.scheme == "https" else 80),
+                type=socket.SOCK_STREAM,
+            )
+        except socket.gaierror as exc:
+            raise UnsafeRemoteURLError(
+                f"Failed to resolve remote media host {hostname}: {exc}"
+            ) from exc
+        resolved_ips = [ipaddress.ip_address(info[4][0]) for info in addrinfo]
+
+    blocked_ips = [str(ip) for ip in resolved_ips if not ip.is_global]
+    if blocked_ips:
+        raise UnsafeRemoteURLError(
+            f"Remote media URL resolves to blocked address(es): {', '.join(sorted(set(blocked_ips)))}"
+        )
+
+
+def _request_with_safe_redirects(
+    method: str,
+    url: str,
+    *,
+    timeout: int,
+    headers: dict[str, str],
+    stream: bool = False,
+    max_redirects: int = 5,
+):
+    """Issue a requests call while validating every redirect target."""
+    current_url = url
+    for _ in range(max_redirects + 1):
+        _validate_url_safety(current_url)
+        response = requests.request(
+            method,
+            current_url,
+            timeout=timeout,
+            headers=headers,
+            allow_redirects=False,
+            verify=True,
+            stream=stream,
+        )
+        if not response.is_redirect and not response.is_permanent_redirect:
+            return response
+
+        location = response.headers.get("location")
+        response.close()
+        if not location:
+            raise UnsafeRemoteURLError(
+                f"Remote media URL redirect missing Location header: {current_url}"
+            )
+        current_url = urljoin(current_url, location)
+
+    raise UnsafeRemoteURLError(
+        f"Remote media URL exceeded redirect limit ({max_redirects}): {url}"
+    )
+
+
 def download_image(url: str, timeout: int = 30, max_size: int = MAX_IMAGE_SIZE) -> str:
     """
     Download image from URL and return local path.
@@ -203,8 +288,8 @@ def download_image(url: str, timeout: int = 30, max_size: int = MAX_IMAGE_SIZE) 
 
     # First, make a HEAD request to check Content-Length
     try:
-        head_response = requests.head(
-            url, timeout=timeout, headers=headers, allow_redirects=True, verify=True
+        head_response = _request_with_safe_redirects(
+            "HEAD", url, timeout=timeout, headers=headers
         )
         content_length = head_response.headers.get("content-length")
         if content_length and int(content_length) > max_size:
@@ -216,8 +301,8 @@ def download_image(url: str, timeout: int = 30, max_size: int = MAX_IMAGE_SIZE) 
         # HEAD request failed, proceed with GET and check during download
         pass
 
-    response = requests.get(
-        url, timeout=timeout, headers=headers, stream=True, verify=True
+    response = _request_with_safe_redirects(
+        "GET", url, timeout=timeout, headers=headers, stream=True
     )
     response.raise_for_status()
 
@@ -241,7 +326,7 @@ def download_image(url: str, timeout: int = 30, max_size: int = MAX_IMAGE_SIZE) 
         ext = ".webp"
     else:
         # Try to get from URL
-        path = urlparse(url).path
+        path = urlparse(response.url).path
         ext = Path(path).suffix or ".jpg"
 
     # Save to temp file with size checking during download
@@ -293,8 +378,8 @@ def download_video(url: str, timeout: int = 120, max_size: int = MAX_VIDEO_SIZE)
 
     # First, make a HEAD request to check Content-Length
     try:
-        head_response = requests.head(
-            url, timeout=timeout, headers=headers, allow_redirects=True, verify=True
+        head_response = _request_with_safe_redirects(
+            "HEAD", url, timeout=timeout, headers=headers
         )
         content_length = head_response.headers.get("content-length")
         if content_length and int(content_length) > max_size:
@@ -306,8 +391,8 @@ def download_video(url: str, timeout: int = 120, max_size: int = MAX_VIDEO_SIZE)
         # HEAD request failed, proceed with GET and check during download
         pass
 
-    response = requests.get(
-        url, timeout=timeout, headers=headers, stream=True, verify=True
+    response = _request_with_safe_redirects(
+        "GET", url, timeout=timeout, headers=headers, stream=True
     )
     response.raise_for_status()
 
@@ -333,7 +418,7 @@ def download_video(url: str, timeout: int = 120, max_size: int = MAX_VIDEO_SIZE)
         ext = ".mkv"
     else:
         # Try to get from URL
-        path = urlparse(url).path
+        path = urlparse(response.url).path
         ext = Path(path).suffix or ".mp4"
 
     # Save to temp file (stream for larger files) with size checking
@@ -421,7 +506,6 @@ def process_video_input(video: str | dict) -> str:
     Process video input in various formats and return local path.
 
     Supports:
-    - Local file path
     - URL (http/https)
     - Base64 encoded string (data:video/mp4;base64,...)
     - OpenAI format dict: {"url": "..."} or {"url": "data:video/...;base64,..."}
@@ -442,10 +526,6 @@ def process_video_input(video: str | dict) -> str:
     if not video:
         raise ValueError("Empty video input")
 
-    # Check if it's a local file
-    if Path(video).exists():
-        return video
-
     # Check if it's a URL
     if is_url(video):
         return download_video(video)
@@ -454,7 +534,9 @@ def process_video_input(video: str | dict) -> str:
     if is_base64_video(video):
         return decode_base64_video(video)
 
-    raise ValueError(f"Cannot process video: {video[:50]}...")
+    raise ValueError(
+        "Unsupported video input. Only http(s) URLs and data:video base64 payloads are allowed."
+    )
 
 
 # Cache for base64 images to avoid re-saving the same image
@@ -505,7 +587,6 @@ def process_image_input(image: str | dict) -> str:
     Process image input in various formats and return local path.
 
     Supports:
-    - Local file path
     - URL (http/https)
     - Base64 encoded string
     - OpenAI format dict: {"url": "..."} or {"url": "data:image/...;base64,..."}
@@ -528,11 +609,9 @@ def process_image_input(image: str | dict) -> str:
     if is_url(image):
         return download_image(image)
 
-    # Check if it's a local file (only for short strings that could be paths)
-    if len(image) < 4096 and Path(image).exists():
-        return image
-
-    raise ValueError(f"Cannot process image: {image[:50]}...")
+    raise ValueError(
+        "Unsupported image input. Only http(s) URLs and data:image base64 payloads are allowed."
+    )
 
 
 def round_by_factor(x: int, factor: int) -> int:
@@ -690,7 +769,7 @@ class MLXMultimodalLM:
     def __init__(
         self,
         model_name: str,
-        trust_remote_code: bool = True,
+        trust_remote_code: bool = False,
         enable_cache: bool = True,
         cache_size: int = 50,
     ):
@@ -758,7 +837,7 @@ class MLXMultimodalLM:
         return self.processor.tokenizer
 
     def _prepare_images(self, images: list) -> list[str]:
-        """Process image inputs and return local file paths."""
+        """Process remote/base64 image inputs into local temp file paths."""
         processed = []
         for img in images:
             try:
@@ -778,7 +857,6 @@ class MLXMultimodalLM:
         Process video input and extract frames.
 
         Supports:
-        - Local file paths
         - URLs (http/https) - will be downloaded
         - Base64 encoded videos (data:video/mp4;base64,...)
         - OpenAI format dicts: {"url": "..."} or {"video_url": {"url": "..."}}
@@ -973,7 +1051,7 @@ class MLXMultimodalLM:
     ) -> list[dict]:
         """Translate OpenAI API format messages to process_vision_info format.
 
-        Converts video_url/video types and resolves URLs/base64 to local paths.
+        Converts video_url/video types and resolves remote/base64 inputs to local paths.
         Images are preserved as-is (process_vision_info handles them).
         """
         translated = []
@@ -1074,8 +1152,8 @@ class MLXMultimodalLM:
 
         Args:
             prompt: Text prompt/question
-            images: List of image paths, URLs, or base64 strings
-            videos: List of video inputs (paths, URLs, base64, or OpenAI format dicts)
+            images: List of image URLs or base64 strings
+            videos: List of video inputs (URLs, base64, or OpenAI format dicts)
             audio: List of audio file paths
             max_tokens: Maximum tokens to generate
             temperature: Sampling temperature
@@ -1319,9 +1397,10 @@ class MLXMultimodalLM:
         from mlx_vlm import generate
         from mlx_vlm.prompt_utils import get_chat_template
 
-        # Extract text and images from messages
-        # Build chat_messages for multi-turn support WITH proper image tokens per message
+        # Extract text, images and audio from messages
+        # Build chat_messages for multi-turn support WITH proper image/audio tokens per message
         all_image_urls = []  # Raw URLs/paths to process later
+        all_audio_urls = []  # Raw audio URLs/paths to process later
         chat_messages = []  # List of properly formatted messages for chat template
 
         logger.info(f"MLLM.chat() called with {len(messages)} messages")
@@ -1405,17 +1484,27 @@ class MLXMultimodalLM:
                             )
                             msg_image_count += 1
 
+                        elif item_type == "audio_url":
+                            aud_url = item.get("audio_url", {})
+                            if isinstance(aud_url, str):
+                                all_audio_urls.append(aud_url)
+                            else:
+                                all_audio_urls.append(aud_url.get("url", ""))
+
             # Add video frame count to image count for this message
             msg_image_count += _msg_video_frame_counts.get(msg_idx, 0)
+            msg_audio_count = len(all_audio_urls)
 
-            # Build properly structured message for Qwen3-VL-MoE
-            # Format: {"role": "...", "content": [{"type": "image"}, ..., {"type": "text", "text": "..."}]}
-            if msg_text or msg_image_count > 0:
-                if role == "user" and msg_image_count > 0:
-                    # User message WITH images - build content array with image tokens FIRST
+            # Build properly structured message
+            # Format: {"role": "...", "content": [{"type": "image"}, ..., {"type": "audio"}, ..., {"type": "text", "text": "..."}]}
+            if msg_text or msg_image_count > 0 or msg_audio_count > 0:
+                if role == "user" and (msg_image_count > 0 or msg_audio_count > 0):
+                    # User message WITH images/audio - build content array with media tokens FIRST
                     content_list = []
                     for _ in range(msg_image_count):
                         content_list.append({"type": "image"})
+                    for _ in range(msg_audio_count):
+                        content_list.append({"type": "audio"})
                     content_list.append(
                         {"type": "text", "text": msg_text, "content": msg_text}
                     )
@@ -1443,7 +1532,7 @@ class MLXMultimodalLM:
 
         # Apply chat template directly - messages are already properly structured
         logger.info(
-            f"Applying chat template with {len(chat_messages)} messages, {len(all_images)} images"
+            f"Applying chat template with {len(chat_messages)} messages, {len(all_images)} images, {len(all_audio_urls)} audios"
         )
         for i, cm in enumerate(chat_messages):
             content_preview = str(cm.get("content", ""))[:80]
@@ -1586,6 +1675,7 @@ class MLXMultimodalLM:
             self.processor,
             formatted_prompt,
             all_images if all_images else None,
+            audio=all_audio_urls if all_audio_urls else None,
             max_tokens=max_tokens,
             temp=temperature,
             verbose=False,
@@ -1996,9 +2086,6 @@ class MLXMultimodalLM:
             Video description text
 
         Example:
-            # Local file
-            model.describe_video("video.mp4")
-
             # URL
             model.describe_video("https://example.com/video.mp4")
 

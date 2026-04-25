@@ -17,6 +17,7 @@ Architecture:
 """
 
 import logging
+import os
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -31,12 +32,71 @@ from .vision_embedding_cache import VisionEmbeddingCache
 logger = logging.getLogger(__name__)
 
 
+def _processors_can_retire(processors: Optional[List[Callable]]) -> bool:
+    """True when any processor advertises a retire-to-content transition."""
+    if os.getenv("VLLM_MLX_ENABLE_THINKING_RETIREMENT_RESUME") != "1":
+        return False
+    return bool(processors) and any(
+        isinstance(getattr(p, "is_retired", None), bool) for p in processors
+    )
+
+
+def _drop_retired_processors(
+    processors: Optional[List[Callable]],
+) -> tuple[Optional[List[Callable]], int]:
+    """Drop retire-capable processors that have completed their work."""
+    if not processors:
+        return processors, 0
+
+    remaining = []
+    retired_count = 0
+    for processor in processors:
+        if getattr(processor, "is_retired", False) is True:
+            retired_count += 1
+            continue
+        remaining.append(processor)
+    return (remaining or None), retired_count
+
+
 class PrefillAbortedError(Exception):
     """Raised when a prefill is aborted due to client disconnect."""
 
     def __init__(self, request_id: str):
         self.request_id = request_id
         super().__init__(f"Prefill aborted for request {request_id}")
+
+
+def _cache_eval_tensors(cache: List[Any]) -> List[Any]:
+    """Return realized tensors that break lazy cache graphs between chunks."""
+    tensors: List[Any] = []
+    for c in cache:
+        keys = getattr(c, "keys", None)
+        values = getattr(c, "values", None)
+        if keys is not None or values is not None:
+            if keys is not None:
+                tensors.append(keys)
+            if values is not None:
+                tensors.append(values)
+            continue
+
+        try:
+            state = getattr(c, "state", None)
+        except AttributeError:
+            state = None
+        if state is None:
+            continue
+        if isinstance(state, (list, tuple)):
+            tensors.extend(s for s in state if s is not None)
+        else:
+            tensors.append(state)
+    return tensors
+
+
+def _eval_prompt_cache(cache: List[Any]) -> None:
+    """Evaluate all cache tensors used by hybrid chunked prefill."""
+    tensors = _cache_eval_tensors(cache)
+    if tensors:
+        mx.eval(*tensors)
 
 
 @dataclass
@@ -60,6 +120,10 @@ class MLLMBatchRequest:
     min_p: float = 0.0
     presence_penalty: float = 0.0
     repetition_penalty: float = 1.0
+    # Extra logits processors (e.g. JSON schema constrained decoding).
+    # Merged with built-in repetition/presence penalty processors in
+    # ``_prefill_batch``.
+    logits_processors: Optional[List[Callable]] = None
 
     # Processed inputs (set after vision preprocessing)
     input_ids: Optional[mx.array] = None
@@ -177,13 +241,16 @@ class MLLMBatch:
             self.samplers = list(self_s) + list(other_s)
 
         # Extend cache - handle both BatchKVCache (.keys/.values) and
-        # ArraysCache (.cache list) from hybrid models like Qwen3.5
+        # ArraysCache (.cache list) from hybrid models like Qwen3.5. Some
+        # cache integrations, such as quantized SDPA caches, expose state only
+        # through empty()/extend() and do not publish .keys.
         for c, o in zip(self.cache, other.cache):
             if c is not None and o is not None and hasattr(c, "extend"):
                 try:
                     has_kv = hasattr(c, "keys") and c.keys is not None
                     has_arrays = hasattr(c, "cache")
-                    if has_kv or has_arrays:
+                    has_extendable_state = hasattr(c, "empty") and not c.empty()
+                    if has_kv or has_arrays or has_extendable_state:
                         c.extend(o)
                 except Exception as e:
                     logger.warning(f"Failed to extend cache: {e}")
@@ -705,10 +772,17 @@ class MLLMBatchGenerator:
         3. Running vision encoder to get features
 
         Uses vision cache to skip processing for repeated images.
+        Idempotent: if input_ids is already set, returns immediately.
 
         Args:
             request: Request to preprocess
         """
+        # Already preprocessed (e.g. by early executor offloading in
+        # _process_loop).  Only skip for text-only requests; vision
+        # requests need pixel cache lookup even if input_ids was set.
+        if request.input_ids is not None and not request.images and not request.videos:
+            return
+
         from mlx_vlm.utils import prepare_inputs
 
         tic = time.perf_counter()
@@ -930,6 +1004,11 @@ class MLLMBatchGenerator:
                 return output.logits
             return output
 
+        logger.info(
+            f"[chunked_prefill] Starting {request.request_id[:12]}: "
+            f"{total} tokens, step={step}"
+        )
+
         # Process all chunks except the last
         processed = 0
         chunk_count = 0
@@ -945,10 +1024,23 @@ class MLLMBatchGenerator:
 
             chunk = input_ids[:, processed : processed + step]
             self.language_model(chunk, cache=cache)
-            mx.eval([c.state for c in cache])
+            # Eval ALL cache types to break the lazy graph between chunks.
+            # ArraysCache (e.g. GatedDeltaNet) has .state; KVCache (full
+            # attention) has .keys/.values. Hybrid models like Qwen3.5 use
+            # both. Skipping either type lets the computation graph grow
+            # across chunks → OOM on long prompts.
+            _eval_prompt_cache(cache)
             processed += step
             chunk_count += 1
             self._prefill_progress[request.request_id] = (processed, total)
+
+            # Log progress every 10 chunks so operators can see prefill
+            # is progressing (not hanging) during long prompts.
+            if chunk_count % 10 == 0:
+                logger.info(
+                    f"[chunked_prefill] {request.request_id[:12]}: "
+                    f"chunk {chunk_count}, {processed}/{total} tokens"
+                )
 
             # Release Metal buffer pool periodically.  Full-attention layers
             # produce attention score buffers that grow each chunk (1024 ×
@@ -962,6 +1054,12 @@ class MLLMBatchGenerator:
         output = self.language_model(last_chunk, cache=cache)
         request.vision_encoded = True
         self._prefill_progress[request.request_id] = (total, total)
+
+        if chunk_count > 0:
+            logger.info(
+                f"[chunked_prefill] Completed {request.request_id[:12]}: "
+                f"{total} tokens in {chunk_count + 1} chunks"
+            )
 
         if hasattr(output, "logits"):
             return output.logits
@@ -1026,6 +1124,7 @@ class MLLMBatchGenerator:
             MLLMBatch ready for generation
         """
         from mlx_lm.models.cache import make_prompt_cache
+        from mlx_lm.sample_utils import make_logits_processors, make_sampler
 
         tic = time.perf_counter()
 
@@ -1058,6 +1157,60 @@ class MLLMBatchGenerator:
         if not requests:
             # All requests failed
             return None
+
+        logits_processors_by_request: dict[str, Optional[List[Callable]]] = {}
+        samplers_by_request: dict[str, Optional[Callable]] = {}
+        for req in requests:
+            need_rep = req.repetition_penalty and req.repetition_penalty != 1.0
+            need_pres = req.presence_penalty and req.presence_penalty != 0.0
+            combined: List[Callable] = []
+            if need_rep or need_pres:
+                lp_kwargs = {}
+                if need_rep:
+                    lp_kwargs["repetition_penalty"] = req.repetition_penalty
+                if need_pres:
+                    lp_kwargs["presence_penalty"] = req.presence_penalty
+                combined.extend(make_logits_processors(**lp_kwargs))
+                logger.info(
+                    f"[sampling] request={req.request_id[:12]} "
+                    f"rep_penalty={req.repetition_penalty} "
+                    f"pres_penalty={req.presence_penalty}"
+                )
+            if req.logits_processors:
+                combined.extend(req.logits_processors)
+                logger.info(
+                    f"[sampling] request={req.request_id[:12]} "
+                    f"extra_logits_processors={len(req.logits_processors)}"
+                )
+            logits_processors_by_request[req.request_id] = combined or None
+
+            samplers_by_request[req.request_id] = make_sampler(
+                temp=req.temperature,
+                top_p=req.top_p,
+                top_k=req.top_k,
+                min_p=req.min_p,
+            )
+            logger.info(
+                f"[sampling] request={req.request_id[:12]} "
+                f"temp={req.temperature} top_p={req.top_p} "
+                f"top_k={req.top_k} min_p={req.min_p}"
+            )
+
+        def _sample_first_token(req: MLLMBatchRequest, logits: mx.array):
+            sample_logits = logits
+            processors = logits_processors_by_request.get(req.request_id)
+            if processors:
+                empty_tokens = mx.array([], dtype=mx.uint32)
+                for processor in processors:
+                    sample_logits = processor(empty_tokens, sample_logits)
+
+            logprobs = sample_logits - mx.logsumexp(
+                sample_logits, axis=-1, keepdims=True
+            )
+            sampler = samplers_by_request.get(req.request_id) or self.sampler
+            sampled = sampler(logprobs)
+            mx.eval(sampled, logprobs)
+            return sampled, logprobs
 
         total_prompt_tokens = sum(
             req.input_ids.size if req.input_ids is not None else 1 for req in requests
@@ -1177,7 +1330,8 @@ class MLLMBatchGenerator:
 
                                 chunk = remaining[:, processed : processed + step]
                                 self.language_model(chunk, cache=request_cache)
-                                mx.eval([c.state for c in request_cache])
+                                # Eval ALL cache types (see _run_chunked_text_prefill)
+                                _eval_prompt_cache(request_cache)
                                 processed += step
                                 chunk_count += 1
                                 self._prefill_progress[req.request_id] = (
@@ -1198,11 +1352,8 @@ class MLLMBatchGenerator:
                             logits = logits.logits
 
                         last_logits = logits[:, -1, :]
-                        logprobs = last_logits - mx.logsumexp(
-                            last_logits, axis=-1, keepdims=True
-                        )
-                        sampled = self.sampler(logprobs)
-                        mx.eval(sampled, logprobs)
+
+                        sampled, logprobs = _sample_first_token(req, last_logits)
 
                         first_tokens.append(sampled.item())
                         all_logprobs.append(logprobs.squeeze(0))
@@ -1236,11 +1387,8 @@ class MLLMBatchGenerator:
                             logits = logits.logits
 
                         last_logits = logits[:, -1, :]
-                        logprobs = last_logits - mx.logsumexp(
-                            last_logits, axis=-1, keepdims=True
-                        )
-                        sampled = self.sampler(logprobs)
-                        mx.eval(sampled, logprobs)
+
+                        sampled, logprobs = _sample_first_token(req, last_logits)
 
                         first_tokens.append(sampled.item())
                         all_logprobs.append(logprobs.squeeze(0))
@@ -1266,14 +1414,10 @@ class MLLMBatchGenerator:
                         else:
                             logits = self._run_vision_encoding(req, cache=request_cache)
 
-                        # Extract last token logits and sample
+                        # Extract last token logits
                         last_logits = logits[:, -1, :]
-                        logprobs = last_logits - mx.logsumexp(
-                            last_logits, axis=-1, keepdims=True
-                        )
-                        sampled = self.sampler(logprobs)
 
-                        mx.eval(sampled, logprobs)
+                        sampled, logprobs = _sample_first_token(req, last_logits)
 
                         first_tokens.append(sampled.item())
                         all_logprobs.append(logprobs.squeeze(0))
@@ -1353,50 +1497,12 @@ class MLLMBatchGenerator:
         # Create initial y (first generated tokens)
         y = mx.array(first_tokens)
 
-        # Build per-request logits processors (repetition_penalty, presence_penalty)
-        from mlx_lm.sample_utils import make_logits_processors, make_sampler
-
-        batch_logits_processors = []
-        has_any_lp = False
-        for req in requests:
-            need_rep = req.repetition_penalty and req.repetition_penalty != 1.0
-            need_pres = req.presence_penalty and req.presence_penalty != 0.0
-            if need_rep or need_pres:
-                lp_kwargs = {}
-                if need_rep:
-                    lp_kwargs["repetition_penalty"] = req.repetition_penalty
-                if need_pres:
-                    lp_kwargs["presence_penalty"] = req.presence_penalty
-                lp = make_logits_processors(**lp_kwargs)
-                batch_logits_processors.append(lp)
-                has_any_lp = True
-                logger.info(
-                    f"[sampling] request={req.request_id[:12]} "
-                    f"rep_penalty={req.repetition_penalty} "
-                    f"pres_penalty={req.presence_penalty}"
-                )
-            else:
-                batch_logits_processors.append(None)
-
-        # Build per-request samplers for top_k/min_p
-        batch_samplers = []
-        has_any_sampler = False
-        for req in requests:
-            if req.top_k != 0 or req.min_p != 0.0:
-                s = make_sampler(
-                    temp=req.temperature,
-                    top_p=req.top_p,
-                    top_k=req.top_k,
-                    min_p=req.min_p,
-                )
-                batch_samplers.append(s)
-                has_any_sampler = True
-                logger.info(
-                    f"[sampling] request={req.request_id[:12]} "
-                    f"top_k={req.top_k} min_p={req.min_p}"
-                )
-            else:
-                batch_samplers.append(None)
+        batch_logits_processors = [
+            logits_processors_by_request.get(req.request_id) for req in requests
+        ]
+        has_any_lp = any(batch_logits_processors)
+        batch_samplers = [samplers_by_request.get(req.request_id) for req in requests]
+        has_any_sampler = any(batch_samplers)
 
         self._stats.prompt_time += time.perf_counter() - tic
 
@@ -1455,10 +1561,15 @@ class MLLMBatchGenerator:
             for e in range(logits.shape[0]):
                 sample_logits = logits[e : e + 1]
                 if logits_processors[e]:
+                    # Build full context: output_tokens + current input token.
+                    # ``output_tokens[e]`` lacks the current step's input token
+                    # because it hasn't been appended yet; adding it here gives
+                    # logits processors (e.g. JSON schema enforcer) accurate
+                    # context about what has been generated so far.
+                    cur_tok = int(input_tokens[e, 0])
+                    full_context = output_tokens[e] + [cur_tok]
                     for processor in logits_processors[e]:
-                        sample_logits = processor(
-                            mx.array(output_tokens[e]), sample_logits
-                        )
+                        sample_logits = processor(mx.array(full_context), sample_logits)
                 processed_logits.append(sample_logits)
             logits = mx.concatenate(processed_logits, axis=0)
 
@@ -1584,11 +1695,13 @@ class MLLMBatchGenerator:
             return error_responses
 
         y, logprobs = batch.y, batch.logprobs
-        output_tokens = (
-            [req.output_tokens for req in batch.requests]
-            if batch.logits_processors
-            else None
-        )
+        output_tokens = None
+        if batch.logits_processors:
+            y_list = y.tolist()
+            output_tokens = [
+                list(req.output_tokens) + [token]
+                for req, token in zip(batch.requests, y_list)
+            ]
         batch.y, batch.logprobs = self._step(
             y[:, None],
             batch.cache,
@@ -1625,6 +1738,26 @@ class MLLMBatchGenerator:
             batch.num_tokens[i] = num_tok
             req.num_tokens = num_tok
             req.output_tokens.append(token)
+
+            if batch.logits_processors and _processors_can_retire(
+                batch.logits_processors[i]
+            ):
+                remaining_processors, retired_count = _drop_retired_processors(
+                    batch.logits_processors[i]
+                )
+                if retired_count > 0:
+                    # Keep the per-request slot but replace an empty processor
+                    # stack with None. The next `_mtp_step` uses any([None]) ==
+                    # False, so a fully retired request becomes MTP-eligible
+                    # without changing batch alignment.
+                    batch.logits_processors[i] = remaining_processors
+                    logger.info(
+                        "[MTP-MLLM] request=%s retired %d processor(s); "
+                        "mtp_eligible_next_step=%s",
+                        request_id[:12],
+                        retired_count,
+                        remaining_processors is None,
+                    )
 
             finish_reason = None
             cache_fn = None
@@ -1789,14 +1922,33 @@ def install_mtp_mllm(
     ) -> Tuple[mx.array, List[mx.array]]:
         """Extended _step with MTP always-advance strategy."""
         batch_size = input_tokens.shape[0]
+        active_requests = (
+            list(batch_gen.active_batch.requests)
+            if batch_gen.active_batch is not None
+            else []
+        )
+        has_non_greedy_sampling = any(
+            getattr(req, "temperature", 0.0) not in (0, 0.0)
+            or getattr(req, "top_p", 1.0) < 1.0
+            or getattr(req, "top_k", 0) != 0
+            or getattr(req, "min_p", 0.0) != 0.0
+            for req in active_requests
+        )
 
         # Prefill guard: skip MTP for multi-token input or when no active batch
         # Also skip MTP when batch has multiple active requests (MTP overhead
-        # hurts aggregate throughput in concurrent scenarios)
+        # hurts aggregate throughput in concurrent scenarios). The current
+        # verifier is only correctness-safe for greedy decoding with no
+        # request-local logits processors. Accepted drafts are emitted directly
+        # from the greedy draft/argmax verify path; they do not pass through the
+        # request-local sampler. Non-greedy decoding needs a sampler-aware
+        # verifier before this guard can be safely relaxed.
         if (
             input_tokens.shape[1] > 1
             or batch_gen.active_batch is None
             or len(batch_gen.active_batch) > 1
+            or has_non_greedy_sampling
+            or (logits_processors is not None and any(logits_processors))
         ):
             _skip_state[0] = None
             return _orig_step(
@@ -2084,8 +2236,14 @@ def install_mtp_mllm(
     batch_gen._step = _mtp_step
     batch_gen._next = _mtp_next
 
+    if num_draft_tokens != 1:
+        logger.warning(
+            "[MTP-MLLM] num_draft_tokens=%d requested, but the current batched "
+            "MLLM MTP path drafts exactly one token per verify step",
+            num_draft_tokens,
+        )
     total = _mtp_stats
     logger.info(
         f"[MTP-MLLM] installed with num_draft_tokens={num_draft_tokens}, "
-        f"always-advance verified mode"
+        f"effective_draft_tokens=1, always-advance verified mode"
     )

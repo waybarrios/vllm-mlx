@@ -13,9 +13,11 @@ Test Cases:
 - Mixed text-only and multimodal requests
 """
 
+import asyncio
 import base64
 import os
 import tempfile
+from contextlib import nullcontext
 from unittest.mock import MagicMock
 
 import pytest
@@ -33,6 +35,76 @@ pytestmark = pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
 
 # Test image (small PNG)
 TEST_IMAGE_B64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
+
+
+class TestMLLMPromptCacheEval:
+    def test_collects_kv_and_arrays_cache_tensors(self):
+        from vllm_mlx.mllm_batch_generator import _cache_eval_tensors
+
+        kv_keys = object()
+        kv_values = object()
+        state_a = object()
+        state_b = object()
+
+        class KVLikeCache:
+            keys = kv_keys
+            values = kv_values
+
+            @property
+            def state(self):
+                raise AssertionError("KV cache state should not be read")
+
+        class ArraysLikeCache:
+            state = [state_a, None, state_b]
+
+        class EmptyKVLikeCache:
+            keys = None
+            values = None
+
+            @property
+            def state(self):
+                raise AttributeError("empty KV cache has no state")
+
+        assert _cache_eval_tensors(
+            [KVLikeCache(), ArraysLikeCache(), EmptyKVLikeCache()]
+        ) == [kv_keys, kv_values, state_a, state_b]
+
+    def test_eval_prompt_cache_skips_empty_cache(self, monkeypatch):
+        from vllm_mlx.mllm_batch_generator import _eval_prompt_cache
+
+        eval_mock = MagicMock()
+        monkeypatch.setattr(mx, "eval", eval_mock)
+
+        class EmptyCache:
+            keys = None
+            values = None
+            state = [None]
+
+        _eval_prompt_cache([EmptyCache()])
+
+        eval_mock.assert_not_called()
+
+    def test_eval_prompt_cache_flattens_cache_tensors(self, monkeypatch):
+        from vllm_mlx.mllm_batch_generator import _eval_prompt_cache
+
+        kv_keys = object()
+        kv_values = object()
+        state = object()
+        eval_mock = MagicMock()
+        monkeypatch.setattr(mx, "eval", eval_mock)
+
+        class KVLikeCache:
+            keys = kv_keys
+            values = kv_values
+
+        class ArraysLikeCache:
+            pass
+
+        ArraysLikeCache.state = [state]
+
+        _eval_prompt_cache([KVLikeCache(), ArraysLikeCache()])
+
+        eval_mock.assert_called_once_with(kv_keys, kv_values, state)
 
 
 def create_test_image(path: str, size: tuple = (32, 32)) -> str:
@@ -233,6 +305,51 @@ class TestMLLMBatch:
         assert len(batch) == 2
         assert batch.uids == [1, 3]
         assert batch.request_ids == ["req-1", "req-3"]
+
+    def test_batch_extend_handles_empty_protocol_caches_without_keys(self):
+        """Caches with empty()/extend() but no .keys still need batch extension."""
+        from vllm_mlx.mllm_batch_generator import MLLMBatch, MLLMBatchRequest
+
+        class OpaqueCache:
+            def __init__(self):
+                self.extend_calls = 0
+                self.extended_with = None
+
+            def empty(self):
+                return False
+
+            def extend(self, other):
+                self.extend_calls += 1
+                self.extended_with = other
+
+        primary_cache = OpaqueCache()
+        other_cache = OpaqueCache()
+        primary = MLLMBatch(
+            uids=[1],
+            request_ids=["req-1"],
+            y=mx.array([100]),
+            logprobs=[mx.array([0.1])],
+            max_tokens=[100],
+            num_tokens=[0],
+            cache=[primary_cache],
+            requests=[MLLMBatchRequest(uid=1, request_id="req-1", prompt="one")],
+        )
+        other = MLLMBatch(
+            uids=[2],
+            request_ids=["req-2"],
+            y=mx.array([200]),
+            logprobs=[mx.array([0.2])],
+            max_tokens=[100],
+            num_tokens=[0],
+            cache=[other_cache],
+            requests=[MLLMBatchRequest(uid=2, request_id="req-2", prompt="two")],
+        )
+
+        primary.extend(other)
+
+        assert primary.y.shape == (2,)
+        assert primary_cache.extend_calls == 1
+        assert primary_cache.extended_with is other_cache
 
 
 class TestMLLMBatchStats:
@@ -642,7 +759,528 @@ class TestMLLMSchedulerIntegration:
         finally:
             await scheduler.stop()
 
+    async def test_stream_outputs_consumer_break_after_finished_does_not_abort(self):
+        """Breaking after a finished output is normal consumption, not orphaning."""
+        from vllm_mlx.mllm_scheduler import MLLMScheduler
+        from vllm_mlx.request import RequestOutput
+
+        scheduler = MLLMScheduler.__new__(MLLMScheduler)
+        scheduler.output_queues = {"req-1": asyncio.Queue()}
+        scheduler.abort_request = MagicMock(return_value=True)
+
+        await scheduler.output_queues["req-1"].put(
+            RequestOutput(
+                request_id="req-1",
+                output_text="done",
+                finished=True,
+                finish_reason="stop",
+            )
+        )
+
+        stream = MLLMScheduler.stream_outputs(scheduler, "req-1")
+        output = await stream.__anext__()
+        assert output.finished is True
+        await stream.aclose()
+
+        scheduler.abort_request.assert_not_called()
+        assert "req-1" not in scheduler.output_queues
+
 
 # Run tests
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+class TestMLLMBatchGeneratorMTPGuards:
+    def test_process_prompts_applies_request_sampling_to_first_token(self, monkeypatch):
+        from vllm_mlx.mllm_batch_generator import (
+            MLLMBatchGenerator,
+            MLLMBatchRequest,
+            MLLMBatchStats,
+        )
+
+        class FakeCache:
+            def merge(self, caches):
+                return self
+
+        class RecordingProcessor:
+            def __init__(self):
+                self.calls = []
+
+            def __call__(self, tokens, logits):
+                self.calls.append(tokens.tolist())
+                return logits
+
+        processor = RecordingProcessor()
+        request_sampler = MagicMock(return_value=mx.array([3], dtype=mx.uint32))
+        fallback_sampler = MagicMock(return_value=mx.array([1], dtype=mx.uint32))
+        sampler_calls = []
+
+        def fake_make_sampler(**kwargs):
+            sampler_calls.append(kwargs)
+            return request_sampler
+
+        monkeypatch.setattr(mx, "stream", lambda stream: nullcontext())
+        monkeypatch.setattr(
+            "mlx_lm.models.cache.make_prompt_cache", lambda model: [FakeCache()]
+        )
+        monkeypatch.setattr("mlx_lm.sample_utils.make_sampler", fake_make_sampler)
+        monkeypatch.setattr(
+            "mlx_lm.sample_utils.make_logits_processors", lambda **_: []
+        )
+
+        generator = MLLMBatchGenerator.__new__(MLLMBatchGenerator)
+        generator._stats = MLLMBatchStats()
+        generator._pending_error_responses = []
+        generator._aborted_request_ids = set()
+        generator._prefill_progress = {}
+        generator.prefix_cache = None
+        generator.prefill_step_size = 512
+        generator.language_model = object()
+        generator.model = MagicMock()
+        generator.sampler = fallback_sampler
+        generator._trim_rotating_caches = lambda cache: None
+        generator._preprocess_request = lambda req: None
+        generator._run_chunked_text_prefill = lambda req, cache: mx.array(
+            [[[0.0, 1.0, 2.0, 3.0]]]
+        )
+
+        request = MLLMBatchRequest(
+            uid=7,
+            request_id="req-7",
+            prompt="hello",
+            temperature=0.3,
+            top_p=0.8,
+            top_k=0,
+            min_p=0.0,
+            logits_processors=[processor],
+        )
+        request.input_ids = mx.array([[42]], dtype=mx.uint32)
+        request.is_text_only = True
+
+        batch = MLLMBatchGenerator._process_prompts(generator, [request])
+
+        assert batch.y.tolist() == [3]
+        assert batch.samplers == [request_sampler]
+        assert batch.logits_processors == [[processor]]
+        assert processor.calls == [[]]
+        assert request_sampler.call_count == 1
+        fallback_sampler.assert_not_called()
+        assert sampler_calls == [{"temp": 0.3, "top_p": 0.8, "top_k": 0, "min_p": 0.0}]
+
+    def test_next_passes_current_token_to_logits_processor_prefix(self):
+        from vllm_mlx.mllm_batch_generator import (
+            MLLMBatch,
+            MLLMBatchGenerator,
+            MLLMBatchRequest,
+            MLLMBatchStats,
+        )
+
+        captured = {}
+
+        def fake_step(input_tokens, cache, logits_processors, output_tokens, samplers):
+            captured["input_tokens"] = input_tokens.tolist()
+            captured["output_tokens"] = output_tokens
+            return mx.array([11]), [mx.array([0.2, 0.8])]
+
+        generator = MLLMBatchGenerator.__new__(MLLMBatchGenerator)
+        generator._stats = MLLMBatchStats()
+        generator.stop_tokens = set()
+        generator.unprocessed_requests = []
+        generator._pending_error_responses = []
+        generator._prefill_progress = {}
+        generator.prefix_cache = None
+        generator._maybe_store_prefix_cache = lambda batch, end_idx: None
+        generator._step = fake_step
+
+        processor = MagicMock()
+        request = MLLMBatchRequest(uid=1, request_id="req-1", prompt="hello")
+        request.output_tokens = [5]
+        generator.active_batch = MLLMBatch(
+            uids=[1],
+            request_ids=["req-1"],
+            y=mx.array([7]),
+            logprobs=[mx.array([0.5, 0.5])],
+            max_tokens=[8],
+            num_tokens=[1],
+            cache=[],
+            requests=[request],
+            logits_processors=[[processor]],
+            samplers=None,
+        )
+
+        responses = MLLMBatchGenerator._next(generator)
+
+        assert [r.token for r in responses] == [7]
+        assert captured["input_tokens"] == [[7]]
+        assert captured["output_tokens"] == [[5, 7]]
+        assert request.output_tokens == [5, 7]
+
+    def test_install_mtp_mllm_disables_mtp_when_logits_processors_active(self):
+        from vllm_mlx.mllm_batch_generator import install_mtp_mllm
+
+        expected_tokens = mx.array([7])
+        expected_logprobs = [mx.array([0.1, 0.9])]
+        original_step = MagicMock(return_value=(expected_tokens, expected_logprobs))
+
+        class FakeBatchGen:
+            def __init__(self):
+                self._step = original_step
+                self._next = MagicMock(return_value=[])
+                self.active_batch = MagicMock()
+                self.active_batch.__len__.return_value = 1
+                self.active_batch.requests = [
+                    MagicMock(
+                        temperature=0.0,
+                        top_p=1.0,
+                        top_k=0,
+                        min_p=0.0,
+                    )
+                ]
+                self.sampler = MagicMock()
+
+        batch_gen = FakeBatchGen()
+        language_model = MagicMock()
+
+        install_mtp_mllm(batch_gen, language_model, num_draft_tokens=4)
+
+        logits_processor = MagicMock()
+        tokens, logprobs = batch_gen._step(
+            mx.array([[123]]),
+            cache=[],
+            logits_processors=[[logits_processor]],
+            output_tokens=[[1, 2]],
+            samplers=[None],
+        )
+
+        assert tokens.tolist() == expected_tokens.tolist()
+        assert [lp.tolist() for lp in logprobs] == [
+            lp.tolist() for lp in expected_logprobs
+        ]
+        original_step.assert_called_once()
+        language_model.assert_not_called()
+        language_model.mtp_forward.assert_not_called()
+
+    def test_install_mtp_mllm_disables_mtp_for_non_greedy_sampling(self):
+        from vllm_mlx.mllm_batch_generator import install_mtp_mllm
+
+        expected_tokens = mx.array([11])
+        expected_logprobs = [mx.array([0.3, 0.7])]
+        original_step = MagicMock(return_value=(expected_tokens, expected_logprobs))
+
+        class FakeBatchGen:
+            def __init__(self):
+                self._step = original_step
+                self._next = MagicMock(return_value=[])
+                self.active_batch = MagicMock()
+                self.active_batch.__len__.return_value = 1
+                self.active_batch.requests = [
+                    MagicMock(
+                        temperature=0.6,
+                        top_p=0.95,
+                        top_k=20,
+                        min_p=0.0,
+                    )
+                ]
+                self.sampler = MagicMock()
+
+        batch_gen = FakeBatchGen()
+        language_model = MagicMock()
+
+        install_mtp_mllm(batch_gen, language_model, num_draft_tokens=4)
+
+        tokens, logprobs = batch_gen._step(
+            mx.array([[321]]),
+            cache=[],
+            logits_processors=None,
+            output_tokens=None,
+            samplers=[MagicMock()],
+        )
+
+        assert tokens.tolist() == expected_tokens.tolist()
+        assert [lp.tolist() for lp in logprobs] == [
+            lp.tolist() for lp in expected_logprobs
+        ]
+        original_step.assert_called_once()
+        language_model.assert_not_called()
+        language_model.mtp_forward.assert_not_called()
+
+    def test_install_mtp_mllm_accepted_drafts_bypass_request_sampler(self):
+        from vllm_mlx.mllm_batch_generator import MLLMBatchResponse, install_mtp_mllm
+
+        class FakeBatchGen:
+            def __init__(self):
+                self._step = MagicMock()
+                self._next = MagicMock(
+                    return_value=[
+                        MLLMBatchResponse(
+                            uid=7,
+                            request_id="req-7",
+                            token=1,
+                            logprobs=mx.array([0.0, 0.0, 0.0, 0.0, 0.0]),
+                            finish_reason=None,
+                        )
+                    ]
+                )
+                self.active_batch = MagicMock()
+                self.active_batch.__len__.return_value = 1
+                self.active_batch.uids = [7]
+                request = MagicMock(
+                    request_id="req-7",
+                    temperature=0.0,
+                    top_p=1.0,
+                    top_k=0,
+                    min_p=0.0,
+                    output_tokens=[],
+                )
+                self.active_batch.requests = [request]
+                self.active_batch.num_tokens = [0]
+                self.active_batch.max_tokens = [16]
+                self.stop_tokens = set()
+                self.sampler = MagicMock(return_value=mx.array([1], dtype=mx.uint32))
+                self._maybe_store_prefix_cache = MagicMock()
+
+        batch_gen = FakeBatchGen()
+        request_sampler = MagicMock(return_value=mx.array([1], dtype=mx.uint32))
+
+        class FakeLanguageModel:
+            def mtp_forward(self, hidden_states, next_token_ids, mtp_cache=None):
+                logits = mx.full((1, 1, 5), -1000.0)
+                logits[:, :, 2] = 0.0
+                return logits
+
+            def __call__(self, verify_input, cache=None, return_hidden=False):
+                logits = mx.full((1, 2, 5), -1000.0)
+                logits[:, 0, 2] = 0.0
+                logits[:, 1, 3] = 0.0
+                return logits, mx.zeros((1, 2, 4))
+
+        install_mtp_mllm(batch_gen, FakeLanguageModel(), num_draft_tokens=1)
+
+        batch_gen._step(
+            mx.array([[123]], dtype=mx.uint32),
+            cache=[],
+            logits_processors=None,
+            output_tokens=[[]],
+            samplers=[request_sampler],
+        )
+        responses = batch_gen._next()
+
+        assert [r.token for r in responses] == [1, 2]
+        assert request_sampler.call_count == 1
+        assert batch_gen.sampler.call_count == 0
+
+    def test_next_keeps_retired_processors_by_default(self, monkeypatch):
+        from vllm_mlx.mllm_batch_generator import (
+            MLLMBatch,
+            MLLMBatchGenerator,
+            MLLMBatchRequest,
+            MLLMBatchStats,
+        )
+
+        monkeypatch.delenv("VLLM_MLX_ENABLE_THINKING_RETIREMENT_RESUME", raising=False)
+
+        class RetiredProcessor:
+            is_retired = True
+
+            def __call__(self, tokens, logits):
+                return logits
+
+        processor = RetiredProcessor()
+        generator = MLLMBatchGenerator.__new__(MLLMBatchGenerator)
+        generator._stats = MLLMBatchStats()
+        generator.stop_tokens = set()
+        generator.unprocessed_requests = []
+        generator._pending_error_responses = []
+        generator._prefill_progress = {}
+        generator.prefix_cache = None
+        generator._maybe_store_prefix_cache = lambda batch, end_idx: None
+        generator._step = lambda *args, **kwargs: (
+            mx.array([11]),
+            [mx.array([0.2, 0.8])],
+        )
+
+        request = MLLMBatchRequest(uid=1, request_id="req-1", prompt="hello")
+        generator.active_batch = MLLMBatch(
+            uids=[1],
+            request_ids=["req-1"],
+            y=mx.array([7]),
+            logprobs=[mx.array([0.5, 0.5])],
+            max_tokens=[4],
+            num_tokens=[0],
+            cache=[],
+            requests=[request],
+            logits_processors=[[processor]],
+            samplers=None,
+        )
+
+        responses = MLLMBatchGenerator._next(generator)
+
+        assert len(responses) == 1
+        assert generator.active_batch is not None
+        assert generator.active_batch.logits_processors == [[processor]]
+
+    def test_next_drops_retired_processors_only_when_enabled(self, monkeypatch):
+        from vllm_mlx.mllm_batch_generator import (
+            MLLMBatch,
+            MLLMBatchGenerator,
+            MLLMBatchRequest,
+            MLLMBatchStats,
+        )
+
+        monkeypatch.setenv("VLLM_MLX_ENABLE_THINKING_RETIREMENT_RESUME", "1")
+
+        class RetiredProcessor:
+            is_retired = True
+
+            def __call__(self, tokens, logits):
+                return logits
+
+        generator = MLLMBatchGenerator.__new__(MLLMBatchGenerator)
+        generator._stats = MLLMBatchStats()
+        generator.stop_tokens = set()
+        generator.unprocessed_requests = []
+        generator._pending_error_responses = []
+        generator._prefill_progress = {}
+        generator.prefix_cache = None
+        generator._maybe_store_prefix_cache = lambda batch, end_idx: None
+        generator._step = lambda *args, **kwargs: (
+            mx.array([11]),
+            [mx.array([0.2, 0.8])],
+        )
+
+        request = MLLMBatchRequest(uid=1, request_id="req-1", prompt="hello")
+        generator.active_batch = MLLMBatch(
+            uids=[1],
+            request_ids=["req-1"],
+            y=mx.array([7]),
+            logprobs=[mx.array([0.5, 0.5])],
+            max_tokens=[4],
+            num_tokens=[0],
+            cache=[],
+            requests=[request],
+            logits_processors=[[RetiredProcessor()]],
+            samplers=None,
+        )
+
+        responses = MLLMBatchGenerator._next(generator)
+
+        assert len(responses) == 1
+        assert generator.active_batch is not None
+        assert generator.active_batch.logits_processors == [None]
+
+
+class TestBatchedMLLMConfigWiring:
+    def test_batched_engine_forwards_prefill_step_size_to_mllm_scheduler(
+        self, monkeypatch
+    ):
+        from vllm_mlx.engine.batched import BatchedEngine
+        from vllm_mlx.scheduler import SchedulerConfig
+
+        captured = {}
+
+        class FakeMLXMultimodalLM:
+            def __init__(self, model_name, trust_remote_code=True):
+                self.model_name = model_name
+                self.model = object()
+                self.processor = object()
+
+            def load(self):
+                return None
+
+        class FakeMLLMSchedulerConfig:
+            def __init__(self, **kwargs):
+                captured["config_kwargs"] = kwargs
+                self.__dict__.update(kwargs)
+
+        class FakeMLLMScheduler:
+            def __init__(self, model, processor, config):
+                captured["scheduler_config"] = config
+
+            async def start(self):
+                return None
+
+        import vllm_mlx.engine.batched as batched_mod
+        import vllm_mlx.mllm_scheduler as mllm_sched_mod
+        import vllm_mlx.models.mllm as mllm_model_mod
+
+        monkeypatch.setattr(mllm_model_mod, "MLXMultimodalLM", FakeMLXMultimodalLM)
+        monkeypatch.setattr(mllm_sched_mod, "MLLMScheduler", FakeMLLMScheduler)
+        monkeypatch.setattr(
+            mllm_sched_mod, "MLLMSchedulerConfig", FakeMLLMSchedulerConfig
+        )
+        monkeypatch.setattr(
+            batched_mod.BatchedEngine, "_inject_mtp_mllm", lambda self: None
+        )
+
+        cfg = SchedulerConfig(
+            prefill_batch_size=4,
+            completion_batch_size=8,
+            prefill_step_size=256,
+            enable_mtp=False,
+        )
+        engine = BatchedEngine(
+            model_name="fake-qwen",
+            scheduler_config=cfg,
+            force_mllm=True,
+        )
+
+        asyncio.run(engine._start_mllm())
+
+        assert captured["config_kwargs"]["prefill_step_size"] == 256
+
+
+class TestPreprocessIdempotent:
+    """_preprocess_request must be idempotent for text-only requests.
+
+    The scheduler offloads preprocessing to a thread-pool executor so
+    the event loop stays responsive.  _process_prompts then calls
+    _preprocess_request again — the second call must be a no-op.
+    """
+
+    def test_text_only_not_preprocessed_twice(self):
+        """When input_ids is already set (executor did it), skip."""
+        from vllm_mlx.mllm_batch_generator import MLLMBatchRequest
+
+        req = MLLMBatchRequest(
+            uid=0,
+            prompt="Hello",
+            request_id="test-idem",
+        )
+        # Simulate executor having already set input_ids
+        req.input_ids = mx.array([[1, 2, 3]])
+
+        # Build a minimal batch generator with the method
+        from vllm_mlx.mllm_batch_generator import MLLMBatchGenerator
+
+        gen = MLLMBatchGenerator.__new__(MLLMBatchGenerator)
+        gen._preprocess_request = MLLMBatchGenerator._preprocess_request.__get__(
+            gen, MLLMBatchGenerator
+        )
+
+        # Must return immediately without touching prepare_inputs
+        gen._preprocess_request(req)
+        assert req.input_ids.shape == (1, 3)
+
+    def test_vision_request_not_skipped(self):
+        """Vision requests should NOT be skipped even with input_ids set."""
+        from vllm_mlx.mllm_batch_generator import MLLMBatchRequest
+
+        req = MLLMBatchRequest(
+            uid=0,
+            prompt="Describe",
+            request_id="test-vis",
+            images=["fake.png"],
+        )
+        req.input_ids = mx.array([[1, 2, 3]])
+
+        from vllm_mlx.mllm_batch_generator import MLLMBatchGenerator
+
+        gen = MLLMBatchGenerator.__new__(MLLMBatchGenerator)
+        gen._preprocess_request = MLLMBatchGenerator._preprocess_request.__get__(
+            gen, MLLMBatchGenerator
+        )
+
+        # Should NOT return early — will try to import prepare_inputs
+        with pytest.raises(Exception):
+            gen._preprocess_request(req)

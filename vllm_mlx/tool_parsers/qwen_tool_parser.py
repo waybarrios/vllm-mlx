@@ -58,6 +58,8 @@ class QwenToolParser(ToolParser):
     Used when --enable-auto-tool-choice --tool-call-parser qwen are set.
     """
 
+    SUPPORTS_NATIVE_TOOL_FORMAT = True
+
     # Pattern for XML-style: <tool_call>{"json"}</tool_call>
     XML_PATTERN = re.compile(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.DOTALL)
 
@@ -69,6 +71,9 @@ class QwenToolParser(ToolParser):
 
     # Pattern for parameter extraction: <parameter=key>value</parameter>
     PARAM_PATTERN = re.compile(r"<parameter=([^>]+)>\s*(.*?)\s*</parameter>", re.DOTALL)
+
+    # Pattern for empty <tool_call> wrappers left after function extraction
+    EMPTY_TOOL_CALL = re.compile(r"<tool_call>\s*</tool_call>", re.DOTALL)
 
     def extract_tool_calls(
         self, model_output: str, request: dict[str, Any] | None = None
@@ -164,6 +169,8 @@ class QwenToolParser(ToolParser):
                 cleaned_text = self.FUNCTION_PATTERN.sub("", cleaned_text).strip()
 
         if tool_calls:
+            # Clean up empty <tool_call> wrappers left after function extraction
+            cleaned_text = self.EMPTY_TOOL_CALL.sub("", cleaned_text).strip()
             return ExtractedToolCallInformation(
                 tools_called=True,
                 tool_calls=tool_calls,
@@ -272,9 +279,11 @@ class QwenToolParser(ToolParser):
 
             return None
 
-        # If we're in a tool call, accumulate and parse at the end
-        # For simplicity, return None during accumulation
-        if "</tool_call>" in delta_text or ")]" in delta_text:
+        # If we're in a tool call, accumulate and parse at the end.
+        # Check current_text (accumulated), not delta_text — closing markers
+        # like ")]" or "</tool_call>" often span token boundaries and may
+        # never appear within a single delta chunk.
+        if "</tool_call>" in current_text or ")]" in current_text:
             # Tool call complete, parse the whole thing
             result = self.extract_tool_calls(current_text)
             if result.tools_called:

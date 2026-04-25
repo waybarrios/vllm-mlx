@@ -12,7 +12,7 @@ Features:
 - Support for LLM and multimodal models
 """
 
-__version__ = "0.2.5"
+__version__ = "0.2.9"
 
 # All imports are lazy to allow usage on non-Apple Silicon platforms
 # (e.g., CI running on Linux) where mlx_lm is not available.

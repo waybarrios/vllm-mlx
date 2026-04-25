@@ -15,6 +15,8 @@ Usage:
 import argparse
 import sys
 
+from .cli_arg_types import make_json_object_arg_parser
+
 
 def serve_command(args):
     """Start the OpenAI-compatible server."""
@@ -26,7 +28,6 @@ def serve_command(args):
 
     # Import unified server
     from . import server
-    from .scheduler import SchedulerConfig
     from .server import RateLimiter, app, load_model
 
     logger = logging.getLogger(__name__)
@@ -42,6 +43,17 @@ def serve_command(args):
         print(
             "Error: --gpu-memory-utilization must be between 0.0 (exclusive) and 1.0 (inclusive)"
         )
+        sys.exit(1)
+    if args.max_tokens < 1:
+        print("Error: --max-tokens must be at least 1")
+        sys.exit(1)
+    max_request_tokens = getattr(args, "max_request_tokens", args.max_tokens)
+    trust_remote_code = getattr(args, "trust_remote_code", False)
+    if max_request_tokens < 1:
+        print("Error: --max-request-tokens must be at least 1")
+        sys.exit(1)
+    if args.max_tokens > max_request_tokens:
+        print("Error: --max-tokens cannot exceed --max-request-tokens")
         sys.exit(1)
 
     # Validate --turbo-kv-bits capability before spinning up model/server
@@ -65,6 +77,7 @@ def serve_command(args):
     server._default_timeout = args.timeout
     server._metrics_enabled = args.enable_metrics
     server._metrics.configure(enabled=args.enable_metrics)
+    server._max_request_tokens = max_request_tokens
     if args.rate_limit > 0:
         server._rate_limiter = RateLimiter(
             requests_per_minute=args.rate_limit, enabled=True
@@ -83,6 +96,11 @@ def serve_command(args):
         server._default_temperature = args.default_temperature
     if args.default_top_p is not None:
         server._default_top_p = args.default_top_p
+    server._default_chat_template_kwargs = args.default_chat_template_kwargs
+    max_audio_upload_mb = getattr(args, "max_audio_upload_mb", 25)
+    max_tts_input_chars = getattr(args, "max_tts_input_chars", 4096)
+    server._max_audio_upload_bytes = max_audio_upload_mb * 1024 * 1024
+    server._max_tts_input_chars = max_tts_input_chars
 
     # Configure reasoning parser
     if args.reasoning_parser:
@@ -124,6 +142,14 @@ def serve_command(args):
         print("  Metrics: ENABLED (/metrics, unauthenticated)")
     else:
         print("  Metrics: DISABLED - Use --enable-metrics to expose /metrics")
+    if trust_remote_code:
+        print("  Remote code loading: ENABLED (--trust-remote-code)")
+    else:
+        print("  Remote code loading: DISABLED (default)")
+    if args.auto_unload_idle_seconds > 0:
+        print(f"  Idle auto-unload: ENABLED ({args.auto_unload_idle_seconds:.0f}s)")
+    else:
+        print("  Idle auto-unload: DISABLED")
     if args.enable_auto_tool_choice:
         print(f"  Tool calling: ENABLED (parser: {args.tool_call_parser})")
     else:
@@ -132,6 +158,10 @@ def serve_command(args):
         print(f"  Reasoning: ENABLED (parser: {args.reasoning_parser})")
     else:
         print("  Reasoning: Use --reasoning-parser to enable")
+    print(
+        f"  Audio upload limit: {max_audio_upload_mb} MiB, "
+        f"TTS input limit: {max_tts_input_chars} chars"
+    )
     print("=" * 60)
 
     # Pre-download model with retry/timeout
@@ -149,8 +179,13 @@ def serve_command(args):
         is_mllm=is_mllm_model(args.model),
     )
 
-    print(f"Loading model: {args.model}")
+    if args.lazy_load_model:
+        print(f"Registering model for lazy load: {args.model}")
+        print("Model will load on the first request.")
+    else:
+        print(f"Loading model: {args.model}")
     print(f"Default max tokens: {args.max_tokens}")
+    print(f"Max request tokens: {max_request_tokens}")
 
     # Store MCP config path for FastAPI startup
     if args.mcp_config:
@@ -158,14 +193,24 @@ def serve_command(args):
         os.environ["VLLM_MLX_MCP_CONFIG"] = args.mcp_config
 
     # Pre-load embedding model if specified
-    if args.embedding_model:
-        print(f"Pre-loading embedding model: {args.embedding_model}")
-        server.load_embedding_model(args.embedding_model, lock=True)
-        print(f"Embedding model loaded: {args.embedding_model}")
+    embedding_model = getattr(args, "embedding_model", None)
+    if embedding_model:
+        print(f"Pre-loading embedding model: {embedding_model}")
+        server.load_embedding_model(embedding_model, lock=True)
+        print(f"Embedding model loaded: {embedding_model}")
+
+    # Pre-load reranker model if specified
+    rerank_model = getattr(args, "rerank_model", None)
+    if rerank_model:
+        print(f"Pre-loading reranker model: {rerank_model}")
+        server.load_reranker_model(rerank_model, lock=True)
+        print(f"Reranker model loaded: {rerank_model}")
 
     # Build scheduler config for batched mode
     scheduler_config = None
     if args.continuous_batching:
+        from .scheduler import SchedulerConfig
+
         # Handle prefix cache flags
         enable_prefix_cache = args.enable_prefix_cache and not args.disable_prefix_cache
 
@@ -199,6 +244,9 @@ def serve_command(args):
             ),
             # TurboQuant
             turbo_kv_bits=args.turbo_kv_bits,
+            # SSD cache tiering
+            ssd_cache_dir=getattr(args, "ssd_cache_dir", None),
+            ssd_cache_max_gb=getattr(args, "ssd_cache_max_gb", 10.0),
         )
 
         print("Mode: Continuous batching (for multiple concurrent users)")
@@ -247,15 +295,20 @@ def serve_command(args):
         scheduler_config=scheduler_config,
         stream_interval=args.stream_interval if args.continuous_batching else 1,
         max_tokens=args.max_tokens,
+        max_request_tokens=max_request_tokens,
         force_mllm=getattr(args, "mllm", False),
         gpu_memory_utilization=args.gpu_memory_utilization,
         served_model_name=args.served_model_name,
+        trust_remote_code=trust_remote_code,
         mtp=args.enable_mtp,
         prefill_step_size=args.prefill_step_size,
         specprefill_enabled=args.specprefill,
         specprefill_threshold=args.specprefill_threshold,
         specprefill_keep_pct=args.specprefill_keep_pct,
         specprefill_draft_model=args.specprefill_draft_model,
+        warm_prompts_path=getattr(args, "warm_prompts", None),
+        auto_unload_idle_seconds=args.auto_unload_idle_seconds,
+        lazy_load_model=args.lazy_load_model,
     )
 
     # Start server
@@ -681,6 +734,72 @@ def bench_kv_cache_command(args):
     )
 
 
+def bench_serve_command(args):
+    """Run serving benchmark."""
+    import asyncio
+    from .bench_serve import run_bench_serve
+
+    prompt_sets = args.prompts.split(",")
+    concurrencies = [int(c) for c in args.concurrency.split(",")]
+
+    # Parse thinking values
+    thinking_values = [None]
+    if args.enable_thinking:
+        thinking_values = []
+        for v in args.enable_thinking.split(","):
+            v = v.strip().lower()
+            if v == "true":
+                thinking_values.append(True)
+            elif v == "false":
+                thinking_values.append(False)
+
+    # Parse extra body (comma-separated JSON dicts)
+    extra_bodies = [""]
+    if args.extra_body:
+        # Handle both '{"a":1}','{"b":2}' and {"a":1},{"b":2}
+        import re
+
+        extra_bodies = [
+            s.strip().strip("'\"")
+            for s in re.split(r"(?<=})\s*,\s*(?={)", args.extra_body)
+        ]
+
+    # Parse override fields
+    overrides = {}
+    for kv in args.override_field or []:
+        if "=" in kv:
+            k, v = kv.split("=", 1)
+            overrides[k] = v
+
+    asyncio.run(
+        run_bench_serve(
+            url=args.url,
+            model=args.model,
+            prompt_sets=prompt_sets,
+            prompt_file=args.prompt_file,
+            concurrencies=concurrencies,
+            max_tokens=args.max_tokens,
+            repetitions=args.repetitions,
+            warmup=args.warmup,
+            thinking_values=thinking_values,
+            extra_bodies=extra_bodies,
+            output_path=args.output,
+            fmt=args.format,
+            do_validate=args.validate == "true",
+            scrape=args.scrape_metrics == "true",
+            tag=args.tag,
+            override_fields=overrides,
+            system_prompt_file=args.system_prompt_file,
+            # Auto-enable skip-preflight when a system-prompt-file is set:
+            # the whole point of that flag is measuring warm-cache behavior,
+            # and the preflight count_prompt_tokens request pollutes the cache.
+            skip_preflight_token_count=(
+                args.skip_preflight_token_count or bool(args.system_prompt_file)
+            ),
+        )
+    )
+
+
 def create_parser() -> argparse.ArgumentParser:
     """Build the top-level CLI parser."""
     parser = argparse.ArgumentParser(
@@ -704,7 +823,10 @@ Examples:
         help="The model name used in the API. If not specified, the model argument is used.",
     )
     serve_parser.add_argument(
-        "--host", type=str, default="0.0.0.0", help="Host to bind"
+        "--host",
+        type=str,
+        default="127.0.0.1",
+        help="Host to bind (default: localhost; use 0.0.0.0 to expose externally)",
     )
     serve_parser.add_argument("--port", type=int, default=8000, help="Port to bind")
     serve_parser.add_argument(
@@ -792,6 +914,33 @@ Examples:
         "3-bit gives 4.6x compression vs FP16 (default: disabled). "
         "Mutually exclusive with --kv-cache-quantization.",
     )
+    # SSD cache tiering options
+    serve_parser.add_argument(
+        "--ssd-cache-dir",
+        type=str,
+        default=None,
+        help="Directory for SSD KV cache tier (default: disabled)",
+    )
+    serve_parser.add_argument(
+        "--ssd-cache-max-gb",
+        type=float,
+        default=10.0,
+        help="Maximum SSD cache size in GB (default: 10.0)",
+    )
+    # Prompt warm-up options
+    serve_parser.add_argument(
+        "--warm-prompts",
+        type=str,
+        default=None,
+        help=(
+            "Path to a JSON file with prompts to pre-run at startup. Populates "
+            "the prefix cache so the first real request hits warm (cold TTFT "
+            "drops 1.3-2.3x on agent workloads). File format is a list of "
+            "message arrays, same shape as /v1/chat/completions messages. "
+            "Prompts are warmed concurrently -- keep the file small (1-3 entries "
+            "for typical agent deployments) to avoid memory pressure at boot."
+        ),
+    )
     serve_parser.add_argument(
         "--stream-interval",
         type=int,
@@ -803,6 +952,12 @@ Examples:
         type=int,
         default=32768,
         help="Default max tokens for generation (default: 32768)",
+    )
+    serve_parser.add_argument(
+        "--max-request-tokens",
+        type=int,
+        default=32768,
+        help="Maximum max_tokens accepted from API clients (default: 32768)",
     )
     serve_parser.add_argument(
         "--continuous-batching",
@@ -933,6 +1088,29 @@ Examples:
         action="store_true",
         help="Expose Prometheus metrics on /metrics (disabled by default)",
     )
+    serve_parser.add_argument(
+        "--auto-unload-idle-seconds",
+        type=float,
+        default=0.0,
+        help="Unload the main model after this many idle seconds (0 = disabled)",
+    )
+    serve_parser.add_argument(
+        "--lazy-load-model",
+        action="store_true",
+        help="Register the main model at startup but defer loading until first request",
+    )
+    serve_parser.add_argument(
+        "--max-audio-upload-mb",
+        type=int,
+        default=25,
+        help="Maximum size of uploaded audio files in MiB (default: 25)",
+    )
+    serve_parser.add_argument(
+        "--max-tts-input-chars",
+        type=int,
+        default=4096,
+        help="Maximum number of characters accepted by /v1/audio/speech (default: 4096)",
+    )
     # Tool calling options
     serve_parser.add_argument(
         "--enable-auto-tool-choice",
@@ -991,6 +1169,11 @@ Examples:
         action="store_true",
         help="Force load model as multimodal (vision) even if name doesn't match auto-detection patterns",
     )
+    serve_parser.add_argument(
+        "--trust-remote-code",
+        action="store_true",
+        help="Allow HuggingFace remote code execution during model/tokenizer loading",
+    )
     # Generation defaults
     serve_parser.add_argument(
         "--default-temperature",
@@ -1004,12 +1187,29 @@ Examples:
         default=None,
         help="Override default top_p for all requests (default: use model default)",
     )
+    serve_parser.add_argument(
+        "--default-chat-template-kwargs",
+        type=make_json_object_arg_parser("--default-chat-template-kwargs"),
+        default=None,
+        help=(
+            "Default chat template kwargs to apply to all requests when request "
+            "chat_template_kwargs is omitted or empty; empty request kwargs use "
+            'existing server defaults (JSON object, e.g. {"enable_thinking": true})'
+        ),
+    )
     # Embedding model option
     serve_parser.add_argument(
         "--embedding-model",
         type=str,
         default=None,
         help="Pre-load an embedding model at startup (e.g. mlx-community/embeddinggemma-300m-6bit)",
+    )
+    # Reranker model option
+    serve_parser.add_argument(
+        "--rerank-model",
+        type=str,
+        default=None,
+        help="Pre-load a reranker model at startup (e.g. mlx-community/jina-reranker-v2-base-multilingual)",
     )
     # Download options
     serve_parser.add_argument(
@@ -1197,7 +1397,138 @@ Examples:
         help="Download as multimodal model (broader file patterns)",
     )
 
+    # Serving benchmark
+    bench_serve_parser = subparsers.add_parser(
+        "bench-serve", help="Benchmark a running vllm-mlx server via HTTP API"
+    )
+    bench_serve_parser.add_argument(
+        "--url",
+        type=str,
+        default="http://127.0.0.1:8080",
+        help="Base URL of the running server (default: http://127.0.0.1:8080)",
+    )
+    bench_serve_parser.add_argument(
+        "--model",
+        type=str,
+        default=None,
+        help="Model ID to benchmark (default: auto-detected from server)",
+    )
+    bench_serve_parser.add_argument(
+        "--prompts",
+        type=str,
+        default="short,medium,long",
+        help="Comma-separated prompt set names or paths (default: short,medium,long)",
+    )
+    bench_serve_parser.add_argument(
+        "--prompt-file",
+        type=str,
+        default=None,
+        help="Path to an additional prompt file (JSON list of message dicts)",
+    )
+    bench_serve_parser.add_argument(
+        "--system-prompt-file",
+        type=str,
+        default=None,
+        help=(
+            "Path to a text file whose contents are prepended as a system "
+            "message to every prompt. Use this together with --warm-prompts "
+            "to benchmark the warm-cache path (the warmup populates the "
+            "prefix cache with this same system, so every request in the "
+            "bench hits the cache)."
+        ),
+    )
+    bench_serve_parser.add_argument(
+        "--skip-preflight-token-count",
+        action="store_true",
+        help=(
+            "Skip the pre-flight max_tokens=1 request that counts prompt "
+            "tokens per prompt set. That request populates the prefix cache "
+            "with the full prompt, which defeats cold-vs-warm comparisons. "
+            "Auto-enabled when --system-prompt-file is set; pass this flag "
+            "explicitly to force-enable regardless."
+        ),
+    )
+    bench_serve_parser.add_argument(
+        "--concurrency",
+        type=str,
+        default="1,4",
+        help="Comma-separated concurrency levels to sweep (default: 1,4)",
+    )
+    bench_serve_parser.add_argument(
+        "--max-tokens",
+        type=int,
+        default=256,
+        help="Maximum tokens to generate per request (default: 256)",
+    )
+    bench_serve_parser.add_argument(
+        "--repetitions",
+        type=int,
+        default=3,
+        help="Number of repetitions per sweep configuration (default: 3)",
+    )
+    bench_serve_parser.add_argument(
+        "--warmup",
+        type=int,
+        default=1,
+        help="Warmup rounds before the first measured repetition (default: 1)",
+    )
+    bench_serve_parser.add_argument(
+        "--enable-thinking",
+        type=str,
+        default=None,
+        help='Enable thinking mode: "true", "false", or "true,false" to sweep both',
+    )
+    bench_serve_parser.add_argument(
+        "--extra-body",
+        type=str,
+        default=None,
+        help="Comma-separated JSON dicts to pass as extra body parameters",
+    )
+    bench_serve_parser.add_argument(
+        "--output",
+        type=str,
+        default=None,
+        help="File path to write results to (default: stdout)",
+    )
+    bench_serve_parser.add_argument(
+        "--format",
+        type=str,
+        default="table",
+        choices=["table", "json", "csv", "sql"],
+        help="Output format (default: table)",
+    )
+    bench_serve_parser.add_argument(
+        "--validate",
+        type=str,
+        default="true",
+        choices=["true", "false"],
+        help="Validate responses (default: true)",
+    )
+    bench_serve_parser.add_argument(
+        "--scrape-metrics",
+        type=str,
+        default="true",
+        choices=["true", "false"],
+        help="Scrape /metrics before and after each run (default: true)",
+    )
+    bench_serve_parser.add_argument(
+        "--tag",
+        type=str,
+        default=None,
+        help="Optional tag string stored in every result row",
+    )
+    bench_serve_parser.add_argument(
+        "--override-field",
+        nargs="*",
+        default=[],
+        help="Override result fields as key=value pairs (e.g. chip=M4Pro)",
+    )
+
     return parser
+
+
+# Alias for test compatibility
+build_parser = create_parser
 
 
 def main():
@@ -1214,6 +1545,8 @@ def main():
         bench_kv_cache_command(args)
     elif args.command == "download":
         download_command(args)
+    elif args.command == "bench-serve":
+        bench_serve_command(args)
     else:
         parser.print_help()
         sys.exit(1)

@@ -161,7 +161,7 @@ class TestEmbeddingsEndpoint:
 
         texts = ["first", "second", "third"]
         mock_engine = MagicMock()
-        mock_engine.model_name = "test-embed"
+        mock_engine.model_name = "mlx-community/all-MiniLM-L6-v2-4bit"
         mock_engine.embed.return_value = [
             [1.0, 0.0],
             [0.0, 1.0],
@@ -174,7 +174,7 @@ class TestEmbeddingsEndpoint:
         try:
             resp = client.post(
                 "/v1/embeddings",
-                json={"model": "test-embed", "input": texts},
+                json={"model": "mlx-community/all-MiniLM-L6-v2-4bit", "input": texts},
             )
         finally:
             srv._embedding_engine = original
@@ -193,14 +193,14 @@ class TestEmbeddingsEndpoint:
         import vllm_mlx.server as srv
 
         mock_engine = MagicMock()
-        mock_engine.model_name = "test-embed"
+        mock_engine.model_name = "mlx-community/all-MiniLM-L6-v2-4bit"
 
         original = srv._embedding_engine
         srv._embedding_engine = mock_engine
         try:
             resp = client.post(
                 "/v1/embeddings",
-                json={"model": "test-embed", "input": []},
+                json={"model": "mlx-community/all-MiniLM-L6-v2-4bit", "input": []},
             )
         finally:
             srv._embedding_engine = original
@@ -208,7 +208,7 @@ class TestEmbeddingsEndpoint:
         assert resp.status_code == 400
 
     def test_model_hot_swap(self, client):
-        """Test that requesting a different model triggers reload."""
+        """Test that switching to another allowlisted model triggers reload."""
         import vllm_mlx.server as srv
 
         mock_engine = MagicMock()
@@ -222,17 +222,22 @@ class TestEmbeddingsEndpoint:
         try:
             with patch("vllm_mlx.embedding.EmbeddingEngine") as mock_cls:
                 new_engine = MagicMock()
-                new_engine.model_name = "new-model"
+                new_engine.model_name = "mlx-community/multilingual-e5-small-mlx"
                 new_engine.embed.return_value = [[0.9]]
                 new_engine.count_tokens.return_value = 1
                 mock_cls.return_value = new_engine
 
                 resp = client.post(
                     "/v1/embeddings",
-                    json={"model": "new-model", "input": "test"},
+                    json={
+                        "model": "mlx-community/multilingual-e5-small-mlx",
+                        "input": "test",
+                    },
                 )
                 assert resp.status_code == 200
-                mock_cls.assert_called_once_with("new-model")
+                mock_cls.assert_called_once_with(
+                    "mlx-community/multilingual-e5-small-mlx"
+                )
                 new_engine.load.assert_called_once()
         finally:
             srv._embedding_engine = original
@@ -261,6 +266,18 @@ class TestEmbeddingsEndpoint:
         finally:
             srv._embedding_engine = original_engine
             srv._embedding_model_locked = original_locked
+
+    def test_unknown_embedding_model_rejected(self, client):
+        """Test that request-time embedding loads reject unknown models."""
+        resp = client.post(
+            "/v1/embeddings",
+            json={"model": "attacker/unknown-embedding", "input": "test"},
+        )
+
+        assert resp.status_code == 400
+        body = resp.json()
+        assert "attacker/unknown-embedding" in body["detail"]
+        assert "--embedding-model" in body["detail"]
 
 
 # =============================================================================

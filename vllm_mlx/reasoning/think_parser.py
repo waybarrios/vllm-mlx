@@ -55,10 +55,14 @@ class BaseThinkingReasoningParser(ReasoningParser):
         super().__init__(tokenizer)
         # Streaming state — reset per request via reset_state()
         self._phase: str = "pre_think"  # "pre_think" | "thinking" | "content"
+        self._content_started = False
+        self._content_buffer = ""
 
     def reset_state(self):
         """Reset state machine for a new streaming request."""
         self._phase = "pre_think"
+        self._content_started = False
+        self._content_buffer = ""
 
     def extract_reasoning(
         self,
@@ -80,21 +84,12 @@ class BaseThinkingReasoningParser(ReasoningParser):
         """
         text = model_output
 
-        # Case 1: Both tags present (normal case)
-        if self.start_token in text and self.end_token in text:
-            _, _, after_start = text.partition(self.start_token)
-            reasoning, _, content = after_start.partition(self.end_token)
-            # Strip duplicate end tokens (some models generate <think></think></think>)
-            while content.lstrip().startswith(self.end_token):
-                content = content.lstrip()[len(self.end_token) :]
-            return reasoning.strip() or None, content.strip() or None
-
-        # Case 2: Only closing tag (think was injected in prompt)
+        # Cases 1 and 2: consume one or more leading reasoning spans. Some
+        # thinking models emit an extra empty ``<think></think>`` block after
+        # the forced transition; that block still belongs to reasoning, not
+        # final content.
         if self.end_token in text:
-            reasoning, _, content = text.partition(self.end_token)
-            while content.lstrip().startswith(self.end_token):
-                content = content.lstrip()[len(self.end_token) :]
-            return reasoning.strip() or None, content.strip() or None
+            return self._extract_complete_reasoning(text)
 
         # Case 3: Only start tag (incomplete reasoning, no end yet)
         if self.start_token in text:
@@ -153,12 +148,7 @@ class BaseThinkingReasoningParser(ReasoningParser):
                     eidx = after.find(end_tok)
                     reasoning = after[:eidx]
                     content = after[eidx + len(end_tok) :]
-                    if not reasoning and not content:
-                        return None
-                    return DeltaMessage(
-                        reasoning=reasoning or None,
-                        content=content or None,
-                    )
+                    return self._transition_to_content(reasoning, content)
                 return DeltaMessage(reasoning=after) if after else None
 
             # Implicit mode: </think> completed without an explicit <think>.
@@ -171,12 +161,7 @@ class BaseThinkingReasoningParser(ReasoningParser):
                 else:
                     reasoning = None
                     content = delta_text
-                if not reasoning and not content:
-                    return None
-                return DeltaMessage(
-                    reasoning=reasoning or None,
-                    content=content or None,
-                )
+                return self._transition_to_content(reasoning, content)
 
             # No tags — default to reasoning (implicit mode assumption).
             # If the model doesn't use thinking at all, the server's
@@ -196,14 +181,109 @@ class BaseThinkingReasoningParser(ReasoningParser):
                 else:
                     reasoning = delta_text
                     content = None
-                if not reasoning and not content:
-                    return None
-                return DeltaMessage(
-                    reasoning=reasoning or None,
-                    content=content or None,
-                )
+                return self._transition_to_content(reasoning, content)
             return DeltaMessage(reasoning=delta_text)
 
         # ── Phase: content ────────────────────────────────────────
         # Past the reasoning block — everything is content.
-        return DeltaMessage(content=delta_text)
+        return self._content_delta(delta_text)
+
+    def _extract_complete_reasoning(self, text: str) -> tuple[str | None, str | None]:
+        """Split complete output into leading reasoning spans and final content."""
+        reasoning_parts: list[str] = []
+        remainder = text
+
+        while remainder:
+            stripped = remainder.lstrip()
+
+            if stripped.startswith(self.start_token):
+                after_start = stripped[len(self.start_token) :]
+                reasoning, found, after_end = after_start.partition(self.end_token)
+                if not found:
+                    reasoning_parts.append(reasoning)
+                    remainder = ""
+                    break
+                if reasoning.strip():
+                    reasoning_parts.append(reasoning.strip())
+                remainder = after_end
+                continue
+
+            start_idx = stripped.find(self.start_token)
+            end_idx = stripped.find(self.end_token)
+            if end_idx != -1 and (start_idx == -1 or end_idx < start_idx):
+                reasoning = stripped[:end_idx]
+                if reasoning.strip():
+                    reasoning_parts.append(reasoning.strip())
+                remainder = stripped[end_idx + len(self.end_token) :]
+                continue
+
+            remainder = stripped
+            break
+
+        reasoning = "\n".join(reasoning_parts).strip() or None
+        content = remainder.strip() or None
+        return reasoning, content
+
+    def _transition_to_content(
+        self, reasoning: str | None, content: str | None
+    ) -> DeltaMessage | None:
+        """Return a delta while suppressing leading post-transition think blocks."""
+        content_msg = self._content_delta(content or "")
+        extra_reasoning = content_msg.reasoning if content_msg else None
+        final_content = content_msg.content if content_msg else None
+        reasoning_text = (reasoning or "") + (extra_reasoning or "")
+        if not reasoning_text and not final_content:
+            return None
+        return DeltaMessage(
+            reasoning=reasoning_text or None,
+            content=final_content or None,
+        )
+
+    def _content_delta(self, delta_text: str) -> DeltaMessage | None:
+        """Emit content after consuming repeated leading think blocks."""
+        if not delta_text and not self._content_buffer:
+            return None
+
+        if self._content_started:
+            return DeltaMessage(content=delta_text) if delta_text else None
+
+        self._content_buffer += delta_text
+        buffer = self._content_buffer.lstrip()
+        reasoning_parts: list[str] = []
+
+        while buffer:
+            if buffer.startswith(self.end_token):
+                buffer = buffer[len(self.end_token) :].lstrip()
+                continue
+
+            if buffer.startswith(self.start_token):
+                after_start = buffer[len(self.start_token) :]
+                end_idx = after_start.find(self.end_token)
+                if end_idx == -1:
+                    self._content_buffer = buffer
+                    return None
+                reasoning = after_start[:end_idx]
+                if reasoning:
+                    reasoning_parts.append(reasoning)
+                buffer = after_start[end_idx + len(self.end_token) :].lstrip()
+                continue
+
+            if self.start_token.startswith(buffer):
+                self._content_buffer = buffer
+                return None
+
+            if self.end_token.startswith(buffer):
+                self._content_buffer = buffer
+                return None
+
+            self._content_started = True
+            self._content_buffer = ""
+            return DeltaMessage(
+                reasoning="".join(reasoning_parts) or None,
+                content=buffer,
+            )
+
+        self._content_buffer = ""
+        if reasoning_parts:
+            return DeltaMessage(reasoning="".join(reasoning_parts))
+        return None

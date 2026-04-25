@@ -24,7 +24,7 @@ vllm-mlx serve <model> [options]
 |--------|-------------|---------|
 | `--served-model-name` | Custom model name exposed through the OpenAI API. If not set, the model path is used as the name. | None |
 | `--port` | Server port | 8000 |
-| `--host` | Server host | 0.0.0.0 |
+| `--host` | Server host | 127.0.0.1 |
 | `--api-key` | API key for authentication | None |
 | `--rate-limit` | Requests per minute per client (0 = disabled) | 0 |
 | `--timeout` | Request timeout in seconds | 300 |
@@ -35,6 +35,7 @@ vllm-mlx serve <model> [options]
 | `--no-memory-aware-cache` | Use legacy entry-count cache | False |
 | `--use-paged-cache` | Enable paged KV cache | False |
 | `--max-tokens` | Default max tokens | 32768 |
+| `--max-request-tokens` | Maximum `max_tokens` accepted from API clients | 32768 |
 | `--stream-interval` | Tokens per stream chunk | 1 |
 | `--mcp-config` | Path to MCP config file | None |
 | `--paged-cache-block-size` | Tokens per cache block | 64 |
@@ -42,6 +43,9 @@ vllm-mlx serve <model> [options]
 | `--max-num-seqs` | Max concurrent sequences | 256 |
 | `--default-temperature` | Default temperature when not specified in request | None |
 | `--default-top-p` | Default top_p when not specified in request | None |
+| `--default-chat-template-kwargs` | Default chat template kwargs applied when request `chat_template_kwargs` is omitted (JSON object) | None |
+| `--max-audio-upload-mb` | Maximum uploaded audio size for `/v1/audio/transcriptions` | 25 |
+| `--max-tts-input-chars` | Maximum text length accepted by `/v1/audio/speech` | 4096 |
 | `--reasoning-parser` | Parser for reasoning models (`qwen3`, `deepseek_r1`) | None |
 | `--embedding-model` | Pre-load an embedding model at startup | None |
 | `--enable-auto-tool-choice` | Enable automatic tool calling | False |
@@ -83,6 +87,11 @@ vllm-mlx serve mlx-community/Qwen3-VL-4B-Instruct-3bit
 
 # Reasoning model (separates thinking from answer)
 vllm-mlx serve mlx-community/Qwen3-8B-4bit --reasoning-parser qwen3
+
+# Disable server-wide thinking by default (request-level chat_template_kwargs still override)
+vllm-mlx serve mlx-community/Qwen3-8B-4bit \
+  --reasoning-parser qwen3 \
+  --default-chat-template-kwargs '{"enable_thinking": false}'
 
 # DeepSeek reasoning model
 vllm-mlx serve mlx-community/DeepSeek-R1-Distill-Qwen-7B-4bit --reasoning-parser deepseek_r1

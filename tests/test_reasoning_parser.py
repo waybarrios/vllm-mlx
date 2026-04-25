@@ -295,6 +295,13 @@ class TestEdgeCases:
         reasoning, content = parser.extract_reasoning(output)
         # Result may vary by parser implementation
 
+    def test_repeated_leading_think_blocks_do_not_leak_to_content(self, parser):
+        """Repeated leading think blocks are reasoning, not final content."""
+        output = "reasoning</think>\n\n<think></think>\n\nanswer"
+        reasoning, content = parser.extract_reasoning(output)
+        assert reasoning == "reasoning"
+        assert content == "answer"
+
     def test_streaming_reset_state(self, parser):
         """reset_state should allow reuse of parser."""
         # First stream
@@ -668,6 +675,15 @@ class TestQwen3SpecificCases:
         assert reasoning is None or reasoning.strip() == ""
         assert content == "Just the answer."
 
+    def test_qwen3_empty_think_tags_after_implicit_transition(self, parser):
+        """Empty blocks after an implicit end tag must not leak to content."""
+        output = (
+            "brief reasoning</think>\n\n</think>\n\n<think></think>\n\nACK_THINK_READY"
+        )
+        reasoning, content = parser.extract_reasoning(output)
+        assert reasoning == "brief reasoning"
+        assert content == "ACK_THINK_READY"
+
     def test_qwen3_whitespace_between_tags(self, parser):
         """Test various whitespace patterns."""
         test_cases = [
@@ -681,6 +697,36 @@ class TestQwen3SpecificCases:
             if expected_reasoning is None:
                 assert reasoning is None or reasoning.strip() == ""
             assert expected_content in (content or "")
+
+    def test_qwen3_streaming_empty_think_tags_after_transition(self, parser):
+        """Streaming parser suppresses repeated leading think blocks in content."""
+        parser.reset_state()
+        deltas = [
+            "brief reasoning",
+            "</think>",
+            "</think>",
+            "\n\n<thi",
+            "nk></think>\n\n",
+            "ACK_THINK_READY",
+        ]
+        previous = ""
+        current = ""
+        reasoning_parts = []
+        content_parts = []
+
+        for delta in deltas:
+            previous = current
+            current += delta
+            result = parser.extract_reasoning_streaming(previous, current, delta)
+            if result is None:
+                continue
+            if result.reasoning:
+                reasoning_parts.append(result.reasoning)
+            if result.content:
+                content_parts.append(result.content)
+
+        assert "".join(reasoning_parts) == "brief reasoning"
+        assert "".join(content_parts) == "ACK_THINK_READY"
 
 
 class TestGptOssParser:
@@ -1318,3 +1364,166 @@ class TestDuplicateThinkEndTag:
         reasoning, content = parser.extract_reasoning(output)
         assert reasoning == "reasoning"
         assert content == "content"
+
+
+class TestReasoningStrippedFromToolCallContent:
+    """
+    Verify that extract_reasoning strips reasoning markers from text that
+    already had tool call markup removed (simulating server.py tool_calls path).
+
+    When tool calls are present, server.py first runs the tool parser (which
+    strips tool markup but leaves reasoning markers), then runs
+    extract_reasoning on the cleaned_text to strip reasoning markers.
+    """
+
+    def test_gemma4_channel_tokens_stripped_after_tool_parse(self):
+        """Gemma 4 channel tokens should be stripped from post-tool-parse text."""
+        parser = get_parser("gemma4")()
+        # Simulate what tool parser leaves behind: reasoning markers + residual text
+        # (tool markup like ```json...``` already removed by tool parser)
+        post_tool_text = "<|channel>thought\nLet me find the weather.\n<channel|>"
+        reasoning, content = parser.extract_reasoning(post_tool_text)
+        assert reasoning == "Let me find the weather."
+        # content should be None or empty (tool calls carry the actual response)
+        assert content is None or content == ""
+
+    def test_gemma4_alternative_format_stripped_after_tool_parse(self):
+        """Alternative <|channel>response format should also be stripped."""
+        parser = get_parser("gemma4")()
+        post_tool_text = "<|channel>thought\nChecking parameters.\n<|channel>response\n"
+        reasoning, content = parser.extract_reasoning(post_tool_text)
+        assert reasoning == "Checking parameters."
+        assert content is None or content.strip() == ""
+
+    def test_gemma4_empty_input_after_tool_parse(self):
+        """Empty string (all content was tool markup) should not crash."""
+        parser = get_parser("gemma4")()
+        reasoning, content = parser.extract_reasoning("")
+        assert reasoning is None
+
+    def test_qwen3_think_tags_stripped_after_tool_parse(self):
+        """Qwen3 <think> tags should be stripped from post-tool-parse text."""
+        parser = get_parser("qwen3")()
+        post_tool_text = "<think>Let me call the function.</think>"
+        reasoning, content = parser.extract_reasoning(post_tool_text)
+        assert reasoning == "Let me call the function."
+        assert content is None or content == ""
+
+    def test_deepseek_think_tags_stripped_after_tool_parse(self):
+        """DeepSeek-R1 <think> tags should be stripped from post-tool-parse text."""
+        parser = get_parser("deepseek_r1")()
+        post_tool_text = "<think>I need to call this API.</think>"
+        reasoning, content = parser.extract_reasoning(post_tool_text)
+        assert reasoning == "I need to call this API."
+        assert content is None or content == ""
+
+    def test_gemma4_residual_text_preserved(self):
+        """Non-reasoning text after channel markers should be preserved as content."""
+        parser = get_parser("gemma4")()
+        post_tool_text = "<|channel>thought\nThinking...\n<channel|>Some residual text"
+        reasoning, content = parser.extract_reasoning(post_tool_text)
+        assert reasoning == "Thinking..."
+        assert content == "Some residual text"
+
+
+class TestGemma4DegenerateCycling:
+    """
+    Test handling of degenerate thought/response cycling in Gemma 4.
+
+    On long prompts with tools, Gemma 4 may oscillate between thought and
+    response channels many times before producing valid output. The parser
+    must split at the LAST <channel|> so all cycles go into reasoning and
+    only the final response goes into content.
+    """
+
+    def test_multiple_channel_end_tokens_in_content(self):
+        """Multiple <channel|> tokens: rpartition splits at the LAST one."""
+        parser = get_parser("gemma4")()
+        output = (
+            "<|channel>thought\nGarbage loop\n<channel|>thought\n<channel|>The answer"
+        )
+        reasoning, content = parser.extract_reasoning(output)
+        assert content == "The answer"
+        assert "Garbage loop" in reasoning
+
+    def test_residual_thought_channel_stripped_from_content(self):
+        """thought\\n<channel|> residuals must not leak into content."""
+        parser = get_parser("gemma4")()
+        output = (
+            "<|channel>thought\nLoop1\n<channel|>"
+            "<|channel>thought\nLoop2\n<channel|>"
+            "Final response here"
+        )
+        reasoning, content = parser.extract_reasoning(output)
+        assert content == "Final response here"
+        assert "<channel|>" not in (content or "")
+        assert "<|channel>" not in (content or "")
+
+    def test_many_cycles_all_go_to_reasoning(self):
+        """All intermediate thought/response cycles end up in reasoning."""
+        parser = get_parser("gemma4")()
+        output = (
+            "<|channel>thought\nCycle1\n<channel|>"
+            "<|channel>thought\nCycle2\n<channel|>"
+            "<|channel>thought\nCycle3\n<channel|>"
+            "Final content"
+        )
+        reasoning, content = parser.extract_reasoning(output)
+        assert content == "Final content"
+        assert "Cycle1" in reasoning
+        assert "Cycle2" in reasoning
+        assert "Cycle3" in reasoning
+
+    def test_channel_tokens_stripped_from_reasoning(self):
+        """Channel special tokens should not appear in reasoning output."""
+        parser = get_parser("gemma4")()
+        output = (
+            "<|channel>thought\nThink1\n<channel|>"
+            "<|channel>thought\nThink2\n<channel|>"
+            "Result"
+        )
+        reasoning, content = parser.extract_reasoning(output)
+        assert "<channel|>" not in (reasoning or "")
+        assert "<|channel>" not in (reasoning or "")
+
+    def test_streaming_degenerate_cycling(self):
+        """Streaming: re-entry into thinking after content transition."""
+        parser = get_parser("gemma4")()
+        deltas = [
+            "<|channel>",
+            "thought\n",
+            "Thinking...",
+            "\n<channel|>",
+            "\nSome content",
+            "\n<|channel>",
+            "thought\n",
+            "More thinking",
+            "\n<channel|>",
+            "\nFinal answer",
+        ]
+        reasoning_parts = []
+        content_parts = []
+        accumulated = ""
+        for delta in deltas:
+            prev = accumulated
+            accumulated += delta
+            result = parser.extract_reasoning_streaming(prev, accumulated, delta)
+            if result is not None:
+                if result.reasoning:
+                    reasoning_parts.append(result.reasoning)
+                if result.content:
+                    content_parts.append(result.content)
+
+        final = parser.finalize_stream()
+        if final:
+            if final.reasoning:
+                reasoning_parts.append(final.reasoning)
+            if final.content:
+                content_parts.append(final.content)
+
+        full_content = "".join(content_parts)
+        # Final answer should be in content (after last <channel|>)
+        assert "Final answer" in full_content
+        # Channel tokens must not leak
+        assert "<channel|>" not in full_content
+        assert "<|channel>" not in full_content

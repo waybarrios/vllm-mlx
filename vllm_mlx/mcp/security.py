@@ -8,9 +8,11 @@ and other attacks via MCP server configurations.
 
 import logging
 import os
+import posixpath
 import re
 import shutil
 import time
+from urllib.parse import unquote, urlparse
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
@@ -77,6 +79,29 @@ DANGEROUS_ARG_PATTERNS: List[re.Pattern] = [
     re.compile(r"<\s*/"),  # Read from absolute path
 ]
 
+# Explicit inline-code execution forms for interpreter-like commands. These
+# combinations turn an otherwise whitelisted runtime into a raw code-execution
+# primitive and are not needed for normal MCP server launches.
+BLOCKED_COMMAND_ARG_RULES: Dict[str, Dict[str, str]] = {
+    "python": {
+        "-c": "inline Python execution",
+    },
+    "python3": {
+        "-c": "inline Python execution",
+    },
+    "node": {
+        "-e": "inline JavaScript evaluation",
+        "--eval": "inline JavaScript evaluation",
+        "-p": "JavaScript evaluation/print",
+        "--print": "JavaScript evaluation/print",
+    },
+    "npx": {
+        "-c": "shell command execution",
+        "--call": "shell command execution",
+    },
+}
+CONTROL_CHARS = ("\n", "\r")
+
 
 class MCPSecurityError(Exception):
     """Raised when MCP security validation fails."""
@@ -123,6 +148,51 @@ class MCPCommandValidator:
                 "This should NEVER be used in production!"
             )
 
+    def _check_control_chars(self, value: str, context: str, server_name: str) -> None:
+        """Block command separators carried via literal newlines."""
+        if any(ch in value for ch in CONTROL_CHARS):
+            raise MCPSecurityError(
+                f"MCP server '{server_name}': {context} contains newline characters. "
+                "Potential command injection blocked."
+            )
+
+    def _check_path_traversal(self, value: str, context: str, server_name: str) -> None:
+        """
+        Block parent-directory traversal, including URL-encoded forms.
+
+        This normalizes likely path-like inputs rather than relying only on
+        the simple ``../`` regex, which can be bypassed by percent-encoding.
+        """
+        candidates = [value]
+        decoded = unquote(value)
+        if decoded != value:
+            candidates.append(decoded)
+
+        for candidate in candidates:
+            if (
+                "/" not in candidate
+                and "\\" not in candidate
+                and "%2e" not in value.lower()
+            ):
+                continue
+
+            normalized = posixpath.normpath(candidate.replace("\\", "/"))
+            if normalized == ".." or normalized.startswith("../"):
+                raise MCPSecurityError(
+                    f"MCP server '{server_name}': {context} contains path traversal: "
+                    f"'{value}'."
+                )
+
+            # Also reject any explicit parent segments before or after normalization.
+            path_parts = [
+                part for part in candidate.replace("\\", "/").split("/") if part
+            ]
+            if any(part == ".." for part in path_parts):
+                raise MCPSecurityError(
+                    f"MCP server '{server_name}': {context} contains path traversal: "
+                    f"'{value}'."
+                )
+
     def validate_command(self, command: str, server_name: str) -> None:
         """
         Validate that a command is safe to execute.
@@ -140,6 +210,9 @@ class MCPCommandValidator:
                 f"allowing command '{command}' (unsafe mode)"
             )
             return
+
+        self._check_control_chars(command, "Command", server_name)
+        self._check_path_traversal(command, "Command", server_name)
 
         # Check for dangerous patterns in command
         for pattern in DANGEROUS_PATTERNS:
@@ -199,6 +272,8 @@ class MCPCommandValidator:
             return
 
         for i, arg in enumerate(args):
+            self._check_control_chars(arg, f"Argument {i}", server_name)
+            self._check_path_traversal(arg, f"Argument {i}", server_name)
             for pattern in DANGEROUS_ARG_PATTERNS:
                 if pattern.search(arg):
                     raise MCPSecurityError(
@@ -208,6 +283,50 @@ class MCPCommandValidator:
 
         logger.debug(
             f"MCP server '{server_name}': {len(args)} arguments validated successfully"
+        )
+
+    def validate_command_args(
+        self,
+        command: str,
+        args: List[str],
+        server_name: str,
+    ) -> None:
+        """
+        Validate command-specific argument combinations.
+
+        Some whitelisted runtimes (python, node, npx) remain acceptable for
+        launching packaged MCP servers, but inline evaluator flags such as
+        ``python -c`` and ``node -e`` must be rejected.
+        """
+        if self.allow_unsafe or not args:
+            return
+
+        base_command = Path(command).name
+        blocked_rules = BLOCKED_COMMAND_ARG_RULES.get(base_command)
+        if not blocked_rules:
+            return
+
+        for i, arg in enumerate(args):
+            if arg in blocked_rules:
+                raise MCPSecurityError(
+                    f"MCP server '{server_name}': Argument {i} '{arg}' enables "
+                    f"{blocked_rules[arg]} for '{base_command}', which is not allowed."
+                )
+
+            if base_command == "node" and arg.startswith("--eval="):
+                raise MCPSecurityError(
+                    f"MCP server '{server_name}': Argument {i} '{arg}' enables "
+                    "inline JavaScript evaluation for 'node', which is not allowed."
+                )
+
+            if base_command == "npx" and arg.startswith("--call="):
+                raise MCPSecurityError(
+                    f"MCP server '{server_name}': Argument {i} '{arg}' enables "
+                    "shell command execution for 'npx', which is not allowed."
+                )
+
+        logger.debug(
+            f"MCP server '{server_name}': command-specific arguments validated"
         )
 
     def validate_env(self, env: Optional[Dict[str, str]], server_name: str) -> None:
@@ -236,6 +355,14 @@ class MCPCommandValidator:
         }
 
         for key, value in env.items():
+            self._check_control_chars(
+                value, f"Environment variable '{key}'", server_name
+            )
+            self._check_path_traversal(
+                value,
+                f"Environment variable '{key}'",
+                server_name,
+            )
             # Check for dangerous env var names
             if key.upper() in dangerous_env_vars:
                 raise MCPSecurityError(
@@ -269,6 +396,8 @@ class MCPCommandValidator:
         if self.allow_unsafe:
             return
 
+        self._check_control_chars(url, "URL", server_name)
+
         # Must be http or https
         if not url.startswith(("http://", "https://")):
             raise MCPSecurityError(
@@ -282,6 +411,11 @@ class MCPCommandValidator:
                 f"MCP server '{server_name}': Using insecure HTTP connection to {url}. "
                 f"Consider using HTTPS for production environments."
             )
+
+        parsed = urlparse(url)
+        self._check_path_traversal(parsed.path, "URL", server_name)
+        if parsed.query:
+            self._check_control_chars(parsed.query, "URL query", server_name)
 
         # Check for dangerous patterns
         for pattern in DANGEROUS_PATTERNS:
@@ -342,6 +476,8 @@ def validate_mcp_server_config(
 
     if args:
         validator.validate_args(args, server_name)
+        if command:
+            validator.validate_command_args(command, args, server_name)
 
     if env:
         validator.validate_env(env, server_name)
@@ -404,6 +540,7 @@ class ToolSandbox:
         self,
         allowed_tools: Optional[Set[str]] = None,
         blocked_tools: Optional[Set[str]] = None,
+        allowed_high_risk_tools: Optional[Set[str]] = None,
         blocked_arg_patterns: Optional[List[re.Pattern]] = None,
         max_calls_per_minute: int = 60,
         audit_callback: Optional[Callable[[ToolExecutionAudit], None]] = None,
@@ -415,6 +552,7 @@ class ToolSandbox:
         Args:
             allowed_tools: If set, only these tools can be executed (whitelist mode).
             blocked_tools: Tools that are always blocked (blacklist mode).
+            allowed_high_risk_tools: High-risk tools that are explicitly allowed.
             blocked_arg_patterns: Patterns to block in tool arguments.
             max_calls_per_minute: Rate limit for tool calls (0 = unlimited).
             audit_callback: Optional callback for audit events.
@@ -422,6 +560,9 @@ class ToolSandbox:
         """
         self.allowed_tools = allowed_tools
         self.blocked_tools = blocked_tools or set()
+        self.allowed_high_risk_tools = {
+            tool.lower() for tool in (allowed_high_risk_tools or set())
+        }
         self.blocked_arg_patterns = (
             blocked_arg_patterns or DANGEROUS_TOOL_ARG_PATTERNS.copy()
         )
@@ -482,7 +623,7 @@ class ToolSandbox:
                 )
 
         # Check for high-risk tool patterns
-        self._check_high_risk_tool(tool_name)
+        self._check_high_risk_tool(tool_name, full_name)
 
         # Validate arguments
         self._validate_arguments(tool_name, arguments)
@@ -500,16 +641,26 @@ class ToolSandbox:
             or tool_name.lower() in self.blocked_tools
         )
 
-    def _check_high_risk_tool(self, tool_name: str) -> None:
+    def _check_high_risk_tool(self, tool_name: str, full_name: str) -> None:
         """Check if tool matches high-risk patterns."""
         tool_lower = tool_name.lower()
+        full_lower = full_name.lower()
         for pattern in HIGH_RISK_TOOL_PATTERNS:
             if pattern in tool_lower:
-                logger.warning(
-                    f"High-risk tool detected: '{tool_name}' matches pattern '{pattern}'. "
-                    f"Ensure this tool is from a trusted MCP server."
+                if (
+                    tool_lower in self.allowed_high_risk_tools
+                    or full_lower in self.allowed_high_risk_tools
+                ):
+                    logger.warning(
+                        "Allowing high-risk tool '%s' due to explicit allowlist entry",
+                        full_name,
+                    )
+                    return
+                raise MCPSecurityError(
+                    f"High-risk tool '{tool_name}' is blocked by security policy. "
+                    f"Add '{full_name}' or '{tool_name}' to allowed_high_risk_tools "
+                    f"to allow it explicitly."
                 )
-                break
 
     def _validate_arguments(self, tool_name: str, arguments: Dict[str, Any]) -> None:
         """Validate tool arguments for dangerous patterns."""

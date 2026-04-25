@@ -3,6 +3,8 @@
 
 import platform
 import sys
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -51,6 +53,31 @@ def test_model_repr():
     assert "not loaded" in repr_str
 
 
+def test_model_stream_generate_passes_num_draft_tokens():
+    """Native MTP path should forward configured draft depth to mlx_lm."""
+    from vllm_mlx.models.llm import MLXLanguageModel
+
+    model = MLXLanguageModel("test-model", mtp=True, mtp_num_draft_tokens=4)
+    model._loaded = True
+    model.model = object()
+    tokenizer = MagicMock()
+    tokenizer.encode.return_value = [1, 2, 3]
+    model.tokenizer = tokenizer
+
+    captured_kwargs = {}
+
+    def fake_stream_generate(_model, _tokenizer, **kwargs):
+        captured_kwargs.update(kwargs)
+        yield SimpleNamespace(text="Hello")
+
+    with patch("mlx_lm.stream_generate", side_effect=fake_stream_generate):
+        chunks = list(model.stream_generate("Hello", max_tokens=8))
+
+    assert chunks[-1].text == "Hello"
+    assert captured_kwargs["mtp"] is True
+    assert captured_kwargs["num_draft_tokens"] == 4
+
+
 @pytest.mark.slow
 def test_model_load(small_model_name):
     """Test loading a model (slow test, downloads model)."""
@@ -97,6 +124,58 @@ def test_model_stream_generate(small_model_name):
 
     assert len(chunks) > 0
     assert any(chunk.finished for chunk in chunks)
+
+
+@pytest.mark.slow
+def test_model_stream_generate_with_prompt_cache(small_model_name):
+    """Test streaming generation with pre-populated prompt_cache."""
+    pytest.importorskip("mlx_lm")
+    import mlx.core as mx
+    from mlx_lm.models.cache import make_prompt_cache
+
+    from vllm_mlx.models.llm import MLXLanguageModel
+
+    model = MLXLanguageModel(small_model_name)
+    model.load()
+
+    # Pre-populate cache by running a prefill
+    cache = make_prompt_cache(model.model)
+    tokens = model.tokenizer.encode("Hello")
+    model.model(mx.array([tokens]), cache=cache)
+    mx.eval([c.state for c in cache])
+
+    # Generate from a single token with the pre-populated cache
+    prompt_token = mx.array([tokens[-1]])
+    chunks = list(
+        model.stream_generate(
+            prompt=prompt_token,
+            max_tokens=10,
+            prompt_cache=cache,
+        )
+    )
+
+    assert len(chunks) > 0
+    assert any(chunk.finished for chunk in chunks)
+    # prompt_tokens should reflect the single-token prompt, not the full string
+    assert chunks[0].prompt_tokens == 1
+
+
+@pytest.mark.slow
+def test_model_stream_generate_with_list_prompt(small_model_name):
+    """Test streaming generation with list[int] prompt."""
+    pytest.importorskip("mlx_lm")
+
+    from vllm_mlx.models.llm import MLXLanguageModel
+
+    model = MLXLanguageModel(small_model_name)
+    model.load()
+
+    token_ids = model.tokenizer.encode("Hello")
+    chunks = list(model.stream_generate(prompt=token_ids, max_tokens=10))
+
+    assert len(chunks) > 0
+    assert any(chunk.finished for chunk in chunks)
+    assert chunks[0].prompt_tokens == len(token_ids)
 
 
 @pytest.mark.slow

@@ -187,74 +187,63 @@ class TestTranslateMessages:
         assert result[0]["content"] == "Hello"
 
     def test_video_url_translated(self):
-        import os
-        import tempfile
+        import base64
 
-        # Create a temp file to act as a "video"
-        with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as f:
-            f.write(b"\x00" * 100)
-            video_path = f.name
+        dummy_video_b64 = base64.b64encode(b"\x00" * 100).decode()
+        video_source = f"data:video/mp4;base64,{dummy_video_b64}"
 
-        try:
-            model = self._make_model()
-            messages = [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "video", "video": video_path},
-                        {"type": "text", "text": "Describe"},
-                    ],
-                }
-            ]
-            result = model._translate_messages_for_native_video(messages, 2.0, 128)
-            content = result[0]["content"]
+        model = self._make_model()
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "video", "video": video_source},
+                    {"type": "text", "text": "Describe"},
+                ],
+            }
+        ]
+        result = model._translate_messages_for_native_video(messages, 2.0, 128)
+        content = result[0]["content"]
 
-            # Should have video and text items
-            types = [item["type"] for item in content]
-            assert "video" in types
-            assert "text" in types
+        # Should have video and text items
+        types = [item["type"] for item in content]
+        assert "video" in types
+        assert "text" in types
 
-            # Video item should have fps and max_frames
-            video_item = next(i for i in content if i["type"] == "video")
-            assert video_item["fps"] == 2.0
-            assert video_item["max_frames"] == 128
-        finally:
-            os.unlink(video_path)
+        # Video item should have fps and max_frames
+        video_item = next(i for i in content if i["type"] == "video")
+        assert video_item["fps"] == 2.0
+        assert video_item["max_frames"] == 128
 
     def test_video_url_type_translated(self):
-        import os
-        import tempfile
+        import base64
 
-        with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as f:
-            f.write(b"\x00" * 100)
-            video_path = f.name
+        dummy_video_b64 = base64.b64encode(b"\x00" * 100).decode()
+        video_source = f"data:video/mp4;base64,{dummy_video_b64}"
 
-        try:
-            model = self._make_model()
-            messages = [
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "video_url",
-                            "video_url": {"url": video_path},
-                        },
-                        {"type": "text", "text": "Describe"},
-                    ],
-                }
-            ]
-            result = model._translate_messages_for_native_video(messages, 1.0, 64)
-            content = result[0]["content"]
+        model = self._make_model()
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "video_url",
+                        "video_url": {"url": video_source},
+                    },
+                    {"type": "text", "text": "Describe"},
+                ],
+            }
+        ]
+        result = model._translate_messages_for_native_video(messages, 1.0, 64)
+        content = result[0]["content"]
 
-            types = [item["type"] for item in content]
-            assert "video" in types
-            assert "text" in types
+        types = [item["type"] for item in content]
+        assert "video" in types
+        assert "text" in types
 
-            video_item = next(i for i in content if i["type"] == "video")
-            assert video_item["fps"] == 1.0
-            assert video_item["max_frames"] == 64
-        finally:
-            os.unlink(video_path)
+        video_item = next(i for i in content if i["type"] == "video")
+        assert video_item["fps"] == 1.0
+        assert video_item["max_frames"] == 64
 
 
 class TestCollectVideoInputsPydantic:

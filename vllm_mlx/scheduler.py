@@ -24,6 +24,7 @@ from mlx_lm.tokenizer_utils import NaiveStreamingDetokenizer
 
 from .memory_cache import MemoryAwarePrefixCache, MemoryCacheConfig
 from .paged_cache import PagedCacheManager
+from .ssd_cache import SSDCacheConfig, SSDCacheTier
 from .prefix_cache import BlockAwarePrefixCache, PrefixCacheManager
 from .request import Request, RequestOutput, RequestStatus, SamplingParams
 from .utils.mamba_cache import ensure_mamba_support
@@ -101,6 +102,10 @@ class SchedulerConfig:
     # 0 = disabled. Only effective when chunked_prefill_tokens > 0.
     mid_prefill_save_interval: int = 8192
 
+    # SSD cache tiering
+    ssd_cache_dir: Optional[str] = None  # None = disabled
+    ssd_cache_max_gb: float = 10.0
+
     # MTP (Multi-Token Prediction) settings
     # Uses the model's built-in MTP head to predict multiple tokens per step
     enable_mtp: bool = False
@@ -130,6 +135,33 @@ class SchedulerOutput:
     outputs: List[RequestOutput] = field(default_factory=list)
     # Whether any work was done
     has_work: bool = False
+
+
+def _install_prompt_cache_save(batch_gen: "BatchGenerator", prompt_cache_save) -> None:
+    """Monkey-patch ``_process_prompts`` to capture prompt-only cache state.
+
+    Can be installed independently of chunked prefill.  If chunked prefill is
+    also installed, *it* takes over ``_process_prompts`` and invokes the
+    callback itself, so call this **before** ``_install_chunked_prefill``.
+    """
+    _orig_process_prompts = batch_gen._process_prompts
+
+    try:
+        from mlx_lm.generate import Batch as _batch_cls
+    except ImportError:
+        _batch_cls = None  # extract_cache fallback handled in patched fn
+
+    def _patched_process_prompts(prompts, _self=batch_gen):
+        batch = _orig_process_prompts(prompts)
+        for e, uid in enumerate(batch.uids):
+            if batch.num_tokens[e] == 0:
+                try:
+                    prompt_cache_save(uid, batch.extract_cache(e))
+                except Exception:
+                    pass
+        return batch
+
+    batch_gen._process_prompts = _patched_process_prompts
 
 
 def _install_chunked_prefill(
@@ -1062,9 +1094,16 @@ def _install_mtp(
     batch_gen._step = _mtp_step
     batch_gen._next = _mtp_next
 
+    if num_draft_tokens != 1:
+        logger.warning(
+            "[MTP] num_draft_tokens=%d requested, but the current batched MTP "
+            "path drafts exactly one token per verify step",
+            num_draft_tokens,
+        )
     mode_str = "optimistic (no verify)" if optimistic else "always-advance"
     logger.info(
-        f"[MTP] installed with num_draft_tokens={num_draft_tokens}, " f"{mode_str} mode"
+        f"[MTP] installed with num_draft_tokens={num_draft_tokens}, "
+        f"effective_draft_tokens=1, {mode_str} mode"
     )
 
 
@@ -1160,6 +1199,22 @@ class Scheduler:
                     f"Memory-aware cache enabled: "
                     f"limit={self.memory_aware_cache.memory_limit_mb:.1f}MB"
                 )
+
+                # Attach SSD tier if configured
+                self._ssd_tier: Optional[SSDCacheTier] = None
+                if self.config.ssd_cache_dir is not None:
+                    ssd_config = SSDCacheConfig(
+                        cache_dir=self.config.ssd_cache_dir,
+                        max_size_gb=self.config.ssd_cache_max_gb,
+                    )
+                    self._ssd_tier = SSDCacheTier(ssd_config)
+                    self._ssd_tier.start_writer()
+                    self._ssd_tier.reconcile()
+                    self.memory_aware_cache.set_ssd_tier(self._ssd_tier)
+                    logger.info(
+                        f"SSD cache tier enabled: dir={self.config.ssd_cache_dir}, "
+                        f"max={self.config.ssd_cache_max_gb}GB"
+                    )
             else:
                 # Use legacy entry-count based prefix cache
                 self.prefix_cache = PrefixCacheManager(
@@ -1275,11 +1330,14 @@ class Scheduler:
         # monkey-patch. Not a BatchGenerator constructor parameter.
         bg.prompt_progress_callback = _prefill_progress
 
-        # Install chunked prefill when explicitly configured OR when
-        # memory-aware cache is active (needed for prefix_boundary saves
-        # in agentic multi-turn workloads with hybrid Mamba+Transformer models).
+        # Install chunked prefill only when explicitly configured.
+        # memory_aware_cache fetch/store works independently; the mid-prefill
+        # save callback is an optimisation, not a requirement.
+        # When chunked_prefill_tokens == 0 (the default), honour the user's
+        # intent — do NOT silently re-enable chunked prefill just because
+        # memory_aware_cache is active (see #178).
         chunked_budget = self.config.chunked_prefill_tokens
-        need_chunked = chunked_budget > 0 or self.memory_aware_cache is not None
+        need_chunked = chunked_budget > 0
 
         # The chunked prefill monkey-patch relies on BatchGenerator internals
         # (_process_prompts, active_batch, _step, etc.) that were refactored
@@ -1288,20 +1346,19 @@ class Scheduler:
             bg, "active_batch"
         )
 
+        prompt_cache_cb = None
+        if self.memory_aware_cache is not None:
+            prompt_cache_cb = self._make_prompt_cache_save_callback()
+
         if need_chunked and chunked_compatible:
-            if chunked_budget <= 0:
-                # No explicit budget — use a very large value so normal
-                # prompts pass through unchanged.  Prefix boundary splits
-                # still trigger via _needs_boundary_split.
-                chunked_budget = 999_999
+            # Full chunked prefill with mid-prefill saves and prompt cache
+            # save wired through the chunked next() and _process_prompts
+            # monkey-patches inside _install_chunked_prefill.
             mid_prefill_cb = None
             save_interval = self.config.mid_prefill_save_interval
             if save_interval > 0 and self.memory_aware_cache is not None:
                 mid_prefill_cb = self._make_mid_prefill_save_callback(save_interval)
                 logger.info(f"[mid_prefill_cache] enabled, interval={save_interval}")
-            prompt_cache_cb = None
-            if self.memory_aware_cache is not None:
-                prompt_cache_cb = self._make_prompt_cache_save_callback()
             _install_chunked_prefill(
                 bg,
                 chunked_budget,
@@ -1317,6 +1374,14 @@ class Scheduler:
                 "internals (_process_prompts, active_batch). Upgrade mlx-lm or "
                 "check compatibility."
             )
+
+        # When chunked prefill is off but memory_aware_cache is active,
+        # install the lightweight _process_prompts hook so prompt-only
+        # cache entries are still captured.  This is the only safe capture
+        # point for hybrid Mamba+Transformer models (#178).
+        if not need_chunked and prompt_cache_cb is not None:
+            if hasattr(bg, "_process_prompts"):
+                _install_prompt_cache_save(bg, prompt_cache_cb)
 
         # Install MTP if the model supports it
         if self.config.enable_mtp:
@@ -1757,6 +1822,14 @@ class Scheduler:
                     f"prompt_tokens={len(request.prompt_token_ids)} "
                     f"time={_fetch_dt:.3f}s entries={len(self.memory_aware_cache._entries)}"
                 )
+                # Check SSD tier for cold-tier hit
+                if hasattr(self, "_ssd_tier") and self._ssd_tier is not None:
+                    ssd_candidate = self.memory_aware_cache.check_ssd(
+                        request.prompt_token_ids
+                    )
+                    if ssd_candidate is not None:
+                        request.cache_hit_type = "ssd_pending"
+                        request._ssd_candidate = ssd_candidate
         elif self.prefix_cache is not None:
             # Use legacy prefix cache
             cache, remaining = self.prefix_cache.fetch_cache(request.prompt_token_ids)
@@ -1885,6 +1958,12 @@ class Scheduler:
         Returns:
             List of requests that were scheduled
         """
+        # Attempt synchronous SSD promotion for any ssd_pending requests
+        # before scheduling. This keeps SSD I/O out of fetch() while
+        # avoiding engine modifications.
+        if hasattr(self, "_ssd_tier") and self._ssd_tier is not None:
+            self._try_promote_ssd_pending()
+
         scheduled = []
 
         while self.waiting and len(self.running) < self.config.max_num_seqs:
@@ -1926,15 +2005,27 @@ class Scheduler:
                 request.remaining_tokens = request.prompt_token_ids
                 tokens_to_process = request.prompt_token_ids
 
-            # Build per-request logits_processors from repetition_penalty
+            # Build per-request logits_processors from repetition_penalty and
+            # any caller-supplied extras (e.g. JSON schema constrained
+            # decoding).
             rep_penalty = request.sampling_params.repetition_penalty
-            lp = None
+            extra_lp = request.sampling_params.logits_processors or []
+            combined_lp: list = []
             if rep_penalty and rep_penalty != 1.0:
-                lp = make_logits_processors(repetition_penalty=rep_penalty)
+                combined_lp.extend(
+                    make_logits_processors(repetition_penalty=rep_penalty)
+                )
                 logger.info(
                     f"[rep_penalty] request={request.request_id[:12]} "
-                    f"penalty={rep_penalty} processors={len(lp)}"
+                    f"penalty={rep_penalty}"
                 )
+            if extra_lp:
+                combined_lp.extend(extra_lp)
+                logger.info(
+                    f"[logits_proc] request={request.request_id[:12]} "
+                    f"extra_processors={len(extra_lp)}"
+                )
+            lp = combined_lp
 
             # Insert into BatchGenerator with optional cache.
             # Wrap in try/except: if cache shapes are incompatible
@@ -1943,9 +2034,10 @@ class Scheduler:
             insert_kwargs = {
                 "max_tokens": [request.sampling_params.max_tokens],
                 "caches": [cache_to_use] if cache_to_use else None,
+                # Always pass logits_processors (even empty list) so that
+                # mlx_lm BatchGenerator never stores None per-sequence.
+                "logits_processors": [lp] if lp else [[]],
             }
-            if lp:
-                insert_kwargs["logits_processors"] = [lp]
             try:
                 uids = self.batch_generator.insert(
                     [tokens_to_process],
@@ -2263,6 +2355,11 @@ class Scheduler:
         error_str = str(error)
         return any(pattern in error_str for pattern in CACHE_CORRUPTION_PATTERNS)
 
+    def _is_stream_thread_error(self, error: Exception) -> bool:
+        """Check if an error indicates MLX stream/thread ownership mismatch."""
+        error_str = str(error)
+        return "no Stream(" in error_str or "no Stream(gpu" in error_str
+
     def _recover_from_cache_error(self) -> None:
         """Recover from cache corruption error."""
         # Properly close batch generator (this is the source of the corruption)
@@ -2411,6 +2508,8 @@ class Scheduler:
                 else:
                     raise
             except Exception as e:
+                if self._is_stream_thread_error(e):
+                    raise
                 import traceback
 
                 logger.error(
@@ -2587,6 +2686,24 @@ class Scheduler:
             return self.prefix_cache.get_stats()
         return None
 
+    def clear_runtime_caches(self) -> Dict[str, bool]:
+        """Clear prefix-cache state without resetting scheduler/request state."""
+        cleared = {
+            "paged_cache": False,
+            "memory_aware_cache": False,
+            "prefix_cache": False,
+        }
+        if self.block_aware_cache is not None:
+            self.block_aware_cache.clear()
+            cleared["paged_cache"] = True
+        if self.memory_aware_cache is not None:
+            self.memory_aware_cache.clear()
+            cleared["memory_aware_cache"] = True
+        if self.prefix_cache is not None:
+            self.prefix_cache.clear()
+            cleared["prefix_cache"] = True
+        return cleared
+
     def reset(self) -> None:
         """Reset the scheduler state."""
         # Drain any pending deferred aborts
@@ -2607,12 +2724,10 @@ class Scheduler:
         self._current_sampler_params = None
 
         # Clear caches
-        if self.block_aware_cache is not None:
-            self.block_aware_cache.clear()
-        if self.memory_aware_cache is not None:
-            self.memory_aware_cache.clear()
-        if self.prefix_cache is not None:
-            self.prefix_cache.clear()
+        self.clear_runtime_caches()
+
+        # Close SSD tier on reset
+        self.close_ssd_tier()
 
     def deep_reset(self) -> None:
         """
@@ -2661,3 +2776,216 @@ class Scheduler:
             return self.memory_aware_cache.load_from_disk(cache_dir)
         logger.info("[cache_persist] no memory-aware cache to load into")
         return 0
+
+    def clear_prefix_cache(self) -> None:
+        """Clear the in-memory prefix cache (keeps disk cache untouched)."""
+        if self.memory_aware_cache is not None and hasattr(
+            self.memory_aware_cache, "clear"
+        ):
+            self.memory_aware_cache.clear()
+            logger.info("[clear_prefix_cache] memory-aware cache cleared")
+            return
+        if self.prefix_cache is not None and hasattr(self.prefix_cache, "clear"):
+            self.prefix_cache.clear()
+            logger.info("[clear_prefix_cache] prefix cache cleared")
+
+    def close_ssd_tier(self) -> None:
+        """Shut down the SSD cache tier if present."""
+        if hasattr(self, "_ssd_tier") and self._ssd_tier is not None:
+            self._ssd_tier.close()
+            self._ssd_tier = None
+            logger.info("SSD cache tier closed")
+
+    def _try_promote_ssd_pending(self) -> None:
+        """Attempt synchronous SSD promotion for waiting requests tagged ssd_pending.
+
+        Called from _schedule_waiting() before requests are moved to running.
+        Reads SSD entries synchronously (disk I/O stays out of fetch() per spec).
+        """
+        for request in self.waiting:
+            if getattr(request, "cache_hit_type", None) != "ssd_pending":
+                continue
+
+            candidate = getattr(request, "_ssd_candidate", None)
+            if candidate is None:
+                continue
+
+            memory_bytes = candidate["memory_bytes"]
+
+            # Check RAM budget availability
+            if self.memory_aware_cache is None:
+                request.cache_hit_type = "miss"
+                continue
+
+            if (
+                self.memory_aware_cache._current_memory + memory_bytes
+                > self.memory_aware_cache._max_memory
+            ):
+                self._ssd_tier._stats.promotion_failures += 1
+                request.cache_hit_type = "miss"
+                logger.info(
+                    f"[ssd_promote] request={request.request_id[:12]} "
+                    f"budget denied ({memory_bytes} bytes)"
+                )
+                continue
+
+            # Tentatively reserve budget
+            self.memory_aware_cache._current_memory += memory_bytes
+
+            # Use the SSD entry's actual token count for read and store,
+            # NOT the full prompt tokens. For prefix hits these differ.
+            matched_count = candidate["matched_tokens"]
+            matched_tokens = tuple(request.prompt_token_ids[:matched_count])
+
+            try:
+                cache_layers = self._ssd_tier._read_entry(
+                    matched_tokens, candidate["file_path"]
+                )
+            except Exception:
+                self.memory_aware_cache._current_memory -= memory_bytes
+                self._ssd_tier._stats.promotion_failures += 1
+                request.cache_hit_type = "miss"
+                logger.exception(
+                    f"[ssd_promote] request={request.request_id[:12]} "
+                    f"disk read failed"
+                )
+                continue
+
+            if cache_layers is None:
+                self.memory_aware_cache._current_memory -= memory_bytes
+                self._ssd_tier._stats.promotion_failures += 1
+                request.cache_hit_type = "miss"
+                continue
+
+            # Release tentative budget (store() will account properly)
+            self.memory_aware_cache._current_memory -= memory_bytes
+
+            # Reconstruct and store under the matched prefix tokens
+            reconstructed = self._reconstruct_ssd_layers(cache_layers)
+            if reconstructed is None:
+                request.cache_hit_type = "miss"
+                continue
+
+            self.memory_aware_cache.store(
+                list(matched_tokens), reconstructed, evict_prefixes=False
+            )
+
+            request.prompt_cache = reconstructed
+            request.cached_tokens = matched_count
+            request.remaining_tokens = request.prompt_token_ids[matched_count:]
+            request.cache_hit_type = "ssd_hit"
+
+            self._ssd_tier._stats.ssd_hits += 1
+            self._ssd_tier._index.touch(matched_tokens)
+
+            logger.info(
+                f"[ssd_promote] request={request.request_id[:12]} "
+                f"{candidate['match_type']} promote: {matched_count}/{len(request.prompt_token_ids)} tokens from SSD, "
+                f"{len(request.remaining_tokens)} remaining"
+            )
+
+    async def promote_from_ssd(self, request) -> bool:
+        """Promote a cold-tier cache entry for a request (async version).
+
+        Alternative to _try_promote_ssd_pending() for callers with an
+        async event loop. Uses asyncio.to_thread for non-blocking disk I/O.
+
+        Returns True if promotion succeeded and request was updated.
+        """
+        if not hasattr(self, "_ssd_tier") or self._ssd_tier is None:
+            return False
+
+        candidate = getattr(request, "_ssd_candidate", None)
+        if candidate is None:
+            return False
+
+        def reserve_budget(nbytes: int) -> bool:
+            """Tentatively reserve RAM budget for promotion."""
+            if self.memory_aware_cache is None:
+                return False
+            if (
+                self.memory_aware_cache._current_memory + nbytes
+                > self.memory_aware_cache._max_memory
+            ):
+                return False
+            self.memory_aware_cache._current_memory += nbytes
+            return True
+
+        def release_budget(nbytes: int) -> None:
+            """Release tentatively reserved budget on failure."""
+            if self.memory_aware_cache is not None:
+                self.memory_aware_cache._current_memory -= nbytes
+
+        # Use matched token count, not full prompt, for prefix hits
+        matched_count = candidate.get("matched_tokens", len(request.prompt_token_ids))
+        matched_tokens = tuple(request.prompt_token_ids[:matched_count])
+
+        cache_layers = await self._ssd_tier.async_promote(
+            matched_tokens, reserve_budget, release_budget
+        )
+
+        if cache_layers is None:
+            request.cache_hit_type = "miss"
+            return False
+
+        # Release tentative budget — store() will account properly
+        release_budget(candidate["memory_bytes"])
+
+        # Reconstruct cache objects from deserialized layer dicts
+        reconstructed = self._reconstruct_ssd_layers(cache_layers)
+        if reconstructed is None:
+            request.cache_hit_type = "miss"
+            return False
+
+        # Store in RAM cache under the matched prefix tokens
+        self.memory_aware_cache.store(
+            list(matched_tokens), reconstructed, evict_prefixes=False
+        )
+
+        request.prompt_cache = reconstructed
+        request.cached_tokens = matched_count
+        request.remaining_tokens = request.prompt_token_ids[matched_count:]
+        request.cache_hit_type = "ssd_hit"
+
+        logger.info(
+            f"[ssd_promote] request={request.request_id[:12]} "
+            f"{candidate.get('match_type', 'exact')} promote: "
+            f"{matched_count}/{len(request.prompt_token_ids)} tokens from SSD, "
+            f"{len(request.remaining_tokens)} remaining"
+        )
+        return True
+
+    def _reconstruct_ssd_layers(self, layer_dicts: list[dict]) -> list | None:
+        """Reconstruct cache objects from deserialized layer dicts.
+
+        Converts numpy arrays back to MLX arrays and creates KVCache objects.
+        """
+        try:
+            from mlx_lm.models.cache import KVCache
+
+            result = []
+            for ld in layer_dicts:
+                if "keys" in ld and "values" in ld:
+                    kv = KVCache()
+                    kv.keys = mx.array(ld["keys"])
+                    kv.values = mx.array(ld["values"])
+                    kv.offset = ld["offset"]
+                    for attr in ("max_size", "keep", "step", "_idx"):
+                        if attr in ld:
+                            setattr(kv, attr, ld[attr])
+                    result.append(kv)
+                elif "state" in ld:
+                    # ArraysCache — need to wrap in a compatible object
+                    state_arrays = [mx.array(a) for a in ld["state"]]
+                    # Create a simple namespace-like object
+                    layer_obj = type("ArraysCacheLayer", (), {"state": state_arrays})()
+                    result.append(layer_obj)
+                else:
+                    logger.warning(
+                        f"[ssd_promote] unknown layer dict format: {list(ld.keys())}"
+                    )
+                    return None
+            return result
+        except Exception as e:
+            logger.warning(f"[ssd_promote] reconstruction failed: {e}")
+            return None

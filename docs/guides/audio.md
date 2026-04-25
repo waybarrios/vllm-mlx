@@ -200,6 +200,10 @@ Transcribe audio to text (OpenAI Whisper API compatible).
 - `language`: Language code (optional, auto-detected)
 - `response_format`: `json` or `text`
 
+**Limits:**
+- Default upload cap: 25 MiB
+- Override with `--max-audio-upload-mb`
+
 **Example:**
 ```bash
 curl http://localhost:8000/v1/audio/transcriptions \
@@ -217,6 +221,10 @@ Generate speech from text (OpenAI TTS API compatible).
 - `voice`: Voice ID
 - `speed`: Speech speed (0.5 to 2.0)
 - `response_format`: `wav`, `mp3`
+
+**Limits:**
+- Default input cap: 4096 characters
+- Override with `--max-tts-input-chars`
 
 **Example:**
 ```bash

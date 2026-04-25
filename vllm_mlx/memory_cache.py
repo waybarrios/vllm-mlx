@@ -38,6 +38,9 @@ _BYTES_PER_MB = 1024 * 1024
 _DEFAULT_MEMORY_PERCENT = 0.20  # 20% of available RAM
 _MIN_MEMORY_BYTES = 100 * _BYTES_PER_MB  # Minimum 100MB
 _MAX_ENTRIES_FALLBACK = 50  # Fallback if memory detection fails
+# Bump this when the cache on-disk format or KV semantics change.
+# Loading a cache with a different version is rejected automatically.
+_CACHE_PERSIST_VERSION = 3
 
 
 def _get_available_memory() -> int:
@@ -520,9 +523,27 @@ def _trim_cache_offset(cache: list[Any], trim_by: int) -> list[Any]:
         ):
             orig_cls = type(layer_cache)
             tc = orig_cls.__new__(orig_cls)
-            tc.keys = layer_cache.keys
-            tc.values = layer_cache.values
-            tc.offset = max(layer_cache.offset - trim_by, 0)
+            new_offset = max(layer_cache.offset - trim_by, 0)
+            keys = layer_cache.keys
+            values = layer_cache.values
+            # Slice the arrays down to new_offset rather than just shrinking the
+            # offset pointer.  Sharing the original (over-sized) array across
+            # requests lets attention paths that read the full underlying
+            # buffer (e.g. Gemma 4's KV-shared layers, which read cache.state
+            # directly instead of going through update_and_fetch) see stale
+            # tokens from the previous owner — issue #384.
+            if (
+                keys is not None
+                and hasattr(keys, "shape")
+                and len(keys.shape) >= 3
+                and new_offset < keys.shape[-2]
+            ):
+                tc.keys = keys[..., :new_offset, :]
+                tc.values = values[..., :new_offset, :]
+            else:
+                tc.keys = keys
+                tc.values = values
+            tc.offset = new_offset
             # Preserve type-specific attrs (max_size, keep, step, _idx)
             for attr in ("max_size", "keep", "step", "_idx"):
                 if hasattr(layer_cache, attr):
@@ -724,6 +745,19 @@ def _dequantize_cache(cache: list[Any]) -> list[Any]:
                 *layer.values, group_size=layer.group_size, bits=layer.bits
             )
             kv.offset = layer.offset
+            # Slice the dequantized arrays down to offset so that readers
+            # which bypass offset (e.g. Gemma 4 KV-shared layers reading
+            # cache.state directly) cannot see stale tokens from a previous
+            # request.  Mirrors the plain-KVCache slice in
+            # _trim_cache_offset — see issue #384.
+            if (
+                kv.keys is not None
+                and hasattr(kv.keys, "shape")
+                and len(kv.keys.shape) >= 3
+                and kv.offset < kv.keys.shape[-2]
+            ):
+                kv.keys = kv.keys[..., : kv.offset, :]
+                kv.values = kv.values[..., : kv.offset, :]
             # Restore type-specific attrs (max_size, keep, step, _idx)
             for attr, val in layer.orig_attrs.items():
                 setattr(kv, attr, val)
@@ -769,6 +803,43 @@ def _dequantize_cache(cache: list[Any]) -> list[Any]:
     return result
 
 
+def _compute_model_fingerprint(model: Any) -> str:
+    """Compute a fingerprint from model architecture for cache compatibility.
+
+    Used to reject disk-persisted caches created by a different model or
+    a different quantisation of the same model.  The fingerprint is a
+    short hex digest of (num_layers, hidden_size, vocab_size, num_kv_heads,
+    head_dim) — lightweight and deterministic.
+    """
+    import hashlib
+
+    parts: list[str] = []
+    # Walk model.config / model.args / direct attributes
+    for cfg_attr in ("config", "args", "model_config"):
+        cfg = getattr(model, cfg_attr, None)
+        if cfg is not None:
+            break
+    if cfg is None:
+        cfg = model  # fallback: attributes on the model itself
+
+    for key in (
+        "num_hidden_layers",
+        "hidden_size",
+        "vocab_size",
+        "num_key_value_heads",
+        "head_dim",
+        "intermediate_size",
+        "model_type",
+    ):
+        val = getattr(cfg, key, None)
+        if val is not None:
+            parts.append(f"{key}={val}")
+
+    fingerprint = hashlib.sha256("|".join(parts).encode()).hexdigest()[:16]
+    logger.debug(f"[model_fingerprint] {fingerprint} ({', '.join(parts)})")
+    return fingerprint
+
+
 class MemoryAwarePrefixCache:
     """
     Prefix cache with memory-based eviction.
@@ -801,6 +872,7 @@ class MemoryAwarePrefixCache:
         """
         self._model_id = id(model)
         self._config = config or MemoryCacheConfig()
+        self._model_fingerprint = _compute_model_fingerprint(model)
 
         # OrderedDict maintains insertion order for LRU
         # Key: tuple(tokens), Value: _CacheEntry
@@ -820,6 +892,9 @@ class MemoryAwarePrefixCache:
 
         # Track the match type from the last fetch() call
         self._last_match_type: str | None = None
+
+        # Optional SSD cold tier (set via set_ssd_tier())
+        self._ssd_tier = None
 
         logger.info(
             f"MemoryAwarePrefixCache initialized: "
@@ -1172,7 +1247,11 @@ class MemoryAwarePrefixCache:
             self._sorted_keys.pop(idx)
 
     def _evict_lru(self) -> None:
-        """Evict the least recently used entry."""
+        """Evict the least recently used entry.
+
+        If an SSD tier is attached, the entry is spilled to disk instead
+        of being discarded.
+        """
         if not self._entries:
             return
 
@@ -1184,9 +1263,14 @@ class MemoryAwarePrefixCache:
         self._stats.entry_count = len(self._entries)
         self._stats.current_memory_bytes = self._current_memory
 
+        # Spill to SSD tier if available
+        if self._ssd_tier is not None:
+            self._ssd_tier.enqueue_spill(tokens_key, entry.cache, entry.memory_bytes)
+
         logger.debug(
             f"[lru_evict] removed {len(tokens_key)} tokens, "
             f"freed {entry.memory_bytes / _BYTES_PER_MB:.2f}MB"
+            f"{'  (spilled to SSD)' if self._ssd_tier is not None else ''}"
         )
 
     def remove(self, tokens: list[int]) -> bool:
@@ -1247,6 +1331,53 @@ class MemoryAwarePrefixCache:
         """Check if tokens are cached."""
         return tuple(tokens) in self._entries
 
+    def set_ssd_tier(self, ssd_tier) -> None:
+        """Attach an SSD cache tier for eviction spilling.
+
+        When set, evicted entries are spilled to SSD instead of discarded.
+
+        Args:
+            ssd_tier: An SSDCacheTier instance (or None to disable).
+        """
+        self._ssd_tier = ssd_tier
+        if ssd_tier is not None:
+            logger.info("[memory_cache] SSD tier attached for eviction spilling")
+
+    def check_ssd(self, tokens: list[int]) -> dict | None:
+        """Check if tokens have an SSD cache hit (without reading data).
+
+        Returns metadata dict with 'match_type' ('exact' or 'prefix') if
+        found in SSD tier, None if not found. For prefix matches, the dict
+        also includes 'matched_tokens' (the count of tokens the SSD entry
+        covers).
+
+        This is a fast synchronous call (SQLite lookup only).
+        The actual data read happens via the scheduler handoff.
+        """
+        if self._ssd_tier is None:
+            return None
+
+        tokens_key = tuple(tokens)
+
+        # If already in RAM, no SSD needed
+        if tokens_key in self._entries:
+            return None
+
+        # Check SSD tier — exact match first, then prefix
+        candidate = self._ssd_tier.lookup_ssd(tokens_key)
+        if candidate is not None:
+            candidate["match_type"] = "exact"
+            candidate["matched_tokens"] = len(tokens)
+            return candidate
+
+        prefix = self._ssd_tier.lookup_ssd_prefix(tokens_key)
+        if prefix is not None:
+            prefix["match_type"] = "prefix"
+            prefix["matched_tokens"] = prefix["num_tokens"]
+            return prefix
+
+        return None
+
     # -----------------------------------------------------------------
     # Disk persistence — survives server restarts
     # -----------------------------------------------------------------
@@ -1282,7 +1413,8 @@ class MemoryAwarePrefixCache:
             return False
 
         index = {
-            "version": 2,
+            "version": _CACHE_PERSIST_VERSION,
+            "model_fingerprint": self._model_fingerprint,
             "num_entries": len(self._entries),
             "total_memory_bytes": self._current_memory,
             "entries": [],
@@ -1360,8 +1492,20 @@ class MemoryAwarePrefixCache:
             index = json.load(f)
 
         version = index.get("version", 1)
-        if version < 2:
-            logger.warning(f"[cache_persist] unsupported version {version}, skipping")
+        if version != _CACHE_PERSIST_VERSION:
+            logger.warning(
+                f"[cache_persist] version mismatch: disk={version} "
+                f"current={_CACHE_PERSIST_VERSION}, discarding stale cache"
+            )
+            return 0
+
+        disk_fp = index.get("model_fingerprint", "")
+        if disk_fp and disk_fp != self._model_fingerprint:
+            logger.warning(
+                f"[cache_persist] model fingerprint mismatch: "
+                f"disk={disk_fp} current={self._model_fingerprint}, "
+                f"discarding incompatible cache"
+            )
             return 0
 
         loaded = 0
