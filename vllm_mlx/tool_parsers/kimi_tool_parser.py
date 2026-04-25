@@ -89,28 +89,17 @@ class KimiToolParser(ToolParser):
         matches = self.TOOL_CALL_PATTERN.findall(model_output)
         for match in matches:
             func_id, func_args = match
-            # func_id format: functions.get_weather:0 or get_weather:0
-            func_name = func_id.split(":")[-2] if ":" in func_id else func_id
+            # func_id format: functions.get_weather:0 or get_weather:0 or get_weather
+            func_name = func_id.rsplit(":", 1)[0] if ":" in func_id else func_id
             func_name = func_name.split(".")[-1]  # Remove 'functions.' prefix
 
-            try:
-                # Validate JSON
-                json.loads(func_args)
-                tool_calls.append(
-                    {
-                        "id": generate_tool_id(),
-                        "name": func_name.strip(),
-                        "arguments": func_args.strip(),
-                    }
-                )
-            except json.JSONDecodeError:
-                tool_calls.append(
-                    {
-                        "id": generate_tool_id(),
-                        "name": func_name.strip(),
-                        "arguments": func_args.strip(),
-                    }
-                )
+            tool_calls.append(
+                {
+                    "id": generate_tool_id(),
+                    "name": func_name.strip(),
+                    "arguments": func_args.strip(),
+                }
+            )
 
         if tool_calls:
             return ExtractedToolCallInformation(
