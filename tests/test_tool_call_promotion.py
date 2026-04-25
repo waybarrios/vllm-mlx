@@ -285,6 +285,34 @@ class TestStreamingPromotion:
             assert content is not None, f"chunk_size={cs}"
             assert "<tool_call>" in content, f"chunk_size={cs}"
 
+    def test_stream_tool_call_closed_immediately_before_think_end(self, parser):
+        """</tool_call></think> with no trailing content."""
+        text = (
+            "<think>R\n"
+            "<tool_call>\n"
+            "<function=f><parameter=x>1</parameter></function>\n"
+            "</tool_call></think>"
+        )
+        reasoning, content = self._stream(parser, text)
+        assert content is not None
+        assert "<tool_call>" in content
+
+    def test_stream_single_delta_promotion_via_transition(self, parser):
+        """Single large delta hits _transition_to_content catch-all."""
+        text = (
+            "<think>R\n"
+            "<tool_call>\n"
+            "<function=f><parameter=x>1</parameter></function>\n"
+            "</tool_call>\n"
+            "More reasoning.\n"
+            "</think>\n"
+            "Content."
+        )
+        reasoning, content = self._stream(parser, text)
+        assert content is not None
+        assert "<tool_call>" in content
+        assert "Content." in content
+
     def test_stream_no_tool_calls_regression(self, parser):
         """Normal reasoning unchanged when streamed as full text."""
         text = "<think>Just thinking here.</think>\nThe answer is 42."

@@ -350,7 +350,7 @@ class BaseThinkingReasoningParser(ReasoningParser):
                 after_think = remainder[eidx + len(end_tok) :]
                 content_msg = self._content_delta(after_think) if after_think else None
                 final_content = promoted + (
-                    content_msg.content or "" if content_msg else ""
+                    (content_msg.content or "") if content_msg else ""
                 )
                 extra_r = content_msg.reasoning if content_msg else None
                 r_text = (reasoning or "") + (extra_r or "")
