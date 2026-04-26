@@ -222,7 +222,18 @@ def load_workload(path: str | Path) -> Workload:
         extra_body = request_extra or None
         if extra_body is not None and not isinstance(extra_body, dict):
             raise ValueError(f"{case_id}: extra_body must be an object")
-        checks = item.get("checks", defaults.get("checks"))
+        merged_checks = dict(defaults.get("checks") or {})
+        if item.get("checks"):
+            for key, value in item["checks"].items():
+                if (
+                    key in ("required_regex", "forbidden_regex")
+                    and isinstance(value, list)
+                    and isinstance(merged_checks.get(key), list)
+                ):
+                    merged_checks[key] = merged_checks[key] + value
+                else:
+                    merged_checks[key] = value
+        checks = merged_checks or None
         if checks is not None and not isinstance(checks, dict):
             raise ValueError(f"{case_id}: checks must be an object")
         tags = item.get("tags", [])
@@ -1181,7 +1192,6 @@ async def run_workload_case(
         "policy": {
             "timeout_ms": case.policy_timeout_ms,
             "within_timeout": within_policy_timeout,
-            "note": "comparison-only unless your product contract explicitly requires it",
         },
         "cache_reset": cache_reset or {"attempted": False},
         "metrics": {
@@ -1341,8 +1351,15 @@ async def run_bench_serve_workload(
                     "event": await clear_runtime_cache(client, url),
                 }
             )
+        total_cases = len(workload.cases) * repetitions
+        completed = 0
         for repetition in range(repetitions):
             for case in workload.cases:
+                print(
+                    f"  [{repetition + 1}/{repetitions}] {case.case_id} ...",
+                    end="",
+                    flush=True,
+                )
                 cache_reset = None
                 if resolved_cache_policy == "before-case":
                     cache_reset = await clear_runtime_cache(client, url)
@@ -1370,6 +1387,11 @@ async def run_bench_serve_workload(
                     cache_reset=cache_reset,
                 )
                 records.append(record)
+                completed += 1
+                latency = record.get("metrics", {}).get("e2e_latency_ms", 0)
+                ok = record.get("ok", False)
+                status = "ok" if ok else "FAIL"
+                print(f" {latency:.0f}ms {status} ({completed}/{total_cases})")
 
     payload = {
         "run_id": run_id,
@@ -1384,6 +1406,9 @@ async def run_bench_serve_workload(
         "transport": {
             "request_timeout_s": request_timeout_s,
             "note": "transport safety only; product policy timeouts live in workload cases",
+        },
+        "policy": {
+            "note": "comparison-only unless your product contract explicitly requires it",
         },
         "cache_policy": {
             "mode": resolved_cache_policy,

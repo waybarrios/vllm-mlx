@@ -840,6 +840,21 @@ def bench_serve_command(args):
     from .bench_serve import run_bench_serve, run_bench_serve_workload
 
     if args.workload:
+        sweep_only_warnings = []
+        if args.prompts != "short,medium,long":
+            sweep_only_warnings.append(f"--prompts={args.prompts}")
+        if args.concurrency != "1,4":
+            sweep_only_warnings.append(f"--concurrency={args.concurrency}")
+        if args.warmup != 1:
+            sweep_only_warnings.append(f"--warmup={args.warmup}")
+        if sweep_only_warnings:
+            import sys as _sys
+
+            print(
+                f"Warning: --workload mode ignores sweep-only args: "
+                f"{', '.join(sweep_only_warnings)}",
+                file=_sys.stderr,
+            )
         request_timeout_s = (
             None if args.request_timeout_s <= 0 else args.request_timeout_s
         )

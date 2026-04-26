@@ -12,6 +12,8 @@ import pytest
 
 from vllm_mlx.bench_serve import (
     RESULT_COLUMNS,
+    WORKLOAD_RESULT_COLUMNS,
+    _WORKLOAD_SQL_SCHEMA,
     BenchServeResult,
     SweepConfig,
     Workload,
@@ -812,6 +814,148 @@ class TestQualityChecks:
 
         assert ok is False
         assert any("not valid JSON" in issue for issue in issues)
+
+    def test_invalid_required_regex_reports_issue(self):
+        ok, issues = validate_quality_checks(
+            "stop", "some content", {"required_regex": ["[unclosed"]}
+        )
+        assert ok is False
+        assert any("invalid required_regex" in i for i in issues)
+
+    def test_invalid_forbidden_regex_reports_issue(self):
+        ok, issues = validate_quality_checks(
+            "stop", "some content", {"forbidden_regex": ["(unclosed"]}
+        )
+        assert ok is False
+        assert any("invalid forbidden_regex" in i for i in issues)
+
+
+class TestWorkloadChecksMerge:
+    """Tests for checks merging behavior in load_workload."""
+
+    def test_case_checks_merge_with_defaults(self, tmp_path: Path):
+        """Case-level checks extend defaults rather than replacing them."""
+        workload_file = tmp_path / "workload.json"
+        workload_file.write_text(
+            json.dumps(
+                {
+                    "defaults": {
+                        "checks": {
+                            "finish_reason": "stop",
+                            "forbidden_regex": ["<think>"],
+                            "min_chars": 100,
+                        }
+                    },
+                    "cases": [
+                        {
+                            "id": "code-case",
+                            "messages": [
+                                {"role": "user", "content": "Write a function."}
+                            ],
+                            "checks": {"required_regex": ["def "]},
+                        }
+                    ],
+                }
+            )
+        )
+
+        workload = load_workload(workload_file)
+        case = workload.cases[0]
+
+        # Case should inherit defaults
+        assert case.checks["finish_reason"] == "stop"
+        assert case.checks["min_chars"] == 100
+        assert "<think>" in case.checks["forbidden_regex"]
+        # Case should also have its own check
+        assert "def " in case.checks["required_regex"]
+
+    def test_case_checks_list_values_concatenate(self, tmp_path: Path):
+        """List-valued check keys (required_regex, forbidden_regex) concatenate."""
+        workload_file = tmp_path / "workload.json"
+        workload_file.write_text(
+            json.dumps(
+                {
+                    "defaults": {
+                        "checks": {
+                            "required_regex": ["Dear"],
+                            "forbidden_regex": ["<think>"],
+                        }
+                    },
+                    "cases": [
+                        {
+                            "id": "case-a",
+                            "messages": [
+                                {"role": "user", "content": "Write a letter."}
+                            ],
+                            "checks": {
+                                "required_regex": ["Sincerely"],
+                                "forbidden_regex": ["TODO"],
+                            },
+                        }
+                    ],
+                }
+            )
+        )
+
+        workload = load_workload(workload_file)
+        case = workload.cases[0]
+
+        assert case.checks["required_regex"] == ["Dear", "Sincerely"]
+        assert case.checks["forbidden_regex"] == ["<think>", "TODO"]
+
+    def test_case_without_checks_inherits_defaults(self, tmp_path: Path):
+        """A case with no checks field gets all default checks."""
+        workload_file = tmp_path / "workload.json"
+        workload_file.write_text(
+            json.dumps(
+                {
+                    "defaults": {"checks": {"finish_reason": "stop", "min_chars": 50}},
+                    "cases": [
+                        {
+                            "id": "plain-case",
+                            "messages": [{"role": "user", "content": "Hello."}],
+                        }
+                    ],
+                }
+            )
+        )
+
+        workload = load_workload(workload_file)
+        case = workload.cases[0]
+
+        assert case.checks == {"finish_reason": "stop", "min_chars": 50}
+
+    def test_case_scalar_check_overrides_default(self, tmp_path: Path):
+        """Non-list check values (scalars) override defaults."""
+        workload_file = tmp_path / "workload.json"
+        workload_file.write_text(
+            json.dumps(
+                {
+                    "defaults": {"checks": {"min_chars": 100, "finish_reason": "stop"}},
+                    "cases": [
+                        {
+                            "id": "short-case",
+                            "messages": [{"role": "user", "content": "Hi."}],
+                            "checks": {"min_chars": 10},
+                        }
+                    ],
+                }
+            )
+        )
+
+        workload = load_workload(workload_file)
+        case = workload.cases[0]
+
+        assert case.checks["min_chars"] == 10
+        assert case.checks["finish_reason"] == "stop"
+
+
+class TestWorkloadSchemaConsistency:
+    """Verify workload SQL schema and column list stay in sync."""
+
+    def test_workload_columns_match_sql_schema(self):
+        schema_cols = [col.split()[0] for col in _WORKLOAD_SQL_SCHEMA.split(", ")]
+        assert schema_cols == WORKLOAD_RESULT_COLUMNS
 
 
 class TestWorkloadSummary:
