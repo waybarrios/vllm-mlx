@@ -830,6 +830,7 @@ class TestMLLMBatchGeneratorMTPGuards:
         )
 
         generator = MLLMBatchGenerator.__new__(MLLMBatchGenerator)
+        generator.max_kv_size = 0
         generator._stats = MLLMBatchStats()
         generator._pending_error_responses = []
         generator._aborted_request_ids = set()
@@ -884,6 +885,7 @@ class TestMLLMBatchGeneratorMTPGuards:
             return mx.array([11]), [mx.array([0.2, 0.8])]
 
         generator = MLLMBatchGenerator.__new__(MLLMBatchGenerator)
+        generator.max_kv_size = 0
         generator._stats = MLLMBatchStats()
         generator.stop_tokens = set()
         generator.unprocessed_requests = []
@@ -1088,6 +1090,7 @@ class TestMLLMBatchGeneratorMTPGuards:
 
         processor = RetiredProcessor()
         generator = MLLMBatchGenerator.__new__(MLLMBatchGenerator)
+        generator.max_kv_size = 0
         generator._stats = MLLMBatchStats()
         generator.stop_tokens = set()
         generator.unprocessed_requests = []
@@ -1137,6 +1140,7 @@ class TestMLLMBatchGeneratorMTPGuards:
                 return logits
 
         generator = MLLMBatchGenerator.__new__(MLLMBatchGenerator)
+        generator.max_kv_size = 0
         generator._stats = MLLMBatchStats()
         generator.stop_tokens = set()
         generator.unprocessed_requests = []
@@ -1254,6 +1258,7 @@ class TestPreprocessIdempotent:
         from vllm_mlx.mllm_batch_generator import MLLMBatchGenerator
 
         gen = MLLMBatchGenerator.__new__(MLLMBatchGenerator)
+        gen.max_kv_size = 0
         gen._preprocess_request = MLLMBatchGenerator._preprocess_request.__get__(
             gen, MLLMBatchGenerator
         )
@@ -1277,6 +1282,7 @@ class TestPreprocessIdempotent:
         from vllm_mlx.mllm_batch_generator import MLLMBatchGenerator
 
         gen = MLLMBatchGenerator.__new__(MLLMBatchGenerator)
+        gen.max_kv_size = 0
         gen._preprocess_request = MLLMBatchGenerator._preprocess_request.__get__(
             gen, MLLMBatchGenerator
         )
