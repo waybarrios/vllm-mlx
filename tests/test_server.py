@@ -2412,6 +2412,62 @@ class TestReasoningAndToolCallsNonStreaming:
 
 
 # =============================================================================
+# Request Cancellation Tests
+# =============================================================================
+
+
+class TestRequestCancellationEndpoint:
+    @pytest.mark.anyio
+    async def test_cancel_request_routes_to_loaded_engine(self):
+        import vllm_mlx.server as server
+
+        class DummyEngine:
+            is_mllm = False
+
+            async def abort_request(self, request_id):
+                self.request_id = request_id
+                return True
+
+        engine = DummyEngine()
+        old_engine = server._engine
+        old_model_name = server._model_name
+        try:
+            server._engine = engine
+            server._model_name = "test-model"
+
+            result = await server.cancel_request("req-123")
+
+            assert result["cancelled"] is True
+            assert result["id"] == "req-123"
+            assert result["model"] == "test-model"
+            assert engine.request_id == "req-123"
+        finally:
+            server._engine = old_engine
+            server._model_name = old_model_name
+
+    @pytest.mark.anyio
+    async def test_cancel_request_404_for_unknown_request(self):
+        import vllm_mlx.server as server
+
+        class DummyEngine:
+            is_mllm = False
+
+            async def abort_request(self, request_id):
+                return False
+
+        old_engine = server._engine
+        try:
+            server._engine = DummyEngine()
+
+            with pytest.raises(server.HTTPException) as exc:
+                await server.cancel_request("missing")
+
+            assert exc.value.status_code == 404
+        finally:
+            server._engine = old_engine
+
+
+# =============================================================================
 # Integration Tests (require running server)
 # =============================================================================
 

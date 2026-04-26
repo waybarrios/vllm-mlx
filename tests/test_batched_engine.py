@@ -124,3 +124,61 @@ class TestBatchedEngineCacheRestore:
         assert loaded == 2
         scheduler._ensure_batch_generator.assert_called_once_with()
         prefix_cache.load_from_disk.assert_called_once_with("/tmp/cache")
+
+
+class TestBatchedEngineAbortRequest:
+    @pytest.mark.anyio
+    async def test_abort_request_routes_to_mllm_scheduler(self):
+        from vllm_mlx.engine.batched import BatchedEngine
+
+        with patch("vllm_mlx.engine.batched.is_mllm_model", return_value=True):
+            engine = BatchedEngine("test-mllm")
+
+        engine._mllm_scheduler = MagicMock()
+        engine._mllm_scheduler.abort_request.return_value = True
+
+        assert await engine.abort_request("req-1") is True
+        engine._mllm_scheduler.abort_request.assert_called_once_with("req-1")
+
+    @pytest.mark.anyio
+    async def test_abort_request_routes_to_text_engine(self):
+        from vllm_mlx.engine.batched import BatchedEngine
+
+        with patch("vllm_mlx.engine.batched.is_mllm_model", return_value=False):
+            engine = BatchedEngine("test-model")
+
+        engine._loaded = True
+        engine._is_mllm = False
+        engine._engine = MagicMock()
+        engine._engine.abort_request.return_value = True
+
+        assert await engine.abort_request("req-1") is True
+        engine._engine.abort_request.assert_called_once_with("req-1")
+
+    @pytest.mark.anyio
+    async def test_abort_request_routes_to_async_text_engine(self):
+        from vllm_mlx.engine.batched import BatchedEngine
+
+        with patch("vllm_mlx.engine.batched.is_mllm_model", return_value=False):
+            engine = BatchedEngine("test-model")
+
+        engine._loaded = True
+        engine._is_mllm = False
+        engine._engine = MagicMock()
+        engine._engine.abort_request = AsyncMock(return_value=True)
+
+        assert await engine.abort_request("req-1") is True
+        engine._engine.abort_request.assert_awaited_once_with("req-1")
+
+    @pytest.mark.anyio
+    async def test_abort_request_returns_false_without_supported_engine(self):
+        from vllm_mlx.engine.batched import BatchedEngine
+
+        with patch("vllm_mlx.engine.batched.is_mllm_model", return_value=False):
+            engine = BatchedEngine("test-model")
+
+        engine._loaded = True
+        engine._is_mllm = False
+        engine._engine = None
+
+        assert await engine.abort_request("req-1") is False

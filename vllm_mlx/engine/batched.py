@@ -12,6 +12,7 @@ LLM engine), so text-only requests must also be routed through it.
 """
 
 import asyncio
+import inspect
 import logging
 import time
 from collections.abc import AsyncIterator
@@ -1071,6 +1072,17 @@ class BatchedEngine(BaseEngine):
         if self._engine is not None:
             return self._engine.clear_runtime_caches()
         return None
+
+    async def abort_request(self, request_id: str) -> bool:
+        """Abort an active or queued batched request by request ID."""
+        if self._mllm_scheduler is not None:
+            return self._mllm_scheduler.abort_request(request_id)
+        if self._engine is not None and hasattr(self._engine, "abort_request"):
+            result = self._engine.abort_request(request_id)
+            if inspect.isawaitable(result):
+                return await result
+            return result
+        return False
 
     def save_cache_to_disk(self, cache_dir: str) -> bool:
         """Save prefix cache to disk for persistence across restarts."""
