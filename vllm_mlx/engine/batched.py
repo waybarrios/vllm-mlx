@@ -299,6 +299,7 @@ class BatchedEngine(BaseEngine):
         )
 
         cache_memory_mb = getattr(self._scheduler_config, "cache_memory_mb", None)
+        max_kv_size = getattr(self._scheduler_config, "max_kv_size", 0)
         enable_mtp = (
             self._scheduler_config.enable_mtp if self._scheduler_config else False
         )
