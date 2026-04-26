@@ -2829,7 +2829,10 @@ async def clear_prefix_cache():
     dependencies=[Depends(verify_api_key), Depends(check_rate_limit)],
 )
 async def cancel_request(request_id: str):
-    """Cancel an active or queued request without restarting the model server."""
+    """Cancel an active or queued request.
+
+    The request_id is the chatcmpl-xxx ID from the first SSE streaming chunk.
+    """
     engine = get_engine()
     try:
         aborted = await engine.abort_request(request_id)
