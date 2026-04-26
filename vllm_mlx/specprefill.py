@@ -325,15 +325,25 @@ def score_tokens(
         attn_obj, "num_key_value_heads", getattr(attn_obj, "n_kv_heads", None)
     )
 
-    # Auto-detect query extractor if not specified
+    # Auto-detect query extractor from model_type (explicit registry, not
+    # attribute sniffing -- avoids silent misclassification on new models).
     if query_extractor is None:
-        if hasattr(attn_obj, "q_norm"):
-            query_extractor = _qwen35_extract_queries
-        elif not hasattr(attn_obj, "rope"):
-            # No RoPE attribute → Nemotron-H style (content-based attention)
-            query_extractor = _nemotron_h_extract_queries
-        else:
-            query_extractor = _llama_extract_queries
+        model_type = getattr(getattr(model, "config", None), "model_type", "")
+        _EXTRACTOR_REGISTRY = {
+            "gemma4": _gemma4_extract_queries,
+            "gemma4_text": _gemma4_extract_queries,
+            "qwen3_5": _qwen35_extract_queries,
+            "qwen3_5_moe": _qwen35_extract_queries,
+            "qwen3_vl": _qwen35_extract_queries,
+            "qwen3_vl_moe": _qwen35_extract_queries,
+            "nemotron_h": _nemotron_h_extract_queries,
+        }
+        query_extractor = _EXTRACTOR_REGISTRY.get(model_type)
+        if query_extractor is None:
+            if _get_rope(attn_obj) is not None:
+                query_extractor = _llama_extract_queries
+            else:
+                query_extractor = _nemotron_h_extract_queries
 
     # Phase 1: Prefill
     cache = make_prompt_cache(model)
@@ -598,6 +608,22 @@ def _get_attn_module(layer):
     return None
 
 
+def _get_rope(attn):
+    """Get the RoPE module from an attention layer, or None.
+
+    mlx_lm models use ``self.rope``; mlx_vlm models use ``self.rotary_emb``.
+    """
+    return getattr(attn, "rope", None) or getattr(attn, "rotary_emb", None)
+
+
+def _set_rope(attn, rope_module):
+    """Set the RoPE module on an attention layer."""
+    if hasattr(attn, "rope"):
+        attn.rope = rope_module
+    elif hasattr(attn, "rotary_emb"):
+        attn.rotary_emb = rope_module
+
+
 def _set_attn_module(layer, module):
     """Set the attention module on a layer (self_attn or mixer)."""
     if hasattr(layer, "self_attn"):
@@ -712,7 +738,7 @@ def sparse_prefill(
 
     # Check if attention layers use RoPE (Nemotron-H has none)
     first_attn = _get_attn_module(attn_layers[0][1])
-    has_rope = hasattr(first_attn, "rope")
+    has_rope = _get_rope(first_attn) is not None
 
     # Patch RoPE on attention layers for position-mapped prefill
     # (skipped for architectures without RoPE, e.g. Nemotron-H)
@@ -720,9 +746,11 @@ def sparse_prefill(
     if has_rope:
         for layer_idx, layer in attn_layers:
             attn = _get_attn_module(layer)
-            original_ropes[layer_idx] = attn.rope
-            attn.rope = _PositionMappedRoPE(
-                attn.rope, selected_positions, cache_start=cache_start
+            rope = _get_rope(attn)
+            original_ropes[layer_idx] = (attn, rope)
+            _set_rope(
+                attn,
+                _PositionMappedRoPE(rope, selected_positions, cache_start=cache_start),
             )
 
     try:
@@ -759,12 +787,11 @@ def sparse_prefill(
             final_cache_offset = cache_start + N
             adjustment = int(total_prompt_len) - int(final_cache_offset)
             for layer_idx, layer in attn_layers:
-                attn = _get_attn_module(layer)
-                original = original_ropes[layer_idx]
+                attn, original = original_ropes[layer_idx]
                 if adjustment > 0:
-                    attn.rope = _OffsetAdjustedRoPE(original, adjustment)
+                    _set_rope(attn, _OffsetAdjustedRoPE(original, adjustment))
                 else:
-                    attn.rope = original
+                    _set_rope(attn, original)
 
     return logits
 
@@ -778,8 +805,10 @@ def cleanup_rope(model):
     """
     for _, layer in _find_attention_layers(model):
         attn = _get_attn_module(layer)
-        if attn is None or not hasattr(attn, "rope"):
+        if attn is None:
             continue
-        rope = attn.rope
+        rope = _get_rope(attn)
+        if rope is None:
+            continue
         if isinstance(rope, (_OffsetAdjustedRoPE, _PositionMappedRoPE)):
-            attn.rope = rope._original
+            _set_rope(attn, rope._original)
