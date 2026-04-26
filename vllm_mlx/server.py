@@ -3368,6 +3368,7 @@ async def _disconnect_guard(
     poll_interval: float = 0.5,
     heartbeat_interval: float = 5.0,
     cleanup=None,
+    timeout: float | None = None,
 ) -> AsyncIterator[str]:
     """Wrap streaming generator to abort on client disconnect.
 
@@ -3377,6 +3378,11 @@ async def _disconnect_guard(
     heartbeat.  This forces an ASGI write which triggers broken-pipe
     detection — without heartbeats, ``is_disconnected()`` stays False
     during long prefill because no data is written to the socket.
+
+    If *timeout* is set, the stream is forcefully stopped once the
+    elapsed wall-clock time exceeds the given number of seconds.
+    Without this, zombie streaming requests can run indefinitely when
+    ``is_disconnected()`` never fires.
 
     On disconnect, the cancellation propagates to stream_outputs()
     finally-block → abort_request() → abort_prefill().
@@ -3388,8 +3394,11 @@ async def _disconnect_guard(
     def _elapsed():
         return f"{_time.monotonic() - _t0:.1f}s"
 
+    _effective_timeout = timeout or _default_timeout
+
     logger.info(
-        f"[disconnect_guard] START poll={poll_interval}s heartbeat={heartbeat_interval}s"
+        f"[disconnect_guard] START poll={poll_interval}s heartbeat={heartbeat_interval}s "
+        f"timeout={_effective_timeout:.0f}s"
     )
 
     async def _wait_disconnect():
@@ -3415,6 +3424,21 @@ async def _disconnect_guard(
         disconnect_task = asyncio.create_task(_wait_disconnect())
         anext_task = None
         while True:
+            # Enforce absolute timeout for streaming requests.
+            if _time.monotonic() - _t0 >= _effective_timeout:
+                logger.warning(
+                    f"[disconnect_guard] TIMEOUT after {_effective_timeout:.0f}s, "
+                    f"{chunk_count} chunks, {heartbeat_count} heartbeats, "
+                    f"elapsed={_elapsed()}"
+                )
+                if anext_task and not anext_task.done():
+                    anext_task.cancel()
+                    try:
+                        await anext_task
+                    except (asyncio.CancelledError, StopAsyncIteration):
+                        pass
+                break
+
             if anext_task is None:
                 anext_task = asyncio.ensure_future(aiter.__anext__())
 
@@ -3477,15 +3501,25 @@ async def _disconnect_guard(
             disconnect_task.cancel()
         if anext_task and not anext_task.done():
             anext_task.cancel()
-        # NOTE: Do NOT call generator.aclose() here.  With run_in_executor,
-        # scheduler.step() runs in a background thread.  aclose() would throw
-        # GeneratorExit into the async-generator chain, which can trigger
-        # mlx::core::eval on the main thread while the executor thread is also
-        # mid-eval → Metal assertion failure → SIGABRT.
-        #
-        # Instead, rely on the task cancellation propagation:
-        #   anext_task.cancel() → CancelledError in stream_outputs()
-        #   → finally block → abort_request() → request removed from scheduler
+        # Close the generator so that stream_outputs() finally-block fires
+        # abort_request(), removing the request from the scheduler.
+        # We defer the close by 0.5s to avoid a Metal thread-safety race:
+        # scheduler.step() runs in run_in_executor and may be mid-eval —
+        # closing the generator immediately could trigger mlx::core::eval
+        # on the main thread concurrently → Metal assertion failure.
+        _gen_to_close = aiter
+
+        async def _deferred_generator_close():
+            await asyncio.sleep(0.5)
+            try:
+                await _gen_to_close.aclose()
+            except Exception as _exc:
+                logger.debug(
+                    f"[disconnect_guard] deferred aclose raised "
+                    f"{type(_exc).__name__}: {_exc}"
+                )
+
+        asyncio.create_task(_deferred_generator_close())
         if cleanup is not None:
             result = cleanup()
             if asyncio.iscoroutine(result):
@@ -3692,6 +3726,7 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
                     ),
                     raw_request,
                     cleanup=_release_default_engine,
+                    timeout=total_timeout,
                 ),
                 media_type="text/event-stream",
             )
@@ -3887,6 +3922,7 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
                     ),
                     raw_request,
                     cleanup=_release_default_engine,
+                    timeout=total_timeout,
                 ),
                 media_type="text/event-stream",
             )
@@ -4282,6 +4318,7 @@ async def create_anthropic_message(
                     ),
                     request,
                     cleanup=_release_default_engine,
+                    timeout=total_timeout,
                 ),
                 media_type="text/event-stream",
                 headers={
