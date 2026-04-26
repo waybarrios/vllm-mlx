@@ -330,8 +330,6 @@ def score_tokens(
     if query_extractor is None:
         model_type = getattr(getattr(model, "config", None), "model_type", "")
         _EXTRACTOR_REGISTRY = {
-            "gemma4": _gemma4_extract_queries,
-            "gemma4_text": _gemma4_extract_queries,
             "qwen3_5": _qwen35_extract_queries,
             "qwen3_5_moe": _qwen35_extract_queries,
             "qwen3_vl": _qwen35_extract_queries,
