@@ -13,7 +13,7 @@ This module provides two implementations:
 import copy
 import logging
 import time
-from collections import deque
+from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -107,8 +107,9 @@ class PrefixCacheManager:
         # Structure: {model_key: {token1: {token2: {..., "cache": CacheEntry}}}}
         self._cache: Dict[Any, Dict] = {}
 
-        # LRU tracking: (model_key, tuple(tokens)) ordered by access time
-        self._lru: deque = deque()
+        # LRU tracking: OrderedDict keyed by (model_key, tuple(tokens)), insertion
+        # order = least-recently-used first. move_to_end() and popitem() are O(1).
+        self._lru: OrderedDict = OrderedDict()
 
         # Statistics
         self.stats = PrefixCacheStats()
@@ -243,17 +244,14 @@ class PrefixCacheManager:
             current = current[tok]
 
         # Store or update cache entry
+        key = (self.model_key, tokens_tuple)
         if "cache" in current:
             current["cache"].count += 1
-            # Update LRU position
-            try:
-                self._lru.remove((self.model_key, tokens_tuple))
-            except ValueError:
-                pass
+            # Move to most-recently-used position — O(1) with OrderedDict
+            self._lru.move_to_end(key)
         else:
             current["cache"] = CacheEntry(prompt_cache, 1)
-
-        self._lru.append((self.model_key, tokens_tuple))
+            self._lru[key] = None
 
         # Evict if over capacity
         while len(self._lru) > self.max_size:
@@ -273,20 +271,19 @@ class PrefixCacheManager:
         return current.get("cache")
 
     def _touch_lru(self, tokens_tuple: tuple) -> None:
-        """Move entry to end of LRU queue (most recently used)."""
+        """Move entry to most-recently-used position — O(1) with OrderedDict."""
         key = (self.model_key, tokens_tuple)
-        try:
-            self._lru.remove(key)
-        except ValueError:
-            pass
-        self._lru.append(key)
+        if key in self._lru:
+            self._lru.move_to_end(key)
+        else:
+            self._lru[key] = None
 
     def _evict_lru(self) -> None:
-        """Evict least recently used entry."""
+        """Evict least recently used entry — O(1) popitem from OrderedDict."""
         if not self._lru:
             return
 
-        model_key, tokens_tuple = self._lru.popleft()
+        (model_key, tokens_tuple), _ = self._lru.popitem(last=False)
         self._delete_cache(model_key, list(tokens_tuple))
         self.stats.evictions += 1
 
