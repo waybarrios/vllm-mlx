@@ -822,7 +822,8 @@ class TestMLLMBatchGeneratorMTPGuards:
 
         monkeypatch.setattr(mx, "stream", lambda stream: nullcontext())
         monkeypatch.setattr(
-            "mlx_lm.models.cache.make_prompt_cache", lambda model: [FakeCache()]
+            "mlx_lm.models.cache.make_prompt_cache",
+            lambda model, **kwargs: [FakeCache()],
         )
         monkeypatch.setattr("mlx_lm.sample_utils.make_sampler", fake_make_sampler)
         monkeypatch.setattr(
