@@ -170,6 +170,8 @@ def serve_command(args):
         print(f"Loading model: {args.model}")
     print(f"Default max tokens: {args.max_tokens}")
     print(f"Max request tokens: {max_request_tokens}")
+    if args.max_kv_size is not None:
+        print(f"Max KV size: {args.max_kv_size} (RotatingKVCache)")
 
     # Store MCP config path for FastAPI startup
     if args.mcp_config:
@@ -229,6 +231,8 @@ def serve_command(args):
             # SSD cache tiering
             ssd_cache_dir=getattr(args, "ssd_cache_dir", None),
             ssd_cache_max_gb=getattr(args, "ssd_cache_max_gb", 10.0),
+            # KV cache size limit
+            max_kv_size=args.max_kv_size or 0,
         )
 
         print("Mode: Continuous batching (for multiple concurrent users)")
@@ -898,6 +902,15 @@ Examples:
         type=int,
         default=1,
         help="Tokens to batch before streaming (1=smooth, higher=throughput)",
+    )
+    serve_parser.add_argument(
+        "--max-kv-size",
+        type=int,
+        default=None,
+        help="Maximum KV cache size per sequence. When set, uses RotatingKVCache "
+        "which bounds memory at the cost of losing early context. Reasoning "
+        "models (e.g. Qwen3, DeepSeek-R1) should use >= 32768 to avoid "
+        "evicting the think block mid-generation.",
     )
     serve_parser.add_argument(
         "--max-tokens",

@@ -689,6 +689,9 @@ def _build_engine(spec: ModelSpec) -> BaseEngine:
     from .engine.simple import SimpleEngine
 
     logger.info(f"Preparing SimpleEngine for residency: {spec.model_name}")
+    max_kv_size = (
+        getattr(spec.scheduler_config, "max_kv_size", 0) if spec.scheduler_config else 0
+    )
     return SimpleEngine(
         model_name=spec.model_name,
         force_mllm=spec.force_mllm,
@@ -698,6 +701,7 @@ def _build_engine(spec: ModelSpec) -> BaseEngine:
         specprefill_threshold=spec.specprefill_threshold,
         specprefill_keep_pct=spec.specprefill_keep_pct,
         specprefill_draft_model=spec.specprefill_draft_model,
+        max_kv_size=max_kv_size,
     )
 
 
@@ -2543,6 +2547,7 @@ def load_model(
             simple_engine_cls = simple_mod.SimpleEngine
 
         logger.info(f"Loading model with SimpleEngine: {model_name}")
+        _max_kv = getattr(scheduler_config, "max_kv_size", 0) if scheduler_config else 0
         _engine = simple_engine_cls(
             model_name=model_name,
             trust_remote_code=trust_remote_code,
@@ -2553,6 +2558,7 @@ def load_model(
             specprefill_threshold=specprefill_threshold,
             specprefill_keep_pct=specprefill_keep_pct,
             specprefill_draft_model=specprefill_draft_model,
+            max_kv_size=_max_kv,
         )
         # Start SimpleEngine synchronously (no background loop)
         # Use new_event_loop() for Python 3.10+ compatibility (get_event_loop() is deprecated)

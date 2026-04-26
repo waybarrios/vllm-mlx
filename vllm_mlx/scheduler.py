@@ -103,6 +103,9 @@ class SchedulerConfig:
     ssd_cache_dir: Optional[str] = None  # None = disabled
     ssd_cache_max_gb: float = 10.0
 
+    # Maximum KV cache size per sequence (0 = unbounded; >0 enables RotatingKVCache)
+    max_kv_size: int = 0
+
     # MTP (Multi-Token Prediction) settings
     # Uses the model's built-in MTP head to predict multiple tokens per step
     enable_mtp: bool = False
@@ -1988,6 +1991,14 @@ class Scheduler:
             else:
                 tokens_to_process = request.prompt_token_ids
             cache_to_use = request.prompt_cache  # May be None
+
+            # Create bounded cache when max_kv_size is configured and no cache exists
+            if cache_to_use is None and self.config.max_kv_size > 0:
+                from mlx_lm.models.cache import make_prompt_cache
+
+                cache_to_use = make_prompt_cache(
+                    self.model, max_kv_size=self.config.max_kv_size
+                )
 
             # Validate cache before using it
             if cache_to_use is not None and not self._validate_cache(cache_to_use):

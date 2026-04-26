@@ -323,7 +323,13 @@ class PrefixCacheManager:
         # Check if first cache layer has is_trimmable method
         first_cache = prompt_cache[0]
         if hasattr(first_cache, "is_trimmable"):
-            return first_cache.is_trimmable()
+            trimmable = first_cache.is_trimmable()
+            if not trimmable:
+                logger.debug(
+                    "Prefix cache reuse skipped: cache is not trimmable "
+                    "(RotatingKVCache does not support trimming)"
+                )
+            return trimmable
         return hasattr(first_cache, "trim")
 
     def _trim_cache(self, prompt_cache: List[Any], num_tokens: int) -> List[Any]:

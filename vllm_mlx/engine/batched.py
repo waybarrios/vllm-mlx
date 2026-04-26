@@ -241,9 +241,11 @@ class BatchedEngine(BaseEngine):
         """Load the MLLM model before scheduler startup."""
         from ..models.mllm import MLXMultimodalLM
 
+        max_kv_size = getattr(self._scheduler_config, "max_kv_size", 0)
         self._mllm_instance = MLXMultimodalLM(
             self._model_name,
             trust_remote_code=self._trust_remote_code,
+            max_kv_size=max_kv_size,
         )
         self._mllm_instance.load()
         self._model = self._mllm_instance.model
@@ -334,6 +336,7 @@ class BatchedEngine(BaseEngine):
             kv_cache_quantization_bits=kv_bits,
             kv_cache_quantization_group_size=kv_group_size,
             chunked_prefill_tokens=chunked_prefill_tokens,
+            max_kv_size=max_kv_size,
             **mllm_extra,
         )
 
