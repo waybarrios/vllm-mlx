@@ -7,6 +7,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
+
 from vllm_mlx.model_workflow import (
     CONVERSION_MANIFEST_NAME,
     MODEL_MANIFEST_NAME,
@@ -148,14 +150,10 @@ def test_acquire_model_refuses_existing_target(tmp_path):
     target.mkdir()
 
     with patch("vllm_mlx.model_workflow.snapshot_download") as mock_download:
-        try:
+        with pytest.raises(FileExistsError):
             acquire_model(
                 "org/model", options=AcquisitionOptions(target_dir=str(target))
             )
-        except FileExistsError:
-            pass
-        else:
-            raise AssertionError("expected FileExistsError")
 
     mock_download.assert_not_called()
 
@@ -207,3 +205,47 @@ def test_convert_model_success_writes_manifest(tmp_path):
 
     assert payload["status"] == "succeeded"
     assert (output / CONVERSION_MANIFEST_NAME).exists()
+
+
+def test_convert_model_failure_reports_status_and_stderr(tmp_path):
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "config.json").write_text(json.dumps({"model_type": "llama"}))
+    output = tmp_path / "out"
+
+    def fake_run(*args, **kwargs):
+        return SimpleNamespace(returncode=1, stdout="", stderr="conversion error")
+
+    with patch("vllm_mlx.model_workflow.subprocess.run", side_effect=fake_run):
+        payload = convert_model(
+            ConversionOptions(source_path=str(source), output_path=str(output))
+        )
+
+    assert payload["status"] == "failed"
+    assert payload["returncode"] == 1
+    assert payload["stderr"] == "conversion error"
+    assert "output_inspection" not in payload
+    assert "manifest_path" not in payload
+
+
+def test_inspect_gptq_model_is_not_detected_as_mlx(tmp_path):
+    """GPTQ/AWQ quantization_config must not trigger has_mlx_signals."""
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {
+                "model_type": "llama",
+                "architectures": ["LlamaForCausalLM"],
+                "quantization_config": {
+                    "quant_method": "gptq",
+                    "bits": 4,
+                    "group_size": 128,
+                },
+            }
+        )
+    )
+    (tmp_path / "model.safetensors").write_bytes(b"x" * 1024)
+
+    payload = inspect_model(str(tmp_path))
+
+    assert payload["mlx"]["looks_like_mlx_artifact"] is False
+    assert payload["mlx"]["needs_conversion"] is True

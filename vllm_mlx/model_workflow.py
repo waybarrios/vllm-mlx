@@ -73,7 +73,7 @@ def _bytes_to_gb(size: int | float | None) -> float | None:
 def _read_json(path: Path) -> dict[str, Any]:
     try:
         return json.loads(path.read_text())
-    except FileNotFoundError:
+    except (FileNotFoundError, json.JSONDecodeError):
         return {}
 
 
@@ -208,6 +208,25 @@ def _model_file_bytes(files: list[dict[str, Any]]) -> int | None:
     return total if known else None
 
 
+_NON_MLX_QUANT_METHODS = frozenset({"gptq", "awq", "squeezellm", "marlin", "fp8"})
+
+
+def _is_mlx_quantization(quant: Any) -> bool:
+    """Return True only when *quant* looks like an mlx-lm quantization config.
+
+    PyTorch quantization configs (GPTQ, AWQ, ...) carry a ``quant_method``
+    key that MLX configs never set.  Treating those as MLX-ready is a false
+    positive reported in review.
+    """
+    if not isinstance(quant, dict):
+        return False
+    method = str(quant.get("quant_method", "")).lower()
+    if method in _NON_MLX_QUANT_METHODS:
+        return False
+    # MLX configs written by mlx-lm always contain "bits".
+    return "bits" in quant
+
+
 def _looks_like_mlx_name(model: str, *, source: str) -> bool:
     name = model.lower() if source == "huggingface" else Path(model).name.lower()
     return (
@@ -285,7 +304,9 @@ def inspect_model(
     has_name_signal = _looks_like_mlx_name(model, source=source) and (
         source == "huggingface" or bool(config)
     )
-    has_mlx_signals = bool(family.get("quantization")) or has_name_signal
+    has_mlx_signals = (
+        _is_mlx_quantization(family.get("quantization")) or has_name_signal
+    )
 
     return {
         "model": model,

@@ -360,6 +360,7 @@ def model_command(args):
         if payload.get("status") == "failed":
             print(json.dumps(payload, indent=2))
             sys.exit(payload.get("returncode") or 1)
+            return  # unreachable, but prevents double-print if sys.exit is caught
     else:
         raise ValueError(f"Unsupported model command: {args.model_command}")
 
