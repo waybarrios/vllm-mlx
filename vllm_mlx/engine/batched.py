@@ -307,6 +307,10 @@ class BatchedEngine(BaseEngine):
             self._scheduler_config, "kv_cache_quantization_group_size", 64
         )
 
+        chunked_prefill_tokens = getattr(
+            self._scheduler_config, "chunked_prefill_tokens", 0
+        )
+
         prefill_step_size = getattr(
             self._scheduler_config, "mllm_prefill_step_size", None
         )
@@ -329,6 +333,7 @@ class BatchedEngine(BaseEngine):
             kv_cache_quantization=kv_quant,
             kv_cache_quantization_bits=kv_bits,
             kv_cache_quantization_group_size=kv_group_size,
+            chunked_prefill_tokens=chunked_prefill_tokens,
             **mllm_extra,
         )
 

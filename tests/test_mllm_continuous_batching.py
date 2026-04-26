@@ -1284,3 +1284,236 @@ class TestPreprocessIdempotent:
         # Should NOT return early — will try to import prepare_inputs
         with pytest.raises(Exception):
             gen._preprocess_request(req)
+
+
+class TestChunkedPrefillCacheHandling:
+    """Tests for chunked prefill prefix cache handling paths."""
+
+    def _make_fake_batch_gen(self):
+        """Build a minimal fake MLLMBatchGenerator for chunked prefill tests."""
+        from vllm_mlx.mllm_batch_generator import MLLMBatchGenerator, MLLMBatchStats
+
+        gen = MLLMBatchGenerator.__new__(MLLMBatchGenerator)
+        gen._stats = MLLMBatchStats()
+        gen._pending_error_responses = []
+        gen._aborted_request_ids = set()
+        gen._prefill_progress = {}
+        gen.active_batch = None
+        gen.stop_tokens = set()
+        gen.unprocessed_requests = []
+        gen._think_suffix_len = 0
+
+        # _has_empty_rotating_cache — always False for test caches
+        gen._has_empty_rotating_cache = lambda cache: False
+
+        return gen
+
+    def _make_fake_kv_cache(self, offset=100):
+        """Create a real KVCache with the given offset."""
+        from mlx_lm.models.cache import KVCache
+
+        cache = KVCache()
+        # Populate cache by updating with dummy data
+        if offset > 0:
+            k = mx.zeros((1, 1, offset, 4))
+            v = mx.zeros((1, 1, offset, 4))
+            cache.update_and_fetch(k, v)
+            mx.eval(cache.keys, cache.values)
+        return cache
+
+    def test_exact_hit_uses_trim_cache_offset(self, monkeypatch):
+        """Exact prefix-cache hit must use _trim_cache_offset(kv, 1),
+        NOT _copy_prefix_cache, to reduce the cache offset by 1."""
+        from vllm_mlx.mllm_batch_generator import (
+            MLLMBatchRequest,
+            install_chunked_prefill_mllm,
+        )
+
+        gen = self._make_fake_batch_gen()
+
+        # Track which functions are called
+        trim_calls = []
+        copy_calls = []
+
+        import vllm_mlx.mllm_batch_generator as bg_mod
+
+        orig_trim = bg_mod._trim_cache_offset
+
+        def tracking_trim(cache, n):
+            trim_calls.append(n)
+            return orig_trim(cache, n)
+
+        monkeypatch.setattr(bg_mod, "_trim_cache_offset", tracking_trim)
+
+        gen._copy_prefix_cache = lambda kv: (copy_calls.append(1), kv)[1]
+        gen._trim_rotating_caches = lambda cache: None
+
+        # Fake prefix cache: exact hit → remaining_ids = [] (empty)
+        fake_kv = [self._make_fake_kv_cache(offset=50)]
+
+        class FakePrefixCache:
+            def fetch(self, ids):
+                return fake_kv, []  # exact hit
+
+        gen.prefix_cache = FakePrefixCache()
+
+        # Fake language model and _orig_next
+        gen.language_model = MagicMock()
+        orig_next_calls = []
+        gen._next = lambda: orig_next_calls.append(1) or []
+
+        # Install chunked prefill (budget large enough that 1 token falls through)
+        install_chunked_prefill_mllm(gen, budget=1024)
+
+        # Create a request
+        req = MLLMBatchRequest(uid=1, request_id="req-exact", prompt="hello")
+        req.input_ids = mx.array([[10, 20, 30, 40, 50]])
+        req.is_text_only = True
+        req.images = None
+        req.videos = None
+        gen.unprocessed_requests.append(req)
+
+        # Preprocess is a no-op (input_ids already set)
+        gen._preprocess_request = lambda r: None
+
+        gen._next()
+
+        # _trim_cache_offset should have been called with trim_by=1
+        assert trim_calls == [
+            1
+        ], f"Expected _trim_cache_offset(kv, 1), got {trim_calls}"
+        # _copy_prefix_cache should NOT have been called
+        assert copy_calls == [], "Exact hit should NOT call _copy_prefix_cache"
+
+    def test_partial_hit_uses_copy_prefix_cache(self, monkeypatch):
+        """Partial prefix-cache hit must use _copy_prefix_cache (not _trim_cache_offset)."""
+        from vllm_mlx.mllm_batch_generator import (
+            MLLMBatchRequest,
+            install_chunked_prefill_mllm,
+        )
+
+        gen = self._make_fake_batch_gen()
+
+        trim_calls = []
+        copy_calls = []
+
+        import vllm_mlx.mllm_batch_generator as bg_mod
+
+        orig_trim = bg_mod._trim_cache_offset
+
+        def tracking_trim(cache, n):
+            trim_calls.append(n)
+            return orig_trim(cache, n)
+
+        monkeypatch.setattr(bg_mod, "_trim_cache_offset", tracking_trim)
+
+        gen._copy_prefix_cache = lambda kv: (copy_calls.append(1), kv)[1]
+        gen._trim_rotating_caches = lambda cache: None
+
+        # Fake prefix cache: partial hit → remaining_ids has tokens
+        fake_kv = [self._make_fake_kv_cache(offset=3)]
+
+        class FakePrefixCache:
+            def fetch(self, ids):
+                return fake_kv, [40, 50]  # partial hit
+
+        gen.prefix_cache = FakePrefixCache()
+
+        gen.language_model = MagicMock()
+        orig_next_calls = []
+        gen._next = lambda: orig_next_calls.append(1) or []
+
+        install_chunked_prefill_mllm(gen, budget=1024)
+
+        req = MLLMBatchRequest(uid=2, request_id="req-partial", prompt="hello world")
+        req.input_ids = mx.array([[10, 20, 30, 40, 50]])
+        req.is_text_only = True
+        req.images = None
+        req.videos = None
+        gen.unprocessed_requests.append(req)
+        gen._preprocess_request = lambda r: None
+
+        gen._next()
+
+        # Partial hit uses _copy_prefix_cache, NOT _trim_cache_offset
+        assert copy_calls == [
+            1
+        ], f"Expected _copy_prefix_cache called once, got {copy_calls}"
+        assert (
+            trim_calls == []
+        ), f"Partial hit should NOT call _trim_cache_offset, got {trim_calls}"
+
+    def test_abort_cleans_up_partial_prefill(self):
+        """Aborting a request during chunked prefill must clean up _partial."""
+        from vllm_mlx.mllm_batch_generator import (
+            MLLMBatchRequest,
+            install_chunked_prefill_mllm,
+        )
+
+        gen = self._make_fake_batch_gen()
+        gen.prefix_cache = None
+        gen.language_model = MagicMock()
+        gen._next = lambda: []
+
+        install_chunked_prefill_mllm(gen, budget=1024)
+
+        # Simulate an in-progress partial prefill
+        req = MLLMBatchRequest(uid=3, request_id="req-abort", prompt="long text")
+        req.input_ids = mx.array([[1, 2, 3, 4, 5]])
+        req.is_text_only = True
+        gen._partial = {
+            "request": req,
+            "cache": [self._make_fake_kv_cache(offset=2)],
+            "remaining_ids": mx.array([[3, 4, 5]]),
+            "processed": 2,
+            "total": 5,
+            "cached_count": 0,
+            "chunk_count": 1,
+        }
+        gen._prefill_progress["req-abort"] = (2, 5)
+
+        # Mark request as aborted
+        gen._aborted_request_ids.add("req-abort")
+
+        responses = gen._next()
+
+        # Partial should be cleared
+        assert gen._partial is None
+        # Prefill progress should be cleaned up
+        assert "req-abort" not in gen._prefill_progress
+        # Should get an abort response (from _pending_error_responses via _generation_step)
+        abort_responses = [r for r in responses if r.finish_reason == "abort"]
+        assert len(abort_responses) == 1
+        assert abort_responses[0].request_id == "req-abort"
+
+    def test_short_prompt_falls_through_to_orig_next(self):
+        """Short prompts (< budget) with no prefix cache must fall through
+        to _orig_next, not be handled by the chunked prefill path."""
+        from vllm_mlx.mllm_batch_generator import (
+            MLLMBatchRequest,
+            install_chunked_prefill_mllm,
+        )
+
+        gen = self._make_fake_batch_gen()
+        gen.prefix_cache = None
+        gen.language_model = MagicMock()
+
+        orig_next_called = []
+        gen._next = lambda: orig_next_called.append(1) or []
+
+        install_chunked_prefill_mllm(gen, budget=1024)
+
+        req = MLLMBatchRequest(uid=4, request_id="req-short", prompt="hi")
+        req.input_ids = mx.array([[10, 20, 30]])  # 3 tokens < 1024 budget
+        req.is_text_only = True
+        req.images = None
+        req.videos = None
+        gen.unprocessed_requests.append(req)
+        gen._preprocess_request = lambda r: None
+
+        gen._next()
+
+        # Should have fallen through to _orig_next
+        assert orig_next_called == [
+            1
+        ], f"Short prompt should fall through to _orig_next, got {orig_next_called}"

@@ -778,8 +778,9 @@ class MLLMBatchGenerator:
             request: Request to preprocess
         """
         # Already preprocessed (e.g. by early executor offloading in
-        # _process_loop).  Only skip for text-only requests; vision
-        # requests need pixel cache lookup even if input_ids was set.
+        # _process_loop or chunked prefill interleaving).  Only skip for
+        # text-only requests; vision requests need pixel cache lookup even
+        # if input_ids was set.
         if request.input_ids is not None and not request.images and not request.videos:
             return
 
@@ -2247,3 +2248,483 @@ def install_mtp_mllm(
         f"[MTP-MLLM] installed with num_draft_tokens={num_draft_tokens}, "
         f"effective_draft_tokens=1, always-advance verified mode"
     )
+
+
+def install_chunked_prefill_mllm(
+    batch_gen: "MLLMBatchGenerator",
+    budget: int = 1024,
+) -> None:
+    """Install interleaved prefill/decode on an MLLMBatchGenerator.
+
+    When a long text-only request arrives, instead of blocking the entire
+    event loop for 20-60+ seconds during prefill, this processes ONE chunk
+    of the new request's prefill per ``step()`` call.  Between steps the
+    scheduler yields to the event loop (``await asyncio.sleep(0)``), so
+    health/status/metrics endpoints remain responsive.
+
+    When an active batch is generating, prefill chunks are interleaved with
+    generation steps to keep throughput for existing requests at 30-50 tok/s.
+
+    Args:
+        batch_gen: The MLLMBatchGenerator to patch.
+        budget: Max tokens to prefill per step (chunk size).
+    """
+    from mlx_lm.models.cache import make_prompt_cache
+
+    _orig_next = batch_gen._next
+    batch_gen._partial = None
+    batch_gen._chunked_prefill_budget = budget
+
+    logger.info(
+        f"[chunked-prefill-mllm] Installing interleaved prefill/decode "
+        f"(budget={budget} tokens/step)"
+    )
+
+    def _generation_step() -> List[MLLMBatchResponse]:
+        """Run one generation step for the active batch. Returns responses."""
+        # Collect pending error responses
+        error_responses = list(batch_gen._pending_error_responses)
+        batch_gen._pending_error_responses.clear()
+
+        batch = batch_gen.active_batch
+        if batch is None:
+            return error_responses
+
+        tic = time.perf_counter()
+        y, logprobs = batch.y, batch.logprobs
+        output_tokens = (
+            [req.output_tokens for req in batch.requests]
+            if batch.logits_processors
+            else None
+        )
+        batch.y, batch.logprobs = batch_gen._step(
+            y[:, None],
+            batch.cache,
+            batch.logits_processors,
+            output_tokens,
+            batch.samplers,
+        )
+        # Synchronous eval — must have results before context switch
+        mx.eval(batch.y, batch.logprobs)
+
+        y = y.tolist()
+        batch_gen._stats.generation_time += time.perf_counter() - tic
+
+        # Build responses and track finished
+        keep_idx = []
+        end_idx = []
+        responses = []
+
+        for i, (token, uid, request_id, num_tok, max_tok, req) in enumerate(
+            zip(
+                y,
+                batch.uids,
+                batch.request_ids,
+                batch.num_tokens,
+                batch.max_tokens,
+                batch.requests,
+            )
+        ):
+            num_tok += 1
+            batch.num_tokens[i] = num_tok
+            req.num_tokens = num_tok
+            req.output_tokens.append(token)
+
+            finish_reason = None
+
+            if token in batch_gen.stop_tokens:
+                finish_reason = "stop"
+                end_idx.append(i)
+            elif num_tok >= max_tok:
+                finish_reason = "length"
+                end_idx.append(i)
+            else:
+                keep_idx.append(i)
+
+            if finish_reason is not None:
+                batch_gen._prefill_progress.pop(request_id, None)
+
+            responses.append(
+                MLLMBatchResponse(
+                    uid=uid,
+                    request_id=request_id,
+                    token=token,
+                    logprobs=logprobs[i],
+                    finish_reason=finish_reason,
+                    prompt_cache=(
+                        (lambda idx=i: batch.extract_cache(idx))
+                        if finish_reason is not None
+                        else None
+                    ),
+                )
+            )
+
+        # Store caches for finished text-only requests BEFORE filtering
+        batch_gen._maybe_store_prefix_cache(batch, end_idx)
+
+        # Remove finished requests from batch
+        if end_idx:
+            if keep_idx:
+                batch.filter(keep_idx)
+            else:
+                batch_gen.active_batch = None
+
+        batch_gen._stats.generation_tokens += len(responses)
+        return error_responses + responses
+
+    def _chunked_next() -> List[MLLMBatchResponse]:
+        """Interleaved prefill/decode: one prefill chunk + one gen step."""
+
+        # === Phase 1: Continue partial prefill ===
+        if batch_gen._partial is not None:
+            partial = batch_gen._partial
+            req = partial["request"]
+
+            # Abort check
+            if req.request_id in batch_gen._aborted_request_ids:
+                batch_gen._aborted_request_ids.discard(req.request_id)
+                batch_gen._partial = None
+                mx.clear_cache()
+                batch_gen._prefill_progress.pop(req.request_id, None)
+                batch_gen._pending_error_responses.append(
+                    MLLMBatchResponse(
+                        uid=req.uid,
+                        request_id=req.request_id,
+                        token=0,
+                        logprobs=mx.zeros(1),
+                        finish_reason="abort",
+                    )
+                )
+                return _generation_step()
+
+            step = batch_gen._chunked_prefill_budget
+            remaining = partial["remaining_ids"]
+            remaining_count = remaining.shape[1]
+
+            if remaining_count > step:
+                # Process ONE chunk
+                tic = time.perf_counter()
+                batch_gen.language_model(remaining[:, :step], cache=partial["cache"])
+                _eval_prompt_cache(partial["cache"])
+                partial["remaining_ids"] = remaining[:, step:]
+                partial["processed"] += step
+                partial["chunk_count"] += 1
+                batch_gen._prefill_progress[req.request_id] = (
+                    partial["cached_count"] + partial["processed"],
+                    partial["total"],
+                )
+                batch_gen._stats.prompt_time += time.perf_counter() - tic
+
+                # Periodic memory cleanup
+                if partial["chunk_count"] % 4 == 0:
+                    mx.clear_cache()
+
+                # Process any short pending requests inline so they
+                # don't wait for the entire long prefill to finish.
+                # IMPORTANT: Only inline requests whose prompt fits
+                # within the chunk budget — longer requests must wait
+                # for their own interleaved prefill (Phase 2).
+                if batch_gen.unprocessed_requests:
+                    _budget = batch_gen._chunked_prefill_budget
+                    short_reqs = []
+                    for r in batch_gen.unprocessed_requests:
+                        if r.images or r.videos:
+                            continue
+                        if r.input_ids is None:
+                            try:
+                                batch_gen._preprocess_request(r)
+                            except Exception:
+                                continue
+                        if r.input_ids is not None and r.input_ids.size <= _budget:
+                            short_reqs.append(r)
+                    if short_reqs:
+                        try:
+                            new_batch = batch_gen._process_prompts(short_reqs)
+                            if new_batch is not None:
+                                if batch_gen.active_batch is not None:
+                                    batch_gen.active_batch.extend(new_batch)
+                                else:
+                                    batch_gen.active_batch = new_batch
+                        except Exception as e:
+                            logger.warning(
+                                f"[chunked-prefill-mllm] Failed to process "
+                                f"inline short requests: {e}"
+                            )
+
+                if batch_gen.active_batch is not None:
+                    return _generation_step()
+                else:
+                    # Idle server — yield to event loop between chunks
+                    return []
+            else:
+                # Last chunk — finalize prefill
+                tic = time.perf_counter()
+                logits = batch_gen.language_model(remaining, cache=partial["cache"])
+                if hasattr(logits, "logits"):
+                    logits = logits.logits
+                last_logits = logits[:, -1, :]
+
+                # Apply logits processors for first token
+                if getattr(req, "logits_processors", None):
+                    empty_tokens = mx.array([], dtype=mx.int32)
+                    for processor in req.logits_processors:
+                        last_logits = processor(empty_tokens, last_logits)
+
+                logprobs = last_logits - mx.logsumexp(
+                    last_logits, axis=-1, keepdims=True
+                )
+                sampled = batch_gen.sampler(logprobs)
+                mx.eval(sampled, logprobs)
+
+                batch_gen._prefill_progress[req.request_id] = (
+                    partial["total"],
+                    partial["total"],
+                )
+                batch_gen._stats.prompt_time += time.perf_counter() - tic
+
+                # Build single-request batch
+                from mlx_lm.sample_utils import make_logits_processors, make_sampler
+
+                req_lp = []
+                need_rep = req.repetition_penalty and req.repetition_penalty != 1.0
+                need_pres = req.presence_penalty and req.presence_penalty != 0.0
+                if need_rep or need_pres:
+                    lp_kwargs = {}
+                    if need_rep:
+                        lp_kwargs["repetition_penalty"] = req.repetition_penalty
+                    if need_pres:
+                        lp_kwargs["presence_penalty"] = req.presence_penalty
+                    req_lp.extend(make_logits_processors(**lp_kwargs))
+                if req.logits_processors:
+                    req_lp.extend(req.logits_processors)
+
+                req_sampler = None
+                if req.top_k != 0 or req.min_p != 0.0:
+                    req_sampler = make_sampler(
+                        temp=req.temperature,
+                        top_p=req.top_p,
+                        top_k=req.top_k,
+                        min_p=req.min_p,
+                    )
+
+                new_batch = MLLMBatch(
+                    uids=[req.uid],
+                    request_ids=[req.request_id],
+                    y=sampled,
+                    logprobs=[logprobs.squeeze(0)],
+                    max_tokens=[req.max_tokens],
+                    num_tokens=[0],
+                    cache=partial["cache"],
+                    requests=[req],
+                    logits_processors=[req_lp] if req_lp else None,
+                    samplers=[req_sampler] if req_sampler else None,
+                )
+
+                # Extend active batch or set as new
+                if batch_gen.active_batch is not None:
+                    # Convert per-request cache to batch-compatible format
+                    # via merge (same as _process_prompts does)
+                    from mlx_lm.models.cache import RotatingKVCache
+
+                    request_cache = partial["cache"]
+                    batch_gen._trim_rotating_caches(request_cache)
+                    for layer_cache in request_cache:
+                        if isinstance(layer_cache, RotatingKVCache):
+                            if layer_cache.keys is not None:
+                                actual_buf = layer_cache.keys.shape[2]
+                                if layer_cache._idx != actual_buf and actual_buf > 0:
+                                    layer_cache.keys = layer_cache._temporal_order(
+                                        layer_cache.keys
+                                    )
+                                    layer_cache.values = layer_cache._temporal_order(
+                                        layer_cache.values
+                                    )
+                                    layer_cache._idx = actual_buf
+
+                    # Convert single-request cache to B=1 batch format
+                    # so it can be extended into the active batch.
+                    merged_cache = [
+                        request_cache[layer_idx].merge([request_cache[layer_idx]])
+                        for layer_idx in range(len(request_cache))
+                    ]
+                    new_batch.cache = merged_cache
+                    batch_gen.active_batch.extend(new_batch)
+                else:
+                    # No active batch — convert single-request cache
+                    # to B=1 batch format for the new active batch.
+                    request_cache = partial["cache"]
+                    merged_cache = [
+                        request_cache[layer_idx].merge([request_cache[layer_idx]])
+                        for layer_idx in range(len(request_cache))
+                    ]
+                    new_batch.cache = merged_cache
+                    batch_gen.active_batch = new_batch
+
+                # Store in prefix cache (prompt-only)
+                if batch_gen.prefix_cache is not None and req.input_ids is not None:
+                    try:
+                        input_ids_list = req.input_ids.reshape(-1).tolist()
+                        S = batch_gen._think_suffix_len
+                        cache_key = input_ids_list[:-S] if S > 0 else input_ids_list
+                        # Trim output: at store time output_count=0, so
+                        # trim by S only (matching canonical path's
+                        # output_count + S invariant).
+                        trim_amount = S
+                        store_cache = _trim_cache_offset(partial["cache"], trim_amount)
+                        batch_gen.prefix_cache.store(cache_key, store_cache)
+                    except Exception as e:
+                        logger.warning(
+                            f"Failed to store prefix cache after chunked "
+                            f"prefill for {req.request_id}: {e}"
+                        )
+
+                logger.info(
+                    f"[chunked-prefill-mllm] Completed interleaved prefill "
+                    f"for {req.request_id[:12]}: "
+                    f"{partial['total']} tokens in {partial['chunk_count']} chunks"
+                )
+                batch_gen._partial = None
+                mx.clear_cache()
+                return _generation_step()
+
+        # === Phase 2: No partial — check for new requests ===
+        batch = batch_gen.active_batch
+        num_active = len(batch) if batch else 0
+
+        if batch_gen.unprocessed_requests:
+            # Find first text-only request eligible for interleaving
+            text_only_req = None
+            for r in batch_gen.unprocessed_requests:
+                if not r.images and not r.videos:
+                    text_only_req = r
+                    break
+
+            if text_only_req is not None:
+                try:
+                    # Preprocess to get input_ids
+                    batch_gen._preprocess_request(text_only_req)
+                except Exception as e:
+                    logger.error(
+                        f"Failed to preprocess request "
+                        f"{text_only_req.request_id}: {e}"
+                    )
+                    batch_gen.unprocessed_requests.remove(text_only_req)
+                    batch_gen._pending_error_responses.append(
+                        MLLMBatchResponse(
+                            uid=text_only_req.uid,
+                            request_id=text_only_req.request_id,
+                            token=0,
+                            logprobs=mx.zeros(1),
+                            finish_reason="error",
+                        )
+                    )
+                    return _generation_step()
+
+                # Check prefix cache
+                input_ids = text_only_req.input_ids
+                if input_ids.ndim == 1:
+                    input_ids = input_ids[None, :]
+
+                cached_kv = None
+                remaining_ids = None
+                cached_count = 0
+                total_tokens = input_ids.shape[1]
+
+                if batch_gen.prefix_cache is not None:
+                    input_ids_list = input_ids.reshape(-1).tolist()
+                    S = batch_gen._think_suffix_len
+                    lookup_ids = input_ids_list[:-S] if S > 0 else input_ids_list
+                    cached_kv, remaining_ids = batch_gen.prefix_cache.fetch(lookup_ids)
+                    if cached_kv is not None and S > 0:
+                        remaining_ids = list(remaining_ids) + input_ids_list[-S:]
+
+                    # Check for empty rotating cache
+                    if cached_kv is not None and batch_gen._has_empty_rotating_cache(
+                        cached_kv
+                    ):
+                        cached_kv = None
+                        remaining_ids = None
+
+                if cached_kv is not None and remaining_ids:
+                    # Prefix cache hit
+                    request_cache = batch_gen._copy_prefix_cache(cached_kv)
+                    batch_gen._trim_rotating_caches(request_cache)
+                    remaining = mx.array(remaining_ids)[None, :]
+                    cached_count = total_tokens - len(remaining_ids)
+                    remaining_count = len(remaining_ids)
+                elif cached_kv is not None and not remaining_ids:
+                    # Exact hit — trim cache by 1 so replaying the last token
+                    # produces correct logits (same as _process_prompts path).
+                    request_cache = _trim_cache_offset(cached_kv, 1)
+                    remaining = input_ids[:, -1:]
+                    cached_count = total_tokens - 1
+                    remaining_count = 1
+                else:
+                    # Cache miss — full prefill
+                    request_cache = make_prompt_cache(batch_gen.language_model)
+                    remaining = input_ids
+                    cached_count = 0
+                    remaining_count = total_tokens
+
+                # Decide: interleave or immediate
+                if remaining_count > batch_gen._chunked_prefill_budget:
+                    # LONG prompt — start partial (interleaved) prefill
+                    logger.info(
+                        f"[chunked-prefill-mllm] Starting interleaved prefill "
+                        f"for {text_only_req.request_id[:12]}: "
+                        f"{remaining_count} remaining tokens "
+                        f"(cached={cached_count}, budget={batch_gen._chunked_prefill_budget})"
+                    )
+                    batch_gen._partial = {
+                        "request": text_only_req,
+                        "cache": request_cache,
+                        "remaining_ids": remaining,
+                        "processed": 0,
+                        "total": total_tokens,
+                        "cached_count": cached_count,
+                        "chunk_count": 0,
+                    }
+                    batch_gen.unprocessed_requests.remove(text_only_req)
+                    text_only_req.vision_encoded = True
+
+                    # Process first chunk immediately
+                    step = batch_gen._chunked_prefill_budget
+                    tic = time.perf_counter()
+                    batch_gen.language_model(remaining[:, :step], cache=request_cache)
+                    _eval_prompt_cache(request_cache)
+                    batch_gen._partial["remaining_ids"] = remaining[:, step:]
+                    batch_gen._partial["processed"] = step
+                    batch_gen._partial["chunk_count"] = 1
+                    batch_gen._prefill_progress[text_only_req.request_id] = (
+                        cached_count + step,
+                        total_tokens,
+                    )
+                    batch_gen._stats.prompt_time += time.perf_counter() - tic
+
+                    if num_active > 0:
+                        return _generation_step()
+                    else:
+                        # Idle server — yield to event loop between chunks
+                        return []
+                # else: SHORT prompt — fall through to _orig_next.
+                # _preprocess_request is idempotent for text-only (sets
+                # input_ids if not already set); _process_prompts checks
+                # input_ids and skips redundant preprocessing.
+
+        # === Phase 3: No partial, no long prompt — original behavior ===
+        return _orig_next()
+
+    # Patch remove() to handle partial abort
+    _orig_remove = batch_gen.remove
+
+    def _patched_remove(uids: List[int]) -> None:
+        if batch_gen._partial is not None:
+            if batch_gen._partial["request"].uid in set(uids):
+                batch_gen._partial = None
+                mx.clear_cache()
+        _orig_remove(uids)
+
+    batch_gen.remove = _patched_remove
+    batch_gen._next = _chunked_next
+
+    logger.info(f"[chunked-prefill-mllm] Installed (budget={budget} tokens/step)")
