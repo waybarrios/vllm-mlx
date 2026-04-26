@@ -199,18 +199,23 @@ class ThinkingAwareLogitsProcessor:
         )
 
     def _restore_snapshot(self, processed_len: int) -> None:
+        # In CONTENT phase, snapshots stop growing (see _sync_to_tokens).
+        # If rollback targets a CONTENT position beyond the snapshot list,
+        # use the last available snapshot -- the state is identical since
+        # _advance_with_token is a no-op in CONTENT.
+        snap_idx = min(processed_len, len(self._snapshots) - 1)
         (
             self._state,
             self._thinking_tokens,
             self._transition_index,
             start_state,
             end_state,
-        ) = self._snapshots[processed_len]
+        ) = self._snapshots[snap_idx]
         self._start_matcher.restore(start_state)
         self._end_matcher.restore(end_state)
         self._processed_len = processed_len
         self._processed_token_ids = self._processed_token_ids[:processed_len]
-        self._snapshots = self._snapshots[: processed_len + 1]
+        self._snapshots = self._snapshots[: snap_idx + 1]
 
     def _sync_to_tokens(self, tokens: mx.array) -> None:
         target_len = int(tokens.size)
@@ -230,7 +235,10 @@ class ThinkingAwareLogitsProcessor:
             self._advance_with_token(token_id)
             self._processed_token_ids.append(token_id)
             self._processed_len += 1
-            self._snapshots.append(self._snapshot_state())
+            # Skip snapshots in CONTENT -- _advance_with_token is a no-op
+            # there, so snapshots would just waste memory on long generations.
+            if self._state != Phase.CONTENT:
+                self._snapshots.append(self._snapshot_state())
 
     def _advance_with_token(self, token_id: int) -> None:
         if self._state == Phase.IDLE:

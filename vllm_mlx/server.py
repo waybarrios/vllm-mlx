@@ -372,6 +372,7 @@ def _build_thinking_processor(
     thinking_token_budget: int,
     *,
     inner: object | None = None,
+    prompt_has_think_tag: bool = True,
 ) -> object | None:
     """Build a ThinkingAwareLogitsProcessor if the tokenizer has think tokens."""
     from .constrained.thinking_processor import ThinkingAwareLogitsProcessor
@@ -399,7 +400,7 @@ def _build_thinking_processor(
         thinking_token_budget=thinking_token_budget,
         inner=inner,
         vocab_size=vocab_size,
-        prompt_has_think_tag=True,
+        prompt_has_think_tag=prompt_has_think_tag,
     )
     logger.info(
         "Thinking processor enabled: budget=%d, start=%s, end=%s",
@@ -492,7 +493,10 @@ def _prepare_chat_completion_invocation(
     enable_thinking = chat_kwargs.get("enable_thinking", True)
     if thinking_budget is not None and enable_thinking is not False:
         thinking_proc = _build_thinking_processor(
-            engine, thinking_budget, inner=json_logits_processor
+            engine,
+            thinking_budget,
+            inner=json_logits_processor,
+            prompt_has_think_tag=bool(enable_thinking),
         )
         if thinking_proc is not None:
             # Replace the logits_processors list: the thinking processor wraps
