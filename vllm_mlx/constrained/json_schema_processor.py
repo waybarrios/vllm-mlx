@@ -24,7 +24,7 @@ from typing import Any
 import mlx.core as mx
 import numpy as np
 
-from .cache import get_tokenizer_data
+from .cache import _get_vocab_size, get_tokenizer_data
 
 logger = logging.getLogger(__name__)
 
@@ -300,7 +300,7 @@ class JSONSchemaLogitsProcessor:
                 self._disabled = True
 
         self._prompt_len: int | None = None
-        self._vocab_size: int = self._tok_data.vocab_size
+        self._vocab_size: int = _get_vocab_size(tokenizer)
 
         # EOS/stop tokens cache.
         eos_id = getattr(self._tok_data, "eos_token_id", None)
