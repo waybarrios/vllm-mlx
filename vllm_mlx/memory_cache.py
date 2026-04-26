@@ -1198,9 +1198,18 @@ class MemoryAwarePrefixCache:
         for i, (tokens_key, entry) in enumerate(self._entries.items()):
             entry_path = os.path.join(cache_dir, f"entry_{i}.safetensors")
             try:
+                # Dequantize _QuantizedCacheWrapper layers before saving.
+                # save_prompt_cache requires .state and .meta_state which
+                # the wrapper does not provide; dequantizing restores the
+                # original cache types that do.
+                persist_cache = (
+                    _dequantize_cache(entry.cache)
+                    if any(isinstance(c, _QuantizedCacheWrapper) for c in entry.cache)
+                    else entry.cache
+                )
                 save_prompt_cache(
                     entry_path,
-                    entry.cache,
+                    persist_cache,
                     metadata={"num_tokens": str(len(tokens_key))},
                 )
                 # Save tokens separately (can be 100K+ ints → binary is smaller)
