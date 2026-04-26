@@ -99,6 +99,8 @@ class ThinkingAwareLogitsProcessor:
         self._start_matcher = BoundedSuffixMatcher(start_token_ids)
         self._end_matcher = BoundedSuffixMatcher(end_token_ids)
         self._end_token_ids = list(end_token_ids)
+        # Mask only the first token of each sequence: sufficient because most
+        # tokenizers encode <think>/<|think|> as a single special token.
         self._content_phase_mask_ids = tuple(
             dict.fromkeys([start_token_ids[0], end_token_ids[0]])
         )
@@ -212,7 +214,7 @@ class ThinkingAwareLogitsProcessor:
 
     def _sync_to_tokens(self, tokens: mx.array) -> None:
         target_len = int(tokens.size)
-        token_ids = [int(tokens[idx].item()) for idx in range(target_len)]
+        token_ids = tokens.tolist()
         common_len = 0
         max_common = min(target_len, self._processed_len)
         while (

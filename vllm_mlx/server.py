@@ -486,8 +486,11 @@ def _prepare_chat_completion_invocation(
             chat_kwargs["enable_thinking"] = False
 
     # Thinking-aware logits processor: cap reasoning tokens when a budget is set.
+    # Only build when thinking is actually enabled for this request -- a CLI
+    # default budget should not alter non-thinking requests.
     thinking_budget = request.thinking_token_budget or _default_thinking_token_budget
-    if thinking_budget is not None:
+    enable_thinking = chat_kwargs.get("enable_thinking", True)
+    if thinking_budget is not None and enable_thinking is not False:
         thinking_proc = _build_thinking_processor(
             engine, thinking_budget, inner=json_logits_processor
         )
