@@ -588,6 +588,11 @@ class EngineCore:
             self.scheduler.add_request(request)
             request_ids.append(request_id)
 
+        # Bind MLX generation streams to the calling thread so that
+        # scheduler.step() can evaluate KV cache state without hitting
+        # "There is no Stream(gpu, N) in current thread" errors.
+        bind_generation_streams()
+
         # Process until all done - direct scheduler access, no async overhead
         results: Dict[str, RequestOutput] = {}
         while self.scheduler.has_requests():
