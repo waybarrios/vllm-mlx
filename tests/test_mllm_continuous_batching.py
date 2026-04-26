@@ -1180,7 +1180,7 @@ class TestBatchedMLLMConfigWiring:
         captured = {}
 
         class FakeMLXMultimodalLM:
-            def __init__(self, model_name, trust_remote_code=True):
+            def __init__(self, model_name, trust_remote_code=True, **kwargs):
                 self.model_name = model_name
                 self.model = object()
                 self.processor = object()
@@ -1302,6 +1302,7 @@ class TestChunkedPrefillCacheHandling:
         gen.stop_tokens = set()
         gen.unprocessed_requests = []
         gen._think_suffix_len = 0
+        gen.max_kv_size = 0
 
         # _has_empty_rotating_cache — always False for test caches
         gen._has_empty_rotating_cache = lambda cache: False
