@@ -2691,6 +2691,98 @@ class TestChatCompletionStreamingModeSwitching:
         ]
 
     @pytest.mark.anyio
+    async def test_nonstream_mllm_endpoint_text_only_does_not_raise_stream_thread_error(
+        self, client, monkeypatch, caplog
+    ):
+        """Direct /v1/chat/completions non-stream MLLM regression for Stream(gpu, N).
+
+        Mirrors production shape:
+        - served model name alias (request model != backing path)
+        - text-only MLLM request
+        - stream=false
+        """
+        import vllm_mlx.server as server
+        from vllm_mlx.engine.simple import SimpleEngine
+
+        class FakeMllmModel:
+            def chat(self, **kwargs):
+                raise RuntimeError("MLLM non-stream chat path must not be used")
+
+            def stream_chat(self, **kwargs):
+                yield SimpleNamespace(
+                    text="one, two, three",
+                    finish_reason="stop",
+                    prompt_tokens=3,
+                )
+
+        engine = SimpleEngine("unsloth/Qwen3.6-35B-A3B-UD-MLX-4bit", force_mllm=True)
+        engine._loaded = True
+        engine._text_model = None
+        engine._model = FakeMllmModel()
+
+        async def fail_if_called(*args, **kwargs):
+            raise RuntimeError("There is no Stream(gpu, 3) in current thread.")
+
+        # If this gets called, code regressed to the old broken thread path.
+        engine._run_blocking_serialized = fail_if_called  # type: ignore[method-assign]
+
+        async def fake_acquire(_raw_request, **_kwargs):
+            return engine
+
+        async def fake_release(*_args, **_kwargs):
+            return None
+
+        caplog.set_level("ERROR", logger="vllm_mlx.server")
+
+        monkeypatch.setattr(server, "_engine", engine)
+        monkeypatch.setattr(server, "_model_name", "Qwen3.6-35B-A3B")
+        monkeypatch.setattr(
+            server,
+            "_model_path",
+            "unsloth/Qwen3.6-35B-A3B-UD-MLX-4bit",
+            raising=False,
+        )
+        monkeypatch.setattr(server, "_force_mllm_model", True, raising=False)
+        monkeypatch.setattr(server, "_default_timeout", 30.0)
+        monkeypatch.setattr(server, "_default_max_tokens", 4096)
+        monkeypatch.setattr(server, "_api_key", None)
+        monkeypatch.setattr(
+            server,
+            "_rate_limiter",
+            server.RateLimiter(requests_per_minute=60, enabled=False),
+        )
+        monkeypatch.setattr(server, "_reasoning_parser", None)
+        monkeypatch.setattr(server, "_enable_auto_tool_choice", True)
+        monkeypatch.setattr(server, "_tool_call_parser", "qwen3_coder")
+        monkeypatch.setattr(server, "_tool_parser_instance", None)
+        monkeypatch.setattr(
+            server,
+            "_acquire_default_engine_for_request",
+            fake_acquire,
+        )
+        monkeypatch.setattr(server, "_release_default_engine", fake_release)
+
+        response = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "Qwen3.6-35B-A3B",
+                "messages": [{"role": "user", "content": "Count: one, two, three"}],
+                "max_tokens": 30,
+                "temperature": 0,
+                "stream": False,
+            },
+        )
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["choices"][0]["message"]["content"] == "one, two, three"
+        assert not [
+            rec.message
+            for rec in caplog.records
+            if "There is no Stream(gpu, 3) in current thread." in rec.message
+        ]
+
+    @pytest.mark.anyio
     async def test_stream_then_nonstream_chat_completion_keeps_stream_thread_valid(
         self, client, monkeypatch, caplog
     ):

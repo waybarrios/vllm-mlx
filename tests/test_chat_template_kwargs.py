@@ -245,24 +245,31 @@ async def test_simple_engine_mllm_chat_forwards_chat_template_kwargs():
         engine = SimpleEngine("test-model")
         engine._loaded = True
         engine._is_mllm = True
+        engine._text_model = None
         engine._model = MagicMock()
-        engine._model.chat = MagicMock(
-            return_value=SimpleNamespace(
-                text="OK",
-                prompt_tokens=5,
-                completion_tokens=1,
-                finish_reason="stop",
+        engine._model.stream_chat = MagicMock(
+            return_value=iter(
+                [
+                    SimpleNamespace(
+                        text="OK",
+                        prompt_tokens=5,
+                        finish_reason="stop",
+                    )
+                ]
             )
         )
 
-        await engine.chat(
+        output = await engine.chat(
             [{"role": "user", "content": "Hello"}],
             chat_template_kwargs={"enable_thinking": False},
         )
 
-        assert engine._model.chat.call_args.kwargs["chat_template_kwargs"] == {
+        assert output.text == "OK"
+        assert engine._model.stream_chat.call_args.kwargs["chat_template_kwargs"] == {
             "enable_thinking": False
         }
+        # Text-only MLLM non-stream chat now aggregates the streaming path.
+        assert engine._model.chat.call_count == 0
 
 
 @pytest.mark.anyio
