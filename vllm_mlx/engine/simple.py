@@ -224,13 +224,26 @@ class SimpleEngine(BaseEngine):
 
         self._model.load()
 
+    def _uses_default_prepare_for_start(self) -> bool:
+        """Return True when prepare_for_start is the class implementation."""
+        method = getattr(self.prepare_for_start, "__func__", None)
+        return method is SimpleEngine.prepare_for_start
+
     async def start(self) -> None:
         """Start the engine (load model if not loaded)."""
         if self._loaded:
             return
         try:
             if self._model is None:
-                await run_blocking_startup_work(self.prepare_for_start)
+                if self._uses_default_prepare_for_start():
+                    # MLX generation streams are thread-local. Keep model load on
+                    # the event-loop thread so default LLM stream_generate() runs
+                    # on the same thread that owns model-associated streams.
+                    self.prepare_for_start()
+                else:
+                    # Test doubles and custom overrides may block; preserve the
+                    # cancellation-safe threaded startup helper for those cases.
+                    await run_blocking_startup_work(self.prepare_for_start)
             self._loaded = True
 
             if self._mtp and self._mtp_num_draft_tokens != 1:
@@ -499,6 +512,11 @@ class SimpleEngine(BaseEngine):
                     return
 
         async with self._generation_lock:
+            # Non-stream chat runs in a worker thread and rebinds generation
+            # streams there. Rebind again on the current thread before
+            # stream_generate so nonstream->stream mode switches remain valid.
+            _bind_worker_generation_streams()
+
             accumulated_text = ""
             prompt_tokens = 0
             completion_tokens = 0

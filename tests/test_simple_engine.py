@@ -2,6 +2,8 @@
 """Tests for SimpleEngine concurrency handling."""
 
 import asyncio
+import threading
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import mlx.core as mx
@@ -294,6 +296,50 @@ class TestSimpleEngineConcurrency:
             )
 
         assert observed is sentinel_stream
+
+    @pytest.mark.anyio
+    async def test_llm_stream_generate_stays_on_model_load_thread(self):
+        """SimpleEngine must load and stream on the same thread for MLX streams."""
+        from vllm_mlx.engine.simple import SimpleEngine
+
+        class FakeLLMModel:
+            def __init__(self, *_args, **_kwargs):
+                self._load_thread = None
+                self.tokenizer = MagicMock()
+                self.tokenizer.encode.return_value = [1, 2, 3]
+
+            def load(self):
+                self._load_thread = threading.get_ident()
+
+            def stream_generate(self, **_kwargs):
+                if threading.get_ident() != self._load_thread:
+                    raise RuntimeError("There is no Stream(gpu, 0) in current thread.")
+                yield SimpleNamespace(
+                    text="ok",
+                    prompt_tokens=3,
+                    finished=True,
+                    finish_reason="stop",
+                )
+
+        with (
+            patch("vllm_mlx.engine.simple.is_mllm_model", return_value=False),
+            patch("vllm_mlx.models.llm.MLXLanguageModel", FakeLLMModel),
+        ):
+            engine = SimpleEngine("test-model")
+
+            outputs = [
+                chunk
+                async for chunk in engine.stream_generate(
+                    prompt="hello",
+                    max_tokens=1,
+                    temperature=0.0,
+                    top_p=1.0,
+                )
+            ]
+
+        assert outputs
+        assert outputs[-1].new_text == "ok"
+        assert outputs[-1].finished is True
 
     @pytest.mark.anyio
     async def test_start_keeps_text_routing_for_mllm_without_mtp(self):

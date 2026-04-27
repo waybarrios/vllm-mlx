@@ -415,6 +415,13 @@ class ResidencyManager:
         if prepare_for_start is None:
             return
 
+        uses_default_prepare = getattr(engine, "_uses_default_prepare_for_start", None)
+        if callable(uses_default_prepare) and uses_default_prepare():
+            # Keep default engine prepare on the event-loop thread so MLX
+            # thread-local stream ownership matches subsequent streaming calls.
+            prepare_for_start()
+            return
+
         prepare_task = asyncio.create_task(asyncio.to_thread(prepare_for_start))
         async with self._lock:
             resident._prepare_task = prepare_task

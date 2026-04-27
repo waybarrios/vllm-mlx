@@ -4,6 +4,7 @@
 import json
 import platform
 import sys
+import threading
 from unittest.mock import AsyncMock, MagicMock, patch
 from types import SimpleNamespace
 
@@ -2122,6 +2123,87 @@ class TestStreamChatCompletion:
         assert payloads[2]["choices"][0]["delta"]["content"] == "final answer"
         assert payloads[2]["choices"][0]["finish_reason"] == "stop"
 
+    @pytest.mark.anyio
+    async def test_streaming_chat_no_stream_thread_error_after_residency_preload(
+        self, monkeypatch, caplog
+    ):
+        """Streaming chat should not hit Stream(gpu, N) after residency preload."""
+        from vllm_mlx.engine.simple import SimpleEngine
+        from vllm_mlx.lifecycle import ModelSpec, ResidencyManager
+        from vllm_mlx.server import (
+            _ensure_sse_terminal,
+            ChatCompletionRequest,
+            Message,
+            stream_chat_completion,
+        )
+        import vllm_mlx.server as server
+
+        class FakeLLMModel:
+            def __init__(self, *_args, **_kwargs):
+                self._load_thread = None
+                self.tokenizer = MagicMock()
+                self.tokenizer.apply_chat_template.return_value = "user: Count"
+                self.tokenizer.bos_token = None
+                self.tokenizer.encode.return_value = [1, 2, 3]
+
+            def load(self):
+                self._load_thread = threading.get_ident()
+
+            def stream_generate(self, **_kwargs):
+                if threading.get_ident() != self._load_thread:
+                    raise RuntimeError("There is no Stream(gpu, 3) in current thread.")
+                yield SimpleNamespace(
+                    text="one, two, three",
+                    prompt_tokens=3,
+                    finished=True,
+                    finish_reason="stop",
+                )
+
+        async def engine_factory(spec):
+            return SimpleEngine(spec.model_name)
+
+        manager = ResidencyManager(engine_factory, auto_unload_idle_seconds=0)
+        manager.register_model(ModelSpec(model_key="default", model_name="test-model"))
+
+        caplog.set_level("ERROR", logger="vllm_mlx.server")
+        monkeypatch.setattr(server, "_model_name", "test-model")
+        monkeypatch.setattr(server, "_reasoning_parser", None)
+        monkeypatch.setattr(server, "_enable_auto_tool_choice", False)
+        monkeypatch.setattr(server, "_tool_call_parser", None)
+        monkeypatch.setattr(server, "_tool_parser_instance", None)
+
+        with (
+            patch("vllm_mlx.engine.simple.is_mllm_model", return_value=False),
+            patch("vllm_mlx.models.llm.MLXLanguageModel", FakeLLMModel),
+        ):
+            try:
+                engine = await manager.ensure_loaded("default")
+                request = ChatCompletionRequest(
+                    model="test-model",
+                    messages=[Message(role="user", content="Count: one, two, three")],
+                    max_tokens=30,
+                    temperature=0,
+                    stream=True,
+                )
+
+                chunks = [
+                    chunk
+                    async for chunk in _ensure_sse_terminal(
+                        stream_chat_completion(engine, request.messages, request),
+                        "data: [DONE]\n\n",
+                    )
+                ]
+            finally:
+                await manager.shutdown()
+
+        errors = [
+            record.message
+            for record in caplog.records
+            if "Streaming error, ensuring terminal frame" in record.message
+        ]
+        assert not errors, f"Unexpected streaming wrapper errors: {errors}"
+        assert any("data: [DONE]" in chunk for chunk in chunks)
+
 
 class TestReasoningAndToolCallsNonStreaming:
     """Non-streaming coexistence of reasoning extraction and tool parsing."""
@@ -2478,6 +2560,391 @@ class TestReasoningAndToolCallsNonStreaming:
 
         assert response.status_code == 200
         assert extract_calls["count"] == 1
+
+
+class TestChatCompletionStreamingModeSwitching:
+    """Endpoint-level regression tests for stream/non-stream mode switching."""
+
+    @pytest.fixture()
+    def client(self):
+        """Create a FastAPI test client."""
+        from fastapi.testclient import TestClient
+
+        from vllm_mlx.server import app
+
+        return TestClient(app)
+
+    @pytest.mark.anyio
+    async def test_nonstream_then_stream_chat_completion_keeps_stream_thread_valid(
+        self, client, monkeypatch, caplog
+    ):
+        """A non-stream chat request must not break the next stream request."""
+        import vllm_mlx.server as server
+        from vllm_mlx.engine.simple import SimpleEngine
+
+        bound_thread = {"id": None}
+
+        def fake_bind_generation_streams():
+            bound_thread["id"] = threading.get_ident()
+
+        class FakeLLMModel:
+            def __init__(self, *_args, **_kwargs):
+                self.tokenizer = MagicMock()
+                self.tokenizer.bos_token = None
+                self.tokenizer.apply_chat_template.return_value = (
+                    "Count: one, two, three"
+                )
+                self.tokenizer.encode.return_value = [1, 2, 3]
+
+            def load(self):
+                # Initial ownership belongs to the load thread.
+                bound_thread["id"] = threading.get_ident()
+
+            def chat(self, **_kwargs):
+                if bound_thread["id"] != threading.get_ident():
+                    raise RuntimeError("There is no Stream(gpu, 3) in current thread.")
+                return SimpleNamespace(
+                    text="one, two, three",
+                    tokens=[11, 12, 13],
+                    finish_reason="stop",
+                )
+
+            def stream_generate(self, **_kwargs):
+                if bound_thread["id"] != threading.get_ident():
+                    raise RuntimeError("There is no Stream(gpu, 3) in current thread.")
+                yield SimpleNamespace(
+                    text="one, two, three",
+                    prompt_tokens=3,
+                    finished=True,
+                    finish_reason="stop",
+                )
+
+        engine = SimpleEngine("test-model")
+
+        async def fake_acquire(_raw_request, **_kwargs):
+            return engine
+
+        async def fake_release(*_args, **_kwargs):
+            return None
+
+        caplog.set_level("ERROR", logger="vllm_mlx.server")
+
+        with (
+            patch("vllm_mlx.engine.simple.is_mllm_model", return_value=False),
+            patch("vllm_mlx.models.llm.MLXLanguageModel", FakeLLMModel),
+            patch(
+                "vllm_mlx.engine.simple.bind_generation_streams",
+                side_effect=fake_bind_generation_streams,
+            ),
+        ):
+            monkeypatch.setattr(server, "_model_name", "test-model")
+            monkeypatch.setattr(server, "_default_timeout", 30.0)
+            monkeypatch.setattr(server, "_default_max_tokens", 128)
+            monkeypatch.setattr(server, "_api_key", None)
+            monkeypatch.setattr(
+                server,
+                "_rate_limiter",
+                server.RateLimiter(requests_per_minute=60, enabled=False),
+            )
+            monkeypatch.setattr(server, "_reasoning_parser", None)
+            monkeypatch.setattr(server, "_enable_auto_tool_choice", True)
+            monkeypatch.setattr(server, "_tool_call_parser", "qwen3_coder")
+            monkeypatch.setattr(server, "_tool_parser_instance", None)
+            monkeypatch.setattr(
+                server,
+                "_acquire_default_engine_for_request",
+                fake_acquire,
+            )
+            monkeypatch.setattr(server, "_release_default_engine", fake_release)
+
+            nonstream = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "test-model",
+                    "messages": [{"role": "user", "content": "Count: one, two, three"}],
+                    "max_tokens": 30,
+                    "temperature": 0,
+                    "stream": False,
+                },
+            )
+            stream = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "test-model",
+                    "messages": [{"role": "user", "content": "Count: one, two, three"}],
+                    "max_tokens": 30,
+                    "temperature": 0,
+                    "stream": True,
+                },
+            )
+
+            await engine.stop()
+
+        assert nonstream.status_code == 200
+        assert stream.status_code == 200
+        assert "data: [DONE]" in stream.text
+        assert "one, two, three" in stream.text
+        assert not [
+            rec.message
+            for rec in caplog.records
+            if "Streaming error, ensuring terminal frame" in rec.message
+        ]
+
+    @pytest.mark.anyio
+    async def test_stream_then_nonstream_chat_completion_keeps_stream_thread_valid(
+        self, client, monkeypatch, caplog
+    ):
+        """A stream chat request must not break the next non-stream request."""
+        import vllm_mlx.server as server
+        from vllm_mlx.engine.simple import SimpleEngine
+
+        bound_thread = {"id": None}
+
+        def fake_bind_generation_streams():
+            bound_thread["id"] = threading.get_ident()
+
+        class FakeLLMModel:
+            def __init__(self, *_args, **_kwargs):
+                self.tokenizer = MagicMock()
+                self.tokenizer.bos_token = None
+                self.tokenizer.apply_chat_template.return_value = (
+                    "Count: one, two, three"
+                )
+                self.tokenizer.encode.return_value = [1, 2, 3]
+
+            def load(self):
+                # Initial ownership belongs to the load thread.
+                bound_thread["id"] = threading.get_ident()
+
+            def chat(self, **_kwargs):
+                if bound_thread["id"] != threading.get_ident():
+                    raise RuntimeError("There is no Stream(gpu, 3) in current thread.")
+                return SimpleNamespace(
+                    text="one, two, three",
+                    tokens=[11, 12, 13],
+                    finish_reason="stop",
+                )
+
+            def stream_generate(self, **_kwargs):
+                if bound_thread["id"] != threading.get_ident():
+                    raise RuntimeError("There is no Stream(gpu, 3) in current thread.")
+                yield SimpleNamespace(
+                    text="one, two, three",
+                    prompt_tokens=3,
+                    finished=True,
+                    finish_reason="stop",
+                )
+
+        engine = SimpleEngine("test-model")
+
+        async def fake_acquire(_raw_request, **_kwargs):
+            return engine
+
+        async def fake_release(*_args, **_kwargs):
+            return None
+
+        caplog.set_level("ERROR", logger="vllm_mlx.server")
+
+        with (
+            patch("vllm_mlx.engine.simple.is_mllm_model", return_value=False),
+            patch("vllm_mlx.models.llm.MLXLanguageModel", FakeLLMModel),
+            patch(
+                "vllm_mlx.engine.simple.bind_generation_streams",
+                side_effect=fake_bind_generation_streams,
+            ),
+        ):
+            monkeypatch.setattr(server, "_model_name", "test-model")
+            monkeypatch.setattr(server, "_default_timeout", 30.0)
+            monkeypatch.setattr(server, "_default_max_tokens", 128)
+            monkeypatch.setattr(server, "_api_key", None)
+            monkeypatch.setattr(
+                server,
+                "_rate_limiter",
+                server.RateLimiter(requests_per_minute=60, enabled=False),
+            )
+            monkeypatch.setattr(server, "_reasoning_parser", None)
+            monkeypatch.setattr(server, "_enable_auto_tool_choice", True)
+            monkeypatch.setattr(server, "_tool_call_parser", "qwen3_coder")
+            monkeypatch.setattr(server, "_tool_parser_instance", None)
+            monkeypatch.setattr(
+                server,
+                "_acquire_default_engine_for_request",
+                fake_acquire,
+            )
+            monkeypatch.setattr(server, "_release_default_engine", fake_release)
+
+            stream = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "test-model",
+                    "messages": [{"role": "user", "content": "Count: one, two, three"}],
+                    "max_tokens": 30,
+                    "temperature": 0,
+                    "stream": True,
+                },
+            )
+            nonstream = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "test-model",
+                    "messages": [{"role": "user", "content": "Count: one, two, three"}],
+                    "max_tokens": 30,
+                    "temperature": 0,
+                    "stream": False,
+                },
+            )
+
+            await engine.stop()
+
+        assert stream.status_code == 200
+        assert nonstream.status_code == 200
+        assert "data: [DONE]" in stream.text
+        assert "one, two, three" in nonstream.text
+        assert not [
+            rec.message
+            for rec in caplog.records
+            if "Streaming error, ensuring terminal frame" in rec.message
+        ]
+
+    @pytest.mark.anyio
+    async def test_nonstream_then_stream_parser_init_does_not_reintroduce_stream_error(
+        self, client, monkeypatch, caplog
+    ):
+        """Stream-time parser init after non-stream request must not trigger Stream(gpu, N) errors."""
+        import vllm_mlx.server as server
+        from vllm_mlx.engine.simple import SimpleEngine
+
+        bound_thread = {"id": None}
+        parser_init_threads: list[int] = []
+
+        def fake_bind_generation_streams():
+            bound_thread["id"] = threading.get_ident()
+
+        class FakeParser:
+            def __init__(self, tokenizer):
+                parser_init_threads.append(threading.get_ident())
+                self.tokenizer = tokenizer
+
+            def reset(self):
+                return None
+
+            def extract_tool_calls_streaming(
+                self, previous_text, current_text, delta_text
+            ):
+                return {"content": delta_text}
+
+            def extract_tool_calls(self, text):
+                return SimpleNamespace(tools_called=False, tool_calls=[], content=text)
+
+        class FakeLLMModel:
+            def __init__(self, *_args, **_kwargs):
+                self.tokenizer = MagicMock()
+                self.tokenizer.bos_token = None
+                self.tokenizer.apply_chat_template.return_value = (
+                    "Count: one, two, three"
+                )
+                self.tokenizer.encode.return_value = [1, 2, 3]
+
+            def load(self):
+                bound_thread["id"] = threading.get_ident()
+
+            def chat(self, **_kwargs):
+                if bound_thread["id"] != threading.get_ident():
+                    raise RuntimeError("There is no Stream(gpu, 3) in current thread.")
+                return SimpleNamespace(
+                    text="one, two, three",
+                    tokens=[11, 12, 13],
+                    finish_reason="stop",
+                )
+
+            def stream_generate(self, **_kwargs):
+                if bound_thread["id"] != threading.get_ident():
+                    raise RuntimeError("There is no Stream(gpu, 3) in current thread.")
+                yield SimpleNamespace(
+                    text="one, two, three",
+                    prompt_tokens=3,
+                    finished=True,
+                    finish_reason="stop",
+                )
+
+        engine = SimpleEngine("test-model")
+
+        async def fake_acquire(_raw_request, **_kwargs):
+            return engine
+
+        async def fake_release(*_args, **_kwargs):
+            return None
+
+        caplog.set_level("ERROR", logger="vllm_mlx.server")
+
+        with (
+            patch("vllm_mlx.engine.simple.is_mllm_model", return_value=False),
+            patch("vllm_mlx.models.llm.MLXLanguageModel", FakeLLMModel),
+            patch(
+                "vllm_mlx.engine.simple.bind_generation_streams",
+                side_effect=fake_bind_generation_streams,
+            ),
+        ):
+            monkeypatch.setattr(server, "_model_name", "test-model")
+            monkeypatch.setattr(server, "_default_timeout", 30.0)
+            monkeypatch.setattr(server, "_default_max_tokens", 128)
+            monkeypatch.setattr(server, "_api_key", None)
+            monkeypatch.setattr(
+                server,
+                "_rate_limiter",
+                server.RateLimiter(requests_per_minute=60, enabled=False),
+            )
+            monkeypatch.setattr(server, "_reasoning_parser", None)
+            monkeypatch.setattr(server, "_enable_auto_tool_choice", True)
+            monkeypatch.setattr(server, "_tool_call_parser", "qwen3_coder")
+            monkeypatch.setattr(server, "_tool_parser_instance", None)
+            monkeypatch.setattr(
+                server.ToolParserManager,
+                "get_tool_parser",
+                staticmethod(lambda _name: FakeParser),
+            )
+            monkeypatch.setattr(
+                server,
+                "_acquire_default_engine_for_request",
+                fake_acquire,
+            )
+            monkeypatch.setattr(server, "_release_default_engine", fake_release)
+
+            nonstream = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "test-model",
+                    "messages": [{"role": "user", "content": "Count: one, two, three"}],
+                    "max_tokens": 30,
+                    "temperature": 0,
+                    "stream": False,
+                },
+            )
+            assert parser_init_threads == []
+
+            stream = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "test-model",
+                    "messages": [{"role": "user", "content": "Count: one, two, three"}],
+                    "max_tokens": 30,
+                    "temperature": 0,
+                    "stream": True,
+                },
+            )
+
+            await engine.stop()
+
+        assert nonstream.status_code == 200
+        assert stream.status_code == 200
+        assert parser_init_threads, "Parser should initialize on stream request"
+        assert "one, two, three" in stream.text
+        assert "data: [DONE]" in stream.text
+        assert not [
+            rec.message
+            for rec in caplog.records
+            if "Streaming error, ensuring terminal frame" in rec.message
+        ]
 
     def test_anthropic_message_prepares_messages_once_in_non_stream_path(
         self, client, monkeypatch
