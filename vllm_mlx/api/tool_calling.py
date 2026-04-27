@@ -849,6 +849,8 @@ def parse_json_output(
 
 def build_json_system_prompt(
     response_format: Optional[Union[ResponseFormat, Dict[str, Any]]] = None,
+    *,
+    thinking_model: bool = False,
 ) -> Optional[str]:
     """
     Build a system prompt instruction for JSON output.
@@ -858,6 +860,10 @@ def build_json_system_prompt(
 
     Args:
         response_format: ResponseFormat specification
+        thinking_model: When ``True`` use softer output rules that allow
+            the model to reason (think) before emitting JSON.  Strict rules
+            that demand ``{`` as the very first character conflict with
+            ``<think>`` blocks and cause degenerated output.
 
     Returns:
         System prompt instruction string, or None if not needed
@@ -883,15 +889,22 @@ def build_json_system_prompt(
     if format_type == "text":
         return None
 
-    strict_rules = (
-        "Output rules (STRICT):\n"
-        "- Your first character MUST be `{` (or `[`).\n"
-        "- Your last character MUST be `}` (or `]`).\n"
-        "- Do NOT wrap the JSON in a markdown code block (no ``` fences).\n"
-        "- Do NOT prepend any preamble such as "
-        '"Here is the JSON" or "Let me format this".\n'
-        "- Do NOT include comments, trailing explanations, or chain-of-thought.\n"
-    )
+    if thinking_model:
+        strict_rules = (
+            "Output rules:\n"
+            "- You may reason first, then output a single valid JSON value.\n"
+            "- Do NOT wrap the JSON in a markdown code block (no ``` fences).\n"
+        )
+    else:
+        strict_rules = (
+            "Output rules (STRICT):\n"
+            "- Your first character MUST be `{` (or `[`).\n"
+            "- Your last character MUST be `}` (or `]`).\n"
+            "- Do NOT wrap the JSON in a markdown code block (no ``` fences).\n"
+            "- Do NOT prepend any preamble such as "
+            '"Here is the JSON" or "Let me format this".\n'
+            "- Do NOT include comments, trailing explanations, or chain-of-thought.\n"
+        )
 
     if format_type == "json_object":
         return (

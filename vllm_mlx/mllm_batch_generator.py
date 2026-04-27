@@ -1597,13 +1597,10 @@ class MLLMBatchGenerator:
             for e in range(logits.shape[0]):
                 sample_logits = logits[e : e + 1]
                 if logits_processors[e]:
-                    # Build full context: output_tokens + current input token.
-                    # ``output_tokens[e]`` lacks the current step's input token
-                    # because it hasn't been appended yet; adding it here gives
-                    # logits processors (e.g. JSON schema enforcer) accurate
-                    # context about what has been generated so far.
-                    cur_tok = int(input_tokens[e, 0])
-                    full_context = output_tokens[e] + [cur_tok]
+                    # ``output_tokens[e]`` already contains all generated
+                    # tokens including the current step's input token (built
+                    # by the caller as ``req.output_tokens + [token]``).
+                    full_context = output_tokens[e]
                     for processor in logits_processors[e]:
                         sample_logits = processor(mx.array(full_context), sample_logits)
                 processed_logits.append(sample_logits)

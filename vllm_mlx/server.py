@@ -325,13 +325,16 @@ def _prepare_json_logits_processor(
     tools: list | None,
     tool_choice: object | None,
     log_context: str | None = None,
+    thinking_model: bool = False,
 ) -> tuple[list[dict], object | None]:
     """Inject response_format instruction and build constrained decoding processor."""
     json_logits_processor = None
     if not response_format:
         return messages, json_logits_processor
 
-    json_instruction = build_json_system_prompt(response_format)
+    json_instruction = build_json_system_prompt(
+        response_format, thinking_model=thinking_model
+    )
     if json_instruction:
         messages = _inject_json_instruction(messages, json_instruction)
 
@@ -411,6 +414,82 @@ def _build_thinking_processor(
     return proc
 
 
+class _ThinkingAwareLogitsProcessor:
+    """Wrap a ``JSONSchemaLogitsProcessor`` so JSON constraining only activates
+    after the model emits ``</think>``, letting it reason freely first.
+
+    Without this wrapper ``enable_thinking`` is forced to ``False`` when
+    constrained decoding is active, which degrades output for thinking models
+    (Qwen 3.5/3.6, DeepSeek-R1, etc.) — the model produces degenerated
+    whitespace/brace loops instead of valid JSON because it was trained to
+    think before answering.
+    """
+
+    def __init__(self, inner):
+        self._inner = inner
+        self._active = False
+        self._in_thinking: bool | None = None  # None = not yet determined
+        self._base_prompt_len: int | None = None
+        self._tokenizer = inner._tokenizer
+
+    def __call__(self, tokens, logits):
+        if self._active:
+            return self._inner(tokens, logits)
+
+        tokens_list = tokens.tolist() if hasattr(tokens, "tolist") else list(tokens)
+        if isinstance(tokens_list, int):
+            tokens_list = [tokens_list]
+        elif tokens_list and isinstance(tokens_list[0], list):
+            tokens_list = tokens_list[0]
+
+        n = len(tokens_list)
+        if self._base_prompt_len is None:
+            self._base_prompt_len = max(0, n - 1)
+
+        gen_tokens = tokens_list[self._base_prompt_len :]
+        if not gen_tokens:
+            return logits
+
+        if self._in_thinking is None:
+            # Decode the first few generated tokens to detect <think>.
+            try:
+                text = self._tokenizer.decode(gen_tokens[: min(3, len(gen_tokens))])
+            except Exception:
+                return logits
+            if "<think>" in text:
+                self._in_thinking = True
+            elif len(gen_tokens) >= 3:
+                # Model is generating content directly — activate constraining.
+                self._active = True
+                self._inner._prompt_len = self._base_prompt_len
+                return self._inner(tokens, logits)
+            else:
+                return logits  # Wait for more tokens to decide.
+
+        if self._in_thinking:
+            # Check a small window of recent tokens for </think>.
+            window = min(5, len(gen_tokens))
+            try:
+                recent = self._tokenizer.decode(gen_tokens[-window:])
+            except Exception:
+                return logits
+            if "</think>" in recent:
+                self._active = True
+                self._inner._prompt_len = n
+                return logits  # Don't constrain the token closing thinking.
+
+        return logits
+
+    # Forward read-only attributes so callers can inspect the inner processor.
+    @property
+    def schema(self):
+        return self._inner.schema
+
+    @property
+    def _disabled(self):
+        return self._inner._disabled
+
+
 def _prepare_chat_completion_invocation(
     engine: BaseEngine,
     request: ChatCompletionRequest,
@@ -427,6 +506,7 @@ def _prepare_chat_completion_invocation(
         response_format,
         tools=request.tools,
         tool_choice=request.tool_choice,
+        thinking_model=bool(_reasoning_parser),
     )
 
     rep_penalty = request.repetition_penalty
@@ -478,13 +558,17 @@ def _prepare_chat_completion_invocation(
         chat_kwargs["stop"] = merged_stop
 
     if json_logits_processor is not None:
-        existing = chat_kwargs.get("logits_processors") or []
-        chat_kwargs["logits_processors"] = list(existing) + [json_logits_processor]
-        # Constrained decoding is incompatible with reasoning parsers:
-        # suppress implicit thinking if caller didn't explicitly set it.
-        if request.enable_thinking is None:
+        if _reasoning_parser and request.enable_thinking is not False:
+            # Thinking model with constrained decoding: let the model reason
+            # freely, then constrain only the JSON content after </think>.
+            json_logits_processor = _ThinkingAwareLogitsProcessor(json_logits_processor)
+        elif request.enable_thinking is None:
+            # No reasoning parser (or thinking explicitly disabled) —
+            # suppress thinking to go straight to JSON.
             request.enable_thinking = False
             chat_kwargs["enable_thinking"] = False
+        existing = chat_kwargs.get("logits_processors") or []
+        chat_kwargs["logits_processors"] = list(existing) + [json_logits_processor]
 
     # Thinking-aware logits processor: cap reasoning tokens when a budget is set.
     # Only build when thinking is actually enabled for this request -- a CLI
@@ -526,6 +610,7 @@ def _prepare_anthropic_invocation(
         tools=openai_request.tools,
         tool_choice=openai_request.tool_choice,
         log_context="Anthropic",
+        thinking_model=bool(_reasoning_parser),
     )
 
     chat_kwargs = {
@@ -551,10 +636,14 @@ def _prepare_anthropic_invocation(
         chat_kwargs["tools"] = template_tools
 
     if json_logits_processor is not None:
+        if _reasoning_parser:
+            # Thinking model: wrap processor to activate after </think>.
+            json_logits_processor = _ThinkingAwareLogitsProcessor(json_logits_processor)
+        else:
+            # No reasoning parser — suppress thinking.
+            chat_kwargs["enable_thinking"] = False
         existing = chat_kwargs.get("logits_processors") or []
         chat_kwargs["logits_processors"] = list(existing) + [json_logits_processor]
-        # Suppress thinking: constrained decoding prevents <think> tags.
-        chat_kwargs["enable_thinking"] = False
 
     return PreparedChatInvocation(
         messages=messages,
@@ -4067,10 +4156,7 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
         reasoning_text, cleaned_text, tool_calls = _extract_reasoning_and_tool_calls(
             output.text,
             request,
-            allow_reasoning=(
-                getattr(request, "enable_thinking", None) is not False
-                and prepared.json_logits_processor is None
-            ),
+            allow_reasoning=(getattr(request, "enable_thinking", None) is not False),
             engine=engine,
         )
 
@@ -4466,7 +4552,13 @@ async def create_anthropic_message(
         reasoning_text, cleaned_text, tool_calls = _extract_reasoning_and_tool_calls(
             output.text,
             openai_request,
-            allow_reasoning=prepared.json_logits_processor is None,
+            allow_reasoning=(
+                prepared.json_logits_processor is None
+                or isinstance(
+                    prepared.json_logits_processor,
+                    _ThinkingAwareLogitsProcessor,
+                )
+            ),
             engine=engine,
         )
 
