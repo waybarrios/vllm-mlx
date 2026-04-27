@@ -1715,9 +1715,12 @@ class MLLMBatchGenerator:
         y = y.tolist()
         toc = time.perf_counter()
 
-        if prompt_processing:
+        if prompt_processing and num_active == 0:
+            # Pure prompt processing (new batch, no prior generation)
             self._stats.prompt_time += toc - tic
         else:
+            # Generation step — even if a new request was extended into the
+            # batch, the dominant cost is generating for all existing requests.
             self._stats.generation_time += toc - tic
 
         # Build responses and track finished

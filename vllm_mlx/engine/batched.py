@@ -1046,6 +1046,7 @@ class BatchedEngine(BaseEngine):
                 "memory_aware_cache",
                 "paged_cache",
                 "prefix_cache",
+                "batch_generator",
                 "requests",
             ):
                 if key in mllm_stats:
