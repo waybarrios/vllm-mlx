@@ -7,7 +7,6 @@ from collections.abc import Iterable
 
 import mlx.core as mx
 
-
 # Serialize stream rebinding so module-level generation_stream references are
 # updated atomically across concurrent engine threads.
 _STREAM_REBIND_LOCK = threading.Lock()

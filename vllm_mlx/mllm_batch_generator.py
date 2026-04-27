@@ -18,6 +18,7 @@ Architecture:
 
 import logging
 import os
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -480,6 +481,7 @@ class MLLMBatchGenerator:
         # same stream concurrently.  See `schedule_removal` /
         # `process_pending_removals`.
         self._pending_removal_uids: set = set()
+        self._pending_removal_lock = threading.Lock()
 
         # Vision embedding cache for repeated images
         self.vision_cache = VisionEmbeddingCache(
@@ -684,8 +686,8 @@ class MLLMBatchGenerator:
         uncommitted encoder`` crash that occurs when two threads submit
         GPU work on the same stream concurrently.
         """
-        for uid in uids:
-            self._pending_removal_uids.add(uid)
+        with self._pending_removal_lock:
+            self._pending_removal_uids.update(uids)
 
     def process_pending_removals(self) -> None:
         """Remove any UIDs enqueued via :meth:`schedule_removal`.
@@ -695,13 +697,15 @@ class MLLMBatchGenerator:
         pass has been issued).  Safe to call even when the queue is
         empty (no-op).
         """
-        if not self._pending_removal_uids:
-            return
-        # Atomically snapshot and clear the queue.  `set` ops are
-        # GIL-protected, and concurrent `schedule_removal` calls that
-        # arrive after the snapshot will simply be processed next step.
-        uids = list(self._pending_removal_uids)
-        self._pending_removal_uids.clear()
+        # Swap the pending set under a lock so enqueues from other threads
+        # cannot be dropped between snapshot and clear.
+        with self._pending_removal_lock:
+            if not self._pending_removal_uids:
+                return
+            pending = self._pending_removal_uids
+            self._pending_removal_uids = set()
+
+        uids = list(pending)
         self.remove(uids)
 
     def __del__(self):

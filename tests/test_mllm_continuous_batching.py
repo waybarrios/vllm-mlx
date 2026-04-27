@@ -16,6 +16,7 @@ Test Cases:
 import asyncio
 import base64
 import os
+import threading
 import tempfile
 from contextlib import nullcontext
 from unittest.mock import MagicMock
@@ -105,6 +106,63 @@ class TestMLLMPromptCacheEval:
         _eval_prompt_cache([KVLikeCache(), ArraysLikeCache()])
 
         eval_mock.assert_called_once_with(kv_keys, kv_values, state)
+
+
+class TestMLLMPendingRemovals:
+    def test_process_pending_removals_atomic_swap_preserves_new_enqueues(self):
+        from vllm_mlx.mllm_batch_generator import MLLMBatchGenerator
+
+        class _InjectOnExhaustionIterator:
+            def __init__(self, base_iter, on_exhaustion):
+                self._base_iter = base_iter
+                self._on_exhaustion = on_exhaustion
+                self._injected = False
+
+            def __iter__(self):
+                return self
+
+            def __next__(self):
+                try:
+                    return next(self._base_iter)
+                except StopIteration:
+                    if not self._injected:
+                        self._injected = True
+                        self._on_exhaustion()
+                    raise
+
+        class _InjectOnExhaustionSet(set):
+            def __init__(self, values, on_exhaustion):
+                super().__init__(values)
+                self._on_exhaustion = on_exhaustion
+
+            def __iter__(self):
+                return _InjectOnExhaustionIterator(
+                    super().__iter__(),
+                    self._on_exhaustion,
+                )
+
+        batch_generator = MLLMBatchGenerator.__new__(MLLMBatchGenerator)
+        batch_generator._pending_removal_lock = threading.Lock()
+        removed: list[int] = []
+
+        def _remove(uids: list[int]) -> None:
+            removed.extend(uids)
+
+        batch_generator.remove = _remove
+        batch_generator._pending_removal_uids = _InjectOnExhaustionSet(
+            {1},
+            lambda: batch_generator.schedule_removal([2]),
+        )
+
+        batch_generator.process_pending_removals()
+
+        assert removed == [1]
+        assert batch_generator._pending_removal_uids == {2}
+
+        batch_generator.process_pending_removals()
+
+        assert removed == [1, 2]
+        assert batch_generator._pending_removal_uids == set()
 
 
 def create_test_image(path: str, size: tuple = (32, 32)) -> str:
