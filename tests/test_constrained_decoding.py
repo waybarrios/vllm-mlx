@@ -615,5 +615,93 @@ class TestIncrementalCaching:
                 assert arr[i] == -np.inf, f"Position {i} should be -inf"
 
 
+# ---------------------------------------------------------------------------
+# JSON context — array vs object discrimination.
+# ---------------------------------------------------------------------------
+
+
+@pytestmark_lmfe
+class TestJsonContextArrayVsObject:
+    """Verify ``_get_json_context`` distinguishes array from object context.
+
+    Regression test: after ``},`` inside a JSON array, the processor returned
+    ``"key_start"`` and ``_filter_key_start_tokens`` removed ``{``, preventing
+    the next array element from being generated.  The fix uses a container
+    stack to track nesting so ``"key_start"`` is only returned inside objects.
+    """
+
+    def _make_processor(self, schema: dict | None = None):
+        from vllm_mlx.constrained import JSONSchemaLogitsProcessor
+
+        tok = _FakeTokenizer()
+        return JSONSchemaLogitsProcessor(schema, tok), tok
+
+    def test_comma_inside_object_returns_key_start(self):
+        """``{"a": 1,`` → key_start (inside an object)."""
+        import mlx.core as mx
+
+        proc, tok = self._make_processor()
+        text = '{"a": 1,'
+        tokens = tok.encode(text)
+        # Prime prompt_len
+        proc(mx.array([], dtype=mx.int32), mx.zeros((tok.vocab_size,)))
+        # Simulate generation of these tokens
+        for t in tokens:
+            proc(
+                mx.array(tokens[: tokens.index(t) + 1], dtype=mx.int32),
+                mx.zeros((tok.vocab_size,)),
+            )
+        ctx = proc._get_json_context(tokens)
+        assert ctx == "key_start", f"Expected key_start inside object, got {ctx!r}"
+
+    def test_comma_inside_array_returns_other(self):
+        """``[1,`` → other (inside an array, NOT key_start)."""
+        import mlx.core as mx
+
+        proc, tok = self._make_processor()
+        text = "[1,"
+        tokens = tok.encode(text)
+        proc(mx.array([], dtype=mx.int32), mx.zeros((tok.vocab_size,)))
+        for t in tokens:
+            proc(
+                mx.array(tokens[: tokens.index(t) + 1], dtype=mx.int32),
+                mx.zeros((tok.vocab_size,)),
+            )
+        ctx = proc._get_json_context(tokens)
+        assert ctx == "other", f"Expected other inside array, got {ctx!r}"
+
+    def test_brace_after_comma_in_array_is_allowed(self):
+        """After ``[{...},`` the context must be ``"other"`` (not ``"key_start"``).
+
+        This verifies that ``_get_json_context`` does not trigger the key
+        filter at array element boundaries.  We check the context directly
+        rather than the full mask because the FakeTokenizer causes the
+        lm-format-enforcer to get stuck (empty allowed set), which triggers
+        the EOS-force recovery path.
+        """
+        import mlx.core as mx
+
+        proc, tok = self._make_processor()
+
+        # Feed ``[{"n": "a"},``
+        text = '[{"n": "a"},'
+        tokens = tok.encode(text)
+        # Prefill
+        proc(mx.array([], dtype=mx.int32), mx.zeros((tok.vocab_size,)))
+        # Generate each token to update incremental context state
+        for i, t in enumerate(tokens):
+            proc(
+                mx.array(tokens[: i + 1], dtype=mx.int32),
+                mx.zeros((tok.vocab_size,)),
+            )
+
+        # The context after `},` inside an array must NOT be "key_start"
+        ctx = proc._get_json_context(tokens)
+        assert ctx == "other", (
+            f"_get_json_context returned {ctx!r} after comma in array — "
+            f"should be 'other', not 'key_start'"
+        )
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

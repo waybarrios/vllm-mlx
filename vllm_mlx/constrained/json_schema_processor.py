@@ -337,6 +337,12 @@ class JSONSchemaLogitsProcessor:
         self._brace_depth: int = 0
         self._bracket_depth: int = 0
 
+        # Container nesting stack for distinguishing object vs array context.
+        # Entries are ``"o"`` (object/brace) or ``"a"`` (array/bracket).
+        # Used by ``_get_json_context`` to return ``"key_start"`` only when
+        # inside an object — NOT when inside an array after ``,``.
+        self._container_stack: list[str] = []
+
     # ------------------------------------------------------------------
 
     def _suffix(self, tokens_list: list[int]) -> list[int]:
@@ -406,6 +412,7 @@ class JSONSchemaLogitsProcessor:
             self._json_ctx_last_quote_pos = -1
             self._brace_depth = 0
             self._bracket_depth = 0
+            self._container_stack = []
 
         self._cached_suffix_text = result
         self._cached_suffix_len = suffix_len
@@ -462,6 +469,7 @@ class JSONSchemaLogitsProcessor:
             last_quote_pos = self._json_ctx_last_quote_pos
             brace_depth = self._brace_depth
             bracket_depth = self._bracket_depth
+            container_stack = self._container_stack
             i = self._json_ctx_scanned_len
             while i < text_len:
                 ch = text[i]
@@ -477,12 +485,18 @@ class JSONSchemaLogitsProcessor:
                         last_quote_pos = i
                     elif ch == "{":
                         brace_depth += 1
+                        container_stack.append("o")
                     elif ch == "}":
                         brace_depth -= 1
+                        if container_stack and container_stack[-1] == "o":
+                            container_stack.pop()
                     elif ch == "[":
                         bracket_depth += 1
+                        container_stack.append("a")
                     elif ch == "]":
                         bracket_depth -= 1
+                        if container_stack and container_stack[-1] == "a":
+                            container_stack.pop()
                 i += 1
             self._json_ctx_in_string = in_string
             self._json_ctx_last_quote_pos = last_quote_pos
@@ -495,6 +509,7 @@ class JSONSchemaLogitsProcessor:
             last_quote_pos = -1
             brace_depth = 0
             bracket_depth = 0
+            container_stack: list[str] = []
             i = 0
             while i < text_len:
                 ch = text[i]
@@ -510,22 +525,32 @@ class JSONSchemaLogitsProcessor:
                         last_quote_pos = i
                     elif ch == "{":
                         brace_depth += 1
+                        container_stack.append("o")
                     elif ch == "}":
                         brace_depth -= 1
+                        if container_stack and container_stack[-1] == "o":
+                            container_stack.pop()
                     elif ch == "[":
                         bracket_depth += 1
+                        container_stack.append("a")
                     elif ch == "]":
                         bracket_depth -= 1
+                        if container_stack and container_stack[-1] == "a":
+                            container_stack.pop()
                 i += 1
             self._json_ctx_in_string = in_string
             self._json_ctx_last_quote_pos = last_quote_pos
             self._json_ctx_scanned_len = text_len
             self._brace_depth = brace_depth
             self._bracket_depth = bracket_depth
+            self._container_stack = container_stack
 
         if self._json_ctx_in_string:
             before = text[: self._json_ctx_last_quote_pos].rstrip()
             if not before or before[-1] in ("{", ","):
+                # Only treat as key if we're inside an object, not an array.
+                if self._container_stack and self._container_stack[-1] == "a":
+                    return "other"
                 return "in_key"
             return "other"
 
@@ -533,6 +558,13 @@ class JSONSchemaLogitsProcessor:
         if not stripped:
             return "other"
         if stripped[-1] in ("{", ","):
+            # Only return key_start when inside an object.  After a comma
+            # inside an array (e.g. ``[{...},``), the next element is a
+            # value, not a key — returning "key_start" here would cause
+            # _filter_key_start_tokens to block valid array element tokens
+            # like ``{``.
+            if self._container_stack and self._container_stack[-1] == "a":
+                return "other"
             return "key_start"
         return "other"
 
@@ -677,6 +709,16 @@ class JSONSchemaLogitsProcessor:
     def __call__(self, tokens: mx.array, logits: mx.array) -> mx.array:
         """Apply the allowed-tokens mask to ``logits``."""
         if self._disabled:
+            # Force EOS immediately — the enforcer got stuck, so continued
+            # generation produces garbage.  Without this cap the model would
+            # generate up to max_tokens (often 262 K) of useless output,
+            # blocking the slot for minutes/hours.
+            if self._eos_set:
+                actual_vocab = logits.shape[-1]
+                mask = self._build_allow_mask(sorted(self._eos_set), actual_vocab)
+                if logits.ndim == 2 and logits.shape[0] == 1:
+                    mask = mask[None, :]
+                return logits + mask
             return logits
 
         try:
@@ -722,11 +764,17 @@ class JSONSchemaLogitsProcessor:
                 if self._suffix_is_complete_json(suffix) and self._eos_set:
                     allowed_list = sorted(self._eos_set)
                 else:
+                    try:
+                        decoded = self._tokenizer.decode(suffix)
+                    except Exception:
+                        decoded = "<decode-error>"
                     logger.warning(
                         "JSONLP: enforcer stuck (empty allowed-set at "
-                        "suffix_len=%d); disabling constrained decoding "
-                        "for this request",
+                        "suffix_len=%d, suffix_tokens=%s, decoded=%r); "
+                        "disabling constrained decoding for this request",
                         len(suffix),
+                        suffix[:10],
+                        decoded[:80],
                     )
                     self._disabled = True
                     return logits
