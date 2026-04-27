@@ -3728,6 +3728,84 @@ async def _ensure_sse_terminal(
             yield terminal_frame
 
 
+def _find_uvicorn_cycle(obj, depth=0, visited=None):
+    """Walk through middleware wrappers to find uvicorn's RequestResponseCycle.
+
+    This relies on uvicorn's internal ``RequestResponseCycle.disconnected``
+    attribute and Starlette's middleware closure layout.  Tested against
+    uvicorn 0.34-0.40 and starlette 0.44-0.46.  If either changes the
+    internal layout, this function returns None and disconnect detection
+    silently falls back to timeout-only behaviour.
+    """
+    if depth > 8:
+        return None
+    if visited is None:
+        visited = set()
+    obj_id = id(obj)
+    if obj_id in visited:
+        return None
+    visited.add(obj_id)
+
+    # Direct hit: object has 'disconnected' bool attr (RequestResponseCycle)
+    if hasattr(obj, "disconnected") and isinstance(getattr(obj, "disconnected"), bool):
+        return obj
+
+    # Check __self__ of bound methods
+    self_obj = getattr(obj, "__self__", None)
+    if self_obj is not None:
+        result = _find_uvicorn_cycle(self_obj, depth + 1, visited)
+        if result:
+            return result
+
+    # Check _receive attribute (Starlette Request -> inner receive)
+    inner = getattr(obj, "_receive", None)
+    if inner is not None:
+        result = _find_uvicorn_cycle(inner, depth + 1, visited)
+        if result:
+            return result
+
+    # Check closure cells (BaseHTTPMiddleware wrappers)
+    if hasattr(obj, "__closure__") and obj.__closure__:
+        for cell in obj.__closure__:
+            try:
+                val = cell.cell_contents
+                result = _find_uvicorn_cycle(val, depth + 1, visited)
+                if result:
+                    return result
+            except ValueError:
+                pass
+
+    return None
+
+
+def _is_client_disconnected(raw_request: Request) -> bool:
+    """Reliable client disconnect check.
+
+    Starlette's ``is_disconnected()`` uses an immediately-cancelled
+    ``anyio.CancelScope`` which prevents the ASGI ``receive()`` from
+    executing — so it always returns False for non-streaming requests.
+
+    This function bypasses Starlette and reads uvicorn's internal
+    ``disconnected`` flag directly from the ``RequestResponseCycle``,
+    walking through any middleware wrappers via closures.
+    """
+    if getattr(raw_request, "_is_disconnected", False):
+        return True
+    # Cache the cycle reference on the request for fast subsequent checks
+    cycle = getattr(raw_request, "_uvicorn_cycle", None)
+    if cycle is None:
+        receive = getattr(raw_request, "_receive", None)
+        if receive is None:
+            return False
+        cycle = _find_uvicorn_cycle(receive)
+        # Cache even if None (to avoid repeated searches)
+        raw_request._uvicorn_cycle = cycle
+    if cycle is not None and cycle.disconnected:
+        raw_request._is_disconnected = True
+        return True
+    return False
+
+
 async def _disconnect_guard(
     generator: AsyncIterator[str],
     raw_request: Request,
@@ -3772,7 +3850,7 @@ async def _disconnect_guard(
         while True:
             await asyncio.sleep(poll_interval)
             poll_count += 1
-            is_disc = await raw_request.is_disconnected()
+            is_disc = _is_client_disconnected(raw_request)
             if poll_count % 10 == 0 or is_disc:
                 logger.info(
                     f"[disconnect_guard] poll #{poll_count} "
@@ -3921,7 +3999,7 @@ async def _wait_with_disconnect(
         while True:
             await asyncio.sleep(poll_interval)
             poll_count += 1
-            is_disc = await raw_request.is_disconnected()
+            is_disc = _is_client_disconnected(raw_request)
             if poll_count % 10 == 0 or is_disc:
                 logger.info(
                     f"[disconnect_guard] poll #{poll_count} "
