@@ -2,9 +2,15 @@
 """Helpers for binding MLX generation streams to worker threads."""
 
 import importlib
+import threading
 from collections.abc import Iterable
 
 import mlx.core as mx
+
+
+# Serialize stream rebinding so module-level generation_stream references are
+# updated atomically across concurrent engine threads.
+_STREAM_REBIND_LOCK = threading.Lock()
 
 
 def bind_generation_streams(
@@ -16,13 +22,14 @@ def bind_generation_streams(
     generation runs on another, module-level generation streams created during
     import can point at a stream that does not exist in the worker thread.
     """
-    default_stream = mx.new_stream(mx.default_device())
-    mx.set_default_stream(default_stream)
-    for module_name in module_names:
-        try:
-            module = importlib.import_module(module_name)
-        except ImportError:
-            continue
-        if hasattr(module, "generation_stream"):
-            module.generation_stream = default_stream
-    return default_stream
+    with _STREAM_REBIND_LOCK:
+        default_stream = mx.new_stream(mx.default_device())
+        mx.set_default_stream(default_stream)
+        for module_name in module_names:
+            try:
+                module = importlib.import_module(module_name)
+            except ImportError:
+                continue
+            if hasattr(module, "generation_stream"):
+                setattr(module, "generation_stream", default_stream)
+        return default_stream
