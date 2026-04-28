@@ -4994,6 +4994,7 @@ async def stream_chat_completion(
     tool_accumulated_text = ""
     tool_calls_detected = False
     tool_markup_possible = False  # Fast path: skip parsing until markers appear
+    _first_content_emitted = False
     tool_parser = _get_streaming_tool_parser(request, engine)
 
     try:
@@ -5052,9 +5053,7 @@ async def stream_chat_completion(
                         )
                     ):
                         tool_accumulated_text += content
-                        # Suppress whitespace-only content when tools are active;
-                        # avoids emitting stray newlines before tool call XML.
-                        if not content.strip():
+                        if not content.strip() and not _first_content_emitted:
                             continue
                     else:
                         if not tool_markup_possible:
@@ -5134,6 +5133,8 @@ async def stream_chat_completion(
                         if flush:
                             content = content + flush
 
+                if content and not _first_content_emitted:
+                    _first_content_emitted = True
                 chunk = ChatCompletionChunk(
                     id=response_id,
                     model=_model_name,
