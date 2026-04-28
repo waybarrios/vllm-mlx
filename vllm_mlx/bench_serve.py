@@ -656,7 +656,8 @@ def parse_sse_line(line: str) -> Optional[dict]:
         ``data: [DONE]`` sentinel.  For all other ``data:`` lines the JSON is
         parsed and a dict is returned::
 
-            {"content": str, "finish_reason": Optional[str], "usage": Optional[dict]}
+            {"id": Optional[str], "content": str,
+             "finish_reason": Optional[str], "usage": Optional[dict]}
 
         Missing keys (``choices``, ``delta``, ``content``) are handled
         gracefully and default to empty string / ``None``.
@@ -684,10 +685,27 @@ def parse_sse_line(line: str) -> Optional[dict]:
     usage = chunk.get("usage")
 
     return {
+        "id": chunk.get("id"),
         "content": content,
         "finish_reason": finish_reason,
         "usage": usage,
     }
+
+
+async def _cancel_server_request(
+    client: httpx.AsyncClient,
+    base_url: str,
+    request_id: Optional[str],
+) -> None:
+    """Best-effort server-side cancellation for timed-out workload streams."""
+    if not request_id:
+        return
+    try:
+        await client.post(f"{base_url}/v1/requests/{request_id}/cancel", timeout=5.0)
+    except Exception:
+        # Older servers may not expose request cancellation. Closing the stream
+        # still gives the server disconnect signal; this endpoint is best effort.
+        pass
 
 
 def compute_request_metrics(
@@ -790,6 +808,7 @@ async def stream_chat_completion(
     max_tokens: int = 256,
     enable_thinking: Optional[bool] = None,
     extra_body: Optional[dict] = None,
+    timeout_s: Optional[float] = None,
 ) -> dict:
     """Send a streaming chat completion and collect per-token timing data.
 
@@ -805,6 +824,9 @@ async def stream_chat_completion(
         enable_thinking: If not ``None``, passed as ``enable_thinking`` in the
             request body.
         extra_body: Optional extra keys merged into the request body.
+        timeout_s: Optional case-level timeout. When set, the stream is closed
+            and best-effort server cancellation is attempted before raising
+            :class:`TimeoutError`.
 
     Returns:
         Dict with all :func:`compute_request_metrics` fields plus
@@ -829,26 +851,43 @@ async def stream_chat_completion(
     content_parts: list[str] = []
     finish_reason: Optional[str] = None
     usage: Optional[dict] = None
+    request_id: Optional[str] = None
 
-    async with client.stream(
-        "POST", f"{base_url}/v1/chat/completions", json=body
-    ) as response:
-        response.raise_for_status()
-        async for raw_line in response.aiter_lines():
-            parsed = parse_sse_line(raw_line)
-            if parsed is None:
-                continue
-            if parsed.get("usage"):
-                usage = parsed["usage"]
-            if parsed.get("finish_reason"):
-                finish_reason = parsed["finish_reason"]
-            chunk_content = parsed.get("content", "")
-            if chunk_content:
-                now = time.perf_counter()
-                if t_first_token is None:
-                    t_first_token = now
-                token_times.append(now)
-                content_parts.append(chunk_content)
+    async def _consume_stream() -> None:
+        nonlocal finish_reason, request_id, t_first_token, usage
+        async with client.stream(
+            "POST", f"{base_url}/v1/chat/completions", json=body
+        ) as response:
+            response.raise_for_status()
+            async for raw_line in response.aiter_lines():
+                parsed = parse_sse_line(raw_line)
+                if parsed is None:
+                    continue
+                if parsed.get("id"):
+                    request_id = parsed["id"]
+                if parsed.get("usage"):
+                    usage = parsed["usage"]
+                if parsed.get("finish_reason"):
+                    finish_reason = parsed["finish_reason"]
+                chunk_content = parsed.get("content", "")
+                if chunk_content:
+                    now = time.perf_counter()
+                    if t_first_token is None:
+                        t_first_token = now
+                    token_times.append(now)
+                    content_parts.append(chunk_content)
+
+    try:
+        if timeout_s and timeout_s > 0:
+            async with asyncio.timeout(timeout_s):
+                await _consume_stream()
+        else:
+            await _consume_stream()
+    except TimeoutError:
+        await _cancel_server_request(client, base_url, request_id)
+        raise TimeoutError(
+            f"stream_chat_completion timed out after {timeout_s:.3f}s"
+        ) from None
 
     t_end = time.perf_counter()
     if t_first_token is None:
@@ -1117,6 +1156,11 @@ async def run_workload_case(
             max_tokens=int(case.max_tokens or workload.defaults.get("max_tokens", 256)),
             enable_thinking=case.enable_thinking,
             extra_body=case.extra_body,
+            timeout_s=(
+                case.policy_timeout_ms / 1000
+                if case.policy_timeout_ms is not None
+                else None
+            ),
         )
         error = ""
     except Exception as exc:

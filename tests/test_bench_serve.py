@@ -38,6 +38,7 @@ from vllm_mlx.bench_serve import (
     parse_status_response,
     run_bench_serve_workload,
     run_workload_case,
+    stream_chat_completion,
     summarize_workload_results,
     validate_quality_checks,
     validate_response,
@@ -622,6 +623,7 @@ class TestSSEParsing:
     def _make_line(self, delta_content=None, finish_reason=None, usage=None):
         """Build a synthetic SSE data line."""
         chunk: dict = {
+            "id": "chatcmpl-test",
             "choices": [
                 {
                     "delta": (
@@ -629,7 +631,7 @@ class TestSSEParsing:
                     ),
                     "finish_reason": finish_reason,
                 }
-            ]
+            ],
         }
         if usage is not None:
             chunk["usage"] = usage
@@ -639,6 +641,7 @@ class TestSSEParsing:
         line = self._make_line(delta_content="Hello")
         result = parse_sse_line(line)
         assert result is not None
+        assert result["id"] == "chatcmpl-test"
         assert result["content"] == "Hello"
         assert result["finish_reason"] is None
         assert result["usage"] is None
@@ -725,6 +728,53 @@ class TestRequestMetrics:
         )
         # Single token → no inter-token interval → TPOT = 0.0
         assert metrics["tpot_ms"] == pytest.approx(0.0)
+
+    def test_stream_chat_completion_timeout_cancels_request(self):
+        class SlowResponse:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return None
+
+            def raise_for_status(self):
+                return None
+
+            async def aiter_lines(self):
+                yield 'data: {"id":"chatcmpl-timeout","choices":[{"delta":{"content":"A"},"finish_reason":null}]}'
+                await asyncio.sleep(10)
+
+        class FakeClient:
+            def __init__(self):
+                self.cancel_urls = []
+
+            def stream(self, *args, **kwargs):
+                return SlowResponse()
+
+            async def post(self, url, **kwargs):
+                self.cancel_urls.append(url)
+
+                class Response:
+                    status_code = 200
+
+                return Response()
+
+        client = FakeClient()
+
+        with pytest.raises(TimeoutError, match="timed out"):
+            asyncio.run(
+                stream_chat_completion(
+                    client=client,
+                    base_url="http://server",
+                    messages=[{"role": "user", "content": "slow"}],
+                    model="test-model",
+                    timeout_s=0.01,
+                )
+            )
+
+        assert client.cancel_urls == [
+            "http://server/v1/requests/chatcmpl-timeout/cancel"
+        ]
 
 
 # ---------------------------------------------------------------------------
@@ -1021,6 +1071,7 @@ class TestWorkloadRunner:
             assert kwargs["max_tokens"] == 64
             assert kwargs["enable_thinking"] is True
             assert kwargs["extra_body"] == {"temperature": 0.6}
+            assert kwargs["timeout_s"] == 1.8
             return {
                 "ttft_ms": 25.0,
                 "tpot_ms": 3.0,
