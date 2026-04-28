@@ -5262,10 +5262,7 @@ async def stream_chat_completion(
                         )
                     ):
                         tool_accumulated_text += content
-                        # Suppress whitespace-only content when tools are active;
-                        # avoids emitting stray newlines before tool call XML.
-                        if not content.strip():
-                            continue
+                        # Emit as-is; no tool markup is even possible yet.
                     else:
                         if not tool_markup_possible:
                             tool_markup_possible = True
