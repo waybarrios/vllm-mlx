@@ -190,6 +190,19 @@ python examples/tts_multilingual.py "Hola mundo" --lang es --play
 vllm-mlx bench-serve --url http://localhost:8000 --concurrency 5 --prompts prompts.txt --output results.csv
 ```
 
+### Model acquisition and conversion
+
+```bash
+# Inspect repo metadata, file sizes, config, and rough fit before downloading weights
+vllm-mlx model inspect mlx-community/Llama-3.2-3B-Instruct-4bit
+
+# Acquire with resumable Hugging Face transfer and write a local artifact manifest
+vllm-mlx model acquire mlx-community/Llama-3.2-3B-Instruct-4bit --target-dir ./models/llama-3b-4bit
+
+# Wrap mlx-lm conversion and record the exact recipe in the converted artifact
+vllm-mlx model convert meta-llama/Llama-3.2-3B-Instruct --output ./models/llama-3b-mlx-q4 --quantize --q-bits 4 --q-group-size 64 --q-mode affine
+```
+
 ### Prometheus metrics
 
 ```bash

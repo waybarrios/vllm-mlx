@@ -5,6 +5,7 @@
 | Command | Description |
 |---------|-------------|
 | `vllm-mlx serve` | Start OpenAI-compatible server |
+| `vllm-mlx model` | Inspect, acquire, or convert model artifacts |
 | `vllm-mlx-bench` | Run performance benchmarks |
 | `vllm-mlx-chat` | Start Gradio chat interface |
 
@@ -136,6 +137,51 @@ Or with curl:
 ```bash
 curl http://localhost:8000/v1/models \
   -H "Authorization: Bearer your-secret-key"
+```
+
+## `vllm-mlx model`
+
+Inspect, acquire, and convert model artifacts without serving them. These
+commands are intended to make model setup auditable: inspect before download,
+download into a finalized artifact manifest, then convert through `mlx-lm` with
+the exact recipe recorded.
+
+### Usage
+
+```bash
+vllm-mlx model inspect <path-or-hf-model-id>
+vllm-mlx model acquire <hf-model-id> [--target-dir <path>]
+vllm-mlx model convert <path-or-hf-model-id> --output <path> [--quantize]
+```
+
+### Options
+
+| Command | Option | Description |
+|---------|--------|-------------|
+| `inspect` | `--revision` | Hugging Face revision to inspect |
+| `inspect` | `--local-files-only` | Inspect only local Hugging Face cache files |
+| `acquire` | `--target-dir` | Final local directory for a staged download |
+| `acquire` | `--staging-dir` | Temporary directory used before finalizing `--target-dir` |
+| `acquire` | `--mllm` | Download multimodal file patterns |
+| `acquire` | `--no-fast-transfer` | Do not set `HF_HUB_ENABLE_HF_TRANSFER=1` |
+| `convert` | `--output` | Output directory for the converted MLX model |
+| `convert` | `--quantize` | Enable `mlx-lm` quantization |
+| `convert` | `--q-bits`, `--q-group-size`, `--q-mode` | Quantization recipe |
+| `convert` | `--quant-predicate` | `mlx-lm` mixed-bit quantization recipe |
+| `convert` | `--dtype` | Dtype for non-quantized parameters |
+| `convert` | `--dry-run` | Print command and manifest without executing conversion |
+
+### Examples
+
+```bash
+vllm-mlx model inspect mlx-community/Llama-3.2-3B-Instruct-4bit
+
+vllm-mlx model acquire mlx-community/Llama-3.2-3B-Instruct-4bit \
+  --target-dir ./models/llama-3b-4bit
+
+vllm-mlx model convert meta-llama/Llama-3.2-3B-Instruct \
+  --output ./models/llama-3b-mlx-q4 \
+  --quantize --q-bits 4 --q-group-size 64 --q-mode affine
 ```
 
 ## `vllm-mlx-bench`

@@ -13,6 +13,7 @@ Usage:
 """
 
 import argparse
+import json
 import sys
 
 from .cli_arg_types import make_json_object_arg_parser
@@ -311,6 +312,59 @@ def download_command(args):
         is_mllm=args.mllm,
     )
     print(f"Model ready at: {path}")
+
+
+def model_command(args):
+    """Run model lifecycle helper commands."""
+    from .model_workflow import (
+        AcquisitionOptions,
+        ConversionOptions,
+        acquire_model,
+        convert_model,
+        inspect_model,
+    )
+
+    if args.model_command == "inspect":
+        payload = inspect_model(
+            args.model,
+            revision=args.revision,
+            local_files_only=args.local_files_only,
+        )
+    elif args.model_command == "acquire":
+        payload = acquire_model(
+            args.model,
+            options=AcquisitionOptions(
+                revision=args.revision,
+                target_dir=args.target_dir,
+                staging_dir=args.staging_dir,
+                is_mllm=args.mllm,
+                fast_transfer=not args.no_fast_transfer,
+                local_files_only=args.local_files_only,
+            ),
+        )
+    elif args.model_command == "convert":
+        payload = convert_model(
+            ConversionOptions(
+                source_path=args.source,
+                output_path=args.output,
+                quantize=args.quantize,
+                q_bits=args.q_bits,
+                q_group_size=args.q_group_size,
+                q_mode=args.q_mode,
+                quant_predicate=args.quant_predicate,
+                dtype=args.dtype,
+                trust_remote_code=args.trust_remote_code,
+                dry_run=args.dry_run,
+            )
+        )
+        if payload.get("status") == "failed":
+            print(json.dumps(payload, indent=2))
+            sys.exit(payload.get("returncode") or 1)
+            return  # unreachable, but prevents double-print if sys.exit is caught
+    else:
+        raise ValueError(f"Unsupported model command: {args.model_command}")
+
+    print(json.dumps(payload, indent=2))
 
 
 def bench_command(args):
@@ -1339,6 +1393,125 @@ Examples:
         help="Download as multimodal model (broader file patterns)",
     )
 
+    # Model lifecycle helpers
+    model_parser = subparsers.add_parser(
+        "model",
+        help="Inspect, acquire, or convert model artifacts",
+    )
+    model_subparsers = model_parser.add_subparsers(
+        dest="model_command", help="Model workflow command", required=True
+    )
+
+    model_inspect_parser = model_subparsers.add_parser(
+        "inspect",
+        help="Inspect a local path or Hugging Face model without loading weights",
+    )
+    model_inspect_parser.add_argument(
+        "model",
+        type=str,
+        help="Local model path or Hugging Face model id",
+    )
+    model_inspect_parser.add_argument(
+        "--revision",
+        type=str,
+        default=None,
+        help="Hugging Face revision to inspect",
+    )
+    model_inspect_parser.add_argument(
+        "--local-files-only",
+        action="store_true",
+        help="Use only local Hugging Face cache files",
+    )
+
+    model_acquire_parser = model_subparsers.add_parser(
+        "acquire",
+        help="Download a Hugging Face model and write an artifact manifest",
+    )
+    model_acquire_parser.add_argument("model", type=str, help="Hugging Face model id")
+    model_acquire_parser.add_argument(
+        "--revision",
+        type=str,
+        default=None,
+        help="Hugging Face revision to download",
+    )
+    model_acquire_parser.add_argument(
+        "--target-dir",
+        type=str,
+        default=None,
+        help="Final local directory. Defaults to Hugging Face cache.",
+    )
+    model_acquire_parser.add_argument(
+        "--staging-dir",
+        type=str,
+        default=None,
+        help="Directory for temporary staged downloads before finalizing target-dir",
+    )
+    model_acquire_parser.add_argument(
+        "--mllm",
+        action="store_true",
+        help="Acquire multimodal model files using broader allow patterns",
+    )
+    model_acquire_parser.add_argument(
+        "--no-fast-transfer",
+        action="store_true",
+        help="Do not set HF_HUB_ENABLE_HF_TRANSFER=1 during download",
+    )
+    model_acquire_parser.add_argument(
+        "--local-files-only",
+        action="store_true",
+        help="Use only local Hugging Face cache files",
+    )
+
+    model_convert_parser = model_subparsers.add_parser(
+        "convert",
+        help="Run mlx-lm conversion and write a conversion manifest",
+    )
+    model_convert_parser.add_argument(
+        "source",
+        type=str,
+        help="Hugging Face model id or local source path",
+    )
+    model_convert_parser.add_argument(
+        "--output",
+        required=True,
+        type=str,
+        help="Output directory for the converted MLX model",
+    )
+    model_convert_parser.add_argument(
+        "--quantize",
+        action="store_true",
+        help="Generate a quantized MLX model",
+    )
+    model_convert_parser.add_argument("--q-bits", type=int, default=None)
+    model_convert_parser.add_argument("--q-group-size", type=int, default=None)
+    model_convert_parser.add_argument(
+        "--q-mode",
+        choices=["affine", "mxfp4", "nvfp4", "mxfp8"],
+        default=None,
+    )
+    model_convert_parser.add_argument(
+        "--quant-predicate",
+        choices=["mixed_2_6", "mixed_3_4", "mixed_3_6", "mixed_4_6"],
+        default=None,
+        help="mlx-lm mixed-bit quantization recipe",
+    )
+    model_convert_parser.add_argument(
+        "--dtype",
+        choices=["float16", "bfloat16", "float32"],
+        default=None,
+        help="Non-quantized parameter dtype",
+    )
+    model_convert_parser.add_argument(
+        "--trust-remote-code",
+        action="store_true",
+        help="Allow Hugging Face remote code during mlx-lm conversion",
+    )
+    model_convert_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print the conversion command and manifest without executing",
+    )
+
     # Serving benchmark
     bench_serve_parser = subparsers.add_parser(
         "bench-serve", help="Benchmark a running vllm-mlx server via HTTP API"
@@ -1487,6 +1660,8 @@ def main():
         bench_kv_cache_command(args)
     elif args.command == "download":
         download_command(args)
+    elif args.command == "model":
+        model_command(args)
     elif args.command == "bench-serve":
         bench_serve_command(args)
     else:
