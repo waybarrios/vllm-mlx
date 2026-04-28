@@ -469,6 +469,12 @@ class MLLMScheduler:
         if request_id in self.running:
             del self.running[request_id]
 
+        # Credit in-flight tokens so dashboard metrics stay accurate
+        # (without this, aborted requests' tokens vanish from /v1/status).
+        if request.num_output_tokens > 0:
+            self.total_completion_tokens += request.num_output_tokens
+            self.total_prompt_tokens += request.num_prompt_tokens
+
         # Mark as aborted
         request.status = RequestStatus.FINISHED_ABORTED
         self.finished_req_ids.add(request_id)
