@@ -107,8 +107,10 @@ IMAGE_FACTOR = 28  # For smart resize
 # Security: File size limits (in bytes)
 MAX_IMAGE_SIZE = 20 * 1024 * 1024  # 20 MB max for images
 MAX_VIDEO_SIZE = 500 * 1024 * 1024  # 500 MB max for videos
+MAX_AUDIO_SIZE = 100 * 1024 * 1024  # 100 MB max for audio
 MAX_BASE64_IMAGE_LENGTH = 30 * 1024 * 1024  # 30 MB base64 string (~22 MB decoded)
 MAX_BASE64_VIDEO_LENGTH = 700 * 1024 * 1024  # 700 MB base64 string (~500 MB decoded)
+MAX_BASE64_AUDIO_LENGTH = 140 * 1024 * 1024  # 140 MB base64 string (~100 MB decoded)
 
 
 class FileSizeExceededError(Exception):
@@ -158,6 +160,11 @@ def is_url(s: str) -> bool:
 def is_base64_video(s: str) -> bool:
     """Check if string is base64-encoded video data."""
     return s.startswith("data:video/")
+
+
+def is_base64_audio(s: str) -> bool:
+    """Check if string is base64-encoded audio data."""
+    return s.startswith("data:audio/")
 
 
 def decode_base64_image(
@@ -355,28 +362,43 @@ def download_image(url: str, timeout: int = 30, max_size: int = MAX_IMAGE_SIZE) 
     return _temp_manager.register(temp_file.name)
 
 
-def download_video(url: str, timeout: int = 120, max_size: int = MAX_VIDEO_SIZE) -> str:
-    """
-    Download video from URL and return local path.
+_VIDEO_EXT_MAP: dict[str, str] = {
+    "mp4": ".mp4",
+    "webm": ".webm",
+    "avi": ".avi",
+    "mov": ".mov",
+    "quicktime": ".mov",
+    "mkv": ".mkv",
+}
 
-    Args:
-        url: Video URL (http/https)
-        timeout: Download timeout in seconds (default 120s for larger videos)
-        max_size: Maximum allowed file size in bytes
+_AUDIO_EXT_MAP: dict[str, str] = {
+    "wav": ".wav",
+    "mpeg": ".mp3",
+    "mp3": ".mp3",
+    "flac": ".flac",
+    "ogg": ".ogg",
+    "webm": ".webm",
+    "mp4": ".m4a",
+    "m4a": ".m4a",
+    "aac": ".m4a",
+}
 
-    Returns:
-        Local file path to downloaded video
 
-    Raises:
-        FileSizeExceededError: If video exceeds max_size
-    """
+def _download_media(
+    url: str,
+    media_type: str,
+    ext_map: dict[str, str],
+    default_ext: str,
+    timeout: int,
+    max_size: int,
+) -> str:
+    """Download media from URL, enforce size limits, and return a local temp path."""
     headers = {
         "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
     }
 
-    logger.info(f"Downloading video from: {url}")
+    logger.info(f"Downloading {media_type} from: {url}")
 
-    # First, make a HEAD request to check Content-Length
     try:
         head_response = _request_with_safe_redirects(
             "HEAD", url, timeout=timeout, headers=headers
@@ -384,11 +406,10 @@ def download_video(url: str, timeout: int = 120, max_size: int = MAX_VIDEO_SIZE)
         content_length = head_response.headers.get("content-length")
         if content_length and int(content_length) > max_size:
             raise FileSizeExceededError(
-                f"Video at {url} exceeds maximum size: {int(content_length) / 1024 / 1024:.1f} MB > "
-                f"{max_size / 1024 / 1024:.1f} MB limit"
+                f"{media_type.capitalize()} at {url} exceeds maximum size: "
+                f"{int(content_length) / 1024 / 1024:.1f} MB > {max_size / 1024 / 1024:.1f} MB limit"
             )
     except requests.RequestException:
-        # HEAD request failed, proceed with GET and check during download
         pass
 
     response = _request_with_safe_redirects(
@@ -396,32 +417,24 @@ def download_video(url: str, timeout: int = 120, max_size: int = MAX_VIDEO_SIZE)
     )
     response.raise_for_status()
 
-    # Check Content-Length header from GET response
     content_length = response.headers.get("content-length")
     if content_length and int(content_length) > max_size:
         raise FileSizeExceededError(
-            f"Video at {url} exceeds maximum size: {int(content_length) / 1024 / 1024:.1f} MB > "
-            f"{max_size / 1024 / 1024:.1f} MB limit"
+            f"{media_type.capitalize()} at {url} exceeds maximum size: "
+            f"{int(content_length) / 1024 / 1024:.1f} MB > {max_size / 1024 / 1024:.1f} MB limit"
         )
 
-    # Determine extension from content type or URL
-    content_type = response.headers.get("content-type", "")
-    if "mp4" in content_type:
-        ext = ".mp4"
-    elif "webm" in content_type:
-        ext = ".webm"
-    elif "avi" in content_type:
-        ext = ".avi"
-    elif "mov" in content_type or "quicktime" in content_type:
-        ext = ".mov"
-    elif "mkv" in content_type:
-        ext = ".mkv"
+    content_type = response.headers.get("content-type", "").lower()
+    ext = default_ext
+    for key, mapped_ext in ext_map.items():
+        if key in content_type:
+            ext = mapped_ext
+            break
     else:
-        # Try to get from URL
-        path = urlparse(response.url).path
-        ext = Path(path).suffix or ".mp4"
+        path_ext = Path(urlparse(response.url).path).suffix
+        if path_ext:
+            ext = path_ext
 
-    # Save to temp file (stream for larger files) with size checking
     temp_file = tempfile.NamedTemporaryFile(suffix=ext, delete=False)
     downloaded_size = 0
     try:
@@ -431,7 +444,7 @@ def download_video(url: str, timeout: int = 120, max_size: int = MAX_VIDEO_SIZE)
                 temp_file.close()
                 os.unlink(temp_file.name)
                 raise FileSizeExceededError(
-                    f"Video at {url} exceeds maximum size during download: "
+                    f"{media_type.capitalize()} at {url} exceeds maximum size during download: "
                     f"{downloaded_size / 1024 / 1024:.1f} MB > {max_size / 1024 / 1024:.1f} MB limit"
                 )
             temp_file.write(chunk)
@@ -446,10 +459,20 @@ def download_video(url: str, timeout: int = 120, max_size: int = MAX_VIDEO_SIZE)
 
     file_size = Path(temp_file.name).stat().st_size
     logger.info(
-        f"Video downloaded: {temp_file.name} ({file_size / 1024 / 1024:.1f} MB)"
+        f"{media_type.capitalize()} downloaded: {temp_file.name} ({file_size / 1024 / 1024:.1f} MB)"
     )
 
     return _temp_manager.register(temp_file.name)
+
+
+def download_video(url: str, timeout: int = 120, max_size: int = MAX_VIDEO_SIZE) -> str:
+    """Download video from URL and return local path."""
+    return _download_media(url, "video", _VIDEO_EXT_MAP, ".mp4", timeout, max_size)
+
+
+def download_audio(url: str, timeout: int = 120, max_size: int = MAX_AUDIO_SIZE) -> str:
+    """Download audio from URL and return local path."""
+    return _download_media(url, "audio", _AUDIO_EXT_MAP, ".wav", timeout, max_size)
 
 
 def decode_base64_video(
@@ -501,6 +524,35 @@ def decode_base64_video(
     return _temp_manager.register(temp_file.name)
 
 
+def decode_base64_audio(
+    base64_string: str, max_length: int = MAX_BASE64_AUDIO_LENGTH
+) -> str:
+    """
+    Decode base64 audio to temp file and return path.
+
+    Supports format: data:audio/wav;base64,AAAA...
+    """
+    if len(base64_string) > max_length:
+        raise FileSizeExceededError(
+            f"Base64 audio data exceeds maximum size: {len(base64_string) / 1024 / 1024:.1f} MB > "
+            f"{max_length / 1024 / 1024:.1f} MB limit"
+        )
+
+    if base64_string.startswith("data:audio/"):
+        header, data = base64_string.split(",", 1)
+        format_part = header.split(";")[0]
+        ext = "." + format_part.split("/")[-1]
+    else:
+        data = base64_string
+        ext = ".wav"
+
+    audio_bytes = base64.b64decode(data)
+    temp_file = tempfile.NamedTemporaryFile(suffix=ext, delete=False)
+    temp_file.write(audio_bytes)
+    temp_file.close()
+    return _temp_manager.register(temp_file.name)
+
+
 def process_video_input(video: str | dict) -> str:
     """
     Process video input in various formats and return local path.
@@ -537,6 +589,37 @@ def process_video_input(video: str | dict) -> str:
     raise ValueError(
         "Unsupported video input. Only http(s) URLs and data:video base64 payloads are allowed."
     )
+
+
+def process_audio_input(audio: str | dict) -> str:
+    """
+    Process audio input in various formats and return local path.
+
+    Supports:
+    - Local file path
+    - URL (http/https)
+    - Base64 encoded string (data:audio/wav;base64,...)
+    - OpenAI format dict: {"url": "..."} or {"audio_url": {"url": "..."}}
+    """
+    if isinstance(audio, dict):
+        url = audio.get("url", audio.get("audio_url", ""))
+        if isinstance(url, dict):
+            url = url.get("url", "")
+        audio = url
+
+    if not audio:
+        raise ValueError("Empty audio input")
+
+    if is_base64_audio(audio):
+        return decode_base64_audio(audio)
+
+    if is_url(audio):
+        return download_audio(audio)
+
+    if len(audio) < 4096 and Path(audio).exists():
+        return audio
+
+    raise ValueError(f"Cannot process audio: {audio[:50]}...")
 
 
 # Cache for base64 images to avoid re-saving the same image
@@ -850,6 +933,17 @@ class MLXMultimodalLM:
                 logger.warning(f"Failed to process image: {e}")
         return processed
 
+    def _prepare_audio(self, audio_inputs: list) -> list[str]:
+        """Process audio inputs and return local file paths."""
+        processed = []
+        for audio_input in audio_inputs:
+            try:
+                path = process_audio_input(audio_input)
+                processed.append(path)
+            except Exception as e:
+                logger.warning(f"Failed to process audio: {e}")
+        return processed
+
     def _prepare_video(
         self,
         video_input: str | dict,
@@ -916,6 +1010,37 @@ class MLXMultimodalLM:
                         if url:
                             video_inputs.setdefault(msg_idx, []).append(url)
         return video_inputs
+
+    def _collect_audio_inputs(self, messages: list[dict]) -> dict[int, list]:
+        """Collect audio inputs from messages, keyed by message index."""
+        audio_inputs: dict[int, list] = {}
+        for msg_idx, msg in enumerate(messages):
+            content = msg.get("content", "")
+            if not isinstance(content, list):
+                continue
+            for item in content:
+                if hasattr(item, "model_dump"):
+                    item = item.model_dump(exclude_none=True)
+                elif hasattr(item, "dict"):
+                    item = {k: v for k, v in item.dict().items() if v is not None}
+
+                if not isinstance(item, dict):
+                    continue
+
+                item_type = item.get("type", "")
+                if item_type == "audio":
+                    audio_value = item.get("audio", item.get("url", ""))
+                    if audio_value:
+                        audio_inputs.setdefault(msg_idx, []).append(audio_value)
+                elif item_type == "audio_url":
+                    audio_url = item.get("audio_url", {})
+                    if isinstance(audio_url, str):
+                        audio_inputs.setdefault(msg_idx, []).append(audio_url)
+                    elif isinstance(audio_url, dict):
+                        url = audio_url.get("url", "")
+                        if url:
+                            audio_inputs.setdefault(msg_idx, []).append(url)
+        return audio_inputs
 
     def _prepare_native_video_inputs(
         self,
@@ -1190,8 +1315,9 @@ class MLXMultimodalLM:
         videos = videos or []
         audio = audio or []
 
-        # Process all images (including frames from videos)
+        # Process all images (including frames from videos) and audio inputs
         all_images = []
+        all_audio = []
         all_sources = []  # Track original sources for cache key
 
         # Process image inputs
@@ -1214,14 +1340,18 @@ class MLXMultimodalLM:
             )
             logger.info(f"Added {len(frames)} frames from video: {video_path}")
 
+        if audio:
+            all_audio.extend(self._prepare_audio(audio))
+
         # Apply chat template if needed
-        if all_images and hasattr(self.processor, "apply_chat_template"):
+        if (all_images or all_audio) and hasattr(self.processor, "apply_chat_template"):
             try:
                 formatted_prompt = apply_chat_template(
                     self.processor,
                     self.config,
                     prompt,
                     num_images=len(all_images),
+                    num_audios=len(all_audio),
                 )
             except Exception:
                 formatted_prompt = prompt
@@ -1231,6 +1361,10 @@ class MLXMultimodalLM:
         # Check cache for existing KV state
         prompt_cache = None
         cache_hit = False
+
+        if use_cache and all_audio:
+            logger.info("MLLM cache disabled for audio inputs")
+            use_cache = False
 
         if use_cache and self._cache_manager is not None and all_sources:
             prompt_cache, cache_hit = self._cache_manager.fetch_cache(
@@ -1255,6 +1389,7 @@ class MLXMultimodalLM:
             self.processor,
             formatted_prompt,
             all_images if all_images else None,
+            audio=all_audio if all_audio else None,
             max_tokens=max_tokens,
             temp=temperature,
             top_p=top_p,
@@ -1297,6 +1432,7 @@ class MLXMultimodalLM:
         prompt: str,
         images: list | None = None,
         videos: list[str] | None = None,
+        audio: list[str] | None = None,
         max_tokens: int = 256,
         temperature: float = 0.7,
         video_fps: float = DEFAULT_FPS,
@@ -1309,6 +1445,7 @@ class MLXMultimodalLM:
             prompt: Text prompt
             images: List of image inputs
             videos: List of video paths
+            audio: List of audio inputs
             max_tokens: Maximum tokens to generate
             temperature: Sampling temperature
             video_fps: FPS for video frame extraction
@@ -1329,6 +1466,7 @@ class MLXMultimodalLM:
                 prompt=prompt,
                 images=images,
                 videos=videos,
+                audio=audio,
                 max_tokens=max_tokens,
                 temperature=temperature,
                 video_fps=video_fps,
@@ -1339,23 +1477,28 @@ class MLXMultimodalLM:
 
         images = images or []
         videos = videos or []
+        audio = audio or []
 
         # Process images
         all_images = []
+        all_audio = []
         if images:
             all_images.extend(self._prepare_images(images))
         for video_path in videos:
             frames = self._prepare_video(video_path, fps=video_fps)
             all_images.extend(frames)
+        if audio:
+            all_audio.extend(self._prepare_audio(audio))
 
         # Apply chat template
-        if all_images:
+        if all_images or all_audio:
             try:
                 formatted_prompt = apply_chat_template(
                     self.processor,
                     self.config,
                     prompt,
                     num_images=len(all_images),
+                    num_audios=len(all_audio),
                 )
             except Exception:
                 formatted_prompt = prompt
@@ -1367,6 +1510,7 @@ class MLXMultimodalLM:
             self.processor,
             formatted_prompt,
             all_images if all_images else None,
+            audio=all_audio if all_audio else None,
             max_tokens=max_tokens,
             temp=temperature,
             **kwargs,
@@ -1406,7 +1550,6 @@ class MLXMultimodalLM:
         # Extract text, images and audio from messages
         # Build chat_messages for multi-turn support WITH proper image/audio tokens per message
         all_image_urls = []  # Raw URLs/paths to process later
-        all_audio_urls = []  # Raw audio URLs/paths to process later
         chat_messages = []  # List of properly formatted messages for chat template
 
         logger.info(f"MLLM.chat() called with {len(messages)} messages")
@@ -1418,8 +1561,9 @@ class MLXMultimodalLM:
         use_cache = kwargs.pop("use_cache", True)
         enable_thinking = kwargs.pop("enable_thinking", True)
 
-        # Collect video inputs from messages
+        # Collect video and audio inputs from messages
         _msg_video_inputs = self._collect_video_inputs(messages)
+        _msg_audio_inputs = self._collect_audio_inputs(messages)
 
         # Use native video pipeline for supported models
         if self._video_native and _msg_video_inputs:
@@ -1436,6 +1580,7 @@ class MLXMultimodalLM:
         # Fallback: extract frames and treat as individual images
         _msg_video_frame_counts: dict[int, int] = {}
         all_video_frames: list[str] = []
+        all_audio_inputs: list[str] = []
         for msg_idx, vid_inputs in _msg_video_inputs.items():
             total_frames = 0
             for vid_input in vid_inputs:
@@ -1447,12 +1592,16 @@ class MLXMultimodalLM:
                 logger.info(f"Added {len(frames)} frames from video: {vid_input}")
             _msg_video_frame_counts[msg_idx] = total_frames
 
+        for aud_inputs in _msg_audio_inputs.values():
+            all_audio_inputs.extend(aud_inputs)
+
         # Second pass: build chat messages with image counts that include video frames
         for msg_idx, msg in enumerate(messages):
             role = msg.get("role", "user")
             content = msg.get("content", "")
             msg_text = ""  # Text content for this message
             msg_image_count = 0  # Number of images in THIS message
+            msg_audio_count = 0  # Number of audio clips in THIS message
 
             if isinstance(content, str):
                 msg_text = content
@@ -1490,16 +1639,9 @@ class MLXMultimodalLM:
                             )
                             msg_image_count += 1
 
-                        elif item_type == "audio_url":
-                            aud_url = item.get("audio_url", {})
-                            if isinstance(aud_url, str):
-                                all_audio_urls.append(aud_url)
-                            else:
-                                all_audio_urls.append(aud_url.get("url", ""))
-
             # Add video frame count to image count for this message
             msg_image_count += _msg_video_frame_counts.get(msg_idx, 0)
-            msg_audio_count = len(all_audio_urls)
+            msg_audio_count += len(_msg_audio_inputs.get(msg_idx, []))
 
             # Build properly structured message
             # Format: {"role": "...", "content": [{"type": "image"}, ..., {"type": "audio"}, ..., {"type": "text", "text": "..."}]}
@@ -1535,10 +1677,11 @@ class MLXMultimodalLM:
             all_images.extend(self._prepare_images(all_image_urls))
         # Append pre-processed video frames
         all_images.extend(all_video_frames)
+        all_audio = self._prepare_audio(all_audio_inputs) if all_audio_inputs else []
 
         # Apply chat template directly - messages are already properly structured
         logger.info(
-            f"Applying chat template with {len(chat_messages)} messages, {len(all_images)} images, {len(all_audio_urls)} audios"
+            f"Applying chat template with {len(chat_messages)} messages, {len(all_images)} images, {len(all_audio)} audios"
         )
         for i, cm in enumerate(chat_messages):
             content_preview = str(cm.get("content", ""))[:80]
@@ -1598,6 +1741,10 @@ class MLXMultimodalLM:
         token_ids = tokenizer.encode(formatted_prompt)
 
         # Check prefix cache
+        if use_cache and all_audio:
+            logger.info("Prefix cache disabled for audio inputs")
+            use_cache = False
+
         if use_cache and self._cache_manager is not None and all_images:
             try:
                 cache_entry, prefix_match_len = self._cache_manager.fetch(
@@ -1684,7 +1831,7 @@ class MLXMultimodalLM:
             self.processor,
             formatted_prompt,
             all_images if all_images else None,
-            audio=all_audio_urls if all_audio_urls else None,
+            audio=all_audio if all_audio else None,
             max_tokens=max_tokens,
             temp=temperature,
             verbose=False,
@@ -1829,8 +1976,9 @@ class MLXMultimodalLM:
         use_cache = kwargs.pop("use_cache", True)
         enable_thinking = kwargs.pop("enable_thinking", True)
 
-        # Collect video inputs from messages
+        # Collect video and audio inputs from messages
         _msg_video_inputs = self._collect_video_inputs(messages)
+        _msg_audio_inputs = self._collect_audio_inputs(messages)
 
         # Use native video pipeline for supported models.
         # NOTE: Native video yields a single chunk (not incremental streaming)
@@ -1854,6 +2002,7 @@ class MLXMultimodalLM:
         # Fallback: frames as images
         _msg_video_frame_counts: dict[int, int] = {}
         all_video_frames: list[str] = []
+        all_audio_inputs: list[str] = []
         for msg_idx, vid_inputs in _msg_video_inputs.items():
             total_frames = 0
             for vid_input in vid_inputs:
@@ -1865,11 +2014,15 @@ class MLXMultimodalLM:
                 logger.info(f"Added {len(frames)} frames from video: {vid_input}")
             _msg_video_frame_counts[msg_idx] = total_frames
 
+        for aud_inputs in _msg_audio_inputs.values():
+            all_audio_inputs.extend(aud_inputs)
+
         for msg_idx, msg in enumerate(messages):
             role = msg.get("role", "user")
             content = msg.get("content", "")
             msg_text = ""
             msg_image_count = 0
+            msg_audio_count = 0
 
             if isinstance(content, str):
                 msg_text = content
@@ -1905,12 +2058,14 @@ class MLXMultimodalLM:
                             msg_image_count += 1
 
             msg_image_count += _msg_video_frame_counts.get(msg_idx, 0)
-
-            if msg_text or msg_image_count > 0:
-                if role == "user" and msg_image_count > 0:
+            msg_audio_count += len(_msg_audio_inputs.get(msg_idx, []))
+            if msg_text or msg_image_count > 0 or msg_audio_count > 0:
+                if role == "user" and (msg_image_count > 0 or msg_audio_count > 0):
                     content_list = []
                     for _ in range(msg_image_count):
                         content_list.append({"type": "image"})
+                    for _ in range(msg_audio_count):
+                        content_list.append({"type": "audio"})
                     content_list.append(
                         {"type": "text", "text": msg_text, "content": msg_text}
                     )
@@ -1931,6 +2086,7 @@ class MLXMultimodalLM:
         if all_image_urls:
             all_images.extend(self._prepare_images(all_image_urls))
         all_images.extend(all_video_frames)
+        all_audio = self._prepare_audio(all_audio_inputs) if all_audio_inputs else []
 
         # Build template kwargs for tool definitions (tools already popped above)
         template_extra_kwargs = {}
@@ -1970,6 +2126,10 @@ class MLXMultimodalLM:
         prompt_cache = None
         cache_hit = False
 
+        if use_cache and all_audio:
+            logger.info("Stream chat cache disabled for audio inputs")
+            use_cache = False
+
         if use_cache and self._cache_manager is not None and all_images:
             prompt_cache, cache_hit = self._cache_manager.fetch_cache(
                 all_images, formatted_prompt
@@ -1996,6 +2156,7 @@ class MLXMultimodalLM:
             self.processor,
             formatted_prompt,
             all_images if all_images else None,
+            audio=all_audio if all_audio else None,
             max_tokens=max_tokens,
             temp=temperature,
             prompt_cache=prompt_cache,

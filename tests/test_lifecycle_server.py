@@ -657,7 +657,7 @@ class TestLifecycleFailureHandling:
             calls["releases"] += 1
 
         def fake_extract(messages, preserve_native_format):
-            return ([{"role": "user", "content": "hi"}], [], [])
+            return ([{"role": "user", "content": "hi"}], [], [], [])
 
         def fake_convert_tools(_tools):
             raise RuntimeError("boom")
@@ -2492,7 +2492,7 @@ class TestLifecycleFailureHandling:
                 return False
 
         def fake_extract(messages, preserve_native_format):
-            return ([{"role": "user", "content": "hi"}], [], [])
+            return ([{"role": "user", "content": "hi"}], [], [], [])
 
         async def fake_engine_factory(spec):
             return FakeEngine()

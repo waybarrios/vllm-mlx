@@ -32,13 +32,14 @@ logger = logging.getLogger(__name__)
 
 def _extract_media_from_messages(messages: list[dict[str, Any]]) -> tuple:
     """
-    Extract images and videos from OpenAI-format messages.
+    Extract images, videos, and audio from OpenAI-format messages.
 
     Returns:
-        Tuple of (has_media, images_list, videos_list)
+        Tuple of (has_media, images_list, videos_list, audios_list)
     """
     images = []
     videos = []
+    audios = []
 
     for msg in messages:
         content = msg.get("content")
@@ -85,8 +86,22 @@ def _extract_media_from_messages(messages: list[dict[str, Any]]) -> tuple:
                 if vid:
                     videos.append(vid)
 
-    has_media = bool(images or videos)
-    return has_media, images, videos
+            elif item_type == "audio_url":
+                audio_url = item.get("audio_url", {})
+                if isinstance(audio_url, str):
+                    audios.append(audio_url)
+                elif isinstance(audio_url, dict):
+                    url = audio_url.get("url", "")
+                    if url:
+                        audios.append(url)
+
+            elif item_type == "audio":
+                audio = item.get("audio") or item.get("url", "")
+                if audio:
+                    audios.append(audio)
+
+    has_media = bool(images or videos or audios)
+    return has_media, images, videos, audios
 
 
 class MLLMModelWrapper:
@@ -525,6 +540,7 @@ class BatchedEngine(BaseEngine):
         messages: list[dict[str, Any]],
         tools: list[dict] | None = None,
         num_images: int = 0,
+        num_audios: int = 0,
         chat_template_kwargs: dict[str, Any] | None = None,
         enable_thinking: bool | None = None,
     ) -> str:
@@ -552,7 +568,7 @@ class BatchedEngine(BaseEngine):
         if template_applicator is not None:
             # Convert OpenAI image_url content parts to HuggingFace format
             # so the processor can insert the correct vision placeholder tokens.
-            if self._is_mllm and num_images > 0:
+            if self._is_mllm and (num_images > 0 or num_audios > 0):
                 messages = self._prepare_mllm_messages(messages)
 
             # Per-request enable_thinking override; default: True unless coder model.
@@ -611,18 +627,20 @@ class BatchedEngine(BaseEngine):
     def _prepare_mllm_messages(
         messages: list[dict[str, Any]],
     ) -> list[dict[str, Any]]:
-        """Convert OpenAI-style image_url content to HuggingFace format.
+        """Convert OpenAI-style multimodal content to HuggingFace format.
 
         The OpenAI API uses ``{"type": "image_url", "image_url": {"url": ...}}``
-        while HuggingFace processors expect ``{"type": "image"}``.
+        and ``{"type": "audio_url", "audio_url": {"url": ...}}`` while
+        HuggingFace processors expect ``{"type": "image"}`` / ``{"type": "audio"}``.
 
         Args:
             messages: List of chat messages in OpenAI format. Each message is a
                 dict with at least ``role`` and ``content`` keys.
 
         Returns:
-            A new list of messages with ``image_url`` parts replaced by
-            ``{"type": "image"}`` entries for the HuggingFace processor.
+            A new list of messages with ``image_url`` / ``audio_url`` parts
+            replaced by ``{"type": "image"}`` / ``{"type": "audio"}`` entries
+            for the HuggingFace processor.
         """
         prepared = []
         for msg in messages:
@@ -634,6 +652,8 @@ class BatchedEngine(BaseEngine):
                 for part in content:
                     if isinstance(part, dict) and part.get("type") == "image_url":
                         new_content.append({"type": "image"})
+                    elif isinstance(part, dict) and part.get("type") == "audio_url":
+                        new_content.append({"type": "audio"})
                     elif isinstance(part, (dict | str)):
                         new_content.append(part)
                     # skip non-dict/non-str parts to avoid passing unexpected types
@@ -651,6 +671,7 @@ class BatchedEngine(BaseEngine):
         stop: list[str] | None = None,
         images: list[str] | None = None,
         videos: list[str] | None = None,
+        audio: list[str] | None = None,
         **kwargs,
     ) -> GenerationOutput:
         """
@@ -664,6 +685,7 @@ class BatchedEngine(BaseEngine):
             stop: Stop sequences
             images: Optional image URLs/paths (for MLLM)
             videos: Optional video URLs/paths (for MLLM)
+            audio: Optional audio URLs/paths (for MLLM)
             **kwargs: Additional model-specific parameters
 
         Returns:
@@ -680,6 +702,7 @@ class BatchedEngine(BaseEngine):
                 prompt=prompt,
                 images=images,
                 videos=videos,
+                audio=audio,
                 max_tokens=max_tokens,
                 temperature=temperature,
                 top_p=top_p,
@@ -737,6 +760,7 @@ class BatchedEngine(BaseEngine):
         stop: list[str] | None = None,
         images: list[str] | None = None,
         videos: list[str] | None = None,
+        audio: list[str] | None = None,
         **kwargs,
     ) -> AsyncIterator[GenerationOutput]:
         """
@@ -750,6 +774,7 @@ class BatchedEngine(BaseEngine):
             stop: Stop sequences
             images: Optional image URLs/paths (for MLLM)
             videos: Optional video URLs/paths (for MLLM)
+            audio: Optional audio URLs/paths (for MLLM)
             **kwargs: Additional model-specific parameters
 
         Yields:
@@ -764,6 +789,7 @@ class BatchedEngine(BaseEngine):
                 prompt=prompt,
                 images=images,
                 videos=videos,
+                audio=audio,
                 max_tokens=max_tokens,
                 temperature=temperature,
                 top_p=top_p,
@@ -853,11 +879,14 @@ class BatchedEngine(BaseEngine):
         if not self._loaded:
             await self.start()
 
-        # Extract images/videos from messages (OpenAI multimodal format)
+        # Extract images/videos/audio from messages (OpenAI multimodal format)
         # Note: We only use extracted media here, messages are already processed by server
-        _, extracted_images, extracted_videos = extract_multimodal_content(messages)
+        _, extracted_images, extracted_videos, extracted_audios = (
+            extract_multimodal_content(messages)
+        )
         all_images = (images or []) + extracted_images
         all_videos = (videos or []) + extracted_videos
+        all_audios = extracted_audios
 
         # Convert tools for template
         template_tools = convert_tools_for_template(tools) if tools else None
@@ -871,6 +900,7 @@ class BatchedEngine(BaseEngine):
             messages,
             template_tools,
             num_images=len(all_images),
+            num_audios=len(all_audios),
             chat_template_kwargs=chat_template_kwargs,
             enable_thinking=enable_thinking,
         )
@@ -882,6 +912,7 @@ class BatchedEngine(BaseEngine):
             top_p=top_p,
             images=all_images if all_images else None,
             videos=all_videos if all_videos else None,
+            audio=all_audios if all_audios else None,
             **kwargs,
         )
 
@@ -981,11 +1012,14 @@ class BatchedEngine(BaseEngine):
         if not self._loaded:
             await self.start()
 
-        # Extract images/videos from messages (OpenAI multimodal format)
+        # Extract images/videos/audio from messages (OpenAI multimodal format)
         # Note: We only use extracted media here, messages are already processed by server
-        _, extracted_images, extracted_videos = extract_multimodal_content(messages)
+        _, extracted_images, extracted_videos, extracted_audios = (
+            extract_multimodal_content(messages)
+        )
         all_images = (images or []) + extracted_images
         all_videos = (videos or []) + extracted_videos
+        all_audios = extracted_audios
 
         # Convert tools for template
         template_tools = convert_tools_for_template(tools) if tools else None
@@ -999,6 +1033,7 @@ class BatchedEngine(BaseEngine):
             messages,
             template_tools,
             num_images=len(all_images),
+            num_audios=len(all_audios),
             chat_template_kwargs=chat_template_kwargs,
             enable_thinking=enable_thinking,
         )
@@ -1019,6 +1054,7 @@ class BatchedEngine(BaseEngine):
             top_p=top_p,
             images=all_images if all_images else None,
             videos=all_videos if all_videos else None,
+            audio=all_audios if all_audios else None,
             **kwargs,
         ):
             yield output

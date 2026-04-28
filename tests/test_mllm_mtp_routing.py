@@ -132,6 +132,27 @@ def test_has_media_content_text_list():
     assert _has_media_content(messages) is False
 
 
+def test_batched_prepare_mllm_messages_converts_audio_url():
+    from vllm_mlx.engine.batched import BatchedEngine
+
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "audio_url",
+                    "audio_url": {"url": "data:audio/wav;base64,..."},
+                },
+                {"type": "text", "text": "Transcribe this"},
+            ],
+        }
+    ]
+
+    prepared = BatchedEngine._prepare_mllm_messages(messages)
+    assert prepared[0]["content"][0] == {"type": "audio"}
+    assert prepared[0]["content"][1]["type"] == "text"
+
+
 def test_has_media_content_with_message_models():
     """Pydantic message models should follow the attribute-based content path."""
     from vllm_mlx.api.models import ContentPart, Message, VideoUrl

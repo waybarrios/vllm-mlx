@@ -113,6 +113,7 @@ class MLLMBatchRequest:
     prompt: str  # Text prompt
     images: Optional[List[str]] = None  # Image paths/URLs/base64
     videos: Optional[List[str]] = None  # Video inputs
+    audio: Optional[List[str]] = None  # Audio inputs
     max_tokens: int = 256
     temperature: float = 0.7
     top_p: float = 0.9
@@ -733,8 +734,8 @@ class MLLMBatchGenerator:
         self.unprocessed_requests = sorted(
             self.unprocessed_requests,
             key=lambda x: (
-                0 if not x.images and not x.videos else 1,
-                len(x.images or []) + len(x.videos or []),
+                0 if not x.images and not x.videos and not x.audio else 1,
+                len(x.images or []) + len(x.videos or []) + len(x.audio or []),
             ),
         )
 
@@ -782,17 +783,23 @@ class MLLMBatchGenerator:
         """
         # Already preprocessed (e.g. by early executor offloading in
         # _process_loop or chunked prefill interleaving).  Only skip for
-        # text-only requests; vision requests need pixel cache lookup even
-        # if input_ids was set.
-        if request.input_ids is not None and not request.images and not request.videos:
+        # text-only requests; media requests need pixel/audio cache lookup
+        # even if input_ids was set.
+        if (
+            request.input_ids is not None
+            and not request.images
+            and not request.videos
+            and not request.audio
+        ):
             return
 
         from mlx_vlm.utils import prepare_inputs
 
         tic = time.perf_counter()
 
-        # Collect all images (including video frames)
+        # Collect all images (including video frames) and audio inputs
         all_images = []
+        all_audio = []
 
         if request.images:
             from .models.mllm import process_image_input
@@ -826,8 +833,22 @@ class MLLMBatchGenerator:
                 except Exception as e:
                     logger.warning(f"Failed to process video: {e}")
 
+        if request.audio:
+            from .models.mllm import process_audio_input
+
+            for audio in request.audio:
+                try:
+                    path = process_audio_input(audio)
+                    all_audio.append(path)
+                except Exception as e:
+                    logger.warning(f"Failed to process audio: {e}")
+
         # Check pixel cache first
-        cached_pixels = self.vision_cache.get_pixel_cache(all_images, request.prompt)
+        cached_pixels = None
+        if not all_audio:
+            cached_pixels = self.vision_cache.get_pixel_cache(
+                all_images, request.prompt
+            )
         if cached_pixels is not None:
             # Cache hit - use cached pixel values
             request.input_ids = cached_pixels.input_ids
@@ -853,6 +874,7 @@ class MLLMBatchGenerator:
         inputs = prepare_inputs(
             self.processor,
             images=all_images if all_images else None,
+            audio=all_audio if all_audio else None,
             prompts=request.prompt,
             image_token_index=image_token_index,
         )
@@ -872,7 +894,7 @@ class MLLMBatchGenerator:
         processing_time = time.perf_counter() - tic
 
         # Store in pixel cache for future reuse
-        if all_images and request.pixel_values is not None:
+        if all_images and not all_audio and request.pixel_values is not None:
             self.vision_cache.set_pixel_cache(
                 images=all_images,
                 prompt=request.prompt,
@@ -888,11 +910,12 @@ class MLLMBatchGenerator:
         self._stats.vision_encoding_time += processing_time
 
         # Mark text-only requests (eligible for prefix cache)
-        request.is_text_only = not bool(all_images)
+        request.is_text_only = not bool(all_images or all_audio)
 
         logger.debug(
             f"Preprocessed request {request.request_id}: "
-            f"{len(all_images)} images, {request.input_ids.size if request.input_ids is not None else 0} tokens "
+            f"{len(all_images)} images, {len(all_audio)} audio clips, "
+            f"{request.input_ids.size if request.input_ids is not None else 0} tokens "
             f"({processing_time:.2f}s)"
         )
 

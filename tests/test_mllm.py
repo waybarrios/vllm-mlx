@@ -89,6 +89,20 @@ def test_video_path(tmp_path):
         return str(path)
 
 
+@pytest.fixture
+def test_audio_path(tmp_path):
+    """Create a small local WAV file for audio input tests."""
+    import wave
+
+    path = tmp_path / "test_audio.wav"
+    with wave.open(str(path), "wb") as wav_file:
+        wav_file.setnchannels(1)
+        wav_file.setsampwidth(2)
+        wav_file.setframerate(16000)
+        wav_file.writeframes(b"\x00\x00" * 1600)
+    return str(path)
+
+
 # =============================================================================
 # Unit Tests - No Model Loading Required
 # =============================================================================
@@ -114,6 +128,15 @@ class TestMLLMHelperFunctions:
         assert is_base64_video("data:video/webm;base64,AAAA")
         assert not is_base64_video("https://example.com/video.mp4")
         assert not is_base64_video("/path/to/video.mp4")
+
+    def test_is_base64_audio(self):
+        """Test base64 audio detection."""
+        from vllm_mlx.models.mllm import is_base64_audio
+
+        assert is_base64_audio("data:audio/wav;base64,AAAA")
+        assert is_base64_audio("data:audio/mp3;base64,AAAA")
+        assert not is_base64_audio("https://example.com/audio.wav")
+        assert not is_base64_audio("/path/to/audio.wav")
 
     def test_is_url(self):
         """Test URL detection."""
@@ -313,6 +336,58 @@ class TestVideoProcessing:
 
         with pytest.raises(mllm.UnsafeRemoteURLError):
             mllm.download_video("http://127.0.0.1/internal.mp4")
+
+
+class TestAudioProcessing:
+    """Test audio processing functions."""
+
+    def test_process_audio_input_local_file(self, test_audio_path):
+        """Test processing local audio file."""
+        from vllm_mlx.models.mllm import process_audio_input
+
+        result = process_audio_input(test_audio_path)
+        assert result == test_audio_path
+
+    def test_process_audio_input_dict_format(self, test_audio_path):
+        """Test processing audio in dict format."""
+        from pathlib import Path
+
+        from vllm_mlx.models.mllm import process_audio_input
+
+        result = process_audio_input({"url": test_audio_path})
+        assert Path(result).exists()
+
+    def test_collect_audio_inputs(self):
+        """Audio items should be extracted and keyed by message index."""
+        from vllm_mlx.models.mllm import MLXMultimodalLM
+
+        model = MLXMultimodalLM.__new__(MLXMultimodalLM)
+        model._loaded = False
+        model._video_native = False
+
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "audio_url",
+                        "audio_url": {"url": "https://example.com/a.wav"},
+                    },
+                    {"type": "text", "text": "Transcribe this"},
+                ],
+            },
+            {
+                "role": "user",
+                "content": [
+                    {"type": "audio", "audio": "/tmp/b.wav"},
+                    {"type": "text", "text": "And this"},
+                ],
+            },
+        ]
+
+        result = model._collect_audio_inputs(messages)
+        assert result[0] == ["https://example.com/a.wav"]
+        assert result[1] == ["/tmp/b.wav"]
 
 
 # =============================================================================

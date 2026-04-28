@@ -125,7 +125,9 @@ class TestExtractMultimodalContentNativeFormat:
 
     def test_default_converts_to_text(self, messages_with_tool_calls):
         """Default behavior converts tool messages to text format."""
-        processed, images, videos = extract_multimodal_content(messages_with_tool_calls)
+        processed, images, videos, audios = extract_multimodal_content(
+            messages_with_tool_calls
+        )
 
         assert len(processed) == 4
 
@@ -146,10 +148,13 @@ class TestExtractMultimodalContentNativeFormat:
         # Final user message unchanged
         assert processed[3]["role"] == "user"
         assert processed[3]["content"] == "Thanks!"
+        assert images == []
+        assert videos == []
+        assert audios == []
 
     def test_preserve_native_format_true(self, messages_with_tool_calls):
         """preserve_native_format=True keeps native tool format."""
-        processed, images, videos = extract_multimodal_content(
+        processed, images, videos, audios = extract_multimodal_content(
             messages_with_tool_calls, preserve_native_format=True
         )
 
@@ -174,6 +179,9 @@ class TestExtractMultimodalContentNativeFormat:
         # Final user message unchanged
         assert processed[3]["role"] == "user"
         assert processed[3]["content"] == "Thanks!"
+        assert images == []
+        assert videos == []
+        assert audios == []
 
     def test_empty_tool_call_id(self):
         """Handle empty or missing tool_call_id gracefully."""
@@ -182,12 +190,12 @@ class TestExtractMultimodalContentNativeFormat:
         ]
 
         # Default mode
-        processed, _, _ = extract_multimodal_content(messages)
+        processed, _, _, _ = extract_multimodal_content(messages)
         assert processed[0]["role"] == "user"
         assert "[Tool Result ()]" in processed[0]["content"]
 
         # Native mode
-        processed, _, _ = extract_multimodal_content(
+        processed, _, _, _ = extract_multimodal_content(
             messages, preserve_native_format=True
         )
         assert processed[0]["role"] == "tool"
@@ -219,7 +227,7 @@ class TestExtractMultimodalContentNativeFormat:
         ]
 
         # Native mode
-        processed, _, _ = extract_multimodal_content(
+        processed, _, _, _ = extract_multimodal_content(
             messages, preserve_native_format=True
         )
 
@@ -239,10 +247,10 @@ class TestExtractMultimodalContentNativeFormat:
         ]
 
         # Default mode
-        processed_default, _, _ = extract_multimodal_content(messages)
+        processed_default, _, _, _ = extract_multimodal_content(messages)
 
         # Native mode
-        processed_native, _, _ = extract_multimodal_content(
+        processed_native, _, _, _ = extract_multimodal_content(
             messages, preserve_native_format=True
         )
 
@@ -270,12 +278,12 @@ class TestExtractMultimodalContentNativeFormat:
         ]
 
         # Default mode - content and tool calls merged
-        processed, _, _ = extract_multimodal_content(messages)
+        processed, _, _, _ = extract_multimodal_content(messages)
         assert "Let me check that for you." in processed[0]["content"]
         assert "[Calling tool: search" in processed[0]["content"]
 
         # Native mode - content and tool_calls separate
-        processed, _, _ = extract_multimodal_content(
+        processed, _, _, _ = extract_multimodal_content(
             messages, preserve_native_format=True
         )
         assert processed[0]["content"] == "Let me check that for you."
@@ -292,7 +300,7 @@ class TestEdgeCases:
             {"role": "tool", "tool_call_id": "call_1", "content": None},
         ]
 
-        processed, _, _ = extract_multimodal_content(
+        processed, _, _, _ = extract_multimodal_content(
             messages, preserve_native_format=True
         )
         assert processed[0]["content"] == ""
@@ -316,7 +324,7 @@ class TestEdgeCases:
             }
         ]
 
-        processed, _, _ = extract_multimodal_content(
+        processed, _, _, _ = extract_multimodal_content(
             messages, preserve_native_format=True
         )
         assert processed[0]["tool_calls"][0]["id"] == "call_v2"
@@ -341,7 +349,7 @@ class TestEdgeCases:
             }
         ]
 
-        processed, _, _ = extract_multimodal_content(
+        processed, _, _, _ = extract_multimodal_content(
             messages, preserve_native_format=True
         )
         assert processed[0]["tool_calls"][0]["id"] == "call_v1"
@@ -363,10 +371,12 @@ class TestEdgeCases:
             {"role": "tool", "tool_call_id": "call_1", "content": "Analysis result"},
         ]
 
-        processed, images, videos = extract_multimodal_content(
+        processed, images, videos, audios = extract_multimodal_content(
             messages, preserve_native_format=True
         )
 
         assert len(images) == 1
         assert images[0] == "http://example.com/img.jpg"
+        assert videos == []
+        assert audios == []
         assert processed[1]["role"] == "tool"

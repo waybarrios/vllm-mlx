@@ -262,7 +262,7 @@ class PreparedChatInvocation:
 def _prepare_chat_messages(
     engine: BaseEngine,
     request_messages: list[Message | dict],
-) -> tuple[list[dict], list, list, bool]:
+) -> tuple[list[dict], list, list, list, bool]:
     """Normalize messages and collect media once for both stream/non-stream paths."""
     is_mllm = bool(getattr(engine, "is_mllm", False))
     preserve_native = bool(getattr(engine, "preserve_native_tool_format", False))
@@ -278,7 +278,7 @@ def _prepare_chat_messages(
                 raw = dict(msg)
                 msg_dict = {k: v for k, v in raw.items() if v is not None}
             messages.append(msg_dict)
-        images, videos = [], []  # MLLM extracts these from messages
+        images, videos, audios = [], [], []  # MLLM extracts these from messages
         logger.debug(f"MLLM: Processing {len(messages)} messages")
         # Convert tool_call arguments from JSON string to dict so that
         # chat templates can iterate them (e.g. GLM-4.6V calls .items()).
@@ -296,14 +296,14 @@ def _prepare_chat_messages(
                             pass
         messages = _normalize_messages(messages)
     else:
-        # For LLM, extract text, images, and videos separately
-        messages, images, videos = extract_multimodal_content(
+        # For LLM, extract text and media separately
+        messages, images, videos, audios = extract_multimodal_content(
             request_messages,
             preserve_native_format=preserve_native,
         )
         messages = _normalize_messages(messages)
 
-    has_media = bool(images or videos)
+    has_media = bool(images or videos or audios)
     if is_mllm and not has_media:
         # MLLM extracts media from messages directly, so images/videos are
         # always empty. Check message content for video/image types instead.
@@ -316,13 +316,20 @@ def _prepare_chat_messages(
                         if hasattr(item, "type")
                         else (item.get("type", "") if isinstance(item, dict) else "")
                     )
-                    if item_type in ("image_url", "image", "video", "video_url"):
+                    if item_type in (
+                        "image_url",
+                        "image",
+                        "video",
+                        "video_url",
+                        "audio",
+                        "audio_url",
+                    ):
                         has_media = True
                         break
             if has_media:
                 break
 
-    return messages, images, videos, has_media
+    return messages, images, videos, audios, has_media
 
 
 def _prepare_json_logits_processor(
@@ -504,7 +511,7 @@ def _prepare_chat_completion_invocation(
     effective_max_tokens: int,
 ) -> PreparedChatInvocation:
     """Precompute messages, kwargs, and decoding constraints for chat completions."""
-    messages, images, videos, has_media = _prepare_chat_messages(
+    messages, images, videos, audios, has_media = _prepare_chat_messages(
         engine, request.messages
     )
     response_format = request.response_format
@@ -609,7 +616,7 @@ def _prepare_anthropic_invocation(
     effective_max_tokens: int,
 ) -> PreparedChatInvocation:
     """Precompute messages, kwargs, and decoding constraints for Anthropic API."""
-    messages, _, _, _ = _prepare_chat_messages(engine, openai_request.messages)
+    messages, _, _, _, _ = _prepare_chat_messages(engine, openai_request.messages)
     response_format = openai_request.response_format
     messages, json_logits_processor = _prepare_json_logits_processor(
         engine,
@@ -1953,7 +1960,7 @@ def _prepare_responses_request(
             f"tools={len(request.tools)}"
         )
 
-    messages, images, videos = extract_multimodal_content(
+    messages, images, videos, audios = extract_multimodal_content(
         chat_request.messages,
         preserve_native_format=engine.preserve_native_tool_format,
     )
