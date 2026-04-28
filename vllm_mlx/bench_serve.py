@@ -25,6 +25,7 @@ import logging
 import math
 import platform
 import re
+import sqlite3
 import statistics
 import sys
 import time
@@ -32,7 +33,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import httpx
 from tabulate import tabulate as _tabulate
@@ -43,6 +44,32 @@ from tabulate import tabulate as _tabulate
 
 _BUILTIN_DIR = Path(__file__).parent / "bench_serve_prompts"
 _BUILTIN_NAMES = {"short", "medium", "long", "thinking"}
+_SQL_IDENTIFIER_RE = re.compile(r"^[a-z_][a-z0-9_]*$")
+
+
+@dataclass
+class WorkloadCase:
+    """One declarative benchmark case for contract-style serving tests."""
+
+    case_id: str
+    messages: list[dict]
+    request_path: Optional[str] = None
+    max_tokens: Optional[int] = None
+    enable_thinking: Optional[bool] = None
+    extra_body: Optional[dict] = None
+    policy_timeout_ms: Optional[int] = None
+    checks: Optional[dict] = None
+    tags: tuple[str, ...] = ()
+
+
+@dataclass
+class Workload:
+    """Normalized bench-serve workload manifest."""
+
+    name: str
+    description: str
+    defaults: dict
+    cases: list[WorkloadCase]
 
 
 def load_prompt_set(name_or_path: str) -> list[list[dict]]:
@@ -107,6 +134,145 @@ def load_prompt_set(name_or_path: str) -> list[list[dict]]:
     raise ValueError(
         f"Prompt entries must be dict or list, got {type(first).__name__} "
         f"in {name_or_path}"
+    )
+
+
+def _require_message_list(value: Any, *, label: str) -> list[dict]:
+    if not isinstance(value, list) or not value:
+        raise ValueError(f"{label}: messages must be a non-empty list")
+    for idx, message in enumerate(value):
+        if not isinstance(message, dict):
+            raise ValueError(f"{label}: message {idx} must be an object")
+        if "role" not in message or "content" not in message:
+            raise ValueError(f"{label}: message {idx} must include role and content")
+    return value
+
+
+def _load_case_request(path: str, *, workload_path: Path, case_id: str) -> dict:
+    request_path = Path(path).expanduser()
+    if not request_path.is_absolute():
+        request_path = workload_path.parent / request_path
+    with request_path.open() as fh:
+        request = json.load(fh)
+    if not isinstance(request, dict):
+        raise ValueError(f"{case_id}: request_path must point to a JSON object")
+    return request
+
+
+def _request_extra_body(request: dict) -> dict:
+    reserved = {
+        "model",
+        "messages",
+        "max_tokens",
+        "stream",
+        "stream_options",
+        "enable_thinking",
+    }
+    return {key: value for key, value in request.items() if key not in reserved}
+
+
+def _first_not_none(*values: Any) -> Any:
+    for value in values:
+        if value is not None:
+            return value
+    return None
+
+
+def load_workload(path: str | Path) -> Workload:
+    """Load a declarative serving benchmark workload.
+
+    Workloads are for product-like qualification where each case can carry
+    request settings, comparison-only policy timeouts, and quality checks.
+    Timeout fields are metadata unless the runner explicitly uses them as a
+    transport limit; they are not treated as hardware capability claims.
+    """
+    workload_path = Path(path).expanduser()
+    with workload_path.open() as fh:
+        raw = json.load(fh)
+
+    if not isinstance(raw, dict):
+        raise ValueError("workload root must be a JSON object")
+    raw_cases = raw.get("cases")
+    if not isinstance(raw_cases, list) or not raw_cases:
+        raise ValueError("workload must contain a non-empty cases list")
+
+    defaults = raw.get("defaults") or {}
+    if not isinstance(defaults, dict):
+        raise ValueError("workload defaults must be an object")
+
+    cases: list[WorkloadCase] = []
+    for idx, item in enumerate(raw_cases):
+        if not isinstance(item, dict):
+            raise ValueError(f"case {idx}: case must be an object")
+        case_id = str(item.get("id") or f"case_{idx + 1}")
+        request_path = item.get("request_path")
+        request_defaults: dict = {}
+        if request_path is not None:
+            request_defaults = _load_case_request(
+                str(request_path), workload_path=workload_path, case_id=case_id
+            )
+        messages = _require_message_list(
+            item.get("messages", request_defaults.get("messages")),
+            label=case_id,
+        )
+        extra_body = item.get("extra_body", defaults.get("extra_body"))
+        request_extra = _request_extra_body(request_defaults)
+        if extra_body:
+            request_extra.update(extra_body)
+        extra_body = request_extra or None
+        if extra_body is not None and not isinstance(extra_body, dict):
+            raise ValueError(f"{case_id}: extra_body must be an object")
+        merged_checks = dict(defaults.get("checks") or {})
+        if item.get("checks"):
+            for key, value in item["checks"].items():
+                if (
+                    key in ("required_regex", "forbidden_regex")
+                    and isinstance(value, list)
+                    and isinstance(merged_checks.get(key), list)
+                ):
+                    merged_checks[key] = merged_checks[key] + value
+                else:
+                    merged_checks[key] = value
+        checks = merged_checks or None
+        if checks is not None and not isinstance(checks, dict):
+            raise ValueError(f"{case_id}: checks must be an object")
+        tags = item.get("tags", [])
+        if isinstance(tags, str):
+            tags = [tags]
+        if not isinstance(tags, list):
+            raise ValueError(f"{case_id}: tags must be a list or string")
+
+        cases.append(
+            WorkloadCase(
+                case_id=case_id,
+                messages=messages,
+                request_path=str(request_path) if request_path is not None else None,
+                max_tokens=_first_not_none(
+                    item.get("max_tokens"),
+                    request_defaults.get("max_tokens"),
+                    defaults.get("max_tokens"),
+                ),
+                enable_thinking=_first_not_none(
+                    item.get("enable_thinking"),
+                    request_defaults.get("enable_thinking"),
+                    defaults.get("enable_thinking"),
+                ),
+                extra_body=extra_body,
+                policy_timeout_ms=_first_not_none(
+                    item.get("policy_timeout_ms"),
+                    request_defaults.get("policy_timeout_ms"),
+                    defaults.get("policy_timeout_ms"),
+                ),
+                checks=checks,
+                tags=tuple(str(tag) for tag in tags),
+            )
+        )
+
+    return Workload(
+        name=str(raw.get("name") or workload_path.stem),
+        description=str(raw.get("description") or ""),
+        defaults=defaults,
+        cases=cases,
     )
 
 
@@ -258,9 +424,15 @@ def parse_status_response(data: dict) -> dict:
     cache = data.get("cache") or {}
     return {
         "model": data.get("model", ""),
-        "metal_active_gb": float(metal.get("active_gb") or 0.0),
-        "metal_peak_gb": float(metal.get("peak_gb") or 0.0),
-        "metal_cache_gb": float(metal.get("cache_gb") or 0.0),
+        "metal_active_gb": float(
+            metal.get("active_memory_gb") or metal.get("active_gb") or 0.0
+        ),
+        "metal_peak_gb": float(
+            metal.get("peak_memory_gb") or metal.get("peak_gb") or 0.0
+        ),
+        "metal_cache_gb": float(
+            metal.get("cache_memory_gb") or metal.get("cache_gb") or 0.0
+        ),
         "cache_type": cache.get("type", "") or "",
     }
 
@@ -428,6 +600,43 @@ async def scrape_metrics(client: httpx.AsyncClient, base_url: str) -> dict:
         return parse_metrics_text(resp.text)
     except Exception:
         return {}
+
+
+async def clear_runtime_cache(client: httpx.AsyncClient, base_url: str) -> dict:
+    """Clear server-side runtime caches and return a JSON-serializable event."""
+    event: dict[str, Any] = {
+        "attempted": True,
+        "ok": False,
+        "status_code": 0,
+        "response": {},
+        "error": "",
+    }
+    try:
+        resp = await client.delete(f"{base_url}/v1/cache")
+        event["status_code"] = resp.status_code
+        try:
+            event["response"] = resp.json()
+        except ValueError:
+            event["response"] = {"text": resp.text}
+        resp.raise_for_status()
+        event["ok"] = True
+    except Exception as exc:
+        event["error"] = str(exc)
+    return event
+
+
+def _normalize_cache_policy(value: Optional[str]) -> str:
+    """Normalize cache-policy spelling from CLI or workload JSON.
+
+    CLI choices are hyphenated, but workload JSON may use underscores when it
+    follows common Python/YAML identifier style.
+    """
+    policy = (value or "preserve").strip().lower().replace("_", "-")
+    if policy not in {"preserve", "before-run", "before-case"}:
+        raise ValueError(
+            "cache policy must be one of: preserve, before-run, before-case"
+        )
+    return policy
 
 
 # ---------------------------------------------------------------------------
@@ -701,6 +910,69 @@ def validate_response(
     return (True, "")
 
 
+def validate_quality_checks(
+    finish_reason: Optional[str],
+    content: str,
+    checks: Optional[dict],
+    *,
+    status_code: int = 200,
+) -> tuple[bool, list[str]]:
+    """Validate content against generic workload quality checks.
+
+    Supported checks:
+    - ``finish_reason``: string or list of allowed finish reasons
+    - ``required_regex``: list of regex patterns that must match
+    - ``forbidden_regex``: list of regex patterns that must not match
+    - ``min_chars`` / ``max_chars``: length bounds
+    - ``json``: when true, content must parse as JSON
+    """
+    basic_ok, basic_issue = validate_response(finish_reason, content, status_code)
+    issues: list[str] = [] if basic_ok else [basic_issue]
+    checks = checks or {}
+
+    allowed_finish = checks.get("finish_reason")
+    if allowed_finish is not None:
+        allowed = (
+            [allowed_finish]
+            if isinstance(allowed_finish, str)
+            else list(allowed_finish)
+        )
+        if finish_reason not in allowed:
+            issues.append(
+                f"finish_reason {finish_reason!r} not in allowed set {allowed!r}"
+            )
+
+    min_chars = checks.get("min_chars")
+    if min_chars is not None and len(content) < int(min_chars):
+        issues.append(f"content shorter than min_chars={min_chars}")
+
+    max_chars = checks.get("max_chars")
+    if max_chars is not None and len(content) > int(max_chars):
+        issues.append(f"content longer than max_chars={max_chars}")
+
+    for pattern in checks.get("required_regex", []) or []:
+        try:
+            if not re.search(str(pattern), content, re.MULTILINE):
+                issues.append(f"required_regex did not match: {pattern}")
+        except re.error as exc:
+            issues.append(f"invalid required_regex {pattern!r}: {exc}")
+
+    for pattern in checks.get("forbidden_regex", []) or []:
+        try:
+            if re.search(str(pattern), content, re.MULTILINE):
+                issues.append(f"forbidden_regex matched: {pattern}")
+        except re.error as exc:
+            issues.append(f"invalid forbidden_regex {pattern!r}: {exc}")
+
+    if checks.get("json"):
+        try:
+            json.loads(content)
+        except json.JSONDecodeError as exc:
+            issues.append(f"content is not valid JSON: {exc}")
+
+    return (not issues, issues)
+
+
 def compute_summary_stats(values: list[float]) -> dict:
     """Compute summary statistics over a list of floats.
 
@@ -810,6 +1082,356 @@ async def run_concurrent_requests(
 
     results = await asyncio.gather(*[_single(msg) for msg in selected])
     return list(results)
+
+
+def _summary_or_empty(values: list[float]) -> dict:
+    return compute_summary_stats(values) if values else {}
+
+
+async def run_workload_case(
+    client: httpx.AsyncClient,
+    base_url: str,
+    *,
+    workload: Workload,
+    case: WorkloadCase,
+    model: str,
+    runtime: dict,
+    hardware: dict,
+    run_id: str,
+    timestamp: str,
+    repetition: int = 0,
+    scrape: bool = True,
+    include_content: bool = False,
+    cache_reset: Optional[dict] = None,
+) -> dict:
+    """Run one workload case and return a JSON-serializable result."""
+    metrics_before = await scrape_metrics(client, base_url) if scrape else {}
+    started_wall = datetime.now(timezone.utc).isoformat()
+
+    try:
+        result = await stream_chat_completion(
+            client=client,
+            base_url=base_url,
+            messages=case.messages,
+            model=model,
+            max_tokens=int(case.max_tokens or workload.defaults.get("max_tokens", 256)),
+            enable_thinking=case.enable_thinking,
+            extra_body=case.extra_body,
+        )
+        error = ""
+    except Exception as exc:
+        result = {
+            "ttft_ms": 0.0,
+            "tpot_ms": 0.0,
+            "e2e_latency_ms": 0.0,
+            "gen_tps": 0.0,
+            "prompt_tps": 0.0,
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "finish_reason": None,
+            "content": "",
+        }
+        error = str(exc)
+
+    metrics_after = await scrape_metrics(client, base_url) if scrape else {}
+    status_after: dict = {}
+    try:
+        resp = await client.get(f"{base_url}/v1/status")
+        resp.raise_for_status()
+        status_after = resp.json()
+    except Exception:
+        status_after = {}
+
+    cache_hits_delta = metrics_after.get("cache_hits", 0) - metrics_before.get(
+        "cache_hits", 0
+    )
+    cache_misses_delta = metrics_after.get("cache_misses", 0) - metrics_before.get(
+        "cache_misses", 0
+    )
+    tokens_saved_delta = metrics_after.get("tokens_saved", 0) - metrics_before.get(
+        "tokens_saved", 0
+    )
+
+    content = str(result.get("content") or "")
+    quality_ok, quality_issues = validate_quality_checks(
+        result.get("finish_reason"),
+        content,
+        case.checks,
+        status_code=500 if error else 200,
+    )
+    if error:
+        quality_issues.append(f"request error: {error}")
+
+    if case.policy_timeout_ms is None:
+        within_policy_timeout = None
+    elif error:
+        within_policy_timeout = False
+    else:
+        within_policy_timeout = result["e2e_latency_ms"] <= case.policy_timeout_ms
+
+    record = {
+        "run_id": run_id,
+        "timestamp": timestamp,
+        "started_at": started_wall,
+        "workload": workload.name,
+        "case_id": case.case_id,
+        "repetition": repetition,
+        "tags": list(case.tags),
+        "model_id": model,
+        "runtime": runtime,
+        "hardware": hardware,
+        "request": {
+            "max_tokens": int(
+                case.max_tokens or workload.defaults.get("max_tokens", 256)
+            ),
+            "request_path": case.request_path,
+            "enable_thinking": case.enable_thinking,
+            "extra_body": case.extra_body or {},
+            "message_count": len(case.messages),
+        },
+        "policy": {
+            "timeout_ms": case.policy_timeout_ms,
+            "within_timeout": within_policy_timeout,
+        },
+        "cache_reset": cache_reset or {"attempted": False},
+        "metrics": {
+            "ttft_ms": result["ttft_ms"],
+            "tpot_ms": result["tpot_ms"],
+            "e2e_latency_ms": result["e2e_latency_ms"],
+            "gen_tps": result["gen_tps"],
+            "prompt_tps": result["prompt_tps"],
+            "prompt_tokens": result["prompt_tokens"],
+            "completion_tokens": result["completion_tokens"],
+            "cache_hits": cache_hits_delta,
+            "cache_misses": cache_misses_delta,
+            "tokens_saved": tokens_saved_delta,
+            "metal": parse_status_response(status_after),
+        },
+        "quality": {
+            "ok": quality_ok,
+            "issues": quality_issues,
+            "finish_reason": result.get("finish_reason"),
+            "content_chars": len(content),
+            "content_preview": content[:240],
+        },
+        "ok": quality_ok,
+    }
+    if include_content:
+        record["quality"]["content"] = content
+    return record
+
+
+def summarize_workload_results(results: list[dict]) -> dict:
+    """Aggregate workload case records into stable qualification summary stats."""
+    latencies = [r["metrics"]["e2e_latency_ms"] for r in results]
+    ttft = [r["metrics"]["ttft_ms"] for r in results]
+    gen_tps = [r["metrics"]["gen_tps"] for r in results]
+    failures = [r for r in results if not r["quality"]["ok"]]
+    policy_trials = [
+        r for r in results if r["policy"].get("within_timeout") is not None
+    ]
+    policy_failures = [
+        r for r in policy_trials if r["policy"].get("within_timeout") is False
+    ]
+    cases: dict[str, list[dict]] = {}
+    for result in results:
+        cases.setdefault(str(result.get("case_id", "")), []).append(result)
+
+    case_summaries = {}
+    for case_id, case_results in sorted(cases.items()):
+        case_quality_failures = [r for r in case_results if not r["quality"].get("ok")]
+        case_policy_trials = [
+            r for r in case_results if r["policy"].get("within_timeout") is not None
+        ]
+        case_policy_failures = [
+            r for r in case_policy_trials if r["policy"].get("within_timeout") is False
+        ]
+        case_summaries[case_id] = {
+            "sample_count": len(case_results),
+            "repetitions": sorted(
+                {
+                    int(r.get("repetition", 0))
+                    for r in case_results
+                    if r.get("repetition") is not None
+                }
+            ),
+            "passed": not case_quality_failures,
+            "failure_count": len(case_quality_failures),
+            "failure_rate": (
+                round(len(case_quality_failures) / len(case_results), 4)
+                if case_results
+                else 0.0
+            ),
+            "policy_timeout_passed": (
+                not case_policy_failures if case_policy_trials else None
+            ),
+            "policy_timeout_failure_count": (
+                len(case_policy_failures) if case_policy_trials else None
+            ),
+            "latency_ms": _summary_or_empty(
+                [r["metrics"]["e2e_latency_ms"] for r in case_results]
+            ),
+            "ttft_ms": _summary_or_empty(
+                [r["metrics"]["ttft_ms"] for r in case_results]
+            ),
+            "gen_tps": _summary_or_empty(
+                [r["metrics"]["gen_tps"] for r in case_results]
+            ),
+            "content_chars": _summary_or_empty(
+                [r["quality"].get("content_chars", 0) for r in case_results]
+            ),
+        }
+
+    return {
+        "case_count": len(results),
+        "unique_case_count": len(cases),
+        "repetition_count": max(
+            (len(summary["repetitions"]) for summary in case_summaries.values()),
+            default=0,
+        ),
+        "passed": not failures,
+        "failure_count": len(failures),
+        "failure_rate": round(len(failures) / len(results), 4) if results else 0.0,
+        "quality_passed": not failures,
+        "quality_failure_count": len(failures),
+        "policy_timeout_passed": not policy_failures if policy_trials else None,
+        "policy_timeout_failure_count": (
+            len(policy_failures) if policy_trials else None
+        ),
+        "latency_ms": _summary_or_empty(latencies),
+        "ttft_ms": _summary_or_empty(ttft),
+        "gen_tps": _summary_or_empty(gen_tps),
+        "case_summaries": case_summaries,
+    }
+
+
+async def run_bench_serve_workload(
+    *,
+    url: str,
+    workload_path: str,
+    model: Optional[str] = None,
+    output_path: Optional[str] = None,
+    output_format: str = "json",
+    scrape: bool = True,
+    include_content: bool = False,
+    request_timeout_s: Optional[float] = 300.0,
+    repetitions: int = 1,
+    cache_policy: Optional[str] = None,
+) -> dict:
+    """Run a declarative workload against a running server.
+
+    This is the contract-style counterpart to prompt sweeps: it keeps product
+    policy knobs in the manifest, records them as evidence, and measures what
+    the server actually does before anyone promotes a model or feature stack.
+    """
+    if repetitions < 1:
+        raise ValueError("repetitions must be at least 1")
+
+    workload = load_workload(workload_path)
+    resolved_cache_policy = _normalize_cache_policy(
+        cache_policy or workload.defaults.get("cache_policy")
+    )
+    run_id = str(uuid.uuid4())[:8]
+    timestamp = datetime.now(timezone.utc).isoformat()
+    timeout = httpx.Timeout(request_timeout_s) if request_timeout_s else None
+
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        runtime = await auto_detect_runtime(client, url)
+        hardware = detect_hardware_fingerprint()
+        model_id = model or runtime.get("model_id", "")
+        if not model_id:
+            raise ValueError("could not determine model ID; pass --model")
+
+        records = []
+        cache_events = []
+        if resolved_cache_policy == "before-run":
+            cache_events.append(
+                {
+                    "scope": "before-run",
+                    "event": await clear_runtime_cache(client, url),
+                }
+            )
+        total_cases = len(workload.cases) * repetitions
+        completed = 0
+        for repetition in range(repetitions):
+            for case in workload.cases:
+                print(
+                    f"  [{repetition + 1}/{repetitions}] {case.case_id} ...",
+                    end="",
+                    flush=True,
+                )
+                cache_reset = None
+                if resolved_cache_policy == "before-case":
+                    cache_reset = await clear_runtime_cache(client, url)
+                    cache_events.append(
+                        {
+                            "scope": "before-case",
+                            "case_id": case.case_id,
+                            "repetition": repetition,
+                            "event": cache_reset,
+                        }
+                    )
+                record = await run_workload_case(
+                    client,
+                    url,
+                    workload=workload,
+                    case=case,
+                    model=model_id,
+                    runtime=runtime,
+                    hardware=hardware,
+                    run_id=run_id,
+                    timestamp=timestamp,
+                    repetition=repetition,
+                    scrape=scrape,
+                    include_content=include_content,
+                    cache_reset=cache_reset,
+                )
+                records.append(record)
+                completed += 1
+                latency = record.get("metrics", {}).get("e2e_latency_ms", 0)
+                ok = record.get("ok", False)
+                status = "ok" if ok else "FAIL"
+                print(f" {latency:.0f}ms {status} ({completed}/{total_cases})")
+
+    payload = {
+        "run_id": run_id,
+        "timestamp": timestamp,
+        "workload": {
+            "name": workload.name,
+            "description": workload.description,
+            "path": str(Path(workload_path).expanduser()),
+            "defaults": workload.defaults,
+            "repetitions": repetitions,
+        },
+        "transport": {
+            "request_timeout_s": request_timeout_s,
+            "note": "transport safety only; product policy timeouts live in workload cases",
+        },
+        "policy": {
+            "note": "comparison-only unless your product contract explicitly requires it",
+        },
+        "cache_policy": {
+            "mode": resolved_cache_policy,
+            "events": cache_events,
+        },
+        "summary": summarize_workload_results(records),
+        "results": records,
+    }
+
+    if output_format == "sqlite":
+        if not output_path:
+            raise ValueError("--output is required when --format sqlite")
+        write_workload_sqlite(payload, output_path)
+        print(f"Workload SQLite results written to {output_path}")
+        return payload
+
+    rendered = format_workload_payload(payload, output_format)
+    if output_path:
+        Path(output_path).expanduser().write_text(rendered)
+        print(f"Workload results written to {output_path}")
+    else:
+        print(rendered)
+    return payload
 
 
 # ---------------------------------------------------------------------------
@@ -958,6 +1580,235 @@ def format_sql(results: list[BenchServeResult]) -> str:
     return "\n".join(lines)
 
 
+def _write_sqlite_rows(
+    output_path: str,
+    *,
+    table: str,
+    schema: str,
+    columns: list[str],
+    rows: list[dict],
+) -> None:
+    """Append benchmark rows to a SQLite database."""
+    db_path = Path(output_path).expanduser()
+    _validate_sql_identifier(table, kind="table")
+    for column in columns:
+        _validate_sql_identifier(column, kind="column")
+    placeholders = ", ".join("?" for _ in columns)
+    column_list = ", ".join(columns)
+    values = [[row.get(col) for col in columns] for row in rows]
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(f"CREATE TABLE IF NOT EXISTS {table} ({schema})")
+        if values:
+            conn.executemany(
+                f"INSERT INTO {table} ({column_list}) VALUES ({placeholders})",
+                values,
+            )
+        conn.commit()
+
+
+def _validate_sql_identifier(identifier: str, *, kind: str) -> None:
+    """Reject unsafe SQL identifiers before string interpolation."""
+    if not _SQL_IDENTIFIER_RE.fullmatch(identifier):
+        raise ValueError(f"invalid SQLite {kind} identifier: {identifier!r}")
+
+
+def write_sqlite(results: list[BenchServeResult], output_path: str) -> None:
+    rows = [_result_to_dict(r) for r in results]
+    _write_sqlite_rows(
+        output_path,
+        table="bench_serve",
+        schema=_SQL_SCHEMA,
+        columns=RESULT_COLUMNS,
+        rows=rows,
+    )
+
+
+WORKLOAD_RESULT_COLUMNS = [
+    "run_id",
+    "timestamp",
+    "workload",
+    "case_id",
+    "repetition",
+    "tags",
+    "model_id",
+    "chip",
+    "memory_gb",
+    "os_version",
+    "engine_type",
+    "model_type",
+    "mtp_enabled",
+    "specprefill",
+    "kv_quant",
+    "cache_type",
+    "request_max_tokens",
+    "request_enable_thinking",
+    "request_extra_body",
+    "policy_timeout_ms",
+    "within_policy_timeout",
+    "ttft_ms",
+    "tpot_ms",
+    "e2e_latency_ms",
+    "gen_tps",
+    "prompt_tps",
+    "prompt_tokens",
+    "completion_tokens",
+    "cache_hits",
+    "cache_misses",
+    "tokens_saved",
+    "metal_active_gb",
+    "metal_peak_gb",
+    "metal_cache_gb",
+    "quality_ok",
+    "quality_issues",
+    "finish_reason",
+    "content_chars",
+    "content_preview",
+]
+
+_WORKLOAD_TABLE_COLUMNS = [
+    "case_id",
+    "repetition",
+    "tags",
+    "quality_ok",
+    "within_policy_timeout",
+    "ttft_ms",
+    "gen_tps",
+    "e2e_latency_ms",
+    "cache_hits",
+    "tokens_saved",
+    "finish_reason",
+]
+
+
+def _workload_record_to_row(record: dict) -> dict:
+    runtime = record.get("runtime") or {}
+    hardware = record.get("hardware") or {}
+    request = record.get("request") or {}
+    policy = record.get("policy") or {}
+    metrics = record.get("metrics") or {}
+    metal = metrics.get("metal") or {}
+    quality = record.get("quality") or {}
+    return {
+        "run_id": record.get("run_id", ""),
+        "timestamp": record.get("timestamp", ""),
+        "workload": record.get("workload", ""),
+        "case_id": record.get("case_id", ""),
+        "repetition": record.get("repetition", 0),
+        "tags": ",".join(record.get("tags") or []),
+        "model_id": record.get("model_id", ""),
+        "chip": hardware.get("chip", ""),
+        "memory_gb": hardware.get("memory_gb", 0.0),
+        "os_version": hardware.get("os_version", ""),
+        "engine_type": runtime.get("engine_type", ""),
+        "model_type": runtime.get("model_type", ""),
+        "mtp_enabled": runtime.get("mtp_enabled", False),
+        "specprefill": runtime.get("specprefill", False),
+        "kv_quant": runtime.get("kv_quant", ""),
+        "cache_type": runtime.get("cache_type", ""),
+        "request_max_tokens": request.get("max_tokens"),
+        "request_enable_thinking": request.get("enable_thinking"),
+        "request_extra_body": json.dumps(
+            request.get("extra_body") or {}, sort_keys=True
+        ),
+        "policy_timeout_ms": policy.get("timeout_ms"),
+        "within_policy_timeout": policy.get("within_timeout"),
+        "ttft_ms": metrics.get("ttft_ms", 0.0),
+        "tpot_ms": metrics.get("tpot_ms", 0.0),
+        "e2e_latency_ms": metrics.get("e2e_latency_ms", 0.0),
+        "gen_tps": metrics.get("gen_tps", 0.0),
+        "prompt_tps": metrics.get("prompt_tps", 0.0),
+        "prompt_tokens": metrics.get("prompt_tokens", 0),
+        "completion_tokens": metrics.get("completion_tokens", 0),
+        "cache_hits": metrics.get("cache_hits", 0),
+        "cache_misses": metrics.get("cache_misses", 0),
+        "tokens_saved": metrics.get("tokens_saved", 0),
+        "metal_active_gb": metal.get("metal_active_gb", 0.0),
+        "metal_peak_gb": metal.get("metal_peak_gb", 0.0),
+        "metal_cache_gb": metal.get("metal_cache_gb", 0.0),
+        "quality_ok": quality.get("ok", False),
+        "quality_issues": json.dumps(quality.get("issues") or []),
+        "finish_reason": quality.get("finish_reason"),
+        "content_chars": quality.get("content_chars", 0),
+        "content_preview": quality.get("content_preview", ""),
+    }
+
+
+def format_workload_table(payload: dict) -> str:
+    rows = []
+    for record in payload.get("results") or []:
+        row = _workload_record_to_row(record)
+        rows.append(
+            [
+                round(value, 1) if isinstance(value, float) else value
+                for value in (row[col] for col in _WORKLOAD_TABLE_COLUMNS)
+            ]
+        )
+    return _tabulate(rows, headers=_WORKLOAD_TABLE_COLUMNS, tablefmt="simple")
+
+
+def format_workload_json(payload: dict) -> str:
+    return json.dumps(payload, indent=2)
+
+
+def format_workload_csv(payload: dict) -> str:
+    buf = io.StringIO()
+    writer = csv_mod.DictWriter(buf, fieldnames=WORKLOAD_RESULT_COLUMNS)
+    writer.writeheader()
+    for record in payload.get("results") or []:
+        writer.writerow(_workload_record_to_row(record))
+    return buf.getvalue()
+
+
+_WORKLOAD_SQL_SCHEMA = (
+    "run_id TEXT, timestamp TEXT, workload TEXT, case_id TEXT, repetition INTEGER, "
+    "tags TEXT, model_id TEXT, chip TEXT, memory_gb REAL, os_version TEXT, "
+    "engine_type TEXT, model_type TEXT, mtp_enabled BOOLEAN, specprefill BOOLEAN, "
+    "kv_quant TEXT, cache_type TEXT, request_max_tokens INTEGER, "
+    "request_enable_thinking BOOLEAN, request_extra_body TEXT, "
+    "policy_timeout_ms INTEGER, within_policy_timeout BOOLEAN, "
+    "ttft_ms REAL, tpot_ms REAL, e2e_latency_ms REAL, gen_tps REAL, "
+    "prompt_tps REAL, prompt_tokens INTEGER, completion_tokens INTEGER, "
+    "cache_hits INTEGER, cache_misses INTEGER, tokens_saved INTEGER, "
+    "metal_active_gb REAL, metal_peak_gb REAL, metal_cache_gb REAL, "
+    "quality_ok BOOLEAN, quality_issues TEXT, finish_reason TEXT, "
+    "content_chars INTEGER, content_preview TEXT"
+)
+
+
+def format_workload_sql(payload: dict) -> str:
+    lines = [
+        f"CREATE TABLE IF NOT EXISTS bench_serve_workload ({_WORKLOAD_SQL_SCHEMA});",
+    ]
+    for record in payload.get("results") or []:
+        row = _workload_record_to_row(record)
+        values = ", ".join(_sql_escape(row[col]) for col in WORKLOAD_RESULT_COLUMNS)
+        lines.append(f"INSERT INTO bench_serve_workload VALUES ({values});")
+    return "\n".join(lines)
+
+
+def write_workload_sqlite(payload: dict, output_path: str) -> None:
+    rows = [_workload_record_to_row(record) for record in payload.get("results") or []]
+    _write_sqlite_rows(
+        output_path,
+        table="bench_serve_workload",
+        schema=_WORKLOAD_SQL_SCHEMA,
+        columns=WORKLOAD_RESULT_COLUMNS,
+        rows=rows,
+    )
+
+
+def format_workload_payload(payload: dict, fmt: str = "json") -> str:
+    if fmt == "json":
+        return format_workload_json(payload)
+    if fmt == "csv":
+        return format_workload_csv(payload)
+    if fmt == "sql":
+        return format_workload_sql(payload)
+    if fmt == "table":
+        return format_workload_table(payload)
+    raise ValueError(f"Unsupported workload output format: {fmt}")
+
+
 # ---------------------------------------------------------------------------
 # Task 7: Main async orchestrator
 # ---------------------------------------------------------------------------
@@ -1004,7 +1855,7 @@ async def run_bench_serve(
         output_path: File path to write results to. If ``None``, prints to
             stdout.
         fmt: Output format — one of ``"table"``, ``"json"``, ``"csv"``,
-            ``"sql"``.
+            ``"sql"``, or ``"sqlite"``.
         do_validate: Whether to validate each response.
         scrape: Whether to scrape ``/metrics`` before and after each run.
         tag: Optional tag string stored in every result row.
@@ -1358,6 +2209,13 @@ async def run_bench_serve(
             results.append(result_obj)
 
         # 12. Format output
+        if fmt == "sqlite":
+            if not output_path:
+                raise ValueError("--output is required when --format sqlite")
+            write_sqlite(results, output_path)
+            print(f"\nSQLite results written to {output_path}")
+            return results
+
         formatters = {
             "table": format_table,
             "json": format_json,

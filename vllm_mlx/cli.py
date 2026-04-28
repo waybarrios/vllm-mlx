@@ -836,7 +836,44 @@ def bench_kv_cache_command(args):
 def bench_serve_command(args):
     """Run serving benchmark."""
     import asyncio
-    from .bench_serve import run_bench_serve
+
+    from .bench_serve import run_bench_serve, run_bench_serve_workload
+
+    if args.workload:
+        sweep_only_warnings = []
+        if args.prompts != "short,medium,long":
+            sweep_only_warnings.append(f"--prompts={args.prompts}")
+        if args.concurrency != "1,4":
+            sweep_only_warnings.append(f"--concurrency={args.concurrency}")
+        if args.warmup != 1:
+            sweep_only_warnings.append(f"--warmup={args.warmup}")
+        if sweep_only_warnings:
+            import sys as _sys
+
+            print(
+                f"Warning: --workload mode ignores sweep-only args: "
+                f"{', '.join(sweep_only_warnings)}",
+                file=_sys.stderr,
+            )
+        request_timeout_s = (
+            None if args.request_timeout_s <= 0 else args.request_timeout_s
+        )
+        output_format = "json" if args.format == "auto" else args.format
+        asyncio.run(
+            run_bench_serve_workload(
+                url=args.url,
+                workload_path=args.workload,
+                model=args.model,
+                output_path=args.output,
+                output_format=output_format,
+                scrape=args.scrape_metrics == "true",
+                include_content=args.include_content,
+                request_timeout_s=request_timeout_s,
+                repetitions=args.repetitions,
+                cache_policy=args.cache_policy,
+            )
+        )
+        return
 
     prompt_sets = args.prompts.split(",")
     concurrencies = [int(c) for c in args.concurrency.split(",")]
@@ -870,6 +907,7 @@ def bench_serve_command(args):
             k, v = kv.split("=", 1)
             overrides[k] = v
 
+    output_format = "table" if args.format == "auto" else args.format
     asyncio.run(
         run_bench_serve(
             url=args.url,
@@ -883,7 +921,7 @@ def bench_serve_command(args):
             thinking_values=thinking_values,
             extra_bodies=extra_bodies,
             output_path=args.output,
-            fmt=args.format,
+            fmt=output_format,
             do_validate=args.validate == "true",
             scrape=args.scrape_metrics == "true",
             tag=args.tag,
@@ -1805,6 +1843,16 @@ Examples:
         help="Model ID to benchmark (default: auto-detected from server)",
     )
     bench_serve_parser.add_argument(
+        "--workload",
+        type=str,
+        default=None,
+        help=(
+            "Path to a declarative workload JSON file. When set, bench-serve "
+            "runs contract-style cases with per-case quality checks and "
+            "comparison-only policy timeouts instead of the prompt sweep."
+        ),
+    )
+    bench_serve_parser.add_argument(
         "--prompts",
         type=str,
         default="short,medium,long",
@@ -1855,7 +1903,7 @@ Examples:
         "--repetitions",
         type=int,
         default=3,
-        help="Number of repetitions per sweep configuration (default: 3)",
+        help="Number of repetitions per sweep configuration or workload case (default: 3)",
     )
     bench_serve_parser.add_argument(
         "--warmup",
@@ -1884,9 +1932,12 @@ Examples:
     bench_serve_parser.add_argument(
         "--format",
         type=str,
-        default="table",
-        choices=["table", "json", "csv", "sql"],
-        help="Output format (default: table)",
+        default="auto",
+        choices=["auto", "table", "json", "csv", "sql", "sqlite"],
+        help=(
+            "Output format (auto = table for prompt sweeps, json for workloads; "
+            "sqlite requires --output)"
+        ),
     )
     bench_serve_parser.add_argument(
         "--validate",
@@ -1901,6 +1952,31 @@ Examples:
         default="true",
         choices=["true", "false"],
         help="Scrape /metrics before and after each run (default: true)",
+    )
+    bench_serve_parser.add_argument(
+        "--include-content",
+        action="store_true",
+        help="Include full generated content in workload JSON output",
+    )
+    bench_serve_parser.add_argument(
+        "--request-timeout-s",
+        type=float,
+        default=300.0,
+        help=(
+            "HTTP transport timeout for workload mode in seconds (default: 300). "
+            "Use 0 to disable; product policy timeouts belong in the workload."
+        ),
+    )
+    bench_serve_parser.add_argument(
+        "--cache-policy",
+        type=str,
+        default=None,
+        choices=["preserve", "before-run", "before-case"],
+        help=(
+            "Workload cache handling (default: workload defaults or preserve). "
+            "Use before-case for cold, uncontaminated per-case qualification. "
+            "Workload JSON may also spell these with underscores."
+        ),
     )
     bench_serve_parser.add_argument(
         "--tag",

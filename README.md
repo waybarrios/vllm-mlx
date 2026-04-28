@@ -188,6 +188,12 @@ python examples/tts_multilingual.py "Hola mundo" --lang es --play
 
 ```bash
 vllm-mlx bench-serve --url http://localhost:8000 --concurrency 5 --prompts prompts.txt --output results.csv
+
+# Product-style workload with quality checks and metrics deltas
+vllm-mlx bench-serve --url http://localhost:8000 --workload workload.json --repetitions 5 --output results.json
+
+# Append workload rows into SQLite for longitudinal comparisons
+vllm-mlx bench-serve --url http://localhost:8000 --workload workload.json --repetitions 5 --format sqlite --output bench.db
 ```
 
 ### Model acquisition and conversion

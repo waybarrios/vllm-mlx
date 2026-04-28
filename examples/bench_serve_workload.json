@@ -1,0 +1,44 @@
+{
+  "name": "quality-contract-smoke",
+  "description": "Small contract-style workload demonstrating bench-serve quality checks.",
+  "defaults": {
+    "max_tokens": 256,
+    "enable_thinking": false,
+    "policy_timeout_ms": 30000,
+    "checks": {
+      "finish_reason": "stop",
+      "forbidden_regex": [
+        "<think>",
+        "I cannot"
+      ],
+      "min_chars": 40
+    }
+  },
+  "cases": [
+    {
+      "id": "python-palindrome",
+      "tags": [
+        "code",
+        "quality"
+      ],
+      "messages": [
+        {
+          "role": "user",
+          "content": "Write a Python function with type hints that checks whether a string is a palindrome. Include one short example."
+        }
+      ],
+      "checks": {
+        "finish_reason": "stop",
+        "required_regex": [
+          "def ",
+          "-> bool"
+        ],
+        "forbidden_regex": [
+          "<think>",
+          "TODO"
+        ],
+        "min_chars": 80
+      }
+    }
+  ]
+}

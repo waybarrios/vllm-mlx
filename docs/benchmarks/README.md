@@ -19,6 +19,99 @@ vllm-mlx-bench --model mlx-community/Qwen3-VL-8B-Instruct-4bit
 
 # Video benchmark
 vllm-mlx-bench --model mlx-community/Qwen3-VL-8B-Instruct-4bit --video
+
+# Running-server prompt sweep with Prometheus metric deltas
+vllm-mlx bench-serve --url http://localhost:8000 --prompts short,long \
+  --concurrency 1,4 --output bench.json --format json
+
+# Running-server product-style workload with quality checks
+vllm-mlx bench-serve --url http://localhost:8000 \
+  --workload ./workload.json --output workload-results.json
+```
+
+## Contract Workloads
+
+`vllm-mlx bench-serve --workload` runs declarative cases against an already
+running OpenAI-compatible server. This is intended for model and feature-stack
+qualification, where raw speed is not enough and every run needs provenance,
+quality checks, Prometheus metric deltas, and policy-timeout evidence.
+Use `--repetitions` to measure variance; workload summaries report per-case
+sample counts, failure rates, and min/median/max latency and throughput.
+`required_regex` and `forbidden_regex` entries are Python regular expressions;
+plain literal strings are valid regex patterns. Workload `cache_policy` accepts
+`preserve`, `before-run`, and `before-case`; JSON/YAML-style underscore
+spellings such as `before_case` are normalized to the same values.
+
+Example workload:
+
+```json
+{
+  "name": "writing-contract",
+  "description": "Representative long-form writing requests",
+  "defaults": {
+    "max_tokens": 32768,
+    "enable_thinking": true,
+    "policy_timeout_ms": 180000,
+    "checks": {
+      "finish_reason": "stop",
+      "forbidden_regex": ["<think>", "prompt leakage"],
+      "min_chars": 500
+    }
+  },
+  "cases": [
+    {
+      "id": "resume-golden-1",
+      "messages": [
+        {"role": "user", "content": "Write the requested artifact..."}
+      ],
+      "tags": ["resume", "quality-floor"]
+    }
+  ]
+}
+```
+
+Cases can also reference an existing OpenAI-compatible request JSON instead of
+duplicating a large prompt body:
+
+```json
+{
+  "name": "writing-contract",
+  "cases": [
+    {
+      "id": "resume-golden-1",
+      "request_path": "./fixtures/job543_resume_precise_request.json",
+      "checks": {
+        "finish_reason": "stop",
+        "forbidden_regex": ["<think>"]
+      }
+    }
+  ]
+}
+```
+
+When `request_path` is used, `messages`, `max_tokens`, `enable_thinking`, and
+extra request-body fields such as `thinking_token_budget` are read from that
+file. Case-level `extra_body` values override request-file values.
+
+`policy_timeout_ms` is recorded as comparison evidence. It is not treated as a
+hardware capability claim. Use it to answer "would this run fit my product
+policy?" after first measuring what the model and serving stack can actually do.
+
+Workload output defaults to JSON for full provenance. Use `--format csv` for
+flat per-case rows, `--format sql` to emit importable SQL, or
+`--format sqlite --output bench.db` to append rows directly into a local
+benchmark database.
+
+`--request-timeout-s` is the HTTP transport ceiling for each request in
+workload mode. Product policy timeouts belong in the workload as
+`policy_timeout_ms` and are recorded as comparison evidence.
+
+```bash
+vllm-mlx bench-serve --url http://localhost:8000 \
+  --workload ./workload.json --repetitions 5 --output workload-results.json
+
+vllm-mlx bench-serve --url http://localhost:8000 \
+  --workload ./workload.json --repetitions 5 --format sqlite --output bench.db
 ```
 
 ## Standalone Test Defaults
