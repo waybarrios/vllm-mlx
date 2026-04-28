@@ -3998,14 +3998,51 @@ def _remaining_request_timeout(total_timeout: float, deadline: float) -> float:
     return remaining
 
 
+_active_request_contexts: dict[int, RequestModelContext] = {}
+
+
 async def _acquire_default_engine_for_request(
     raw_request: Request,
     *,
     total_timeout: float,
     deadline: float,
     count_activity: bool = True,
+    model: str | None = None,
 ) -> BaseEngine | None:
-    """Acquire the default engine inside the request guardrails."""
+    """Acquire the engine for a request, using the model registry when active.
+
+    When ``_model_manager`` is set (registry mode), acquires the engine for the
+    requested *model* via ``_acquire_request_model``.  The resulting
+    ``RequestModelContext`` is stashed in ``_active_request_contexts`` keyed by
+    ``id(raw_request)`` so that the matching ``_release_default_engine`` call
+    can release the lease.
+
+    In single-model mode the behaviour is unchanged.
+    """
+    if _model_manager is not None and model is not None:
+
+        async def _registry_acquire():
+            ctx = await _acquire_request_model(model)
+            if raw_request is not None:
+                _active_request_contexts[id(raw_request)] = ctx
+            return ctx.engine
+
+        async def _registry_cleanup(_result):
+            ctx = _active_request_contexts.pop(id(raw_request), None)
+            if ctx is not None:
+                await ctx.release()
+
+        if raw_request is None:
+            return await _registry_acquire()
+
+        return await _wait_with_disconnect(
+            _registry_acquire(),
+            raw_request,
+            timeout=_remaining_request_timeout(total_timeout, deadline),
+            timeout_detail_seconds=total_timeout,
+            cleanup_result=lambda _r: _registry_cleanup(_r),
+        )
+
     if count_activity:
         acquire_coro = _acquire_default_engine()
         cleanup = lambda _result: _release_default_engine()
@@ -4023,6 +4060,36 @@ async def _acquire_default_engine_for_request(
         timeout_detail_seconds=total_timeout,
         cleanup_result=cleanup,
     )
+
+
+async def _release_engine_for_request(raw_request: Request | None) -> None:
+    """Release the engine acquired for this request.
+
+    In registry mode, releases the model lease stashed by
+    ``_acquire_default_engine_for_request``.  In single-model mode, falls
+    through to the default release path.
+    """
+    if raw_request is not None:
+        ctx = _active_request_contexts.pop(id(raw_request), None)
+        if ctx is not None:
+            await ctx.release()
+            return
+    await _release_default_engine()
+
+
+def _make_release_cleanup(raw_request: Request | None):
+    """Return a cleanup callable suitable for ``_disconnect_guard``."""
+    if _model_manager is not None and raw_request is not None:
+
+        async def _cleanup():
+            ctx = _active_request_contexts.pop(id(raw_request), None)
+            if ctx is not None:
+                await ctx.release()
+            else:
+                await _release_default_engine()
+
+        return _cleanup
+    return _release_default_engine
 
 
 # =============================================================================
@@ -4063,6 +4130,7 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
         raw_request,
         total_timeout=total_timeout,
         deadline=deadline,
+        model=request.model,
     )
     if engine is None:
         return Response(status_code=499)
@@ -4084,7 +4152,7 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
                         "data: [DONE]\n\n",
                     ),
                     raw_request,
-                    cleanup=_release_default_engine,
+                    cleanup=_make_release_cleanup(raw_request),
                     timeout=total_timeout,
                 ),
                 media_type="text/event-stream",
@@ -4169,7 +4237,7 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
         )
     finally:
         if release_on_exit:
-            await _release_default_engine()
+            await _release_engine_for_request(raw_request)
 
 
 @app.post(
@@ -4254,6 +4322,7 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
         raw_request,
         total_timeout=total_timeout,
         deadline=deadline,
+        model=request.model,
     )
     if engine is None:
         return Response(status_code=499)
@@ -4280,7 +4349,7 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
                         "data: [DONE]\n\n",
                     ),
                     raw_request,
-                    cleanup=_release_default_engine,
+                    cleanup=_make_release_cleanup(raw_request),
                     timeout=total_timeout,
                 ),
                 media_type="text/event-stream",
@@ -4364,7 +4433,7 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
         )
     finally:
         if release_on_exit:
-            await _release_default_engine()
+            await _release_engine_for_request(raw_request)
 
 
 def _normalize_messages(messages: list[dict]) -> list[dict]:
@@ -4645,6 +4714,7 @@ async def create_anthropic_message(
         request,
         total_timeout=total_timeout,
         deadline=deadline,
+        model=openai_request.model,
     )
     if engine is None:
         return Response(status_code=499)
@@ -4673,7 +4743,7 @@ async def create_anthropic_message(
                         anthropic_terminal,
                     ),
                     request,
-                    cleanup=_release_default_engine,
+                    cleanup=_make_release_cleanup(raw_request),
                     timeout=total_timeout,
                 ),
                 media_type="text/event-stream",
@@ -4800,7 +4870,7 @@ async def create_anthropic_message(
         )
     finally:
         if release_on_exit:
-            await _release_default_engine()
+            await _release_engine_for_request(raw_request)
 
 
 @app.post(
@@ -4826,6 +4896,7 @@ async def count_anthropic_tokens(request: Request):
         total_timeout=total_timeout,
         deadline=deadline,
         count_activity=False,
+        model=request_model,
     )
     if engine is None:
         return Response(status_code=499)
@@ -4887,7 +4958,7 @@ async def count_anthropic_tokens(request: Request):
 
         return {"input_tokens": total_tokens}
     finally:
-        await _release_default_engine(count_activity=False)
+        await _release_engine_for_request(request)
 
 
 def _emit_content_pieces(
