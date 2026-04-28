@@ -56,3 +56,26 @@ def server_url(request):
 def anyio_backend():
     """Run anyio-marked tests on asyncio only."""
     return "asyncio"
+
+
+@pytest.fixture(autouse=True, scope="session")
+def _bind_mlx_default_stream():
+    """Ensure the main-thread default MLX stream is set once at session start.
+
+    Tests that create worker threads with ``bind_generation_streams`` allocate
+    new MLX streams and call ``mx.set_default_stream``.  Because MLX streams
+    are thread-local, this is harmless to the main thread.  However, if a test
+    *on the main thread* calls ``bind_generation_streams`` (e.g. via
+    ``generate_batch_sync`` or a monkeypatch), the default stream changes and
+    later tests that assume the original default stream will fail with
+    ``RuntimeError: There is no Stream(gpu, N) in current thread``.
+
+    Binding once at session start gives all main-thread tests a known-good
+    default stream.
+    """
+    try:
+        import mlx.core as mx
+
+        mx.set_default_stream(mx.new_stream(mx.default_device()))
+    except ImportError:
+        pass
