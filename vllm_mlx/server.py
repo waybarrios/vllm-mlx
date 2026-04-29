@@ -444,8 +444,37 @@ class _ThinkingAwareLogitsProcessor:
         self._inner = inner
         self._active = False
         self._in_thinking: bool | None = None  # None = not yet determined
+        self._waiting_for_json = False  # Waiting for { or [ before activating
         self._base_prompt_len: int | None = None
+        self._json_scan_offset: int | None = None  # Absolute offset to start scanning
         self._tokenizer = inner._tokenizer
+
+    def _scan_for_json_start(self, tokens_list, tokens, logits):
+        """Scan generated tokens for the first ``{`` or ``[``.
+
+        Scans from ``_json_scan_offset`` (set when entering the waiting
+        phase) so that thinking-span tokens are never considered.  After
+        50 tokens past the scan offset without a JSON start character the
+        enforcer is force-activated as a safety net.
+        """
+        n = len(tokens_list)
+        start = self._json_scan_offset
+        scan_tokens = tokens_list[start:]
+        for i in range(len(scan_tokens)):
+            try:
+                decoded = self._tokenizer.decode([scan_tokens[i]])
+            except Exception:
+                continue
+            if any(c in decoded for c in ("{", "[")):
+                self._active = True
+                self._inner._prompt_len = start + i
+                return self._inner(tokens, logits)
+        # Safety: >50 tokens past scan offset without JSON start
+        if len(scan_tokens) > 50:
+            self._active = True
+            self._inner._prompt_len = n
+            return self._inner(tokens, logits)
+        return logits
 
     def __call__(self, tokens, logits):
         if self._active:
@@ -461,6 +490,10 @@ class _ThinkingAwareLogitsProcessor:
         if self._base_prompt_len is None:
             self._base_prompt_len = max(0, n - 1)
 
+        # --- Phase: waiting for JSON start ({ or [) ---
+        if self._waiting_for_json:
+            return self._scan_for_json_start(tokens_list, tokens, logits)
+
         gen_tokens = tokens_list[self._base_prompt_len :]
         if not gen_tokens:
             return logits
@@ -474,10 +507,10 @@ class _ThinkingAwareLogitsProcessor:
             if "<think>" in text:
                 self._in_thinking = True
             elif len(gen_tokens) >= 3:
-                # Model is generating content directly — activate constraining.
-                self._active = True
-                self._inner._prompt_len = self._base_prompt_len
-                return self._inner(tokens, logits)
+                # No <think> detected — scan for JSON start immediately.
+                self._waiting_for_json = True
+                self._json_scan_offset = self._base_prompt_len
+                return self._scan_for_json_start(tokens_list, tokens, logits)
             else:
                 return logits  # Wait for more tokens to decide.
 
@@ -489,9 +522,10 @@ class _ThinkingAwareLogitsProcessor:
             except Exception:
                 return logits
             if "</think>" in recent:
-                self._active = True
-                self._inner._prompt_len = n
-                return logits  # Don't constrain the token closing thinking.
+                # Thinking ended — scan only tokens AFTER the thinking span.
+                self._waiting_for_json = True
+                self._json_scan_offset = n
+                return self._scan_for_json_start(tokens_list, tokens, logits)
 
         return logits
 
