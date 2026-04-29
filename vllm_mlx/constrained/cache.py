@@ -168,8 +168,6 @@ def get_tokenizer_data(tokenizer: Any) -> Any | None:
             regular_tokens,
             decode_fn,
             eos_token_id,
-            False,  # use_bitmask
-            vocab_size,
         )
     except Exception as exc:
         logger.warning("Failed to build TokenEnforcerTokenizerData: %s", exc)
