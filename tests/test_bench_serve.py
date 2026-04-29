@@ -19,10 +19,12 @@ from vllm_mlx.bench_serve import (
     Workload,
     WorkloadCase,
     _validate_sql_identifier,
+    accumulate_tool_calls,
     compute_request_metrics,
     compute_summary_stats,
     detect_hardware_fingerprint,
     expand_sweep,
+    finalize_tool_calls,
     format_csv,
     format_json,
     format_sql,
@@ -674,6 +676,81 @@ class TestSSEParsing:
         assert result is not None
         assert result["finish_reason"] == "stop"
 
+    def test_parse_tool_call_delta(self):
+        chunk = {
+            "id": "chatcmpl-test",
+            "choices": [
+                {
+                    "delta": {
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                "id": "call_1",
+                                "type": "function",
+                                "function": {
+                                    "name": "get_weather",
+                                    "arguments": '{"city"',
+                                },
+                            }
+                        ]
+                    },
+                    "finish_reason": None,
+                }
+            ],
+        }
+
+        result = parse_sse_line(f"data: {json.dumps(chunk)}")
+
+        assert result is not None
+        assert result["tool_calls_delta"][0]["function"]["name"] == "get_weather"
+
+
+class TestToolCallAccumulation:
+    """Unit tests for streamed tool-call delta accumulation."""
+
+    def test_accumulates_split_arguments(self):
+        acc: dict[int, dict] = {}
+
+        accumulate_tool_calls(
+            acc,
+            [
+                {
+                    "index": 0,
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "get_weather", "arguments": '{"city"'},
+                }
+            ],
+        )
+        accumulate_tool_calls(
+            acc,
+            [{"index": 0, "function": {"arguments": ': "Tokyo"}'}}],
+        )
+
+        assert finalize_tool_calls(acc) == [
+            {
+                "id": "call_1",
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "arguments": '{"city": "Tokyo"}',
+                },
+            }
+        ]
+
+    def test_preserves_index_order(self):
+        acc: dict[int, dict] = {}
+
+        accumulate_tool_calls(
+            acc,
+            [
+                {"index": 1, "function": {"name": "b", "arguments": "{}"}},
+                {"index": 0, "function": {"name": "a", "arguments": "{}"}},
+            ],
+        )
+
+        assert [tc["function"]["name"] for tc in finalize_tool_calls(acc)] == ["a", "b"]
+
 
 # ---------------------------------------------------------------------------
 # TestRequestMetrics  (Task 4)
@@ -799,6 +876,22 @@ class TestValidation:
         assert is_valid is False
         assert "empty" in msg.lower()
 
+    def test_empty_content_with_tool_call_is_valid(self):
+        is_valid, msg = validate_response(
+            finish_reason="tool_calls",
+            content="",
+            status_code=200,
+            tool_calls=[
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "get_weather", "arguments": "{}"},
+                }
+            ],
+        )
+        assert is_valid is True
+        assert msg == ""
+
     def test_length_truncation(self):
         is_valid, msg = validate_response(
             finish_reason="length", content="partial text", status_code=200
@@ -878,6 +971,44 @@ class TestQualityChecks:
         )
         assert ok is False
         assert any("invalid forbidden_regex" in i for i in issues)
+
+    def test_tool_call_checks(self):
+        tool_calls = [
+            {
+                "id": "call_1",
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "arguments": '{"city": "Tokyo"}',
+                },
+            }
+        ]
+
+        ok, issues = validate_quality_checks(
+            "tool_calls",
+            "",
+            {
+                "finish_reason": "tool_calls",
+                "tool_call_count": 1,
+                "tool_call_names": ["get_weather"],
+                "tool_call_args_required_keys": {"get_weather": ["city"]},
+            },
+            tool_calls=tool_calls,
+        )
+
+        assert ok is True
+        assert issues == []
+
+    def test_required_tool_call_name_must_exist(self):
+        ok, issues = validate_quality_checks(
+            "tool_calls",
+            "",
+            {"tool_call_args_required_keys": {"get_weather": ["city"]}},
+            tool_calls=[],
+        )
+
+        assert ok is False
+        assert any("no tool call named 'get_weather'" in issue for issue in issues)
 
 
 class TestWorkloadChecksMerge:

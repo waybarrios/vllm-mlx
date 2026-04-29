@@ -5,6 +5,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from vllm_mlx.engine.batched import _normalize_tool_call_arguments_for_template
+
 
 class TestBatchedEngineGenerate:
     """Test BatchedEngine.generate() output fields."""
@@ -182,3 +184,54 @@ class TestBatchedEngineAbortRequest:
         engine._engine = None
 
         assert await engine.abort_request("req-1") is False
+
+
+class TestToolCallReplayNormalization:
+    """Tests for OpenAI tool-call replay normalization before chat templating."""
+
+    def test_parses_function_arguments_string_to_mapping(self):
+        messages = [
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {
+                            "name": "get_weather",
+                            "arguments": '{"city": "Tokyo"}',
+                        },
+                    }
+                ],
+            }
+        ]
+
+        normalized = _normalize_tool_call_arguments_for_template(messages)
+
+        assert normalized[0]["tool_calls"][0]["function"]["arguments"] == {
+            "city": "Tokyo"
+        }
+        assert messages[0]["tool_calls"][0]["function"]["arguments"] == (
+            '{"city": "Tokyo"}'
+        )
+
+    def test_wraps_non_mapping_arguments_for_template_items(self):
+        messages = [
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "function": {
+                            "name": "echo",
+                            "arguments": '["not", "object"]',
+                        }
+                    }
+                ],
+            }
+        ]
+
+        normalized = _normalize_tool_call_arguments_for_template(messages)
+
+        assert normalized[0]["tool_calls"][0]["function"]["arguments"] == {
+            "value": ["not", "object"]
+        }

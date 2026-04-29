@@ -657,7 +657,8 @@ def parse_sse_line(line: str) -> Optional[dict]:
         parsed and a dict is returned::
 
             {"id": Optional[str], "content": str,
-             "finish_reason": Optional[str], "usage": Optional[dict]}
+             "finish_reason": Optional[str], "usage": Optional[dict],
+             "tool_calls_delta": Optional[list]}
 
         Missing keys (``choices``, ``delta``, ``content``) are handled
         gracefully and default to empty string / ``None``.
@@ -683,12 +684,14 @@ def parse_sse_line(line: str) -> Optional[dict]:
     content = delta.get("content", "") or ""
     finish_reason = choices[0].get("finish_reason") if choices else None
     usage = chunk.get("usage")
+    tool_calls_delta = delta.get("tool_calls")
 
     return {
         "id": chunk.get("id"),
         "content": content,
         "finish_reason": finish_reason,
         "usage": usage,
+        "tool_calls_delta": tool_calls_delta,
     }
 
 
@@ -706,6 +709,33 @@ async def _cancel_server_request(
         # Older servers may not expose request cancellation. Closing the stream
         # still gives the server disconnect signal; this endpoint is best effort.
         pass
+
+
+def accumulate_tool_calls(acc: dict[int, dict], delta_list: list[dict]) -> None:
+    """Merge streamed OpenAI tool-call deltas into *acc* by index."""
+    for tc_delta in delta_list:
+        idx = int(tc_delta.get("index", 0))
+        if idx not in acc:
+            acc[idx] = {
+                "id": tc_delta.get("id", ""),
+                "type": tc_delta.get("type", "function"),
+                "function": {"name": "", "arguments": ""},
+            }
+        entry = acc[idx]
+        if tc_delta.get("id"):
+            entry["id"] = tc_delta["id"]
+        if tc_delta.get("type"):
+            entry["type"] = tc_delta["type"]
+        function_delta = tc_delta.get("function") or {}
+        if function_delta.get("name"):
+            entry["function"]["name"] += function_delta["name"]
+        if function_delta.get("arguments"):
+            entry["function"]["arguments"] += function_delta["arguments"]
+
+
+def finalize_tool_calls(acc: dict[int, dict]) -> list[dict]:
+    """Return accumulated tool calls in stream index order."""
+    return [acc[idx] for idx in sorted(acc)]
 
 
 def compute_request_metrics(
@@ -852,6 +882,7 @@ async def stream_chat_completion(
     finish_reason: Optional[str] = None
     usage: Optional[dict] = None
     request_id: Optional[str] = None
+    tool_calls_acc: dict[int, dict] = {}
 
     async def _consume_stream() -> None:
         nonlocal finish_reason, request_id, t_first_token, usage
@@ -869,6 +900,13 @@ async def stream_chat_completion(
                     usage = parsed["usage"]
                 if parsed.get("finish_reason"):
                     finish_reason = parsed["finish_reason"]
+                tc_delta = parsed.get("tool_calls_delta")
+                if tc_delta:
+                    now = time.perf_counter()
+                    if t_first_token is None:
+                        t_first_token = now
+                    token_times.append(now)
+                    accumulate_tool_calls(tool_calls_acc, tc_delta)
                 chunk_content = parsed.get("content", "")
                 if chunk_content:
                     now = time.perf_counter()
@@ -911,6 +949,7 @@ async def stream_chat_completion(
         "prompt_tokens": prompt_tokens,
         "finish_reason": finish_reason,
         "content": "".join(content_parts),
+        "tool_calls": finalize_tool_calls(tool_calls_acc),
     }
 
 
@@ -923,6 +962,8 @@ def validate_response(
     finish_reason: Optional[str],
     content: str,
     status_code: int,
+    *,
+    tool_calls: Optional[list[dict]] = None,
 ) -> tuple[bool, str]:
     """Validate a single streaming response result.
 
@@ -944,7 +985,7 @@ def validate_response(
         return (False, "Missing finish_reason")
     if finish_reason == "length":
         return (False, "Truncated (finish_reason=length)")
-    if not content:
+    if not content and not tool_calls:
         return (False, "Empty response content")
     return (True, "")
 
@@ -955,6 +996,7 @@ def validate_quality_checks(
     checks: Optional[dict],
     *,
     status_code: int = 200,
+    tool_calls: Optional[list[dict]] = None,
 ) -> tuple[bool, list[str]]:
     """Validate content against generic workload quality checks.
 
@@ -964,10 +1006,17 @@ def validate_quality_checks(
     - ``forbidden_regex``: list of regex patterns that must not match
     - ``min_chars`` / ``max_chars``: length bounds
     - ``json``: when true, content must parse as JSON
+    - ``tool_call_count``: exact number of streamed tool calls
+    - ``tool_call_names``: expected function names, order-independent
+    - ``tool_call_args_required_keys``: required JSON argument keys by function
+    - ``no_tool_calls``: assert that no tool calls were emitted
     """
-    basic_ok, basic_issue = validate_response(finish_reason, content, status_code)
+    basic_ok, basic_issue = validate_response(
+        finish_reason, content, status_code, tool_calls=tool_calls
+    )
     issues: list[str] = [] if basic_ok else [basic_issue]
     checks = checks or {}
+    tool_calls = tool_calls or []
 
     allowed_finish = checks.get("finish_reason")
     if allowed_finish is not None:
@@ -1008,6 +1057,59 @@ def validate_quality_checks(
             json.loads(content)
         except json.JSONDecodeError as exc:
             issues.append(f"content is not valid JSON: {exc}")
+
+    if checks.get("no_tool_calls") and tool_calls:
+        issues.append(f"no_tool_calls: expected 0 tool calls, got {len(tool_calls)}")
+
+    expected_count = checks.get("tool_call_count")
+    if expected_count is not None and len(tool_calls) != int(expected_count):
+        issues.append(
+            f"tool_call_count: expected {expected_count}, got {len(tool_calls)}"
+        )
+
+    expected_names = checks.get("tool_call_names")
+    if expected_names is not None:
+        actual_names = sorted(
+            tc.get("function", {}).get("name", "") for tc in tool_calls
+        )
+        expected_sorted = sorted(str(name) for name in expected_names)
+        if actual_names != expected_sorted:
+            issues.append(
+                f"tool_call_names: expected {expected_sorted!r}, got {actual_names!r}"
+            )
+
+    required_args = checks.get("tool_call_args_required_keys") or {}
+    if required_args:
+        by_name: dict[str, list[dict]] = {}
+        for tc in tool_calls:
+            name = tc.get("function", {}).get("name", "")
+            by_name.setdefault(name, []).append(tc)
+        for name, required_keys in required_args.items():
+            matches = by_name.get(str(name), [])
+            if not matches:
+                issues.append(
+                    f"tool_call_args_required_keys: no tool call named {name!r}"
+                )
+                continue
+            for tc in matches:
+                raw_args = tc.get("function", {}).get("arguments", "")
+                try:
+                    parsed_args = json.loads(raw_args or "{}")
+                except json.JSONDecodeError as exc:
+                    issues.append(
+                        f"tool_call_args_required_keys: {name} arguments invalid JSON: {exc}"
+                    )
+                    continue
+                if not isinstance(parsed_args, dict):
+                    issues.append(
+                        f"tool_call_args_required_keys: {name} arguments not an object"
+                    )
+                    continue
+                missing = [key for key in required_keys if key not in parsed_args]
+                if missing:
+                    issues.append(
+                        f"tool_call_args_required_keys: {name} missing keys {missing!r}"
+                    )
 
     return (not issues, issues)
 
@@ -1174,6 +1276,7 @@ async def run_workload_case(
             "completion_tokens": 0,
             "finish_reason": None,
             "content": "",
+            "tool_calls": [],
         }
         error = str(exc)
 
@@ -1202,6 +1305,7 @@ async def run_workload_case(
         content,
         case.checks,
         status_code=500 if error else 200,
+        tool_calls=result.get("tool_calls") or [],
     )
     if error:
         quality_issues.append(f"request error: {error}")
@@ -1258,6 +1362,18 @@ async def run_workload_case(
             "content_chars": len(content),
             "content_preview": content[:240],
         },
+        "tool_calls": (
+            {
+                "count": len(result.get("tool_calls") or []),
+                "names": sorted(
+                    tc.get("function", {}).get("name", "")
+                    for tc in (result.get("tool_calls") or [])
+                ),
+                "raw": result.get("tool_calls") or [],
+            }
+            if result.get("tool_calls")
+            else None
+        ),
         "ok": quality_ok,
     }
     if include_content:
