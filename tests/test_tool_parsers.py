@@ -10,6 +10,7 @@ from vllm_mlx.tool_parsers import (
     DeepSeekToolParser,
     FunctionaryToolParser,
     Gemma4ToolParser,
+    Glm47ToolParser,
     GraniteToolParser,
     HermesToolParser,
     KimiToolParser,
@@ -859,9 +860,7 @@ class TestQwen3CoderParser:
     def test_bare_function_without_tool_call_wrapper(self):
         """Test bare <function=...> blocks without <tool_call> wrapper."""
         parser = HermesToolParser()
-        text = (
-            "<function=get_weather>" "<parameter=city>Berlin</parameter>" "</function>"
-        )
+        text = "<function=get_weather><parameter=city>Berlin</parameter></function>"
         result = parser.extract_tool_calls(text)
 
         assert result.tools_called
@@ -1405,3 +1404,59 @@ class TestQwenStreamingBuffering:
         assert len(emitted_calls) == 2
         assert emitted_calls[0]["function"]["name"] == "func1"
         assert emitted_calls[1]["function"]["name"] == "func2"
+
+
+class TestGLM47ToolParser:
+    """Tests for GLM47 tool parser."""
+
+    def test_zero_arguments_tool_call(self):
+        """Test Fix 2: Handle zero-argument tool calls without crashing."""
+        parser = Glm47ToolParser()
+
+        output = "<tool_call>get_current_time</tool_call>"
+
+        result = parser.extract_tool_calls(output)
+
+        assert result.tools_called is True
+        assert len(result.tool_calls) == 1
+        assert result.tool_calls[0]["name"] == "get_current_time"
+        args = json.loads(result.tool_calls[0]["arguments"])
+        assert args == {}
+
+    def test_with_arguments(self):
+        """Test tool call with arguments."""
+        parser = Glm47ToolParser()
+
+        output = "<tool_call>search\n<arg_key>query</arg_key><arg_value>Python</arg_value></tool_call>"
+
+        result = parser.extract_tool_calls(output)
+
+        assert result.tools_called is True
+        assert len(result.tool_calls) == 1
+        assert result.tool_calls[0]["name"] == "search"
+        args = json.loads(result.tool_calls[0]["arguments"])
+        assert args["query"] == "Python"
+
+    def test_streaming_zero_args(self):
+        """Test Fix 2: Streaming with zero-argument tool call."""
+        parser = Glm47ToolParser()
+
+        chunks = ["<tool_call>", "get_status", "</tool_call>"]
+        accumulated = ""
+        tool_calls_found = False
+
+        for chunk in chunks:
+            prev = accumulated
+            accumulated += chunk
+            r = parser.extract_tool_calls_streaming(
+                previous_text=prev,
+                current_text=accumulated,
+                delta_text=chunk,
+            )
+            if r is not None and "tool_calls" in r:
+                tool_calls_found = True
+                assert r["tool_calls"][0]["function"]["name"] == "get_status"
+                args = json.loads(r["tool_calls"][0]["function"]["arguments"])
+                assert args == {}
+
+        assert tool_calls_found, "Zero-argument tool call should have been detected"
