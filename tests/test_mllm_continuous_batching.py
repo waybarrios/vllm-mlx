@@ -1010,7 +1010,13 @@ class TestMLLMBatchGeneratorMTPGuards:
         assert stats["requested_draft_tokens"] == 4
         assert stats["effective_draft_tokens"] == 1
         assert stats["attempted"] == 0
-        assert "non_greedy_sampling" in stats["bypass_reasons"]
+        assert stats["bypass_counts"] == {
+            "prefill": 0,
+            "no_active_batch": 0,
+            "concurrent_batch": 0,
+            "non_greedy_sampling": 0,
+            "logits_processors": 0,
+        }
 
         logits_processor = MagicMock()
         tokens, logprobs = batch_gen._step(
@@ -1028,7 +1034,9 @@ class TestMLLMBatchGeneratorMTPGuards:
         original_step.assert_called_once()
         language_model.assert_not_called()
         language_model.mtp_forward.assert_not_called()
-        assert batch_gen.get_mtp_stats()["attempted"] == 0
+        stats = batch_gen.get_mtp_stats()
+        assert stats["attempted"] == 0
+        assert stats["bypass_counts"]["logits_processors"] == 1
 
     def test_install_mtp_mllm_disables_mtp_for_non_greedy_sampling(self):
         from vllm_mlx.mllm_batch_generator import install_mtp_mllm
@@ -1073,6 +1081,75 @@ class TestMLLMBatchGeneratorMTPGuards:
         original_step.assert_called_once()
         language_model.assert_not_called()
         language_model.mtp_forward.assert_not_called()
+        stats = batch_gen.get_mtp_stats()
+        assert stats["attempted"] == 0
+        assert stats["bypass_counts"]["non_greedy_sampling"] == 1
+
+    def test_install_mtp_mllm_counts_structural_bypasses(self):
+        from vllm_mlx.mllm_batch_generator import install_mtp_mllm
+
+        expected_tokens = mx.array([11])
+        expected_logprobs = [mx.array([0.3, 0.7])]
+        original_step = MagicMock(return_value=(expected_tokens, expected_logprobs))
+
+        class FakeBatchGen:
+            def __init__(self):
+                self._step = original_step
+                self._next = MagicMock(return_value=[])
+                self.active_batch = MagicMock()
+                self.active_batch.__len__.return_value = 1
+                self.active_batch.requests = [
+                    MagicMock(
+                        temperature=0.0,
+                        top_p=1.0,
+                        top_k=0,
+                        min_p=0.0,
+                    )
+                ]
+                self.sampler = MagicMock()
+
+        batch_gen = FakeBatchGen()
+        language_model = MagicMock()
+
+        install_mtp_mllm(batch_gen, language_model, num_draft_tokens=4)
+
+        batch_gen._step(
+            mx.array([[1, 2]]),
+            cache=[],
+            logits_processors=None,
+            output_tokens=None,
+            samplers=None,
+        )
+        batch_gen.active_batch = None
+        batch_gen._step(
+            mx.array([[3]]),
+            cache=[],
+            logits_processors=None,
+            output_tokens=None,
+            samplers=None,
+        )
+        batch_gen.active_batch = MagicMock()
+        batch_gen.active_batch.__len__.return_value = 2
+        batch_gen.active_batch.requests = [
+            MagicMock(temperature=0.0, top_p=1.0, top_k=0, min_p=0.0),
+            MagicMock(temperature=0.0, top_p=1.0, top_k=0, min_p=0.0),
+        ]
+        batch_gen._step(
+            mx.array([[4]]),
+            cache=[],
+            logits_processors=None,
+            output_tokens=None,
+            samplers=None,
+        )
+
+        assert original_step.call_count == 3
+        language_model.assert_not_called()
+        language_model.mtp_forward.assert_not_called()
+        stats = batch_gen.get_mtp_stats()
+        assert stats["attempted"] == 0
+        assert stats["bypass_counts"]["prefill"] == 1
+        assert stats["bypass_counts"]["no_active_batch"] == 1
+        assert stats["bypass_counts"]["concurrent_batch"] == 1
 
     def test_install_mtp_mllm_accepted_drafts_bypass_request_sampler(self):
         from vllm_mlx.mllm_batch_generator import MLLMBatchResponse, install_mtp_mllm

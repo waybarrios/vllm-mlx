@@ -501,6 +501,39 @@ class TestStatusEndpointEngineRace:
         assert result["status"] == "healthy"
         assert result["model_loaded"] is False
 
+    @pytest.mark.anyio
+    async def test_status_endpoint_returns_disabled_mtp_object_when_absent(
+        self, monkeypatch
+    ):
+        """/v1/status should keep the mtp field object-shaped when MTP is off."""
+        import vllm_mlx.server as srv
+
+        class EngineWithoutMTPStats:
+            def get_stats(self):
+                return {
+                    "running": True,
+                    "uptime_seconds": 10,
+                    "steps_executed": 1,
+                    "num_running": 0,
+                    "num_waiting": 0,
+                    "num_requests_processed": 0,
+                    "total_prompt_tokens": 0,
+                    "total_completion_tokens": 0,
+                    "metal_active_memory_gb": 0,
+                    "metal_peak_memory_gb": 0,
+                    "metal_cache_memory_gb": 0,
+                    "requests": [],
+                }
+
+        monkeypatch.setattr(srv, "_engine", EngineWithoutMTPStats())
+        monkeypatch.setattr(srv, "_model_name", "test")
+        monkeypatch.setattr(srv, "_residency_manager", None)
+        monkeypatch.setattr(srv, "_default_model_key", None)
+
+        result = await srv.status()
+
+        assert result["mtp"] == {"enabled": False}
+
 
 class TestToolParserUsesLocalEngine:
     """Tool parser should initialize from the request-local engine."""
