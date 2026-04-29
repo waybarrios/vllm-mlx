@@ -1973,8 +1973,41 @@ def install_mtp_mllm(
     # Deferred drafts keyed by UID
     _deferred_drafts: Dict[int, dict] = {}
 
-    # MTP stats
-    _mtp_stats = {"accepted": 0, "rejected": 0, "errors": 0}
+    # MTP stats. These are intentionally exposed through get_mtp_stats() so
+    # /v1/status can distinguish "weights injected" from useful draft work.
+    _mtp_stats_lock = threading.Lock()
+    _mtp_stats = {"attempted": 0, "accepted": 0, "rejected": 0, "errors": 0}
+    _bypass_counts = {
+        "prefill": 0,
+        "no_active_batch": 0,
+        "concurrent_batch": 0,
+        "non_greedy_sampling": 0,
+        "logits_processors": 0,
+    }
+
+    def _get_mtp_stats() -> Dict[str, Any]:
+        with _mtp_stats_lock:
+            attempted = _mtp_stats["attempted"]
+            accepted = _mtp_stats["accepted"]
+            rejected = _mtp_stats["rejected"]
+            errors = _mtp_stats["errors"]
+            bypass_counts = dict(_bypass_counts)
+        verified = accepted + rejected
+        acceptance_rate = accepted / verified if verified > 0 else 0.0
+        return {
+            "enabled": True,
+            "requested_draft_tokens": num_draft_tokens,
+            "effective_draft_tokens": 1,
+            "mode": "always_advance_verified",
+            "attempted": attempted,
+            "accepted": accepted,
+            "rejected": rejected,
+            "errors": errors,
+            "acceptance_rate": acceptance_rate,
+            "bypass_counts": bypass_counts,
+        }
+
+    batch_gen.get_mtp_stats = _get_mtp_stats
 
     def _mtp_step(
         input_tokens: mx.array,
@@ -2006,13 +2039,40 @@ def install_mtp_mllm(
         # from the greedy draft/argmax verify path; they do not pass through the
         # request-local sampler. Non-greedy decoding needs a sampler-aware
         # verifier before this guard can be safely relaxed.
+        prefill_bypass = input_tokens.shape[1] > 1
+        no_active_batch_bypass = batch_gen.active_batch is None
+        concurrent_batch_bypass = (
+            batch_gen.active_batch is not None and len(batch_gen.active_batch) > 1
+        )
+        non_greedy_bypass = has_non_greedy_sampling
+        logits_processors_bypass = logits_processors is not None and any(
+            logits_processors
+        )
         if (
-            input_tokens.shape[1] > 1
-            or batch_gen.active_batch is None
-            or len(batch_gen.active_batch) > 1
-            or has_non_greedy_sampling
-            or (logits_processors is not None and any(logits_processors))
+            prefill_bypass
+            or no_active_batch_bypass
+            or concurrent_batch_bypass
+            or non_greedy_bypass
+            or logits_processors_bypass
         ):
+            # Keep the descriptions near the guards so operator-facing
+            # telemetry stays dynamic instead of duplicating code predicates:
+            # prefill=input_tokens.shape[1] > 1
+            # no_active_batch=active_batch is None
+            # concurrent_batch=len(active_batch) > 1
+            # non_greedy_sampling=request sampler is not greedy
+            # logits_processors=request-local processors are active
+            with _mtp_stats_lock:
+                if prefill_bypass:
+                    _bypass_counts["prefill"] += 1
+                if no_active_batch_bypass:
+                    _bypass_counts["no_active_batch"] += 1
+                if concurrent_batch_bypass:
+                    _bypass_counts["concurrent_batch"] += 1
+                if non_greedy_bypass:
+                    _bypass_counts["non_greedy_sampling"] += 1
+                if logits_processors_bypass:
+                    _bypass_counts["logits_processors"] += 1
             _skip_state[0] = None
             return _orig_step(
                 input_tokens, cache, logits_processors, output_tokens, samplers
@@ -2067,6 +2127,8 @@ def install_mtp_mllm(
 
         # MTP draft + always-advance verify
         try:
+            with _mtp_stats_lock:
+                _mtp_stats["attempted"] += 1
             draft_logits = language_model.mtp_forward(
                 hidden_states[:, -1:, :],
                 primary_tokens[:, None],
@@ -2123,7 +2185,8 @@ def install_mtp_mllm(
                         "token": draft_list[e],
                         "logprobs": verify_lp[e],
                     }
-                _mtp_stats["accepted"] += 1
+                with _mtp_stats_lock:
+                    _mtp_stats["accepted"] += 1
 
             else:
                 # REJECT
@@ -2181,19 +2244,22 @@ def install_mtp_mllm(
                         _skip_state[0] = None
                 for uid in current_uids:
                     _deferred_drafts.pop(uid, None)
-                _mtp_stats["rejected"] += 1
+                with _mtp_stats_lock:
+                    _mtp_stats["rejected"] += 1
 
         except Exception as e:
             logger.warning(f"[MTP-MLLM] draft/verify failed: {e}")
             _skip_state[0] = None
-            _mtp_stats["errors"] += 1
+            with _mtp_stats_lock:
+                _mtp_stats["errors"] += 1
 
         # Log MTP stats every 50 steps
-        total = _mtp_stats["accepted"] + _mtp_stats["rejected"] + _mtp_stats["errors"]
-        if total > 0 and total % 50 == 0:
+        with _mtp_stats_lock:
             acc = _mtp_stats["accepted"]
             rej = _mtp_stats["rejected"]
             err = _mtp_stats["errors"]
+        total = acc + rej + err
+        if total > 0 and total % 50 == 0:
             rate = acc / (acc + rej) * 100 if (acc + rej) > 0 else 0
             logger.info(
                 f"[MTP-MLLM] stats: accepted={acc} rejected={rej} "
