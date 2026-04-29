@@ -316,6 +316,15 @@ class BatchedEngine(BaseEngine):
 
         cache_memory_mb = getattr(self._scheduler_config, "cache_memory_mb", None)
         max_kv_size = getattr(self._scheduler_config, "max_kv_size", 0)
+        enable_prefix_cache = getattr(
+            self._scheduler_config, "enable_prefix_cache", True
+        )
+        use_memory_aware_cache = getattr(
+            self._scheduler_config, "use_memory_aware_cache", True
+        )
+        prefix_cache_memory_mb = getattr(
+            self._scheduler_config, "cache_memory_mb", None
+        )
         enable_mtp = (
             self._scheduler_config.enable_mtp if self._scheduler_config else False
         )
@@ -347,6 +356,9 @@ class BatchedEngine(BaseEngine):
             enable_vision_cache=True,
             vision_cache_size=100,
             cache_memory_mb=cache_memory_mb,
+            enable_prefix_cache=enable_prefix_cache,
+            use_memory_aware_cache=use_memory_aware_cache,
+            prefix_cache_memory_mb=prefix_cache_memory_mb,
             enable_mtp=enable_mtp,
             mtp_num_draft_tokens=mtp_num_draft,
             kv_cache_quantization=kv_quant,

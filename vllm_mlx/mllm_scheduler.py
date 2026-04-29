@@ -72,6 +72,9 @@ class MLLMSchedulerConfig:
     mtp_num_draft_tokens: int = 1
     # Enable KV prefix cache for text-only requests
     enable_prefix_cache: bool = True
+    # MLLM supports the memory-aware prefix cache only; if disabled, prefix
+    # caching is disabled rather than silently falling back to another cache.
+    use_memory_aware_cache: bool = True
     # Memory limit for prefix cache (None = auto-detect)
     prefix_cache_memory_mb: Optional[int] = None
     # KV cache quantization for prefix cache store/fetch
@@ -294,7 +297,7 @@ class MLLMScheduler:
             # Quantization happens on store(), dequantization on fetch() —
             # the model always receives normal KVCache with plain arrays.
             prefix_cache_config = None
-            if self.config.enable_prefix_cache:
+            if self.config.enable_prefix_cache and self.config.use_memory_aware_cache:
                 prefix_cache_config = MemoryCacheConfig(
                     max_memory_mb=self.config.prefix_cache_memory_mb,
                     kv_quantize=self.config.kv_cache_quantization,

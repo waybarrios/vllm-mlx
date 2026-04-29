@@ -1280,6 +1280,9 @@ class TestBatchedMLLMConfigWiring:
             prefill_batch_size=4,
             completion_batch_size=8,
             prefill_step_size=256,
+            enable_prefix_cache=False,
+            use_memory_aware_cache=False,
+            cache_memory_mb=123,
             enable_mtp=False,
         )
         engine = BatchedEngine(
@@ -1291,6 +1294,10 @@ class TestBatchedMLLMConfigWiring:
         asyncio.run(engine._start_mllm())
 
         assert captured["config_kwargs"]["prefill_step_size"] == 256
+        assert captured["config_kwargs"]["enable_prefix_cache"] is False
+        assert captured["config_kwargs"]["use_memory_aware_cache"] is False
+        assert captured["config_kwargs"]["cache_memory_mb"] == 123
+        assert captured["config_kwargs"]["prefix_cache_memory_mb"] == 123
 
 
 class TestPreprocessIdempotent:
