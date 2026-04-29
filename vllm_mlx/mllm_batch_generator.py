@@ -1973,8 +1973,35 @@ def install_mtp_mllm(
     # Deferred drafts keyed by UID
     _deferred_drafts: Dict[int, dict] = {}
 
-    # MTP stats
-    _mtp_stats = {"accepted": 0, "rejected": 0, "errors": 0}
+    # MTP stats. These are intentionally exposed through get_mtp_stats() so
+    # /v1/status can distinguish "weights injected" from useful draft work.
+    _mtp_stats = {"attempted": 0, "accepted": 0, "rejected": 0, "errors": 0}
+
+    def _get_mtp_stats() -> Dict[str, Any]:
+        verified = _mtp_stats["accepted"] + _mtp_stats["rejected"]
+        acceptance_rate = (
+            _mtp_stats["accepted"] / verified if verified > 0 else 0.0
+        )
+        return {
+            "enabled": True,
+            "requested_draft_tokens": num_draft_tokens,
+            "effective_draft_tokens": 1,
+            "mode": "always_advance_verified",
+            "attempted": _mtp_stats["attempted"],
+            "accepted": _mtp_stats["accepted"],
+            "rejected": _mtp_stats["rejected"],
+            "errors": _mtp_stats["errors"],
+            "acceptance_rate": acceptance_rate,
+            "bypass_reasons": {
+                "prefill": "input_tokens.shape[1] > 1",
+                "no_active_batch": "active_batch is None",
+                "concurrent_batch": "len(active_batch) > 1",
+                "non_greedy_sampling": "temperature/top_p/top_k/min_p not greedy",
+                "logits_processors": "request-local logits processors active",
+            },
+        }
+
+    batch_gen.get_mtp_stats = _get_mtp_stats
 
     def _mtp_step(
         input_tokens: mx.array,
@@ -2067,6 +2094,7 @@ def install_mtp_mllm(
 
         # MTP draft + always-advance verify
         try:
+            _mtp_stats["attempted"] += 1
             draft_logits = language_model.mtp_forward(
                 hidden_states[:, -1:, :],
                 primary_tokens[:, None],

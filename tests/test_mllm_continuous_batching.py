@@ -1005,6 +1005,13 @@ class TestMLLMBatchGeneratorMTPGuards:
 
         install_mtp_mllm(batch_gen, language_model, num_draft_tokens=4)
 
+        stats = batch_gen.get_mtp_stats()
+        assert stats["enabled"] is True
+        assert stats["requested_draft_tokens"] == 4
+        assert stats["effective_draft_tokens"] == 1
+        assert stats["attempted"] == 0
+        assert "non_greedy_sampling" in stats["bypass_reasons"]
+
         logits_processor = MagicMock()
         tokens, logprobs = batch_gen._step(
             mx.array([[123]]),
@@ -1021,6 +1028,7 @@ class TestMLLMBatchGeneratorMTPGuards:
         original_step.assert_called_once()
         language_model.assert_not_called()
         language_model.mtp_forward.assert_not_called()
+        assert batch_gen.get_mtp_stats()["attempted"] == 0
 
     def test_install_mtp_mllm_disables_mtp_for_non_greedy_sampling(self):
         from vllm_mlx.mllm_batch_generator import install_mtp_mllm
@@ -1130,6 +1138,9 @@ class TestMLLMBatchGeneratorMTPGuards:
         assert [r.token for r in responses] == [1, 2]
         assert request_sampler.call_count == 1
         assert batch_gen.sampler.call_count == 0
+        assert batch_gen.get_mtp_stats()["attempted"] == 1
+        assert batch_gen.get_mtp_stats()["accepted"] == 1
+        assert batch_gen.get_mtp_stats()["acceptance_rate"] == 1.0
 
     def test_next_keeps_retired_processors_by_default(self, monkeypatch):
         from vllm_mlx.mllm_batch_generator import (
