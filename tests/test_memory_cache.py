@@ -25,6 +25,7 @@ class TestMemoryCacheConfig:
         assert config.max_memory_percent == 0.20
         assert config.max_entries == 1000
         assert config.enable_memory_tracking is True
+        assert config.min_prefix_tokens == 128
 
     def test_custom_config(self):
         config = MemoryCacheConfig(
@@ -51,6 +52,10 @@ class TestMemoryCacheConfig:
     def test_invalid_max_entries(self):
         with pytest.raises(ValueError, match="max_entries"):
             MemoryCacheConfig(max_entries=0)
+
+    def test_invalid_min_prefix_tokens(self):
+        with pytest.raises(ValueError, match="min_prefix_tokens"):
+            MemoryCacheConfig(min_prefix_tokens=0)
 
     def test_compute_memory_limit_explicit(self):
         config = MemoryCacheConfig(max_memory_mb=1024)
@@ -239,7 +244,11 @@ class TestMemoryAwarePrefixCache:
     @pytest.fixture
     def small_cache(self, model):
         """Cache with 1MB limit."""
-        config = MemoryCacheConfig(max_memory_mb=1, max_entries=10)
+        config = MemoryCacheConfig(
+            max_memory_mb=1,
+            max_entries=10,
+            min_prefix_tokens=1,
+        )
         return MemoryAwarePrefixCache(model, config)
 
     @pytest.fixture
@@ -270,6 +279,26 @@ class TestMemoryAwarePrefixCache:
         assert result is kv  # Same reference, no copy
         assert remaining == []
 
+    def test_short_prefix_reuse_is_rejected(self, model, mock_kv_cache):
+        cache = MemoryAwarePrefixCache(
+            model,
+            MemoryCacheConfig(
+                max_memory_mb=10,
+                max_entries=10,
+                min_prefix_tokens=8,
+            ),
+        )
+        short_tokens = [1, 2, 3, 4, 5]
+        kv = mock_kv_cache(1000)
+
+        assert cache.store(short_tokens, kv) is False
+        assert len(cache) == 0
+
+        result, remaining = cache.fetch(short_tokens)
+        assert result is None
+        assert remaining == short_tokens
+        assert cache.get_stats()["misses"] == 1
+
     def test_fetch_prefix_match(self, small_cache, mock_kv_cache):
         # Store shorter sequence
         short_tokens = [1, 2, 3]
@@ -295,7 +324,11 @@ class TestMemoryAwarePrefixCache:
 
     def test_lru_eviction_on_memory_pressure(self, model, mock_kv_cache):
         # Create cache with 500KB limit
-        config = MemoryCacheConfig(max_memory_mb=0.5, max_entries=100)
+        config = MemoryCacheConfig(
+            max_memory_mb=0.5,
+            max_entries=100,
+            min_prefix_tokens=1,
+        )
         cache = MemoryAwarePrefixCache(model, config)
 
         # Store entries that together exceed limit
