@@ -1979,9 +1979,7 @@ def install_mtp_mllm(
 
     def _get_mtp_stats() -> Dict[str, Any]:
         verified = _mtp_stats["accepted"] + _mtp_stats["rejected"]
-        acceptance_rate = (
-            _mtp_stats["accepted"] / verified if verified > 0 else 0.0
-        )
+        acceptance_rate = _mtp_stats["accepted"] / verified if verified > 0 else 0.0
         return {
             "enabled": True,
             "requested_draft_tokens": num_draft_tokens,
