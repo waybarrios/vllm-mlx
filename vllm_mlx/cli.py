@@ -68,6 +68,22 @@ def serve_command(args):
         print("Error: --max-tokens cannot exceed --max-request-tokens")
         sys.exit(1)
 
+    # Validate --turbo-kv-bits capability before spinning up model/server
+    if args.turbo_kv_bits is not None:
+        if args.kv_cache_quantization:
+            print(
+                "Error: --turbo-kv-bits and --kv-cache-quantization are mutually "
+                "exclusive; pick one compression path"
+            )
+            sys.exit(1)
+
+        from .memory_cache import _check_turboquant_capability
+
+        missing = _check_turboquant_capability()
+        if missing is not None:
+            print(f"Error: --turbo-kv-bits requires TurboQuant support: {missing}")
+            sys.exit(1)
+
     # Configure server security settings
     server._api_key = args.api_key
     server._default_timeout = args.timeout
@@ -250,6 +266,8 @@ def serve_command(args):
             mllm_prefill_step_size=(
                 args.mllm_prefill_step_size if args.mllm_prefill_step_size > 0 else None
             ),
+            # TurboQuant
+            turbo_kv_bits=args.turbo_kv_bits,
             # SSD cache tiering
             ssd_cache_dir=getattr(args, "ssd_cache_dir", None),
             ssd_cache_max_gb=getattr(args, "ssd_cache_max_gb", 10.0),
@@ -274,7 +292,9 @@ def serve_command(args):
                 else f"{args.cache_memory_percent*100:.0f}% of RAM"
             )
             print(f"Memory-aware cache: {cache_info}")
-            if args.kv_cache_quantization:
+            if args.turbo_kv_bits:
+                print(f"TurboQuant: {args.turbo_kv_bits}-bit prefix cache compression")
+            elif args.kv_cache_quantization:
                 print(
                     f"KV cache quantization: {args.kv_cache_quantization_bits}-bit, "
                     f"group_size={args.kv_cache_quantization_group_size}"
@@ -464,6 +484,22 @@ def bench_command(args):
     # Handle prefix cache flags
     enable_prefix_cache = args.enable_prefix_cache and not args.disable_prefix_cache
 
+    # Validate --turbo-kv-bits capability before loading the model
+    if args.turbo_kv_bits is not None:
+        if args.kv_cache_quantization:
+            print(
+                "Error: --turbo-kv-bits and --kv-cache-quantization are mutually "
+                "exclusive; pick one compression path"
+            )
+            sys.exit(1)
+
+        from .memory_cache import _check_turboquant_capability
+
+        missing = _check_turboquant_capability()
+        if missing is not None:
+            print(f"Error: --turbo-kv-bits requires TurboQuant support: {missing}")
+            sys.exit(1)
+
     async def run_benchmark():
         print(f"Loading model: {args.model}")
         model, tokenizer = load(args.model)
@@ -487,6 +523,8 @@ def bench_command(args):
             kv_cache_quantization_bits=args.kv_cache_quantization_bits,
             kv_cache_quantization_group_size=args.kv_cache_quantization_group_size,
             kv_cache_min_quantize_tokens=args.kv_cache_min_quantize_tokens,
+            # TurboQuant
+            turbo_kv_bits=args.turbo_kv_bits,
         )
 
         engine_config = EngineConfig(
@@ -1047,6 +1085,16 @@ Examples:
         default=256,
         help="Minimum tokens for quantization to apply (default: 256)",
     )
+    # TurboQuant KV cache compression (arXiv 2504.19874)
+    serve_parser.add_argument(
+        "--turbo-kv-bits",
+        type=int,
+        default=None,
+        choices=[1, 2, 3, 4],
+        help="TurboQuant KV cache compression bits for prefix cache. "
+        "3-bit gives 4.6x compression vs FP16 (default: disabled). "
+        "Mutually exclusive with --kv-cache-quantization.",
+    )
     # SSD cache tiering options
     serve_parser.add_argument(
         "--ssd-cache-dir",
@@ -1070,7 +1118,7 @@ Examples:
             "the prefix cache so the first real request hits warm (cold TTFT "
             "drops 1.3-2.3x on agent workloads). File format is a list of "
             "message arrays, same shape as /v1/chat/completions messages. "
-            "Prompts are warmed concurrently — keep the file small (1-3 entries "
+            "Prompts are warmed concurrently -- keep the file small (1-3 entries "
             "for typical agent deployments) to avoid memory pressure at boot."
         ),
     )
@@ -1458,6 +1506,16 @@ Examples:
         type=int,
         default=256,
         help="Minimum tokens for quantization to apply (default: 256)",
+    )
+    # TurboQuant KV cache compression
+    bench_parser.add_argument(
+        "--turbo-kv-bits",
+        type=int,
+        default=None,
+        choices=[1, 2, 3, 4],
+        help="TurboQuant KV cache compression bits for prefix cache. "
+        "3-bit gives 4.6x compression vs FP16 (default: disabled). "
+        "Mutually exclusive with --kv-cache-quantization.",
     )
     # Paged cache options (experimental)
     bench_parser.add_argument(
