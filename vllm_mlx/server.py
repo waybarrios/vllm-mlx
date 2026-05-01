@@ -440,10 +440,14 @@ class _ThinkingAwareLogitsProcessor:
     think before answering.
     """
 
-    def __init__(self, inner):
+    def __init__(self, inner, prompt_has_think_tag: bool = False):
         self._inner = inner
         self._active = False
-        self._in_thinking: bool | None = None  # None = not yet determined
+        # When the chat template already injects ``<think>\n`` into the prompt,
+        # the model's output starts INSIDE the thinking block — so ``<think>``
+        # will never appear in the generated tokens.  Pre-set ``_in_thinking``
+        # to skip the 3-token detection and go straight to ``</think>`` scan.
+        self._in_thinking: bool | None = True if prompt_has_think_tag else None
         self._waiting_for_json = False  # Waiting for { or [ before activating
         self._base_prompt_len: int | None = None
         self._json_scan_offset: int | None = None  # Absolute offset to start scanning
@@ -607,15 +611,31 @@ def _prepare_chat_completion_invocation(
         chat_kwargs["stop"] = merged_stop
 
     if json_logits_processor is not None:
-        if _reasoning_parser and request.enable_thinking is not False:
-            # Thinking model with constrained decoding: let the model reason
-            # freely, then constrain only the JSON content after </think>.
-            json_logits_processor = _ThinkingAwareLogitsProcessor(json_logits_processor)
-        elif request.enable_thinking is None:
-            # No reasoning parser (or thinking explicitly disabled) —
-            # suppress thinking to go straight to JSON.
+        # Determine the *effective* thinking state: the request field, the
+        # resolved chat_template_kwargs, or the server default can all inject
+        # ``<think>`` into the rendered prompt independently.
+        ctk = chat_kwargs.get("chat_template_kwargs") or {}
+        effective_thinking = (
+            request.enable_thinking is True or ctk.get("enable_thinking") is True
+        )
+
+        if _reasoning_parser and effective_thinking:
+            # User explicitly requested thinking with constrained decoding
+            # (via top-level enable_thinking or chat_template_kwargs).
+            # Wrap the processor so the enforcer only activates after </think>.
+            json_logits_processor = _ThinkingAwareLogitsProcessor(
+                json_logits_processor, prompt_has_think_tag=True
+            )
+        else:
+            # Suppress thinking so the model goes straight to JSON.
+            # The template injects an empty <think></think> block and the
+            # enforcer constrains output from the first token onward.
+            # Force both top-level and chat_template_kwargs to prevent the
+            # Jinja template from rendering an open <think> block.
             request.enable_thinking = False
             chat_kwargs["enable_thinking"] = False
+            if "chat_template_kwargs" in chat_kwargs:
+                chat_kwargs["chat_template_kwargs"]["enable_thinking"] = False
         existing = chat_kwargs.get("logits_processors") or []
         chat_kwargs["logits_processors"] = list(existing) + [json_logits_processor]
 
@@ -685,12 +705,21 @@ def _prepare_anthropic_invocation(
         chat_kwargs["tools"] = template_tools
 
     if json_logits_processor is not None:
-        if _reasoning_parser:
-            # Thinking model: wrap processor to activate after </think>.
-            json_logits_processor = _ThinkingAwareLogitsProcessor(json_logits_processor)
+        # Same logic as the OpenAI path: check both top-level and
+        # chat_template_kwargs for an explicit thinking request.
+        ctk = chat_kwargs.get("chat_template_kwargs") or {}
+        effective_thinking = (
+            openai_request.enable_thinking is True or ctk.get("enable_thinking") is True
+        )
+
+        if _reasoning_parser and effective_thinking:
+            json_logits_processor = _ThinkingAwareLogitsProcessor(
+                json_logits_processor, prompt_has_think_tag=True
+            )
         else:
-            # No reasoning parser — suppress thinking.
             chat_kwargs["enable_thinking"] = False
+            if "chat_template_kwargs" in chat_kwargs:
+                chat_kwargs["chat_template_kwargs"]["enable_thinking"] = False
         existing = chat_kwargs.get("logits_processors") or []
         chat_kwargs["logits_processors"] = list(existing) + [json_logits_processor]
 
