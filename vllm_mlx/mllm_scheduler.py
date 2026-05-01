@@ -35,7 +35,7 @@ from .mllm_batch_generator import (
     MLLMBatchRequest,
     MLLMBatchResponse,
 )
-from .mlx_streams import bind_generation_streams
+from .mlx_streams import MLXWorkerThread, bind_generation_streams
 from .multimodal_processor import MultimodalProcessor
 from .request import RequestOutput, RequestStatus, SamplingParams
 
@@ -178,6 +178,7 @@ class MLLMScheduler:
         model: Any,
         processor: Any,
         config: Optional[MLLMSchedulerConfig] = None,
+        mlx_worker: Optional[MLXWorkerThread] = None,
     ):
         """
         Initialize MLLM scheduler.
@@ -186,10 +187,14 @@ class MLLMScheduler:
             model: The VLM model
             processor: The VLM processor
             config: Scheduler configuration
+            mlx_worker: MLXWorkerThread that owns the model.  When provided,
+                ``step()`` runs on this thread so model load and inference
+                share the same thread-local Metal stream context.
         """
         self.model = model
         self.processor = processor
         self.config = config or MLLMSchedulerConfig()
+        self._mlx_worker = mlx_worker
 
         # Get model config
         self.model_config = getattr(model, "config", None)
@@ -814,16 +819,66 @@ class MLLMScheduler:
     async def _process_loop(self) -> None:
         """Main async processing loop.
 
-        MLLM models are loaded on the server/event-loop thread, so their MLX
-        arrays and cache state must be consumed on that same thread.  Unlike
-        the text-only EngineCore path, moving MLLM prefill to a worker crosses
-        MLX stream ownership and can fail with "no Stream in current thread".
+        When an ``MLXWorkerThread`` is provided (the default for
+        BatchedEngine), ``step()`` is submitted to that thread.  This
+        is the same thread that loaded the model, so all MLX arrays,
+        caches and Metal streams are consistent — no cross-thread
+        stream errors.
 
-        Text-only preprocessing (Jinja2 template rendering + tokenization) is
-        run BEFORE ``step()`` with ``await asyncio.sleep(0)`` yields between
-        each request.  This prevents long preprocessing (10-30+ s for 40K+
-        token conversations) from blocking health checks and new connections.
+        Text-only preprocessing (Jinja2 template rendering + tokenization)
+        is offloaded to the default executor so the event loop stays
+        responsive for health checks and new connections.
+
+        Without an ``MLXWorkerThread`` the loop falls back to running
+        ``step()`` directly on the event loop thread with
+        ``bind_generation_streams()`` (legacy behaviour).
         """
+        loop = asyncio.get_running_loop()
+
+        # ── Worker-thread path (preferred) ───────────────────────────
+        if self._mlx_worker is not None:
+            while self._running:
+                try:
+                    # Preprocessing creates MLX arrays (input_ids) so it must
+                    # run on the same worker thread as step() to avoid
+                    # cross-thread stream errors.  We submit each text-only
+                    # request's preprocessing to the worker individually so the
+                    # event loop stays responsive between requests.
+                    bg = self.batch_generator
+                    if bg is not None:
+                        for req in list(getattr(bg, "unprocessed_requests", ())):
+                            if (
+                                req.input_ids is None
+                                and not req.images
+                                and not req.videos
+                                and not req.audio
+                            ):
+                                try:
+                                    await self._mlx_worker.submit(
+                                        loop, bg._preprocess_request, req
+                                    )
+                                except Exception as e:
+                                    logger.error(
+                                        f"Early preprocessing failed for "
+                                        f"{req.request_id}: {e}"
+                                    )
+
+                    if self.has_requests():
+                        await self._mlx_worker.submit(loop, self.step)
+                        # Yield event-loop cycles for HTTP health checks
+                        for _ in range(5):
+                            await asyncio.sleep(0)
+                    else:
+                        await asyncio.sleep(0.01)
+
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    logger.error(f"Error in MLLM process loop: {e}", exc_info=True)
+                    await asyncio.sleep(0.1)
+            return
+
+        # ── Legacy event-loop path (no worker thread) ────────────────
         streams_bound = False
 
         def _ensure_streams_bound() -> None:
@@ -832,17 +887,8 @@ class MLLMScheduler:
                 bind_generation_streams()
                 streams_bound = True
 
-        loop = asyncio.get_running_loop()
-
         while self._running:
             try:
-                # --- Early preprocessing phase ---
-                # Run text-only preprocessing (Jinja2 template rendering +
-                # tokenization) in a thread-pool executor so the event loop
-                # stays responsive for health checks, new connections, and
-                # active streaming requests.  Preprocessing is CPU-bound
-                # (no MLX GPU work) and HuggingFace tokenizers are
-                # thread-safe, so this is safe to offload.
                 bg = self.batch_generator
                 if bg is not None:
                     for req in list(getattr(bg, "unprocessed_requests", ())):
@@ -874,7 +920,6 @@ class MLLMScheduler:
                                     f"{req.request_id}: {e}"
                                 )
 
-                # --- Step phase ---
                 if self.has_requests():
                     _ensure_streams_bound()
                     tic = time.perf_counter()
@@ -886,20 +931,10 @@ class MLLMScheduler:
                             f"(waiting={len(self.waiting)}, "
                             f"running={len(self.running)})"
                         )
-                    # Yield multiple event-loop cycles so that pending
-                    # HTTP health checks can complete.  A single
-                    # asyncio.sleep() gives only ONE _run_once() cycle,
-                    # but an HTTP request needs ~3 cycles minimum:
-                    #   1. accept TCP connection
-                    #   2. read HTTP request / parse headers
-                    #   3. run handler / write response
-                    # Using repeated asyncio.sleep(0) gives many cycles
-                    # with negligible wall-clock overhead (<1ms total).
                     n_yields = 10 if elapsed > 1.0 else 5
                     for _ in range(n_yields):
                         await asyncio.sleep(0)
                 else:
-                    # No work, wait a bit
                     await asyncio.sleep(0.01)
 
             except asyncio.CancelledError:

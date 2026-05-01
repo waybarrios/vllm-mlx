@@ -27,6 +27,7 @@ from .base import (
     cleanup_startup_cancellation,
     run_blocking_startup_work,
 )
+from ..mlx_streams import MLXWorkerThread
 
 logger = logging.getLogger(__name__)
 
@@ -216,6 +217,7 @@ class BatchedEngine(BaseEngine):
         self._tokenizer = None  # For LLM
         self._engine = None  # AsyncEngineCore for LLM
         self._mllm_scheduler = None  # MLLMScheduler for MLLM
+        self._mlx_worker = None  # Shared MLXWorkerThread for MLLM load + inference
         self._mllm_instance = None  # MLXMultimodalLM instance
         self._loaded = False
 
@@ -282,17 +284,43 @@ class BatchedEngine(BaseEngine):
         method = getattr(self.prepare_for_start, "__func__", None)
         return method is BatchedEngine.prepare_for_start
 
-    def _prepare_mllm_model(self) -> None:
-        """Load the MLLM model before scheduler startup."""
+    async def _prepare_mllm_model(self) -> None:
+        """Load the MLLM model on a dedicated MLXWorkerThread.
+
+        MLX >= 0.31.2 makes Metal command encoders thread-local.  Model
+        loading creates arrays and streams that are bound to the thread
+        that executes them.  If the model is loaded on the event-loop
+        thread but inference runs on a different thread, ``mx.eval()``
+        raises ``RuntimeError: There is no Stream(gpu, N) in current
+        thread``.
+
+        By loading the model on the same ``MLXWorkerThread`` that will
+        later run ``step()`` calls, we guarantee all MLX state lives on
+        a single thread.
+        """
+        import mlx.core as mx
+
         from ..models.mllm import MLXMultimodalLM
 
+        self._mlx_worker = MLXWorkerThread(name="mllm-worker")
+        loop = asyncio.get_event_loop()
+
         max_kv_size = getattr(self._scheduler_config, "max_kv_size", 0)
-        self._mllm_instance = MLXMultimodalLM(
-            self._model_name,
-            trust_remote_code=self._trust_remote_code,
-            max_kv_size=max_kv_size,
-        )
-        self._mllm_instance.load()
+        model_name = self._model_name
+        trust_remote_code = self._trust_remote_code
+
+        def _load_on_worker():
+            mx.new_thread_local_stream(mx.gpu)
+            inst = MLXMultimodalLM(
+                model_name,
+                trust_remote_code=trust_remote_code,
+                max_kv_size=max_kv_size,
+            )
+            inst.load()
+            logger.info("MLLM model loaded on MLXWorkerThread")
+            return inst
+
+        self._mllm_instance = await self._mlx_worker.submit(loop, _load_on_worker)
         self._model = self._mllm_instance.model
         self._processor = self._mllm_instance.processor
 
@@ -329,7 +357,7 @@ class BatchedEngine(BaseEngine):
         from ..mllm_scheduler import MLLMScheduler, MLLMSchedulerConfig
 
         if self._model is None or self._processor is None:
-            self._prepare_mllm_model()
+            await self._prepare_mllm_model()
 
         # Create MLLM scheduler config with batch generator support
         if self._scheduler_config and hasattr(self._scheduler_config, "max_num_seqs"):
@@ -403,6 +431,7 @@ class BatchedEngine(BaseEngine):
             model=self._model,
             processor=self._processor,
             config=mllm_config,
+            mlx_worker=self._mlx_worker,
         )
         await self._mllm_scheduler.start()
 
