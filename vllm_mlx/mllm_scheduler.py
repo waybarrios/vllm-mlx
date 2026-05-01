@@ -839,27 +839,43 @@ class MLLMScheduler:
         if self._mlx_worker is not None:
             while self._running:
                 try:
-                    # Preprocessing creates MLX arrays (input_ids) so it must
-                    # run on the same worker thread as step() to avoid
-                    # cross-thread stream errors.  We submit each text-only
-                    # request's preprocessing to the worker individually so the
-                    # event loop stays responsive between requests.
                     bg = self.batch_generator
                     if bg is not None:
+                        # Phase 1: CPU-only tokenization on thread pool (parallel).
+                        # This handles Jinja2 template rendering + tokenization
+                        # without creating MLX arrays, so it can safely run on
+                        # any thread.  For 40K+ token prompts this takes 10-30s,
+                        # so offloading prevents the worker from blocking.
                         for req in list(getattr(bg, "unprocessed_requests", ())):
                             if (
                                 req.input_ids is None
                                 and not req.images
                                 and not req.videos
                                 and not req.audio
+                                and getattr(req, "_tokenized_ids", None) is None
                             ):
                                 try:
-                                    await self._mlx_worker.submit(
-                                        loop, bg._preprocess_request, req
+                                    await loop.run_in_executor(
+                                        None, bg._tokenize_text_only, req
                                     )
                                 except Exception as e:
                                     logger.error(
-                                        f"Early preprocessing failed for "
+                                        f"Tokenization failed for "
+                                        f"{req.request_id}: {e}"
+                                    )
+
+                        # Phase 2: Fast mx.array() conversion on worker thread.
+                        # Converts pre-tokenized Python lists to MLX arrays.
+                        # This is microseconds per request, not a bottleneck.
+                        for req in list(getattr(bg, "unprocessed_requests", ())):
+                            if getattr(req, "_tokenized_ids", None) is not None:
+                                try:
+                                    await self._mlx_worker.submit(
+                                        loop, bg._materialize_tokens, req
+                                    )
+                                except Exception as e:
+                                    logger.error(
+                                        f"Token materialization failed for "
                                         f"{req.request_id}: {e}"
                                     )
 
