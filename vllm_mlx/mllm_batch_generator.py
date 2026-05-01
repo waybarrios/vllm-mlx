@@ -1372,7 +1372,14 @@ class MLLMBatchGenerator:
                 # running them through the language model alone.
                 cached_kv = None
                 remaining_ids = None
-                if self.prefix_cache is not None and req.input_ids is not None:
+                if req.pixel_values is not None:
+                    # Multimodal request — skip prefix cache entirely.
+                    # The VLM forward must run with pixel_values to encode
+                    # the vision features into the KV cache. Running the
+                    # language model alone on image placeholder tokens
+                    # produces garbage output.
+                    pass
+                elif self.prefix_cache is not None and req.input_ids is not None:
                     input_ids_list = req.input_ids.reshape(-1).tolist()
                     # Strip think suffix from lookup key so stored entries
                     # (also stripped) match as clean PREFIX.

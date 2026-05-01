@@ -239,12 +239,18 @@ class BatchedEngine(BaseEngine):
         return self._tokenizer
 
     def prepare_for_start(self) -> None:
-        """Load heavyweight model state off the serving event loop."""
+        """Load heavyweight model state off the serving event loop.
+
+        For MLLM models this is a no-op: the async _prepare_mllm_model()
+        requires the MLXWorkerThread and event loop, so model loading is
+        deferred to _start_mllm() which is properly awaited.
+        """
         if self._model is not None:
             return
 
         if self._is_mllm:
-            self._prepare_mllm_model()
+            # MLLM loading is async and handled by _start_mllm().
+            return
         else:
             self._prepare_llm_model()
 
