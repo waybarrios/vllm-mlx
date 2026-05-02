@@ -88,6 +88,7 @@ class TestSSDCacheStats:
 
 import os
 
+from vllm_mlx import ssd_cache as ssd_cache_module
 from vllm_mlx.ssd_cache import SSDIndex
 
 
@@ -141,6 +142,71 @@ class TestSSDIndex:
         assert "b.safetensors" in file_paths
         assert "c.safetensors" in file_paths
         assert "d.safetensors" not in file_paths
+
+    def test_lookup_prefix_uses_bounded_prefix_hash_candidates(self, index):
+        index.insert_entry((1, 2, 3, 4), "match.safetensors", 1000, 4)
+        for i in range(100):
+            index.insert_entry((9000 + i, 2, 3, 4), f"miss-{i}.safetensors", 1000, 4)
+
+        results = index.lookup_prefix((1, 2, 3, 4, 5))
+
+        assert [r["file_path"] for r in results] == ["match.safetensors"]
+        with index._db_lock:
+            cur = index._conn.execute(
+                "SELECT COUNT(*) FROM entries WHERE prefix_hash = ?",
+                (ssd_cache_module._prefix_hash((1, 2, 3, 4)),),
+            )
+            assert cur.fetchone()[0] == 1
+
+    def test_legacy_index_backfills_prefix_hashes(self, db_dir):
+        import sqlite3
+        import time
+
+        os.makedirs(db_dir, exist_ok=True)
+        conn = sqlite3.connect(os.path.join(db_dir, "index.db"))
+        conn.executescript("""
+            CREATE TABLE schema_version (version INTEGER NOT NULL);
+            INSERT INTO schema_version (version) VALUES (1);
+            CREATE TABLE entries (
+                token_hash   TEXT PRIMARY KEY,
+                tokens_blob  BLOB NOT NULL,
+                num_tokens   INTEGER NOT NULL,
+                file_path    TEXT NOT NULL,
+                memory_bytes INTEGER NOT NULL,
+                created_at   REAL NOT NULL,
+                accessed_at  REAL NOT NULL
+            );
+            """)
+        tokens = (1, 2, 3)
+        now = time.time()
+        conn.execute(
+            "INSERT INTO entries VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                ssd_cache_module._tokens_hash(tokens),
+                ssd_cache_module._tokens_to_blob(tokens),
+                len(tokens),
+                "legacy.safetensors",
+                1000,
+                now,
+                now,
+            ),
+        )
+        conn.commit()
+        conn.close()
+
+        idx = SSDIndex(db_dir)
+        try:
+            assert (
+                idx.lookup_prefix((1, 2, 3, 4))[0]["file_path"] == "legacy.safetensors"
+            )
+            with idx._db_lock:
+                cur = idx._conn.execute(
+                    "SELECT prefix_hash FROM entries WHERE file_path = ?",
+                    ("legacy.safetensors",),
+                )
+                assert cur.fetchone()[0] == ssd_cache_module._prefix_hash(tokens)
+        finally:
+            idx.close()
 
     def test_delete_entry(self, index):
         tokens = (10, 20, 30)
@@ -363,6 +429,29 @@ class TestSSDCacheTierCore:
         tier = SSDCacheTier(config)
         tier.close()
         tier.close()  # Should not raise
+
+    def test_init_closes_index_when_later_setup_fails(self, tmp_path, monkeypatch):
+        fake_index = type(
+            "FakeIndex",
+            (),
+            {
+                "closed": False,
+                "close": lambda self: setattr(self, "closed", True),
+            },
+        )()
+
+        monkeypatch.setattr(ssd_cache_module, "SSDIndex", lambda cache_dir: fake_index)
+
+        def fail_queue(*args, **kwargs):
+            raise RuntimeError("queue setup failed")
+
+        monkeypatch.setattr(ssd_cache_module.queue, "Queue", fail_queue)
+
+        config = SSDCacheConfig(cache_dir=str(tmp_path / "init_fail"))
+        with pytest.raises(RuntimeError, match="queue setup failed"):
+            SSDCacheTier(config)
+
+        assert fake_index.closed
 
 
 import time
@@ -897,6 +986,21 @@ class TestIntegrationSpillAndFetch:
         )
 
         tier.close()
+
+    def test_scheduler_reconstructs_real_arrays_cache(self):
+        cache_mod = pytest.importorskip("mlx_lm.models.cache")
+        mx = pytest.importorskip("mlx.core")
+        from vllm_mlx.scheduler import Scheduler
+
+        scheduler = object.__new__(Scheduler)
+        reconstructed = Scheduler._reconstruct_ssd_layers(
+            scheduler,
+            [{"state": [np.array([1, 2], dtype=np.float32)]}],
+        )
+
+        assert reconstructed is not None
+        assert isinstance(reconstructed[0], cache_mod.ArraysCache)
+        assert reconstructed[0].state[0].tolist() == mx.array([1, 2]).tolist()
 
     def test_capacity_eviction_end_to_end(self, tmp_path):
         """Entries beyond max_entries are evicted from SSD."""

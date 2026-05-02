@@ -385,6 +385,17 @@ class TestMemoryAwarePrefixCache:
         assert stats["misses"] == 1
         assert stats["entry_count"] == 1
 
+    def test_try_reserve_and_release_memory(self, small_cache):
+        assert small_cache.try_reserve_memory(512 * 1024) is True
+        assert small_cache.get_stats()["current_memory_mb"] == 0.5
+
+        small_cache.release_reserved_memory(128 * 1024)
+        assert small_cache.get_stats()["current_memory_mb"] == 0.38
+
+    def test_try_reserve_memory_denies_over_limit(self, small_cache):
+        assert small_cache.try_reserve_memory(2 * 1024 * 1024) is False
+        assert small_cache.get_stats()["current_memory_mb"] == 0
+
     def test_reset_stats(self, small_cache, mock_kv_cache):
         small_cache.store([1, 2, 3], mock_kv_cache(1000))
         small_cache.fetch([1, 2, 3])

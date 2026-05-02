@@ -36,6 +36,7 @@ logger = logging.getLogger(__name__)
 
 _BYTES_PER_MB = 1024 * 1024
 _BYTES_PER_GB = 1024 * 1024 * 1024
+_PREFIX_FILTER_TOKENS = 16
 
 
 @dataclass(frozen=True)
@@ -141,6 +142,11 @@ def _tokens_hash(tokens: tuple[int, ...]) -> str:
     return hashlib.sha256(_tokens_to_blob(tokens)).hexdigest()
 
 
+def _prefix_hash(tokens: tuple[int, ...]) -> str:
+    """Hash the bounded token prefix used to prefilter prefix lookups."""
+    return _tokens_hash(tokens[:_PREFIX_FILTER_TOKENS])
+
+
 class SSDIndex:
     """SQLite-backed index for SSD cache entries.
 
@@ -173,6 +179,7 @@ class SSDIndex:
             CREATE TABLE IF NOT EXISTS entries (
                 token_hash   TEXT PRIMARY KEY,
                 tokens_blob  BLOB NOT NULL,
+                prefix_hash  TEXT,
                 num_tokens   INTEGER NOT NULL,
                 file_path    TEXT NOT NULL,
                 memory_bytes INTEGER NOT NULL,
@@ -180,13 +187,19 @@ class SSDIndex:
                 accessed_at  REAL NOT NULL
             );
 
+            """
+        self._conn.executescript(schema_sql)
+        self._ensure_column("entries", "prefix_hash", "TEXT")
+        self._conn.executescript("""
             CREATE INDEX IF NOT EXISTS idx_entries_accessed
                 ON entries(accessed_at);
 
             CREATE INDEX IF NOT EXISTS idx_entries_num_tokens
                 ON entries(num_tokens);
-            """
-        self._conn.executescript(schema_sql)
+
+            CREATE INDEX IF NOT EXISTS idx_entries_prefix_hash_num_tokens
+                ON entries(prefix_hash, num_tokens);
+            """)
         # Insert schema version if not present
         cur = self._conn.execute("SELECT COUNT(*) FROM schema_version")
         if cur.fetchone()[0] == 0:
@@ -194,7 +207,25 @@ class SSDIndex:
                 "INSERT INTO schema_version (version) VALUES (?)",
                 (self._SCHEMA_VERSION,),
             )
+        self._backfill_prefix_hashes()
         self._conn.commit()
+
+    def _ensure_column(self, table: str, column: str, definition: str) -> None:
+        cur = self._conn.execute(f"PRAGMA table_info({table})")
+        if column not in {row["name"] for row in cur.fetchall()}:
+            self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
+    def _backfill_prefix_hashes(self) -> None:
+        cur = self._conn.execute(
+            "SELECT token_hash, tokens_blob FROM entries WHERE prefix_hash IS NULL"
+        )
+        rows = cur.fetchall()
+        for row in rows:
+            tokens = _blob_to_tokens(row["tokens_blob"])
+            self._conn.execute(
+                "UPDATE entries SET prefix_hash = ? WHERE token_hash = ?",
+                (_prefix_hash(tokens), row["token_hash"]),
+            )
 
     def insert_entry(
         self,
@@ -206,18 +237,20 @@ class SSDIndex:
         """Insert or replace a cache entry in the index."""
         now = time.time()
         token_hash = _tokens_hash(tokens_key)
+        prefix_hash = _prefix_hash(tokens_key)
         tokens_blob = _tokens_to_blob(tokens_key)
         with self._db_lock:
             self._conn.execute(
                 """
                 INSERT OR REPLACE INTO entries
-                    (token_hash, tokens_blob, num_tokens, file_path,
+                    (token_hash, tokens_blob, prefix_hash, num_tokens, file_path,
                      memory_bytes, created_at, accessed_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     token_hash,
                     tokens_blob,
+                    prefix_hash,
                     num_tokens,
                     file_path,
                     memory_bytes,
@@ -247,19 +280,28 @@ class SSDIndex:
     def lookup_prefix(self, query_tokens: tuple[int, ...]) -> list[dict]:
         """Find entries whose token sequence is a prefix of query_tokens.
 
-        Scans entries with num_tokens <= len(query_tokens) and compares the
-        full stored token blob against the corresponding prefix of query_tokens.
+        Uses a bounded token-prefix hash to avoid scanning all entries, then
+        compares the full stored token blob against the corresponding prefix of
+        query_tokens.
 
         Returns list of dicts sorted by num_tokens descending (longest prefix first).
         """
         query_len = len(query_tokens)
         query_blob = _tokens_to_blob(query_tokens)
+        prefix_hashes = {
+            _tokens_hash(query_tokens[:n])
+            for n in range(1, min(query_len, _PREFIX_FILTER_TOKENS) + 1)
+        }
+        if not prefix_hashes:
+            return []
 
         with self._db_lock:
+            placeholders = ",".join("?" for _ in prefix_hashes)
             cur = self._conn.execute(
                 "SELECT token_hash, tokens_blob, num_tokens, file_path, memory_bytes "
-                "FROM entries WHERE num_tokens <= ? ORDER BY num_tokens DESC",
-                (query_len,),
+                f"FROM entries WHERE num_tokens <= ? AND prefix_hash IN ({placeholders}) "
+                "ORDER BY num_tokens DESC",
+                (query_len, *prefix_hashes),
             )
             rows = cur.fetchall()
 
@@ -534,6 +576,8 @@ class SSDCacheTier:
 
     def __init__(self, config: SSDCacheConfig) -> None:
         self._config = config
+        self._closed = True
+        self._writer_thread: threading.Thread | None = None
 
         if config.cache_dir is None:
             raise ValueError("SSDCacheConfig.cache_dir must be set")
@@ -545,18 +589,25 @@ class SSDCacheTier:
         os.makedirs(self._cache_dir, mode=config.dir_permissions, exist_ok=True)
         os.makedirs(self._data_dir, mode=config.dir_permissions, exist_ok=True)
 
-        # Open SQLite index
-        self._index = SSDIndex(self._cache_dir)
+        try:
+            # Open SQLite index
+            self._index = SSDIndex(self._cache_dir)
 
-        # Stats
-        self._stats = SSDCacheStats()
-        self._lock = threading.Lock()
-        self._closed = False
+            # Stats
+            self._stats = SSDCacheStats()
+            self._lock = threading.Lock()
 
-        # Spill queue and writer thread
-        self._spill_queue: queue.Queue = queue.Queue(maxsize=config.spill_queue_size)
-        self._writer_thread: threading.Thread | None = None
-        self._writer_stop = threading.Event()
+            # Spill queue and writer thread
+            self._spill_queue: queue.Queue = queue.Queue(
+                maxsize=config.spill_queue_size
+            )
+            self._writer_stop = threading.Event()
+            self._closed = False
+        except Exception:
+            index = getattr(self, "_index", None)
+            if index is not None:
+                index.close()
+            raise
 
     @staticmethod
     def _entry_hash(tokens: tuple[int, ...]) -> str:

@@ -27,6 +27,7 @@ from __future__ import annotations
 import bisect
 import logging
 import math
+import threading
 from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Any
@@ -671,6 +672,7 @@ class MemoryAwarePrefixCache:
         # Memory tracking
         self._max_memory = self._config.compute_memory_limit()
         self._current_memory = 0
+        self._memory_lock = threading.Lock()
 
         # Statistics
         self._stats = CacheStats(max_memory_bytes=self._max_memory)
@@ -1096,6 +1098,21 @@ class MemoryAwarePrefixCache:
     def memory_limit_mb(self) -> float:
         """Memory limit in MB."""
         return self._max_memory / _BYTES_PER_MB
+
+    def try_reserve_memory(self, nbytes: int) -> bool:
+        """Tentatively reserve cache memory for an upcoming promotion."""
+        with self._memory_lock:
+            if self._current_memory + nbytes > self._max_memory:
+                return False
+            self._current_memory += nbytes
+            self._stats.current_memory_bytes = self._current_memory
+            return True
+
+    def release_reserved_memory(self, nbytes: int) -> None:
+        """Release memory previously reserved by try_reserve_memory()."""
+        with self._memory_lock:
+            self._current_memory = max(0, self._current_memory - nbytes)
+            self._stats.current_memory_bytes = self._current_memory
 
     def __len__(self) -> int:
         """Return number of cached entries."""

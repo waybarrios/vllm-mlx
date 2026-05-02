@@ -1164,6 +1164,7 @@ class Scheduler:
         self.memory_aware_cache: Optional[MemoryAwarePrefixCache] = None
         self.paged_cache_manager: Optional[PagedCacheManager] = None
         self.block_aware_cache: Optional[BlockAwarePrefixCache] = None
+        self._ssd_tier: Optional[SSDCacheTier] = None
 
         if self.config.enable_prefix_cache:
             if self.config.use_paged_cache:
@@ -1199,8 +1200,6 @@ class Scheduler:
                     f"limit={self.memory_aware_cache.memory_limit_mb:.1f}MB"
                 )
 
-                # Attach SSD tier if configured
-                self._ssd_tier: Optional[SSDCacheTier] = None
                 if self.config.ssd_cache_dir is not None:
                     ssd_config = SSDCacheConfig(
                         cache_dir=self.config.ssd_cache_dir,
@@ -1822,7 +1821,7 @@ class Scheduler:
                     f"time={_fetch_dt:.3f}s entries={len(self.memory_aware_cache._entries)}"
                 )
                 # Check SSD tier for cold-tier hit
-                if hasattr(self, "_ssd_tier") and self._ssd_tier is not None:
+                if self._ssd_tier is not None:
                     ssd_candidate = self.memory_aware_cache.check_ssd(
                         request.prompt_token_ids
                     )
@@ -1969,7 +1968,7 @@ class Scheduler:
         # Attempt synchronous SSD promotion for any ssd_pending requests
         # before scheduling. This keeps SSD I/O out of fetch() while
         # avoiding engine modifications.
-        if hasattr(self, "_ssd_tier") and self._ssd_tier is not None:
+        if self._ssd_tier is not None:
             self._try_promote_ssd_pending()
 
         scheduled = []
@@ -2821,7 +2820,7 @@ class Scheduler:
 
     def close_ssd_tier(self) -> None:
         """Shut down the SSD cache tier if present."""
-        if hasattr(self, "_ssd_tier") and self._ssd_tier is not None:
+        if self._ssd_tier is not None:
             self._ssd_tier.close()
             self._ssd_tier = None
             logger.info("SSD cache tier closed")
@@ -2847,10 +2846,7 @@ class Scheduler:
                 request.cache_hit_type = "miss"
                 continue
 
-            if (
-                self.memory_aware_cache._current_memory + memory_bytes
-                > self.memory_aware_cache._max_memory
-            ):
+            if not self.memory_aware_cache.try_reserve_memory(memory_bytes):
                 self._ssd_tier._stats.promotion_failures += 1
                 request.cache_hit_type = "miss"
                 logger.info(
@@ -2858,9 +2854,6 @@ class Scheduler:
                     f"budget denied ({memory_bytes} bytes)"
                 )
                 continue
-
-            # Tentatively reserve budget
-            self.memory_aware_cache._current_memory += memory_bytes
 
             # Use the SSD entry's actual token count for read and store,
             # NOT the full prompt tokens. For prefix hits these differ.
@@ -2872,7 +2865,7 @@ class Scheduler:
                     matched_tokens, candidate["file_path"]
                 )
             except Exception:
-                self.memory_aware_cache._current_memory -= memory_bytes
+                self.memory_aware_cache.release_reserved_memory(memory_bytes)
                 self._ssd_tier._stats.promotion_failures += 1
                 request.cache_hit_type = "miss"
                 logger.exception(
@@ -2882,13 +2875,13 @@ class Scheduler:
                 continue
 
             if cache_layers is None:
-                self.memory_aware_cache._current_memory -= memory_bytes
+                self.memory_aware_cache.release_reserved_memory(memory_bytes)
                 self._ssd_tier._stats.promotion_failures += 1
                 request.cache_hit_type = "miss"
                 continue
 
             # Release tentative budget (store() will account properly)
-            self.memory_aware_cache._current_memory -= memory_bytes
+            self.memory_aware_cache.release_reserved_memory(memory_bytes)
 
             # Reconstruct and store under the matched prefix tokens
             reconstructed = self._reconstruct_ssd_layers(cache_layers)
@@ -2922,7 +2915,7 @@ class Scheduler:
 
         Returns True if promotion succeeded and request was updated.
         """
-        if not hasattr(self, "_ssd_tier") or self._ssd_tier is None:
+        if self._ssd_tier is None:
             return False
 
         candidate = getattr(request, "_ssd_candidate", None)
@@ -2933,18 +2926,12 @@ class Scheduler:
             """Tentatively reserve RAM budget for promotion."""
             if self.memory_aware_cache is None:
                 return False
-            if (
-                self.memory_aware_cache._current_memory + nbytes
-                > self.memory_aware_cache._max_memory
-            ):
-                return False
-            self.memory_aware_cache._current_memory += nbytes
-            return True
+            return self.memory_aware_cache.try_reserve_memory(nbytes)
 
         def release_budget(nbytes: int) -> None:
             """Release tentatively reserved budget on failure."""
             if self.memory_aware_cache is not None:
-                self.memory_aware_cache._current_memory -= nbytes
+                self.memory_aware_cache.release_reserved_memory(nbytes)
 
         # Use matched token count, not full prompt, for prefix hits
         matched_count = candidate.get("matched_tokens", len(request.prompt_token_ids))
@@ -2991,7 +2978,7 @@ class Scheduler:
         Converts numpy arrays back to MLX arrays and creates KVCache objects.
         """
         try:
-            from mlx_lm.models.cache import KVCache
+            from mlx_lm.models.cache import ArraysCache, KVCache
 
             result = []
             for ld in layer_dicts:
@@ -3005,10 +2992,9 @@ class Scheduler:
                             setattr(kv, attr, ld[attr])
                     result.append(kv)
                 elif "state" in ld:
-                    # ArraysCache — need to wrap in a compatible object
                     state_arrays = [mx.array(a) for a in ld["state"]]
-                    # Create a simple namespace-like object
-                    layer_obj = type("ArraysCacheLayer", (), {"state": state_arrays})()
+                    layer_obj = ArraysCache(len(state_arrays))
+                    layer_obj.state = state_arrays
                     result.append(layer_obj)
                 else:
                     logger.warning(
