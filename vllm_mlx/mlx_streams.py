@@ -20,6 +20,11 @@ def bind_generation_streams(
     MLX streams are thread-local. If a model is loaded on one thread and
     generation runs on another, module-level generation streams created during
     import can point at a stream that does not exist in the worker thread.
+
+    This intentionally creates a fresh stream for the current worker call and
+    replaces module-level generation_stream handles under a process-local lock.
+    It is an admission/ownership fix, not a batching optimization; callers
+    should invoke it at worker-entry boundaries rather than inside token loops.
     """
     with _STREAM_REBIND_LOCK:
         default_stream = mx.new_stream(mx.default_device())

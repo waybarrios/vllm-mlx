@@ -28,6 +28,30 @@ vllm-mlx serve mlx-community/Qwen3-0.6B-8bit --continuous-batching --use-paged-c
 - Better throughput for concurrent users
 - Small overhead per request
 
+### MLLM MTP and Prefill Notes
+
+For multimodal models served through the batched MLLM scheduler, MTP is
+currently a conservative greedy-only optimization. The MLLM MTP verifier is
+used only when the active batch has one request, `temperature=0`, `top_p=1`,
+`top_k=0`, `min_p=0`, and no request-local logits processors. Requests outside
+that envelope fall back to the normal scheduler path instead of using MTP. This
+keeps sampling correctness ahead of throughput until the MLLM verifier is
+sampler-aware.
+
+Thinking/logits processors stay active by default for the whole request. The
+experimental retirement-to-MTP handoff is opt-in via
+`VLLM_MLX_ENABLE_THINKING_RETIREMENT_RESUME=1`; leave it unset unless you have
+validated that the processor advertises a safe `is_retired` transition.
+
+MLLM prefill uses the regular scheduler `prefill_step_size` unless a future
+MLLM-specific override is provided. This value controls the language-model
+prefill chunk size; image/video preprocessing remains per request.
+
+MLX generation streams are thread-local. The runtime rebinds mlx-lm/mlx-vlm
+generation streams at worker-entry boundaries so generation does not reuse a
+stream created on a different thread. This is a correctness guard for worker
+ownership, not a throughput feature.
+
 ### Paged Cache
 - KV cache stored in fixed-size blocks
 - Shared system prompts use same blocks

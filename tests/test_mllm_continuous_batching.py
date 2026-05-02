@@ -1022,7 +1022,18 @@ class TestMLLMBatchGeneratorMTPGuards:
         language_model.assert_not_called()
         language_model.mtp_forward.assert_not_called()
 
-    def test_install_mtp_mllm_disables_mtp_for_non_greedy_sampling(self):
+    @pytest.mark.parametrize(
+        "sampling_kwargs",
+        [
+            {"temperature": 0.6, "top_p": 1.0, "top_k": 0, "min_p": 0.0},
+            {"temperature": 0.0, "top_p": 0.95, "top_k": 0, "min_p": 0.0},
+            {"temperature": 0.0, "top_p": 1.0, "top_k": 20, "min_p": 0.0},
+            {"temperature": 0.0, "top_p": 1.0, "top_k": 0, "min_p": 0.05},
+        ],
+    )
+    def test_install_mtp_mllm_disables_mtp_for_non_greedy_sampling(
+        self, sampling_kwargs
+    ):
         from vllm_mlx.mllm_batch_generator import install_mtp_mllm
 
         expected_tokens = mx.array([11])
@@ -1035,14 +1046,7 @@ class TestMLLMBatchGeneratorMTPGuards:
                 self._next = MagicMock(return_value=[])
                 self.active_batch = MagicMock()
                 self.active_batch.__len__.return_value = 1
-                self.active_batch.requests = [
-                    MagicMock(
-                        temperature=0.6,
-                        top_p=0.95,
-                        top_k=20,
-                        min_p=0.0,
-                    )
-                ]
+                self.active_batch.requests = [MagicMock(**sampling_kwargs)]
                 self.sampler = MagicMock()
 
         batch_gen = FakeBatchGen()
