@@ -164,6 +164,12 @@ curl http://localhost:8000/v1/rerank -H 'Content-Type: application/json' -d '{
 }'
 ```
 
+The built-in MLX reranker forward path supports standard BERT/XLM-RoBERTa
+sequence-classification weights with `gelu`, `gelu_new`/`gelu_fast`, `relu`, or
+`silu`/`swish` `hidden_act` values. Other activations fail explicitly so custom
+reranker architectures can add a dedicated adapter instead of silently using the
+wrong activation.
+
 ### Embeddings
 
 ```bash

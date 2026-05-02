@@ -164,6 +164,12 @@ curl http://localhost:8000/v1/rerank -H 'Content-Type: application/json' -d '{
 }'
 ```
 
+La ruta integrada de reranking MLX admite pesos de clasificación de secuencia
+BERT/XLM-RoBERTa estándar con valores `hidden_act` `gelu`,
+`gelu_new`/`gelu_fast`, `relu` o `silu`/`swish`. Otras activaciones fallan de
+forma explícita para que las arquitecturas personalizadas agreguen un adaptador
+dedicado en lugar de usar GELU silenciosamente.
+
 ### Embeddings
 
 ```bash

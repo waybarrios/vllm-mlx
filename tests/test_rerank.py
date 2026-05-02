@@ -364,6 +364,67 @@ class TestClassifierForward:
 
         assert logits.shape == (1, 3)
 
+    @pytest.mark.parametrize(
+        "hidden_act", ["gelu", "gelu_new", "gelu_fast", "relu", "silu", "swish"]
+    )
+    def test_classifier_forward_honors_supported_hidden_act(self, hidden_act):
+        """Test forward pass accepts supported BERT-family hidden activations."""
+        import mlx.core as mx
+
+        from vllm_mlx.rerank_forward import classifier_forward
+
+        config = {
+            "hidden_size": 8,
+            "num_attention_heads": 2,
+            "intermediate_size": 16,
+            "num_hidden_layers": 1,
+            "num_labels": 1,
+            "vocab_size": 20,
+            "max_position_embeddings": 32,
+            "type_vocab_size": 2,
+            "layer_norm_eps": 1e-12,
+            "hidden_act": hidden_act,
+        }
+        weights = _make_bert_weights(config)
+
+        logits = classifier_forward(
+            mx.array([[1, 2, 3]]),
+            mx.array([[1, 1, 1]]),
+            weights,
+            config,
+        )
+        mx.eval(logits)
+
+        assert logits.shape == (1, 1)
+
+    def test_classifier_forward_rejects_unsupported_hidden_act(self):
+        """Test unsupported activations fail explicitly instead of falling back to GELU."""
+        import mlx.core as mx
+
+        from vllm_mlx.rerank_forward import classifier_forward
+
+        config = {
+            "hidden_size": 8,
+            "num_attention_heads": 2,
+            "intermediate_size": 16,
+            "num_hidden_layers": 1,
+            "num_labels": 1,
+            "vocab_size": 20,
+            "max_position_embeddings": 32,
+            "type_vocab_size": 2,
+            "layer_norm_eps": 1e-12,
+            "hidden_act": "mish",
+        }
+        weights = _make_bert_weights(config)
+
+        with pytest.raises(ValueError, match="Unsupported reranker hidden_act"):
+            classifier_forward(
+                mx.array([[1, 2, 3]]),
+                mx.array([[1, 1, 1]]),
+                weights,
+                config,
+            )
+
 
 def _make_bert_weights(config: dict) -> dict:
     """Build minimal random BERT-style weights for testing."""

@@ -175,7 +175,7 @@ def _encoder_layer(
     out_ln_b = weights[f"{prefix}.output.LayerNorm.bias"]
 
     intermediate = hidden @ inter_w.T + inter_b
-    intermediate = _gelu(intermediate)
+    intermediate = _apply_hidden_activation(intermediate, config)
     ffn_out = intermediate @ out_w.T + out_b
     hidden = _layer_norm(hidden + ffn_out, out_ln_w, out_ln_b, eps)
 
@@ -185,3 +185,46 @@ def _encoder_layer(
 def _gelu(x: mx.array) -> mx.array:
     """GELU activation (exact form)."""
     return nn.gelu(x)
+
+
+def _gelu_new(x: mx.array) -> mx.array:
+    """BERT GELU approximation used by transformers gelu_new."""
+    return 0.5 * x * (1.0 + mx.tanh(0.7978845608028654 * (x + 0.044715 * x**3)))
+
+
+def _relu(x: mx.array) -> mx.array:
+    """ReLU activation."""
+    return mx.maximum(x, 0)
+
+
+def _silu(x: mx.array) -> mx.array:
+    """SiLU/swish activation."""
+    return x * mx.sigmoid(x)
+
+
+def _apply_hidden_activation(x: mx.array, config: dict) -> mx.array:
+    """
+    Apply the configured encoder hidden activation.
+
+    The MLX reranker forward pass targets standard BERT/XLM-RoBERTa-style
+    sequence classifiers. Configs that request an activation outside that
+    supported contract fail explicitly instead of silently using GELU.
+    """
+    hidden_act = config.get("hidden_act", "gelu")
+    if isinstance(hidden_act, dict):
+        hidden_act = hidden_act.get("type", "gelu")
+    hidden_act = str(hidden_act).lower()
+
+    if hidden_act == "gelu":
+        return _gelu(x)
+    if hidden_act in {"gelu_new", "gelu_fast"}:
+        return _gelu_new(x)
+    if hidden_act == "relu":
+        return _relu(x)
+    if hidden_act in {"silu", "swish"}:
+        return _silu(x)
+
+    raise ValueError(
+        f"Unsupported reranker hidden_act '{hidden_act}'. "
+        "Supported activations are gelu, gelu_new/gelu_fast, relu, and silu/swish."
+    )
