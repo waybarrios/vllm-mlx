@@ -54,6 +54,10 @@ _BARE_KEY = re.compile(r"(?<=[{,])\s*(\w+)\s*:")
 _BARE_VALUE = re.compile(r"(?<=[:\[,])(\s*)([A-Za-z_][\w\-]*)(?=\s*[,}\]])")
 _JSON_LITERALS = frozenset({"true", "false", "null"})
 
+# Pattern to convert single-quoted strings to double-quoted.
+# Quantized models sometimes emit 'value' instead of <|"|>value<|"|>.
+_SINGLE_QUOTED = re.compile(r"'([^']*)'")
+
 # Max arg block length to prevent runaway parsing on malformed input (1 MB)
 _MAX_ARG_BLOCK_LEN = 1_048_576
 
@@ -122,6 +126,10 @@ def _gemma4_args_to_json(text: str) -> str:
     def _capture(m: re.Match) -> str:
         strings.append(m.group(1))
         return f"\x00{len(strings) - 1}\x00"
+
+    # Step 0.5: Convert single-quoted strings to <|"|>-delimited.
+    # Quantized models may emit 'value' instead of <|"|>value<|"|>.
+    text = _SINGLE_QUOTED.sub(lambda m: '<|"|>' + m.group(1) + '<|"|>', text)
 
     # Step 1: Extract <|"|>-delimited strings
     text = _STRING_DELIM_RE.sub(_capture, text)

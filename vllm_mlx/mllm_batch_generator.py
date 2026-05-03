@@ -379,9 +379,6 @@ class MLLMBatchGenerator:
         ...         print(f"Request {resp.request_id}: token={resp.token}")
     """
 
-    # Generation stream for async eval
-    _stream = None
-
     def __init__(
         self,
         model: nn.Module,
@@ -521,10 +518,6 @@ class MLLMBatchGenerator:
         # Stripping the suffix from cache keys enables clean PREFIX match.
         self._think_suffix_len = self._compute_think_suffix_len()
 
-        # Generation stream
-        if MLLMBatchGenerator._stream is None:
-            MLLMBatchGenerator._stream = mx.new_stream(mx.default_device())
-
         # Memory management
         self._old_wired_limit = None
         if mx.metal.is_available():
@@ -661,7 +654,7 @@ class MLLMBatchGenerator:
     def close(self) -> None:
         """Release resources and reset wired limit."""
         if self._old_wired_limit is not None:
-            mx.synchronize(MLLMBatchGenerator._stream)
+            mx.synchronize()
             mx.set_wired_limit(self._old_wired_limit)
             self._old_wired_limit = None
 
@@ -769,6 +762,80 @@ class MLLMBatchGenerator:
         self.unprocessed_requests = [
             r for r in self.unprocessed_requests if r.uid not in uid_set
         ]
+
+
+    def _tokenize_text_only(self, request: MLLMBatchRequest) -> None:
+        """CPU-only tokenization for text-only requests.
+
+        This performs Jinja2 template rendering and tokenization WITHOUT
+        creating any MLX arrays.  The result is stored as Python lists in
+        ``request._tokenized_ids`` and ``request._tokenized_mask``.
+        The actual ``mx.array()`` conversion happens later on the MLX
+        worker thread (inside ``_process_prompts`` or ``_preprocess_request``).
+
+        Safe to call from any thread (no MLX operations).
+        """
+        if request.input_ids is not None:
+            return  # Already preprocessed
+        if request.images or request.videos or request.audio:
+            return  # Not text-only, needs full _preprocess_request
+
+        # Check if already tokenized (idempotent)
+        if getattr(request, "_tokenized_ids", None) is not None:
+            return
+
+        from mlx_vlm.utils import prepare_inputs
+
+        tokenizer = (
+            self.processor.tokenizer
+            if hasattr(self.processor, "tokenizer")
+            else self.processor
+        )
+
+        # Ensure pad_token exists
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+
+        # Run tokenizer — returns Python/numpy, NOT mx.array
+        inputs = tokenizer(
+            request.prompt,
+            add_special_tokens=False,
+            padding=True,
+            padding_side="left",
+            return_tensors=None,  # Return Python lists, not tensors
+        )
+
+        # Store as Python lists for later mx.array() on worker
+        request._tokenized_ids = inputs["input_ids"]
+        request._tokenized_mask = inputs.get("attention_mask")
+
+    def _materialize_tokens(self, request: MLLMBatchRequest) -> None:
+        """Convert pre-tokenized Python lists to mx.array on the current thread.
+
+        Must be called on the MLX worker thread.  This is a fast operation
+        (microseconds) compared to tokenization (milliseconds-seconds).
+        """
+        ids = getattr(request, "_tokenized_ids", None)
+        if ids is None:
+            return  # Not pre-tokenized, will use _preprocess_request
+
+        import mlx.core as mx
+
+        request.input_ids = mx.array(ids) if not isinstance(ids, mx.array) else ids
+        mask = getattr(request, "_tokenized_mask", None)
+        if mask is not None:
+            request.attention_mask = (
+                mx.array(mask) if not isinstance(mask, mx.array) else mask
+            )
+
+        # Mark as text-only for prefix cache eligibility
+        request.is_text_only = True
+        request.extra_kwargs = {}
+
+        # Clean up temporary storage
+        del request._tokenized_ids
+        if hasattr(request, "_tokenized_mask"):
+            del request._tokenized_mask
 
     def _preprocess_request(self, request: MLLMBatchRequest) -> None:
         """
@@ -1305,7 +1372,14 @@ class MLLMBatchGenerator:
                 # running them through the language model alone.
                 cached_kv = None
                 remaining_ids = None
-                if self.prefix_cache is not None and req.input_ids is not None:
+                if req.pixel_values is not None:
+                    # Multimodal request — skip prefix cache entirely.
+                    # The VLM forward must run with pixel_values to encode
+                    # the vision features into the KV cache. Running the
+                    # language model alone on image placeholder tokens
+                    # produces garbage output.
+                    pass
+                elif self.prefix_cache is not None and req.input_ids is not None:
                     input_ids_list = req.input_ids.reshape(-1).tolist()
                     # Strip think suffix from lookup key so stored entries
                     # (also stripped) match as clean PREFIX.
@@ -1351,62 +1425,61 @@ class MLLMBatchGenerator:
                     total_tokens = len(input_ids_list)
                     remaining_count = len(remaining_ids)
 
-                    with mx.stream(MLLMBatchGenerator._stream):
-                        step = self.prefill_step_size
-                        if remaining_count <= step:
-                            # Short remaining — process in one shot
-                            self._prefill_progress[req.request_id] = (
-                                total_tokens,
-                                total_tokens,
-                            )
-                            logits = self.language_model(remaining, cache=request_cache)
-                        else:
-                            # Chunked prefill on remaining tokens
-                            self._prefill_progress[req.request_id] = (
-                                cached_count,
-                                total_tokens,
-                            )
-                            processed = 0
-                            chunk_count = 0
-                            while processed + step < remaining_count:
-                                # Check for abort between chunks
-                                if req.request_id in self._aborted_request_ids:
-                                    self._aborted_request_ids.discard(req.request_id)
-                                    logger.info(
-                                        f"[chunked_prefill] Aborted {req.request_id} "
-                                        f"at {cached_count + processed}/{total_tokens} tokens"
-                                    )
-                                    raise PrefillAbortedError(req.request_id)
-
-                                chunk = remaining[:, processed : processed + step]
-                                self.language_model(chunk, cache=request_cache)
-                                # Eval ALL cache types (see _run_chunked_text_prefill)
-                                _eval_prompt_cache(request_cache)
-                                processed += step
-                                chunk_count += 1
-                                self._prefill_progress[req.request_id] = (
-                                    cached_count + processed,
-                                    total_tokens,
+                    step = self.prefill_step_size
+                    if remaining_count <= step:
+                        # Short remaining — process in one shot
+                        self._prefill_progress[req.request_id] = (
+                            total_tokens,
+                            total_tokens,
+                        )
+                        logits = self.language_model(remaining, cache=request_cache)
+                    else:
+                        # Chunked prefill on remaining tokens
+                        self._prefill_progress[req.request_id] = (
+                            cached_count,
+                            total_tokens,
+                        )
+                        processed = 0
+                        chunk_count = 0
+                        while processed + step < remaining_count:
+                            # Check for abort between chunks
+                            if req.request_id in self._aborted_request_ids:
+                                self._aborted_request_ids.discard(req.request_id)
+                                logger.info(
+                                    f"[chunked_prefill] Aborted {req.request_id} "
+                                    f"at {cached_count + processed}/{total_tokens} tokens"
                                 )
-                                if chunk_count % 4 == 0:
-                                    mx.clear_cache()
-                            # Last chunk — return logits
-                            remaining = remaining[:, processed:]
-                            logits = self.language_model(remaining, cache=request_cache)
+                                raise PrefillAbortedError(req.request_id)
+
+                            chunk = remaining[:, processed : processed + step]
+                            self.language_model(chunk, cache=request_cache)
+                            # Eval ALL cache types (see _run_chunked_text_prefill)
+                            _eval_prompt_cache(request_cache)
+                            processed += step
+                            chunk_count += 1
                             self._prefill_progress[req.request_id] = (
-                                total_tokens,
+                                cached_count + processed,
                                 total_tokens,
                             )
+                            if chunk_count % 4 == 0:
+                                mx.clear_cache()
+                        # Last chunk — return logits
+                        remaining = remaining[:, processed:]
+                        logits = self.language_model(remaining, cache=request_cache)
+                        self._prefill_progress[req.request_id] = (
+                            total_tokens,
+                            total_tokens,
+                        )
 
-                        if hasattr(logits, "logits"):
-                            logits = logits.logits
+                    if hasattr(logits, "logits"):
+                        logits = logits.logits
 
-                        last_logits = logits[:, -1, :]
+                    last_logits = logits[:, -1, :]
 
-                        sampled, logprobs = _sample_first_token(req, last_logits)
+                    sampled, logprobs = _sample_first_token(req, last_logits)
 
-                        first_tokens.append(sampled.item())
-                        all_logprobs.append(logprobs.squeeze(0))
+                    first_tokens.append(sampled.item())
+                    all_logprobs.append(logprobs.squeeze(0))
 
                     per_request_caches.append(request_cache)
                     req.vision_encoded = True
@@ -1431,17 +1504,16 @@ class MLLMBatchGenerator:
                         total_tokens,
                     )
 
-                    with mx.stream(MLLMBatchGenerator._stream):
-                        logits = self.language_model(last_token, cache=request_cache)
-                        if hasattr(logits, "logits"):
-                            logits = logits.logits
+                    logits = self.language_model(last_token, cache=request_cache)
+                    if hasattr(logits, "logits"):
+                        logits = logits.logits
 
-                        last_logits = logits[:, -1, :]
+                    last_logits = logits[:, -1, :]
 
-                        sampled, logprobs = _sample_first_token(req, last_logits)
+                    sampled, logprobs = _sample_first_token(req, last_logits)
 
-                        first_tokens.append(sampled.item())
-                        all_logprobs.append(logprobs.squeeze(0))
+                    first_tokens.append(sampled.item())
+                    all_logprobs.append(logprobs.squeeze(0))
 
                     per_request_caches.append(request_cache)
                     req.vision_encoded = True
@@ -1457,23 +1529,22 @@ class MLLMBatchGenerator:
                         max_kv_size=self.max_kv_size or None,
                     )
 
-                    with mx.stream(MLLMBatchGenerator._stream):
-                        # Text-only: chunked prefill with real progress tracking
-                        # Multimodal: atomic VLM forward (vision encoder needs full input)
-                        if req.is_text_only:
-                            logits = self._run_chunked_text_prefill(
-                                req, cache=request_cache
-                            )
-                        else:
-                            logits = self._run_vision_encoding(req, cache=request_cache)
+                    # Text-only: chunked prefill with real progress tracking
+                    # Multimodal: atomic VLM forward (vision encoder needs full input)
+                    if req.is_text_only:
+                        logits = self._run_chunked_text_prefill(
+                            req, cache=request_cache
+                        )
+                    else:
+                        logits = self._run_vision_encoding(req, cache=request_cache)
 
-                        # Extract last token logits
-                        last_logits = logits[:, -1, :]
+                    # Extract last token logits
+                    last_logits = logits[:, -1, :]
 
-                        sampled, logprobs = _sample_first_token(req, last_logits)
+                    sampled, logprobs = _sample_first_token(req, last_logits)
 
-                        first_tokens.append(sampled.item())
-                        all_logprobs.append(logprobs.squeeze(0))
+                    first_tokens.append(sampled.item())
+                    all_logprobs.append(logprobs.squeeze(0))
 
                     per_request_caches.append(request_cache)
 
@@ -1871,8 +1942,7 @@ class MLLMBatchGenerator:
         Returns:
             List of MLLMBatchResponse, one per active request
         """
-        with mx.stream(MLLMBatchGenerator._stream):
-            return self._next()
+        return self._next()
 
     def stats(self) -> MLLMBatchStats:
         """
