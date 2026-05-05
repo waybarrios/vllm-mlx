@@ -276,7 +276,6 @@ class MLXLanguageModel:
 
         mtp_kwargs = {}
         if self._mtp:
-            mtp_kwargs["mtp"] = True
             mtp_kwargs["num_draft_tokens"] = self._mtp_num_draft_tokens
         if prompt_cache is not None:
             mtp_kwargs["prompt_cache"] = prompt_cache
