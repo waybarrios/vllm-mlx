@@ -42,6 +42,19 @@ def _processors_can_retire(processors: Optional[List[Callable]]) -> bool:
     )
 
 
+def _mark_mtp_attempts_on_primary_responses(
+    responses: List["MLLMBatchResponse"],
+    attempted_drafts_by_uid: Dict[int, int],
+) -> None:
+    """Mark only responses from steps that actually attempted MTP drafts."""
+    for response in responses:
+        draft_count = attempted_drafts_by_uid.pop(response.uid, 0)
+        if draft_count <= 0 or response.finish_reason is not None:
+            continue
+        response.mtp_attempted = True
+        response.mtp_attempted_count = draft_count
+
+
 def _drop_retired_processors(
     processors: Optional[List[Callable]],
 ) -> tuple[Optional[List[Callable]], int]:
@@ -161,6 +174,9 @@ class MLLMBatchResponse:
     logprobs: mx.array  # Log probabilities
     finish_reason: Optional[str] = None  # "stop", "length", or None
     prompt_cache: Optional[Callable[[], List[Any]]] = None  # Cache extraction function
+    from_draft: bool = False  # True when this response is an accepted MTP draft
+    mtp_attempted: bool = False  # True when the primary step attempted MTP
+    mtp_attempted_count: int = 0  # Number of draft tokens attempted
 
 
 @dataclass
@@ -1972,6 +1988,7 @@ def install_mtp_mllm(
 
     # Deferred drafts keyed by UID
     _deferred_drafts: Dict[int, dict] = {}
+    _attempted_drafts_by_uid: Dict[int, int] = {}
 
     # MTP stats
     _mtp_stats = {"accepted": 0, "rejected": 0, "errors": 0}
@@ -2077,6 +2094,8 @@ def install_mtp_mllm(
                 draft_logits, axis=-1, keepdims=True
             )
             draft_tokens = _draft_sampler(draft_logprobs)
+            for uid in current_uids:
+                _attempted_drafts_by_uid[uid] = 1
 
             # Snapshot RNN state for hybrid models
             _rnn_snapshots = {}
@@ -2210,6 +2229,7 @@ def install_mtp_mllm(
         if batch_gen.active_batch is None:
             _skip_state[0] = None
             _deferred_drafts.clear()
+            _attempted_drafts_by_uid.clear()
 
         # Save deferred drafts from previous step
         prev_deferred: Dict[int, dict] = {}
@@ -2219,6 +2239,9 @@ def install_mtp_mllm(
                     prev_deferred[uid] = _deferred_drafts.pop(uid)
 
         responses = batch_gen._inner_next()
+
+        if responses:
+            _mark_mtp_attempts_on_primary_responses(responses, _attempted_drafts_by_uid)
 
         if not prev_deferred or not responses:
             return responses
@@ -2249,6 +2272,7 @@ def install_mtp_mllm(
                             token=draft_t,
                             logprobs=draft_lp,
                             finish_reason="stop",
+                            from_draft=True,
                         )
                     )
                     draft_end_uids.add(uid)
@@ -2272,6 +2296,7 @@ def install_mtp_mllm(
                             token=draft_t,
                             logprobs=draft_lp,
                             finish_reason=draft_finish,
+                            from_draft=True,
                         )
                     )
 

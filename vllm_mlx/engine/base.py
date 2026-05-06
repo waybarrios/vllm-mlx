@@ -30,6 +30,9 @@ class GenerationOutput:
     # For streaming
     new_text: str = ""
     finished: bool = True
+    # MTP speculative decoding counters. Zero means no MTP attempt occurred.
+    mtp_drafts: int = 0
+    mtp_accepted: int = 0
 
 
 @contextmanager

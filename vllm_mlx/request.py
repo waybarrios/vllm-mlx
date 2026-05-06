@@ -213,6 +213,9 @@ class RequestOutput:
     # Timing
     prompt_tokens: int = 0
     completion_tokens: int = 0
+    # MTP speculative decoding counters. Zero means no MTP attempt occurred.
+    mtp_drafts: int = 0
+    mtp_accepted: int = 0
 
     @property
     def usage(self) -> Dict[str, int]:

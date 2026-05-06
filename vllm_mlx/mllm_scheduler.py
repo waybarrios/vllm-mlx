@@ -115,6 +115,8 @@ class MLLMRequest:
     # Token counts
     num_prompt_tokens: int = 0
     num_output_tokens: int = 0
+    mtp_drafts: int = 0
+    mtp_accepted: int = 0
 
     # Timing
     first_token_time: Optional[float] = None
@@ -618,6 +620,10 @@ class MLLMScheduler:
             # Append token to request
             request.output_tokens.append(response.token)
             request.num_output_tokens = len(request.output_tokens)
+            if response.mtp_attempted:
+                request.mtp_drafts += response.mtp_attempted_count
+            if response.from_draft:
+                request.mtp_accepted += 1
 
             if request.first_token_time is None and request.num_output_tokens > 0:
                 request.first_token_time = time.time()
@@ -642,6 +648,8 @@ class MLLMScheduler:
                 output_token_ids=list(request.output_tokens),
                 prompt_tokens=request.num_prompt_tokens,
                 completion_tokens=request.num_output_tokens,
+                mtp_drafts=request.mtp_drafts,
+                mtp_accepted=request.mtp_accepted,
             )
 
             # Check if finished
