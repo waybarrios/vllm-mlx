@@ -33,14 +33,16 @@ def serve_command(args):
     from .server import RateLimiter, app, load_model, load_model_registry
 
     logger = logging.getLogger(__name__)
+    model_arg = getattr(args, "model", None)
+    models_config = getattr(args, "models_config", None)
 
-    if args.models_config and args.model:
+    if models_config and model_arg:
         print("Error: use either positional MODEL or --models-config, not both")
         sys.exit(1)
-    if not args.models_config and not args.model:
+    if not models_config and not model_arg:
         print("Error: MODEL is required unless --models-config is provided")
         sys.exit(1)
-    if args.models_config and args.served_model_name:
+    if models_config and args.served_model_name:
         print("Error: --served-model-name cannot be used with --models-config")
         sys.exit(1)
 
@@ -60,12 +62,24 @@ def serve_command(args):
         print("Error: --max-tokens must be at least 1")
         sys.exit(1)
     max_request_tokens = getattr(args, "max_request_tokens", args.max_tokens)
+    max_kv_size = getattr(args, "max_kv_size", None)
     trust_remote_code = getattr(args, "trust_remote_code", False)
     if max_request_tokens < 1:
         print("Error: --max-request-tokens must be at least 1")
         sys.exit(1)
     if args.max_tokens > max_request_tokens:
         print("Error: --max-tokens cannot exceed --max-request-tokens")
+        sys.exit(1)
+    mllm_draft_model = getattr(args, "mllm_draft_model", None)
+    mllm_draft_kind = getattr(args, "mllm_draft_kind", None)
+    mllm_draft_block_size = getattr(args, "mllm_draft_block_size", None)
+    if mllm_draft_model and args.continuous_batching:
+        print(
+            "Error: --mllm-draft-model is supported only without --continuous-batching"
+        )
+        sys.exit(1)
+    if mllm_draft_model and (args.auto_unload_idle_seconds > 0 or args.lazy_load_model):
+        print("Error: --mllm-draft-model is not supported with lifecycle residency yet")
         sys.exit(1)
 
     # Configure server security settings
@@ -99,8 +113,9 @@ def serve_command(args):
     server._max_tts_input_chars = max_tts_input_chars
 
     # Configure thinking token budget
-    if args.default_thinking_token_budget is not None:
-        server._default_thinking_token_budget = args.default_thinking_token_budget
+    default_thinking_token_budget = getattr(args, "default_thinking_token_budget", None)
+    if default_thinking_token_budget is not None:
+        server._default_thinking_token_budget = default_thinking_token_budget
 
     # Configure reasoning parser
     if args.reasoning_parser:
@@ -160,8 +175,8 @@ def serve_command(args):
         print(f"  Reasoning: ENABLED (parser: {args.reasoning_parser})")
     else:
         print("  Reasoning: Use --reasoning-parser to enable")
-    if args.default_thinking_token_budget is not None:
-        print(f"  Thinking budget: {args.default_thinking_token_budget} tokens")
+    if default_thinking_token_budget is not None:
+        print(f"  Thinking budget: {default_thinking_token_budget} tokens")
     print(
         f"  Audio upload limit: {max_audio_upload_mb} MiB, "
         f"TTS input limit: {max_tts_input_chars} chars"
@@ -177,23 +192,23 @@ def serve_command(args):
         max_retries=args.download_retries,
         offline=getattr(args, "offline", False),
     )
-    if args.model:
+    if model_arg:
         ensure_model_downloaded(
-            args.model,
+            model_arg,
             config=download_config,
-            is_mllm=is_mllm_model(args.model),
+            is_mllm=is_mllm_model(model_arg),
         )
         if args.lazy_load_model:
-            print(f"Registering model for lazy load: {args.model}")
+            print(f"Registering model for lazy load: {model_arg}")
             print("Model will load on the first request.")
         else:
-            print(f"Loading model: {args.model}")
+            print(f"Loading model: {model_arg}")
     else:
-        print(f"Loading models config: {args.models_config}")
+        print(f"Loading models config: {models_config}")
     print(f"Default max tokens: {args.max_tokens}")
     print(f"Max request tokens: {max_request_tokens}")
-    if args.max_kv_size is not None:
-        print(f"Max KV size: {args.max_kv_size} (RotatingKVCache)")
+    if max_kv_size is not None:
+        print(f"Max KV size: {max_kv_size} (RotatingKVCache)")
 
     # Store MCP config path for FastAPI startup
     if args.mcp_config:
@@ -254,7 +269,7 @@ def serve_command(args):
             ssd_cache_dir=getattr(args, "ssd_cache_dir", None),
             ssd_cache_max_gb=getattr(args, "ssd_cache_max_gb", 10.0),
             # KV cache size limit
-            max_kv_size=args.max_kv_size or 0,
+            max_kv_size=max_kv_size or 0,
         )
 
         print("Mode: Continuous batching (for multiple concurrent users)")
@@ -293,8 +308,14 @@ def serve_command(args):
                 f"threshold={args.specprefill_threshold}, "
                 f"keep={args.specprefill_keep_pct*100:.0f}%)"
             )
+        if mllm_draft_model:
+            print(
+                "MLLM draft model: enabled "
+                f"(draft={mllm_draft_model}, kind={mllm_draft_kind}, "
+                f"block_size={mllm_draft_block_size})"
+            )
 
-    if args.models_config:
+    if models_config:
         defaults = RegistryServeDefaults(
             continuous_batching=args.continuous_batching,
             force_mllm=getattr(args, "mllm", False),
@@ -310,11 +331,11 @@ def serve_command(args):
             max_tokens=args.max_tokens,
             download_config=download_config,
         )
-        load_model_registry(args.models_config, defaults=defaults)
+        load_model_registry(models_config, defaults=defaults)
     else:
         # Load model with unified server
         load_model(
-            args.model,
+            model_arg,
             use_batching=args.continuous_batching,
             scheduler_config=scheduler_config,
             stream_interval=args.stream_interval if args.continuous_batching else 1,
@@ -330,6 +351,9 @@ def serve_command(args):
             specprefill_threshold=args.specprefill_threshold,
             specprefill_keep_pct=args.specprefill_keep_pct,
             specprefill_draft_model=args.specprefill_draft_model,
+            mllm_draft_model=mllm_draft_model,
+            mllm_draft_kind=mllm_draft_kind,
+            mllm_draft_block_size=mllm_draft_block_size,
             warm_prompts_path=getattr(args, "warm_prompts", None),
             auto_unload_idle_seconds=args.auto_unload_idle_seconds,
             lazy_load_model=args.lazy_load_model,
@@ -1198,6 +1222,27 @@ Examples:
         default=None,
         help="Path to small draft model for SpecPrefill importance scoring. "
         "Must share the same tokenizer as the target model.",
+    )
+    # MLLM speculative draft/assistant model
+    serve_parser.add_argument(
+        "--mllm-draft-model",
+        type=str,
+        default=None,
+        help="Path to an mlx-vlm MLLM draft/assistant model. "
+        "For Gemma 4 assistant drafters, use with --mllm-draft-kind mtp.",
+    )
+    serve_parser.add_argument(
+        "--mllm-draft-kind",
+        type=str,
+        default=None,
+        choices=["mtp"],
+        help="mlx-vlm draft kind for --mllm-draft-model.",
+    )
+    serve_parser.add_argument(
+        "--mllm-draft-block-size",
+        type=int,
+        default=None,
+        help="Draft block size passed to mlx-vlm for --mllm-draft-model.",
     )
     # MCP options
     serve_parser.add_argument(

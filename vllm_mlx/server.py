@@ -2741,6 +2741,9 @@ def load_model(
     specprefill_threshold: int = 8192,
     specprefill_keep_pct: float = 0.3,
     specprefill_draft_model: str = None,
+    mllm_draft_model: str | None = None,
+    mllm_draft_kind: str | None = None,
+    mllm_draft_block_size: int | None = None,
     warm_prompts_path: str | None = None,
     auto_unload_idle_seconds: float = 0.0,
     lazy_load_model: bool = False,
@@ -2763,6 +2766,9 @@ def load_model(
         specprefill_threshold: Minimum suffix tokens to trigger SpecPrefill (default: 8192)
         specprefill_keep_pct: Fraction of tokens to keep (default: 0.3)
         specprefill_draft_model: Path to small draft model for SpecPrefill scoring
+        mllm_draft_model: Optional MLLM speculative draft/assistant model path.
+        mllm_draft_kind: Optional mlx-vlm draft kind, for example "mtp".
+        mllm_draft_block_size: Optional speculative block size passed to mlx-vlm.
         auto_unload_idle_seconds: Idle time before auto-unloading the main model.
             When non-zero, the main model is managed through lifecycle
             residency instead of being loaded immediately in this function.
@@ -2783,6 +2789,12 @@ def load_model(
         raise ValueError("Max request tokens must be at least 1")
     if max_tokens > max_request_tokens:
         raise ValueError("Default max tokens cannot exceed max request tokens")
+    if mllm_draft_model and use_batching:
+        raise ValueError("MLLM draft models are supported only by SimpleEngine")
+    if mllm_draft_model and (auto_unload_idle_seconds > 0 or lazy_load_model):
+        raise ValueError(
+            "MLLM draft models are not supported with lifecycle residency yet"
+        )
 
     if _lifespan_active:
         raise RuntimeError(
@@ -2898,6 +2910,9 @@ def load_model(
             specprefill_keep_pct=specprefill_keep_pct,
             specprefill_draft_model=specprefill_draft_model,
             max_kv_size=_max_kv,
+            mllm_draft_model=mllm_draft_model,
+            mllm_draft_kind=mllm_draft_kind,
+            mllm_draft_block_size=mllm_draft_block_size,
         )
         # Start SimpleEngine synchronously (no background loop)
         # Use new_event_loop() for Python 3.10+ compatibility (get_event_loop() is deprecated)
@@ -6123,6 +6138,9 @@ def main():
         max_request_tokens=args.max_request_tokens,
         force_mllm=args.mllm,
         trust_remote_code=args.trust_remote_code,
+        mllm_draft_model=args.mllm_draft_model,
+        mllm_draft_kind=args.mllm_draft_kind,
+        mllm_draft_block_size=args.mllm_draft_block_size,
         auto_unload_idle_seconds=args.auto_unload_idle_seconds,
         lazy_load_model=args.lazy_load_model,
     )
@@ -6187,6 +6205,25 @@ Examples:
         "--continuous-batching",
         action="store_true",
         help="Enable continuous batching for multiple concurrent users",
+    )
+    parser.add_argument(
+        "--mllm-draft-model",
+        type=str,
+        default=None,
+        help="Path to an mlx-vlm MLLM draft/assistant model.",
+    )
+    parser.add_argument(
+        "--mllm-draft-kind",
+        type=str,
+        default=None,
+        choices=["mtp"],
+        help="mlx-vlm draft kind for --mllm-draft-model.",
+    )
+    parser.add_argument(
+        "--mllm-draft-block-size",
+        type=int,
+        default=None,
+        help="Draft block size passed to mlx-vlm for --mllm-draft-model.",
     )
     parser.add_argument(
         "--mcp-config",

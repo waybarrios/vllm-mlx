@@ -125,6 +125,9 @@ class SimpleEngine(BaseEngine):
         specprefill_keep_pct: float = 0.3,
         specprefill_draft_model: str | None = None,
         max_kv_size: int = 0,
+        mllm_draft_model: str | None = None,
+        mllm_draft_kind: str | None = None,
+        mllm_draft_block_size: int | None = None,
     ):
         """
         Initialize the simple engine.
@@ -142,6 +145,9 @@ class SimpleEngine(BaseEngine):
             specprefill_keep_pct: Fraction of tokens to keep (default: 0.3)
             specprefill_draft_model: Path to small draft model for importance scoring
             max_kv_size: Maximum KV cache size per sequence (0 = unbounded)
+            mllm_draft_model: Optional MLLM speculative draft/assistant model path
+            mllm_draft_kind: Optional mlx-vlm draft kind, for example "mtp"
+            mllm_draft_block_size: Optional speculative block size for mlx-vlm
         """
         self._model_name = model_name
         self._created_at = time.time()
@@ -157,6 +163,9 @@ class SimpleEngine(BaseEngine):
         self._specprefill_threshold = specprefill_threshold
         self._specprefill_keep_pct = specprefill_keep_pct
         self._specprefill_draft_model_path = specprefill_draft_model
+        self._mllm_draft_model_path = mllm_draft_model
+        self._mllm_draft_kind = mllm_draft_kind
+        self._mllm_draft_block_size = mllm_draft_block_size
 
         # KV cache size limit
         self._max_kv_size = max_kv_size
@@ -211,6 +220,9 @@ class SimpleEngine(BaseEngine):
                 trust_remote_code=self._trust_remote_code,
                 enable_cache=self._enable_cache,
                 max_kv_size=self._max_kv_size,
+                draft_model=self._mllm_draft_model_path,
+                draft_kind=self._mllm_draft_kind,
+                draft_block_size=self._mllm_draft_block_size,
             )
         else:
             from ..models.llm import MLXLanguageModel
@@ -256,7 +268,7 @@ class SimpleEngine(BaseEngine):
             # Build parallel mlx_lm TextModel for text-only routing.
             # Even when MTP is disabled, text-only requests should not be trapped
             # on the slower mlx_vlm multimodal path.
-            if self._is_mllm:
+            if self._is_mllm and self._should_route_text_through_text_model():
                 try:
                     from ..text_model_from_vlm import build_text_model
 
@@ -339,6 +351,10 @@ class SimpleEngine(BaseEngine):
         self._system_kv_hash = None
         self._system_kv_token_count = 0
         logger.info("SimpleEngine stopped")
+
+    def _should_route_text_through_text_model(self) -> bool:
+        """Return whether text-only MLLM requests may use mlx_lm TextModel."""
+        return self._mllm_draft_model_path is None
 
     async def _run_blocking_serialized(self, func, /, *args, on_cancel=None, **kwargs):
         """Run a blocking MLX operation under the generation lock.
@@ -658,6 +674,8 @@ class SimpleEngine(BaseEngine):
                 prompt_tokens=output.prompt_tokens,
                 completion_tokens=output.completion_tokens,
                 finish_reason=output.finish_reason,
+                mtp_drafts=getattr(output, "mtp_drafts", 0),
+                mtp_accepted=getattr(output, "mtp_accepted", 0),
             )
         else:
             output = await self._run_blocking_serialized(
@@ -729,6 +747,7 @@ class SimpleEngine(BaseEngine):
         if (
             self._is_mllm
             and self._text_model is not None
+            and self._should_route_text_through_text_model()
             and not has_media_content(messages)
         ):
             has_mtp = (
@@ -788,6 +807,8 @@ class SimpleEngine(BaseEngine):
                             completion_tokens=token_count,
                             finished=finished,
                             finish_reason=chunk.finish_reason if finished else None,
+                            mtp_drafts=getattr(chunk, "mtp_drafts", 0),
+                            mtp_accepted=getattr(chunk, "mtp_accepted", 0),
                         )
 
                         if finished:
@@ -825,6 +846,8 @@ class SimpleEngine(BaseEngine):
                     completion_tokens=token_count,
                     finished=finished,
                     finish_reason=chunk.finish_reason if finished else None,
+                    mtp_drafts=getattr(chunk, "mtp_drafts", 0),
+                    mtp_accepted=getattr(chunk, "mtp_accepted", 0),
                 )
 
                 if finished:

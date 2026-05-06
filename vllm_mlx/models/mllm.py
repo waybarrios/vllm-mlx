@@ -15,6 +15,7 @@ Features:
 
 import atexit
 import base64
+import json
 import ipaddress
 import logging
 import math
@@ -143,6 +144,42 @@ class MLLMOutput:
     finish_reason: str | None = None
     prompt_tokens: int = 0
     completion_tokens: int = 0
+    mtp_drafts: int = 0
+    mtp_accepted: int = 0
+
+
+def load_gemma4_assistant_drafter(model_path: str):
+    """Load a Gemma 4 assistant drafter for mlx-vlm speculative decoding."""
+    try:
+        import mlx.core as mx
+        from mlx_vlm.speculative.drafters import gemma4_assistant as arch
+    except ImportError as exc:
+        raise ImportError(
+            "Gemma 4 assistant drafter support requires an mlx-vlm build that "
+            "provides mlx_vlm.speculative.drafters.gemma4_assistant."
+        ) from exc
+
+    path = Path(model_path)
+    config_path = path / "config.json"
+    weight_paths = sorted(path.glob("*.safetensors"))
+    if not config_path.exists():
+        raise FileNotFoundError(f"Gemma 4 assistant config not found: {config_path}")
+    if not weight_paths:
+        raise FileNotFoundError(f"Gemma 4 assistant weights not found: {path}")
+
+    config = arch.ModelConfig.from_dict(
+        json.loads(config_path.read_text(encoding="utf-8"))
+    )
+    model = arch.Model(config)
+    weights = {}
+    for weight_path in weight_paths:
+        weights.update(mx.load(str(weight_path)))
+    if hasattr(model, "sanitize"):
+        weights = model.sanitize(weights)
+    model.load_weights(list(weights.items()))
+    mx.eval(model.parameters())
+    model.eval()
+    return model
 
 
 def is_base64_image(s: str) -> bool:
@@ -856,6 +893,9 @@ class MLXMultimodalLM:
         enable_cache: bool = True,
         cache_size: int = 50,
         max_kv_size: int = 0,
+        draft_model: str | None = None,
+        draft_kind: str | None = None,
+        draft_block_size: int | None = None,
     ):
         """
         Initialize the MLX multimodal language model.
@@ -866,15 +906,22 @@ class MLXMultimodalLM:
             enable_cache: Enable KV cache for repeated image/video+prompt (default: True)
             cache_size: Maximum cache entries (default: 50)
             max_kv_size: Maximum KV cache size per sequence (0 = unbounded)
+            draft_model: Optional MLLM speculative draft/assistant model path.
+            draft_kind: Optional mlx-vlm draft kind, for example "mtp".
+            draft_block_size: Optional speculative block size passed to mlx-vlm.
         """
         self.model_name = model_name
         self.trust_remote_code = trust_remote_code
         self.enable_cache = enable_cache
         self.max_kv_size = max_kv_size
+        self.draft_model_path = draft_model
+        self.draft_kind = draft_kind
+        self.draft_block_size = draft_block_size
 
         self.model = None
         self.processor = None
         self.config = None
+        self._draft_model = None
         self._loaded = False
         self._video_native = False
 
@@ -896,6 +943,8 @@ class MLXMultimodalLM:
 
             self.model, self.processor = load(self.model_name)
             self.config = load_config(self.model_name)
+            if self.draft_model_path:
+                self._draft_model = self._load_draft_model()
 
             self._loaded = True
             self._video_native = hasattr(
@@ -913,6 +962,53 @@ class MLXMultimodalLM:
         except Exception as e:
             logger.error(f"Failed to load MLLM: {e}")
             raise
+
+    def _load_draft_model(self):
+        if self.draft_kind == "mtp":
+            return load_gemma4_assistant_drafter(self.draft_model_path)
+
+        from mlx_vlm.utils import load
+
+        draft_model, _ = load(self.draft_model_path)
+        return draft_model
+
+    def _draft_generation_kwargs(self) -> dict:
+        if self._draft_model is None:
+            return {}
+        kwargs = {"draft_model": self._draft_model}
+        if self.draft_kind:
+            kwargs["draft_kind"] = self.draft_kind
+        if self.draft_block_size is not None:
+            kwargs["draft_block_size"] = self.draft_block_size
+        return kwargs
+
+    def _reset_draft_metrics(self) -> int:
+        if self._draft_model is None:
+            return 0
+        if hasattr(self._draft_model, "accept_lens"):
+            self._draft_model.accept_lens = []
+        return 0
+
+    def _draft_metrics_since(self, start_accept_lens: int) -> dict[str, int]:
+        if self._draft_model is None:
+            return {"mtp_drafts": 0, "mtp_accepted": 0}
+        accept_lens = list(getattr(self._draft_model, "accept_lens", []))
+        if start_accept_lens > len(accept_lens):
+            new_accept_lens = accept_lens
+        else:
+            new_accept_lens = accept_lens[start_accept_lens:]
+        block_size = (
+            int(self.draft_block_size)
+            if self.draft_block_size is not None
+            else int(
+                getattr(getattr(self._draft_model, "config", None), "block_size", 0)
+            )
+        )
+        drafted_per_round = max(block_size - 1, 0)
+        return {
+            "mtp_drafts": drafted_per_round * len(new_accept_lens),
+            "mtp_accepted": sum(int(value) for value in new_accept_lens),
+        }
 
     def get_language_model(self):
         """Extract the underlying language model for mlx_lm TextModel construction."""
@@ -1384,6 +1480,7 @@ class MLXMultimodalLM:
                 prompt_cache = None
 
         # Generate with cache
+        draft_accept_start = self._reset_draft_metrics()
         result = generate(
             self.model,
             self.processor,
@@ -1395,8 +1492,10 @@ class MLXMultimodalLM:
             top_p=top_p,
             verbose=False,
             prompt_cache=prompt_cache,
+            **self._draft_generation_kwargs(),
             **kwargs,
         )
+        draft_metrics = self._draft_metrics_since(draft_accept_start)
 
         # Store cache for future reuse (only on miss)
         if use_cache and self._cache_manager and all_sources and not cache_hit:
@@ -1425,6 +1524,7 @@ class MLXMultimodalLM:
             finish_reason="stop",
             prompt_tokens=prompt_tokens,
             completion_tokens=generation_tokens,
+            **draft_metrics,
         )
 
     def stream_generate(
@@ -1513,6 +1613,7 @@ class MLXMultimodalLM:
             audio=all_audio if all_audio else None,
             max_tokens=max_tokens,
             temp=temperature,
+            **self._draft_generation_kwargs(),
             **kwargs,
         ):
             yield chunk
@@ -1826,6 +1927,7 @@ class MLXMultimodalLM:
             except Exception:
                 prompt_cache = None
 
+        draft_accept_start = self._reset_draft_metrics()
         result = generate(
             self.model,
             self.processor,
@@ -1837,8 +1939,10 @@ class MLXMultimodalLM:
             verbose=False,
             prompt_cache=prompt_cache,
             skip_prompt_processing=skip_prompt_processing,
+            **self._draft_generation_kwargs(),
             **kwargs,
         )
+        draft_metrics = self._draft_metrics_since(draft_accept_start)
 
         # Store KV cache for future reuse (on cache miss)
         # IMPORTANT: We need to store only the prompt portion, not generated tokens
@@ -1921,6 +2025,7 @@ class MLXMultimodalLM:
             finish_reason="stop",
             prompt_tokens=prompt_tokens,
             completion_tokens=generation_tokens,
+            **draft_metrics,
         )
 
     def stream_chat(
@@ -2150,6 +2255,7 @@ class MLXMultimodalLM:
         # Stream generate tokens with cache
         accumulated_text = ""
         token_count = 0
+        draft_accept_start = self._reset_draft_metrics()
 
         for chunk in stream_generate(
             self.model,
@@ -2160,6 +2266,7 @@ class MLXMultimodalLM:
             max_tokens=max_tokens,
             temp=temperature,
             prompt_cache=prompt_cache,
+            **self._draft_generation_kwargs(),
             **kwargs,
         ):
             token_count += 1
@@ -2180,6 +2287,7 @@ class MLXMultimodalLM:
             finish_reason="stop",
             prompt_tokens=getattr(chunk, "prompt_tokens", 0) if "chunk" in dir() else 0,
             completion_tokens=token_count,
+            **self._draft_metrics_since(draft_accept_start),
         )
 
     def describe_image(
