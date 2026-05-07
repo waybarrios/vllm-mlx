@@ -248,6 +248,7 @@ class ChatCompletionResponse(BaseModel):
     model: str
     choices: list[ChatCompletionChoice]
     usage: Usage = Field(default_factory=Usage)
+    generation_metadata: dict | None = None
 
 
 # =============================================================================

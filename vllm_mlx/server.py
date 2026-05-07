@@ -257,6 +257,7 @@ class PreparedChatInvocation:
     chat_kwargs: dict[str, object]
     response_format: object | None
     json_logits_processor: object | None
+    thinking_processor: object | None = None
 
 
 def _prepare_chat_messages(
@@ -419,6 +420,7 @@ def _build_thinking_processor(
         inner=inner,
         vocab_size=vocab_size,
         prompt_has_think_tag=prompt_has_think_tag,
+        no_final_content_token_limit=_resolve_no_final_content_token_limit(),
     )
     logger.info(
         "Thinking processor enabled: budget=%d, start=%s, end=%s",
@@ -427,6 +429,29 @@ def _build_thinking_processor(
         end_ids,
     )
     return proc
+
+
+def _resolve_no_final_content_token_limit() -> int | None:
+    raw = os.environ.get("VLLM_MLX_NO_FINAL_CONTENT_TOKEN_LIMIT")
+    if raw is None or raw.strip() == "":
+        return None
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning("Ignoring invalid VLLM_MLX_NO_FINAL_CONTENT_TOKEN_LIMIT=%r", raw)
+        return None
+    if value <= 0:
+        return None
+    return value
+
+
+def _generation_metadata(thinking_processor: object | None) -> dict:
+    return {
+        "no_final_content_watchdog_tokens": _resolve_no_final_content_token_limit(),
+        "no_final_content_watchdog_enforced": bool(
+            getattr(thinking_processor, "watchdog_was_enforced", False)
+        ),
+    }
 
 
 class _ThinkingAwareLogitsProcessor:
@@ -644,6 +669,7 @@ def _prepare_chat_completion_invocation(
     # default budget should not alter non-thinking requests.
     thinking_budget = request.thinking_token_budget or _default_thinking_token_budget
     enable_thinking = chat_kwargs.get("enable_thinking", True)
+    thinking_proc = None
     if thinking_budget is not None and enable_thinking is not False:
         thinking_proc = _build_thinking_processor(
             engine,
@@ -661,6 +687,7 @@ def _prepare_chat_completion_invocation(
         chat_kwargs=chat_kwargs,
         response_format=response_format,
         json_logits_processor=json_logits_processor,
+        thinking_processor=thinking_proc,
     )
 
 
@@ -4600,6 +4627,7 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
                 completion_tokens=output.completion_tokens,
                 total_tokens=output.prompt_tokens + output.completion_tokens,
             ),
+            generation_metadata=_generation_metadata(prepared.thinking_processor),
         )
     finally:
         if release_on_exit:
