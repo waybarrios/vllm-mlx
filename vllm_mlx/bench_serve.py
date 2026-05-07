@@ -178,6 +178,128 @@ def _first_not_none(*values: Any) -> Any:
     return None
 
 
+def _normalize_tags(tags: Any, *, case_id: str) -> tuple[str, ...]:
+    """Coerce a workload case's ``tags`` field to a tuple of strings.
+
+    Accepts either a single string (treated as a one-element list) or a
+    list. Any other type is rejected with a case-scoped ``ValueError``.
+    """
+    if isinstance(tags, str):
+        tags = [tags]
+    if not isinstance(tags, list):
+        raise ValueError(f"{case_id}: tags must be a list or string")
+    return tuple(str(tag) for tag in tags)
+
+
+def _merge_case_checks(
+    default_checks: Any,
+    case_checks: Any,
+    *,
+    case_id: str,
+) -> Optional[dict]:
+    """Merge a case's ``checks`` over the workload defaults.
+
+    Most keys are overridden by the case-level value. The two regex list
+    keys (``required_regex``, ``forbidden_regex``) are list-concatenated
+    with default patterns first and case patterns appended, so
+    case-level patterns extend defaults rather than replace them.
+    Returns ``None`` when neither source contributes any checks.
+
+    Rejects a non-dict ``case_checks`` with a ``ValueError`` named after
+    the case so the operator gets a clear message instead of the
+    ``AttributeError`` that the previous inline code raised on
+    ``case_checks.items()``.
+    """
+    merged: dict = dict(default_checks or {})
+    if not case_checks:
+        return merged or None
+    if not isinstance(case_checks, dict):
+        raise ValueError(f"{case_id}: checks must be an object")
+    for key, value in case_checks.items():
+        if (
+            key in ("required_regex", "forbidden_regex")
+            and isinstance(value, list)
+            and isinstance(merged.get(key), list)
+        ):
+            merged[key] = merged[key] + value
+        else:
+            merged[key] = value
+    return merged or None
+
+
+def _build_workload_case(
+    item: Any,
+    idx: int,
+    *,
+    defaults: dict,
+    workload_path: Path,
+) -> WorkloadCase:
+    """Construct one ``WorkloadCase`` from a raw workload entry.
+
+    Validates the entry shape, loads request defaults from a sibling JSON
+    file when ``request_path`` is provided, merges ``extra_body`` and
+    ``checks`` against the workload defaults, and resolves scalar fields
+    (``max_tokens``, ``enable_thinking``, ``policy_timeout_ms``) via
+    ``_first_not_none`` priority: case-level beats request_path defaults
+    beats workload defaults.
+
+    ``extra_body`` follows a different merge: it composes the
+    ``request_path`` extras (base) with either the case-level
+    ``extra_body`` if present, otherwise the workload-default
+    ``extra_body``. The case-vs-default fallback is a get-with-default,
+    not a three-way merge.
+    """
+    if not isinstance(item, dict):
+        raise ValueError(f"case {idx}: case must be an object")
+    case_id = str(item.get("id") or f"case_{idx + 1}")
+
+    request_path = item.get("request_path")
+    request_defaults: dict = {}
+    if request_path is not None:
+        request_defaults = _load_case_request(
+            str(request_path), workload_path=workload_path, case_id=case_id
+        )
+
+    messages = _require_message_list(
+        item.get("messages", request_defaults.get("messages")),
+        label=case_id,
+    )
+
+    extra_body = item.get("extra_body", defaults.get("extra_body"))
+    request_extra = _request_extra_body(request_defaults)
+    if extra_body:
+        request_extra.update(extra_body)
+    extra_body = request_extra or None
+
+    checks = _merge_case_checks(
+        defaults.get("checks"), item.get("checks"), case_id=case_id
+    )
+
+    return WorkloadCase(
+        case_id=case_id,
+        messages=messages,
+        request_path=str(request_path) if request_path is not None else None,
+        max_tokens=_first_not_none(
+            item.get("max_tokens"),
+            request_defaults.get("max_tokens"),
+            defaults.get("max_tokens"),
+        ),
+        enable_thinking=_first_not_none(
+            item.get("enable_thinking"),
+            request_defaults.get("enable_thinking"),
+            defaults.get("enable_thinking"),
+        ),
+        extra_body=extra_body,
+        policy_timeout_ms=_first_not_none(
+            item.get("policy_timeout_ms"),
+            request_defaults.get("policy_timeout_ms"),
+            defaults.get("policy_timeout_ms"),
+        ),
+        checks=checks,
+        tags=_normalize_tags(item.get("tags", []), case_id=case_id),
+    )
+
+
 def load_workload(path: str | Path) -> Workload:
     """Load a declarative serving benchmark workload.
 
@@ -200,73 +322,10 @@ def load_workload(path: str | Path) -> Workload:
     if not isinstance(defaults, dict):
         raise ValueError("workload defaults must be an object")
 
-    cases: list[WorkloadCase] = []
-    for idx, item in enumerate(raw_cases):
-        if not isinstance(item, dict):
-            raise ValueError(f"case {idx}: case must be an object")
-        case_id = str(item.get("id") or f"case_{idx + 1}")
-        request_path = item.get("request_path")
-        request_defaults: dict = {}
-        if request_path is not None:
-            request_defaults = _load_case_request(
-                str(request_path), workload_path=workload_path, case_id=case_id
-            )
-        messages = _require_message_list(
-            item.get("messages", request_defaults.get("messages")),
-            label=case_id,
-        )
-        extra_body = item.get("extra_body", defaults.get("extra_body"))
-        request_extra = _request_extra_body(request_defaults)
-        if extra_body:
-            request_extra.update(extra_body)
-        extra_body = request_extra or None
-        if extra_body is not None and not isinstance(extra_body, dict):
-            raise ValueError(f"{case_id}: extra_body must be an object")
-        merged_checks = dict(defaults.get("checks") or {})
-        if item.get("checks"):
-            for key, value in item["checks"].items():
-                if (
-                    key in ("required_regex", "forbidden_regex")
-                    and isinstance(value, list)
-                    and isinstance(merged_checks.get(key), list)
-                ):
-                    merged_checks[key] = merged_checks[key] + value
-                else:
-                    merged_checks[key] = value
-        checks = merged_checks or None
-        if checks is not None and not isinstance(checks, dict):
-            raise ValueError(f"{case_id}: checks must be an object")
-        tags = item.get("tags", [])
-        if isinstance(tags, str):
-            tags = [tags]
-        if not isinstance(tags, list):
-            raise ValueError(f"{case_id}: tags must be a list or string")
-
-        cases.append(
-            WorkloadCase(
-                case_id=case_id,
-                messages=messages,
-                request_path=str(request_path) if request_path is not None else None,
-                max_tokens=_first_not_none(
-                    item.get("max_tokens"),
-                    request_defaults.get("max_tokens"),
-                    defaults.get("max_tokens"),
-                ),
-                enable_thinking=_first_not_none(
-                    item.get("enable_thinking"),
-                    request_defaults.get("enable_thinking"),
-                    defaults.get("enable_thinking"),
-                ),
-                extra_body=extra_body,
-                policy_timeout_ms=_first_not_none(
-                    item.get("policy_timeout_ms"),
-                    request_defaults.get("policy_timeout_ms"),
-                    defaults.get("policy_timeout_ms"),
-                ),
-                checks=checks,
-                tags=tuple(str(tag) for tag in tags),
-            )
-        )
+    cases = [
+        _build_workload_case(item, idx, defaults=defaults, workload_path=workload_path)
+        for idx, item in enumerate(raw_cases)
+    ]
 
     return Workload(
         name=str(raw.get("name") or workload_path.stem),
