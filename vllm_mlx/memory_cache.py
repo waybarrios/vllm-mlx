@@ -672,7 +672,7 @@ class MemoryAwarePrefixCache:
         # Memory tracking
         self._max_memory = self._config.compute_memory_limit()
         self._current_memory = 0
-        self._memory_lock = threading.Lock()
+        self._memory_lock = threading.RLock()
 
         # Statistics
         self._stats = CacheStats(max_memory_bytes=self._max_memory)
@@ -934,79 +934,80 @@ class MemoryAwarePrefixCache:
         if not tokens or not cache:
             return False
 
-        tokens_key = tuple(tokens)
+        with self._memory_lock:
+            tokens_key = tuple(tokens)
 
-        # If already cached, just update LRU order (skip expensive trim/quantize)
-        if tokens_key in self._entries:
-            self._entries.move_to_end(tokens_key)
-            return True
+            # If already cached, just update LRU order (skip expensive trim/quantize)
+            if tokens_key in self._entries:
+                self._entries.move_to_end(tokens_key)
+                return True
 
-        # Trim oversized KV arrays to actual used size
-        cache = _trim_to_offset(cache)
+            # Trim oversized KV arrays to actual used size
+            cache = _trim_to_offset(cache)
 
-        # Quantize if enabled and sequence is long enough
-        if (
-            self._config.kv_quantize
-            and len(tokens) >= self._config.kv_min_quantize_tokens
-        ):
-            cache = _quantize_cache(
-                cache, self._config.kv_bits, self._config.kv_group_size
-            )
-
-        # Create entry and estimate memory
-        entry = _CacheEntry.create(tokens, cache)
-
-        # Check if single entry exceeds limit
-        if entry.memory_bytes > self._max_memory:
-            logger.warning(
-                f"Cache entry too large: {entry.memory_bytes / _BYTES_PER_MB:.1f}MB "
-                f"exceeds limit {self._max_memory / _BYTES_PER_MB:.1f}MB"
-            )
-            return False
-
-        # Prefix-subset eviction: remove entries whose token sequence
-        # is a strict prefix of the new entry.  Uses sorted index for
-        # O(log N + K) lookup instead of O(N) scan.
-        if evict_prefixes and self._sorted_keys:
-            to_remove = []
-            idx = bisect.bisect_left(self._sorted_keys, tokens_key)
-            # Scan backwards — prefixes of tokens_key are immediately before idx
-            for i in range(idx - 1, -1, -1):
-                key = self._sorted_keys[i]
-                klen = len(key)
-                if klen >= len(tokens_key):
-                    continue
-                if tokens_key[:klen] == key:
-                    to_remove.append(key)
-                elif key[0] != tokens_key[0]:
-                    break
-            for key in to_remove:
-                old = self._entries.pop(key)
-                self._current_memory -= old.memory_bytes
-                self._stats.evictions += 1
-                self._remove_from_sorted(key)
-                logger.debug(
-                    f"[prefix_evict] removed {len(key)} tokens, "
-                    f"freed {old.memory_bytes / _BYTES_PER_MB:.2f}MB, "
-                    f"new_entry={len(tokens_key)} tokens"
+            # Quantize if enabled and sequence is long enough
+            if (
+                self._config.kv_quantize
+                and len(tokens) >= self._config.kv_min_quantize_tokens
+            ):
+                cache = _quantize_cache(
+                    cache, self._config.kv_bits, self._config.kv_group_size
                 )
-            if to_remove:
-                self._stats.entry_count = len(self._entries)
-                self._stats.current_memory_bytes = self._current_memory
 
-        # Evict until we have room
-        while (
-            self._current_memory + entry.memory_bytes > self._max_memory
-            or len(self._entries) >= self._config.max_entries
-        ) and self._entries:
-            self._evict_lru()
+            # Create entry and estimate memory
+            entry = _CacheEntry.create(tokens, cache)
 
-        # Store entry
-        self._entries[tokens_key] = entry
-        self._current_memory += entry.memory_bytes
-        bisect.insort(self._sorted_keys, tokens_key)
-        self._stats.entry_count = len(self._entries)
-        self._stats.current_memory_bytes = self._current_memory
+            # Check if single entry exceeds limit
+            if entry.memory_bytes > self._max_memory:
+                logger.warning(
+                    f"Cache entry too large: {entry.memory_bytes / _BYTES_PER_MB:.1f}MB "
+                    f"exceeds limit {self._max_memory / _BYTES_PER_MB:.1f}MB"
+                )
+                return False
+
+            # Prefix-subset eviction: remove entries whose token sequence
+            # is a strict prefix of the new entry.  Uses sorted index for
+            # O(log N + K) lookup instead of O(N) scan.
+            if evict_prefixes and self._sorted_keys:
+                to_remove = []
+                idx = bisect.bisect_left(self._sorted_keys, tokens_key)
+                # Scan backwards — prefixes of tokens_key are immediately before idx
+                for i in range(idx - 1, -1, -1):
+                    key = self._sorted_keys[i]
+                    klen = len(key)
+                    if klen >= len(tokens_key):
+                        continue
+                    if tokens_key[:klen] == key:
+                        to_remove.append(key)
+                    elif key[0] != tokens_key[0]:
+                        break
+                for key in to_remove:
+                    old = self._entries.pop(key)
+                    self._current_memory -= old.memory_bytes
+                    self._stats.evictions += 1
+                    self._remove_from_sorted(key)
+                    logger.debug(
+                        f"[prefix_evict] removed {len(key)} tokens, "
+                        f"freed {old.memory_bytes / _BYTES_PER_MB:.2f}MB, "
+                        f"new_entry={len(tokens_key)} tokens"
+                    )
+                if to_remove:
+                    self._stats.entry_count = len(self._entries)
+                    self._stats.current_memory_bytes = self._current_memory
+
+            # Evict until we have room
+            while (
+                self._current_memory + entry.memory_bytes > self._max_memory
+                or len(self._entries) >= self._config.max_entries
+            ) and self._entries:
+                self._evict_lru()
+
+            # Store entry
+            self._entries[tokens_key] = entry
+            self._current_memory += entry.memory_bytes
+            bisect.insort(self._sorted_keys, tokens_key)
+            self._stats.entry_count = len(self._entries)
+            self._stats.current_memory_bytes = self._current_memory
 
         logger.debug(
             f"Stored cache: {len(tokens)} tokens, "
@@ -1028,16 +1029,17 @@ class MemoryAwarePrefixCache:
         If an SSD tier is attached, the entry is spilled to disk instead
         of being discarded.
         """
-        if not self._entries:
-            return
+        with self._memory_lock:
+            if not self._entries:
+                return
 
-        # popitem(last=False) removes oldest entry (FIFO order = LRU)
-        tokens_key, entry = self._entries.popitem(last=False)
-        self._current_memory -= entry.memory_bytes
-        self._remove_from_sorted(tokens_key)
-        self._stats.evictions += 1
-        self._stats.entry_count = len(self._entries)
-        self._stats.current_memory_bytes = self._current_memory
+            # popitem(last=False) removes oldest entry (FIFO order = LRU)
+            tokens_key, entry = self._entries.popitem(last=False)
+            self._current_memory -= entry.memory_bytes
+            self._remove_from_sorted(tokens_key)
+            self._stats.evictions += 1
+            self._stats.entry_count = len(self._entries)
+            self._stats.current_memory_bytes = self._current_memory
 
         # Spill to SSD tier if available
         if self._ssd_tier is not None:
@@ -1059,22 +1061,24 @@ class MemoryAwarePrefixCache:
         Returns:
             True if entry was found and removed.
         """
-        tokens_key = tuple(tokens)
-        entry = self._entries.pop(tokens_key, None)
-        if entry is not None:
-            self._current_memory -= entry.memory_bytes
-            self._remove_from_sorted(tokens_key)
-            self._stats.entry_count = len(self._entries)
-            self._stats.current_memory_bytes = self._current_memory
-            return True
-        return False
+        with self._memory_lock:
+            tokens_key = tuple(tokens)
+            entry = self._entries.pop(tokens_key, None)
+            if entry is not None:
+                self._current_memory -= entry.memory_bytes
+                self._remove_from_sorted(tokens_key)
+                self._stats.entry_count = len(self._entries)
+                self._stats.current_memory_bytes = self._current_memory
+                return True
+            return False
 
     def clear(self) -> None:
         """Clear all cached entries."""
-        self._entries.clear()
-        self._sorted_keys.clear()
-        self._current_memory = 0
-        self._stats = CacheStats(max_memory_bytes=self._max_memory)
+        with self._memory_lock:
+            self._entries.clear()
+            self._sorted_keys.clear()
+            self._current_memory = 0
+            self._stats = CacheStats(max_memory_bytes=self._max_memory)
         logger.debug("Cache cleared")
 
     def get_stats(self) -> dict[str, Any]:
@@ -1083,11 +1087,12 @@ class MemoryAwarePrefixCache:
 
     def reset_stats(self) -> None:
         """Reset statistics while preserving cache contents."""
-        self._stats = CacheStats(
-            max_memory_bytes=self._max_memory,
-            current_memory_bytes=self._current_memory,
-            entry_count=len(self._entries),
-        )
+        with self._memory_lock:
+            self._stats = CacheStats(
+                max_memory_bytes=self._max_memory,
+                current_memory_bytes=self._current_memory,
+                entry_count=len(self._entries),
+            )
 
     @property
     def memory_usage_mb(self) -> float:
@@ -1333,25 +1338,26 @@ class MemoryAwarePrefixCache:
                 # Estimate memory
                 memory = estimate_kv_cache_memory(cache)
 
-                # Check if it fits
-                if self._current_memory + memory > self._max_memory:
-                    logger.info(
-                        f"[cache_persist] entry {i} would exceed memory limit "
-                        f"({(self._current_memory + memory) / _BYTES_PER_MB:.0f}MB > "
-                        f"{self._max_memory / _BYTES_PER_MB:.0f}MB), stopping load"
-                    )
-                    break
+                with self._memory_lock:
+                    # Check if it fits
+                    if self._current_memory + memory > self._max_memory:
+                        logger.info(
+                            f"[cache_persist] entry {i} would exceed memory limit "
+                            f"({(self._current_memory + memory) / _BYTES_PER_MB:.0f}MB > "
+                            f"{self._max_memory / _BYTES_PER_MB:.0f}MB), stopping load"
+                        )
+                        break
 
-                tokens_key = tuple(tokens)
-                entry = _CacheEntry(
-                    tokens=tokens_key,
-                    cache=cache,
-                    memory_bytes=memory,
-                )
-                self._entries[tokens_key] = entry
-                self._current_memory += memory
-                bisect.insort(self._sorted_keys, tokens_key)
-                loaded += 1
+                    tokens_key = tuple(tokens)
+                    entry = _CacheEntry(
+                        tokens=tokens_key,
+                        cache=cache,
+                        memory_bytes=memory,
+                    )
+                    self._entries[tokens_key] = entry
+                    self._current_memory += memory
+                    bisect.insort(self._sorted_keys, tokens_key)
+                    loaded += 1
 
                 logger.info(
                     f"[cache_persist] loaded entry {i}: "
@@ -1362,8 +1368,9 @@ class MemoryAwarePrefixCache:
             except Exception as e:
                 logger.warning(f"[cache_persist] failed to load entry {i}: {e}")
 
-        self._stats.entry_count = len(self._entries)
-        self._stats.current_memory_bytes = self._current_memory
+        with self._memory_lock:
+            self._stats.entry_count = len(self._entries)
+            self._stats.current_memory_bytes = self._current_memory
 
         dt = _time.monotonic() - t0
         logger.info(

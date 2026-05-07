@@ -606,7 +606,12 @@ class SSDCacheTier:
         except Exception:
             index = getattr(self, "_index", None)
             if index is not None:
-                index.close()
+                try:
+                    index.close()
+                except Exception:
+                    logger.exception(
+                        "ssd_cache: failed to close index during init cleanup"
+                    )
             raise
 
     @staticmethod

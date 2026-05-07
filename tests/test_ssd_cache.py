@@ -453,6 +453,24 @@ class TestSSDCacheTierCore:
 
         assert fake_index.closed
 
+    def test_init_preserves_setup_failure_when_index_close_fails(
+        self, tmp_path, monkeypatch
+    ):
+        class FakeIndex:
+            def close(self):
+                raise RuntimeError("index close failed")
+
+        monkeypatch.setattr(ssd_cache_module, "SSDIndex", lambda cache_dir: FakeIndex())
+
+        def fail_queue(*args, **kwargs):
+            raise RuntimeError("queue setup failed")
+
+        monkeypatch.setattr(ssd_cache_module.queue, "Queue", fail_queue)
+
+        config = SSDCacheConfig(cache_dir=str(tmp_path / "init_close_fail"))
+        with pytest.raises(RuntimeError, match="queue setup failed"):
+            SSDCacheTier(config)
+
 
 import time
 

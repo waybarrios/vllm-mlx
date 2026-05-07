@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for memory-aware prefix cache."""
 
+import threading
+import time
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -395,6 +397,43 @@ class TestMemoryAwarePrefixCache:
     def test_try_reserve_memory_denies_over_limit(self, small_cache):
         assert small_cache.try_reserve_memory(2 * 1024 * 1024) is False
         assert small_cache.get_stats()["current_memory_mb"] == 0
+
+    def test_memory_mutations_wait_for_memory_lock(self, small_cache, mock_kv_cache):
+        def assert_waits_for_lock(operation):
+            result = {}
+            errors = []
+            small_cache._memory_lock.acquire()
+
+            def run_operation():
+                try:
+                    result["value"] = operation()
+                except Exception as exc:  # pragma: no cover - surfaced below
+                    errors.append(exc)
+
+            thread = threading.Thread(target=run_operation)
+            thread.start()
+            try:
+                time.sleep(0.05)
+                assert thread.is_alive()
+            finally:
+                small_cache._memory_lock.release()
+            thread.join(timeout=1)
+
+            assert not thread.is_alive()
+            assert errors == []
+            return result.get("value")
+
+        assert assert_waits_for_lock(
+            lambda: small_cache.store([10], mock_kv_cache(1000))
+        )
+
+        small_cache.store([20], mock_kv_cache(1000))
+        assert assert_waits_for_lock(lambda: small_cache.remove([20]))
+
+        small_cache.store([30], mock_kv_cache(1000))
+        assert_waits_for_lock(small_cache.clear)
+        assert len(small_cache) == 0
+        assert small_cache.memory_usage_mb == 0
 
     def test_reset_stats(self, small_cache, mock_kv_cache):
         small_cache.store([1, 2, 3], mock_kv_cache(1000))
