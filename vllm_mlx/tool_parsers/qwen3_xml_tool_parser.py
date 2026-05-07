@@ -208,30 +208,28 @@ class StreamingXMLToolCallParser:
             try:
                 new_deltas = self.deltas[initial_delta_count:]
                 # If this chunk contains </function>
-                # but didn't generate '}', then complete it
+                # but didn't generate '}', then complete it.
+                # We count every </function> literal in the chunk and compare
+                # against the number of function-close deltas already emitted
+                # for this chunk, regardless of which call_id they belong to.
+                # When a single chunk straddles end-of-call-N and start-of-
+                # call-N+1, the current_call_id at this point is N+1, so a
+                # call-id-scoped check would miss the close already done for
+                # call N and fire a spurious close on call N+1.
                 if (
                     self.current_call_id is not None
                     and self.function_end_token in xml_chunk
                 ):
-
-                    # - Added '}' (non-empty parameter ending)
-                    # - Added '{}' (empty parameter function)
-                    has_function_close = any(
-                        (
-                            td.tool_calls
-                            and any(
-                                (
-                                    tc.function
-                                    and tc.id == self.current_call_id
-                                    and isinstance(tc.function.arguments, str)
-                                    and (tc.function.arguments in ("}", "{}"))
-                                )
-                                for tc in td.tool_calls
-                            )
-                        )
+                    function_closes_in_chunk = xml_chunk.count(self.function_end_token)
+                    function_close_deltas_emitted = sum(
+                        1
                         for td in new_deltas
+                        for tc in (td.tool_calls or [])
+                        if tc.function
+                        and isinstance(tc.function.arguments, str)
+                        and tc.function.arguments in ("}", "{}")
                     )
-                    if not has_function_close:
+                    if function_closes_in_chunk > function_close_deltas_emitted:
                         # Close potentially unclosed element
                         if self.current_param_name:
                             self._end_element("parameter")
