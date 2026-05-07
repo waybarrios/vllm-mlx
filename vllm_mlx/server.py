@@ -2029,6 +2029,8 @@ def _build_response_object(
 
 def _prepare_responses_request(
     request: ResponsesRequest,
+    *,
+    validate_remote_media: bool = True,
 ) -> tuple[BaseEngine, ChatCompletionRequest, list[dict], dict]:
     """Prepare a Responses request for execution on the chat engine."""
     _validate_model_name(request.model)
@@ -2043,7 +2045,8 @@ def _prepare_responses_request(
             f"tools={len(request.tools)}"
         )
 
-    _validate_remote_media_urls(chat_request.messages)
+    if validate_remote_media:
+        _validate_remote_media_urls(chat_request.messages)
 
     messages, images, videos, audios = extract_multimodal_content(
         chat_request.messages,
@@ -2068,6 +2071,13 @@ def _prepare_responses_request(
         chat_kwargs["videos"] = videos
 
     return engine, chat_request, messages, chat_kwargs
+
+
+def _prepare_streaming_responses_request(
+    request: ResponsesRequest,
+) -> tuple[BaseEngine, ChatCompletionRequest, list[dict], dict]:
+    """Prepare a streaming Responses request after eager URL validation."""
+    return _prepare_responses_request(request, validate_remote_media=False)
 
 
 async def _run_responses_request(
@@ -2128,7 +2138,9 @@ async def _run_responses_request(
 
 async def _stream_responses_request(request: ResponsesRequest) -> AsyncIterator[str]:
     """Execute a Responses API request and stream SSE events incrementally."""
-    engine, chat_request, messages, chat_kwargs = _prepare_responses_request(request)
+    engine, chat_request, messages, chat_kwargs = _prepare_streaming_responses_request(
+        request
+    )
 
     response_id = _new_response_item_id("resp")
     sequence = 1
@@ -4831,6 +4843,22 @@ def _convert_anthropic_stop_reason(openai_reason: str | None) -> str:
     return mapping.get(openai_reason or "", "end_turn")
 
 
+def _prepare_anthropic_endpoint_invocation(
+    engine: BaseEngine,
+    openai_request: ChatCompletionRequest,
+    effective_max_tokens: int,
+) -> PreparedChatInvocation:
+    """Prepare Anthropic invocation and convert URL-safety errors to 400s."""
+    try:
+        return _prepare_anthropic_invocation(
+            engine,
+            openai_request,
+            effective_max_tokens,
+        )
+    except UnsafeRemoteURLError as exc:
+        _raise_remote_media_http_error(exc)
+
+
 @app.post(
     "/v1/messages", dependencies=[Depends(verify_api_key), Depends(check_rate_limit)]
 )
@@ -4899,7 +4927,7 @@ async def create_anthropic_message(
     if engine is None:
         return Response(status_code=499)
     release_on_exit = True
-    prepared = _prepare_anthropic_invocation(
+    prepared = _prepare_anthropic_endpoint_invocation(
         engine,
         openai_request,
         effective_max_tokens,
