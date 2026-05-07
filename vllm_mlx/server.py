@@ -773,6 +773,7 @@ _STREAMING_TOOL_MARKERS = (
 )
 _STREAMING_BARE_BRACKET_MARKER = re.compile(r"\[\w+\(\{")
 _STREAMING_BARE_BRACKET_PARTIAL = re.compile(r"\[\w+\($")
+_STREAMING_TOOL_MARKUP_SCAN_CHARS = 512
 
 
 def _sanitize_log_text(value: object, limit: int | None = None) -> str:
@@ -2310,8 +2311,11 @@ async def _stream_responses_request(request: ResponsesRequest) -> AsyncIterator[
             # shapes (<tool_call>, <function=, [Calling tool:, [TOOL_CALLS],
             # bare bracket [func({...})], etc.) — the old `"<" not in` check
             # missed bracket formats and let Qwen3.6-style tool calls leak.
-            if not tool_markup_possible and not _streaming_tool_markup_possible(
-                tool_accumulated_text + delta_text
+            if (
+                not tool_markup_possible
+                and not _streaming_tool_markup_possible_after_delta(
+                    tool_accumulated_text, delta_text
+                )
             ):
                 tool_accumulated_text += delta_text
             else:
@@ -2666,6 +2670,24 @@ def _streaming_tool_markup_possible(text: str) -> bool:
         or _STREAMING_BARE_BRACKET_MARKER.search(text) is not None
         or _STREAMING_BARE_BRACKET_PARTIAL.search(text) is not None
     )
+
+
+def _streaming_tool_markup_possible_after_delta(
+    accumulated_text: str, delta_text: str
+) -> bool:
+    """
+    Check only the boundary window needed to detect newly appearing tool markup.
+
+    Streaming paths call this before any marker has been seen. Scanning the full
+    accumulated text on every ordinary chunk is quadratic for long responses, so
+    keep enough trailing context to catch markers split across chunk boundaries.
+    Once markup is possible, callers switch to the parser path with the full
+    accumulated text.
+    """
+    if not delta_text:
+        return False
+    check_text = accumulated_text[-_STREAMING_TOOL_MARKUP_SCAN_CHARS:] + delta_text
+    return _streaming_tool_markup_possible(check_text)
 
 
 def load_embedding_model(
@@ -5267,8 +5289,8 @@ async def _stream_anthropic_messages(
                 if tool_parser and content_to_emit:
                     if (
                         not tool_markup_possible
-                        and not _streaming_tool_markup_possible(
-                            tool_accumulated_text + content_to_emit
+                        and not _streaming_tool_markup_possible_after_delta(
+                            tool_accumulated_text, content_to_emit
                         )
                     ):
                         tool_accumulated_text += content_to_emit
@@ -5317,8 +5339,8 @@ async def _stream_anthropic_messages(
                 if tool_parser and content_to_emit:
                     if (
                         not tool_markup_possible
-                        and not _streaming_tool_markup_possible(
-                            tool_accumulated_text + content_to_emit
+                        and not _streaming_tool_markup_possible_after_delta(
+                            tool_accumulated_text, content_to_emit
                         )
                     ):
                         tool_accumulated_text += content_to_emit
@@ -5628,8 +5650,8 @@ async def stream_chat_completion(
                 if tool_parser and content:
                     if (
                         not tool_markup_possible
-                        and not _streaming_tool_markup_possible(
-                            tool_accumulated_text + content
+                        and not _streaming_tool_markup_possible_after_delta(
+                            tool_accumulated_text, content
                         )
                     ):
                         tool_accumulated_text += content
@@ -5752,8 +5774,8 @@ async def stream_chat_completion(
                     # parser flags are configured.
                     if (
                         not tool_markup_possible
-                        and not _streaming_tool_markup_possible(
-                            tool_accumulated_text + delta_text
+                        and not _streaming_tool_markup_possible_after_delta(
+                            tool_accumulated_text, delta_text
                         )
                     ):
                         tool_accumulated_text += delta_text

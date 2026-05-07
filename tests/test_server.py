@@ -1906,6 +1906,22 @@ class TestStreamChatCompletion:
         assert delta.get("content") is None
         assert tool_payloads[0]["choices"][0]["finish_reason"] == "tool_calls"
 
+    def test_streaming_tool_markup_precheck_uses_bounded_boundary(self):
+        """Pre-marker checks should not need the full accumulated stream."""
+        import vllm_mlx.server as server
+
+        long_prefix = "ordinary text " * 1000
+
+        assert not server._streaming_tool_markup_possible_after_delta(
+            long_prefix, "with [ordinary brackets] and no tool call"
+        )
+        assert server._streaming_tool_markup_possible_after_delta(
+            long_prefix, '[read({"file_path": "/tmp/test.py"})]'
+        )
+        assert server._streaming_tool_markup_possible_after_delta(
+            long_prefix + "[read(", '{"file_path": "/tmp/test.py"}'
+        )
+
     @pytest.mark.anyio
     async def test_reasoning_stream_emits_structured_tool_calls(self, monkeypatch):
         """Tool markup after </think> should emit tool_calls chunks."""
