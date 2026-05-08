@@ -965,8 +965,9 @@ class TestSimpleEngineConcurrency:
         assert len(calls) == 2
         assert "mtp" not in calls[0]
         assert calls[0]["logits_processors"][0] is processor
-        assert calls[1]["mtp"] is True
+        assert "mtp" not in calls[1]
         assert calls[1]["num_draft_tokens"] == 4
+        assert "prompt_cache" in calls[1]
         assert "logits_processors" not in calls[1]
 
     @pytest.mark.anyio
@@ -1053,8 +1054,9 @@ class TestSimpleEngineConcurrency:
 
         assert outputs[-1].text == "Hello world"
         assert len(calls) == 1
-        assert calls[0]["mtp"] is True
+        assert "mtp" not in calls[0]
         assert calls[0]["num_draft_tokens"] == 4
+        assert "prompt_cache" in calls[0]
         assert "logits_processors" not in calls[0]
 
     @pytest.mark.anyio
