@@ -22,16 +22,12 @@ from .base import (
     BaseEngine,
     GenerationOutput,
     cleanup_startup_cancellation,
-    run_blocking_startup_work,
 )
-from ..mlx_streams import bind_generation_streams
+from ..mlx_streams import MLXWorkerThread
 
 logger = logging.getLogger(__name__)
 
-
-def _bind_worker_generation_streams() -> None:
-    """Rebind mlx generation streams inside the current worker thread."""
-    bind_generation_streams()
+_mlx_worker = MLXWorkerThread()
 
 
 def _seed_logits_processors(
@@ -224,26 +220,14 @@ class SimpleEngine(BaseEngine):
 
         self._model.load()
 
-    def _uses_default_prepare_for_start(self) -> bool:
-        """Return True when prepare_for_start is the class implementation."""
-        method = getattr(self.prepare_for_start, "__func__", None)
-        return method is SimpleEngine.prepare_for_start
-
     async def start(self) -> None:
         """Start the engine (load model if not loaded)."""
         if self._loaded:
             return
         try:
             if self._model is None:
-                if self._uses_default_prepare_for_start():
-                    # MLX generation streams are thread-local. Keep model load on
-                    # the event-loop thread so default LLM stream_generate() runs
-                    # on the same thread that owns model-associated streams.
-                    self.prepare_for_start()
-                else:
-                    # Test doubles and custom overrides may block; preserve the
-                    # cancellation-safe threaded startup helper for those cases.
-                    await run_blocking_startup_work(self.prepare_for_start)
+                loop = asyncio.get_event_loop()
+                await _mlx_worker.submit(loop, self.prepare_for_start)
             self._loaded = True
 
             if self._mtp and self._mtp_num_draft_tokens != 1:
@@ -348,12 +332,10 @@ class SimpleEngine(BaseEngine):
         corrupt the command-buffer state.
         """
         async with self._generation_lock:
-
-            def run_bound():
-                _bind_worker_generation_streams()
-                return func(*args, **kwargs)
-
-            task = asyncio.create_task(asyncio.to_thread(run_bound))
+            loop = asyncio.get_event_loop()
+            task = asyncio.ensure_future(
+                _mlx_worker.submit(loop, func, *args, **kwargs)
+            )
             try:
                 return await asyncio.shield(task)
             except asyncio.CancelledError:
@@ -511,17 +493,8 @@ class SimpleEngine(BaseEngine):
                         yield output
                     return
 
-        async with self._generation_lock:
-            # Non-stream chat runs in a worker thread and rebinds generation
-            # streams there. Rebind again on the current thread before
-            # stream_generate so nonstream->stream mode switches remain valid.
-            _bind_worker_generation_streams()
-
-            accumulated_text = ""
-            prompt_tokens = 0
-            completion_tokens = 0
-            finished = False
-
+        def _run_stream_generate():
+            results = []
             for chunk in self._model.stream_generate(
                 prompt=prompt,
                 max_tokens=max_tokens,
@@ -530,45 +503,56 @@ class SimpleEngine(BaseEngine):
                 stop=stop,
                 **kwargs,
             ):
-                prompt_tokens = (
-                    chunk.prompt_tokens
-                    if hasattr(chunk, "prompt_tokens") and chunk.prompt_tokens
-                    else prompt_tokens
-                )
-                completion_tokens += 1
-                new_text = chunk.text if hasattr(chunk, "text") else str(chunk)
-                accumulated_text += new_text
+                results.append(chunk)
+            return results
 
-                finished = (
-                    getattr(chunk, "finished", False) or completion_tokens >= max_tokens
-                )
-                finish_reason = None
-                if finished:
-                    finish_reason = getattr(chunk, "finish_reason", "stop")
+        chunks = await self._run_blocking_serialized(_run_stream_generate)
 
-                yield GenerationOutput(
-                    text=accumulated_text,
-                    new_text=new_text,
-                    prompt_tokens=prompt_tokens,
-                    completion_tokens=completion_tokens,
-                    finished=finished,
-                    finish_reason=finish_reason,
-                )
+        accumulated_text = ""
+        prompt_tokens = 0
+        completion_tokens = 0
+        finished = False
 
-                if finished:
-                    break
+        for chunk in chunks:
+            prompt_tokens = (
+                chunk.prompt_tokens
+                if hasattr(chunk, "prompt_tokens") and chunk.prompt_tokens
+                else prompt_tokens
+            )
+            completion_tokens += 1
+            new_text = chunk.text if hasattr(chunk, "text") else str(chunk)
+            accumulated_text += new_text
 
-            if not finished:
-                if prompt_tokens == 0:
-                    prompt_tokens = len(self._model.tokenizer.encode(prompt))
-                yield GenerationOutput(
-                    text=accumulated_text,
-                    new_text="",
-                    prompt_tokens=prompt_tokens,
-                    completion_tokens=completion_tokens,
-                    finished=True,
-                    finish_reason=None,
-                )
+            finished = (
+                getattr(chunk, "finished", False) or completion_tokens >= max_tokens
+            )
+            finish_reason = None
+            if finished:
+                finish_reason = getattr(chunk, "finish_reason", "stop")
+
+            yield GenerationOutput(
+                text=accumulated_text,
+                new_text=new_text,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                finished=finished,
+                finish_reason=finish_reason,
+            )
+
+            if finished:
+                break
+
+        if not finished:
+            if prompt_tokens == 0:
+                prompt_tokens = len(self._model.tokenizer.encode(prompt))
+            yield GenerationOutput(
+                text=accumulated_text,
+                new_text="",
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                finished=True,
+                finish_reason=None,
+            )
 
     async def chat(
         self,
@@ -758,40 +742,45 @@ class SimpleEngine(BaseEngine):
             accumulated_text = ""
             token_count = 0
 
-            # Text-only fallback when no TextModel exists: keep execution on the
-            # current thread. Routing through to_thread can break mlx_vlm stream
-            # ownership on some models (Stream(gpu, N) mismatch).
+            # Text-only fallback when no TextModel exists: route through the
+            # persistent worker thread to maintain stream ownership.
             if self._text_model is None and not has_media_content(messages):
                 local_kwargs = dict(kwargs)
                 if chat_template_kwargs:
                     local_kwargs["chat_template_kwargs"] = chat_template_kwargs
 
-                async with self._generation_lock:
-                    _bind_worker_generation_streams()
-                    for chunk in self._model.stream_chat(
-                        messages=messages,
-                        max_tokens=max_tokens,
-                        temperature=temperature,
-                        tools=template_tools,
-                        **local_kwargs,
-                    ):
-                        token_count += 1
-                        new_text = chunk.text if hasattr(chunk, "text") else str(chunk)
-                        accumulated_text += new_text
-
-                        finished = chunk.finish_reason is not None
-
-                        yield GenerationOutput(
-                            text=accumulated_text,
-                            new_text=new_text,
-                            prompt_tokens=getattr(chunk, "prompt_tokens", 0),
-                            completion_tokens=token_count,
-                            finished=finished,
-                            finish_reason=chunk.finish_reason if finished else None,
+                def _run_text_fallback_stream():
+                    return list(
+                        self._model.stream_chat(
+                            messages=messages,
+                            max_tokens=max_tokens,
+                            temperature=temperature,
+                            tools=template_tools,
+                            **local_kwargs,
                         )
+                    )
 
-                        if finished:
-                            break
+                chunks = await self._run_blocking_serialized(
+                    _run_text_fallback_stream
+                )
+                for chunk in chunks:
+                    token_count += 1
+                    new_text = chunk.text if hasattr(chunk, "text") else str(chunk)
+                    accumulated_text += new_text
+
+                    finished = chunk.finish_reason is not None
+
+                    yield GenerationOutput(
+                        text=accumulated_text,
+                        new_text=new_text,
+                        prompt_tokens=getattr(chunk, "prompt_tokens", 0),
+                        completion_tokens=token_count,
+                        finished=finished,
+                        finish_reason=chunk.finish_reason if finished else None,
+                    )
+
+                    if finished:
+                        break
                 return
 
             # Run stream_chat in thread pool since it's synchronous
