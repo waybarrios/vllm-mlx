@@ -1593,11 +1593,63 @@ async def run_workload_case(
     )
 
 
+def _group_results_by_case_id(results: list[dict]) -> dict[str, list[dict]]:
+    """Bucket workload case records by their ``case_id`` field, defaulting
+    a missing ``case_id`` to the empty string so the grouping is stable."""
+    cases: dict[str, list[dict]] = {}
+    for result in results:
+        cases.setdefault(str(result.get("case_id", "")), []).append(result)
+    return cases
+
+
+def _summarize_case(case_results: list[dict]) -> dict:
+    """Build the per-case summary block.
+
+    Mirrors the shape used at the run-level (sample counts, pass/fail
+    rates, policy-timeout outcome, latency / ttft / gen_tps summaries)
+    and adds two case-only fields: ``sample_count`` and ``repetitions``
+    (the sorted set of repetition indices the case was run under), plus
+    ``content_chars`` since content length is more useful per-case than
+    per-run.
+    """
+    quality_failures = [r for r in case_results if not r["quality"].get("ok")]
+    policy_trials = [
+        r for r in case_results if r["policy"].get("within_timeout") is not None
+    ]
+    policy_failures = [
+        r for r in policy_trials if r["policy"].get("within_timeout") is False
+    ]
+    return {
+        "sample_count": len(case_results),
+        "repetitions": sorted(
+            {
+                int(r.get("repetition", 0))
+                for r in case_results
+                if r.get("repetition") is not None
+            }
+        ),
+        "passed": not quality_failures,
+        "failure_count": len(quality_failures),
+        "failure_rate": (
+            round(len(quality_failures) / len(case_results), 4) if case_results else 0.0
+        ),
+        "policy_timeout_passed": (not policy_failures if policy_trials else None),
+        "policy_timeout_failure_count": (
+            len(policy_failures) if policy_trials else None
+        ),
+        "latency_ms": _summary_or_empty(
+            [r["metrics"]["e2e_latency_ms"] for r in case_results]
+        ),
+        "ttft_ms": _summary_or_empty([r["metrics"]["ttft_ms"] for r in case_results]),
+        "gen_tps": _summary_or_empty([r["metrics"]["gen_tps"] for r in case_results]),
+        "content_chars": _summary_or_empty(
+            [r["quality"].get("content_chars", 0) for r in case_results]
+        ),
+    }
+
+
 def summarize_workload_results(results: list[dict]) -> dict:
     """Aggregate workload case records into stable qualification summary stats."""
-    latencies = [r["metrics"]["e2e_latency_ms"] for r in results]
-    ttft = [r["metrics"]["ttft_ms"] for r in results]
-    gen_tps = [r["metrics"]["gen_tps"] for r in results]
     failures = [r for r in results if not r["quality"]["ok"]]
     policy_trials = [
         r for r in results if r["policy"].get("within_timeout") is not None
@@ -1605,54 +1657,12 @@ def summarize_workload_results(results: list[dict]) -> dict:
     policy_failures = [
         r for r in policy_trials if r["policy"].get("within_timeout") is False
     ]
-    cases: dict[str, list[dict]] = {}
-    for result in results:
-        cases.setdefault(str(result.get("case_id", "")), []).append(result)
 
-    case_summaries = {}
-    for case_id, case_results in sorted(cases.items()):
-        case_quality_failures = [r for r in case_results if not r["quality"].get("ok")]
-        case_policy_trials = [
-            r for r in case_results if r["policy"].get("within_timeout") is not None
-        ]
-        case_policy_failures = [
-            r for r in case_policy_trials if r["policy"].get("within_timeout") is False
-        ]
-        case_summaries[case_id] = {
-            "sample_count": len(case_results),
-            "repetitions": sorted(
-                {
-                    int(r.get("repetition", 0))
-                    for r in case_results
-                    if r.get("repetition") is not None
-                }
-            ),
-            "passed": not case_quality_failures,
-            "failure_count": len(case_quality_failures),
-            "failure_rate": (
-                round(len(case_quality_failures) / len(case_results), 4)
-                if case_results
-                else 0.0
-            ),
-            "policy_timeout_passed": (
-                not case_policy_failures if case_policy_trials else None
-            ),
-            "policy_timeout_failure_count": (
-                len(case_policy_failures) if case_policy_trials else None
-            ),
-            "latency_ms": _summary_or_empty(
-                [r["metrics"]["e2e_latency_ms"] for r in case_results]
-            ),
-            "ttft_ms": _summary_or_empty(
-                [r["metrics"]["ttft_ms"] for r in case_results]
-            ),
-            "gen_tps": _summary_or_empty(
-                [r["metrics"]["gen_tps"] for r in case_results]
-            ),
-            "content_chars": _summary_or_empty(
-                [r["quality"].get("content_chars", 0) for r in case_results]
-            ),
-        }
+    cases = _group_results_by_case_id(results)
+    case_summaries = {
+        case_id: _summarize_case(case_results)
+        for case_id, case_results in sorted(cases.items())
+    }
 
     return {
         "case_count": len(results),
@@ -1670,9 +1680,11 @@ def summarize_workload_results(results: list[dict]) -> dict:
         "policy_timeout_failure_count": (
             len(policy_failures) if policy_trials else None
         ),
-        "latency_ms": _summary_or_empty(latencies),
-        "ttft_ms": _summary_or_empty(ttft),
-        "gen_tps": _summary_or_empty(gen_tps),
+        "latency_ms": _summary_or_empty(
+            [r["metrics"]["e2e_latency_ms"] for r in results]
+        ),
+        "ttft_ms": _summary_or_empty([r["metrics"]["ttft_ms"] for r in results]),
+        "gen_tps": _summary_or_empty([r["metrics"]["gen_tps"] for r in results]),
         "case_summaries": case_summaries,
     }
 
