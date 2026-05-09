@@ -1229,94 +1229,120 @@ def _summary_or_empty(values: list[float]) -> dict:
     return compute_summary_stats(values) if values else {}
 
 
-async def run_workload_case(
-    client: httpx.AsyncClient,
-    base_url: str,
+def _resolve_max_tokens(case: WorkloadCase, workload: Workload) -> int:
+    """Return the effective ``max_tokens`` for a case, falling back to
+    workload defaults and finally to 256."""
+    return int(case.max_tokens or workload.defaults.get("max_tokens", 256))
+
+
+def _assemble_case_request_kwargs(
+    case: WorkloadCase, workload: Workload, model: str
+) -> dict:
+    """Build the keyword-arguments dict passed to ``stream_chat_completion``
+    for one case, applying max_tokens fallback and converting
+    ``policy_timeout_ms`` to seconds."""
+    return {
+        "messages": case.messages,
+        "model": model,
+        "max_tokens": _resolve_max_tokens(case, workload),
+        "enable_thinking": case.enable_thinking,
+        "extra_body": case.extra_body,
+        "timeout_s": (
+            case.policy_timeout_ms / 1000
+            if case.policy_timeout_ms is not None
+            else None
+        ),
+    }
+
+
+def _empty_completion_result() -> dict:
+    """Zero-valued completion result used when ``stream_chat_completion``
+    raises. The structure matches a real successful response so downstream
+    code can read ``result.get(...)`` without branching on the failure."""
+    return {
+        "ttft_ms": 0.0,
+        "tpot_ms": 0.0,
+        "e2e_latency_ms": 0.0,
+        "gen_tps": 0.0,
+        "prompt_tps": 0.0,
+        "prompt_tokens": 0,
+        "completion_tokens": 0,
+        "finish_reason": None,
+        "content": "",
+        "tool_calls": [],
+    }
+
+
+async def _fetch_post_run_status(client: httpx.AsyncClient, base_url: str) -> dict:
+    """GET ``/v1/status`` after a case run, swallowing transport errors so
+    a missing or temporarily-unavailable status endpoint does not fail
+    the case record."""
+    try:
+        resp = await client.get(f"{base_url}/v1/status")
+        resp.raise_for_status()
+        return resp.json()
+    except Exception:
+        return {}
+
+
+def _compute_within_policy_timeout(
+    timeout_ms: Optional[int], *, error_present: bool, e2e_latency_ms: float
+) -> Optional[bool]:
+    """Resolve the ``policy.within_timeout`` field.
+
+    ``None`` when the case did not configure a policy timeout, ``False``
+    when the request errored (any latency claim would be misleading),
+    and otherwise the latency comparison result.
+    """
+    if timeout_ms is None:
+        return None
+    if error_present:
+        return False
+    return e2e_latency_ms <= timeout_ms
+
+
+def _build_tool_calls_summary(tool_calls: Any) -> Optional[dict]:
+    """Compact summary of streamed tool calls for the case record.
+
+    Returns ``None`` when no tool calls were emitted so consumers can
+    distinguish "feature not exercised" from "feature exercised, zero
+    calls" if that ever matters.
+    """
+    if not tool_calls:
+        return None
+    return {
+        "count": len(tool_calls),
+        "names": sorted(tc.get("function", {}).get("name", "") for tc in tool_calls),
+        "raw": tool_calls,
+    }
+
+
+def _build_workload_record(
     *,
-    workload: Workload,
     case: WorkloadCase,
+    workload: Workload,
     model: str,
     runtime: dict,
     hardware: dict,
     run_id: str,
     timestamp: str,
-    repetition: int = 0,
-    scrape: bool = True,
-    include_content: bool = False,
-    cache_reset: Optional[dict] = None,
+    started_wall: str,
+    repetition: int,
+    result: dict,
+    error: str,
+    quality_ok: bool,
+    quality_issues: list[str],
+    content: str,
+    cache_hits_delta: int,
+    cache_misses_delta: int,
+    tokens_saved_delta: int,
+    status_after: dict,
+    cache_reset: Optional[dict],
+    include_content: bool,
 ) -> dict:
-    """Run one workload case and return a JSON-serializable result."""
-    metrics_before = await scrape_metrics(client, base_url) if scrape else {}
-    started_wall = datetime.now(timezone.utc).isoformat()
-
-    try:
-        result = await stream_chat_completion(
-            client=client,
-            base_url=base_url,
-            messages=case.messages,
-            model=model,
-            max_tokens=int(case.max_tokens or workload.defaults.get("max_tokens", 256)),
-            enable_thinking=case.enable_thinking,
-            extra_body=case.extra_body,
-            timeout_s=(
-                case.policy_timeout_ms / 1000
-                if case.policy_timeout_ms is not None
-                else None
-            ),
-        )
-        error = ""
-    except Exception as exc:
-        result = {
-            "ttft_ms": 0.0,
-            "tpot_ms": 0.0,
-            "e2e_latency_ms": 0.0,
-            "gen_tps": 0.0,
-            "prompt_tps": 0.0,
-            "prompt_tokens": 0,
-            "completion_tokens": 0,
-            "finish_reason": None,
-            "content": "",
-            "tool_calls": [],
-        }
-        error = str(exc)
-
-    metrics_after = await scrape_metrics(client, base_url) if scrape else {}
-    status_after: dict = {}
-    try:
-        resp = await client.get(f"{base_url}/v1/status")
-        resp.raise_for_status()
-        status_after = resp.json()
-    except Exception:
-        status_after = {}
-
-    cache_hits_delta = metrics_after.get("cache_hits", 0) - metrics_before.get(
-        "cache_hits", 0
-    )
-    cache_misses_delta = metrics_after.get("cache_misses", 0) - metrics_before.get(
-        "cache_misses", 0
-    )
-    tokens_saved_delta = metrics_after.get("tokens_saved", 0) - metrics_before.get(
-        "tokens_saved", 0
-    )
-
-    content = str(result.get("content") or "")
-    quality_ok, quality_issues = validate_quality_checks(
-        result.get("finish_reason"),
-        content,
-        case.checks,
-        status_code=500 if error else 200,
-        tool_calls=result.get("tool_calls") or [],
-    )
-    if error:
-        quality_issues.append(f"request error: {error}")
-
-    if case.policy_timeout_ms is None:
-        within_policy_timeout = None
-    elif error:
-        within_policy_timeout = False
-    else:
-        within_policy_timeout = result["e2e_latency_ms"] <= case.policy_timeout_ms
-
+    """Assemble the JSON-serializable workload-case record from the raw
+    inputs and the completion result. Pure function: no I/O, deterministic
+    given its arguments."""
     record = {
         "run_id": run_id,
         "timestamp": timestamp,
@@ -1329,9 +1355,7 @@ async def run_workload_case(
         "runtime": runtime,
         "hardware": hardware,
         "request": {
-            "max_tokens": int(
-                case.max_tokens or workload.defaults.get("max_tokens", 256)
-            ),
+            "max_tokens": _resolve_max_tokens(case, workload),
             "request_path": case.request_path,
             "enable_thinking": case.enable_thinking,
             "extra_body": case.extra_body or {},
@@ -1339,7 +1363,11 @@ async def run_workload_case(
         },
         "policy": {
             "timeout_ms": case.policy_timeout_ms,
-            "within_timeout": within_policy_timeout,
+            "within_timeout": _compute_within_policy_timeout(
+                case.policy_timeout_ms,
+                error_present=bool(error),
+                e2e_latency_ms=result["e2e_latency_ms"],
+            ),
         },
         "cache_reset": cache_reset or {"attempted": False},
         "metrics": {
@@ -1362,23 +1390,90 @@ async def run_workload_case(
             "content_chars": len(content),
             "content_preview": content[:240],
         },
-        "tool_calls": (
-            {
-                "count": len(result.get("tool_calls") or []),
-                "names": sorted(
-                    tc.get("function", {}).get("name", "")
-                    for tc in (result.get("tool_calls") or [])
-                ),
-                "raw": result.get("tool_calls") or [],
-            }
-            if result.get("tool_calls")
-            else None
-        ),
+        "tool_calls": _build_tool_calls_summary(result.get("tool_calls") or []),
         "ok": quality_ok,
     }
     if include_content:
         record["quality"]["content"] = content
     return record
+
+
+async def run_workload_case(
+    client: httpx.AsyncClient,
+    base_url: str,
+    *,
+    workload: Workload,
+    case: WorkloadCase,
+    model: str,
+    runtime: dict,
+    hardware: dict,
+    run_id: str,
+    timestamp: str,
+    repetition: int = 0,
+    scrape: bool = True,
+    include_content: bool = False,
+    cache_reset: Optional[dict] = None,
+) -> dict:
+    """Run one workload case and return a JSON-serializable result."""
+    metrics_before = await scrape_metrics(client, base_url) if scrape else {}
+    started_wall = datetime.now(timezone.utc).isoformat()
+
+    request_kwargs = _assemble_case_request_kwargs(case, workload, model)
+    try:
+        result = await stream_chat_completion(
+            client=client, base_url=base_url, **request_kwargs
+        )
+        error = ""
+    except Exception as exc:
+        result = _empty_completion_result()
+        error = str(exc)
+
+    metrics_after = await scrape_metrics(client, base_url) if scrape else {}
+    status_after = await _fetch_post_run_status(client, base_url)
+
+    cache_hits_delta = metrics_after.get("cache_hits", 0) - metrics_before.get(
+        "cache_hits", 0
+    )
+    cache_misses_delta = metrics_after.get("cache_misses", 0) - metrics_before.get(
+        "cache_misses", 0
+    )
+    tokens_saved_delta = metrics_after.get("tokens_saved", 0) - metrics_before.get(
+        "tokens_saved", 0
+    )
+
+    content = str(result.get("content") or "")
+    quality_ok, quality_issues = validate_quality_checks(
+        result.get("finish_reason"),
+        content,
+        case.checks,
+        status_code=500 if error else 200,
+        tool_calls=result.get("tool_calls") or [],
+    )
+    if error:
+        quality_issues.append(f"request error: {error}")
+
+    return _build_workload_record(
+        case=case,
+        workload=workload,
+        model=model,
+        runtime=runtime,
+        hardware=hardware,
+        run_id=run_id,
+        timestamp=timestamp,
+        started_wall=started_wall,
+        repetition=repetition,
+        result=result,
+        error=error,
+        quality_ok=quality_ok,
+        quality_issues=quality_issues,
+        content=content,
+        cache_hits_delta=cache_hits_delta,
+        cache_misses_delta=cache_misses_delta,
+        tokens_saved_delta=tokens_saved_delta,
+        status_after=status_after,
+        cache_reset=cache_reset,
+        include_content=include_content,
+    )
 
 
 def summarize_workload_results(results: list[dict]) -> dict:
