@@ -288,16 +288,12 @@ class TestIsMllmModelConfigPriority:
 
     def test_config_indicates_vlm_recognises_llava(self):
         assert (
-            _config_indicates_vlm(
-                {"architectures": ["LlavaForConditionalGeneration"]}
-            )
+            _config_indicates_vlm({"architectures": ["LlavaForConditionalGeneration"]})
             is True
         )
 
     def test_config_indicates_vlm_rejects_text_only_qwen3(self):
-        assert (
-            _config_indicates_vlm({"architectures": ["Qwen3ForCausalLM"]}) is False
-        )
+        assert _config_indicates_vlm({"architectures": ["Qwen3ForCausalLM"]}) is False
 
     def test_config_indicates_vlm_handles_missing_architectures(self):
         assert _config_indicates_vlm({"model_type": "qwen3"}) is False
