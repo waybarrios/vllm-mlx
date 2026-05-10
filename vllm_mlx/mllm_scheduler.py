@@ -639,7 +639,7 @@ class MLLMScheduler:
                 request_id=request_id,
                 new_token_ids=[response.token],
                 new_text=new_text,
-                output_token_ids=list(request.output_tokens),
+                output_token_ids=request.output_tokens,
                 prompt_tokens=request.num_prompt_tokens,
                 completion_tokens=request.num_output_tokens,
             )

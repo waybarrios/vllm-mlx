@@ -2160,7 +2160,7 @@ class Scheduler:
                 request_id=request_id,
                 new_token_ids=[response.token],
                 new_text=new_text,
-                output_token_ids=list(request.output_token_ids),
+                output_token_ids=request.output_token_ids,
                 prompt_tokens=request.num_prompt_tokens,
                 completion_tokens=request.num_output_tokens,
             )
