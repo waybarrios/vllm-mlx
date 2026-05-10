@@ -272,7 +272,9 @@ class MLXLanguageModel:
         else:
             num_prompt_tokens = len(prompt)
 
-        accumulated_text = ""
+        stop_list = stop or []
+        max_stop_len = max((len(s) for s in stop_list), default=0)
+        accumulated_tail = ""
 
         mtp_kwargs = {}
         if self._mtp:
@@ -295,15 +297,17 @@ class MLXLanguageModel:
         ):
             # response.text is the new token text (not accumulated)
             new_text = response.text
-            accumulated_text += new_text
 
-            # Check for stop sequences
+            # Check for stop sequences against a bounded tail rather than
+            # accumulating the full response (which is O(n^2) over the loop).
             should_stop = False
-            if stop:
-                for stop_seq in stop:
-                    if stop_seq in accumulated_text:
+            if max_stop_len > 0:
+                combined = accumulated_tail + new_text
+                for stop_seq in stop_list:
+                    if stop_seq in combined:
                         should_stop = True
                         break
+                accumulated_tail = combined[-max_stop_len:]
 
             finished = should_stop or token_count >= max_tokens
             finish_reason = None
