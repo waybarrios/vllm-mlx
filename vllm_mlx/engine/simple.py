@@ -1018,6 +1018,10 @@ class SimpleEngine(BaseEngine):
                         model(sys_arr[None], cache=bc)
                         mx.eval([c.state for c in bc])
 
+                    # Free intermediate prefill activations before snapshotting;
+                    # mirrors the MLLM path between chunked prefill and decode.
+                    mx.clear_cache()
+
                     snapshot = [c.state for c in bc]
                     mx.eval([s for pair in snapshot for s in pair])
                     self._system_kv_snapshot = snapshot
