@@ -348,7 +348,11 @@ class JSONSchemaLogitsProcessor:
     def _suffix(self, tokens_list: list[int]) -> list[int]:
         """Return the slice of ``tokens`` that corresponds to generated output."""
         if self._prompt_len is None:
-            self._prompt_len = max(0, len(tokens_list) - 1)
+            # Use len(tokens_list) so the prompt is excluded entirely.
+            # The previous ``- 1`` caused the last prompt token (e.g. Gemma-4's
+            # <channel|> thinking-end special token) to be prepended to every
+            # suffix fed to the enforcer, corrupting the JSON grammar state.
+            self._prompt_len = len(tokens_list)
         return tokens_list[self._prompt_len :]
 
     def _decode_token_cached(self, tok_id: int) -> str | None:
