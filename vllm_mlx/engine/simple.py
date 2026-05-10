@@ -7,6 +7,7 @@ performance when serving a single user at a time.
 """
 
 import asyncio
+import hashlib
 import logging
 import os
 import threading
@@ -860,172 +861,259 @@ class SimpleEngine(BaseEngine):
             prompt = "\n".join(f"{m['role']}: {m['content']}" for m in messages)
             prompt += "\nassistant:"
 
-        # --- System prompt KV caching for pure-LLM (mirrors _stream_generate_text) ---
-        # Detect system prefix via ChatML markers. If we have one, route through
-        # the cache-aware path: HIT restores the snapshot and prefills only the
-        # suffix; MISS prefills system, snapshots it, then continues with suffix.
-        # Falls back to the original self.stream_generate() if no system prefix
-        # is detected or anything else looks wrong.
-        import hashlib as _hashlib
-
+        # --- System-prompt KV caching on the pure-LLM stream_chat path ---
+        # Mirrors the cache in _stream_generate_text. Locates the system prefix
+        # via probe-divergence (cf. prompt_warmup._build_strict_prefix_string):
+        # render the template with two different user contents and take the
+        # shared prefix. Works across Qwen/ChatML, Llama, Gemma, and any other
+        # chat format -- no per-model marker list. Falls back to the original
+        # uncached self.stream_generate() if the system prefix can't be
+        # isolated or any step of the cache-aware path raises.
         cache_hit = False
-        backbone_cache = None
         suffix_tokens = None
         system_tokens = None
         system_token_count = 0
+        full_token_count = 0
         system_hash = None
-        full_tokens_list = None
         kv_cache_eligible = False
 
         has_system = any(m.get("role") == "system" for m in messages)
         if has_system and hasattr(tokenizer, "apply_chat_template"):
-            system_prefix_end = -1
-            for marker in ("<|im_start|>user\n", "<|im_start|>assistant\n"):
-                idx = prompt.find(marker)
-                if idx > 0:
-                    system_prefix_end = idx
-                    break
+            def _with_user(user_content: str) -> list[dict[str, Any]]:
+                msgs = [dict(m) for m in messages]
+                if msgs and msgs[-1].get("role") == "user":
+                    msgs[-1] = {**msgs[-1], "content": user_content}
+                else:
+                    msgs = [*msgs, {"role": "user", "content": user_content}]
+                return msgs
 
-            if system_prefix_end > 0:
-                system_prefix_text = prompt[:system_prefix_end]
-                system_hash = _hashlib.sha256(
-                    system_prefix_text.encode()
-                ).hexdigest()[:16]
+            rendered_a: Any = None
+            rendered_b: Any = None
+            try:
+                rendered_a = tokenizer.apply_chat_template(
+                    _with_user("Alpha"), **template_kwargs
+                )
+                rendered_b = tokenizer.apply_chat_template(
+                    _with_user("Bravo"), **template_kwargs
+                )
+            except Exception:
+                pass
 
-                add_special = (
-                    tokenizer.bos_token is None
-                    or not prompt.startswith(tokenizer.bos_token)
-                )
-                full_tokens_list = tokenizer.encode(
-                    prompt, add_special_tokens=add_special
-                )
-                system_tokens_list = tokenizer.encode(
-                    system_prefix_text, add_special_tokens=add_special
-                )
-                system_token_count = len(system_tokens_list)
+            if isinstance(rendered_a, str) and isinstance(rendered_b, str):
+                boundary = 0
+                diverged = False
+                for i in range(min(len(rendered_a), len(rendered_b))):
+                    if rendered_a[i] != rendered_b[i]:
+                        diverged = True
+                        break
+                    boundary = i + 1
 
-                if (
-                    len(full_tokens_list) > system_token_count
-                    and full_tokens_list[:system_token_count] == system_tokens_list
-                ):
-                    system_tokens = system_tokens_list
-                    suffix_tokens = full_tokens_list[system_token_count:]
-                    kv_cache_eligible = True
+                if diverged and boundary >= 16:
+                    system_prefix_text = rendered_a[:boundary]
+                    system_hash = hashlib.sha256(
+                        system_prefix_text.encode()
+                    ).hexdigest()[:16]
+
+                    add_special = (
+                        tokenizer.bos_token is None
+                        or not prompt.startswith(tokenizer.bos_token)
+                    )
+                    full_tokens_list = tokenizer.encode(
+                        prompt, add_special_tokens=add_special
+                    )
+                    system_tokens_list = tokenizer.encode(
+                        system_prefix_text, add_special_tokens=add_special
+                    )
+                    full_token_count = len(full_tokens_list)
+                    system_token_count = len(system_tokens_list)
+
                     if (
-                        system_hash == self._system_kv_hash
-                        and self._system_kv_snapshot is not None
-                        and system_token_count == self._system_kv_token_count
+                        len(full_tokens_list) > system_token_count
+                        and full_tokens_list[:system_token_count] == system_tokens_list
                     ):
-                        cache_hit = True
-                        logger.info(
-                            "System KV cache HIT (pure-LLM): reusing %d tokens, "
-                            "prefilling %d new (hash=%s)",
-                            system_token_count, len(suffix_tokens), system_hash,
-                        )
-                    else:
-                        logger.info(
-                            "System KV cache MISS (pure-LLM): will prefill %d system + "
-                            "%d suffix tokens (hash=%s)",
-                            system_token_count, len(suffix_tokens), system_hash,
-                        )
+                        system_tokens = system_tokens_list
+                        suffix_tokens = full_tokens_list[system_token_count:]
+                        kv_cache_eligible = True
+                        if (
+                            system_hash == self._system_kv_hash
+                            and self._system_kv_snapshot is not None
+                            and system_token_count == self._system_kv_token_count
+                        ):
+                            cache_hit = True
+                            logger.info(
+                                "System KV cache HIT (stream_chat): reusing %d "
+                                "tokens, prefilling %d new (hash=%s)",
+                                system_token_count,
+                                len(suffix_tokens),
+                                system_hash,
+                            )
+                        else:
+                            logger.info(
+                                "System KV cache MISS (stream_chat): will "
+                                "prefill %d system + %d suffix tokens (hash=%s)",
+                                system_token_count,
+                                len(suffix_tokens),
+                                system_hash,
+                            )
 
         if kv_cache_eligible:
             # Cache-aware path: drive mlx-lm directly with a pre-populated cache.
-            # NOTE: do NOT wrap in `async with self._generation_lock` — the inner
-            # _run_blocking_serialized already acquires it. Double-acquire deadlocks.
-            if True:
-                def _run_with_cache():
-                    import mlx.core as mx
-                    from mlx_lm import stream_generate as mlx_stream_generate
-                    from mlx_lm.models.cache import make_prompt_cache
-                    from mlx_lm.sample_utils import make_sampler
+            # Stream chunks back to the caller via an asyncio.Queue (mirrors
+            # _stream_generate_text) so the client sees tokens as they arrive
+            # rather than after the full generation finishes.
+            loop = asyncio.get_running_loop()
+            response_queue: asyncio.Queue[tuple[str, Any]] = asyncio.Queue()
+            abort_event = threading.Event()
 
-                    model = self._model.model
-                    sampler = make_sampler(temp=temperature, top_p=top_p)
-
-                    if cache_hit:
-                        bc = make_prompt_cache(model)
-                        for i, saved_state in enumerate(self._system_kv_snapshot):
-                            bc[i].state = saved_state
-                    else:
-                        bc = make_prompt_cache(model)
-                        sys_arr = mx.array(system_tokens)
-                        step = self._prefill_step_size
-                        while sys_arr.size > step:
-                            model(sys_arr[:step][None], cache=bc)
-                            mx.eval([c.state for c in bc])
-                            sys_arr = sys_arr[step:]
-                            mx.clear_cache()
-                        if sys_arr.size > 0:
-                            model(sys_arr[None], cache=bc)
-                            mx.eval([c.state for c in bc])
-                        snapshot = [c.state for c in bc]
-                        mx.eval([s for pair in snapshot for s in pair])
-                        self._system_kv_snapshot = snapshot
-                        self._system_kv_hash = system_hash
-                        self._system_kv_token_count = system_token_count
-                        try:
-                            cache_mb = sum(c.nbytes for c in bc) / 1e6
-                        except Exception:
-                            cache_mb = -1
-                        logger.info(
-                            "System KV cache STORED (pure-LLM): %d tokens (%.1f MB)",
-                            system_token_count, cache_mb,
-                        )
-
-                    prompt_arr = mx.array(suffix_tokens)
-                    return list(mlx_stream_generate(
-                        model,
-                        tokenizer,
-                        prompt=prompt_arr,
-                        max_tokens=max_tokens,
-                        sampler=sampler,
-                        prompt_cache=bc,
-                    ))
-
-                try:
-                    all_resps = await self._run_blocking_serialized(_run_with_cache)
-                except Exception as exc:
-                    logger.warning(
-                        "Pure-LLM KV-cache path failed (%s); falling back to "
-                        "uncached stream_generate", exc,
-                    )
-                    async for output in self.stream_generate(
-                        prompt=prompt,
-                        max_tokens=max_tokens,
-                        temperature=temperature,
-                        top_p=top_p,
-                        **kwargs,
-                    ):
-                        yield output
+            def _emit_response(resp: Any) -> None:
+                if abort_event.is_set():
                     return
-
-                accumulated_text = ""
-                token_count = 0
-                finished = False
-                full_token_count = (
-                    len(full_tokens_list) if full_tokens_list is not None else 0
+                loop.call_soon_threadsafe(
+                    response_queue.put_nowait, ("resp", resp)
                 )
-                for i, resp in enumerate(all_resps):
+
+            def _emit_done() -> None:
+                loop.call_soon_threadsafe(
+                    response_queue.put_nowait, ("done", None)
+                )
+
+            def _emit_error(exc: BaseException) -> None:
+                loop.call_soon_threadsafe(
+                    response_queue.put_nowait, ("error", exc)
+                )
+
+            def _run_with_cache() -> None:
+                from mlx_lm import stream_generate as mlx_stream_generate
+                from mlx_lm.models.cache import make_prompt_cache
+                from mlx_lm.sample_utils import make_sampler
+
+                model = self._model.model
+                sampler = make_sampler(temp=temperature, top_p=top_p)
+
+                if cache_hit:
+                    bc = make_prompt_cache(model)
+                    for i, saved_state in enumerate(self._system_kv_snapshot):
+                        bc[i].state = saved_state
+                else:
+                    bc = make_prompt_cache(model)
+                    sys_arr = mx.array(system_tokens)
+                    step = self._prefill_step_size
+                    while sys_arr.size > step:
+                        model(sys_arr[:step][None], cache=bc)
+                        mx.eval([c.state for c in bc])
+                        sys_arr = sys_arr[step:]
+                        mx.clear_cache()
+                    if sys_arr.size > 0:
+                        model(sys_arr[None], cache=bc)
+                        mx.eval([c.state for c in bc])
+
+                    snapshot = [c.state for c in bc]
+                    mx.eval([s for pair in snapshot for s in pair])
+                    self._system_kv_snapshot = snapshot
+                    self._system_kv_hash = system_hash
+                    self._system_kv_token_count = system_token_count
+                    try:
+                        cache_mb = sum(c.nbytes for c in bc) / 1e6
+                    except Exception:
+                        cache_mb = -1
+                    logger.info(
+                        "System KV cache STORED (stream_chat): %d tokens "
+                        "(%.1f MB)",
+                        system_token_count,
+                        cache_mb,
+                    )
+
+                prompt_arr = mx.array(suffix_tokens)
+                for resp in mlx_stream_generate(
+                    model,
+                    tokenizer,
+                    prompt=prompt_arr,
+                    max_tokens=max_tokens,
+                    sampler=sampler,
+                    prompt_cache=bc,
+                ):
+                    if abort_event.is_set():
+                        break
+                    _emit_response(resp)
+
+            async def _produce_responses() -> None:
+                try:
+                    await self._run_blocking_serialized(
+                        _run_with_cache,
+                        on_cancel=abort_event.set,
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except BaseException as exc:
+                    _emit_error(exc)
+                else:
+                    _emit_done()
+
+            producer_task = asyncio.create_task(_produce_responses())
+
+            accumulated_text = ""
+            token_count = 0
+            finished = False
+            cache_path_failed_before_first_token = False
+            try:
+                while True:
+                    kind, payload = await response_queue.get()
+                    if kind == "done":
+                        break
+                    if kind == "error":
+                        if token_count == 0:
+                            logger.warning(
+                                "Pure-LLM KV-cache path failed before first "
+                                "token (%s); falling back to uncached "
+                                "stream_generate",
+                                payload,
+                            )
+                            cache_path_failed_before_first_token = True
+                            break
+                        # Already streamed partial output; can't cleanly
+                        # restart on the uncached path, so surface the error.
+                        raise payload
+                    resp = payload
                     token_count += 1
                     new_text = resp.text if hasattr(resp, "text") else str(resp)
                     accumulated_text += new_text
-                    is_last = i == len(all_resps) - 1
-                    finished = is_last or token_count >= max_tokens
+                    finish_reason = getattr(resp, "finish_reason", None)
+                    finished = (
+                        finish_reason is not None or token_count >= max_tokens
+                    )
+                    if finish_reason is None and finished:
+                        finish_reason = "stop"
+
                     yield GenerationOutput(
                         text=accumulated_text,
                         new_text=new_text,
                         prompt_tokens=full_token_count,
                         completion_tokens=token_count,
                         finished=finished,
-                        finish_reason=getattr(resp, "finish_reason", None)
-                        or ("stop" if finished else None),
+                        finish_reason=finish_reason,
                     )
                     if finished:
                         break
-                return
+            finally:
+                if not producer_task.done():
+                    abort_event.set()
+                    try:
+                        await producer_task
+                    except BaseException:
+                        pass
 
-        # Fallback: no system prefix detected → original uncached path
+            if cache_path_failed_before_first_token:
+                async for output in self.stream_generate(
+                    prompt=prompt,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    top_p=top_p,
+                    **kwargs,
+                ):
+                    yield output
+            return
+
+        # Fallback: no system prefix detected -> original uncached path
         async for output in self.stream_generate(
             prompt=prompt,
             max_tokens=max_tokens,
