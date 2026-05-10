@@ -877,10 +877,28 @@ class SimpleEngine(BaseEngine):
         system_hash = None
         kv_cache_eligible = False
 
-        has_system = any(m.get("role") == "system" for m in messages)
+        # Normalize messages to plain dicts. The public stream_chat signature
+        # types messages as list[dict], but internal callers (server.py,
+        # tests) sometimes pass Pydantic Message objects directly; those
+        # don't expose a dict-style .get() interface.
+        def _to_msg_dict(m: Any) -> dict[str, Any]:
+            if isinstance(m, dict):
+                return m
+            if hasattr(m, "model_dump"):
+                return m.model_dump()
+            if hasattr(m, "dict"):
+                return m.dict()
+            return {
+                "role": getattr(m, "role", None),
+                "content": getattr(m, "content", ""),
+            }
+
+        messages_for_cache = [_to_msg_dict(m) for m in messages]
+        has_system = any(m.get("role") == "system" for m in messages_for_cache)
         if has_system and hasattr(tokenizer, "apply_chat_template"):
+
             def _with_user(user_content: str) -> list[dict[str, Any]]:
-                msgs = [dict(m) for m in messages]
+                msgs = [dict(m) for m in messages_for_cache]
                 if msgs and msgs[-1].get("role") == "user":
                     msgs[-1] = {**msgs[-1], "content": user_content}
                 else:
@@ -914,9 +932,8 @@ class SimpleEngine(BaseEngine):
                         system_prefix_text.encode()
                     ).hexdigest()[:16]
 
-                    add_special = (
-                        tokenizer.bos_token is None
-                        or not prompt.startswith(tokenizer.bos_token)
+                    add_special = tokenizer.bos_token is None or not prompt.startswith(
+                        tokenizer.bos_token
                     )
                     full_tokens_list = tokenizer.encode(
                         prompt, add_special_tokens=add_special
@@ -968,19 +985,13 @@ class SimpleEngine(BaseEngine):
             def _emit_response(resp: Any) -> None:
                 if abort_event.is_set():
                     return
-                loop.call_soon_threadsafe(
-                    response_queue.put_nowait, ("resp", resp)
-                )
+                loop.call_soon_threadsafe(response_queue.put_nowait, ("resp", resp))
 
             def _emit_done() -> None:
-                loop.call_soon_threadsafe(
-                    response_queue.put_nowait, ("done", None)
-                )
+                loop.call_soon_threadsafe(response_queue.put_nowait, ("done", None))
 
             def _emit_error(exc: BaseException) -> None:
-                loop.call_soon_threadsafe(
-                    response_queue.put_nowait, ("error", exc)
-                )
+                loop.call_soon_threadsafe(response_queue.put_nowait, ("error", exc))
 
             def _run_with_cache() -> None:
                 from mlx_lm import stream_generate as mlx_stream_generate
@@ -1017,8 +1028,7 @@ class SimpleEngine(BaseEngine):
                     except Exception:
                         cache_mb = -1
                     logger.info(
-                        "System KV cache STORED (stream_chat): %d tokens "
-                        "(%.1f MB)",
+                        "System KV cache STORED (stream_chat): %d tokens " "(%.1f MB)",
                         system_token_count,
                         cache_mb,
                     )
@@ -1078,9 +1088,7 @@ class SimpleEngine(BaseEngine):
                     new_text = resp.text if hasattr(resp, "text") else str(resp)
                     accumulated_text += new_text
                     finish_reason = getattr(resp, "finish_reason", None)
-                    finished = (
-                        finish_reason is not None or token_count >= max_tokens
-                    )
+                    finished = finish_reason is not None or token_count >= max_tokens
                     if finish_reason is None and finished:
                         finish_reason = "stop"
 
