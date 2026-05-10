@@ -17,6 +17,7 @@ row.
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import logging
 from typing import Any
@@ -31,6 +32,43 @@ logger = logging.getLogger(__name__)
 
 class LMFormatEnforcerNotAvailableError(RuntimeError):
     """Raised when ``lm-format-enforcer`` is required but not installed."""
+
+
+# Module-level cache of (parser_schema, JsonSchemaParser) keyed by a canonical
+# hash of the input schema. Building a JsonSchemaParser is dominated by the
+# schema-walking work in _simplify_schema/_force_no_additional_properties
+# plus the parser's own indexing. Both are deterministic functions of the
+# schema, so memoising across requests is safe: the parser is not mutated
+# after construction; only the per-request TokenEnforcer carries state.
+# No eviction policy — agent workloads typically reuse a small fixed set of
+# tool schemas, so unbounded growth is not a realistic concern.
+_parser_cache: dict[str, tuple[dict, Any]] = {}
+
+
+def _canonical_schema_key(schema: dict | None) -> str:
+    if schema is None:
+        return "__none__"
+    blob = json.dumps(schema, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(blob).hexdigest()
+
+
+def _get_or_build_parser(schema: dict | None) -> tuple[dict, Any]:
+    """Return (parser_schema, JsonSchemaParser) for ``schema``, memoised."""
+    from lmformatenforcer import JsonSchemaParser
+
+    key = _canonical_schema_key(schema)
+    cached = _parser_cache.get(key)
+    if cached is not None:
+        return cached
+
+    if schema is None:
+        parser_schema = _GENERIC_JSON_SCHEMA
+    else:
+        parser_schema = _simplify_schema(schema)
+        parser_schema = _force_no_additional_properties(parser_schema)
+    parser = JsonSchemaParser(parser_schema)
+    _parser_cache[key] = (parser_schema, parser)
+    return parser_schema, parser
 
 
 def is_available() -> bool:
@@ -250,7 +288,7 @@ class JSONSchemaLogitsProcessor:
                 'Install it with `pip install "lm-format-enforcer>=0.10.9"`.'
             )
 
-        from lmformatenforcer import JsonSchemaParser, TokenEnforcer
+        from lmformatenforcer import TokenEnforcer
 
         self._tokenizer = tokenizer
         self._schema = schema
@@ -260,18 +298,13 @@ class JSONSchemaLogitsProcessor:
                 "Could not build TokenEnforcerTokenizerData for this tokenizer."
             )
 
-        # Pre-process schema: resolve $ref, remove 'not', convert type arrays.
-        # Then harden: force ``additionalProperties: false`` on all object
-        # sub-schemas to prevent the enforcer from allowing arbitrary keys.
+        # Reuse a memoised JsonSchemaParser for this schema; the parser is
+        # immutable after construction so it can be shared across requests.
+        # Each request still gets its own TokenEnforcer (which carries the
+        # per-sequence ``prefix_states`` and must not be shared).
         self._disabled = False
-        if schema is not None:
-            parser_schema = _simplify_schema(schema)
-            parser_schema = _force_no_additional_properties(parser_schema)
-        else:
-            parser_schema = _GENERIC_JSON_SCHEMA
-
         try:
-            self._parser = JsonSchemaParser(parser_schema)
+            parser_schema, self._parser = _get_or_build_parser(schema)
             self._enforcer = TokenEnforcer(self._tok_data, self._parser)
         except Exception as exc:
             logger.warning(
