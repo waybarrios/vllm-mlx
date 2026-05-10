@@ -860,7 +860,172 @@ class SimpleEngine(BaseEngine):
             prompt = "\n".join(f"{m['role']}: {m['content']}" for m in messages)
             prompt += "\nassistant:"
 
-        # Stream generate
+        # --- System prompt KV caching for pure-LLM (mirrors _stream_generate_text) ---
+        # Detect system prefix via ChatML markers. If we have one, route through
+        # the cache-aware path: HIT restores the snapshot and prefills only the
+        # suffix; MISS prefills system, snapshots it, then continues with suffix.
+        # Falls back to the original self.stream_generate() if no system prefix
+        # is detected or anything else looks wrong.
+        import hashlib as _hashlib
+
+        cache_hit = False
+        backbone_cache = None
+        suffix_tokens = None
+        system_tokens = None
+        system_token_count = 0
+        system_hash = None
+        full_tokens_list = None
+        kv_cache_eligible = False
+
+        has_system = any(m.get("role") == "system" for m in messages)
+        if has_system and hasattr(tokenizer, "apply_chat_template"):
+            system_prefix_end = -1
+            for marker in ("<|im_start|>user\n", "<|im_start|>assistant\n"):
+                idx = prompt.find(marker)
+                if idx > 0:
+                    system_prefix_end = idx
+                    break
+
+            if system_prefix_end > 0:
+                system_prefix_text = prompt[:system_prefix_end]
+                system_hash = _hashlib.sha256(
+                    system_prefix_text.encode()
+                ).hexdigest()[:16]
+
+                add_special = (
+                    tokenizer.bos_token is None
+                    or not prompt.startswith(tokenizer.bos_token)
+                )
+                full_tokens_list = tokenizer.encode(
+                    prompt, add_special_tokens=add_special
+                )
+                system_tokens_list = tokenizer.encode(
+                    system_prefix_text, add_special_tokens=add_special
+                )
+                system_token_count = len(system_tokens_list)
+
+                if (
+                    len(full_tokens_list) > system_token_count
+                    and full_tokens_list[:system_token_count] == system_tokens_list
+                ):
+                    system_tokens = system_tokens_list
+                    suffix_tokens = full_tokens_list[system_token_count:]
+                    kv_cache_eligible = True
+                    if (
+                        system_hash == self._system_kv_hash
+                        and self._system_kv_snapshot is not None
+                        and system_token_count == self._system_kv_token_count
+                    ):
+                        cache_hit = True
+                        logger.info(
+                            "System KV cache HIT (pure-LLM): reusing %d tokens, "
+                            "prefilling %d new (hash=%s)",
+                            system_token_count, len(suffix_tokens), system_hash,
+                        )
+                    else:
+                        logger.info(
+                            "System KV cache MISS (pure-LLM): will prefill %d system + "
+                            "%d suffix tokens (hash=%s)",
+                            system_token_count, len(suffix_tokens), system_hash,
+                        )
+
+        if kv_cache_eligible:
+            # Cache-aware path: drive mlx-lm directly with a pre-populated cache.
+            # NOTE: do NOT wrap in `async with self._generation_lock` — the inner
+            # _run_blocking_serialized already acquires it. Double-acquire deadlocks.
+            if True:
+                def _run_with_cache():
+                    import mlx.core as mx
+                    from mlx_lm import stream_generate as mlx_stream_generate
+                    from mlx_lm.models.cache import make_prompt_cache
+                    from mlx_lm.sample_utils import make_sampler
+
+                    model = self._model.model
+                    sampler = make_sampler(temp=temperature, top_p=top_p)
+
+                    if cache_hit:
+                        bc = make_prompt_cache(model)
+                        for i, saved_state in enumerate(self._system_kv_snapshot):
+                            bc[i].state = saved_state
+                    else:
+                        bc = make_prompt_cache(model)
+                        sys_arr = mx.array(system_tokens)
+                        step = self._prefill_step_size
+                        while sys_arr.size > step:
+                            model(sys_arr[:step][None], cache=bc)
+                            mx.eval([c.state for c in bc])
+                            sys_arr = sys_arr[step:]
+                            mx.clear_cache()
+                        if sys_arr.size > 0:
+                            model(sys_arr[None], cache=bc)
+                            mx.eval([c.state for c in bc])
+                        snapshot = [c.state for c in bc]
+                        mx.eval([s for pair in snapshot for s in pair])
+                        self._system_kv_snapshot = snapshot
+                        self._system_kv_hash = system_hash
+                        self._system_kv_token_count = system_token_count
+                        try:
+                            cache_mb = sum(c.nbytes for c in bc) / 1e6
+                        except Exception:
+                            cache_mb = -1
+                        logger.info(
+                            "System KV cache STORED (pure-LLM): %d tokens (%.1f MB)",
+                            system_token_count, cache_mb,
+                        )
+
+                    prompt_arr = mx.array(suffix_tokens)
+                    return list(mlx_stream_generate(
+                        model,
+                        tokenizer,
+                        prompt=prompt_arr,
+                        max_tokens=max_tokens,
+                        sampler=sampler,
+                        prompt_cache=bc,
+                    ))
+
+                try:
+                    all_resps = await self._run_blocking_serialized(_run_with_cache)
+                except Exception as exc:
+                    logger.warning(
+                        "Pure-LLM KV-cache path failed (%s); falling back to "
+                        "uncached stream_generate", exc,
+                    )
+                    async for output in self.stream_generate(
+                        prompt=prompt,
+                        max_tokens=max_tokens,
+                        temperature=temperature,
+                        top_p=top_p,
+                        **kwargs,
+                    ):
+                        yield output
+                    return
+
+                accumulated_text = ""
+                token_count = 0
+                finished = False
+                full_token_count = (
+                    len(full_tokens_list) if full_tokens_list is not None else 0
+                )
+                for i, resp in enumerate(all_resps):
+                    token_count += 1
+                    new_text = resp.text if hasattr(resp, "text") else str(resp)
+                    accumulated_text += new_text
+                    is_last = i == len(all_resps) - 1
+                    finished = is_last or token_count >= max_tokens
+                    yield GenerationOutput(
+                        text=accumulated_text,
+                        new_text=new_text,
+                        prompt_tokens=full_token_count,
+                        completion_tokens=token_count,
+                        finished=finished,
+                        finish_reason=getattr(resp, "finish_reason", None)
+                        or ("stop" if finished else None),
+                    )
+                    if finished:
+                        break
+                return
+
+        # Fallback: no system prefix detected → original uncached path
         async for output in self.stream_generate(
             prompt=prompt,
             max_tokens=max_tokens,
