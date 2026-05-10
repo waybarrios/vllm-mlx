@@ -5632,6 +5632,15 @@ async def stream_chat_completion(
     start_time = time.perf_counter()
     result_label = "success"
 
+    # Tools schema for argument coercion is invariant for the request;
+    # compute once instead of model_dump()-ing the whole request on every
+    # tool-call delta during streaming.
+    tools_dict = (
+        request.model_dump(include={"tools"}).get("tools")
+        if request and request.tools
+        else None
+    )
+
     # Check if we should include usage in the final chunk
     include_usage = request.stream_options and request.stream_options.include_usage
 
@@ -5778,17 +5787,12 @@ async def stream_chat_completion(
                             # Emit structured tool calls
                             tool_calls_detected = True
                             # Coerce arguments against tool schemas
-                            tools = (
-                                request.model_dump().get("tools")
-                                if request and request.tools
-                                else None
-                            )
-                            if tools:
+                            if tools_dict:
                                 for tc in tool_result["tool_calls"]:
                                     fn = tc.get("function", {})
                                     if "arguments" in fn and "name" in fn:
                                         fn["arguments"] = _coerce_tool_arguments(
-                                            fn["arguments"], fn["name"], tools
+                                            fn["arguments"], fn["name"], tools_dict
                                         )
                             chunk = ChatCompletionChunk(
                                 id=response_id,
@@ -5886,17 +5890,12 @@ async def stream_chat_completion(
                             # Emit structured tool calls
                             tool_calls_detected = True
                             # Coerce arguments against tool schemas
-                            tools = (
-                                request.model_dump().get("tools")
-                                if request and request.tools
-                                else None
-                            )
-                            if tools:
+                            if tools_dict:
                                 for tc in tool_result["tool_calls"]:
                                     fn = tc.get("function", {})
                                     if "arguments" in fn and "name" in fn:
                                         fn["arguments"] = _coerce_tool_arguments(
-                                            fn["arguments"], fn["name"], tools
+                                            fn["arguments"], fn["name"], tools_dict
                                         )
                             chunk = ChatCompletionChunk(
                                 id=response_id,
@@ -5959,11 +5958,6 @@ async def stream_chat_completion(
         ):
             final_parse_result = tool_parser.extract_tool_calls(tool_accumulated_text)
             if final_parse_result.tools_called:
-                tools = (
-                    request.model_dump().get("tools")
-                    if request and request.tools
-                    else None
-                )
                 tool_chunk = ChatCompletionChunk(
                     id=response_id,
                     model=_model_name,
@@ -5978,7 +5972,7 @@ async def stream_chat_completion(
                                         "function": {
                                             "name": tc["name"],
                                             "arguments": _coerce_tool_arguments(
-                                                tc["arguments"], tc["name"], tools
+                                                tc["arguments"], tc["name"], tools_dict
                                             ),
                                         },
                                     }
