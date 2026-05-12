@@ -53,6 +53,7 @@ def _mark_mtp_attempts_on_primary_responses(
             continue
         response.mtp_attempted = True
         response.mtp_attempted_count = draft_count
+    attempted_drafts_by_uid.clear()
 
 
 def _drop_retired_processors(
@@ -2095,6 +2096,8 @@ def install_mtp_mllm(
             )
             draft_tokens = _draft_sampler(draft_logprobs)
             for uid in current_uids:
+                # Current MLLM MTP drafts one token per primary step. Keep this
+                # as a count so future multi-token drafters can report >1.
                 _attempted_drafts_by_uid[uid] = 1
 
             # Snapshot RNN state for hybrid models

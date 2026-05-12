@@ -195,7 +195,7 @@ def test_mllm_mtp_attempt_metadata_only_marks_real_attempts():
         _mark_mtp_attempts_on_primary_responses,
     )
 
-    attempted = {7: 1}
+    attempted = {7: 1, 99: 1}
     attempted_response = MLLMBatchResponse(
         uid=7,
         request_id="req-7",
@@ -218,6 +218,7 @@ def test_mllm_mtp_attempt_metadata_only_marks_real_attempts():
     assert attempted_response.mtp_attempted_count == 1
     assert skipped_response.mtp_attempted is False
     assert skipped_response.mtp_attempted_count == 0
+    assert attempted == {}
 
 
 def test_mllm_scheduler_exposes_mtp_attempts_and_accepts_on_outputs():

@@ -756,7 +756,7 @@ class BatchedEngine(BaseEngine):
                 logits_processors=kwargs.pop("logits_processors", None),
             )
 
-            generation_output = GenerationOutput(
+            return GenerationOutput(
                 text=clean_output_text(output.output_text),
                 tokens=output.output_token_ids,
                 prompt_tokens=output.prompt_tokens,
@@ -765,7 +765,6 @@ class BatchedEngine(BaseEngine):
                 mtp_drafts=output.mtp_drafts,
                 mtp_accepted=output.mtp_accepted,
             )
-            return generation_output
 
         # Use LLM engine for text-only (non-MLLM models)
         from ..request import SamplingParams
@@ -847,7 +846,7 @@ class BatchedEngine(BaseEngine):
             )
 
             async for output in self._mllm_scheduler.stream_outputs(request_id):
-                generation_output = GenerationOutput(
+                yield GenerationOutput(
                     text=clean_output_text(output.output_text),
                     new_text=output.new_text,
                     prompt_tokens=output.prompt_tokens,
@@ -857,7 +856,6 @@ class BatchedEngine(BaseEngine):
                     mtp_drafts=output.mtp_drafts,
                     mtp_accepted=output.mtp_accepted,
                 )
-                yield generation_output
             return
 
         # Use LLM engine for text-only
