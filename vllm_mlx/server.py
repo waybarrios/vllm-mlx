@@ -105,6 +105,7 @@ from .api.models import (
     Usage,  # noqa: F401
     VideoUrl,  # noqa: F401
 )
+from .api.prompt_canonicalize import canonicalize_system_messages
 from .api.responses_models import (
     ResponseCompletedEvent,
     ResponseContentPartAddedEvent,
@@ -305,6 +306,8 @@ def _prepare_chat_messages(
             preserve_native_format=preserve_native,
         )
         messages = _normalize_messages(messages)
+
+    messages = canonicalize_system_messages(messages)
 
     has_media = bool(images or videos or audios)
     if is_mllm and not has_media:
@@ -2082,6 +2085,7 @@ def _prepare_responses_request(
         chat_request.messages,
         preserve_native_format=engine.preserve_native_tool_format,
     )
+    messages = canonicalize_system_messages(messages)
 
     chat_kwargs = {
         "max_tokens": chat_request.max_tokens or _default_max_tokens,
