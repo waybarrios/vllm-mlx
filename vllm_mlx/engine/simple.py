@@ -906,10 +906,43 @@ class SimpleEngine(BaseEngine):
             cache_blocking_controls.append("presence_penalty")
         if (kwargs.get("repetition_penalty") or 1.0) != 1.0:
             cache_blocking_controls.append("repetition_penalty")
+
+        # Engine-feature gate.
+        # The cache branch also bypasses engine-level features that
+        # ``self.stream_generate`` (and the ``MLXLanguageModel.stream_generate``
+        # wrapper underneath it) layer on top of ``mlx_lm.stream_generate``.
+        # Same correctness reasoning as the decode-control gate: cache-eligible
+        # and uncached requests must decode under identical engine semantics, so
+        # skip the cache branch when any of these are active.
+        # Specifically:
+        #   - ``self._mtp`` injects ``mtp=True`` and ``num_draft_tokens`` into
+        #     the mlx-lm call (see ``MLXLanguageModel.stream_generate``).
+        #   - A loaded SpecPrefill draft model (``self._draft_model is not None``,
+        #     set when ``specprefill_enabled`` + ``specprefill_draft_model`` are
+        #     configured at engine init) routes large prompts through
+        #     ``_stream_generate_specprefill`` instead of the plain stream path.
+        #   - A per-request ``specprefill`` override from ``extra_body`` (popped
+        #     by the wrapper from ``kwargs``) can force or suppress SpecPrefill
+        #     for a single request.
+        #     ``specprefill=False`` is a meaningful suppression signal — gate on
+        #     ``is not None`` rather than truthiness so the wrapper sees it.
+        #   - ``self._max_kv_size`` (when > 0) caps the prompt cache; the cache
+        #     branch builds its cache with ``make_prompt_cache(model)`` and has
+        #     no equivalent bound.
+        if self._mtp:
+            cache_blocking_controls.append("mtp")
+        if self._draft_model is not None:
+            cache_blocking_controls.append("specprefill_loaded")
+        if kwargs.get("specprefill") is not None:
+            cache_blocking_controls.append("specprefill_request_override")
+        if (self._max_kv_size or 0) > 0:
+            cache_blocking_controls.append("max_kv_size")
+
         if cache_blocking_controls:
             logger.info(
-                "System KV cache SKIP (stream_chat): request has decode controls the "
-                "cache branch cannot honor (%s); using uncached path",
+                "System KV cache SKIP (stream_chat): request or engine has "
+                "controls/features the cache branch cannot honor (%s); using "
+                "uncached path",
                 cache_blocking_controls,
             )
 

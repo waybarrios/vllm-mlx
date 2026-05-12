@@ -548,6 +548,179 @@ class TestSimpleEngineConcurrency:
         assert tokenizer.apply_chat_template.call_count == 3
 
     @pytest.mark.anyio
+    async def test_stream_chat_skips_cache_path_when_mtp_active(self):
+        """When ``self._mtp`` is configured, the cache branch must be skipped.
+        The branch calls ``mlx_lm.stream_generate`` directly with no ``mtp`` /
+        ``num_draft_tokens`` kwargs, while ``MLXLanguageModel.stream_generate``
+        attaches them from ``self._mtp`` / ``self._mtp_num_draft_tokens``.
+        Running the same request through the cache branch would silently drop
+        speculative decoding for cache-eligible turns while keeping it on
+        uncached turns — different engine semantics for the same request."""
+        from vllm_mlx.engine.simple import SimpleEngine
+
+        tokenizer = MagicMock()
+        tokenizer.apply_chat_template.return_value = (
+            "<|im_start|>system\nYou are helpful.<|im_end|>\n"
+            "<|im_start|>user\nhello<|im_end|>\n"
+            "<|im_start|>assistant\n"
+        )
+        tokenizer.bos_token = None
+        tokenizer.encode = MagicMock(return_value=[1, 2, 3])
+
+        model = MagicMock()
+        model.tokenizer = tokenizer
+
+        fallback_kwargs: list[dict] = []
+
+        async def fake_stream_generate(*, prompt, **kw):
+            fallback_kwargs.append(kw)
+            out = MagicMock(
+                text="ok",
+                new_text="ok",
+                prompt_tokens=3,
+                completion_tokens=1,
+                finished=True,
+                finish_reason="stop",
+            )
+            yield out
+
+        with patch("vllm_mlx.engine.simple.is_mllm_model", return_value=False):
+            engine = SimpleEngine("test-model", mtp=True, mtp_num_draft_tokens=4)
+            engine._model = model
+            engine._loaded = True
+            engine.stream_generate = fake_stream_generate  # type: ignore[method-assign]
+
+            chunks = [
+                c
+                async for c in engine.stream_chat(
+                    messages=[
+                        {"role": "system", "content": "You are helpful."},
+                        {"role": "user", "content": "hello"},
+                    ],
+                )
+            ]
+
+        # Cache-path probes must NOT run — only the initial prompt render.
+        assert tokenizer.apply_chat_template.call_count == 1
+        # The uncached wrapper must have been invoked.
+        # MTP kwargs are layered on inside ``MLXLanguageModel.stream_generate``,
+        # not at this seam, so this test only proves the cache branch was
+        # bypassed; the wrapper attaches MTP itself when ``self._mtp`` is set.
+        assert fallback_kwargs, "uncached stream_generate fallback was not invoked"
+        assert chunks and chunks[0].text == "ok"
+
+    @pytest.mark.anyio
+    async def test_stream_chat_skips_cache_path_when_specprefill_loaded(self):
+        """A loaded SpecPrefill draft model (``self._draft_model is not None``)
+        triggers ``_stream_generate_specprefill`` routing inside the wrapper for
+        large prompts.
+        The cache branch has no equivalent routing, so it must be skipped
+        whenever a draft model is loaded so all requests go through the
+        wrapper's SpecPrefill decision."""
+        from vllm_mlx.engine.simple import SimpleEngine
+
+        tokenizer = MagicMock()
+        tokenizer.apply_chat_template.return_value = (
+            "<|im_start|>system\nYou are helpful.<|im_end|>\n"
+            "<|im_start|>user\nhello<|im_end|>\n"
+            "<|im_start|>assistant\n"
+        )
+        tokenizer.bos_token = None
+        tokenizer.encode = MagicMock(return_value=[1, 2, 3])
+
+        model = MagicMock()
+        model.tokenizer = tokenizer
+
+        fallback_kwargs: list[dict] = []
+
+        async def fake_stream_generate(*, prompt, **kw):
+            fallback_kwargs.append(kw)
+            out = MagicMock(
+                text="ok",
+                new_text="ok",
+                prompt_tokens=3,
+                completion_tokens=1,
+                finished=True,
+                finish_reason="stop",
+            )
+            yield out
+
+        with patch("vllm_mlx.engine.simple.is_mllm_model", return_value=False):
+            engine = SimpleEngine("test-model")
+            engine._model = model
+            engine._draft_model = MagicMock(name="specprefill_draft_model")
+            engine._loaded = True
+            engine.stream_generate = fake_stream_generate  # type: ignore[method-assign]
+
+            chunks = [
+                c
+                async for c in engine.stream_chat(
+                    messages=[
+                        {"role": "system", "content": "You are helpful."},
+                        {"role": "user", "content": "hello"},
+                    ],
+                )
+            ]
+
+        assert tokenizer.apply_chat_template.call_count == 1
+        assert fallback_kwargs, "uncached stream_generate fallback was not invoked"
+        assert chunks and chunks[0].text == "ok"
+
+    @pytest.mark.anyio
+    async def test_stream_chat_skips_cache_path_when_max_kv_size_set(self):
+        """Configured ``max_kv_size`` caps the prompt cache.
+        The cache branch builds its cache with ``make_prompt_cache(model)``
+        without forwarding ``max_kv_size``, so a non-zero engine-level bound
+        must force the uncached path."""
+        from vllm_mlx.engine.simple import SimpleEngine
+
+        tokenizer = MagicMock()
+        tokenizer.apply_chat_template.return_value = (
+            "<|im_start|>system\nYou are helpful.<|im_end|>\n"
+            "<|im_start|>user\nhello<|im_end|>\n"
+            "<|im_start|>assistant\n"
+        )
+        tokenizer.bos_token = None
+        tokenizer.encode = MagicMock(return_value=[1, 2, 3])
+
+        model = MagicMock()
+        model.tokenizer = tokenizer
+
+        fallback_kwargs: list[dict] = []
+
+        async def fake_stream_generate(*, prompt, **kw):
+            fallback_kwargs.append(kw)
+            out = MagicMock(
+                text="ok",
+                new_text="ok",
+                prompt_tokens=3,
+                completion_tokens=1,
+                finished=True,
+                finish_reason="stop",
+            )
+            yield out
+
+        with patch("vllm_mlx.engine.simple.is_mllm_model", return_value=False):
+            engine = SimpleEngine("test-model", max_kv_size=4096)
+            engine._model = model
+            engine._loaded = True
+            engine.stream_generate = fake_stream_generate  # type: ignore[method-assign]
+
+            chunks = [
+                c
+                async for c in engine.stream_chat(
+                    messages=[
+                        {"role": "system", "content": "You are helpful."},
+                        {"role": "user", "content": "hello"},
+                    ],
+                )
+            ]
+
+        assert tokenizer.apply_chat_template.call_count == 1
+        assert fallback_kwargs, "uncached stream_generate fallback was not invoked"
+        assert chunks and chunks[0].text == "ok"
+
+    @pytest.mark.anyio
     async def test_lock_serializes_stream_generate(self, mock_model):
         """Test that stream_generate uses the same lock as other methods."""
         from vllm_mlx.engine.simple import SimpleEngine
