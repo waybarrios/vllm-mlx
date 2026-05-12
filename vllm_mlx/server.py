@@ -87,6 +87,7 @@ from .api.models import (
     EmbeddingResponse,
     EmbeddingUsage,
     FunctionCall,
+    GenerationMetadata,
     ImageUrl,  # noqa: F401
     MCPExecuteRequest,
     MCPExecuteResponse,
@@ -413,6 +414,18 @@ def _build_thinking_processor(
 
     vocab_size = getattr(tokenizer, "vocab_size", 152064)
 
+    no_final_content_token_limit = _resolve_no_final_content_token_limit()
+    if (
+        no_final_content_token_limit is not None
+        and no_final_content_token_limit >= thinking_token_budget
+    ):
+        logger.warning(
+            "VLLM_MLX_NO_FINAL_CONTENT_TOKEN_LIMIT=%d will not fire because "
+            "thinking_token_budget=%d is reached first",
+            no_final_content_token_limit,
+            thinking_token_budget,
+        )
+
     proc = ThinkingAwareLogitsProcessor(
         start_token_ids=start_ids,
         end_token_ids=end_ids,
@@ -420,7 +433,7 @@ def _build_thinking_processor(
         inner=inner,
         vocab_size=vocab_size,
         prompt_has_think_tag=prompt_has_think_tag,
-        no_final_content_token_limit=_resolve_no_final_content_token_limit(),
+        no_final_content_token_limit=no_final_content_token_limit,
     )
     logger.info(
         "Thinking processor enabled: budget=%d, start=%s, end=%s",
@@ -445,13 +458,19 @@ def _resolve_no_final_content_token_limit() -> int | None:
     return value
 
 
-def _generation_metadata(thinking_processor: object | None) -> dict:
-    return {
-        "no_final_content_watchdog_tokens": _resolve_no_final_content_token_limit(),
-        "no_final_content_watchdog_enforced": bool(
+def _generation_metadata(
+    thinking_processor: object | None,
+) -> GenerationMetadata | None:
+    if thinking_processor is None:
+        return None
+    return GenerationMetadata(
+        no_final_content_watchdog_tokens=getattr(
+            thinking_processor, "_no_final_content_token_limit", None
+        ),
+        no_final_content_watchdog_enforced=bool(
             getattr(thinking_processor, "watchdog_was_enforced", False)
         ),
-    }
+    )
 
 
 class _ThinkingAwareLogitsProcessor:

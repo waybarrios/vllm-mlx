@@ -7,6 +7,7 @@ import importlib.util
 import sys
 import types
 from pathlib import Path
+from types import SimpleNamespace
 
 
 def _load_thinking_processor():
@@ -64,3 +65,47 @@ def test_budget_transition_does_not_mark_watchdog_enforced():
 
     assert proc.state is module.Phase.TRANSITIONING
     assert proc.watchdog_was_enforced is False
+
+
+def test_generation_metadata_uses_processor_limit_not_current_env(monkeypatch):
+    from vllm_mlx import server
+
+    proc = SimpleNamespace(
+        _no_final_content_token_limit=7,
+        watchdog_was_enforced=True,
+    )
+
+    monkeypatch.setenv("VLLM_MLX_NO_FINAL_CONTENT_TOKEN_LIMIT", "99")
+
+    metadata = server._generation_metadata(proc)
+
+    assert metadata is not None
+    assert metadata.no_final_content_watchdog_tokens == 7
+    assert metadata.no_final_content_watchdog_enforced is True
+
+
+def test_generation_metadata_omitted_without_thinking_processor(monkeypatch):
+    from vllm_mlx import server
+
+    monkeypatch.setenv("VLLM_MLX_NO_FINAL_CONTENT_TOKEN_LIMIT", "7")
+
+    assert server._generation_metadata(None) is None
+
+
+def test_build_thinking_processor_warns_when_watchdog_cannot_fire(monkeypatch, caplog):
+    from vllm_mlx import server
+
+    class Tokenizer:
+        vocab_size = 100
+
+        def encode(self, text, add_special_tokens=False):
+            return {"<think>": [1], "</think>": [2]}[text]
+
+    engine = SimpleNamespace(_tokenizer=Tokenizer())
+    monkeypatch.setenv("VLLM_MLX_NO_FINAL_CONTENT_TOKEN_LIMIT", "10")
+
+    proc = server._build_thinking_processor(engine, 5)
+
+    assert proc is not None
+    assert proc._no_final_content_token_limit == 10
+    assert "will not fire" in caplog.text
