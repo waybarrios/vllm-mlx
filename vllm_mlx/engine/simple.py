@@ -877,6 +877,42 @@ class SimpleEngine(BaseEngine):
         system_hash = None
         kv_cache_eligible = False
 
+        # Decode-control gate.
+        # The cache branch below drives ``mlx_lm.stream_generate`` directly with only
+        # ``prompt``, ``max_tokens``, ``sampler`` (built from temperature+top_p), and
+        # ``prompt_cache``.
+        # The uncached fallback threads ``**kwargs`` through ``self.stream_generate``,
+        # which preserves ``stop``, request-local ``logits_processors`` (parser stop
+        # tokens and JSON-constrained decoding attached by server.py per request), and
+        # the ``top_k`` / ``min_p`` / ``presence_penalty`` / ``repetition_penalty``
+        # sampling controls.
+        # If the cache branch ran with any of those active, cache-eligible and uncached
+        # requests would silently decode under different constraints.
+        # Skip the cache branch in that case so both paths share identical decode
+        # semantics.
+        # server.py always supplies the no-op defaults (``top_k=0``, ``min_p=0.0``,
+        # ``presence_penalty=0.0``, ``repetition_penalty=1.0``); compare against those
+        # rather than ``key in kwargs`` so the common path still hits the cache.
+        cache_blocking_controls: list[str] = []
+        if kwargs.get("stop"):
+            cache_blocking_controls.append("stop")
+        if kwargs.get("logits_processors"):
+            cache_blocking_controls.append("logits_processors")
+        if (kwargs.get("top_k") or 0) > 0:
+            cache_blocking_controls.append("top_k")
+        if (kwargs.get("min_p") or 0.0) > 0.0:
+            cache_blocking_controls.append("min_p")
+        if (kwargs.get("presence_penalty") or 0.0) != 0.0:
+            cache_blocking_controls.append("presence_penalty")
+        if (kwargs.get("repetition_penalty") or 1.0) != 1.0:
+            cache_blocking_controls.append("repetition_penalty")
+        if cache_blocking_controls:
+            logger.info(
+                "System KV cache SKIP (stream_chat): request has decode controls the "
+                "cache branch cannot honor (%s); using uncached path",
+                cache_blocking_controls,
+            )
+
         # Normalize messages to plain dicts. The public stream_chat signature
         # types messages as list[dict], but internal callers (server.py,
         # tests) sometimes pass Pydantic Message objects directly; those
@@ -895,7 +931,11 @@ class SimpleEngine(BaseEngine):
 
         messages_for_cache = [_to_msg_dict(m) for m in messages]
         has_system = any(m.get("role") == "system" for m in messages_for_cache)
-        if has_system and hasattr(tokenizer, "apply_chat_template"):
+        if (
+            has_system
+            and not cache_blocking_controls
+            and hasattr(tokenizer, "apply_chat_template")
+        ):
 
             def _with_user(user_content: str) -> list[dict[str, Any]]:
                 msgs = [dict(m) for m in messages_for_cache]

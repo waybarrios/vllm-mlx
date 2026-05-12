@@ -408,6 +408,146 @@ class TestSimpleEngineConcurrency:
         assert chunks and chunks[0].text == "fallback-response"
 
     @pytest.mark.anyio
+    async def test_stream_chat_skips_cache_path_when_decode_controls_present(self):
+        """If the request carries ``stop`` or ``logits_processors`` (or any non-default
+        ``top_k`` / ``min_p`` / ``presence_penalty`` / ``repetition_penalty``), the
+        cache branch must be skipped so those controls flow through
+        ``self.stream_generate``.
+        The cache branch drives ``mlx_lm.stream_generate`` directly with only
+        prompt/max_tokens/sampler/prompt_cache, silently dropping any other decode
+        controls.
+        Gating here keeps cache-eligible and uncached requests on identical decode
+        semantics."""
+        from vllm_mlx.engine.simple import SimpleEngine
+
+        tokenizer = MagicMock()
+        # Render contains a system block so ``has_system`` would otherwise send us
+        # into the cache branch.
+        tokenizer.apply_chat_template.return_value = (
+            "<|im_start|>system\nYou are helpful.<|im_end|>\n"
+            "<|im_start|>user\nhello<|im_end|>\n"
+            "<|im_start|>assistant\n"
+        )
+        tokenizer.bos_token = None
+        tokenizer.encode = MagicMock(return_value=[1, 2, 3])
+
+        model = MagicMock()
+        model.tokenizer = tokenizer
+
+        fallback_kwargs: list[dict] = []
+
+        async def fake_stream_generate(*, prompt, **kw):
+            fallback_kwargs.append(kw)
+            out = MagicMock(
+                text="ok",
+                new_text="ok",
+                prompt_tokens=3,
+                completion_tokens=1,
+                finished=True,
+                finish_reason="stop",
+            )
+            yield out
+
+        sentinel_processor = MagicMock(name="logits_processor")
+
+        with patch("vllm_mlx.engine.simple.is_mllm_model", return_value=False):
+            engine = SimpleEngine("test-model")
+            engine._model = model
+            engine._loaded = True
+            engine.stream_generate = fake_stream_generate  # type: ignore[method-assign]
+
+            chunks = [
+                c
+                async for c in engine.stream_chat(
+                    messages=[
+                        {"role": "system", "content": "You are helpful."},
+                        {"role": "user", "content": "hello"},
+                    ],
+                    stop=["<|im_end|>"],
+                    logits_processors=[sentinel_processor],
+                )
+            ]
+
+        # Cache-path probe (``apply_chat_template`` called a second + third time for
+        # probe-divergence) must NOT happen — only the initial prompt render.
+        assert tokenizer.apply_chat_template.call_count == 1
+        # The uncached fallback must have been invoked.
+        # The decode-control kwargs must have been threaded through.
+        assert fallback_kwargs, "uncached stream_generate fallback was not invoked"
+        assert fallback_kwargs[0].get("stop") == ["<|im_end|>"]
+        assert fallback_kwargs[0].get("logits_processors") == [sentinel_processor]
+        assert chunks and chunks[0].text == "ok"
+
+    @pytest.mark.anyio
+    async def test_stream_chat_takes_cache_path_when_decode_controls_are_no_ops(self):
+        """server.py always sets ``top_k=0``, ``min_p=0.0``, ``presence_penalty=0.0``,
+        ``repetition_penalty=1.0`` (no-ops) in ``chat_kwargs``.
+        The gate must compare against those defaults so the common path still hits the
+        cache.
+        Only *active* controls should block."""
+        from vllm_mlx.engine.simple import SimpleEngine
+
+        def apply_chat_template_side_effect(messages, **kwargs):
+            user_content = ""
+            for m in reversed(messages):
+                role = (
+                    m.get("role") if isinstance(m, dict) else getattr(m, "role", None)
+                )
+                if role == "user":
+                    content = (
+                        m.get("content")
+                        if isinstance(m, dict)
+                        else getattr(m, "content", "")
+                    )
+                    user_content = content or ""
+                    break
+            return (
+                "<|im_start|>system\nYou are helpful.<|im_end|>\n"
+                f"<|im_start|>user\n{user_content}<|im_end|>\n"
+                "<|im_start|>assistant\n"
+            )
+
+        tokenizer = MagicMock()
+        tokenizer.apply_chat_template.side_effect = apply_chat_template_side_effect
+        tokenizer.bos_token = None
+        tokenizer.encode = MagicMock(side_effect=[list(range(50)), list(range(20))])
+
+        model = MagicMock()
+        model.tokenizer = tokenizer
+
+        with patch("vllm_mlx.engine.simple.is_mllm_model", return_value=False):
+            engine = SimpleEngine("test-model")
+            engine._model = model
+            engine._loaded = True
+
+            # No fallback needed since cache path should be exercised.
+            # Patch _run_blocking_serialized to short-circuit cache execution cleanly
+            # without needing a real mlx_lm.
+            async def short_circuit(func, *args, on_cancel=None, **kw):
+                # Simulate immediate completion with no responses.
+                # The producer-task harness will fire _emit_done().
+                return None
+
+            engine._run_blocking_serialized = short_circuit  # type: ignore[method-assign]
+
+            _ = [
+                c
+                async for c in engine.stream_chat(
+                    messages=[
+                        {"role": "system", "content": "You are helpful."},
+                        {"role": "user", "content": "hello"},
+                    ],
+                    top_k=0,
+                    min_p=0.0,
+                    presence_penalty=0.0,
+                    repetition_penalty=1.0,
+                )
+            ]
+
+        # Probe-divergence ran ⇒ apply_chat_template called for prompt + 2 probes.
+        assert tokenizer.apply_chat_template.call_count == 3
+
+    @pytest.mark.anyio
     async def test_lock_serializes_stream_generate(self, mock_model):
         """Test that stream_generate uses the same lock as other methods."""
         from vllm_mlx.engine.simple import SimpleEngine
