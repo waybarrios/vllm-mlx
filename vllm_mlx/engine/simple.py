@@ -352,9 +352,11 @@ class SimpleEngine(BaseEngine):
         self._system_kv_token_count = 0
         logger.info("SimpleEngine stopped")
 
-    def _should_route_text_through_text_model(self) -> bool:
+    def _should_route_text_through_text_model(
+        self, *, mllm_draft_requested: bool = False
+    ) -> bool:
         """Return whether text-only MLLM requests may use mlx_lm TextModel."""
-        return self._mllm_draft_model_path is None
+        return not (mllm_draft_requested and self._mllm_draft_model_path is not None)
 
     async def _run_blocking_serialized(self, func, /, *args, on_cancel=None, **kwargs):
         """Run a blocking MLX operation under the generation lock.
@@ -639,6 +641,8 @@ class SimpleEngine(BaseEngine):
                 prompt_tokens=final_output.prompt_tokens,
                 completion_tokens=final_output.completion_tokens,
                 finish_reason=final_output.finish_reason,
+                mtp_drafts=final_output.mtp_drafts,
+                mtp_accepted=final_output.mtp_accepted,
             )
 
         # mlx-lm non-streaming chat with tools can stall indefinitely on some
@@ -739,6 +743,7 @@ class SimpleEngine(BaseEngine):
             await self.start()
 
         chat_template_kwargs = dict(kwargs.pop("chat_template_kwargs", {}) or {})
+        mllm_draft_requested = bool(kwargs.pop("mllm_draft", False))
 
         # Convert tools for template
         template_tools = convert_tools_for_template(tools) if tools else None
@@ -747,7 +752,9 @@ class SimpleEngine(BaseEngine):
         if (
             self._is_mllm
             and self._text_model is not None
-            and self._should_route_text_through_text_model()
+            and self._should_route_text_through_text_model(
+                mllm_draft_requested=mllm_draft_requested
+            )
             and not has_media_content(messages)
         ):
             has_mtp = (

@@ -16,7 +16,7 @@ import argparse
 import json
 import sys
 
-from .cli_arg_types import make_json_object_arg_parser
+from .cli_arg_types import make_json_object_arg_parser, make_positive_int_arg_parser
 
 
 def serve_command(args):
@@ -73,6 +73,15 @@ def serve_command(args):
     mllm_draft_model = getattr(args, "mllm_draft_model", None)
     mllm_draft_kind = getattr(args, "mllm_draft_kind", None)
     mllm_draft_block_size = getattr(args, "mllm_draft_block_size", None)
+    if mllm_draft_model and models_config:
+        print("Error: --mllm-draft-model cannot be used with --models-config")
+        sys.exit(1)
+    if mllm_draft_model and not getattr(args, "mllm", False):
+        print("Error: --mllm-draft-model requires --mllm")
+        sys.exit(1)
+    if mllm_draft_block_size is not None and mllm_draft_block_size <= 0:
+        print("Error: --mllm-draft-block-size must be a positive integer")
+        sys.exit(1)
     if mllm_draft_model and args.continuous_batching:
         print(
             "Error: --mllm-draft-model is supported only without --continuous-batching"
@@ -1240,7 +1249,7 @@ Examples:
     )
     serve_parser.add_argument(
         "--mllm-draft-block-size",
-        type=int,
+        type=make_positive_int_arg_parser("--mllm-draft-block-size"),
         default=None,
         help="Draft block size passed to mlx-vlm for --mllm-draft-model.",
     )

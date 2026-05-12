@@ -188,6 +188,8 @@ class ChatCompletionRequest(BaseModel):
     specprefill_keep_pct: float | None = None
     # Enable/disable thinking mode (None = server default, typically True)
     enable_thinking: bool | None = None
+    # MLLM assistant-drafter path: opt in per request when a drafter is configured.
+    mllm_draft: bool | None = None
     # Thinking token budget: cap reasoning tokens by forcing </think> when
     # budget exhausted (None = no budget, unlimited reasoning)
     thinking_token_budget: int | None = Field(default=None, gt=0)

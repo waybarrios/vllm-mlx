@@ -182,6 +182,53 @@ def load_gemma4_assistant_drafter(model_path: str):
     return model
 
 
+_DRAFT_KWARG_NAMES = ("draft_model", "draft_kind", "draft_block_size")
+
+
+def _count_draft_tokens(draft_tokens) -> int:
+    """Best-effort drafted-token count for an mlx-vlm drafter output."""
+    shape = getattr(draft_tokens, "shape", None)
+    if shape:
+        try:
+            return max(int(shape[-1]), 0)
+        except (TypeError, ValueError):
+            pass
+    try:
+        return max(len(draft_tokens), 0)
+    except TypeError:
+        return 0
+
+
+def _install_draft_metrics_hooks(draft_model) -> None:
+    """Record actual drafted token counts from mlx-vlm assistant drafters."""
+    if draft_model is None or getattr(draft_model, "_vllm_mlx_metrics_hooked", False):
+        return
+
+    if not hasattr(draft_model, "_vllm_mlx_draft_counts"):
+        draft_model._vllm_mlx_draft_counts = []
+
+    draft_block = getattr(draft_model, "draft_block", None)
+    if callable(draft_block):
+
+        def draft_block_with_metrics(*args, **kwargs):
+            draft_tokens = draft_block(*args, **kwargs)
+            draft_model._vllm_mlx_draft_counts.append(_count_draft_tokens(draft_tokens))
+            return draft_tokens
+
+        draft_model.draft_block = draft_block_with_metrics
+
+    reset = getattr(draft_model, "reset", None)
+    if callable(reset):
+
+        def reset_with_metrics(*args, **kwargs):
+            draft_model._vllm_mlx_draft_counts = []
+            return reset(*args, **kwargs)
+
+        draft_model.reset = reset_with_metrics
+
+    draft_model._vllm_mlx_metrics_hooked = True
+
+
 def is_base64_image(s: str) -> bool:
     """Check if string is base64-encoded image data."""
     return s.startswith("data:image/") or (
@@ -945,6 +992,7 @@ class MLXMultimodalLM:
             self.config = load_config(self.model_name)
             if self.draft_model_path:
                 self._draft_model = self._load_draft_model()
+                _install_draft_metrics_hooks(self._draft_model)
 
             self._loaded = True
             self._video_native = hasattr(
@@ -972,9 +1020,13 @@ class MLXMultimodalLM:
         draft_model, _ = load(self.draft_model_path)
         return draft_model
 
-    def _draft_generation_kwargs(self) -> dict:
+    def _draft_generation_kwargs(self, call_kwargs: dict | None = None) -> dict:
+        if call_kwargs is not None:
+            for key in _DRAFT_KWARG_NAMES:
+                call_kwargs.pop(key, None)
         if self._draft_model is None:
             return {}
+        _install_draft_metrics_hooks(self._draft_model)
         kwargs = {"draft_model": self._draft_model}
         if self.draft_kind:
             kwargs["draft_kind"] = self.draft_kind
@@ -987,6 +1039,8 @@ class MLXMultimodalLM:
             return 0
         if hasattr(self._draft_model, "accept_lens"):
             self._draft_model.accept_lens = []
+        if hasattr(self._draft_model, "_vllm_mlx_draft_counts"):
+            self._draft_model._vllm_mlx_draft_counts = []
         return 0
 
     def _draft_metrics_since(self, start_accept_lens: int) -> dict[str, int]:
@@ -997,6 +1051,11 @@ class MLXMultimodalLM:
             new_accept_lens = accept_lens
         else:
             new_accept_lens = accept_lens[start_accept_lens:]
+        draft_counts = list(getattr(self._draft_model, "_vllm_mlx_draft_counts", []))
+        if start_accept_lens > len(draft_counts):
+            new_draft_counts = draft_counts
+        else:
+            new_draft_counts = draft_counts[start_accept_lens:]
         block_size = (
             int(self.draft_block_size)
             if self.draft_block_size is not None
@@ -1005,8 +1064,13 @@ class MLXMultimodalLM:
             )
         )
         drafted_per_round = max(block_size - 1, 0)
+        mtp_drafts = (
+            sum(max(int(value), 0) for value in new_draft_counts)
+            if new_draft_counts
+            else drafted_per_round * len(new_accept_lens)
+        )
         return {
-            "mtp_drafts": drafted_per_round * len(new_accept_lens),
+            "mtp_drafts": mtp_drafts,
             "mtp_accepted": sum(int(value) for value in new_accept_lens),
         }
 
@@ -1492,7 +1556,7 @@ class MLXMultimodalLM:
             top_p=top_p,
             verbose=False,
             prompt_cache=prompt_cache,
-            **self._draft_generation_kwargs(),
+            **self._draft_generation_kwargs(kwargs),
             **kwargs,
         )
         draft_metrics = self._draft_metrics_since(draft_accept_start)
@@ -1613,7 +1677,7 @@ class MLXMultimodalLM:
             audio=all_audio if all_audio else None,
             max_tokens=max_tokens,
             temp=temperature,
-            **self._draft_generation_kwargs(),
+            **self._draft_generation_kwargs(kwargs),
             **kwargs,
         ):
             yield chunk
@@ -1939,7 +2003,7 @@ class MLXMultimodalLM:
             verbose=False,
             prompt_cache=prompt_cache,
             skip_prompt_processing=skip_prompt_processing,
-            **self._draft_generation_kwargs(),
+            **self._draft_generation_kwargs(kwargs),
             **kwargs,
         )
         draft_metrics = self._draft_metrics_since(draft_accept_start)
@@ -2266,7 +2330,7 @@ class MLXMultimodalLM:
             max_tokens=max_tokens,
             temp=temperature,
             prompt_cache=prompt_cache,
-            **self._draft_generation_kwargs(),
+            **self._draft_generation_kwargs(kwargs),
             **kwargs,
         ):
             token_count += 1

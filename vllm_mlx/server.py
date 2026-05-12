@@ -151,7 +151,7 @@ from .audio_limits import (
     save_upload_with_limit,
     validate_tts_input_length,
 )
-from .cli_arg_types import make_json_object_arg_parser
+from .cli_arg_types import make_json_object_arg_parser, make_positive_int_arg_parser
 from .engine import BaseEngine, BatchedEngine, GenerationOutput, SimpleEngine
 from .endpoint_model_policies import (
     resolve_embedding_model_name,
@@ -597,6 +597,9 @@ def _prepare_chat_completion_invocation(
 
     if request.enable_thinking is not None:
         chat_kwargs["enable_thinking"] = request.enable_thinking
+
+    if request.mllm_draft is not None:
+        chat_kwargs["mllm_draft"] = request.mllm_draft
 
     if request.tools and request.tool_choice != "none":
         template_tools = convert_tools_for_template(request.tools)
@@ -2789,6 +2792,10 @@ def load_model(
         raise ValueError("Max request tokens must be at least 1")
     if max_tokens > max_request_tokens:
         raise ValueError("Default max tokens cannot exceed max request tokens")
+    if mllm_draft_model and not force_mllm:
+        raise ValueError("MLLM draft models require force_mllm/--mllm")
+    if mllm_draft_block_size is not None and mllm_draft_block_size <= 0:
+        raise ValueError("MLLM draft block size must be a positive integer")
     if mllm_draft_model and use_batching:
         raise ValueError("MLLM draft models are supported only by SimpleEngine")
     if mllm_draft_model and (auto_unload_idle_seconds > 0 or lazy_load_model):
@@ -6221,7 +6228,7 @@ Examples:
     )
     parser.add_argument(
         "--mllm-draft-block-size",
-        type=int,
+        type=make_positive_int_arg_parser("--mllm-draft-block-size"),
         default=None,
         help="Draft block size passed to mlx-vlm for --mllm-draft-model.",
     )

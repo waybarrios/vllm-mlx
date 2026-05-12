@@ -64,7 +64,85 @@ def test_mllm_chat_forwards_configured_assistant_drafter(monkeypatch):
     assert captured["kwargs"]["draft_block_size"] == 4
 
 
-def test_simple_engine_disables_text_routing_when_mllm_drafter_configured():
+def test_mllm_draft_metrics_use_recorded_draft_counts():
+    from vllm_mlx.models.mllm import MLXMultimodalLM
+
+    draft_model = SimpleNamespace(
+        accept_lens=[1, 0],
+        _vllm_mlx_draft_counts=[2, 1],
+        config=SimpleNamespace(block_size=4),
+    )
+    model = MLXMultimodalLM(
+        "target",
+        draft_model="assistant",
+        draft_kind="mtp",
+        draft_block_size=4,
+    )
+    model._draft_model = draft_model
+
+    assert model._draft_metrics_since(0) == {
+        "mtp_drafts": 3,
+        "mtp_accepted": 1,
+    }
+
+
+def test_mllm_chat_uses_configured_drafter_over_call_kwargs(monkeypatch):
+    from vllm_mlx.models.mllm import MLXMultimodalLM
+
+    captured = {}
+    configured_draft = SimpleNamespace(accept_lens=[], _vllm_mlx_draft_counts=[])
+    caller_draft = SimpleNamespace()
+
+    def fake_generate(*args, **kwargs):
+        captured["kwargs"] = kwargs
+        return SimpleNamespace(text="ok", prompt_tokens=3, generation_tokens=1)
+
+    monkeypatch.setitem(
+        sys.modules,
+        "mlx_vlm",
+        SimpleNamespace(generate=fake_generate),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "mlx_vlm.prompt_utils",
+        SimpleNamespace(get_chat_template=lambda *args, **kwargs: "rendered prompt"),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "mlx_vlm.models",
+        SimpleNamespace(cache=SimpleNamespace(make_prompt_cache=lambda *a, **k: None)),
+    )
+
+    tokenizer = SimpleNamespace(encode=lambda text: [1, 2, 3])
+    model = MLXMultimodalLM(
+        "target",
+        draft_model="assistant",
+        draft_kind="mtp",
+        draft_block_size=4,
+    )
+    model._loaded = True
+    model.model = SimpleNamespace(language_model=object())
+    model.processor = SimpleNamespace(tokenizer=tokenizer)
+    model.config = {}
+    model._draft_model = configured_draft
+    model._cache_manager = None
+
+    output = model.chat(
+        [{"role": "user", "content": "hello"}],
+        max_tokens=8,
+        temperature=0.0,
+        draft_model=caller_draft,
+        draft_kind="other",
+        draft_block_size=99,
+    )
+
+    assert output.text == "ok"
+    assert captured["kwargs"]["draft_model"] is configured_draft
+    assert captured["kwargs"]["draft_kind"] == "mtp"
+    assert captured["kwargs"]["draft_block_size"] == 4
+
+
+def test_simple_engine_text_route_stays_default_when_mllm_drafter_configured():
     from vllm_mlx.engine.simple import SimpleEngine
 
     engine = SimpleEngine(
@@ -77,4 +155,29 @@ def test_simple_engine_disables_text_routing_when_mllm_drafter_configured():
     engine._loaded = True
     engine._text_model = object()
 
-    assert engine._should_route_text_through_text_model() is False
+    assert engine._should_route_text_through_text_model() is True
+    assert (
+        engine._should_route_text_through_text_model(mllm_draft_requested=True) is False
+    )
+
+
+def test_chat_request_passes_mllm_draft_opt_in():
+    from vllm_mlx.server import (
+        ChatCompletionRequest,
+        Message,
+        _prepare_chat_completion_invocation,
+    )
+
+    class Engine:
+        is_mllm = True
+        preserve_native_tool_format = False
+
+    request = ChatCompletionRequest(
+        model="gemma4",
+        messages=[Message(role="user", content="hello")],
+        mllm_draft=True,
+    )
+
+    prepared = _prepare_chat_completion_invocation(Engine(), request, 16)
+
+    assert prepared.chat_kwargs["mllm_draft"] is True
