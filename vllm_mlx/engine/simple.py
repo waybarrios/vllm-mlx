@@ -774,6 +774,14 @@ class SimpleEngine(BaseEngine):
                 yield chunk
             return
 
+        def mllm_call_kwargs() -> dict:
+            local_kwargs = dict(kwargs)
+            if chat_template_kwargs:
+                local_kwargs["chat_template_kwargs"] = chat_template_kwargs
+            if mllm_draft_requested:
+                local_kwargs["mllm_draft"] = True
+            return local_kwargs
+
         # Build prompt using tokenizer
         if self._is_mllm:
             if self._text_model is not None:
@@ -788,9 +796,7 @@ class SimpleEngine(BaseEngine):
             # current thread. Routing through to_thread can break mlx_vlm stream
             # ownership on some models (Stream(gpu, N) mismatch).
             if self._text_model is None and not has_media_content(messages):
-                local_kwargs = dict(kwargs)
-                if chat_template_kwargs:
-                    local_kwargs["chat_template_kwargs"] = chat_template_kwargs
+                local_kwargs = mllm_call_kwargs()
 
                 async with self._generation_lock:
                     _bind_worker_generation_streams()
@@ -824,9 +830,7 @@ class SimpleEngine(BaseEngine):
 
             # Run stream_chat in thread pool since it's synchronous
             def run_stream():
-                local_kwargs = dict(kwargs)
-                if chat_template_kwargs:
-                    local_kwargs["chat_template_kwargs"] = chat_template_kwargs
+                local_kwargs = mllm_call_kwargs()
                 return list(
                     self._model.stream_chat(
                         messages=messages,

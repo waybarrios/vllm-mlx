@@ -15,6 +15,7 @@ Features:
 
 import atexit
 import base64
+from importlib.metadata import PackageNotFoundError, version
 import json
 import ipaddress
 import logging
@@ -158,6 +159,16 @@ def load_gemma4_assistant_drafter(model_path: str):
             "Gemma 4 assistant drafter support requires an mlx-vlm build that "
             "provides mlx_vlm.speculative.drafters.gemma4_assistant."
         ) from exc
+
+    try:
+        mlx_vlm_version = version("mlx-vlm")
+    except PackageNotFoundError:
+        mlx_vlm_version = "unknown"
+    logger.info(
+        "Loading Gemma 4 assistant drafter from %s using mlx-vlm %s",
+        model_path,
+        mlx_vlm_version,
+    )
 
     path = Path(model_path)
     config_path = path / "config.json"
@@ -1021,11 +1032,20 @@ class MLXMultimodalLM:
         return draft_model
 
     def _draft_generation_kwargs(self, call_kwargs: dict | None = None) -> dict:
+        """Return mlx-vlm drafter kwargs when the request explicitly opts in.
+
+        ``call_kwargs`` is the outbound mlx-vlm kwargs dict. This method removes
+        vllm-mlx drafter control keys before the dict is forwarded so caller
+        passthrough values cannot conflict with the configured server drafter.
+        """
+        draft_requested = False
         if call_kwargs is not None:
+            draft_requested = bool(call_kwargs.pop("mllm_draft", False))
             for key in _DRAFT_KWARG_NAMES:
                 call_kwargs.pop(key, None)
-        if self._draft_model is None:
+        if not draft_requested or self._draft_model is None:
             return {}
+        # Tests may install the draft model after load(); the hook is idempotent.
         _install_draft_metrics_hooks(self._draft_model)
         kwargs = {"draft_model": self._draft_model}
         if self.draft_kind:
