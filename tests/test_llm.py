@@ -74,7 +74,7 @@ def test_model_stream_generate_passes_num_draft_tokens():
         chunks = list(model.stream_generate("Hello", max_tokens=8))
 
     assert chunks[-1].text == "Hello"
-    assert captured_kwargs["mtp"] is True
+    assert "mtp" not in captured_kwargs
     assert captured_kwargs["num_draft_tokens"] == 4
 
 

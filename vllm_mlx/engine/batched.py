@@ -1131,6 +1131,7 @@ class BatchedEngine(BaseEngine):
                 "paged_cache",
                 "prefix_cache",
                 "batch_generator",
+                "mtp",
                 "requests",
             ):
                 if key in mllm_stats:

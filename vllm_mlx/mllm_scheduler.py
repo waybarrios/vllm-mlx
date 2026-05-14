@@ -1130,6 +1130,8 @@ class MLLMScheduler:
             # Vision embedding cache stats from batch generator
             vec_stats = self.batch_generator.get_vision_cache_stats()
             stats["vision_embedding_cache"] = vec_stats
+            if hasattr(self.batch_generator, "get_mtp_stats"):
+                stats["mtp"] = self.batch_generator.get_mtp_stats()
 
         # Include Metal memory stats
         try:

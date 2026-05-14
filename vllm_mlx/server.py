@@ -825,6 +825,23 @@ _STREAMING_BARE_BRACKET_PARTIAL = re.compile(r"\[\w+\($")
 _STREAMING_TOOL_MARKUP_SCAN_CHARS = 512
 
 
+def _strip_backslash_before_unicode(obj: object) -> object:
+    """Remove spurious backslashes before non-ASCII chars in JSON string values.
+
+    lm-format-enforcer's grammar allows ``\\`` (valid JSON escape) followed by
+    non-ASCII characters such as Korean syllables.  The model therefore generates
+    ``\\빠\\르\\게`` — valid JSON whose decoded value contains literal backslashes.
+    This helper strips those spurious backslashes so clients receive clean text.
+    """
+    if isinstance(obj, dict):
+        return {k: _strip_backslash_before_unicode(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_strip_backslash_before_unicode(v) for v in obj]
+    if isinstance(obj, str):
+        return re.sub(r"\\([^\x00-\x7F])", r"\1", obj)
+    return obj
+
+
 def _sanitize_log_text(value: object, limit: int | None = None) -> str:
     """Escape control characters before logging untrusted text."""
     text = str(value)
@@ -3173,6 +3190,7 @@ async def status():
         "cache": stats.get("memory_aware_cache")
         or stats.get("paged_cache")
         or stats.get("prefix_cache"),
+        "mtp": stats.get("mtp") or {"enabled": False},
         "requests": stats.get("requests", []),
     }
 
@@ -4634,7 +4652,8 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
             )
             if parsed_json is not None:
                 # Return JSON as string
-                cleaned_text = json.dumps(parsed_json)
+                parsed_json = _strip_backslash_before_unicode(parsed_json)
+                cleaned_text = json.dumps(parsed_json, ensure_ascii=False)
             if not is_valid:
                 if prepared.json_logits_processor is not None:
                     logger.error(
@@ -5057,7 +5076,8 @@ async def create_anthropic_message(
                 json_input, prepared.response_format
             )
             if parsed_json is not None:
-                cleaned_text = json.dumps(parsed_json)
+                parsed_json = _strip_backslash_before_unicode(parsed_json)
+                cleaned_text = json.dumps(parsed_json, ensure_ascii=False)
             if not is_valid:
                 if prepared.json_logits_processor is not None:
                     logger.error(

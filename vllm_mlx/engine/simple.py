@@ -310,6 +310,14 @@ class SimpleEngine(BaseEngine):
                     logger.error("SpecPrefill: draft model load failed: %s", e)
                     self._draft_model = None
 
+            # Warn if MTP is enabled without continuous-batching and text routing not available
+            if self._mtp and (not self._is_mllm or self._text_model is None):
+                logger.warning(
+                    "[MTP] --enable-mtp without --continuous-batching: "
+                    "speculative decoding via draft tokens will not be active. "
+                    "For full MTP support, use: --enable-mtp --continuous-batching"
+                )
+
             mtp_info = ""
             if self._mtp:
                 mtp_info = (
@@ -1356,7 +1364,6 @@ class SimpleEngine(BaseEngine):
                 # a fresh MTP cache so stale speculative state cannot survive the
                 # processor-to-content handoff.
                 resume_kwargs["prompt_cache"] = prompt_cache + model.make_mtp_cache()
-                resume_kwargs["mtp"] = True
                 resume_kwargs["num_draft_tokens"] = self._mtp_num_draft_tokens
             for resp in mlx_stream_generate(
                 model,
@@ -1457,7 +1464,6 @@ class SimpleEngine(BaseEngine):
             if all_processors:
                 gen_kwargs["logits_processors"] = all_processors
             if use_mtp:
-                gen_kwargs["mtp"] = True
                 gen_kwargs["num_draft_tokens"] = self._mtp_num_draft_tokens
             if prompt_cache is not None:
                 gen_kwargs["prompt_cache"] = prompt_cache

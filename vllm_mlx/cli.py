@@ -261,7 +261,12 @@ def serve_command(args):
         if args.chunked_prefill_tokens > 0:
             print(f"Chunked prefill: {args.chunked_prefill_tokens} tokens per step")
         if args.enable_mtp:
-            print(f"MTP: enabled, draft_tokens={args.mtp_num_draft_tokens}")
+            print(f"MTP: enabled, requested_draft_tokens={args.mtp_num_draft_tokens}")
+            if args.mllm:
+                print(
+                    "MTP: MLLM path currently uses effective_draft_tokens=1 "
+                    "per verify step; inspect /v1/status for attempts and acceptance"
+                )
         print(f"Stream interval: {args.stream_interval} tokens")
         if args.use_paged_cache:
             print(
