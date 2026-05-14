@@ -243,6 +243,7 @@ class TestSimpleEngineConcurrency:
             engine = SimpleEngine("test-model")
             engine._model = model
             engine._loaded = True
+            engine._supports_system_kv_cache = True
             engine.stream_generate = fake_stream_generate  # type: ignore[method-assign]
 
             messages = [
