@@ -892,7 +892,7 @@ class TestSimpleEngineConcurrency:
             ]
 
         assert outputs[-1].text == "Hello"
-        assert captured_kwargs["mtp"] is True
+        assert "mtp" not in captured_kwargs
         assert captured_kwargs["num_draft_tokens"] == 4
 
     @pytest.mark.anyio
