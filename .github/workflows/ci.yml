@@ -95,8 +95,6 @@ jobs:
             tests/test_streaming_think_router.py \
             tests/test_streaming_tool_filter.py \
             tests/test_tool_call_promotion.py \
-            tests/test_lifecycle_cli.py \
-            tests/test_lifecycle_server.py \
             -v --tb=short \
             -k "not Integration and not InjectJson and not TestMLXMultimodalLMCache" \
             --cov=vllm_mlx \
@@ -149,6 +147,8 @@ jobs:
             tests/test_batching.py \
             tests/test_continuous_batching.py \
             tests/test_memory_cache_mlx.py \
+            tests/test_lifecycle_cli.py \
+            tests/test_lifecycle_server.py \
             tests/test_normalize_messages.py \
             tests/test_responses_api.py \
             tests/test_thinking_aware_processor.py \
