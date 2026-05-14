@@ -218,6 +218,9 @@ class TestLifecycleCli:
             mllm_prefill_step_size=None,
             lazy_load_model=True,
             auto_unload_idle_seconds=300,
+            models_config=None,
+            default_thinking_token_budget=None,
+            max_kv_size=0,
         )
 
         cli.serve_command(args)
@@ -305,6 +308,9 @@ class TestLifecycleCli:
             mllm_prefill_step_size=0,
             lazy_load_model=True,
             auto_unload_idle_seconds=300,
+            models_config=None,
+            default_thinking_token_budget=None,
+            max_kv_size=0,
         )
 
         cli.serve_command(args)
@@ -415,6 +421,9 @@ class TestLifecycleCli:
             mllm_prefill_step_size=None,
             lazy_load_model=True,
             auto_unload_idle_seconds=0.0,
+            models_config=None,
+            default_thinking_token_budget=None,
+            max_kv_size=0,
         )
 
         cli.serve_command(args)
