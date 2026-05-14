@@ -179,6 +179,12 @@ class SimpleEngine(BaseEngine):
         self._system_kv_snapshot = None  # List of (keys, values) per backbone layer
         self._system_kv_hash = None  # Hash of system prefix text
         self._system_kv_token_count = 0  # Tokens in cached prefix
+        # True only when the model's prompt cache is composed entirely of
+        # plain ``KVCache`` entries. Sliding-window models (gemma3_text,
+        # olmo3, recurrent_gemma) return ``RotatingKVCache`` whose ``.state``
+        # aliases buffers ``update_and_fetch`` mutates in place — snapshot
+        # restore would silently desynchronize. Probed once in ``start()``.
+        self._supports_system_kv_cache: bool = False
 
     @property
     def model_name(self) -> str:
@@ -253,6 +259,36 @@ class SimpleEngine(BaseEngine):
                     "effective speculative draft depth remains 1",
                     self._mtp_num_draft_tokens,
                 )
+
+            # Probe whether this model's prompt cache is snapshot-safe for the
+            # stream_chat system-prefix cache branch. Sliding-window models
+            # (gemma3_text, olmo3, recurrent_gemma) return RotatingKVCache
+            # entries whose ``.state`` aliases in-place-mutated buffers.
+            # Only relevant for the LLM path; MLLM never enters the cache
+            # branch.
+            if not self._is_mllm and self._model is not None:
+                try:
+                    from mlx_lm.models.cache import KVCache, make_prompt_cache
+
+                    probe_cache = make_prompt_cache(self._model.model)
+                    self._supports_system_kv_cache = bool(probe_cache) and all(
+                        isinstance(c, KVCache) for c in probe_cache
+                    )
+                    if not self._supports_system_kv_cache:
+                        cache_types = sorted({type(c).__name__ for c in probe_cache})
+                        logger.info(
+                            "System KV cache snapshot disabled: model returned "
+                            "non-KVCache entries (%s); stream_chat will use the "
+                            "uncached path",
+                            cache_types,
+                        )
+                except Exception as e:
+                    logger.debug(
+                        "System KV cache support probe failed (%s); "
+                        "disabling snapshot path",
+                        e,
+                    )
+                    self._supports_system_kv_cache = False
 
             # Build parallel mlx_lm TextModel for text-only routing.
             # Even when MTP is disabled, text-only requests should not be trapped
@@ -339,6 +375,7 @@ class SimpleEngine(BaseEngine):
         self._system_kv_snapshot = None
         self._system_kv_hash = None
         self._system_kv_token_count = 0
+        self._supports_system_kv_cache = False
         logger.info("SimpleEngine stopped")
 
     async def _run_blocking_serialized(self, func, /, *args, on_cancel=None, **kwargs):
@@ -876,6 +913,11 @@ class SimpleEngine(BaseEngine):
         full_token_count = 0
         system_hash = None
         kv_cache_eligible = False
+        # Snapshot reference captured at gate time so a concurrent MISS that
+        # reassigns ``self._system_kv_snapshot`` between the gate and the
+        # restore (which runs later inside ``_run_blocking_serialized``)
+        # can't desynchronize the restored KV from the hash that decided HIT.
+        hit_snapshot: Any = None
 
         # Decode-control gate.
         # The cache branch below drives ``mlx_lm.stream_generate`` directly with only
@@ -937,6 +979,13 @@ class SimpleEngine(BaseEngine):
             cache_blocking_controls.append("specprefill_request_override")
         if (self._max_kv_size or 0) > 0:
             cache_blocking_controls.append("max_kv_size")
+        # Sliding-window models build their prompt cache from RotatingKVCache
+        # entries whose ``.state`` aliases buffers that ``update_and_fetch``
+        # mutates in place. Snapshot capture would corrupt the cached prefix
+        # on the next decode. Probed once at start; ``False`` if the model
+        # exposes any non-KVCache entries or the probe failed.
+        if not self._supports_system_kv_cache:
+            cache_blocking_controls.append("non_kv_cache_class")
 
         if cache_blocking_controls:
             logger.info(
@@ -1024,12 +1073,20 @@ class SimpleEngine(BaseEngine):
                         system_tokens = system_tokens_list
                         suffix_tokens = full_tokens_list[system_token_count:]
                         kv_cache_eligible = True
+                        # Read the snapshot reference once. If we promote to
+                        # HIT, ``hit_snapshot`` is the exact list the hash
+                        # check just validated against. A later concurrent
+                        # MISS that reassigns ``self._system_kv_snapshot``
+                        # before our serialized worker restores it cannot
+                        # alias what we captured here.
+                        candidate_snapshot = self._system_kv_snapshot
                         if (
                             system_hash == self._system_kv_hash
-                            and self._system_kv_snapshot is not None
+                            and candidate_snapshot is not None
                             and system_token_count == self._system_kv_token_count
                         ):
                             cache_hit = True
+                            hit_snapshot = candidate_snapshot
                             logger.info(
                                 "System KV cache HIT (stream_chat): reusing %d "
                                 "tokens, prefilling %d new (hash=%s)",
@@ -1076,7 +1133,12 @@ class SimpleEngine(BaseEngine):
 
                 if cache_hit:
                     bc = make_prompt_cache(model)
-                    for i, saved_state in enumerate(self._system_kv_snapshot):
+                    # Restore from the closure-local reference captured at the
+                    # gate, never from ``self._system_kv_snapshot`` directly:
+                    # a concurrent MISS could have replaced the instance
+                    # attribute with a snapshot for a different system prefix
+                    # between the gate check and this point.
+                    for i, saved_state in enumerate(hit_snapshot):
                         bc[i].state = saved_state
                 else:
                     bc = make_prompt_cache(model)
@@ -1091,8 +1153,11 @@ class SimpleEngine(BaseEngine):
                         model(sys_arr[None], cache=bc)
                         mx.eval([c.state for c in bc])
 
-                    # Free intermediate prefill activations before snapshotting;
-                    # mirrors the MLLM path between chunked prefill and decode.
+                    # Free intermediate prefill activations before snapshotting.
+                    # Intentionally stricter than the MLLM path, which does not
+                    # ``mx.clear_cache()`` between its last prefill chunk and
+                    # the snapshot; here we want the snapshot to reflect only
+                    # the KV state, not residual activations from prefill.
                     mx.clear_cache()
 
                     snapshot = [c.state for c in bc]

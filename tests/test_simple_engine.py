@@ -519,6 +519,9 @@ class TestSimpleEngineConcurrency:
             engine = SimpleEngine("test-model")
             engine._model = model
             engine._loaded = True
+            # Probe normally runs in start(); short-circuit it here so the
+            # gate doesn't trip on the synthetic engine state.
+            engine._supports_system_kv_cache = True
 
             # No fallback needed since cache path should be exercised.
             # Patch _run_blocking_serialized to short-circuit cache execution cleanly
@@ -588,6 +591,8 @@ class TestSimpleEngineConcurrency:
             engine = SimpleEngine("test-model", mtp=True, mtp_num_draft_tokens=4)
             engine._model = model
             engine._loaded = True
+            # Isolate the gate to the feature under test.
+            engine._supports_system_kv_cache = True
             engine.stream_generate = fake_stream_generate  # type: ignore[method-assign]
 
             chunks = [
@@ -650,6 +655,7 @@ class TestSimpleEngineConcurrency:
             engine._model = model
             engine._draft_model = MagicMock(name="specprefill_draft_model")
             engine._loaded = True
+            engine._supports_system_kv_cache = True
             engine.stream_generate = fake_stream_generate  # type: ignore[method-assign]
 
             chunks = [
@@ -704,6 +710,7 @@ class TestSimpleEngineConcurrency:
             engine = SimpleEngine("test-model", max_kv_size=4096)
             engine._model = model
             engine._loaded = True
+            engine._supports_system_kv_cache = True
             engine.stream_generate = fake_stream_generate  # type: ignore[method-assign]
 
             chunks = [
@@ -719,6 +726,190 @@ class TestSimpleEngineConcurrency:
         assert tokenizer.apply_chat_template.call_count == 1
         assert fallback_kwargs, "uncached stream_generate fallback was not invoked"
         assert chunks and chunks[0].text == "ok"
+
+    @pytest.mark.anyio
+    async def test_stream_chat_skips_cache_path_when_model_has_non_kv_cache(self):
+        """Models whose ``make_prompt_cache`` returns ``RotatingKVCache``
+        (sliding-window models like gemma3_text, olmo3, recurrent_gemma) cannot
+        be safely snapshotted: ``.state`` aliases buffers that
+        ``update_and_fetch`` mutates in place, so restoring a captured snapshot
+        on the next turn would silently desynchronize from the running cache.
+        ``start()`` probes ``make_prompt_cache`` once and sets
+        ``_supports_system_kv_cache=False`` for those models; the gate must
+        then skip the cache branch."""
+        from vllm_mlx.engine.simple import SimpleEngine
+
+        tokenizer = MagicMock()
+        tokenizer.apply_chat_template.return_value = (
+            "<|im_start|>system\nYou are helpful.<|im_end|>\n"
+            "<|im_start|>user\nhello<|im_end|>\n"
+            "<|im_start|>assistant\n"
+        )
+        tokenizer.bos_token = None
+        tokenizer.encode = MagicMock(return_value=[1, 2, 3])
+
+        model = MagicMock()
+        model.tokenizer = tokenizer
+
+        fallback_kwargs: list[dict] = []
+
+        async def fake_stream_generate(*, prompt, **kw):
+            fallback_kwargs.append(kw)
+            out = MagicMock(
+                text="ok",
+                new_text="ok",
+                prompt_tokens=3,
+                completion_tokens=1,
+                finished=True,
+                finish_reason="stop",
+            )
+            yield out
+
+        with patch("vllm_mlx.engine.simple.is_mllm_model", return_value=False):
+            engine = SimpleEngine("test-model")
+            engine._model = model
+            engine._loaded = True
+            # Simulate the probe finding non-KVCache entries (rotating cache).
+            engine._supports_system_kv_cache = False
+            engine.stream_generate = fake_stream_generate  # type: ignore[method-assign]
+
+            chunks = [
+                c
+                async for c in engine.stream_chat(
+                    messages=[
+                        {"role": "system", "content": "You are helpful."},
+                        {"role": "user", "content": "hello"},
+                    ],
+                )
+            ]
+
+        # Cache-path probes must NOT run when the model isn't snapshot-safe.
+        assert tokenizer.apply_chat_template.call_count == 1
+        assert fallback_kwargs, "uncached stream_generate fallback was not invoked"
+        assert chunks and chunks[0].text == "ok"
+
+    @pytest.mark.anyio
+    async def test_stream_chat_uses_gate_time_snapshot_under_concurrent_mutation(
+        self,
+    ):
+        """A concurrent MISS that reassigns ``self._system_kv_snapshot`` between
+        the cache-hit gate (which runs outside ``_run_blocking_serialized``) and
+        the snapshot restore (which runs inside the serialized worker) must not
+        corrupt the HIT. The restore must use the snapshot reference captured at
+        gate time, not re-read ``self._system_kv_snapshot`` later — otherwise a
+        different system prefix's KV would be loaded under the hash that decided
+        HIT.
+
+        Simulates the race by reassigning ``engine._system_kv_snapshot`` inside
+        the ``_run_blocking_serialized`` hook (executed after the gate but
+        before the worker enters the cache branch), then asserts the restore
+        loop wrote the gate-time entries, not the post-gate intruder."""
+        import hashlib
+
+        from vllm_mlx.engine.simple import SimpleEngine
+
+        # Same template the positive test uses: divergence falls at the user
+        # content so the detected system prefix is the leading frame up through
+        # ``<|im_start|>user\n``.
+        def apply_chat_template_side_effect(messages, **kwargs):
+            user_content = ""
+            for m in reversed(messages):
+                role = (
+                    m.get("role") if isinstance(m, dict) else getattr(m, "role", None)
+                )
+                if role == "user":
+                    content = (
+                        m.get("content")
+                        if isinstance(m, dict)
+                        else getattr(m, "content", "")
+                    )
+                    user_content = content or ""
+                    break
+            return (
+                "<|im_start|>system\nYou are helpful.<|im_end|>\n"
+                f"<|im_start|>user\n{user_content}<|im_end|>\n"
+                "<|im_start|>assistant\n"
+            )
+
+        expected_prefix = (
+            "<|im_start|>system\nYou are helpful.<|im_end|>\n" "<|im_start|>user\n"
+        )
+        expected_hash = hashlib.sha256(expected_prefix.encode()).hexdigest()[:16]
+
+        tokenizer = MagicMock()
+        tokenizer.apply_chat_template.side_effect = apply_chat_template_side_effect
+        tokenizer.bos_token = None
+        # First encode = full prompt tokens; second = system prefix tokens.
+        # range(20) is a prefix of range(50), so prefix-match validation passes.
+        tokenizer.encode = MagicMock(side_effect=[list(range(50)), list(range(20))])
+
+        model = MagicMock()
+        model.tokenizer = tokenizer
+
+        original_snapshot = [("ORIGINAL_K", "ORIGINAL_V")]
+        intruder_snapshot = [("INTRUDER_K", "INTRUDER_V")]
+
+        captured_states: list = []
+
+        class MockCacheEntry:
+            def __init__(self) -> None:
+                self._state = None
+
+            @property
+            def state(self):
+                return self._state
+
+            @state.setter
+            def state(self, value) -> None:
+                captured_states.append(value)
+                self._state = value
+
+        with patch("vllm_mlx.engine.simple.is_mllm_model", return_value=False):
+            engine = SimpleEngine("test-model")
+            engine._model = model
+            engine._loaded = True
+            engine._supports_system_kv_cache = True
+            # Pre-seed HIT state matching the divergence-detected prefix.
+            engine._system_kv_hash = expected_hash
+            engine._system_kv_token_count = 20
+            engine._system_kv_snapshot = original_snapshot
+
+            async def serialized_with_race(func, *args, on_cancel=None, **kw):
+                # Simulate a concurrent MISS overwriting the instance attribute
+                # AFTER the gate's HIT decision but BEFORE the worker restores.
+                engine._system_kv_snapshot = intruder_snapshot
+                await asyncio.to_thread(func)
+                return None
+
+            engine._run_blocking_serialized = (
+                serialized_with_race  # type: ignore[method-assign]
+            )
+
+            with (
+                patch("mlx_lm.stream_generate", return_value=iter([])),
+                patch(
+                    "mlx_lm.models.cache.make_prompt_cache",
+                    return_value=[MockCacheEntry()],
+                ),
+                patch("mlx_lm.sample_utils.make_sampler"),
+            ):
+                _ = [
+                    c
+                    async for c in engine.stream_chat(
+                        messages=[
+                            {"role": "system", "content": "You are helpful."},
+                            {"role": "user", "content": "hello"},
+                        ],
+                    )
+                ]
+
+        # Restore wrote the gate-time snapshot exactly once.
+        # If the worker had re-read ``self._system_kv_snapshot`` we would see
+        # ``("INTRUDER_K", "INTRUDER_V")`` instead — that's the TOCTOU bug.
+        assert captured_states == [("ORIGINAL_K", "ORIGINAL_V")], (
+            "Snapshot restore did not use the gate-time reference; "
+            f"captured={captured_states}"
+        )
 
     @pytest.mark.anyio
     async def test_lock_serializes_stream_generate(self, mock_model):
