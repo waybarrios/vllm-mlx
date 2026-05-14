@@ -53,6 +53,32 @@ def restore_server_globals():
     )
     snapshot = {name: getattr(srv, name, sentinel) for name in global_names}
 
+    # Reset state-holding globals before each test so prior-file pollution
+    # (an engine left alive by test_simple_engine.py, a model name registered
+    # by test_server.py) doesn't leak in.  Config defaults like _default_timeout
+    # stay untouched because they're numbers used in arithmetic.
+    state_reset = {
+        "_engine": None,
+        "_model_name": None,
+        "_model_path": None,
+        "_default_model_key": None,
+        "_force_mllm_model": None,
+        "_residency_manager": None,
+        "_lifecycle_task": None,
+        "_lifespan_active": False,
+        "_mcp_manager": None,
+        "_mcp_executor": None,
+        "_embedding_engine": None,
+        "_embedding_model_locked": False,
+        "_reasoning_parser": None,
+        "_enable_auto_tool_choice": False,
+        "_tool_call_parser": None,
+        "_tool_parser_instance": None,
+        "_idle_unload_enabled": None,
+    }
+    for name, value in state_reset.items():
+        setattr(srv, name, value)
+
     yield
 
     leaked_task = getattr(srv, "_lifecycle_task", None)
