@@ -132,6 +132,149 @@ class UnsafeRemoteURLError(ValueError):
         self.public_message = public_message
 
 
+def _normalize_content_part(item: object) -> object:
+    """Convert Pydantic content parts into plain Python objects."""
+    if hasattr(item, "model_dump"):
+        return item.model_dump(exclude_none=True)
+    if hasattr(item, "dict"):
+        return {k: v for k, v in item.dict().items() if v is not None}
+    return item
+
+
+def _extract_media_url(item: dict, item_type: str) -> str:
+    if item_type == "image_url":
+        media_value = item.get("image_url", {})
+    elif item_type == "video_url":
+        media_value = item.get("video_url", {})
+    elif item_type == "audio_url":
+        media_value = item.get("audio_url", {})
+    elif item_type in {"image", "video", "audio"}:
+        media_value = item.get(item_type, item.get("url", ""))
+    else:
+        return ""
+
+    if isinstance(media_value, dict):
+        media_value = media_value.get("url", "")
+    return media_value if isinstance(media_value, str) else ""
+
+
+def _text_content_part(text: str) -> dict[str, str]:
+    return {"type": "text", "text": text, "content": text}
+
+
+def _append_text_content_part(
+    built_parts: list[dict[str, str]], text_parts: list[str], text: str
+) -> None:
+    if not text:
+        return
+    built_parts.append(_text_content_part(text))
+    text_parts.append(text)
+
+
+def _build_string_mllm_message_content(content: str, role: str) -> tuple[object, bool]:
+    if not content:
+        return "", False
+    if role == "assistant":
+        return content, True
+    return [_text_content_part(content)], True
+
+
+def _append_ordered_mllm_content_part(
+    raw_item: object,
+    *,
+    built_parts: list[dict[str, str]],
+    text_parts: list[str],
+    all_image_urls: list[str],
+    video_frame_count: int,
+) -> int:
+    item = _normalize_content_part(raw_item)
+    if isinstance(item, str):
+        _append_text_content_part(built_parts, text_parts, item)
+        return video_frame_count
+
+    if not isinstance(item, dict):
+        return video_frame_count
+
+    item_type = item.get("type", "")
+    if item_type in {"text", "input_text"}:
+        _append_text_content_part(
+            built_parts, text_parts, item.get("text", "") or item.get("content", "")
+        )
+    elif item_type in {"image_url", "image"}:
+        media_url = _extract_media_url(item, item_type)
+        if media_url:
+            all_image_urls.append(media_url)
+        built_parts.append({"type": "image"})
+    elif item_type in {"audio_url", "audio"}:
+        # Audio inputs are collected once by _collect_audio_inputs before
+        # message reconstruction; this helper only preserves placeholder order.
+        built_parts.append({"type": "audio"})
+    elif item_type in {"video", "video_url"}:
+        # Native video models bypass this helper. For fallback frame extraction,
+        # preserve the video position by inserting that message's frames here.
+        built_parts.extend({"type": "image"} for _ in range(video_frame_count))
+        return 0
+    return video_frame_count
+
+
+def _build_ordered_mllm_message_content(
+    content: object,
+    *,
+    role: str,
+    all_image_urls: list[str],
+    video_frame_count: int = 0,
+) -> tuple[object, bool]:
+    """Build template content while preserving OpenAI media/text part order."""
+    if isinstance(content, str):
+        return _build_string_mllm_message_content(content, role)
+
+    if not isinstance(content, list):
+        return "", False
+
+    built_parts: list[dict[str, str]] = []
+    text_parts: list[str] = []
+    remaining_video_frames = video_frame_count
+
+    for raw_item in content:
+        remaining_video_frames = _append_ordered_mllm_content_part(
+            raw_item,
+            built_parts=built_parts,
+            text_parts=text_parts,
+            all_image_urls=all_image_urls,
+            video_frame_count=remaining_video_frames,
+        )
+
+    if role == "assistant":
+        text = "".join(text_parts)
+        return text, bool(text)
+
+    return built_parts, bool(built_parts)
+
+
+def _build_mllm_chat_messages(
+    messages: list[dict],
+    *,
+    all_image_urls: list[str],
+    video_frame_counts: dict[int, int],
+) -> list[dict]:
+    """Build chat-template messages without reordering multimodal content parts."""
+    chat_messages: list[dict] = []
+    for msg_idx, msg in enumerate(messages):
+        role = msg.get("role", "user")
+        if not isinstance(role, str):
+            role = str(role)
+
+        content, has_content = _build_ordered_mllm_message_content(
+            msg.get("content", ""),
+            role=role,
+            all_image_urls=all_image_urls,
+            video_frame_count=video_frame_counts.get(msg_idx, 0),
+        )
+        if has_content:
+            chat_messages.append({"role": role, "content": content})
+    return chat_messages
+
+
 @dataclass
 class MultimodalInput:
     """Input for multimodal generation."""
@@ -1602,81 +1745,11 @@ class MLXMultimodalLM:
         for aud_inputs in _msg_audio_inputs.values():
             all_audio_inputs.extend(aud_inputs)
 
-        # Second pass: build chat messages with image counts that include video frames
-        for msg_idx, msg in enumerate(messages):
-            role = msg.get("role", "user")
-            content = msg.get("content", "")
-            msg_text = ""  # Text content for this message
-            msg_image_count = 0  # Number of images in THIS message
-            msg_audio_count = 0  # Number of audio clips in THIS message
-
-            if isinstance(content, str):
-                msg_text = content
-            elif isinstance(content, list):
-                # OpenAI multimodal format - extract text and count images for THIS message
-                for item in content:
-                    if isinstance(item, str):
-                        msg_text += item
-                        continue
-
-                    # Convert Pydantic models to dicts, excluding None fields
-                    # to avoid null keys like image_url: null on text parts
-                    if hasattr(item, "model_dump"):
-                        item = item.model_dump(exclude_none=True)
-                    elif hasattr(item, "dict"):
-                        item = {k: v for k, v in item.dict().items() if v is not None}
-
-                    if isinstance(item, dict):
-                        item_type = item.get("type", "")
-
-                        if item_type == "text":
-                            msg_text += item.get("text", "")
-
-                        elif item_type == "image_url":
-                            img_url = item.get("image_url", {})
-                            if isinstance(img_url, str):
-                                all_image_urls.append(img_url)
-                            else:
-                                all_image_urls.append(img_url.get("url", ""))
-                            msg_image_count += 1
-
-                        elif item_type == "image":
-                            all_image_urls.append(
-                                item.get("image", item.get("url", ""))
-                            )
-                            msg_image_count += 1
-
-            # Add video frame count to image count for this message
-            msg_image_count += _msg_video_frame_counts.get(msg_idx, 0)
-            msg_audio_count += len(_msg_audio_inputs.get(msg_idx, []))
-
-            # Build properly structured message
-            # Format: {"role": "...", "content": [{"type": "image"}, ..., {"type": "audio"}, ..., {"type": "text", "text": "..."}]}
-            if msg_text or msg_image_count > 0 or msg_audio_count > 0:
-                if role == "user" and (msg_image_count > 0 or msg_audio_count > 0):
-                    # User message WITH images/audio - build content array with media tokens FIRST
-                    content_list = []
-                    for _ in range(msg_image_count):
-                        content_list.append({"type": "image"})
-                    for _ in range(msg_audio_count):
-                        content_list.append({"type": "audio"})
-                    content_list.append(
-                        {"type": "text", "text": msg_text, "content": msg_text}
-                    )
-                    chat_messages.append({"role": role, "content": content_list})
-                elif role == "assistant":
-                    # Assistant messages - just text content (not array)
-                    chat_messages.append({"role": role, "content": msg_text})
-                else:
-                    # User/system message WITHOUT images - still use content array format
-                    chat_messages.append(
-                        {
-                            "role": role,
-                            "content": [
-                                {"type": "text", "text": msg_text, "content": msg_text}
-                            ],
-                        }
-                    )
+        chat_messages = _build_mllm_chat_messages(
+            messages,
+            all_image_urls=all_image_urls,
+            video_frame_counts=_msg_video_frame_counts,
+        )
 
         # Process images
         all_images = []
@@ -2024,70 +2097,11 @@ class MLXMultimodalLM:
         for aud_inputs in _msg_audio_inputs.values():
             all_audio_inputs.extend(aud_inputs)
 
-        for msg_idx, msg in enumerate(messages):
-            role = msg.get("role", "user")
-            content = msg.get("content", "")
-            msg_text = ""
-            msg_image_count = 0
-            msg_audio_count = 0
-
-            if isinstance(content, str):
-                msg_text = content
-            elif isinstance(content, list):
-                for item in content:
-                    if isinstance(item, str):
-                        msg_text += item
-                        continue
-
-                    if hasattr(item, "model_dump"):
-                        item = item.model_dump(exclude_none=True)
-                    elif hasattr(item, "dict"):
-                        item = {k: v for k, v in item.dict().items() if v is not None}
-
-                    if isinstance(item, dict):
-                        item_type = item.get("type", "")
-
-                        if item_type == "text":
-                            msg_text += item.get("text", "")
-
-                        elif item_type == "image_url":
-                            img_url = item.get("image_url", {})
-                            if isinstance(img_url, str):
-                                all_image_urls.append(img_url)
-                            else:
-                                all_image_urls.append(img_url.get("url", ""))
-                            msg_image_count += 1
-
-                        elif item_type == "image":
-                            all_image_urls.append(
-                                item.get("image", item.get("url", ""))
-                            )
-                            msg_image_count += 1
-
-            msg_image_count += _msg_video_frame_counts.get(msg_idx, 0)
-            msg_audio_count += len(_msg_audio_inputs.get(msg_idx, []))
-            if msg_text or msg_image_count > 0 or msg_audio_count > 0:
-                if role == "user" and (msg_image_count > 0 or msg_audio_count > 0):
-                    content_list = []
-                    for _ in range(msg_image_count):
-                        content_list.append({"type": "image"})
-                    for _ in range(msg_audio_count):
-                        content_list.append({"type": "audio"})
-                    content_list.append(
-                        {"type": "text", "text": msg_text, "content": msg_text}
-                    )
-                    chat_messages.append({"role": role, "content": content_list})
-                elif role == "assistant":
-                    chat_messages.append({"role": role, "content": msg_text})
-                else:
-                    chat_messages.append(
-                        {
-                            "role": role,
-                            "content": [
-                                {"type": "text", "text": msg_text, "content": msg_text}
-                            ],
-                        }
-                    )
+        chat_messages = _build_mllm_chat_messages(
+            messages,
+            all_image_urls=all_image_urls,
+            video_frame_counts=_msg_video_frame_counts,
+        )
 
         all_images = []
         if all_image_urls:
