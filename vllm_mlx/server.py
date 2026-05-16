@@ -819,6 +819,7 @@ def _thinking_disabled(request, chat_kwargs: dict | None = None) -> bool:
             return True
     return False
 
+
 # Tool calling configuration
 _enable_auto_tool_choice: bool = False
 _tool_call_parser: str | None = None  # Parser name: auto, mistral, qwen, llama, hermes
