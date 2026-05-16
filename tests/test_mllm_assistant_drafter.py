@@ -245,7 +245,7 @@ def test_chat_request_passes_mllm_draft_opt_in():
     assert prepared.chat_kwargs["mllm_draft"] is True
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_simple_engine_forwards_mllm_draft_opt_in_to_mllm_path():
     from vllm_mlx.engine.simple import SimpleEngine
 
