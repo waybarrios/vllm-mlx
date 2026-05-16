@@ -594,6 +594,26 @@ class _ThinkingAwareLogitsProcessor:
         return self._inner._disabled
 
 
+def _attach_response_format_logits_processor(
+    chat_kwargs: dict, json_logits_processor: object
+) -> object:
+    """Attach response_format constraints and keep thinking disabled.
+
+    response_format content must be constrained from the first generated token.
+    If the processor is hidden behind thinking-state handling, direct JSON
+    emissions can bypass the constraint and run until max_tokens.
+    """
+
+    chat_kwargs["enable_thinking"] = False
+    if "chat_template_kwargs" in chat_kwargs:
+        chat_kwargs["chat_template_kwargs"] = dict(chat_kwargs["chat_template_kwargs"])
+        chat_kwargs["chat_template_kwargs"]["enable_thinking"] = False
+
+    existing = chat_kwargs.get("logits_processors") or []
+    chat_kwargs["logits_processors"] = list(existing) + [json_logits_processor]
+    return json_logits_processor
+
+
 def _prepare_chat_completion_invocation(
     engine: BaseEngine,
     request: ChatCompletionRequest,
@@ -662,33 +682,9 @@ def _prepare_chat_completion_invocation(
         chat_kwargs["stop"] = merged_stop
 
     if json_logits_processor is not None:
-        # Determine the *effective* thinking state: the request field, the
-        # resolved chat_template_kwargs, or the server default can all inject
-        # ``<think>`` into the rendered prompt independently.
-        ctk = chat_kwargs.get("chat_template_kwargs") or {}
-        effective_thinking = (
-            request.enable_thinking is True or ctk.get("enable_thinking") is True
+        json_logits_processor = _attach_response_format_logits_processor(
+            chat_kwargs, json_logits_processor
         )
-
-        if _reasoning_parser and effective_thinking:
-            # User explicitly requested thinking with constrained decoding
-            # (via top-level enable_thinking or chat_template_kwargs).
-            # Wrap the processor so the enforcer only activates after </think>.
-            json_logits_processor = _ThinkingAwareLogitsProcessor(
-                json_logits_processor, prompt_has_think_tag=True
-            )
-        else:
-            # Suppress thinking so the model goes straight to JSON.
-            # The template injects an empty <think></think> block and the
-            # enforcer constrains output from the first token onward.
-            # Force both top-level and chat_template_kwargs to prevent the
-            # Jinja template from rendering an open <think> block.
-            request.enable_thinking = False
-            chat_kwargs["enable_thinking"] = False
-            if "chat_template_kwargs" in chat_kwargs:
-                chat_kwargs["chat_template_kwargs"]["enable_thinking"] = False
-        existing = chat_kwargs.get("logits_processors") or []
-        chat_kwargs["logits_processors"] = list(existing) + [json_logits_processor]
 
     # Thinking-aware logits processor: cap reasoning tokens when a budget is set.
     # Only build when thinking is actually enabled for this request -- a CLI
@@ -756,23 +752,9 @@ def _prepare_anthropic_invocation(
         chat_kwargs["tools"] = template_tools
 
     if json_logits_processor is not None:
-        # Same logic as the OpenAI path: check both top-level and
-        # chat_template_kwargs for an explicit thinking request.
-        ctk = chat_kwargs.get("chat_template_kwargs") or {}
-        effective_thinking = (
-            openai_request.enable_thinking is True or ctk.get("enable_thinking") is True
+        json_logits_processor = _attach_response_format_logits_processor(
+            chat_kwargs, json_logits_processor
         )
-
-        if _reasoning_parser and effective_thinking:
-            json_logits_processor = _ThinkingAwareLogitsProcessor(
-                json_logits_processor, prompt_has_think_tag=True
-            )
-        else:
-            chat_kwargs["enable_thinking"] = False
-            if "chat_template_kwargs" in chat_kwargs:
-                chat_kwargs["chat_template_kwargs"]["enable_thinking"] = False
-        existing = chat_kwargs.get("logits_processors") or []
-        chat_kwargs["logits_processors"] = list(existing) + [json_logits_processor]
 
     return PreparedChatInvocation(
         messages=messages,

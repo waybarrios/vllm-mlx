@@ -246,6 +246,22 @@ class TestProcessorMask:
         result = processor(tokens, logits)
         assert result.shape == logits.shape
 
+    def test_complete_json_forces_eos(self):
+        """Once the suffix is complete JSON, only EOS should remain allowed."""
+        import mlx.core as mx
+        import numpy as np
+
+        processor, tok = self._make_processor()
+        processor._prompt_len = 0
+        tokens = mx.array(tok.encode('{"a":1}'), dtype=mx.int32)
+        logits = mx.zeros((tok.vocab_size,))
+
+        masked = processor(tokens, logits)
+        arr = np.array(masked)
+        finite = {i for i, value in enumerate(arr) if np.isfinite(value)}
+
+        assert finite == {tok.eos_token_id}
+
 
 # ---------------------------------------------------------------------------
 # Anthropic adapter — response_format propagation.

@@ -262,6 +262,41 @@ def _walk_properties(node: Any, names: set[str]) -> None:
                 _walk_properties(item, names)
 
 
+def _complete_json_eos_logits(
+    eos_set: set[int],
+    suffix: list[int],
+    logits: mx.array,
+    is_complete_json,
+    build_allow_mask,
+) -> mx.array | None:
+    if not eos_set or not is_complete_json(suffix):
+        return None
+    return _eos_logits(eos_set, logits, build_allow_mask)
+
+
+def _eos_logits(
+    eos_set: set[int],
+    logits: mx.array,
+    build_allow_mask,
+) -> mx.array | None:
+    if not eos_set:
+        return None
+    actual_vocab = logits.shape[-1]
+    mask = build_allow_mask(sorted(eos_set), actual_vocab)
+    if logits.ndim == 2 and logits.shape[0] == 1:
+        mask = mask[None, :]
+    return logits + mask
+
+
+def _eos_logits_or_original(
+    eos_set: set[int],
+    logits: mx.array,
+    build_allow_mask,
+) -> mx.array:
+    masked = _eos_logits(eos_set, logits, build_allow_mask)
+    return logits if masked is None else masked
+
+
 class JSONSchemaLogitsProcessor:
     """
     Logits processor that constrains generation to valid JSON.
@@ -750,13 +785,11 @@ class JSONSchemaLogitsProcessor:
             # generation produces garbage.  Without this cap the model would
             # generate up to max_tokens (often 262 K) of useless output,
             # blocking the slot for minutes/hours.
-            if self._eos_set:
-                actual_vocab = logits.shape[-1]
-                mask = self._build_allow_mask(sorted(self._eos_set), actual_vocab)
-                if logits.ndim == 2 and logits.shape[0] == 1:
-                    mask = mask[None, :]
-                return logits + mask
-            return logits
+            return _eos_logits_or_original(
+                self._eos_set,
+                logits,
+                self._build_allow_mask,
+            )
 
         try:
             tokens_list = tokens.tolist() if hasattr(tokens, "tolist") else list(tokens)
@@ -766,6 +799,16 @@ class JSONSchemaLogitsProcessor:
                 tokens_list = tokens_list[0]
 
             suffix = self._suffix(tokens_list)
+            eos_logits = _complete_json_eos_logits(
+                self._eos_set,
+                suffix,
+                logits,
+                self._suffix_is_complete_json,
+                self._build_allow_mask,
+            )
+            if eos_logits is not None:
+                return eos_logits
+
             # Use prompt_len directly instead of O(n) list comparison.
             pass_to_enforcer = suffix if self._prompt_len else tokens_list
             allowed_result = self._enforcer.get_allowed_tokens(pass_to_enforcer)
