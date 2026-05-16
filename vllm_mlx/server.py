@@ -162,7 +162,7 @@ from .endpoint_model_policies import (
     resolve_stt_model_name,
     resolve_tts_model_name,
 )
-from .engine.base import suspend_cancellation
+from .engine.base import EngineBusy, suspend_cancellation
 from .lifecycle import ModelSpec, ResidencyManager
 from .model_registry import (
     ModelLease,
@@ -971,6 +971,17 @@ def _log_and_raise_internal_error(log_prefix: str, exc: Exception, detail: str) 
     """Log a sanitized exception string and raise a generic 500 response."""
     logger.error("%s: %s", log_prefix, _sanitize_log_text(exc, limit=500))
     raise HTTPException(status_code=500, detail=detail)
+
+
+def _raise_engine_busy(exc: EngineBusy) -> None:
+    """Translate serialized-engine admission failures into retryable HTTP 503."""
+    raise HTTPException(
+        status_code=503,
+        detail={
+            "error": exc.code,
+            "message": str(exc),
+        },
+    ) from exc
 
 
 @dataclass
@@ -4637,6 +4648,9 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
             except HTTPException as exc:
                 tracker.finish(result=_metrics_result_from_status(exc.status_code))
                 raise
+            except EngineBusy as exc:
+                tracker.finish(result="busy")
+                _raise_engine_busy(exc)
             if output is None:
                 tracker.finish(
                     result="client_closed",
@@ -4815,6 +4829,9 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
         except HTTPException as exc:
             tracker.finish(result=_metrics_result_from_status(exc.status_code))
             raise
+        except EngineBusy as exc:
+            tracker.finish(result="busy")
+            _raise_engine_busy(exc)
         if output is None:
             tracker.finish(result="client_closed")
             return Response(status_code=499)  # Client closed request

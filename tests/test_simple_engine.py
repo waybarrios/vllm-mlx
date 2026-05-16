@@ -104,6 +104,7 @@ class TestSimpleEngineConcurrency:
             engine = SimpleEngine("test-model")
             engine._model = mock_model
             engine._loaded = True
+            engine._generation_lock_admission = "wait"
 
             # Launch multiple concurrent generate calls
             tasks = [
@@ -128,6 +129,7 @@ class TestSimpleEngineConcurrency:
             engine = SimpleEngine("test-model")
             engine._model = mock_llm_model
             engine._loaded = True
+            engine._generation_lock_admission = "wait"
 
             # Launch multiple concurrent chat calls
             tasks = [
@@ -144,6 +146,76 @@ class TestSimpleEngineConcurrency:
                 f"Expected max concurrent to be 1, but got {mock_llm_model._max_concurrent}. "
                 "The lock is not working correctly."
             )
+
+    @pytest.mark.anyio
+    async def test_default_admission_rejects_second_serialized_request(self):
+        """Default SimpleEngine admission fails fast instead of queueing."""
+        from vllm_mlx.engine.base import EngineBusy
+        from vllm_mlx.engine.simple import SimpleEngine
+
+        with patch("vllm_mlx.engine.simple.is_mllm_model", return_value=False):
+            engine = SimpleEngine("test-model")
+            engine._loaded = True
+
+            started = threading.Event()
+            release = threading.Event()
+
+            def slow_call():
+                started.set()
+                release.wait(timeout=1.0)
+                return "ok"
+
+            first = asyncio.create_task(
+                engine._run_blocking_serialized(
+                    slow_call,
+                    request_id="first-serialized-request",
+                )
+            )
+            await asyncio.to_thread(started.wait, 1.0)
+
+            with pytest.raises(EngineBusy) as excinfo:
+                await engine._run_blocking_serialized(
+                    lambda: "late",
+                    request_id="second-serialized-request",
+                )
+
+            assert "text_generation_busy" == excinfo.value.code
+            assert "active=first-serialized-request" in str(excinfo.value)
+            assert engine._generation_busy_rejections == 1
+
+            release.set()
+            await first
+
+    @pytest.mark.anyio
+    async def test_blocking_serialized_tracks_active_request(self):
+        """Busy errors include the current blocking serialized holder."""
+        from vllm_mlx.engine.simple import SimpleEngine
+
+        with patch("vllm_mlx.engine.simple.is_mllm_model", return_value=False):
+            engine = SimpleEngine("test-model")
+            engine._loaded = True
+
+            def slow_call():
+                import time
+
+                time.sleep(0.05)
+                return "ok"
+
+            first = asyncio.create_task(
+                engine._run_blocking_serialized(
+                    slow_call,
+                    request_id="probe-active-holder",
+                )
+            )
+            for _ in range(100):
+                if engine._generation_lock.locked():
+                    break
+                await asyncio.sleep(0.001)
+
+            assert "probe-active-holder" in engine._generation_lock_holder_summary()
+
+            await first
+            assert engine._generation_lock_holder_summary() == "none"
 
     async def test_chat_with_tools_aggregates_streaming_path(self, mock_llm_model):
         """Tool-enabled non-stream chat should use the streaming path."""
@@ -1142,6 +1214,7 @@ class TestSimpleEngineConcurrency:
             engine = SimpleEngine("test-model")
             engine._model = mock_model
             engine._loaded = True
+            engine._generation_lock_admission = "wait"
 
             # Test that stream_generate acquires the lock
             # by checking if it blocks when lock is already held
@@ -2027,6 +2100,7 @@ class TestSimpleEngineConcurrency:
             engine = SimpleEngine("test-model")
             engine._model = mock_llm_model
             engine._loaded = True
+            engine._generation_lock_admission = "wait"
 
             task1 = asyncio.create_task(
                 engine.chat(
