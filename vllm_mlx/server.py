@@ -598,8 +598,9 @@ def _prepare_chat_completion_invocation(
     if request.enable_thinking is not None:
         chat_kwargs["enable_thinking"] = request.enable_thinking
 
-    if request.mllm_draft is not None:
-        chat_kwargs["mllm_draft"] = request.mllm_draft
+    mllm_draft = getattr(request, "mllm_draft", None)
+    if mllm_draft is not None:
+        chat_kwargs["mllm_draft"] = mllm_draft
 
     if request.tools and request.tool_choice != "none":
         template_tools = convert_tools_for_template(request.tools)
