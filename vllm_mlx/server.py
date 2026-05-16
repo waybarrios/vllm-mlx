@@ -800,6 +800,25 @@ _auth_warning_logged: bool = False
 _reasoning_parser = None  # ReasoningParser instance when enabled
 _reasoning_parser_name: str | None = None
 
+
+def _thinking_disabled(request, chat_kwargs: dict | None = None) -> bool:
+    """Return True iff thinking is explicitly disabled for this request.
+
+    Checks both the request-level ``enable_thinking`` field and the resolved
+    ``chat_template_kwargs`` (which may carry the server-wide default set via
+    ``--default-chat-template-kwargs``). When thinking is disabled the prompt
+    contains no injected ``<think>`` block, so the streaming reasoning parser
+    must not default to implicit-thinking mode and swallow plain content into
+    a ``thinking`` block.
+    """
+    if getattr(request, "enable_thinking", None) is False:
+        return True
+    if chat_kwargs:
+        ctk = chat_kwargs.get("chat_template_kwargs") or {}
+        if ctk.get("enable_thinking") is False:
+            return True
+    return False
+
 # Tool calling configuration
 _enable_auto_tool_choice: bool = False
 _tool_call_parser: str | None = None  # Parser name: auto, mistral, qwen, llama, hermes
@@ -2344,7 +2363,7 @@ async def _stream_responses_request(request: ResponsesRequest) -> AsyncIterator[
         previous_text = raw_accumulated_text
         raw_accumulated_text += delta_text
 
-        if _reasoning_parser:
+        if _reasoning_parser and not _thinking_disabled(request, chat_kwargs):
             delta_msg = _reasoning_parser.extract_reasoning_streaming(
                 previous_text, raw_accumulated_text, delta_text
             )
@@ -4640,7 +4659,7 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
         reasoning_text, cleaned_text, tool_calls = _extract_reasoning_and_tool_calls(
             output.text,
             request,
-            allow_reasoning=(getattr(request, "enable_thinking", None) is not False),
+            allow_reasoning=not _thinking_disabled(request, prepared.chat_kwargs),
             engine=engine,
         )
 
@@ -5061,10 +5080,13 @@ async def create_anthropic_message(
             output.text,
             openai_request,
             allow_reasoning=(
-                prepared.json_logits_processor is None
-                or isinstance(
-                    prepared.json_logits_processor,
-                    _ThinkingAwareLogitsProcessor,
+                not _thinking_disabled(openai_request, prepared.chat_kwargs)
+                and (
+                    prepared.json_logits_processor is None
+                    or isinstance(
+                        prepared.json_logits_processor,
+                        _ThinkingAwareLogitsProcessor,
+                    )
                 )
             ),
             engine=engine,
@@ -5341,8 +5363,10 @@ async def _stream_anthropic_messages(
     }
     yield f"event: message_start\ndata: {json.dumps(message_start)}\n\n"
 
-    use_reasoning = _reasoning_parser is not None and not chat_kwargs.get(
-        "logits_processors"
+    use_reasoning = (
+        _reasoning_parser is not None
+        and not chat_kwargs.get("logits_processors")
+        and not _thinking_disabled(openai_request, chat_kwargs)
     )
 
     if use_reasoning:
@@ -5734,11 +5758,13 @@ async def stream_chat_completion(
             if hasattr(output, "completion_tokens") and output.completion_tokens:
                 completion_tokens = output.completion_tokens
 
-            # Use reasoning parser if enabled (skip when enable_thinking=False)
+            # Use reasoning parser if enabled (skip when enable_thinking=False
+            # is set either on the request or via the resolved chat template
+            # kwargs / server default).
             if (
                 _reasoning_parser
                 and delta_text
-                and request.enable_thinking is not False
+                and not _thinking_disabled(request, kwargs)
             ):
                 previous_text = accumulated_text
                 accumulated_text += delta_text
