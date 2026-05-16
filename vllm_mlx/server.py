@@ -131,7 +131,9 @@ from .api.responses_models import (
     ResponsesUsage,
 )
 from .api.tool_calling import (
+    InvalidResponseFormatOutput,
     StreamingJsonFenceStripper,
+    apply_response_format_or_error,
     build_json_logits_processor,
     build_json_system_prompt,
     convert_tools_for_template,
@@ -1686,6 +1688,28 @@ def _parse_tool_calls_with_parser(
     except Exception as e:
         logger.warning("Tool parser error: %s", _sanitize_log_text(e, limit=500))
         return parse_tool_calls(output_text, request_dict)
+
+
+def _apply_response_format_or_raise(
+    text: str,
+    response_format: object,
+    *,
+    ensure_ascii: bool = False,
+) -> str:
+    """Return validated JSON content or fail before returning a success response."""
+    try:
+        text = apply_response_format_or_error(
+            text, response_format, ensure_ascii=ensure_ascii
+        )
+    except InvalidResponseFormatOutput as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "error": "invalid_response_format_output",
+                "message": exc.message,
+            },
+        ) from exc
+    return _strip_backslash_before_unicode(text)
 
 
 def _new_response_item_id(prefix: str) -> str:
@@ -4647,20 +4671,20 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
         # Process response_format if specified (after reasoning parser cleaned the text)
         if prepared.response_format and not tool_calls:
             json_input = cleaned_text or output.text
-            _, parsed_json, is_valid, error = parse_json_output(
-                json_input, prepared.response_format
-            )
-            if parsed_json is not None:
-                # Return JSON as string
-                parsed_json = _strip_backslash_before_unicode(parsed_json)
-                cleaned_text = json.dumps(parsed_json, ensure_ascii=False)
-            if not is_valid:
+            try:
+                cleaned_text = _apply_response_format_or_raise(
+                    json_input,
+                    prepared.response_format,
+                    ensure_ascii=False,
+                )
+            except HTTPException as exc:
                 if prepared.json_logits_processor is not None:
                     logger.error(
-                        "Constrained decoding produced invalid JSON: %s", error
+                        "Constrained decoding produced invalid JSON: %s", exc.detail
                     )
                 else:
-                    logger.warning(f"JSON validation failed: {error}")
+                    logger.warning("JSON validation failed: %s", exc.detail)
+                raise
 
         # Determine finish reason
         finish_reason = "tool_calls" if tool_calls else output.finish_reason
@@ -5072,22 +5096,23 @@ async def create_anthropic_message(
 
         if prepared.response_format and not tool_calls:
             json_input = cleaned_text or output.text
-            _, parsed_json, is_valid, error = parse_json_output(
-                json_input, prepared.response_format
-            )
-            if parsed_json is not None:
-                parsed_json = _strip_backslash_before_unicode(parsed_json)
-                cleaned_text = json.dumps(parsed_json, ensure_ascii=False)
-            if not is_valid:
+            try:
+                cleaned_text = _apply_response_format_or_raise(
+                    json_input,
+                    prepared.response_format,
+                    ensure_ascii=False,
+                )
+            except HTTPException as exc:
                 if prepared.json_logits_processor is not None:
                     logger.error(
                         "Constrained decoding produced invalid JSON on Anthropic endpoint: %s",
-                        error,
+                        exc.detail,
                     )
                 else:
                     logger.warning(
-                        "JSON validation failed on Anthropic endpoint: %s", error
+                        "JSON validation failed on Anthropic endpoint: %s", exc.detail
                     )
+                raise
 
         # Clean output text
         final_content = None
