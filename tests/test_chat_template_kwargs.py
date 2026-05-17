@@ -309,3 +309,76 @@ async def test_simple_engine_stream_generate_text_applies_chat_template_kwargs()
             ]
             is False
         )
+
+
+# Regression tests for the reasoning-parser bypass when enable_thinking=False.
+# Server started with --default-chat-template-kwargs '{"enable_thinking": false}'
+# plus a Qwen3 reasoning parser used to route every token into a `thinking`
+# block and leave `text` empty, so Claude Code saw `result: ""`.
+
+
+@pytest.mark.parametrize(
+    "enable_thinking, ctk, expected",
+    [
+        (None, None, False),  # nothing set
+        (False, None, True),  # request-level flag
+        (None, {"enable_thinking": False}, True),  # server default surface
+        (True, {"enable_thinking": True}, False),  # explicit True
+        (None, {}, False),  # empty kwargs
+    ],
+)
+def test_thinking_disabled_helper(enable_thinking, ctk, expected):
+    request = SimpleNamespace(enable_thinking=enable_thinking)
+    chat_kwargs = {"chat_template_kwargs": ctk} if ctk is not None else {}
+    assert srv._thinking_disabled(request, chat_kwargs) is expected
+
+
+@pytest.mark.anyio
+async def test_stream_anthropic_skips_reasoning_parser_when_thinking_disabled():
+    from vllm_mlx.reasoning import DeltaMessage
+
+    class _EatsEverythingAsReasoning:
+        # Mimics BaseThinkingReasoningParser's implicit-mode default.
+        def reset_state(self):
+            pass
+
+        def extract_reasoning_streaming(self, prev, cur, delta):
+            return DeltaMessage(reasoning=delta)
+
+    async def fake_stream_chat(messages, **kwargs):
+        for piece in ("HEL", "LO"):
+            yield SimpleNamespace(new_text=piece, prompt_tokens=4, completion_tokens=1)
+
+    engine = MagicMock(stream_chat=fake_stream_chat)
+    msgs = [{"role": "user", "content": "Say HELLO"}]
+    openai_request = srv.ChatCompletionRequest(
+        model="test-model", messages=[srv.Message(**msgs[0])], max_tokens=8
+    )
+    anthropic_request = srv.AnthropicRequest(
+        model="test-model", max_tokens=8, messages=msgs
+    )
+    prepared = srv.PreparedChatInvocation(
+        messages=msgs,
+        chat_kwargs={"chat_template_kwargs": {"enable_thinking": False}},
+        response_format=None,
+        json_logits_processor=None,
+    )
+
+    saved = (srv._reasoning_parser, srv._model_name)
+    srv._reasoning_parser, srv._model_name = _EatsEverythingAsReasoning(), "test-model"
+    try:
+        body = "".join(
+            [
+                c
+                async for c in srv._stream_anthropic_messages(
+                    engine, openai_request, anthropic_request, prepared
+                )
+            ]
+        )
+    finally:
+        srv._reasoning_parser, srv._model_name = saved
+
+    assert "thinking_delta" not in body  # would fire on broken path
+    assert '"type": "thinking"' not in body
+    assert "HEL" in body and "LO" in body
+    assert '"type": "text_delta"' in body
