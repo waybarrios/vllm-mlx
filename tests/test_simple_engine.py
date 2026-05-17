@@ -1689,6 +1689,45 @@ class TestSimpleEngineConcurrency:
         ]
 
     @pytest.mark.anyio
+    async def test_stream_generate_text_normal_path_stays_on_event_loop_thread(self):
+        """VLM-derived TextModel generation must not hop to a worker thread."""
+        from vllm_mlx.engine.simple import SimpleEngine
+
+        owner_thread = threading.get_ident()
+        generation_threads = []
+
+        def fake_stream_generate(_model, _tokenizer, **_kwargs):
+            generation_threads.append(threading.get_ident())
+            yield SimpleNamespace(text="Hello", finish_reason="stop")
+
+        tokenizer = MagicMock()
+        tokenizer.apply_chat_template.return_value = "<|im_start|>user\nhello"
+        tokenizer.bos_token = None
+        tokenizer.eos_token_id = 42
+        tokenizer.encode.return_value = [1, 2, 3]
+
+        engine = SimpleEngine("test-model", force_mllm=True, mtp=False)
+        engine._loaded = True
+        engine._text_model = MagicMock()
+        engine._text_model.mtp = None
+        engine._text_tokenizer = tokenizer
+        engine._text_model_owner_thread = owner_thread
+
+        with patch("mlx_lm.stream_generate", side_effect=fake_stream_generate):
+            outputs = [
+                chunk
+                async for chunk in engine._stream_generate_text(
+                    messages=[{"role": "user", "content": "hello"}],
+                    max_tokens=16,
+                    temperature=0.7,
+                    top_p=0.9,
+                )
+            ]
+
+        assert outputs[-1].text == "Hello"
+        assert generation_threads == [owner_thread]
+
+    @pytest.mark.anyio
     async def test_stream_generate_text_disables_mtp_when_logits_processors_active(
         self,
     ):

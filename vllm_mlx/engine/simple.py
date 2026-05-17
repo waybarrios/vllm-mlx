@@ -203,6 +203,7 @@ class SimpleEngine(BaseEngine):
         # Per-request routing state (MLLM+MTP mode)
         self._text_model = None
         self._text_tokenizer = None
+        self._text_model_owner_thread: int | None = None
 
         # SpecPrefill draft model (loaded at start if enabled)
         self._draft_model = None
@@ -355,6 +356,7 @@ class SimpleEngine(BaseEngine):
                     )
 
                     if self._text_model is not None:
+                        self._text_model_owner_thread = threading.get_ident()
                         self._text_tokenizer = self._model.get_tokenizer()
 
                         # Apply Qwen3.5 eos_token fix (matches MLXLanguageModel.load)
@@ -416,11 +418,13 @@ class SimpleEngine(BaseEngine):
                     else:
                         self._text_model = None
                         self._text_tokenizer = None
+                        self._text_model_owner_thread = None
 
                 except Exception as e:
                     logger.error("MLLM text routing setup failed: %s", e)
                     self._text_model = None
                     self._text_tokenizer = None
+                    self._text_model_owner_thread = None
 
             # Load SpecPrefill draft model (small model for importance scoring)
             if self._specprefill_enabled and self._specprefill_draft_model_path:
@@ -471,6 +475,7 @@ class SimpleEngine(BaseEngine):
         self._model = None
         self._text_model = None
         self._text_tokenizer = None
+        self._text_model_owner_thread = None
         self._draft_model = None
         self._loaded = False
         self._system_kv_cache.clear()
@@ -2012,6 +2017,87 @@ class SimpleEngine(BaseEngine):
                 _SPECPREFILL_MAX_TOKENS,
             )
             use_specprefill = False
+
+        if (
+            self._text_model_owner_thread == threading.get_ident()
+            and not use_specprefill
+            and backbone_cache is None
+        ):
+            prompt_tokens = (
+                full_token_count
+                if full_token_count
+                else len(self._text_tokenizer.encode(full_prompt))
+            )
+            gen_kwargs = dict(
+                max_tokens=max_tokens,
+                sampler=sampler,
+                prefill_step_size=self._prefill_step_size,
+            )
+            if all_processors:
+                gen_kwargs["logits_processors"] = all_processors
+            use_mtp = (
+                self._mtp
+                and not custom_logits_active
+                and hasattr(self._text_model, "mtp")
+                and self._text_model.mtp is not None
+            )
+            if use_mtp:
+                gen_kwargs["num_draft_tokens"] = self._mtp_num_draft_tokens
+            elif self._mtp and custom_logits_active:
+                logger.info(
+                    "Text route: disabling MTP for request-local logits processors"
+                )
+
+            accumulated_text = ""
+            token_count = 0
+            finished = False
+            async with self._generation_lock:
+                for resp in mlx_stream_generate(
+                    self._text_model,
+                    self._text_tokenizer,
+                    prompt=full_prompt,
+                    **gen_kwargs,
+                ):
+                    token_count += 1
+                    new_text = resp.text if hasattr(resp, "text") else str(resp)
+                    accumulated_text += new_text
+
+                    stop_hit = False
+                    if stop:
+                        stop_hit = any(
+                            stop_seq in accumulated_text for stop_seq in stop
+                        )
+                    finished = stop_hit or token_count >= max_tokens
+                    finish_reason = getattr(resp, "finish_reason", None)
+                    if stop_hit:
+                        finish_reason = "stop"
+                    elif finish_reason is None and finished:
+                        finish_reason = "stop"
+                    elif finish_reason is not None:
+                        finished = True
+
+                    yield GenerationOutput(
+                        text=accumulated_text,
+                        new_text=new_text,
+                        prompt_tokens=prompt_tokens,
+                        completion_tokens=token_count,
+                        finished=finished,
+                        finish_reason=finish_reason,
+                    )
+
+                    if finished:
+                        break
+
+            if not finished:
+                yield GenerationOutput(
+                    text=accumulated_text,
+                    new_text="",
+                    prompt_tokens=prompt_tokens,
+                    completion_tokens=token_count,
+                    finished=True,
+                    finish_reason="length",
+                )
+            return
 
         loop = asyncio.get_running_loop()
         response_queue: asyncio.Queue[tuple[str, Any]] = asyncio.Queue()
