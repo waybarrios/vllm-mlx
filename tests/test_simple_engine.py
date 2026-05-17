@@ -3,6 +3,7 @@
 
 import asyncio
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -1270,6 +1271,8 @@ class TestSimpleEngineConcurrency:
         """MLLM text-only routing must stay available when MTP is disabled."""
         from vllm_mlx.engine.simple import SimpleEngine
 
+        event_loop_thread = threading.get_ident()
+        captured = {}
         text_model = MagicMock()
         text_model.mtp = None
         tokenizer = MagicMock()
@@ -1279,6 +1282,10 @@ class TestSimpleEngineConcurrency:
         mock_mllm.model = MagicMock()
         mock_mllm.get_tokenizer.return_value = tokenizer
 
+        def build_text_model(*_args, **_kwargs):
+            captured["build_thread"] = threading.get_ident()
+            return text_model
+
         with (
             patch(
                 "vllm_mlx.models.mllm.MLXMultimodalLM",
@@ -1286,7 +1293,7 @@ class TestSimpleEngineConcurrency:
             ),
             patch(
                 "vllm_mlx.text_model_from_vlm.build_text_model",
-                return_value=text_model,
+                side_effect=build_text_model,
             ),
         ):
             engine = SimpleEngine("qwen3.6-27b", force_mllm=True, mtp=False)
@@ -1294,6 +1301,9 @@ class TestSimpleEngineConcurrency:
 
         assert engine._text_model is text_model
         assert engine._text_tokenizer is tokenizer
+        assert captured["build_thread"] != event_loop_thread
+        assert engine._text_model_owner_thread == captured["build_thread"]
+        await engine.stop()
 
     @pytest.mark.anyio
     async def test_mllm_nonstream_text_only_routes_without_mtp(self):
@@ -1689,11 +1699,11 @@ class TestSimpleEngineConcurrency:
         ]
 
     @pytest.mark.anyio
-    async def test_stream_generate_text_normal_path_stays_on_event_loop_thread(self):
-        """VLM-derived TextModel generation must not hop to a worker thread."""
+    async def test_stream_generate_text_normal_path_uses_text_model_owner_worker(self):
+        """VLM-derived TextModel generation must run on its build-owner worker."""
         from vllm_mlx.engine.simple import SimpleEngine
 
-        owner_thread = threading.get_ident()
+        event_loop_thread = threading.get_ident()
         generation_threads = []
 
         def fake_stream_generate(_model, _tokenizer, **_kwargs):
@@ -1711,21 +1721,31 @@ class TestSimpleEngineConcurrency:
         engine._text_model = MagicMock()
         engine._text_model.mtp = None
         engine._text_tokenizer = tokenizer
-        engine._text_model_owner_thread = owner_thread
+        engine._text_model_executor = ThreadPoolExecutor(max_workers=1)
 
-        with patch("mlx_lm.stream_generate", side_effect=fake_stream_generate):
-            outputs = [
-                chunk
-                async for chunk in engine._stream_generate_text(
-                    messages=[{"role": "user", "content": "hello"}],
-                    max_tokens=16,
-                    temperature=0.7,
-                    top_p=0.9,
-                )
-            ]
+        def bind_owner_thread():
+            engine._text_model_owner_thread = threading.get_ident()
+
+        engine._text_model_executor.submit(bind_owner_thread).result(timeout=1.0)
+        owner_thread = engine._text_model_owner_thread
+
+        try:
+            with patch("mlx_lm.stream_generate", side_effect=fake_stream_generate):
+                outputs = [
+                    chunk
+                    async for chunk in engine._stream_generate_text(
+                        messages=[{"role": "user", "content": "hello"}],
+                        max_tokens=16,
+                        temperature=0.7,
+                        top_p=0.9,
+                    )
+                ]
+        finally:
+            await engine.stop()
 
         assert outputs[-1].text == "Hello"
         assert generation_threads == [owner_thread]
+        assert generation_threads[0] != event_loop_thread
 
     @pytest.mark.anyio
     async def test_stream_generate_text_disables_mtp_when_logits_processors_active(

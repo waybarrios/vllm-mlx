@@ -16,6 +16,7 @@ import time
 import uuid
 from collections import OrderedDict, deque
 from collections.abc import AsyncIterator
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 # Re-entrancy guard for SimpleEngine._track_request_stream so that
@@ -204,6 +205,7 @@ class SimpleEngine(BaseEngine):
         self._text_model = None
         self._text_tokenizer = None
         self._text_model_owner_thread: int | None = None
+        self._text_model_executor: ThreadPoolExecutor | None = None
 
         # SpecPrefill draft model (loaded at start if enabled)
         self._draft_model = None
@@ -349,16 +351,31 @@ class SimpleEngine(BaseEngine):
             # on the slower mlx_vlm multimodal path.
             if self._is_mllm and self._should_route_text_through_text_model():
                 try:
-                    from ..text_model_from_vlm import build_text_model
 
-                    self._text_model = build_text_model(
-                        self._model.model, self._model_name
+                    def build_text_route():
+                        from ..text_model_from_vlm import build_text_model
+
+                        text_model = build_text_model(
+                            self._model.model, self._model_name
+                        )
+                        if text_model is None:
+                            return None, None, None
+                        return (
+                            text_model,
+                            self._model.get_tokenizer(),
+                            threading.get_ident(),
+                        )
+
+                    (
+                        self._text_model,
+                        self._text_tokenizer,
+                        self._text_model_owner_thread,
+                    ) = await self._run_blocking_serialized(
+                        build_text_route,
+                        executor=self._ensure_text_model_executor(),
                     )
 
                     if self._text_model is not None:
-                        self._text_model_owner_thread = threading.get_ident()
-                        self._text_tokenizer = self._model.get_tokenizer()
-
                         # Apply Qwen3.5 eos_token fix (matches MLXLanguageModel.load)
                         if "qwen3" in self._model_name.lower():
                             self._text_tokenizer.eos_token = "<|im_end|>"
@@ -476,6 +493,10 @@ class SimpleEngine(BaseEngine):
         self._text_model = None
         self._text_tokenizer = None
         self._text_model_owner_thread = None
+        text_model_executor = self._text_model_executor
+        self._text_model_executor = None
+        if text_model_executor is not None:
+            text_model_executor.shutdown(wait=False, cancel_futures=True)
         self._draft_model = None
         self._loaded = False
         self._system_kv_cache.clear()
@@ -490,7 +511,24 @@ class SimpleEngine(BaseEngine):
         """Return whether text-only MLLM requests may use mlx_lm TextModel."""
         return not (mllm_draft_requested and self._mllm_draft_model_path is not None)
 
-    async def _run_blocking_serialized(self, func, /, *args, on_cancel=None, **kwargs):
+    def _ensure_text_model_executor(self) -> ThreadPoolExecutor:
+        """Return the stable owner executor for VLM-derived TextModel calls."""
+        if self._text_model_executor is None:
+            self._text_model_executor = ThreadPoolExecutor(
+                max_workers=1,
+                thread_name_prefix="simple-text-model",
+            )
+        return self._text_model_executor
+
+    async def _run_blocking_serialized(
+        self,
+        func,
+        /,
+        *args,
+        on_cancel=None,
+        executor: ThreadPoolExecutor | None = None,
+        **kwargs,
+    ):
         """Run a blocking MLX operation under the generation lock.
 
         Cancellation must not release the async lock before the worker thread
@@ -503,7 +541,11 @@ class SimpleEngine(BaseEngine):
                 _bind_worker_generation_streams()
                 return func(*args, **kwargs)
 
-            task = asyncio.create_task(asyncio.to_thread(run_bound))
+            if executor is None:
+                task = asyncio.create_task(asyncio.to_thread(run_bound))
+            else:
+                loop = asyncio.get_running_loop()
+                task = asyncio.ensure_future(loop.run_in_executor(executor, run_bound))
             try:
                 return await asyncio.shield(task)
             except asyncio.CancelledError:
@@ -1932,6 +1974,7 @@ class SimpleEngine(BaseEngine):
                                 make_cache_with_snapshot,
                                 self._text_model,
                                 hit_candidate[0],
+                                executor=self._text_model_executor,
                             )
                         )
                         # Bump LRU position now that we know we'll use it.
@@ -2018,87 +2061,6 @@ class SimpleEngine(BaseEngine):
             )
             use_specprefill = False
 
-        if (
-            self._text_model_owner_thread == threading.get_ident()
-            and not use_specprefill
-            and backbone_cache is None
-        ):
-            prompt_tokens = (
-                full_token_count
-                if full_token_count
-                else len(self._text_tokenizer.encode(full_prompt))
-            )
-            gen_kwargs = dict(
-                max_tokens=max_tokens,
-                sampler=sampler,
-                prefill_step_size=self._prefill_step_size,
-            )
-            if all_processors:
-                gen_kwargs["logits_processors"] = all_processors
-            use_mtp = (
-                self._mtp
-                and not custom_logits_active
-                and hasattr(self._text_model, "mtp")
-                and self._text_model.mtp is not None
-            )
-            if use_mtp:
-                gen_kwargs["num_draft_tokens"] = self._mtp_num_draft_tokens
-            elif self._mtp and custom_logits_active:
-                logger.info(
-                    "Text route: disabling MTP for request-local logits processors"
-                )
-
-            accumulated_text = ""
-            token_count = 0
-            finished = False
-            async with self._generation_lock:
-                for resp in mlx_stream_generate(
-                    self._text_model,
-                    self._text_tokenizer,
-                    prompt=full_prompt,
-                    **gen_kwargs,
-                ):
-                    token_count += 1
-                    new_text = resp.text if hasattr(resp, "text") else str(resp)
-                    accumulated_text += new_text
-
-                    stop_hit = False
-                    if stop:
-                        stop_hit = any(
-                            stop_seq in accumulated_text for stop_seq in stop
-                        )
-                    finished = stop_hit or token_count >= max_tokens
-                    finish_reason = getattr(resp, "finish_reason", None)
-                    if stop_hit:
-                        finish_reason = "stop"
-                    elif finish_reason is None and finished:
-                        finish_reason = "stop"
-                    elif finish_reason is not None:
-                        finished = True
-
-                    yield GenerationOutput(
-                        text=accumulated_text,
-                        new_text=new_text,
-                        prompt_tokens=prompt_tokens,
-                        completion_tokens=token_count,
-                        finished=finished,
-                        finish_reason=finish_reason,
-                    )
-
-                    if finished:
-                        break
-
-            if not finished:
-                yield GenerationOutput(
-                    text=accumulated_text,
-                    new_text="",
-                    prompt_tokens=prompt_tokens,
-                    completion_tokens=token_count,
-                    finished=True,
-                    finish_reason="length",
-                )
-            return
-
         loop = asyncio.get_running_loop()
         response_queue: asyncio.Queue[tuple[str, Any]] = asyncio.Queue()
 
@@ -2155,6 +2117,14 @@ class SimpleEngine(BaseEngine):
         # Run all Metal ops in a single serialized thread.
         def _run_all():
             nonlocal backbone_cache, prompt_to_send
+
+            if (
+                self._text_model_owner_thread is not None
+                and threading.get_ident() != self._text_model_owner_thread
+            ):
+                raise RuntimeError(
+                    "VLM TextModel generation must run on its owner thread"
+                )
 
             model = self._text_model
             can_retire_processors = _processors_can_retire(all_processors)
@@ -2490,6 +2460,7 @@ class SimpleEngine(BaseEngine):
                 await self._run_blocking_serialized(
                     _run_all,
                     on_cancel=abort_event.set,
+                    executor=self._text_model_executor,
                 )
             except asyncio.CancelledError:
                 raise
