@@ -2140,6 +2140,83 @@ class TestStreamChatCompletion:
         assert payloads[2]["choices"][0]["finish_reason"] == "stop"
 
     @pytest.mark.anyio
+    async def test_response_format_stream_promotes_reasoning_json_to_content(
+        self, monkeypatch
+    ):
+        """response_format JSON belongs on the streaming content channel."""
+        from vllm_mlx.engine.base import GenerationOutput
+        from vllm_mlx.reasoning import DeltaMessage
+        from vllm_mlx.server import (
+            ChatCompletionRequest,
+            Message,
+            stream_chat_completion,
+        )
+        import vllm_mlx.server as server
+
+        class FakeEngine:
+            model_name = "fake-engine"
+
+            async def stream_chat(self, messages, **kwargs):
+                yield GenerationOutput(
+                    text="",
+                    new_text='{"ok": true}',
+                    finished=True,
+                    finish_reason="stop",
+                    prompt_tokens=4,
+                    completion_tokens=3,
+                )
+
+        class ReasoningOnlyParser:
+            def reset_state(self):
+                pass
+
+            def extract_reasoning_streaming(
+                self, previous_text, current_text, delta_text
+            ):
+                return DeltaMessage(reasoning=delta_text)
+
+        monkeypatch.setattr(server, "_model_name", "served-model")
+        monkeypatch.setattr(server, "_reasoning_parser", ReasoningOnlyParser())
+        monkeypatch.setattr(server, "_enable_auto_tool_choice", False)
+        monkeypatch.setattr(server, "_tool_call_parser", None)
+        monkeypatch.setattr(server, "_tool_parser_instance", None)
+
+        request = ChatCompletionRequest(
+            model="served-model",
+            messages=[Message(role="user", content="return json")],
+            stream=True,
+            response_format={
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "ok",
+                    "schema": {
+                        "type": "object",
+                        "properties": {"ok": {"type": "boolean"}},
+                        "required": ["ok"],
+                    },
+                },
+            },
+        )
+
+        chunks = [
+            chunk
+            async for chunk in stream_chat_completion(
+                FakeEngine(), request.messages, request
+            )
+        ]
+
+        payloads = [
+            json.loads(chunk.removeprefix("data: ").strip())
+            for chunk in chunks
+            if chunk != "data: [DONE]\n\n"
+        ]
+
+        delta = payloads[1]["choices"][0]["delta"]
+        assert json.loads(delta["content"]) == {"ok": True}
+        assert "reasoning_content" not in delta
+        assert payloads[1]["choices"][0]["finish_reason"] == "stop"
+
+    @pytest.mark.anyio
     async def test_streaming_chat_no_stream_thread_error_after_residency_preload(
         self, monkeypatch, caplog
     ):

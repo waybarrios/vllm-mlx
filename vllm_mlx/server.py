@@ -1694,6 +1694,35 @@ def _apply_response_format_or_raise(
     return _strip_backslash_before_unicode(text)
 
 
+def _response_format_type(response_format: object | None) -> str | None:
+    if response_format is None:
+        return None
+    if isinstance(response_format, dict):
+        return response_format.get("type")
+    return getattr(response_format, "type", None)
+
+
+def _promote_streaming_response_format_delta(
+    content: str | None,
+    reasoning: str | None,
+    request: ChatCompletionRequest,
+) -> tuple[str | None, str | None]:
+    """Keep response_format JSON on the streaming content channel.
+
+    Some thinking parsers classify direct JSON output as reasoning when the
+    model emits JSON without an explicit reasoning end marker.  For
+    response_format requests, that JSON is the final assistant content.
+    """
+    if content or not reasoning:
+        return content, reasoning
+    if _response_format_type(getattr(request, "response_format", None)) in (
+        "json_object",
+        "json_schema",
+    ):
+        return reasoning, None
+    return content, reasoning
+
+
 def _new_response_item_id(prefix: str) -> str:
     """Generate stable OpenAI-style item ids."""
     return f"{prefix}_{uuid.uuid4().hex}"
@@ -5759,6 +5788,9 @@ async def stream_chat_completion(
 
                 content = delta_msg.content
                 reasoning = delta_msg.reasoning
+                content, reasoning = _promote_streaming_response_format_delta(
+                    content, reasoning, request
+                )
 
                 # Some models (e.g. MiniMax) wrap tool calls in <think>
                 # blocks, so reasoning parser captures tool call XML as
