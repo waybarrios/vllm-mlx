@@ -342,6 +342,70 @@ class TestCallSemantics:
         masked = proc(tokens, logits)
         assert masked.shape == (1, tok.vocab_size)
 
+    def test_long_leading_whitespace_cannot_continue_without_json_progress(self):
+        """Bound legal-but-non-progress whitespace in constrained JSON mode.
+
+        ``lm-format-enforcer`` permits arbitrary whitespace after JSON
+        structural positions such as ``{``.  That is spec-correct, but a model
+        can then spend a long non-streaming request emitting only whitespace
+        while the client sees no useful JSON progress.  Once a suffix has a
+        long trailing whitespace run outside a string, the processor should
+        force a structural/content token instead of allowing more pure
+        whitespace.
+        """
+        import mlx.core as mx
+        import numpy as np
+
+        proc, tok = _make_processor(
+            {
+                "type": "object",
+                "properties": {"a": {"type": "string"}},
+                "required": ["a"],
+                "additionalProperties": False,
+            }
+        )
+        prompt = tok.encode(" ")
+        proc(mx.array(prompt, dtype=mx.int32), mx.zeros((tok.vocab_size,)))
+
+        full = prompt + tok.encode(" " * 300)
+        masked = proc(mx.array(full, dtype=mx.int32), mx.zeros((tok.vocab_size,)))
+        arr = np.array(masked)
+
+        assert arr[tok._tok_to_id[" "]] == -np.inf
+        assert arr[tok._tok_to_id["\n"]] == -np.inf
+        assert arr[tok._tok_to_id["\t"]] == -np.inf
+        assert arr[tok._tok_to_id["{"]] == 0.0
+
+    def test_long_structural_whitespace_cannot_continue_without_json_progress(self):
+        """The same whitespace-progress bound applies after JSON structure."""
+        import mlx.core as mx
+        import numpy as np
+
+        proc, tok = _make_processor(
+            {
+                "type": "object",
+                "properties": {"a": {"type": "string"}},
+                "required": ["a"],
+                "additionalProperties": False,
+            }
+        )
+        prompt = tok.encode(" ")
+        proc(mx.array(prompt, dtype=mx.int32), mx.zeros((tok.vocab_size,)))
+
+        full = prompt + tok.encode("{" + (" " * 300))
+        masked = proc(mx.array(full, dtype=mx.int32), mx.zeros((tok.vocab_size,)))
+        arr = np.array(masked)
+
+        assert arr[tok._tok_to_id[" "]] == -np.inf
+        assert arr[tok._tok_to_id["\n"]] == -np.inf
+        assert arr[tok._tok_to_id["\t"]] == -np.inf
+        finite_non_ws = [
+            token_id
+            for token_id, value in enumerate(arr)
+            if np.isfinite(value) and tok.decode([token_id]).strip()
+        ]
+        assert finite_non_ws
+
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
