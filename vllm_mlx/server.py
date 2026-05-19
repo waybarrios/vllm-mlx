@@ -914,6 +914,11 @@ def _list_available_model_names() -> list[str]:
     return [_model_name] if _model_name else []
 
 
+def _response_model_name(request_model: str) -> str:
+    """Return the response model field for single-model or registry mode."""
+    return _model_name or request_model
+
+
 async def _acquire_request_model(request_model: str) -> RequestModelContext:
     """Acquire the model/engine that should serve this request."""
     _validate_model_name(request_model)
@@ -4501,7 +4506,7 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
             completion_tokens=total_completion_tokens,
         )
         return CompletionResponse(
-            model=_model_name,
+            model=_response_model_name(request.model),
             choices=choices,
             usage=Usage(
                 prompt_tokens=total_prompt_tokens,
@@ -4691,7 +4696,7 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
             completion_tokens=output.completion_tokens,
         )
         return ChatCompletionResponse(
-            model=_model_name,
+            model=_response_model_name(request.model),
             choices=[
                 ChatCompletionChoice(
                     message=AssistantMessage(
@@ -5156,7 +5161,7 @@ async def create_anthropic_message(
         )
 
         anthropic_response = AnthropicResponse(
-            model=_model_name,
+            model=_response_model_name(anthropic_request.model),
             content=content_blocks,
             stop_reason=stop_reason,
             usage=AnthropicUsage(
@@ -5352,7 +5357,7 @@ async def _stream_anthropic_messages(
             "id": msg_id,
             "type": "message",
             "role": "assistant",
-            "model": _model_name,
+            "model": _response_model_name(anthropic_request.model),
             "content": [],
             "stop_reason": None,
             "stop_sequence": None,
@@ -5635,7 +5640,7 @@ async def stream_completion(
                 "id": f"cmpl-{uuid.uuid4().hex[:8]}",
                 "object": "text_completion",
                 "created": int(time.time()),
-                "model": _model_name,
+                "model": _response_model_name(request.model),
                 "choices": [
                     {
                         "index": 0,
@@ -5695,7 +5700,7 @@ async def stream_chat_completion(
     # First chunk with role
     first_chunk = ChatCompletionChunk(
         id=response_id,
-        model=_model_name,
+        model=_response_model_name(request.model),
         choices=[
             ChatCompletionChunkChoice(
                 delta=ChatCompletionChunkDelta(role="assistant"),
@@ -5819,7 +5824,7 @@ async def stream_chat_completion(
                                 # Still emit reasoning while buffering tool call
                                 chunk = ChatCompletionChunk(
                                     id=response_id,
-                                    model=_model_name,
+                                    model=_response_model_name(request.model),
                                     choices=[
                                         ChatCompletionChunkChoice(
                                             delta=ChatCompletionChunkDelta(
@@ -5846,7 +5851,7 @@ async def stream_chat_completion(
                                         )
                             chunk = ChatCompletionChunk(
                                 id=response_id,
-                                model=_model_name,
+                                model=_response_model_name(request.model),
                                 choices=[
                                     ChatCompletionChunkChoice(
                                         delta=ChatCompletionChunkDelta(
@@ -5879,7 +5884,7 @@ async def stream_chat_completion(
 
                 chunk = ChatCompletionChunk(
                     id=response_id,
-                    model=_model_name,
+                    model=_response_model_name(request.model),
                     choices=[
                         ChatCompletionChunkChoice(
                             delta=ChatCompletionChunkDelta(
@@ -5949,7 +5954,7 @@ async def stream_chat_completion(
                                         )
                             chunk = ChatCompletionChunk(
                                 id=response_id,
-                                model=_model_name,
+                                model=_response_model_name(request.model),
                                 choices=[
                                     ChatCompletionChunkChoice(
                                         delta=ChatCompletionChunkDelta(
@@ -5981,7 +5986,7 @@ async def stream_chat_completion(
 
                 chunk = ChatCompletionChunk(
                     id=response_id,
-                    model=_model_name,
+                    model=_response_model_name(request.model),
                     choices=[
                         ChatCompletionChunkChoice(
                             delta=ChatCompletionChunkDelta(
@@ -6010,7 +6015,7 @@ async def stream_chat_completion(
             if final_parse_result.tools_called:
                 tool_chunk = ChatCompletionChunk(
                     id=response_id,
-                    model=_model_name,
+                    model=_response_model_name(request.model),
                     choices=[
                         ChatCompletionChunkChoice(
                             delta=ChatCompletionChunkDelta(
@@ -6081,7 +6086,7 @@ async def stream_chat_completion(
         if include_usage:
             usage_chunk = ChatCompletionChunk(
                 id=response_id,
-                model=_model_name,
+                model=_response_model_name(request.model),
                 choices=[],  # Empty choices for usage-only chunk
                 usage=Usage(
                     prompt_tokens=prompt_tokens,
