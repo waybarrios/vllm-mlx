@@ -425,6 +425,59 @@ class TestClassifierForward:
                 config,
             )
 
+    def test_classifier_forward_supports_xlm_roberta_two_layer_head(self):
+        """XLM-RoBERTa rerankers use dense -> tanh -> out_proj classifier heads."""
+        import mlx.core as mx
+
+        from vllm_mlx.rerank_forward import classifier_forward
+
+        config = {
+            "model_type": "xlm-roberta",
+            "hidden_size": 8,
+            "num_attention_heads": 2,
+            "intermediate_size": 16,
+            "num_hidden_layers": 1,
+            "num_labels": 1,
+            "vocab_size": 20,
+            "max_position_embeddings": 32,
+            "type_vocab_size": 2,
+            "layer_norm_eps": 1e-12,
+            "hidden_act": "gelu",
+            "pad_token_id": 1,
+        }
+        weights = _rename_bert_prefix(_make_bert_weights(config), "xlm-roberta")
+        del weights["classifier.weight"]
+        del weights["classifier.bias"]
+        weights["classifier.dense.weight"] = mx.random.normal((8, 8)) * 0.02
+        weights["classifier.dense.bias"] = mx.zeros((8,))
+        weights["classifier.out_proj.weight"] = mx.random.normal((1, 8)) * 0.02
+        weights["classifier.out_proj.bias"] = mx.zeros((1,))
+
+        logits = classifier_forward(
+            mx.array([[1, 2, 3]]),
+            mx.array([[1, 1, 1]]),
+            weights,
+            config,
+        )
+        mx.eval(logits)
+
+        assert logits.shape == (1, 1)
+
+    def test_roberta_position_ids_use_padding_offset(self):
+        """RoBERTa-family rerankers reserve pad position and offset real tokens."""
+        import mlx.core as mx
+
+        from vllm_mlx.rerank_forward import _position_ids_for_config
+
+        config = {"model_type": "xlm-roberta", "pad_token_id": 1}
+        input_ids = mx.array([[7, 8, 1, 1], [9, 10, 11, 1]])
+        attention_mask = mx.array([[1, 1, 0, 0], [1, 1, 1, 0]])
+
+        position_ids = _position_ids_for_config(config, input_ids, attention_mask)
+        mx.eval(position_ids)
+
+        assert position_ids.tolist() == [[2, 3, 1, 1], [2, 3, 4, 1]]
+
 
 def _make_bert_weights(config: dict) -> dict:
     """Build minimal random BERT-style weights for testing."""
@@ -479,6 +532,13 @@ def _make_bert_weights(config: dict) -> dict:
     w["classifier.bias"] = mx.zeros((num_labels,))
 
     return w
+
+
+def _rename_bert_prefix(weights: dict, new_prefix: str) -> dict:
+    renamed = {}
+    for key, value in weights.items():
+        renamed[key.replace("bert.", f"{new_prefix}.", 1)] = value
+    return renamed
 
 
 # =============================================================================
