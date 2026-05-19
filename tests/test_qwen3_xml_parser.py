@@ -2,6 +2,7 @@
 """Functional tests for Qwen3XMLToolParser parsing logic."""
 
 import json
+import logging
 
 import pytest
 
@@ -134,6 +135,43 @@ class TestNonStreamingExtraction:
         result = parser.extract_tool_calls(text)
         assert not result.tools_called
 
+    @pytest.mark.parametrize(
+        "text",
+        ["<tool_call></>", "<tool_call></tool_call>", "<tool_call/>"],
+    )
+    def test_empty_wrapper_is_not_synthesized(self, parser, caplog, text):
+        request = {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "list files in /tmp/projects",
+                }
+            ],
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "bash",
+                        "description": "Run a shell command",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"command": {"type": "string"}},
+                            "required": ["command"],
+                        },
+                    },
+                },
+            ],
+        }
+
+        with caplog.at_level(logging.WARNING):
+            result = parser.extract_tool_calls(text, request=request)
+
+        assert not result.tools_called
+        assert result.tool_calls == []
+        assert result.content == ""
+        assert "empty tool_call wrapper" in caplog.text
+        assert "ls -la" not in caplog.text
+
     def test_multiline_parameter(self, parser):
         text = (
             "<tool_call>\n"
@@ -186,6 +224,42 @@ class TestStreamingParser:
             if result is not None:
                 deltas.append(result)
         assert len(deltas) > 0
+
+    @pytest.mark.parametrize(
+        "text",
+        ["<tool_call></>", "<tool_call></tool_call>", "<tool_call/>"],
+    )
+    def test_streaming_empty_wrapper_does_not_emit_tool_call(
+        self, parser, caplog, text
+    ):
+        request = {
+            "messages": [{"role": "user", "content": "list files in /tmp/projects"}],
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "bash",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"command": {"type": "string"}},
+                            "required": ["command"],
+                        },
+                    },
+                }
+            ],
+        }
+
+        with caplog.at_level(logging.WARNING):
+            result = parser.extract_tool_calls_streaming(
+                "",
+                text,
+                text,
+                request=request,
+            )
+
+        assert result is None or not result.get("tool_calls")
+        assert "empty tool_call wrapper" in caplog.text
+        assert "ls -la" not in caplog.text
 
 
 class TestMalformedXML:

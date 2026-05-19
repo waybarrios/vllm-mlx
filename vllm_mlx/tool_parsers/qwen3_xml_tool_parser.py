@@ -44,6 +44,14 @@ from .abstract_tool_parser import (
 logger = logging.getLogger(__name__)
 
 
+def _is_empty_tool_wrapper(text: str) -> bool:
+    cleaned = text.strip()
+    return bool(
+        re.fullmatch(r"<tool_call>\s*</(?:tool_call)?>", cleaned)
+        or re.fullmatch(r"<tool_call\s*/>", cleaned)
+    )
+
+
 # ---------------------------------------------------------------------------
 # Shim types matching vLLM protocol types used by StreamingXMLToolCallParser.
 # These are lightweight replacements so the core parser works unchanged.
@@ -1317,6 +1325,16 @@ class Qwen3XMLToolParser(ToolParser):
         # this guards against non-streaming paths or missing parser.)
         cleaned = self.strip_think_tags(model_output)
 
+        if _is_empty_tool_wrapper(cleaned):
+            logger.warning(
+                "Model emitted empty tool_call wrapper; treating it as content"
+            )
+            return ExtractedToolCallInformation(
+                tools_called=False,
+                tool_calls=[],
+                content="",
+            )
+
         self._xml_parser.reset_streaming_state()
         tools = self._wrap_tools(request)
         if tools:
@@ -1363,6 +1381,12 @@ class Qwen3XMLToolParser(ToolParser):
         Returns dict with 'tool_calls' and/or 'content' keys,
         or None to suppress the chunk.
         """
+        if _is_empty_tool_wrapper(current_text):
+            logger.warning(
+                "Model emitted empty tool_call wrapper; treating it as content"
+            )
+            return None
+
         if not previous_text:
             self._xml_parser.reset_streaming_state()
             tools = self._wrap_tools(request)
