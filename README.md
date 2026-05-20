@@ -41,6 +41,29 @@ export ANTHROPIC_API_KEY=not-needed
 claude
 ```
 
+## Runtime profiles from a checkout
+
+The PyPI package gives you the `vllm-mlx` command. A source checkout also
+includes profile scripts that keep common local serving setups repeatable.
+
+```bash
+# Daily local text serving
+scripts/serve_profile.sh text-default mlx-community/Qwen3-4B-Instruct-2507-4bit
+
+# Tool-calling profile
+scripts/serve_profile.sh text-tools mlx-community/Qwen3-4B-Instruct-2507-4bit
+
+# Generic OpenAI-compatible client profile
+scripts/serve_client_profile.sh generic-openai mlx-community/Qwen3-4B-Instruct-2507-4bit
+```
+
+The profile launchers default to localhost binding. Set `LISTEN_MODE=public`
+only when the server must be reachable from another host.
+
+See [Client Compatibility](docs/guides/client-compatibility.md) and
+[Model And Serve Profile Matrix](docs/guides/model-profile-matrix.md) for the
+profile map.
+
 ## Features
 
 ### APIs
