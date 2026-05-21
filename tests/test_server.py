@@ -193,6 +193,64 @@ class TestCompletionRequest:
             )
 
 
+class TestSamplingDefaults:
+    """Test server-wide sampling default resolution."""
+
+    def test_extended_sampling_defaults_resolve_from_server_globals(self):
+        from vllm_mlx import server
+
+        old_values = (
+            server._default_top_k,
+            server._default_min_p,
+            server._default_presence_penalty,
+            server._default_repetition_penalty,
+        )
+        try:
+            server._default_top_k = 20
+            server._default_min_p = 0.05
+            server._default_presence_penalty = 1.5
+            server._default_repetition_penalty = 1.1
+
+            assert server._resolve_top_k(None) == 20
+            assert server._resolve_min_p(None) == 0.05
+            assert server._resolve_presence_penalty(None) == 1.5
+            assert server._resolve_repetition_penalty(None) == 1.1
+        finally:
+            (
+                server._default_top_k,
+                server._default_min_p,
+                server._default_presence_penalty,
+                server._default_repetition_penalty,
+            ) = old_values
+
+    def test_request_values_override_extended_sampling_defaults(self):
+        from vllm_mlx import server
+
+        old_values = (
+            server._default_top_k,
+            server._default_min_p,
+            server._default_presence_penalty,
+            server._default_repetition_penalty,
+        )
+        try:
+            server._default_top_k = 20
+            server._default_min_p = 0.05
+            server._default_presence_penalty = 1.5
+            server._default_repetition_penalty = 1.1
+
+            assert server._resolve_top_k(0) == 0
+            assert server._resolve_min_p(0.0) == 0.0
+            assert server._resolve_presence_penalty(0.0) == 0.0
+            assert server._resolve_repetition_penalty(1.0) == 1.0
+        finally:
+            (
+                server._default_top_k,
+                server._default_min_p,
+                server._default_presence_penalty,
+                server._default_repetition_penalty,
+            ) = old_values
+
+
 class TestAnthropicRequest:
     """Test Anthropic request model."""
 

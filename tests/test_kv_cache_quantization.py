@@ -166,7 +166,11 @@ class TestPrefixCacheIntegration:
 
     def test_store_fetch_without_quantization(self):
         model = self._make_cache_and_model()
-        config = MemoryCacheConfig(kv_quantize=False, max_memory_mb=500)
+        config = MemoryCacheConfig(
+            kv_quantize=False,
+            max_memory_mb=500,
+            min_prefix_tokens=1,
+        )
         pc = MemoryAwarePrefixCache(model, config)
 
         cache = _make_kv_cache(n_layers=2, seq_len=50)
@@ -187,6 +191,7 @@ class TestPrefixCacheIntegration:
             kv_bits=8,
             kv_min_quantize_tokens=0,
             max_memory_mb=500,
+            min_prefix_tokens=1,
         )
         pc = MemoryAwarePrefixCache(model, config)
 
@@ -282,6 +287,7 @@ class TestMinQuantizeTokensThreshold:
             kv_bits=8,
             kv_min_quantize_tokens=256,
             max_memory_mb=500,
+            min_prefix_tokens=1,
         )
         pc = MemoryAwarePrefixCache(model, config)
 
@@ -319,7 +325,11 @@ class TestMinQuantizeTokensThreshold:
     def test_trim_applied_without_quantization(self):
         """Oversized arrays should be trimmed even without quantization."""
         model = self._make_model()
-        config = MemoryCacheConfig(kv_quantize=False, max_memory_mb=500)
+        config = MemoryCacheConfig(
+            kv_quantize=False,
+            max_memory_mb=500,
+            min_prefix_tokens=1,
+        )
         pc = MemoryAwarePrefixCache(model, config)
 
         # Create oversized cache: arrays have 4096 but offset is 100
