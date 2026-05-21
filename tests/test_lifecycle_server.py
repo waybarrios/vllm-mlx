@@ -3726,3 +3726,64 @@ class TestResponseModelFieldUsesServedName:
         body = json.loads(response.body.decode())
         assert body["model"] == served_name
         assert body["model"] != "user-sent-model-name"
+
+    @pytest.mark.anyio
+    async def test_registry_mode_completion_response_uses_request_model(
+        self, monkeypatch
+    ):
+        import vllm_mlx.server as srv
+        from vllm_mlx.engine.base import GenerationOutput
+
+        class FakeEngine:
+            preserve_native_tool_format = False
+            is_mllm = False
+
+            async def generate(self, **kwargs):
+                return GenerationOutput(
+                    text="hello",
+                    completion_tokens=1,
+                    prompt_tokens=1,
+                )
+
+        async def fake_acquire(
+            raw_request,
+            *,
+            total_timeout=None,
+            deadline=None,
+            count_activity=True,
+            model=None,
+        ):
+            return FakeEngine()
+
+        async def fake_release(*, count_activity=True):
+            pass
+
+        monkeypatch.setattr(srv, "_validate_model_name", lambda _m: None)
+        monkeypatch.setattr(srv, "_acquire_default_engine_for_request", fake_acquire)
+        monkeypatch.setattr(srv, "_release_default_engine", fake_release)
+        monkeypatch.setattr(srv, "_model_name", None)
+        monkeypatch.setattr(srv, "_default_max_tokens", 32)
+
+        class FakeRawRequest:
+            async def is_disconnected(self):
+                return False
+
+        request = srv.CompletionRequest(
+            model="registry-model-name",
+            prompt="hi",
+            stream=False,
+        )
+
+        response = await srv.create_completion(request, FakeRawRequest())
+        assert response.model == "registry-model-name"
+
+    def test_registry_mode_response_builders_do_not_use_bare_global_model_name(self):
+        from pathlib import Path
+
+        import vllm_mlx.server as srv
+
+        source = Path(srv.__file__).read_text(encoding="utf-8")
+        endpoint_source = source[source.index("# Completion Endpoints") :]
+
+        assert "model=_model_name," not in endpoint_source
+        assert '"model": _model_name,' not in endpoint_source
