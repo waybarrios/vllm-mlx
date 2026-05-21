@@ -460,15 +460,23 @@ class SimpleEngine(BaseEngine):
         Mirrors the threading constraint enforced by ``prepare_for_start``:
         the model was loaded on the MLX worker, so iteration must happen on
         the same worker for MLX thread-local stream ownership to hold.
+
+        Cancellation: the consumer sets ``cancel_event`` in its ``finally``
+        block. The producer checks the event between chunks and breaks out
+        early so a disconnected client doesn't keep the single-threaded
+        ``_mlx_executor`` busy generating tokens nothing will consume.
         """
         import queue as _queue
 
         q: _queue.Queue = _queue.Queue()  # unbounded; max_tokens caps memory
+        cancel_event = threading.Event()
 
         def producer():
             try:
                 _bind_worker_generation_streams()
                 for chunk in factory():
+                    if cancel_event.is_set():
+                        break
                     q.put(("c", chunk))
             except BaseException as exc:
                 q.put(("e", exc))
@@ -486,8 +494,13 @@ class SimpleEngine(BaseEngine):
                     raise payload
                 yield payload
         finally:
-            # If the consumer broke early, the producer keeps pushing to an
-            # unbounded queue; it will exit on its own when the model
+            # Signal the producer to stop ASAP if the consumer is bailing
+            # (client disconnect, exception, or early break). Without this
+            # the producer continues generating tokens to completion on the
+            # single MLX worker thread and blocks all subsequent requests.
+            cancel_event.set()
+            # Producer will still emit the trailing ("d", None) sentinel after
+            # observing the cancel between chunks; no need to wait for fut.
             # iterator finishes or raises. No further action required here.
             if not fut.done():
                 pass
@@ -509,9 +522,10 @@ class SimpleEngine(BaseEngine):
             # asyncio.to_thread uses the default thread pool, landing on a
             # different worker per call and breaking model-parameter stream
             # affinity for models that touch the GPU during __init__.
+            # loop.run_in_executor already returns an asyncio.Future, so
+            # asyncio.shield/ensure_future work on it directly.
             loop = asyncio.get_running_loop()
-            future = loop.run_in_executor(self._mlx_executor, run_bound)
-            task = asyncio.ensure_future(asyncio.wrap_future(future))
+            task = loop.run_in_executor(self._mlx_executor, run_bound)
             try:
                 return await asyncio.shield(task)
             except asyncio.CancelledError:
