@@ -189,6 +189,82 @@ def test_has_media_content_none_content():
 from unittest.mock import MagicMock
 
 
+def test_mllm_mtp_attempt_metadata_only_marks_real_attempts():
+    from vllm_mlx.mllm_batch_generator import (
+        MLLMBatchResponse,
+        _mark_mtp_attempts_on_primary_responses,
+    )
+
+    attempted = {7: 1, 99: 1}
+    attempted_response = MLLMBatchResponse(
+        uid=7,
+        request_id="req-7",
+        token=11,
+        logprobs=None,
+    )
+    skipped_response = MLLMBatchResponse(
+        uid=9,
+        request_id="req-9",
+        token=21,
+        logprobs=None,
+    )
+
+    _mark_mtp_attempts_on_primary_responses(
+        [attempted_response, skipped_response],
+        attempted,
+    )
+
+    assert attempted_response.mtp_attempted is True
+    assert attempted_response.mtp_attempted_count == 1
+    assert skipped_response.mtp_attempted is False
+    assert skipped_response.mtp_attempted_count == 0
+    assert attempted == {}
+
+
+def test_mllm_scheduler_exposes_mtp_attempts_and_accepts_on_outputs():
+    from vllm_mlx.mllm_batch_generator import MLLMBatchResponse
+    from vllm_mlx.mllm_scheduler import MLLMRequest, MLLMScheduler
+
+    class _Tokenizer:
+        clean_up_tokenization_spaces = False
+
+        def decode(self, tokens):
+            return "".join(str(token) for token in tokens)
+
+    scheduler = MLLMScheduler.__new__(MLLMScheduler)
+    scheduler.uid_to_request_id = {7: "req-7"}
+    scheduler.running = {"req-7": MLLMRequest(request_id="req-7", prompt="prompt")}
+    scheduler.processor = _Tokenizer()
+    scheduler._detokenizer_pool = {}
+    scheduler.total_completion_tokens = 0
+    scheduler.num_requests_processed = 0
+
+    outputs, finished = scheduler._process_batch_responses(
+        [
+            MLLMBatchResponse(
+                uid=7,
+                request_id="req-7",
+                token=11,
+                logprobs=None,
+                mtp_attempted=True,
+                mtp_attempted_count=1,
+            ),
+            MLLMBatchResponse(
+                uid=7,
+                request_id="req-7",
+                token=12,
+                logprobs=None,
+                finish_reason="stop",
+                from_draft=True,
+            ),
+        ]
+    )
+
+    assert finished == {"req-7"}
+    assert outputs[-1].mtp_drafts == 1
+    assert outputs[-1].mtp_accepted == 1
+
+
 def test_get_language_model():
     from vllm_mlx.models.mllm import MLXMultimodalLM
 
