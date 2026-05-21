@@ -13,6 +13,7 @@ import os
 import threading
 import time
 from collections.abc import AsyncIterator
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 import mlx.core as mx
@@ -196,6 +197,19 @@ class SimpleEngine(BaseEngine):
         # restore would silently desynchronize. Probed once in ``start()``.
         self._supports_system_kv_cache: bool = False
 
+        # MLX streams are thread-local. Some models (gpt-oss-120b's
+        # QuantizedSwitchLinear) touch the GPU during nn.Module __init__,
+        # which binds the model parameter arrays to the loading thread's
+        # stream. Routing inference through asyncio's default executor or
+        # asyncio.to_thread (a different thread per call) breaks those
+        # arrays. Owning ONE worker thread for the lifetime of the engine,
+        # and pinning load + every inference call to it, keeps the model's
+        # stream namespace consistent.
+        self._mlx_executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="mlx-worker"
+        )
+        self._mlx_thread_id: int | None = None
+
     @property
     def model_name(self) -> str:
         """Get the model name."""
@@ -216,10 +230,35 @@ class SimpleEngine(BaseEngine):
         return self._model.tokenizer
 
     def prepare_for_start(self) -> None:
-        """Load the backing model off the serving event loop."""
+        """Load the backing model on the engine's dedicated MLX worker thread.
+
+        Routes through self._mlx_executor regardless of which thread the
+        caller is on. Necessary because models that touch the GPU during
+        nn.Module __init__ (e.g. gpt-oss-120b's QuantizedSwitchLinear) bind
+        their parameter mx.array objects to the loading thread's stream.
+        Subsequent inference must run on the SAME thread to share that
+        stream namespace.
+
+        Callable from any thread; blocks the caller until load completes.
+        """
         if self._model is not None:
             return
+        if threading.get_ident() == self._mlx_thread_id:
+            # Already on the MLX worker (re-entry from inference path).
+            self._do_prepare_for_start()
+        else:
+            fut = self._mlx_executor.submit(self._mlx_marked_prepare)
+            fut.result()
 
+    def _mlx_marked_prepare(self) -> None:
+        """Record the MLX worker thread id, then run the real load."""
+        self._mlx_thread_id = threading.get_ident()
+        self._do_prepare_for_start()
+
+    def _do_prepare_for_start(self) -> None:
+        """Actual model construction + weight load. Runs on the MLX worker."""
+        if self._model is not None:
+            return
         if self._is_mllm:
             from ..models.mllm import MLXMultimodalLM
 
@@ -397,6 +436,15 @@ class SimpleEngine(BaseEngine):
         self._system_kv_hash = None
         self._system_kv_token_count = 0
         self._supports_system_kv_cache = False
+        try:
+            self._mlx_executor.shutdown(wait=False, cancel_futures=True)
+        except Exception:
+            logger.debug("mlx executor shutdown failed", exc_info=True)
+        # Rebuild so a subsequent start() (e.g. in tests) gets a fresh worker.
+        self._mlx_executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="mlx-worker"
+        )
+        self._mlx_thread_id = None
         logger.info("SimpleEngine stopped")
 
     def _should_route_text_through_text_model(
@@ -404,6 +452,45 @@ class SimpleEngine(BaseEngine):
     ) -> bool:
         """Return whether text-only MLLM requests may use mlx_lm TextModel."""
         return not (mllm_draft_requested and self._mllm_draft_model_path is not None)
+
+    async def _stream_in_mlx_executor(self, factory):
+        """Run a synchronous chunk iterator on the dedicated MLX worker thread,
+        bridging chunks back to the event loop via a thread-safe queue.
+
+        Mirrors the threading constraint enforced by ``prepare_for_start``:
+        the model was loaded on the MLX worker, so iteration must happen on
+        the same worker for MLX thread-local stream ownership to hold.
+        """
+        import queue as _queue
+
+        q: _queue.Queue = _queue.Queue()  # unbounded; max_tokens caps memory
+
+        def producer():
+            try:
+                _bind_worker_generation_streams()
+                for chunk in factory():
+                    q.put(("c", chunk))
+            except BaseException as exc:
+                q.put(("e", exc))
+            finally:
+                q.put(("d", None))
+
+        fut = self._mlx_executor.submit(producer)
+        loop = asyncio.get_running_loop()
+        try:
+            while True:
+                tag, payload = await loop.run_in_executor(None, q.get)
+                if tag == "d":
+                    return
+                if tag == "e":
+                    raise payload
+                yield payload
+        finally:
+            # If the consumer broke early, the producer keeps pushing to an
+            # unbounded queue; it will exit on its own when the model
+            # iterator finishes or raises. No further action required here.
+            if not fut.done():
+                pass
 
     async def _run_blocking_serialized(self, func, /, *args, on_cancel=None, **kwargs):
         """Run a blocking MLX operation under the generation lock.
@@ -418,7 +505,13 @@ class SimpleEngine(BaseEngine):
                 _bind_worker_generation_streams()
                 return func(*args, **kwargs)
 
-            task = asyncio.create_task(asyncio.to_thread(run_bound))
+            # Pin to the engine's dedicated MLX thread — see __init__.
+            # asyncio.to_thread uses the default thread pool, landing on a
+            # different worker per call and breaking model-parameter stream
+            # affinity for models that touch the GPU during __init__.
+            loop = asyncio.get_running_loop()
+            future = loop.run_in_executor(self._mlx_executor, run_bound)
+            task = asyncio.ensure_future(asyncio.wrap_future(future))
             try:
                 return await asyncio.shield(task)
             except asyncio.CancelledError:
@@ -577,23 +670,23 @@ class SimpleEngine(BaseEngine):
                     return
 
         async with self._generation_lock:
-            # Non-stream chat runs in a worker thread and rebinds generation
-            # streams there. Rebind again on the current thread before
-            # stream_generate so nonstream->stream mode switches remain valid.
-            _bind_worker_generation_streams()
-
             accumulated_text = ""
             prompt_tokens = 0
             completion_tokens = 0
             finished = False
 
-            for chunk in self._model.stream_generate(
+            # Drive the sync iterator on the engine's MLX worker thread (same
+            # thread as load()), bridging chunks back via _stream_in_mlx_executor.
+            stream_kwargs = dict(
                 prompt=prompt,
                 max_tokens=max_tokens,
                 temperature=temperature,
                 top_p=top_p,
                 stop=stop,
                 **kwargs,
+            )
+            async for chunk in self._stream_in_mlx_executor(
+                lambda: self._model.stream_generate(**stream_kwargs)
             ):
                 prompt_tokens = (
                     chunk.prompt_tokens
