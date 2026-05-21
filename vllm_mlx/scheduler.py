@@ -80,6 +80,12 @@ class SchedulerConfig:
     kv_cache_quantization_bits: int = 8
     kv_cache_quantization_group_size: int = 64
     kv_cache_min_quantize_tokens: int = 256
+    kv_cache_k_bits: Optional[int] = (
+        None  # None = inherit from kv_cache_quantization_bits
+    )
+    kv_cache_v_bits: Optional[int] = (
+        None  # None = inherit from kv_cache_quantization_bits
+    )
 
     # Paged cache settings (experimental - for memory efficiency)
     use_paged_cache: bool = (
@@ -1188,6 +1194,8 @@ class Scheduler:
                     max_memory_percent=self.config.cache_memory_percent,
                     kv_quantize=self.config.kv_cache_quantization,
                     kv_bits=self.config.kv_cache_quantization_bits,
+                    kv_k_bits=self.config.kv_cache_k_bits,
+                    kv_v_bits=self.config.kv_cache_v_bits,
                     kv_group_size=self.config.kv_cache_quantization_group_size,
                     kv_min_quantize_tokens=self.config.kv_cache_min_quantize_tokens,
                 )

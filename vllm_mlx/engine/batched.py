@@ -340,6 +340,8 @@ class BatchedEngine(BaseEngine):
         kv_group_size = getattr(
             self._scheduler_config, "kv_cache_quantization_group_size", 64
         )
+        kv_k_bits = getattr(self._scheduler_config, "kv_cache_k_bits", None)
+        kv_v_bits = getattr(self._scheduler_config, "kv_cache_v_bits", None)
 
         chunked_prefill_tokens = getattr(
             self._scheduler_config, "chunked_prefill_tokens", 0
@@ -370,6 +372,8 @@ class BatchedEngine(BaseEngine):
             kv_cache_quantization=kv_quant,
             kv_cache_quantization_bits=kv_bits,
             kv_cache_quantization_group_size=kv_group_size,
+            kv_cache_k_bits=kv_k_bits,
+            kv_cache_v_bits=kv_v_bits,
             chunked_prefill_tokens=chunked_prefill_tokens,
             max_kv_size=max_kv_size,
             **mllm_extra,

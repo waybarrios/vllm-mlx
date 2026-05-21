@@ -313,7 +313,7 @@ class TestDequantizeCacheSlice:
         layer.offset = 512
         mx.eval(layer.keys, layer.values)
 
-        qw = _QuantizedCacheWrapper(layer, bits=8, group_size=64)
+        qw = _QuantizedCacheWrapper(layer, k_bits=8, v_bits=8, group_size=64)
         trimmed = _trim_cache_offset([qw], 512 - 60)
         result = _dequantize_cache(trimmed)
 
@@ -342,7 +342,7 @@ class TestDequantizeCacheSlice:
         layer.offset = 512
         mx.eval(layer.keys, layer.values)
 
-        qw = _QuantizedCacheWrapper(layer, bits=8, group_size=64)
+        qw = _QuantizedCacheWrapper(layer, k_bits=8, v_bits=8, group_size=64)
         trimmed = _trim_cache_offset([qw], 512 - 64)
         result = _dequantize_cache(trimmed)
 
@@ -369,7 +369,7 @@ class TestDequantizeCacheSlice:
         layer.offset = 128
         mx.eval(layer.keys, layer.values)
 
-        qw = _QuantizedCacheWrapper(layer, bits=8, group_size=64)
+        qw = _QuantizedCacheWrapper(layer, k_bits=8, v_bits=8, group_size=64)
         result = _dequantize_cache([qw])
 
         tc = result[0]
@@ -394,7 +394,7 @@ class TestDequantizeCacheSlice:
         layer.offset = 256
         mx.eval(layer.keys, layer.values)
 
-        qw = _QuantizedCacheWrapper(layer, bits=8, group_size=64)
+        qw = _QuantizedCacheWrapper(layer, k_bits=8, v_bits=8, group_size=64)
         original_offset = qw.offset
         original_keys_shape = qw.keys[0].shape  # quantized data tuple
 

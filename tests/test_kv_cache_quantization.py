@@ -351,3 +351,113 @@ class TestMinQuantizeTokensThreshold:
                 layer.keys.shape[2] == 100
             ), f"Expected trimmed to 100, got {layer.keys.shape[2]}"
             assert layer.values.shape[2] == 100
+
+
+class TestAsymmetricKVBits:
+    """Test asymmetric K/V bit quantization (e.g. K=8, V=4)."""
+
+    def test_asymmetric_k8_v4_quantize(self):
+        """K=8, V=4 roundtrip should work and produce correct types."""
+        cache = _make_kv_cache(n_layers=4, seq_len=128, n_heads=8, head_dim=64)
+        quantized = _quantize_cache(cache, k_bits=8, v_bits=4, group_size=64)
+        assert len(quantized) == len(cache)
+        for layer in quantized:
+            assert isinstance(layer, _QuantizedCacheWrapper)
+            assert layer.k_bits == 8
+            assert layer.v_bits == 4
+
+        restored = _dequantize_cache(quantized)
+        for orig, rest in zip(cache, restored):
+            assert isinstance(rest, KVCache)
+            assert rest.keys.shape == orig.keys.shape
+            assert rest.values.shape == orig.values.shape
+
+    def test_asymmetric_preserves_shapes(self):
+        """Dequantized shapes must match original regardless of bit config."""
+        cache = _make_kv_cache(n_layers=4, seq_len=256, n_heads=16, head_dim=64)
+        for k_bits, v_bits in [(8, 4), (4, 8), (4, 4), (8, 8)]:
+            quantized = _quantize_cache(
+                cache, k_bits=k_bits, v_bits=v_bits, group_size=64
+            )
+            restored = _dequantize_cache(quantized)
+            for orig, rest in zip(cache, restored):
+                assert (
+                    rest.keys.shape == orig.keys.shape
+                ), f"K shape mismatch for k={k_bits},v={v_bits}"
+                assert (
+                    rest.values.shape == orig.values.shape
+                ), f"V shape mismatch for k={k_bits},v={v_bits}"
+
+    def test_asymmetric_v4_uses_less_memory_than_symmetric_8(self):
+        """K=8, V=4 should use less memory than K=8, V=8."""
+        cache = _make_kv_cache(n_layers=8, seq_len=512, n_heads=32, head_dim=128)
+        q_sym = _quantize_cache(cache, k_bits=8, v_bits=8, group_size=64)
+        q_asym = _quantize_cache(cache, k_bits=8, v_bits=4, group_size=64)
+        mem_sym = estimate_kv_cache_memory(q_sym)
+        mem_asym = estimate_kv_cache_memory(q_asym)
+        assert (
+            mem_asym < mem_sym
+        ), f"K8V4 ({mem_asym}) should use less memory than K8V8 ({mem_sym})"
+
+    def test_config_with_asymmetric_bits(self):
+        """MemoryCacheConfig should accept kv_k_bits and kv_v_bits."""
+        config = MemoryCacheConfig(
+            kv_quantize=True,
+            kv_bits=8,
+            kv_k_bits=8,
+            kv_v_bits=4,
+        )
+        assert config.kv_k_bits == 8
+        assert config.kv_v_bits == 4
+        assert config.kv_bits == 8
+
+    def test_config_defaults_none(self):
+        """kv_k_bits and kv_v_bits default to None."""
+        config = MemoryCacheConfig()
+        assert config.kv_k_bits is None
+        assert config.kv_v_bits is None
+
+    def test_store_fetch_with_asymmetric_bits(self):
+        """Integration: store with K=8 V=4, fetch should return valid KVCache."""
+
+        class FakeModel:
+            pass
+
+        model = FakeModel()
+        config = MemoryCacheConfig(
+            kv_quantize=True,
+            kv_bits=8,
+            kv_k_bits=8,
+            kv_v_bits=4,
+            kv_min_quantize_tokens=0,
+            max_memory_mb=500,
+            min_prefix_tokens=1,
+        )
+        pc = MemoryAwarePrefixCache(model, config)
+
+        cache = _make_kv_cache(n_layers=2, seq_len=50)
+        tokens = list(range(50))
+
+        pc.store(tokens, cache)
+
+        # Verify stored as quantized with correct bits
+        stored_entry = list(pc._entries.values())[0]
+        for layer in stored_entry.cache:
+            assert isinstance(layer, _QuantizedCacheWrapper)
+            assert layer.k_bits == 8
+            assert layer.v_bits == 4
+
+        # Fetch should dequantize back to KVCache
+        fetched, remaining = pc.fetch(tokens)
+        assert fetched is not None
+        assert remaining == []
+        for layer in fetched:
+            assert isinstance(layer, KVCache)
+
+    def test_v_bits_none_falls_back_to_k_bits(self):
+        """_quantize_cache with v_bits=None should use k_bits for both."""
+        cache = _make_kv_cache(n_layers=2, seq_len=64)
+        quantized = _quantize_cache(cache, k_bits=4, v_bits=None, group_size=64)
+        for layer in quantized:
+            assert layer.k_bits == 4
+            assert layer.v_bits == 4

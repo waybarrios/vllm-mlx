@@ -281,6 +281,8 @@ def serve_command(args):
             kv_cache_quantization_bits=args.kv_cache_quantization_bits,
             kv_cache_quantization_group_size=args.kv_cache_quantization_group_size,
             kv_cache_min_quantize_tokens=args.kv_cache_min_quantize_tokens,
+            kv_cache_k_bits=args.kv_k_bits,
+            kv_cache_v_bits=args.kv_v_bits,
             mllm_prefill_step_size=(
                 args.mllm_prefill_step_size if args.mllm_prefill_step_size > 0 else None
             ),
@@ -314,10 +316,18 @@ def serve_command(args):
             )
             print(f"Memory-aware cache: {cache_info}")
             if args.kv_cache_quantization:
-                print(
-                    f"KV cache quantization: {args.kv_cache_quantization_bits}-bit, "
-                    f"group_size={args.kv_cache_quantization_group_size}"
-                )
+                kv_k = args.kv_k_bits or args.kv_cache_quantization_bits
+                kv_v = args.kv_v_bits or args.kv_cache_quantization_bits
+                if kv_k == kv_v:
+                    print(
+                        f"KV cache quantization: {kv_k}-bit, "
+                        f"group_size={args.kv_cache_quantization_group_size}"
+                    )
+                else:
+                    print(
+                        f"KV cache quantization: K={kv_k}-bit, V={kv_v}-bit, "
+                        f"group_size={args.kv_cache_quantization_group_size}"
+                    )
         elif enable_prefix_cache:
             print(f"Prefix cache: max_entries={args.prefix_cache_size}")
     else:
@@ -779,14 +789,21 @@ def bench_kv_cache_command(args):
     print(f"FP16 cache memory: {fp16_mem / 1024 / 1024:.2f} MB")
     print()
 
-    # Test each bit width
+    # Test each bit width configuration: (label, k_bits, v_bits)
+    configs = [
+        ("K8V8", 8, 8),
+        ("K8V4", 8, 4),
+        ("K4V4", 4, 4),
+    ]
     results = []
-    for bits in [8, 4]:
+    for label, k_bits, v_bits in configs:
         group_size = args.group_size
 
         # Quantize
         start = time.perf_counter()
-        quantized = _quantize_cache(cache, bits=bits, group_size=group_size)
+        quantized = _quantize_cache(
+            cache, k_bits=k_bits, v_bits=v_bits, group_size=group_size
+        )
         mx.eval(
             *[
                 layer.keys[0]
@@ -830,7 +847,9 @@ def bench_kv_cache_command(args):
 
         results.append(
             {
-                "bits": bits,
+                "label": label,
+                "k_bits": k_bits,
+                "v_bits": v_bits,
                 "mem_mb": quant_mem / 1024 / 1024,
                 "ratio": ratio,
                 "mean_err": mean_error,
@@ -854,7 +873,7 @@ def bench_kv_cache_command(args):
 
     for r in results:
         print(
-            f"{r['bits']}-bit{'':<7} {r['mem_mb']:>8.2f}MB "
+            f"{r['label']:<12} {r['mem_mb']:>8.2f}MB "
             f"{r['ratio']:>9.2f}x "
             f"{r['mean_err']:>10.5f} {r['max_err']:>10.5f} "
             f"{r['quant_ms']:>8.1f}ms {r['dequant_ms']:>8.1f}ms"
@@ -863,21 +882,23 @@ def bench_kv_cache_command(args):
     print()
 
     # Recommendation
-    best = results[0]  # 8-bit
+    best = results[0]  # K8V8
+    asym = results[1]  # K8V4
     print(
-        f"Recommendation: 8-bit quantization gives {best['ratio']:.1f}x memory savings "
+        f"Recommendation: K8V8 gives {best['ratio']:.1f}x memory savings "
         f"with mean error {best['mean_err']:.5f}"
     )
     print(
-        f"Use 4-bit for maximum compression if quality loss of "
-        f"{results[1]['mean_err']:.4f} is acceptable."
+        f"K8V4 (asymmetric) gives {asym['ratio']:.1f}x savings "
+        f"with mean error {asym['mean_err']:.5f} — "
+        f"~25% less memory than K8V8."
     )
     print()
     print("Usage:")
     print("  vllm-mlx serve <model> --continuous-batching --kv-cache-quantization")
     print(
         "  vllm-mlx serve <model> --continuous-batching --kv-cache-quantization "
-        "--kv-cache-quantization-bits 4"
+        "--kv-v-bits 4"
     )
 
 
@@ -1094,6 +1115,20 @@ Examples:
         type=int,
         default=256,
         help="Minimum tokens for quantization to apply (default: 256)",
+    )
+    serve_parser.add_argument(
+        "--kv-k-bits",
+        type=int,
+        default=None,
+        choices=[4, 8],
+        help="Bit width for KV cache key quantization (overrides --kv-cache-quantization-bits for keys)",
+    )
+    serve_parser.add_argument(
+        "--kv-v-bits",
+        type=int,
+        default=None,
+        choices=[4, 8],
+        help="Bit width for KV cache value quantization (overrides --kv-cache-quantization-bits for values)",
     )
     # SSD cache tiering options
     serve_parser.add_argument(

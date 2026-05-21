@@ -81,6 +81,12 @@ class MLLMSchedulerConfig:
     kv_cache_quantization: bool = False
     kv_cache_quantization_bits: int = 8
     kv_cache_quantization_group_size: int = 64
+    kv_cache_k_bits: Optional[int] = (
+        None  # None = inherit from kv_cache_quantization_bits
+    )
+    kv_cache_v_bits: Optional[int] = (
+        None  # None = inherit from kv_cache_quantization_bits
+    )
     # Interleaved prefill/decode budget per step (0 = disabled, blocking prefill)
     chunked_prefill_tokens: int = 0
     # Maximum KV cache size per sequence (0 = unbounded; >0 enables RotatingKVCache)
@@ -304,6 +310,8 @@ class MLLMScheduler:
                     max_memory_mb=self.config.prefix_cache_memory_mb,
                     kv_quantize=self.config.kv_cache_quantization,
                     kv_bits=self.config.kv_cache_quantization_bits,
+                    kv_k_bits=self.config.kv_cache_k_bits,
+                    kv_v_bits=self.config.kv_cache_v_bits,
                     kv_group_size=self.config.kv_cache_quantization_group_size,
                 )
 

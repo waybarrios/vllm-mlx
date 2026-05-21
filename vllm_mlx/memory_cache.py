@@ -156,7 +156,9 @@ class MemoryCacheConfig:
         max_entries: Hard limit on number of entries (safety net).
         enable_memory_tracking: Whether to track per-entry memory.
         kv_quantize: Whether to quantize KV cache layers for reduced memory.
-        kv_bits: Number of bits for KV cache quantization.
+        kv_bits: Number of bits for KV cache quantization (symmetric default).
+        kv_k_bits: Bit width for key quantization (None = use kv_bits).
+        kv_v_bits: Bit width for value quantization (None = use kv_bits).
         kv_group_size: Group size for KV cache quantization.
         kv_min_quantize_tokens: Minimum sequence length for quantization to apply.
         min_prefix_tokens: Minimum cached prefix length eligible for reuse.
@@ -168,6 +170,8 @@ class MemoryCacheConfig:
     enable_memory_tracking: bool = True
     kv_quantize: bool = False
     kv_bits: int = 8
+    kv_k_bits: int | None = None  # None = use kv_bits
+    kv_v_bits: int | None = None  # None = use kv_bits
     kv_group_size: int = 64
     kv_min_quantize_tokens: int = 256
     min_prefix_tokens: int = 128
@@ -291,7 +295,8 @@ def _trim_cache_offset(cache: list[Any], trim_by: int) -> list[Any]:
             tc.keys = layer_cache.keys
             tc.values = layer_cache.values
             tc.offset = max(layer_cache.offset - trim_by, 0)
-            tc.bits = layer_cache.bits
+            tc.k_bits = layer_cache.k_bits
+            tc.v_bits = layer_cache.v_bits
             tc.group_size = layer_cache.group_size
             tc.orig_type = layer_cache.orig_type
             tc.orig_attrs = layer_cache.orig_attrs
@@ -499,19 +504,21 @@ class _QuantizedCacheWrapper:
         "keys",
         "values",
         "offset",
-        "bits",
+        "k_bits",
+        "v_bits",
         "group_size",
         "orig_type",
         "orig_attrs",
     )
 
-    def __init__(self, layer: Any, bits: int, group_size: int):
+    def __init__(self, layer: Any, k_bits: int, v_bits: int, group_size: int):
         import mlx.core as mx
 
-        self.keys = mx.quantize(layer.keys, group_size=group_size, bits=bits)
-        self.values = mx.quantize(layer.values, group_size=group_size, bits=bits)
+        self.keys = mx.quantize(layer.keys, group_size=group_size, bits=k_bits)
+        self.values = mx.quantize(layer.values, group_size=group_size, bits=v_bits)
         self.offset = layer.offset
-        self.bits = bits
+        self.k_bits = k_bits
+        self.v_bits = v_bits
         self.group_size = group_size
         self.orig_type = type(layer)
         # Preserve RotatingKVCache-specific attrs
@@ -521,20 +528,42 @@ class _QuantizedCacheWrapper:
                 self.orig_attrs[attr] = getattr(layer, attr)
 
 
-def _quantize_cache(cache: list[Any], bits: int = 8, group_size: int = 64) -> list[Any]:
+def _quantize_cache(
+    cache: list[Any],
+    k_bits: int = 8,
+    v_bits: int | None = None,
+    group_size: int = 64,
+    *,
+    bits: int | None = None,
+) -> list[Any]:
     """Quantize KV cache layers to reduce memory.
+
+    Supports asymmetric bit widths: ``k_bits`` for keys, ``v_bits`` for values.
+    When ``v_bits`` is None it defaults to ``k_bits`` (symmetric mode).
+
+    The legacy ``bits`` keyword is accepted for backward compatibility and
+    sets both ``k_bits`` and ``v_bits`` when the new parameters are at their
+    defaults.
 
     Only plain KVCache layers are quantized. RotatingKVCache (sliding window)
     is left as-is because its internal _idx/rotation state is tightly coupled
     with update_and_fetch logic and cannot survive quantize/dequantize roundtrip.
     RotatingKVCache is typically small (max_size=1024) so skipping it is fine.
     """
+    # Legacy compat: `bits=N` sets both k_bits and v_bits when they are defaults
+    if bits is not None:
+        if k_bits == 8 and v_bits is None:
+            k_bits = bits
+        v_bits = v_bits if v_bits is not None else bits
+    if v_bits is None:
+        v_bits = k_bits
+
     from mlx_lm.models.cache import KVCache
 
     quantized = []
     for layer in cache:
         if type(layer) is KVCache and getattr(layer, "keys", None) is not None:
-            quantized.append(_QuantizedCacheWrapper(layer, bits, group_size))
+            quantized.append(_QuantizedCacheWrapper(layer, k_bits, v_bits, group_size))
         else:
             quantized.append(layer)
     return quantized
@@ -555,10 +584,10 @@ def _dequantize_cache(cache: list[Any]) -> list[Any]:
             orig_cls = layer.orig_type
             kv = orig_cls.__new__(orig_cls)
             kv.keys = mx.dequantize(
-                *layer.keys, group_size=layer.group_size, bits=layer.bits
+                *layer.keys, group_size=layer.group_size, bits=layer.k_bits
             )
             kv.values = mx.dequantize(
-                *layer.values, group_size=layer.group_size, bits=layer.bits
+                *layer.values, group_size=layer.group_size, bits=layer.v_bits
             )
             kv.offset = layer.offset
             # Slice the dequantized arrays down to offset so that readers
@@ -977,7 +1006,10 @@ class MemoryAwarePrefixCache:
                 and len(tokens) >= self._config.kv_min_quantize_tokens
             ):
                 cache = _quantize_cache(
-                    cache, self._config.kv_bits, self._config.kv_group_size
+                    cache,
+                    k_bits=self._config.kv_k_bits or self._config.kv_bits,
+                    v_bits=self._config.kv_v_bits or self._config.kv_bits,
+                    group_size=self._config.kv_group_size,
                 )
 
             # Create entry and estimate memory
