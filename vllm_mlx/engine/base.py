@@ -27,6 +27,8 @@ class GenerationOutput:
     prompt_tokens: int = 0
     completion_tokens: int = 0
     finish_reason: str | None = "stop"
+    mtp_drafts: int = 0
+    mtp_accepted: int = 0
     # For streaming
     new_text: str = ""
     finished: bool = True

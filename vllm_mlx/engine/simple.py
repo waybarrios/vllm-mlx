@@ -127,6 +127,9 @@ class SimpleEngine(BaseEngine):
         specprefill_keep_pct: float = 0.3,
         specprefill_draft_model: str | None = None,
         max_kv_size: int = 0,
+        mllm_draft_model: str | None = None,
+        mllm_draft_kind: str | None = None,
+        mllm_draft_block_size: int | None = None,
     ):
         """
         Initialize the simple engine.
@@ -144,6 +147,9 @@ class SimpleEngine(BaseEngine):
             specprefill_keep_pct: Fraction of tokens to keep (default: 0.3)
             specprefill_draft_model: Path to small draft model for importance scoring
             max_kv_size: Maximum KV cache size per sequence (0 = unbounded)
+            mllm_draft_model: Optional MLLM speculative draft/assistant model path
+            mllm_draft_kind: Optional mlx-vlm draft kind, for example "mtp"
+            mllm_draft_block_size: Optional speculative block size for mlx-vlm
         """
         self._model_name = model_name
         self._created_at = time.time()
@@ -159,6 +165,9 @@ class SimpleEngine(BaseEngine):
         self._specprefill_threshold = specprefill_threshold
         self._specprefill_keep_pct = specprefill_keep_pct
         self._specprefill_draft_model_path = specprefill_draft_model
+        self._mllm_draft_model_path = mllm_draft_model
+        self._mllm_draft_kind = mllm_draft_kind
+        self._mllm_draft_block_size = mllm_draft_block_size
 
         # KV cache size limit
         self._max_kv_size = max_kv_size
@@ -219,6 +228,9 @@ class SimpleEngine(BaseEngine):
                 trust_remote_code=self._trust_remote_code,
                 enable_cache=self._enable_cache,
                 max_kv_size=self._max_kv_size,
+                draft_model=self._mllm_draft_model_path,
+                draft_kind=self._mllm_draft_kind,
+                draft_block_size=self._mllm_draft_block_size,
             )
         else:
             from ..models.llm import MLXLanguageModel
@@ -294,7 +306,7 @@ class SimpleEngine(BaseEngine):
             # Build parallel mlx_lm TextModel for text-only routing.
             # Even when MTP is disabled, text-only requests should not be trapped
             # on the slower mlx_vlm multimodal path.
-            if self._is_mllm:
+            if self._is_mllm and self._should_route_text_through_text_model():
                 try:
                     from ..text_model_from_vlm import build_text_model
 
@@ -386,6 +398,12 @@ class SimpleEngine(BaseEngine):
         self._system_kv_token_count = 0
         self._supports_system_kv_cache = False
         logger.info("SimpleEngine stopped")
+
+    def _should_route_text_through_text_model(
+        self, *, mllm_draft_requested: bool = False
+    ) -> bool:
+        """Return whether text-only MLLM requests may use mlx_lm TextModel."""
+        return not (mllm_draft_requested and self._mllm_draft_model_path is not None)
 
     async def _run_blocking_serialized(self, func, /, *args, on_cancel=None, **kwargs):
         """Run a blocking MLX operation under the generation lock.
@@ -670,6 +688,8 @@ class SimpleEngine(BaseEngine):
                 prompt_tokens=final_output.prompt_tokens,
                 completion_tokens=final_output.completion_tokens,
                 finish_reason=final_output.finish_reason,
+                mtp_drafts=final_output.mtp_drafts,
+                mtp_accepted=final_output.mtp_accepted,
             )
 
         # mlx-lm non-streaming chat with tools can stall indefinitely on some
@@ -705,6 +725,8 @@ class SimpleEngine(BaseEngine):
                 prompt_tokens=output.prompt_tokens,
                 completion_tokens=output.completion_tokens,
                 finish_reason=output.finish_reason,
+                mtp_drafts=getattr(output, "mtp_drafts", 0),
+                mtp_accepted=getattr(output, "mtp_accepted", 0),
             )
         else:
             output = await self._run_blocking_serialized(
@@ -768,6 +790,7 @@ class SimpleEngine(BaseEngine):
             await self.start()
 
         chat_template_kwargs = dict(kwargs.pop("chat_template_kwargs", {}) or {})
+        mllm_draft_requested = bool(kwargs.pop("mllm_draft", False))
 
         # Convert tools for template
         template_tools = convert_tools_for_template(tools) if tools else None
@@ -776,6 +799,9 @@ class SimpleEngine(BaseEngine):
         if (
             self._is_mllm
             and self._text_model is not None
+            and self._should_route_text_through_text_model(
+                mllm_draft_requested=mllm_draft_requested
+            )
             and not has_media_content(messages)
         ):
             has_mtp = (
@@ -795,6 +821,14 @@ class SimpleEngine(BaseEngine):
                 yield chunk
             return
 
+        def mllm_call_kwargs() -> dict:
+            local_kwargs = dict(kwargs)
+            if chat_template_kwargs:
+                local_kwargs["chat_template_kwargs"] = chat_template_kwargs
+            if mllm_draft_requested:
+                local_kwargs["mllm_draft"] = True
+            return local_kwargs
+
         # Build prompt using tokenizer
         if self._is_mllm:
             if self._text_model is not None:
@@ -809,9 +843,7 @@ class SimpleEngine(BaseEngine):
             # current thread. Routing through to_thread can break mlx_vlm stream
             # ownership on some models (Stream(gpu, N) mismatch).
             if self._text_model is None and not has_media_content(messages):
-                local_kwargs = dict(kwargs)
-                if chat_template_kwargs:
-                    local_kwargs["chat_template_kwargs"] = chat_template_kwargs
+                local_kwargs = mllm_call_kwargs()
 
                 async with self._generation_lock:
                     _bind_worker_generation_streams()
@@ -835,6 +867,8 @@ class SimpleEngine(BaseEngine):
                             completion_tokens=token_count,
                             finished=finished,
                             finish_reason=chunk.finish_reason if finished else None,
+                            mtp_drafts=getattr(chunk, "mtp_drafts", 0),
+                            mtp_accepted=getattr(chunk, "mtp_accepted", 0),
                         )
 
                         if finished:
@@ -843,9 +877,7 @@ class SimpleEngine(BaseEngine):
 
             # Run stream_chat in thread pool since it's synchronous
             def run_stream():
-                local_kwargs = dict(kwargs)
-                if chat_template_kwargs:
-                    local_kwargs["chat_template_kwargs"] = chat_template_kwargs
+                local_kwargs = mllm_call_kwargs()
                 return list(
                     self._model.stream_chat(
                         messages=messages,
@@ -872,6 +904,8 @@ class SimpleEngine(BaseEngine):
                     completion_tokens=token_count,
                     finished=finished,
                     finish_reason=chunk.finish_reason if finished else None,
+                    mtp_drafts=getattr(chunk, "mtp_drafts", 0),
+                    mtp_accepted=getattr(chunk, "mtp_accepted", 0),
                 )
 
                 if finished:

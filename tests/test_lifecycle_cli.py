@@ -148,6 +148,125 @@ class TestLifecycleCli:
 
         assert captured["lazy_load_model"] is False
 
+    def test_main_parses_mllm_draft_flags(self, monkeypatch):
+        """The top-level CLI should accept MLLM assistant drafter knobs."""
+        import vllm_mlx.cli as cli
+
+        captured = {}
+
+        def fake_serve_command(args):
+            captured["mllm_draft_model"] = args.mllm_draft_model
+            captured["mllm_draft_kind"] = args.mllm_draft_kind
+            captured["mllm_draft_block_size"] = args.mllm_draft_block_size
+
+        monkeypatch.setattr(cli, "serve_command", fake_serve_command)
+        monkeypatch.setattr(
+            cli.sys,
+            "argv",
+            [
+                "vllm-mlx",
+                "serve",
+                "google/gemma-4-E2B-it",
+                "--mllm",
+                "--mllm-draft-model",
+                "google/gemma-4-E2B-it-assistant",
+                "--mllm-draft-kind",
+                "mtp",
+                "--mllm-draft-block-size",
+                "4",
+            ],
+        )
+
+        cli.main()
+
+        assert captured == {
+            "mllm_draft_model": "google/gemma-4-E2B-it-assistant",
+            "mllm_draft_kind": "mtp",
+            "mllm_draft_block_size": 4,
+        }
+
+    def test_main_rejects_nonpositive_mllm_draft_block_size(self, monkeypatch, capsys):
+        """Drafter block size must be positive at parse time."""
+        import vllm_mlx.cli as cli
+
+        monkeypatch.setattr(
+            cli.sys,
+            "argv",
+            [
+                "vllm-mlx",
+                "serve",
+                "google/gemma-4-E2B-it",
+                "--mllm",
+                "--mllm-draft-model",
+                "assistant",
+                "--mllm-draft-kind",
+                "mtp",
+                "--mllm-draft-block-size",
+                "0",
+            ],
+        )
+
+        with pytest.raises(SystemExit):
+            cli.main()
+
+        assert "--mllm-draft-block-size" in capsys.readouterr().err
+
+    def test_serve_command_rejects_mllm_draft_without_mllm(self, capsys):
+        """Drafter flags should not be silently ignored on text-only models."""
+        import vllm_mlx.cli as cli
+
+        args = SimpleNamespace(
+            model="mlx-community/Qwen3-0.6B-8bit",
+            models_config=None,
+            served_model_name=None,
+            enable_auto_tool_choice=False,
+            tool_call_parser=None,
+            gpu_memory_utilization=0.90,
+            max_tokens=32768,
+            max_request_tokens=32768,
+            mllm_draft_model="assistant",
+            mllm_draft_kind="mtp",
+            mllm_draft_block_size=4,
+            continuous_batching=False,
+            auto_unload_idle_seconds=0.0,
+            lazy_load_model=False,
+            mllm=False,
+        )
+
+        with pytest.raises(SystemExit):
+            cli.serve_command(args)
+
+        assert "--mllm-draft-model requires --mllm" in capsys.readouterr().out
+
+    def test_serve_command_rejects_mllm_draft_with_models_config(self, capsys):
+        """Registry mode must not accept drafter flags that it does not load."""
+        import vllm_mlx.cli as cli
+
+        args = SimpleNamespace(
+            model=None,
+            models_config="/tmp/models.yaml",
+            served_model_name=None,
+            enable_auto_tool_choice=False,
+            tool_call_parser=None,
+            gpu_memory_utilization=0.90,
+            max_tokens=32768,
+            max_request_tokens=32768,
+            mllm_draft_model="assistant",
+            mllm_draft_kind="mtp",
+            mllm_draft_block_size=4,
+            continuous_batching=False,
+            auto_unload_idle_seconds=0.0,
+            lazy_load_model=False,
+            mllm=True,
+        )
+
+        with pytest.raises(SystemExit):
+            cli.serve_command(args)
+
+        assert "--mllm-draft-model cannot be used with --models-config" in (
+            capsys.readouterr().out
+        )
+
     def test_serve_command_wires_auto_unload_idle_seconds_into_load_model(
         self, monkeypatch
     ):
@@ -156,6 +275,7 @@ class TestLifecycleCli:
 
         import vllm_mlx.cli as cli
         import vllm_mlx.server as srv
+        import vllm_mlx.utils.download as download_mod
 
         captured = {}
 
@@ -165,6 +285,11 @@ class TestLifecycleCli:
 
         monkeypatch.setattr(srv, "load_model", fake_load_model)
         monkeypatch.setattr(uvicorn, "run", lambda *args, **kwargs: None)
+        monkeypatch.setattr(
+            download_mod,
+            "ensure_model_downloaded",
+            lambda *args, **kwargs: "/tmp/model",
+        )
 
         args = SimpleNamespace(
             model="mlx-community/Qwen3-0.6B-8bit",
