@@ -932,20 +932,25 @@ class SimpleEngine(BaseEngine):
             accumulated_text = ""
             token_count = 0
 
-            # Text-only fallback when no TextModel exists: keep execution on the
-            # current thread. Routing through to_thread can break mlx_vlm stream
-            # ownership on some models (Stream(gpu, N) mismatch).
+            # Text-only fallback when no TextModel exists: drive the sync
+            # iterator on the engine's dedicated MLX worker (same thread as
+            # load()), bridging chunks back via _stream_in_mlx_executor.
+            # mlx_vlm.stream_generate has the same Stream(gpu, N) thread-affinity
+            # bug as mlx_lm.stream_generate when run on a different thread than
+            # load() — see vllm-mlx PR #556 for the equivalent text-LLM fix.
             if self._text_model is None and not has_media_content(messages):
                 local_kwargs = mllm_call_kwargs()
 
                 async with self._generation_lock:
-                    _bind_worker_generation_streams()
-                    for chunk in self._model.stream_chat(
+                    stream_chat_kwargs = dict(
                         messages=messages,
                         max_tokens=max_tokens,
                         temperature=temperature,
                         tools=template_tools,
                         **local_kwargs,
+                    )
+                    async for chunk in self._stream_in_mlx_executor(
+                        lambda: self._model.stream_chat(**stream_chat_kwargs)
                     ):
                         token_count += 1
                         new_text = chunk.text if hasattr(chunk, "text") else str(chunk)
