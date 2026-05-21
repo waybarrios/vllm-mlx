@@ -414,6 +414,7 @@ class MLLMBatchGenerator:
         vision_cache_size: int = 100,
         prefix_cache_config: Optional[MemoryCacheConfig] = None,
         max_kv_size: int = 0,
+        linear_state_bf16: bool = False,
     ):
         """
         Initialize MLLM batch generator.
@@ -432,6 +433,7 @@ class MLLMBatchGenerator:
             vision_cache_size: Max entries in vision cache
             prefix_cache_config: Config for KV prefix cache (text-only requests)
             max_kv_size: Maximum KV cache size per sequence (0 = unbounded)
+            linear_state_bf16: Store GatedDeltaNet recurrent state in bfloat16.
         """
         self.model = model
         self.processor = processor
@@ -460,6 +462,13 @@ class MLLMBatchGenerator:
         patch_qwen35_attention_for_batching()
         patch_gemma4_attention_for_batching()
         patch_glm4v_moe_for_batching()
+
+        # Opt-in: store GatedDeltaNet recurrent state in bfloat16 to halve
+        # linear-attention state memory for Qwen3.5/3.6 hybrid models.
+        if linear_state_bf16:
+            from .patches.gated_delta_bf16 import patch_gated_delta_bf16_state
+
+            patch_gated_delta_bf16_state()
 
         self.max_tokens = max_tokens
         self.stop_tokens = stop_tokens or set()

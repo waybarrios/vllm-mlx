@@ -80,6 +80,18 @@ class SchedulerConfig:
     kv_cache_quantization_bits: int = 8
     kv_cache_quantization_group_size: int = 64
     kv_cache_min_quantize_tokens: int = 256
+    # Asymmetric K/V bits (None = use kv_cache_quantization_bits for both)
+    kv_cache_k_bits: Optional[int] = None
+    kv_cache_v_bits: Optional[int] = None
+    # Hadamard rotation (QuaRot) for KV cache quantization
+    kv_hadamard: bool = False
+
+    # Linear-attention (GatedDeltaNet) state quantization for prefix cache
+    linear_state_quantization: bool = False
+    linear_state_quantization_bits: int = 8
+    linear_state_quantization_group_size: int = 64
+    # Store GatedDeltaNet recurrent state in bfloat16 during live inference
+    linear_state_bf16: bool = False
 
     # Paged cache settings (experimental - for memory efficiency)
     use_paged_cache: bool = (
@@ -1139,6 +1151,14 @@ class Scheduler:
         self.tokenizer = tokenizer
         self.config = config or SchedulerConfig()
 
+        # Opt-in: store GatedDeltaNet recurrent state in bfloat16 for
+        # Qwen3.5/3.6 hybrid models. Patches the model class (per-process),
+        # so install before any forward pass.
+        if self.config.linear_state_bf16:
+            from .patches.gated_delta_bf16 import patch_gated_delta_bf16_state
+
+            patch_gated_delta_bf16_state()
+
         # Detect if tokenizer is a processor (MLLM) and get the actual tokenizer
         self._actual_tokenizer = self._get_actual_tokenizer(tokenizer)
 
@@ -1190,6 +1210,15 @@ class Scheduler:
                     kv_bits=self.config.kv_cache_quantization_bits,
                     kv_group_size=self.config.kv_cache_quantization_group_size,
                     kv_min_quantize_tokens=self.config.kv_cache_min_quantize_tokens,
+                    kv_k_bits=self.config.kv_cache_k_bits
+                    or self.config.kv_cache_quantization_bits,
+                    kv_v_bits=self.config.kv_cache_v_bits
+                    or self.config.kv_cache_quantization_bits,
+                    linear_state_quantize=self.config.linear_state_quantization,
+                    linear_state_bits=self.config.linear_state_quantization_bits,
+                    linear_state_group_size=(
+                        self.config.linear_state_quantization_group_size
+                    ),
                 )
                 self.memory_aware_cache = MemoryAwarePrefixCache(
                     model=model,
@@ -1222,6 +1251,23 @@ class Scheduler:
                 logger.info(
                     f"Prefix cache enabled with max_entries={self.config.prefix_cache_size}"
                 )
+
+        # Install live KV cache quantization if enabled
+        if self.config.kv_cache_quantization:
+            k_bits = (
+                self.config.kv_cache_k_bits or self.config.kv_cache_quantization_bits
+            )
+            v_bits = (
+                self.config.kv_cache_v_bits or self.config.kv_cache_quantization_bits
+            )
+            from vllm_mlx.utils.quantized_kv_cache import install_quantized_kv_cache
+
+            install_quantized_kv_cache(
+                k_bits=k_bits,
+                v_bits=v_bits,
+                group_size=self.config.kv_cache_quantization_group_size,
+                use_hadamard=self.config.kv_hadamard,
+            )
 
         # Thread-safe set for deferred aborts (main thread → executor thread)
         # CPython GIL guarantees set.add() and `x in set` are atomic.

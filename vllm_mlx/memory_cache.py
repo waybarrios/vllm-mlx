@@ -109,6 +109,11 @@ def estimate_kv_cache_memory(cache: list[Any]) -> int:
 
     for layer_cache in cache:
         # Handle different cache object types
+        # Quantized linear-attention state wrapper: no .keys/.state, so it
+        # must be measured explicitly or it would contribute 0 bytes.
+        if isinstance(layer_cache, _QuantizedArraysCacheWrapper):
+            total_bytes += layer_cache.nbytes()
+            continue
         # Check dict first since dicts have .keys() method that would match below
         if isinstance(layer_cache, dict) and "state" in layer_cache:
             # Extracted state dict
@@ -159,6 +164,10 @@ class MemoryCacheConfig:
         kv_bits: Number of bits for KV cache quantization.
         kv_group_size: Group size for KV cache quantization.
         kv_min_quantize_tokens: Minimum sequence length for quantization to apply.
+        linear_state_quantize: Whether to quantize linear-attention (GatedDeltaNet)
+            ArraysCache state layers for reduced memory.
+        linear_state_bits: Number of bits for linear-attention state quantization.
+        linear_state_group_size: Group size for linear-attention state quantization.
         min_prefix_tokens: Minimum cached prefix length eligible for reuse.
     """
 
@@ -170,6 +179,12 @@ class MemoryCacheConfig:
     kv_bits: int = 8
     kv_group_size: int = 64
     kv_min_quantize_tokens: int = 256
+    # Asymmetric K/V bits (defaults to kv_bits if not set)
+    kv_k_bits: int | None = None
+    kv_v_bits: int | None = None
+    linear_state_quantize: bool = False
+    linear_state_bits: int = 8
+    linear_state_group_size: int = 64
     min_prefix_tokens: int = 128
 
     def __post_init__(self) -> None:
@@ -183,10 +198,24 @@ class MemoryCacheConfig:
             raise ValueError(
                 f"kv_min_quantize_tokens must be >= 0, got {self.kv_min_quantize_tokens}"
             )
+        if self.linear_state_bits not in (4, 8):
+            raise ValueError(
+                f"linear_state_bits must be 4 or 8, got {self.linear_state_bits}"
+            )
+        if self.linear_state_group_size < 1:
+            raise ValueError(
+                "linear_state_group_size must be >= 1, got "
+                f"{self.linear_state_group_size}"
+            )
         if self.min_prefix_tokens < 1:
             raise ValueError(
                 f"min_prefix_tokens must be >= 1, got {self.min_prefix_tokens}"
             )
+
+    @property
+    def any_quantize(self) -> bool:
+        """True if any cache-quantization mode (KV or linear state) is enabled."""
+        return self.kv_quantize or self.linear_state_quantize
 
     def compute_memory_limit(self) -> int:
         """
@@ -493,6 +522,7 @@ class _QuantizedCacheWrapper:
 
     Unlike ``QuantizedKVCache``, this preserves enough info to reconstruct
     the *original* cache type (KVCache, RotatingKVCache, etc.) on dequantize.
+    Supports asymmetric K/V bit widths via k_bits and v_bits.
     """
 
     __slots__ = (
@@ -500,18 +530,29 @@ class _QuantizedCacheWrapper:
         "values",
         "offset",
         "bits",
+        "k_bits",
+        "v_bits",
         "group_size",
         "orig_type",
         "orig_attrs",
     )
 
-    def __init__(self, layer: Any, bits: int, group_size: int):
+    def __init__(
+        self,
+        layer: Any,
+        bits: int,
+        group_size: int,
+        k_bits: int | None = None,
+        v_bits: int | None = None,
+    ):
         import mlx.core as mx
 
-        self.keys = mx.quantize(layer.keys, group_size=group_size, bits=bits)
-        self.values = mx.quantize(layer.values, group_size=group_size, bits=bits)
+        self.k_bits = k_bits or bits
+        self.v_bits = v_bits or bits
+        self.keys = mx.quantize(layer.keys, group_size=group_size, bits=self.k_bits)
+        self.values = mx.quantize(layer.values, group_size=group_size, bits=self.v_bits)
         self.offset = layer.offset
-        self.bits = bits
+        self.bits = bits  # backward compat
         self.group_size = group_size
         self.orig_type = type(layer)
         # Preserve RotatingKVCache-specific attrs
@@ -521,20 +562,142 @@ class _QuantizedCacheWrapper:
                 self.orig_attrs[attr] = getattr(layer, attr)
 
 
-def _quantize_cache(cache: list[Any], bits: int = 8, group_size: int = 64) -> list[Any]:
-    """Quantize KV cache layers to reduce memory.
+class _QuantizedArraysCacheWrapper:
+    """Stores quantized linear-attention (GatedDeltaNet) ArraysCache state.
 
-    Only plain KVCache layers are quantized. RotatingKVCache (sliding window)
-    is left as-is because its internal _idx/rotation state is tightly coupled
-    with update_and_fetch logic and cannot survive quantize/dequantize roundtrip.
-    RotatingKVCache is typically small (max_size=1024) so skipping it is fine.
+    Qwen3.5/3.6 hybrid models keep GatedDeltaNet recurrent + conv state in an
+    ``ArraysCache`` (a list of arrays) rather than keys/values. This wrapper
+    quantizes each array on store and reconstructs a usable ``ArraysCache`` on
+    dequantize. Per-slot dtype is recorded so the recurrent matrix (float32)
+    and conv state (bfloat16) each round-trip to their original precision.
+
+    Arrays that cannot be quantized (non-float dtype, or last dim not divisible
+    by ``group_size``) are stored raw — distinguishable later because
+    ``mx.quantize`` returns a 3-tuple while a raw array does not.
     """
-    from mlx_lm.models.cache import KVCache
+
+    __slots__ = ("quant", "dtypes", "bits", "group_size", "orig_type", "left_padding")
+
+    def __init__(self, layer: Any, bits: int, group_size: int):
+        import mlx.core as mx
+
+        self.bits = bits
+        self.group_size = group_size
+        self.orig_type = type(layer)
+        self.left_padding = getattr(layer, "left_padding", None)
+        self.quant: list[Any] = []
+        self.dtypes: list[Any] = []
+        for arr in layer.cache:
+            if arr is None:
+                self.quant.append(None)
+                self.dtypes.append(None)
+                continue
+            self.dtypes.append(arr.dtype)
+            quantizable = (
+                mx.issubdtype(arr.dtype, mx.floating)
+                and getattr(arr, "ndim", 0) >= 2
+                and arr.shape[-1] % group_size == 0
+            )
+            if quantizable:
+                self.quant.append(mx.quantize(arr, group_size=group_size, bits=bits))
+            else:
+                # Raw fallback — store the array as-is (deep-copied on restore).
+                self.quant.append(arr)
+
+    def nbytes(self) -> int:
+        """Total bytes of the quantized (or raw-fallback) arrays."""
+        total = 0
+        for entry in self.quant:
+            if entry is None:
+                continue
+            # mx.quantize returns a (data, scales, biases) sequence; a
+            # raw-fallback entry is a plain mx.array.
+            if isinstance(entry, (list, tuple)):
+                for a in entry:
+                    total += _array_memory(a)
+            else:
+                total += _array_memory(entry)
+        return total
+
+
+def _dequantize_arrays_cache_layer(wrapper: "_QuantizedArraysCacheWrapper") -> Any:
+    """Reconstruct an ArraysCache from a _QuantizedArraysCacheWrapper.
+
+    Each slot is dequantized and cast back to its recorded dtype. Raw-fallback
+    slots are deep-copied so the model's in-place mutations cannot corrupt the
+    stored entry.
+    """
+    import mlx.core as mx
+
+    cls = wrapper.orig_type
+    obj = cls.__new__(cls)
+    obj.left_padding = wrapper.left_padding
+    new_cache: list[Any] = []
+    for entry, dtype in zip(wrapper.quant, wrapper.dtypes):
+        if entry is None:
+            new_cache.append(None)
+        elif isinstance(entry, (list, tuple)):
+            arr = mx.dequantize(
+                *entry, group_size=wrapper.group_size, bits=wrapper.bits
+            )
+            new_cache.append(arr.astype(dtype))
+        else:
+            # Raw-stored array — deep-copy.
+            new_cache.append(mx.array(entry))
+    obj.cache = new_cache
+    mx.eval(*[a for a in new_cache if a is not None])
+    return obj
+
+
+def _quantize_cache(
+    cache: list[Any],
+    bits: int = 8,
+    group_size: int = 64,
+    k_bits: int | None = None,
+    v_bits: int | None = None,
+    linear_bits: int | None = None,
+    linear_group_size: int | None = None,
+    quantize_kv: bool = True,
+    quantize_linear: bool = False,
+) -> list[Any]:
+    """Quantize cache layers to reduce memory.
+
+    KVCache (full-attention) layers are quantized when ``quantize_kv`` is set.
+    ArraysCache (linear-attention / GatedDeltaNet) layers are quantized when
+    ``quantize_linear`` is set. RotatingKVCache (sliding window) is left as-is
+    because its internal _idx/rotation state is tightly coupled with
+    update_and_fetch logic and cannot survive a quantize/dequantize roundtrip.
+    RotatingKVCache is typically small (max_size=1024) so skipping it is fine.
+    Supports asymmetric K/V bits via k_bits and v_bits parameters.
+    """
+    from mlx_lm.models.cache import ArraysCache, KVCache
+
+    linear_bits = linear_bits if linear_bits is not None else bits
+    linear_group_size = (
+        linear_group_size if linear_group_size is not None else group_size
+    )
 
     quantized = []
     for layer in cache:
-        if type(layer) is KVCache and getattr(layer, "keys", None) is not None:
-            quantized.append(_QuantizedCacheWrapper(layer, bits, group_size))
+        if (
+            quantize_kv
+            and type(layer) is KVCache
+            and getattr(layer, "keys", None) is not None
+        ):
+            quantized.append(
+                _QuantizedCacheWrapper(
+                    layer, bits, group_size, k_bits=k_bits, v_bits=v_bits
+                )
+            )
+        elif (
+            quantize_linear
+            and isinstance(layer, ArraysCache)
+            and getattr(layer, "cache", None)
+            and any(a is not None for a in layer.cache)
+        ):
+            quantized.append(
+                _QuantizedArraysCacheWrapper(layer, linear_bits, linear_group_size)
+            )
         else:
             quantized.append(layer)
     return quantized
@@ -547,18 +710,23 @@ def _dequantize_cache(cache: list[Any]) -> list[Any]:
     ``update_and_fetch`` mutations don't corrupt the stored cache entry.
     """
     import mlx.core as mx
+    from mlx_lm.models.cache import ArraysCache
 
     result = []
     for layer in cache:
-        if isinstance(layer, _QuantizedCacheWrapper):
+        if isinstance(layer, _QuantizedArraysCacheWrapper):
+            result.append(_dequantize_arrays_cache_layer(layer))
+        elif isinstance(layer, _QuantizedCacheWrapper):
             # Reconstruct original cache type from quantized data
             orig_cls = layer.orig_type
             kv = orig_cls.__new__(orig_cls)
+            k_bits = getattr(layer, "k_bits", layer.bits)
+            v_bits = getattr(layer, "v_bits", layer.bits)
             kv.keys = mx.dequantize(
-                *layer.keys, group_size=layer.group_size, bits=layer.bits
+                *layer.keys, group_size=layer.group_size, bits=k_bits
             )
             kv.values = mx.dequantize(
-                *layer.values, group_size=layer.group_size, bits=layer.bits
+                *layer.values, group_size=layer.group_size, bits=v_bits
             )
             kv.offset = layer.offset
             # Slice the dequantized arrays down to offset so that readers
@@ -590,6 +758,14 @@ def _dequantize_cache(cache: list[Any]) -> list[Any]:
                 if hasattr(layer, attr):
                     setattr(kv, attr, getattr(layer, attr))
             result.append(kv)
+        elif isinstance(layer, ArraysCache):
+            # Deep-copy linear-attention (GatedDeltaNet) state so the model's
+            # in-place mutations of cache[i] don't corrupt the stored entry.
+            cls = type(layer)
+            obj = cls.__new__(cls)
+            obj.left_padding = getattr(layer, "left_padding", None)
+            obj.cache = [mx.array(a) if a is not None else None for a in layer.cache]
+            result.append(obj)
         else:
             result.append(layer)
     return result
@@ -734,7 +910,7 @@ class MemoryAwarePrefixCache:
             self._last_match_type = "exact"
             cache_out = (
                 _dequantize_cache(entry.cache)
-                if self._config.kv_quantize
+                if self._config.any_quantize
                 else entry.cache
             )
             return cache_out, []
@@ -809,7 +985,7 @@ class MemoryAwarePrefixCache:
                 self._last_match_type = "supersequence"
                 trimmed_cache = (
                     _dequantize_cache(trimmed_cache)
-                    if self._config.kv_quantize
+                    if self._config.any_quantize
                     else trimmed_cache
                 )
                 return trimmed_cache, []
@@ -820,7 +996,7 @@ class MemoryAwarePrefixCache:
                 self._last_match_type = "supersequence"
                 cache_out = (
                     _dequantize_cache(best_super.cache)
-                    if self._config.kv_quantize
+                    if self._config.any_quantize
                     else best_super.cache
                 )
                 return cache_out, []
@@ -834,7 +1010,7 @@ class MemoryAwarePrefixCache:
             self._last_match_type = "prefix"
             cache_out = (
                 _dequantize_cache(best_match.cache)
-                if self._config.kv_quantize
+                if self._config.any_quantize
                 else best_match.cache
             )
             return cache_out, remaining
@@ -918,7 +1094,7 @@ class MemoryAwarePrefixCache:
                 self._last_match_type = "lcp"
                 trimmed_cache = (
                     _dequantize_cache(trimmed_cache)
-                    if self._config.kv_quantize
+                    if self._config.any_quantize
                     else trimmed_cache
                 )
                 return trimmed_cache, remaining
@@ -973,11 +1149,19 @@ class MemoryAwarePrefixCache:
 
             # Quantize if enabled and sequence is long enough
             if (
-                self._config.kv_quantize
+                self._config.any_quantize
                 and len(tokens) >= self._config.kv_min_quantize_tokens
             ):
                 cache = _quantize_cache(
-                    cache, self._config.kv_bits, self._config.kv_group_size
+                    cache,
+                    self._config.kv_bits,
+                    self._config.kv_group_size,
+                    k_bits=self._config.kv_k_bits,
+                    v_bits=self._config.kv_v_bits,
+                    linear_bits=self._config.linear_state_bits,
+                    linear_group_size=self._config.linear_state_group_size,
+                    quantize_kv=self._config.kv_quantize,
+                    quantize_linear=self._config.linear_state_quantize,
                 )
 
             # Create entry and estimate memory
@@ -1252,7 +1436,12 @@ class MemoryAwarePrefixCache:
                 # original cache types that do.
                 persist_cache = (
                     _dequantize_cache(entry.cache)
-                    if any(isinstance(c, _QuantizedCacheWrapper) for c in entry.cache)
+                    if any(
+                        isinstance(
+                            c, (_QuantizedCacheWrapper, _QuantizedArraysCacheWrapper)
+                        )
+                        for c in entry.cache
+                    )
                     else entry.cache
                 )
                 save_prompt_cache(
