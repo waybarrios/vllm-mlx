@@ -1152,11 +1152,16 @@ class TestSimpleEngineConcurrency:
     async def test_mllm_nonstream_text_only_without_text_model_keeps_stream_thread_owner(
         self,
     ):
-        """MLLM text-only non-stream path must keep stream_chat on model thread.
+        """MLLM text-only non-stream path must keep stream_chat on the same
+        thread as model construction (the SimpleEngine MLX worker).
 
-        Regression: aggregate_stream_chat -> stream_chat used _run_blocking_serialized,
-        which moved mlx_vlm stream generation to a worker thread and could raise
-        "There is no Stream(gpu, N) in current thread".
+        Regression: aggregate_stream_chat -> stream_chat used
+        _run_blocking_serialized, which moved mlx_vlm stream generation to
+        a different worker thread per call and could raise "There is no
+        Stream(gpu, N) in current thread". Now both load and inference are
+        pinned to ``self._mlx_executor`` (a single-thread executor), so the
+        model's "owner thread" is the executor thread and stream_chat must
+        run on that same thread.
         """
         from types import SimpleNamespace
 
@@ -1164,7 +1169,12 @@ class TestSimpleEngineConcurrency:
 
         class FakeMllmModel:
             def __init__(self):
+                # Captured on whichever thread SimpleEngine constructs us,
+                # which under the executor-pinning fix is the MLX worker.
                 self._owner_thread = threading.get_ident()
+
+            def load(self):
+                pass  # SimpleEngine.prepare_for_start calls this; no-op here
 
             def stream_chat(self, **kwargs):
                 if threading.get_ident() != self._owner_thread:
@@ -1175,15 +1185,23 @@ class TestSimpleEngineConcurrency:
                     prompt_tokens=3,
                 )
 
-        engine = SimpleEngine("test-model", force_mllm=True, mtp=False)
-        engine._loaded = True
-        engine._text_model = None
-        engine._model = FakeMllmModel()
+        # Patch the MLLM model class so SimpleEngine constructs FakeMllmModel
+        # via prepare_for_start on the MLX worker thread (matching prod load
+        # behavior), then the same executor runs stream_chat — single-thread
+        # invariant holds.
+        with patch(
+            "vllm_mlx.models.mllm.MLXMultimodalLM",
+            lambda *a, **k: FakeMllmModel(),
+        ):
+            engine = SimpleEngine("test-model", force_mllm=True, mtp=False)
+            engine.prepare_for_start()  # constructs FakeMllmModel on MLX worker
+            engine._loaded = True
+            engine._text_model = None
 
-        output = await engine.chat(
-            messages=[{"role": "user", "content": "Count: one, two, three"}],
-            max_tokens=16,
-        )
+            output = await engine.chat(
+                messages=[{"role": "user", "content": "Count: one, two, three"}],
+                max_tokens=16,
+            )
 
         assert output.text == "one, two, three"
         assert output.finish_reason == "stop"
