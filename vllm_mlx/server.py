@@ -2702,7 +2702,17 @@ def _extract_reasoning_and_tool_calls(
         if cleaned_reasoning_text is not None:
             text_for_tool_parse = cleaned_reasoning_text
         elif reasoning_text is not None:
-            text_for_tool_parse = ""
+            # Reasoning was extracted but no `final` content channel — for
+            # gpt-oss / harmony the model jumped from <|channel|>analysis
+            # straight into <|channel|>commentary to=functions.* (a tool
+            # call) without ever emitting a `final` channel. Keep the full
+            # raw output so the downstream tool parser can find the
+            # commentary block; its regex anchors on
+            # `<|channel|>commentary to=functions.` so it will skip the
+            # analysis block correctly. Setting text_for_tool_parse = ""
+            # here (the previous behavior) hid every gpt-oss tool call
+            # from the parser whenever a reasoning parser was enabled.
+            text_for_tool_parse = output_text
 
     # Skip tool parsing when the request defines no tools — otherwise the
     # parser can misinterpret JSON output (e.g. response_format) as tool calls.

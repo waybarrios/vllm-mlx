@@ -35,10 +35,20 @@ def _generate_tool_id() -> str:
 
 
 # Pattern: <|channel|>commentary to=functions.tool_name ... <|call|>
+# The trailing terminator is one of:
+#   - <|call|>       — normal completion of a commentary tool-call block
+#   - <|end|>        — alternate harmony terminator some checkpoints emit
+#   - <|return|>     — model jumped to return without emitting <|call|>
+#   - <|start|>      — next message starting (next assistant turn)
+#   - end-of-string  — model output truncated mid-block (e.g. max_tokens,
+#                       or vllm-mlx consumed <|call|> as a stop token without
+#                       echoing it). Without this, models that don't echo
+#                       <|call|> in their decoded output never get their
+#                       tool calls extracted.
 _COMMENTARY_BLOCK_PATTERN = re.compile(
     r"<\|channel\|>commentary\s+to=functions\.(\w+)"
     r"(?:\s*<\|constrain\|>\w+)?"
-    r"\s*<\|message\|>(.*?)<\|call\|>",
+    r"\s*<\|message\|>(.*?)(?:<\|call\|>|<\|end\|>|<\|return\|>|<\|start\|>|\Z)",
     re.DOTALL,
 )
 

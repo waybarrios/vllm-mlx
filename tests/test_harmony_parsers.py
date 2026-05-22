@@ -632,12 +632,23 @@ class TestHarmonyToolDefinitionConverter:
 class TestHarmonyEdgeCases:
     """Edge case tests for Harmony parsers."""
 
-    def test_tool_parser_incomplete_call(self):
-        """Incomplete tool call (missing <|call|>) is not parsed."""
+    def test_tool_parser_incomplete_call_with_valid_args(self):
+        """Tool call without trailing <|call|> IS parsed when args are valid JSON.
+
+        gpt-oss-120b commonly produces commentary blocks without echoing the
+        <|call|> terminator — either because vllm-mlx consumed it as a stop
+        token, or because the model emitted a stop without the terminator.
+        We extract the call as long as the function name + valid JSON args
+        are present at end-of-text.
+        """
+        import json as _json
+
         parser = HarmonyToolParser()
         text = "<|channel|>commentary to=functions.func\n" '<|message|>{"arg": "value"}'
         result = parser.extract_tool_calls(text)
-        assert not result.tools_called
+        assert result.tools_called
+        assert result.tool_calls[0]["name"] == "func"
+        assert _json.loads(result.tool_calls[0]["arguments"]) == {"arg": "value"}
 
     def test_tool_parser_unicode_content(self):
         """Handle unicode in tool arguments."""

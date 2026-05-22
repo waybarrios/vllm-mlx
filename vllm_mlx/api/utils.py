@@ -35,6 +35,14 @@ _FINAL_CHANNEL_RE = re.compile(
     r"<\|channel\|>final[^<]*(?:<\|constrain\|>[^<]*)?<\|message\|>"
 )
 
+# Pattern: <|channel|>commentary to=functions.<name>
+# Used to detect harmony tool-call blocks so we leave them intact for the
+# downstream HarmonyToolParser. Without this guard, clean_output_text would
+# strip the channel/call structural tokens before the parser ever sees them,
+# leaving only the bare arg-JSON glued to surrounding analysis text — which
+# the parser then can't extract.
+_COMMENTARY_TOOL_RE = re.compile(r"<\|channel\|>commentary\s+to=functions\.")
+
 
 def _clean_gpt_oss_output(text: str) -> str:
     """
@@ -90,6 +98,14 @@ def clean_output_text(text: str) -> str:
         Cleaned text with special tokens removed
     """
     if not text:
+        return text
+
+    # GPT-OSS tool-call output: preserve harmony commentary blocks containing
+    # `to=functions.<name>` so the downstream HarmonyToolParser can extract
+    # the call. The chat-completion handler runs clean_output_text again on
+    # the parser's residue (result.content), where this branch will not
+    # match and normal stripping will apply.
+    if _COMMENTARY_TOOL_RE.search(text):
         return text
 
     # GPT-OSS channel format — extract final content before general stripping
