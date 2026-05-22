@@ -34,7 +34,7 @@ def _generate_tool_id() -> str:
     return f"call_{uuid.uuid4().hex[:8]}"
 
 
-# Pattern: <|channel|>commentary to=functions.tool_name ... <|call|>
+# Pattern: <|channel|>commentary to=functions.tool_name ... <terminator>
 # The trailing terminator is one of:
 #   - <|call|>       — normal completion of a commentary tool-call block
 #   - <|end|>        — alternate harmony terminator some checkpoints emit
@@ -45,10 +45,16 @@ def _generate_tool_id() -> str:
 #                       echoing it). Without this, models that don't echo
 #                       <|call|> in their decoded output never get their
 #                       tool calls extracted.
+#
+# The terminator is captured in a named group so extract_tool_calls can tell
+# explicit-terminator matches from end-of-string fallbacks — the latter is
+# treated more strictly (require valid JSON) to avoid turning truncated
+# output into a structured tool call with malformed arguments.
 _COMMENTARY_BLOCK_PATTERN = re.compile(
     r"<\|channel\|>commentary\s+to=functions\.(\w+)"
     r"(?:\s*<\|constrain\|>\w+)?"
-    r"\s*<\|message\|>(.*?)(?:<\|call\|>|<\|end\|>|<\|return\|>|<\|start\|>|\Z)",
+    r"\s*<\|message\|>(.*?)"
+    r"(?P<terminator><\|call\|>|<\|end\|>|<\|return\|>|<\|start\|>|\Z)",
     re.DOTALL,
 )
 
@@ -89,6 +95,11 @@ class HarmonyToolParser(ToolParser):
         for match in _COMMENTARY_BLOCK_PATTERN.finditer(model_output):
             tool_name = match.group(1)
             args_str = match.group(2).strip()
+            # Empty terminator string == matched at end-of-string (\Z).
+            # We distinguish this from explicit terminators because EOS is
+            # the only branch where the block is ambiguously either
+            # legitimately-unterminated or truncated mid-generation.
+            matched_at_eos = match.group("terminator") == ""
 
             try:
                 arguments = json.loads(args_str)
@@ -104,7 +115,20 @@ class HarmonyToolParser(ToolParser):
                     }
                 )
             except json.JSONDecodeError:
-                # Keep the raw arguments string
+                if matched_at_eos:
+                    # No explicit terminator + invalid JSON = almost
+                    # certainly a truncated generation (max_tokens hit
+                    # mid-block, OOM, etc.). Don't synthesize a tool call
+                    # with broken args — fall through and let this run as
+                    # plain content. The raw-arg fallback below is reserved
+                    # for blocks that DID terminate explicitly but with
+                    # quirky JSON, where the model's intent to call the
+                    # tool was clearly signalled.
+                    continue
+                # Explicit terminator + invalid JSON: keep the raw
+                # arguments fallback for backward compatibility — some
+                # checkpoints emit non-strict JSON intentionally and the
+                # terminator confirms the model meant to call the tool.
                 tool_calls.append(
                     {
                         "id": _generate_tool_id(),

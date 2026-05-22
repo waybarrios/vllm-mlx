@@ -650,6 +650,55 @@ class TestHarmonyEdgeCases:
         assert result.tool_calls[0]["name"] == "func"
         assert _json.loads(result.tool_calls[0]["arguments"]) == {"arg": "value"}
 
+    def test_tool_parser_truncated_at_eos_does_not_extract(self):
+        """Truncated args at end-of-string MUST NOT become a tool call.
+
+        When the regex match terminates at \\Z (no explicit <|call|>,
+        <|end|>, <|return|>, or <|start|>) AND the captured arg-text is not
+        valid JSON, this is almost certainly a truncated generation
+        (max_tokens hit mid-block, OOM, etc). Synthesizing a tool call with
+        broken arguments would surface to the API consumer as a malformed
+        function call — much worse than treating the partial output as
+        plain content. The parser must NOT extract a tool call here.
+
+        Requested by Thump604 on PR #562: pre-fix, the raw-args fallback
+        would emit `{"arguments": "{\\"path\\":\\"/etc/hosts\\""}` — a tool
+        call payload that no downstream consumer can deserialize.
+        """
+        parser = HarmonyToolParser()
+        # Note: trailing `}` is missing — JSON is truncated mid-object.
+        text = (
+            "<|channel|>commentary to=functions.read_file\n"
+            '<|message|>{"path": "/etc/hosts"'
+        )
+        result = parser.extract_tool_calls(text)
+        assert not result.tools_called
+        assert result.tool_calls == []
+
+    def test_tool_parser_explicit_terminator_with_invalid_json_keeps_raw(self):
+        """Explicit terminator + invalid JSON: preserve raw-args fallback.
+
+        When the model EXPLICITLY closes the block with <|call|> (or one of
+        the other terminators), its intent to call the tool is unambiguous
+        even if the JSON didn't parse strictly. The legacy raw-args
+        fallback handles checkpoints that emit non-strict JSON-like text,
+        and we must keep that behavior under explicit terminators — only
+        the new \\Z (end-of-string) branch is tightened.
+        """
+        parser = HarmonyToolParser()
+        # Trailing comma is invalid JSON, but <|call|> ends the block — the
+        # raw-args fallback path should still emit a tool call.
+        text = (
+            "<|channel|>commentary to=functions.read_file\n"
+            '<|message|>{"path": "/etc/hosts",}'
+            "<|call|>"
+        )
+        result = parser.extract_tool_calls(text)
+        assert result.tools_called
+        assert result.tool_calls[0]["name"] == "read_file"
+        # The raw (non-strict) JSON string is preserved verbatim.
+        assert result.tool_calls[0]["arguments"] == '{"path": "/etc/hosts",}'
+
     def test_tool_parser_unicode_content(self):
         """Handle unicode in tool arguments."""
         parser = HarmonyToolParser()
