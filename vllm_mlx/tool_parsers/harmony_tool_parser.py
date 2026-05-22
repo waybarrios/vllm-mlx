@@ -34,22 +34,9 @@ def _generate_tool_id() -> str:
     return f"call_{uuid.uuid4().hex[:8]}"
 
 
-# Pattern: <|channel|>commentary to=functions.tool_name ... <terminator>
-# The trailing terminator is one of:
-#   - <|call|>       — normal completion of a commentary tool-call block
-#   - <|end|>        — alternate harmony terminator some checkpoints emit
-#   - <|return|>     — model jumped to return without emitting <|call|>
-#   - <|start|>      — next message starting (next assistant turn)
-#   - end-of-string  — model output truncated mid-block (e.g. max_tokens,
-#                       or vllm-mlx consumed <|call|> as a stop token without
-#                       echoing it). Without this, models that don't echo
-#                       <|call|> in their decoded output never get their
-#                       tool calls extracted.
-#
-# The terminator is captured in a named group so extract_tool_calls can tell
-# explicit-terminator matches from end-of-string fallbacks — the latter is
-# treated more strictly (require valid JSON) to avoid turning truncated
-# output into a structured tool call with malformed arguments.
+# Terminator captured as named group: \Z (end-of-string) is treated more
+# strictly than explicit terminators — truncated mid-block output must not
+# become a structured tool call with malformed args.
 _COMMENTARY_BLOCK_PATTERN = re.compile(
     r"<\|channel\|>commentary\s+to=functions\.(\w+)"
     r"(?:\s*<\|constrain\|>\w+)?"
@@ -95,10 +82,6 @@ class HarmonyToolParser(ToolParser):
         for match in _COMMENTARY_BLOCK_PATTERN.finditer(model_output):
             tool_name = match.group(1)
             args_str = match.group(2).strip()
-            # Empty terminator string == matched at end-of-string (\Z).
-            # We distinguish this from explicit terminators because EOS is
-            # the only branch where the block is ambiguously either
-            # legitimately-unterminated or truncated mid-generation.
             matched_at_eos = match.group("terminator") == ""
 
             try:
@@ -116,19 +99,10 @@ class HarmonyToolParser(ToolParser):
                 )
             except json.JSONDecodeError:
                 if matched_at_eos:
-                    # No explicit terminator + invalid JSON = almost
-                    # certainly a truncated generation (max_tokens hit
-                    # mid-block, OOM, etc.). Don't synthesize a tool call
-                    # with broken args — fall through and let this run as
-                    # plain content. The raw-arg fallback below is reserved
-                    # for blocks that DID terminate explicitly but with
-                    # quirky JSON, where the model's intent to call the
-                    # tool was clearly signalled.
+                    # No terminator + invalid JSON: treat as truncated, not
+                    # a tool call.
                     continue
-                # Explicit terminator + invalid JSON: keep the raw
-                # arguments fallback for backward compatibility — some
-                # checkpoints emit non-strict JSON intentionally and the
-                # terminator confirms the model meant to call the tool.
+                # Explicit terminator + invalid JSON: keep raw-args fallback.
                 tool_calls.append(
                     {
                         "id": _generate_tool_id(),
