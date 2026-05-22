@@ -2980,12 +2980,36 @@ class Scheduler:
         try:
             from mlx_lm.models.cache import ArraysCache, KVCache
 
+            # Resolve mlx dtype objects by string name. Used to cast back
+            # arrays that were upcast (e.g. bf16 → fp32) on the spill path so
+            # numpy could persist them — see ssd_cache._mx_to_numpy_safe.
+            def _mx_dtype_from_name(name: str):
+                # Defensive: mlx might not have every dtype on every version;
+                # falling through with None means "skip the cast and accept
+                # the default dtype from mx.array(numpy_fp32)".
+                return getattr(mx, name, None)
+
             result = []
             for ld in layer_dicts:
                 if "keys" in ld and "values" in ld:
                     kv = KVCache()
                     kv.keys = mx.array(ld["keys"])
                     kv.values = mx.array(ld["values"])
+                    # Restore original dtype (e.g. bfloat16) if the snapshot
+                    # had to upcast for safetensors/numpy compatibility. The
+                    # model expects its native KV dtype; without this, the
+                    # next attention call would either pay an implicit cast
+                    # or refuse the input.
+                    keys_orig = ld.get("keys_original_dtype")
+                    if keys_orig is not None:
+                        dt = _mx_dtype_from_name(keys_orig)
+                        if dt is not None:
+                            kv.keys = kv.keys.astype(dt)
+                    values_orig = ld.get("values_original_dtype")
+                    if values_orig is not None:
+                        dt = _mx_dtype_from_name(values_orig)
+                        if dt is not None:
+                            kv.values = kv.values.astype(dt)
                     kv.offset = ld["offset"]
                     for attr in ("max_size", "keep", "step", "_idx"):
                         if attr in ld:
@@ -2993,6 +3017,15 @@ class Scheduler:
                     result.append(kv)
                 elif "state" in ld:
                     state_arrays = [mx.array(a) for a in ld["state"]]
+                    # Same dtype-restore for ArraysCache state entries.
+                    state_dtypes = ld.get("state_original_dtypes")
+                    if state_dtypes is not None:
+                        for i, dtype_name in enumerate(state_dtypes):
+                            if dtype_name is None:
+                                continue
+                            dt = _mx_dtype_from_name(dtype_name)
+                            if dt is not None:
+                                state_arrays[i] = state_arrays[i].astype(dt)
                     layer_obj = ArraysCache(len(state_arrays))
                     layer_obj.state = state_arrays
                     result.append(layer_obj)

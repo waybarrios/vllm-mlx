@@ -322,7 +322,12 @@ class TestLayerSerializer:
 
         serializer = KVCacheSerializer()
         file_path = str(tmp_path / "layer_0.safetensors")
-        metadata = serializer.serialize_layer(layer, 0, file_path)
+        # serialize_layer now expects a snapshot (CPU-only dict) produced by
+        # snapshot_layer, not the raw MLX-backed layer. This mirrors the
+        # producer/writer thread split: snapshot runs on the request thread,
+        # serialize runs on the SSD writer thread with only the snapshot.
+        snapshot = serializer.snapshot_layer(layer)
+        metadata = serializer.serialize_layer(snapshot, 0, file_path)
 
         assert os.path.exists(file_path)
         assert metadata["layer_type"] == "KVCache"
@@ -346,7 +351,10 @@ class TestLayerSerializer:
 
         serializer = ArraysCacheSerializer()
         file_path = str(tmp_path / "layer_0.safetensors")
-        metadata = serializer.serialize_layer(layer, 0, file_path)
+        # See KVCacheSerializer round-trip test: snapshot is the producer-
+        # side step, serialize is the writer-side step.
+        snapshot = serializer.snapshot_layer(layer)
+        metadata = serializer.serialize_layer(snapshot, 0, file_path)
 
         assert os.path.exists(file_path)
         assert metadata["layer_type"] == "ArraysCache"
@@ -571,7 +579,11 @@ class TestSpillPath:
 
     def test_evict_lru_calls_ssd_spill(self, tmp_path):
         model = MagicMock()
-        config = MemoryCacheConfig(max_memory_mb=1, max_entries=3)
+        # min_prefix_tokens=1: this test uses 10-token sequences; the prod
+        # default (128) would silently reject every store() call and leave
+        # the cache empty, so the eviction-triggers-spill assertion below
+        # would never fire. Same override applied to the other spill tests.
+        config = MemoryCacheConfig(max_memory_mb=1, max_entries=3, min_prefix_tokens=1)
         cache = MemoryAwarePrefixCache(model, config)
 
         ssd_config = SSDCacheConfig(cache_dir=str(tmp_path / "spill_test"))
@@ -603,7 +615,9 @@ class TestSpillPath:
     def test_evict_without_ssd_tier_still_works(self):
         """Eviction without SSD tier should work as before (discard)."""
         model = MagicMock()
-        config = MemoryCacheConfig(max_memory_mb=1, max_entries=2)
+        # min_prefix_tokens=1 so the 10-token sequences below actually store
+        # (prod default 128 would reject them silently).
+        config = MemoryCacheConfig(max_memory_mb=1, max_entries=2, min_prefix_tokens=1)
         cache = MemoryAwarePrefixCache(model, config)
 
         for i in range(5):
@@ -612,6 +626,84 @@ class TestSpillPath:
 
         # Should not raise, just discard
         assert len(cache) <= 2
+
+    def test_snapshot_runs_on_caller_thread(self, tmp_path):
+        """Producer-thread snapshot invariant: enqueue_spill MUST materialize
+        layer tensors on the *calling* thread, not the writer thread.
+
+        This is the regression test for the SSD spill Stream(gpu, N) crash.
+        We give the SSD tier a fake layer whose ``keys``/``values`` attributes
+        raise on access from any thread other than the one that created the
+        layer — simulating the MLX behavior of a per-thread Stream that's
+        only registered on the request handler.
+
+        Pre-fix: ``serialize_layer`` did ``np.array(layer.keys)`` on the
+        writer thread → access from the wrong thread → would crash.
+        Post-fix: ``enqueue_spill`` calls ``snapshot_layer`` on the calling
+        thread, so the materialization happens before the queue handoff.
+        """
+        import threading as _threading
+
+        creator_thread_id = _threading.get_ident()
+
+        class ThreadBoundArray:
+            """Mimics an mx.array that errors when read off-thread.
+
+            Real mx.array doesn't error this way at the Python level — it
+            crashes at the C++ level with the Stream(gpu, N) abort. We use a
+            controlled Python exception so the test can observe a failure
+            without taking down the test process.
+            """
+
+            def __init__(self, data, owner_tid):
+                self._data = data
+                self._owner_tid = owner_tid
+
+            def __array__(self):
+                if _threading.get_ident() != self._owner_tid:
+                    raise RuntimeError(
+                        "ThreadBoundArray accessed from wrong thread "
+                        "(simulates MLX Stream(gpu, N) cross-thread abort)"
+                    )
+                return self._data
+
+        class ThreadBoundKV:
+            def __init__(self, tid):
+                self.keys = ThreadBoundArray(
+                    np.zeros((1, 1, 1, 1), dtype=np.float16), tid
+                )
+                self.values = ThreadBoundArray(
+                    np.zeros((1, 1, 1, 1), dtype=np.float16), tid
+                )
+                self.offset = 1
+
+        ssd_config = SSDCacheConfig(cache_dir=str(tmp_path / "snapshot_test"))
+        ssd_tier = SSDCacheTier(ssd_config)
+        ssd_tier.start_writer()
+
+        try:
+            # enqueue_spill runs on THIS thread, the creator thread, so
+            # snapshot_layer's np.array(layer.keys) is allowed.
+            tokens = tuple(range(0, 200))  # arbitrary
+            enqueued = ssd_tier.enqueue_spill(
+                tokens,
+                [ThreadBoundKV(creator_thread_id)],
+                memory_bytes=64,
+            )
+            assert enqueued is True
+
+            # Writer thread now picks up the snapshot (numpy-only). It must
+            # NEVER touch the ThreadBoundArray instances. If it did, we'd
+            # see spill_count==0 and a warning in the log; with the fix in
+            # place spill_count goes to 1.
+            deadline = time.monotonic() + 5.0
+            while time.monotonic() < deadline:
+                if ssd_tier._stats.spill_count >= 1:
+                    break
+                time.sleep(0.05)
+            assert ssd_tier._stats.spill_count == 1
+        finally:
+            ssd_tier.close()
 
 
 import asyncio
@@ -879,7 +971,9 @@ class TestMemoryCacheSSDCheck:
     def test_check_ssd_returns_none_on_ram_hit(self, tmp_path):
         """When RAM has a hit, check_ssd should return None (not needed)."""
         model = MagicMock()
-        config = MemoryCacheConfig(max_memory_mb=1)
+        # 3-token sequence; need min_prefix_tokens=1 so the store() below
+        # actually populates the cache and a RAM hit is observable.
+        config = MemoryCacheConfig(max_memory_mb=1, min_prefix_tokens=1)
         cache = MemoryAwarePrefixCache(model, config)
 
         kv = [MockKVCacheForSpill(1000)]
@@ -901,7 +995,10 @@ class TestIntegrationSpillAndFetch:
     def cache_with_ssd(self, tmp_path):
         """RAM cache + SSD tier, small limits to force eviction."""
         model = MagicMock()
-        config = MemoryCacheConfig(max_memory_mb=1, max_entries=2)
+        # 10-token test sequences need min_prefix_tokens lowered from the
+        # 128 production default; without this every store() returns False
+        # and the spill-and-promote round-trip can never be observed.
+        config = MemoryCacheConfig(max_memory_mb=1, max_entries=2, min_prefix_tokens=1)
         ram_cache = MemoryAwarePrefixCache(model, config)
 
         ssd_config = SSDCacheConfig(
