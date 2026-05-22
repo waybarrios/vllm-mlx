@@ -498,12 +498,10 @@ class SimpleEngine(BaseEngine):
             # (client disconnect, exception, or early break). Without this
             # the producer continues generating tokens to completion on the
             # single MLX worker thread and blocks all subsequent requests.
+            # The producer still emits the trailing ("d", None) sentinel
+            # after observing the cancel between chunks; no need to wait
+            # on the future explicitly.
             cancel_event.set()
-            # Producer will still emit the trailing ("d", None) sentinel after
-            # observing the cancel between chunks; no need to wait for fut.
-            # iterator finishes or raises. No further action required here.
-            if not fut.done():
-                pass
 
     async def _run_blocking_serialized(self, func, /, *args, on_cancel=None, **kwargs):
         """Run a blocking MLX operation under the generation lock.
