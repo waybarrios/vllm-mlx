@@ -101,7 +101,12 @@ def test_patched_call_accepts_shared_kv_and_offset_kwargs(monkeypatch):
 
 
 def test_patched_call_snapshots_offset_before_update(monkeypatch):
-    """RoPE on queries must see the pre-update offset, even with BatchKVCache."""
+    """RoPE on queries must see the pre-update offset, even when BatchKVCache
+    mutates cache.offset in place via __iadd__ (which mx.array supports).
+    Re-bind (self.offset = self.offset + 1) is NOT the bug we're guarding —
+    use a real in-place += so the test would catch a regression that strips
+    the defensive copy.
+    """
     Attention = _install_fake_gemma4_modules(monkeypatch)
     from vllm_mlx.patches.gemma4_mllm import patch_gemma4_attention_for_batching
 
@@ -119,12 +124,14 @@ def test_patched_call_snapshots_offset_before_update(monkeypatch):
             return x
 
     class MutatingBatchCache:
-        # Mimics BatchKVCache: offset is mx.array, update_and_fetch advances it.
+        # mx.array.__iadd__ is in-place — same mutation pattern as real
+        # BatchKVCache. A naive non-copying snapshot survives a rebind but
+        # NOT an in-place +=; this is the actual regression to defend.
         def __init__(self):
             self.offset = mx.array([5])
 
         def update_and_fetch(self, keys, values):
-            self.offset = self.offset + 1
+            self.offset += 1
             return keys, values
 
     attn = Attention()

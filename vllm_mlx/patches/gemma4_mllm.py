@@ -1,25 +1,20 @@
 # SPDX-License-Identifier: Apache-2.0
 """
-Runtime patch for mlx-vlm's Gemma 4 attention to support BatchKVCache.
+Runtime patch for mlx-vlm Gemma 4 Attention to trim oversized masks.
 
-Gemma 4 Attention reads cache.offset into a local variable before calling
-update_and_fetch, then uses the same variable later for RoPE on queries:
+mlx-vlm 0.5.0's stock Gemma 4 attention assumes the mask's last dim matches
+keys.shape[-2] exactly. vllm-mlx's BatchedEngine MLLM path (continuous
+batching) sometimes passes a mask sized for the max sequence in the batch
+while a specific layer's keys end up shorter — sliding-window layers cap
+keys at window=512, the mask is built once for the full prompt. Without a
+trim, scaled_dot_product_attention sees a shape mismatch.
 
-    offset = cache.offset          # reference to mx.array([22])
-    keys = self.rope(keys, offset=offset)
-    keys, values = cache.update_and_fetch(keys, values)
-    #  ^^^ self.offset += 1  mutates the SAME mx.array in-place!
-    queries = self.rope(queries, offset=offset)   # offset is now 23!
-
-For KVCache, cache.offset is a Python int (immutable), so the local copy
-is unaffected. For BatchKVCache, cache.offset is an mx.array and
-mx.array.__iadd__ is *in-place*, so the local reference is silently
-mutated by update_and_fetch, giving queries the wrong RoPE position.
-
-This patch replaces Gemma4 Attention.__call__ with a version that
-snapshots cache.offset as a defensive copy before any mutation can occur.
-The mx.array copy preserves per-sequence offsets needed for correct RoPE
-in continuous batching (unlike int conversion which would lose this info).
+That mask trim is the only behavior this patch adds; everything else
+mirrors mlx-vlm 0.5.0 verbatim (signature, return shape, offset handling).
+The previous reason for this patch — BatchKVCache's in-place `+=` on
+`cache.offset` corrupting RoPE — is now handled upstream: mlx-vlm 0.5.0
+line 223 does `offset = mx.array(cache.offset) if cache is not None else 0`
+which is a defensive copy. (Confirmed in review of PR #564.)
 """
 
 import logging
@@ -30,27 +25,11 @@ import mlx.core as mx
 logger = logging.getLogger(__name__)
 
 
-def _snapshot_cache_offset(cache):
-    """Snapshot cache offset, making a defensive copy if it's an mx.array.
-
-    BatchKVCache stores offset as mx.array (per-batch-item).
-    mx.array.__iadd__ is in-place, so update_and_fetch mutates the original.
-    We return a copy to preserve the pre-update value for RoPE on queries.
-    """
-    if cache is None:
-        return 0
-    off = cache.offset
-    if isinstance(off, int):
-        return off
-    if isinstance(off, mx.array):
-        return off + 0  # defensive copy — new array, same values
-    return off
-
-
 def patch_gemma4_attention_for_batching() -> bool:
-    """Monkey-patch Gemma4 Attention.__call__: snapshot offset before
-    update_and_fetch (BatchKVCache fix) AND match mlx-vlm 0.5.0's signature
-    (shared_kv/offset kwargs + 3-tuple return).
+    """Patch Gemma 4 Attention.__call__ to trim oversized masks.
+
+    Otherwise mirrors mlx-vlm 0.5.0 upstream verbatim. Returns True if
+    applied, False if mlx-vlm is not installed or Gemma 4 unavailable.
     """
     try:
         from mlx_vlm.models.gemma4.language import Attention as Gemma4Attention
@@ -62,8 +41,6 @@ def patch_gemma4_attention_for_batching() -> bool:
     if getattr(Gemma4Attention, "_batch_patched", False):
         logger.debug("[Gemma4 patch] Already patched")
         return True
-
-    _orig_call = Gemma4Attention.__call__
 
     def _patched_call(
         self,
@@ -81,17 +58,14 @@ def patch_gemma4_attention_for_batching() -> bool:
         if shared_kv is not None:
             keys, values = shared_kv
         else:
-            # Snapshot offset BEFORE update_and_fetch can mutate it in-place
-            # (the original reason for this patch — see module docstring).
-            if offset is None:
-                offset = _snapshot_cache_offset(cache)
-
             keys = self.k_proj(x).reshape(B, L, self.n_kv_heads, self.head_dim)
 
             if self.use_k_eq_v:
                 values = keys
             else:
                 values = self.v_proj(x).reshape(B, L, self.n_kv_heads, self.head_dim)
+
+            offset = mx.array(cache.offset) if cache is not None else 0
 
             keys = self.k_norm(keys)
             keys = keys.transpose(0, 2, 1, 3)
@@ -106,6 +80,7 @@ def patch_gemma4_attention_for_batching() -> bool:
         queries = queries.transpose(0, 2, 1, 3)
         queries = self.rope(queries, offset=offset)
 
+        # Only addition vs upstream: trim mask if longer than keys.
         if mask is not None and isinstance(mask, mx.array):
             if mask.shape[-1] != keys.shape[-2]:
                 mask = mask[..., -keys.shape[-2] :]
@@ -115,10 +90,9 @@ def patch_gemma4_attention_for_batching() -> bool:
         )
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
 
-        # 3-tuple return matches mlx-vlm 0.5.0 DecoderLayer's expected unpack.
         return self.o_proj(output), (keys, values), offset
 
     Gemma4Attention.__call__ = _patched_call
     Gemma4Attention._batch_patched = True
-    logger.info("[Gemma4 patch] Attention patched for BatchKVCache support")
+    logger.info("[Gemma4 patch] Attention patched (mask trim for BatchedEngine)")
     return True
