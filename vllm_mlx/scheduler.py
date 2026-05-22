@@ -2980,13 +2980,10 @@ class Scheduler:
         try:
             from mlx_lm.models.cache import ArraysCache, KVCache
 
-            # Resolve mlx dtype objects by string name. Used to cast back
-            # arrays that were upcast (e.g. bf16 → fp32) on the spill path so
-            # numpy could persist them — see ssd_cache._mx_to_numpy_safe.
+            # Cast restored arrays back to their original dtype if the spill
+            # path upcast for numpy (bf16 → fp32). None = mlx lacks the named
+            # dtype on this version; accept default from mx.array(np_fp32).
             def _mx_dtype_from_name(name: str):
-                # Defensive: mlx might not have every dtype on every version;
-                # falling through with None means "skip the cast and accept
-                # the default dtype from mx.array(numpy_fp32)".
                 return getattr(mx, name, None)
 
             result = []
@@ -2995,11 +2992,6 @@ class Scheduler:
                     kv = KVCache()
                     kv.keys = mx.array(ld["keys"])
                     kv.values = mx.array(ld["values"])
-                    # Restore original dtype (e.g. bfloat16) if the snapshot
-                    # had to upcast for safetensors/numpy compatibility. The
-                    # model expects its native KV dtype; without this, the
-                    # next attention call would either pay an implicit cast
-                    # or refuse the input.
                     keys_orig = ld.get("keys_original_dtype")
                     if keys_orig is not None:
                         dt = _mx_dtype_from_name(keys_orig)
@@ -3017,7 +3009,6 @@ class Scheduler:
                     result.append(kv)
                 elif "state" in ld:
                     state_arrays = [mx.array(a) for a in ld["state"]]
-                    # Same dtype-restore for ArraysCache state entries.
                     state_dtypes = ld.get("state_original_dtypes")
                     if state_dtypes is not None:
                         for i, dtype_name in enumerate(state_dtypes):
