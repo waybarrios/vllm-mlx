@@ -48,37 +48,9 @@ def _snapshot_cache_offset(cache):
 
 
 def patch_gemma4_attention_for_batching() -> bool:
-    """Monkey-patch Gemma4 Attention.__call__ to snapshot offset before update
-    AND to match the mlx-vlm 0.5.0+ signature (shared_kv / offset kwargs and a
-    3-tuple return).
-
-    Background — two distinct reasons this patch exists
-    ---------------------------------------------------
-    1. **BatchKVCache compatibility (the original reason for this patch).**
-       BatchedEngine wraps the per-request KV cache in a ``BatchKVCache``
-       whose ``offset`` is an ``mx.array`` (one slot per batched sequence)
-       rather than a scalar int. The stock mlx-vlm Gemma 4 attention reads
-       ``cache.offset`` after ``update_and_fetch`` has already advanced it
-       in place, producing an off-by-one RoPE position for the just-
-       appended tokens — see ``_snapshot_cache_offset`` for the fix.
-
-    2. **mlx-vlm 0.5.0 signature change (added 2026-05-21).**
-       Upstream Gemma 4 added ``shared_kv: Optional[tuple]`` and ``offset``
-       kwargs, and ``DecoderLayer.__call__`` now unpacks a 3-tuple return
-       ``(output, (keys, values), offset)`` from ``self.self_attn``. The
-       previous version of this patch only accepted ``(x, mask, cache)``
-       and returned a single ``mx.array``, which made every Gemma 4
-       request under ``--continuous-batching`` crash with::
-
-           TypeError: patch_gemma4_attention_for_batching.<locals>._patched_call()
-           got an unexpected keyword argument 'shared_kv'
-
-       This update mirrors the upstream signature/return shape so the
-       DecoderLayer's tuple-unpack succeeds, while keeping the offset
-       snapshot behavior in #1 above.
-
-    Returns True if patch was applied, False if mlx-vlm is not installed
-    or Gemma 4 module not available.
+    """Monkey-patch Gemma4 Attention.__call__: snapshot offset before
+    update_and_fetch (BatchKVCache fix) AND match mlx-vlm 0.5.0's signature
+    (shared_kv/offset kwargs + 3-tuple return).
     """
     try:
         from mlx_vlm.models.gemma4.language import Attention as Gemma4Attention
@@ -101,36 +73,21 @@ def patch_gemma4_attention_for_batching() -> bool:
         shared_kv: Optional[tuple] = None,
         offset: Optional[Any] = None,
     ) -> Any:
-        # Returns a 3-tuple to match mlx-vlm 0.5.0's
-        #     h, shared_kv, offset = self.self_attn(...)
-        # in DecoderLayer. Returning a single mx.array (as the old patch
-        # did) breaks tuple-unpacking with TypeError.
         B, L, _ = x.shape
 
         queries = self.q_proj(x).reshape(B, L, self.n_heads, self.head_dim)
         queries = self.q_norm(queries)
 
         if shared_kv is not None:
-            # KV-shared layers (Gemma 4's first N decoder layers) reuse the
-            # previous layer's k/v rather than computing their own. mlx-vlm
-            # 0.5.0+ threads them through via the ``shared_kv`` kwarg from
-            # the DecoderLayer, replacing the older
-            # ``self.is_kv_shared_layer + cache.state`` lookup the previous
-            # version of this patch used.
             keys, values = shared_kv
         else:
             # Snapshot offset BEFORE update_and_fetch can mutate it in-place
             # (the original reason for this patch — see module docstring).
-            # If the caller supplied an offset, trust it; otherwise snapshot
-            # from cache. This matches upstream's branch where the
-            # DecoderLayer can override offset.
             if offset is None:
                 offset = _snapshot_cache_offset(cache)
 
             keys = self.k_proj(x).reshape(B, L, self.n_kv_heads, self.head_dim)
 
-            # k_eq_v: values come from raw k_proj (pre-k_norm) — upstream
-            # quirk preserved exactly.
             if self.use_k_eq_v:
                 values = keys
             else:
@@ -158,9 +115,7 @@ def patch_gemma4_attention_for_batching() -> bool:
         )
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
 
-        # 3-tuple return mirrors mlx-vlm 0.5.0 upstream. The middle slot is
-        # the (keys, values) the next KV-shared layer will read back via
-        # its own ``shared_kv`` kwarg.
+        # 3-tuple return matches mlx-vlm 0.5.0 DecoderLayer's expected unpack.
         return self.o_proj(output), (keys, values), offset
 
     Gemma4Attention.__call__ = _patched_call
