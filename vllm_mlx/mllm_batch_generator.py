@@ -456,10 +456,26 @@ class MLLMBatchGenerator:
         from .patches.qwen3_5_mllm import patch_qwen35_attention_for_batching
         from .patches.gemma4_mllm import patch_gemma4_attention_for_batching
         from .patches.glm4v_moe_mllm import patch_glm4v_moe_for_batching
+        from .patches.turboquant_r4 import install_turboquant_r4
 
         patch_qwen35_attention_for_batching()
         patch_gemma4_attention_for_batching()
         patch_glm4v_moe_for_batching()
+        # TurboQuant R4 patch is idempotent — safe to install unconditionally.
+        # Activates only for models loaded with quantization.type=="turboquant_v1".
+        # For non-turboquant models the patched code path is functionally identical
+        # to the original because their weights are not pre-rotated by R4 —
+        # but the patch DOES still apply mx.hadamard_transform which would CORRUPT
+        # a non-turboquant model. So we gate on env var instead.
+        import os
+
+        r4_env = os.environ.get("VLLM_MLX_TURBOQUANT_R4")
+        if r4_env in ("1", "all"):
+            install_turboquant_r4("all")
+        elif r4_env == "shared":
+            install_turboquant_r4("shared")
+        elif r4_env == "experts":
+            install_turboquant_r4("experts")
 
         self.max_tokens = max_tokens
         self.stop_tokens = stop_tokens or set()

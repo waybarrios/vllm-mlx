@@ -61,8 +61,25 @@ def load_model_with_fallback(model_name: str, tokenizer_config: dict = None):
         Tuple of (model, tokenizer)
     """
     from mlx_lm import load
+    from mlx_lm.utils import _download, load_config
 
     tokenizer_config = tokenizer_config or {}
+
+    # TurboQuant detection: install R4 online-Hadamard runtime patch BEFORE
+    # any model class instantiation so SwitchGLU / Qwen3NextMLP forward uses
+    # the patched __call__. Patches are idempotent + no-op for non-turboquant.
+    try:
+        model_path = _download(model_name)
+        cfg = load_config(model_path)
+        q = cfg.get("quantization") or cfg.get("quantization_config") or {}
+        if isinstance(q, dict) and q.get("type") == "turboquant_v1":
+            from vllm_mlx.patches.turboquant_r4 import install_turboquant_r4
+
+            install_turboquant_r4()
+            logger.info("TurboQuant model detected — R4 runtime patch installed")
+    except Exception as e:
+        # Don't block model load if probe fails; non-turboquant path continues.
+        logger.debug(f"TurboQuant probe failed (non-fatal): {e}")
 
     # Check if model needs fallback (e.g., Nemotron)
     if _needs_tokenizer_fallback(model_name):
