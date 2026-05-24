@@ -67,10 +67,16 @@ def test_serve_command_propagates_all_sampling_defaults(monkeypatch):
     from vllm_mlx import cli, server
     from vllm_mlx.utils import download
 
+    loaded = {}
+
     monkeypatch.setattr(
         download, "ensure_model_downloaded", lambda *args, **kwargs: "local-test-model"
     )
-    monkeypatch.setattr(server, "load_model", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        server,
+        "load_model",
+        lambda *args, **kwargs: loaded.update({"args": args, "kwargs": kwargs}),
+    )
     monkeypatch.setattr("uvicorn.run", lambda *args, **kwargs: None)
 
     for attr in (
@@ -91,6 +97,7 @@ def test_serve_command_propagates_all_sampling_defaults(monkeypatch):
             default_min_p=0.0,
             default_presence_penalty=0.0,
             default_repetition_penalty=1.0,
+            specprefill_backbone_pct=0.25,
         )
     )
 
@@ -100,3 +107,4 @@ def test_serve_command_propagates_all_sampling_defaults(monkeypatch):
     assert server._default_min_p == 0.0
     assert server._default_presence_penalty == 0.0
     assert server._default_repetition_penalty == 1.0
+    assert loaded["kwargs"]["specprefill_backbone_pct"] == 0.25
