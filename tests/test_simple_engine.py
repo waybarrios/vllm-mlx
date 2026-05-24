@@ -1689,6 +1689,69 @@ class TestSimpleEngineConcurrency:
         ]
 
     @pytest.mark.anyio
+    async def test_stream_generate_text_skips_system_cache_when_text_model_not_safe(
+        self,
+    ):
+        """MLLM TextModel routing must not snapshot hybrid ArraysCache state."""
+        from types import SimpleNamespace
+
+        from vllm_mlx.engine.simple import SimpleEngine
+
+        tokenizer = MagicMock()
+        tokenizer.apply_chat_template.return_value = (
+            "<|im_start|>system\nYou are helpful.<|im_end|>\n"
+            "<|im_start|>user\nhello<|im_end|>\n"
+            "<|im_start|>assistant\n"
+        )
+        tokenizer.bos_token = None
+        tokenizer.eos_token_id = 42
+        tokenizer.encode = MagicMock(
+            side_effect=[
+                list(range(10)),  # full prompt
+                list(range(5)),  # system prefix
+            ]
+        )
+
+        captured_prompts = []
+
+        def fake_stream_generate(model, tokenizer, prompt, **kwargs):
+            captured_prompts.append(prompt)
+            yield SimpleNamespace(text="Hello", finish_reason="stop")
+
+        def fail_if_manual_cache_path_runs(*args, **kwargs):
+            raise AssertionError("manual system-cache path must be skipped")
+
+        engine = SimpleEngine("test-model", force_mllm=True, mtp=False)
+        engine._loaded = True
+        engine._text_model = MagicMock()
+        engine._text_model.mtp = None
+        engine._text_tokenizer = tokenizer
+        engine._supports_system_kv_cache = False
+
+        with (
+            patch("mlx_lm.stream_generate", side_effect=fake_stream_generate),
+            patch(
+                "mlx_lm.models.cache.make_prompt_cache",
+                side_effect=fail_if_manual_cache_path_runs,
+            ),
+        ):
+            outputs = [
+                chunk
+                async for chunk in engine._stream_generate_text(
+                    messages=[
+                        {"role": "system", "content": "You are helpful."},
+                        {"role": "user", "content": "hello"},
+                    ],
+                    max_tokens=16,
+                    temperature=0.3,
+                    top_p=0.8,
+                )
+            ]
+
+        assert outputs[-1].text == "Hello"
+        assert captured_prompts == [tokenizer.apply_chat_template.return_value]
+
+    @pytest.mark.anyio
     async def test_stream_generate_text_disables_mtp_when_logits_processors_active(
         self,
     ):
