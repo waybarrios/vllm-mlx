@@ -3281,6 +3281,10 @@ async def status():
         "cache": stats.get("memory_aware_cache")
         or stats.get("paged_cache")
         or stats.get("prefix_cache"),
+        # SimpleEngine reports its (much simpler) system-prompt KV snapshot
+        # separately so dashboards can render a panel even in non-batched mode.
+        # Batched engines do not populate this field.
+        "system_kv_cache": stats.get("system_kv_cache"),
         "mtp": stats.get("mtp") or {"enabled": False},
         "requests": stats.get("requests", []),
     }

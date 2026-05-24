@@ -189,6 +189,12 @@ class SimpleEngine(BaseEngine):
         self._system_kv_snapshot = None  # List of (keys, values) per backbone layer
         self._system_kv_hash = None  # Hash of system prefix text
         self._system_kv_token_count = 0  # Tokens in cached prefix
+        # Hit/miss counters surfaced via get_stats() / GET /v1/status so
+        # dashboards can monitor SimpleEngine prompt-cache effectiveness the
+        # same way they monitor BatchedEngine prefix cache.
+        self._system_kv_hits = 0
+        self._system_kv_misses = 0
+        self._system_kv_tokens_saved = 0
         # True only when the model's prompt cache is composed entirely of
         # plain ``KVCache`` entries. Sliding-window models (gemma3_text,
         # olmo3, recurrent_gemma) return ``RotatingKVCache`` whose ``.state``
@@ -396,6 +402,9 @@ class SimpleEngine(BaseEngine):
         self._system_kv_snapshot = None
         self._system_kv_hash = None
         self._system_kv_token_count = 0
+        self._system_kv_hits = 0
+        self._system_kv_misses = 0
+        self._system_kv_tokens_saved = 0
         self._supports_system_kv_cache = False
         logger.info("SimpleEngine stopped")
 
@@ -1131,6 +1140,8 @@ class SimpleEngine(BaseEngine):
                         ):
                             cache_hit = True
                             hit_snapshot = candidate_snapshot
+                            self._system_kv_hits += 1
+                            self._system_kv_tokens_saved += system_token_count
                             logger.info(
                                 "System KV cache HIT (stream_chat): reusing %d "
                                 "tokens, prefilling %d new (hash=%s)",
@@ -1139,6 +1150,7 @@ class SimpleEngine(BaseEngine):
                                 system_hash,
                             )
                         else:
+                            self._system_kv_misses += 1
                             logger.info(
                                 "System KV cache MISS (stream_chat): will "
                                 "prefill %d system + %d suffix tokens (hash=%s)",
@@ -1684,6 +1696,8 @@ class SimpleEngine(BaseEngine):
                             )
                         )
                         cache_hit = True
+                        self._system_kv_hits += 1
+                        self._system_kv_tokens_saved += system_token_count
 
                         logger.info(
                             "System KV cache HIT: reusing %d cached tokens, "
@@ -1694,6 +1708,7 @@ class SimpleEngine(BaseEngine):
                         )
                     else:
                         # Cache MISS — will prefill system tokens and snapshot
+                        self._system_kv_misses += 1
                         logger.info(
                             "System KV cache MISS: will prefill %d system tokens, "
                             "%d suffix tokens (hash=%s)",
@@ -2222,19 +2237,28 @@ class SimpleEngine(BaseEngine):
                 "keep_pct": self._specprefill_keep_pct,
             }
 
-        # System KV cache stats
+        # System KV cache stats — always reported (even when no snapshot is
+        # cached yet) so dashboards have a stable schema to render the panel.
+        # When a snapshot exists, ``memory_mb`` reflects its actual bytes.
+        cache_bytes = 0
         if self._system_kv_snapshot is not None:
-            cache_bytes = 0
             for entry in self._system_kv_snapshot:
                 if isinstance(entry, tuple) and len(entry) == 2:
                     cache_bytes += entry[0].nbytes + entry[1].nbytes
                 elif isinstance(entry, list):
                     cache_bytes += sum(a.nbytes for a in entry if a is not None)
-            stats["system_kv_cache"] = {
-                "tokens": self._system_kv_token_count,
-                "hash": self._system_kv_hash,
-                "memory_mb": round(cache_bytes / 1e6, 1),
-            }
+        total_attempts = self._system_kv_hits + self._system_kv_misses
+        hit_rate = self._system_kv_hits / total_attempts if total_attempts > 0 else 0.0
+        stats["system_kv_cache"] = {
+            "enabled": self._supports_system_kv_cache,
+            "tokens": self._system_kv_token_count,
+            "hash": self._system_kv_hash,
+            "memory_mb": round(cache_bytes / 1e6, 1),
+            "hits": self._system_kv_hits,
+            "misses": self._system_kv_misses,
+            "hit_rate": round(hit_rate, 4),
+            "tokens_saved": self._system_kv_tokens_saved,
+        }
 
         # Include Metal memory stats
         try:
