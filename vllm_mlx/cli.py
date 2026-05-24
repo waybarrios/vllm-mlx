@@ -281,6 +281,16 @@ def serve_command(args):
             kv_cache_quantization_bits=args.kv_cache_quantization_bits,
             kv_cache_quantization_group_size=args.kv_cache_quantization_group_size,
             kv_cache_min_quantize_tokens=args.kv_cache_min_quantize_tokens,
+            kv_cache_k_bits=args.kv_k_bits or args.kv_cache_quantization_bits,
+            kv_cache_v_bits=args.kv_v_bits or args.kv_cache_quantization_bits,
+            kv_hadamard=args.kv_hadamard,
+            # Linear-attention (GatedDeltaNet) state quantization
+            linear_state_quantization=args.linear_state_quantization,
+            linear_state_quantization_bits=args.linear_state_quantization_bits,
+            linear_state_quantization_group_size=(
+                args.linear_state_quantization_group_size
+            ),
+            linear_state_bf16=args.linear_state_bf16,
             mllm_prefill_step_size=(
                 args.mllm_prefill_step_size if args.mllm_prefill_step_size > 0 else None
             ),
@@ -314,10 +324,29 @@ def serve_command(args):
             )
             print(f"Memory-aware cache: {cache_info}")
             if args.kv_cache_quantization:
+                kv_k = args.kv_k_bits or args.kv_cache_quantization_bits
+                kv_v = args.kv_v_bits or args.kv_cache_quantization_bits
+                if kv_k == kv_v:
+                    print(
+                        f"KV cache quantization: {kv_k}-bit, "
+                        f"group_size={args.kv_cache_quantization_group_size}"
+                    )
+                else:
+                    print(
+                        f"KV cache quantization: K={kv_k}-bit, V={kv_v}-bit, "
+                        f"group_size={args.kv_cache_quantization_group_size}"
+                    )
+            if args.linear_state_quantization:
                 print(
-                    f"KV cache quantization: {args.kv_cache_quantization_bits}-bit, "
-                    f"group_size={args.kv_cache_quantization_group_size}"
+                    "Linear-attention state quantization: "
+                    f"{args.linear_state_quantization_bits}-bit, "
+                    f"group_size={args.linear_state_quantization_group_size}"
                 )
+            if args.linear_state_bf16:
+                import os
+
+                ls_dtype = os.environ.get("VLLM_MLX_LINEAR_STATE_DTYPE", "bf16")
+                print(f"Linear-attention recurrent state: 16-bit {ls_dtype} (live)")
         elif enable_prefix_cache:
             print(f"Prefix cache: max_entries={args.prefix_cache_size}")
     else:
@@ -338,6 +367,22 @@ def serve_command(args):
                 f"(draft={mllm_draft_model}, kind={mllm_draft_kind}, "
                 f"block_size={mllm_draft_block_size})"
             )
+        if args.kv_cache_quantization:
+            kv_k = args.kv_k_bits or args.kv_cache_quantization_bits
+            kv_v = args.kv_v_bits or args.kv_cache_quantization_bits
+            hadamard_tag = " +QuaRot" if args.kv_hadamard else ""
+            if kv_k == kv_v:
+                print(
+                    f"KV cache quantization: {kv_k}-bit, "
+                    f"group_size={args.kv_cache_quantization_group_size}"
+                    f"{hadamard_tag}"
+                )
+            else:
+                print(
+                    f"KV cache quantization: K={kv_k}-bit, V={kv_v}-bit, "
+                    f"group_size={args.kv_cache_quantization_group_size}"
+                    f"{hadamard_tag}"
+                )
 
     if models_config:
         defaults = RegistryServeDefaults(
@@ -381,6 +426,16 @@ def serve_command(args):
             warm_prompts_path=getattr(args, "warm_prompts", None),
             auto_unload_idle_seconds=args.auto_unload_idle_seconds,
             lazy_load_model=args.lazy_load_model,
+            # KV cache quantization (live, BatchQuantizedKVCache). For
+            # SimpleEngine these flags activate the make_prompt_cache
+            # monkey-patch; for BatchedEngine the same values are read
+            # from scheduler_config (also built from these args above).
+            kv_cache_quantization=args.kv_cache_quantization,
+            kv_cache_quantization_bits=args.kv_cache_quantization_bits,
+            kv_cache_quantization_group_size=args.kv_cache_quantization_group_size,
+            kv_cache_k_bits=args.kv_k_bits,
+            kv_cache_v_bits=args.kv_v_bits,
+            kv_hadamard=args.kv_hadamard,
         )
 
     # Start server
@@ -535,6 +590,16 @@ def bench_command(args):
             kv_cache_quantization_bits=args.kv_cache_quantization_bits,
             kv_cache_quantization_group_size=args.kv_cache_quantization_group_size,
             kv_cache_min_quantize_tokens=args.kv_cache_min_quantize_tokens,
+            kv_cache_k_bits=args.kv_k_bits or args.kv_cache_quantization_bits,
+            kv_cache_v_bits=args.kv_v_bits or args.kv_cache_quantization_bits,
+            kv_hadamard=args.kv_hadamard,
+            # Linear-attention (GatedDeltaNet) state quantization
+            linear_state_quantization=args.linear_state_quantization,
+            linear_state_quantization_bits=args.linear_state_quantization_bits,
+            linear_state_quantization_group_size=(
+                args.linear_state_quantization_group_size
+            ),
+            linear_state_bf16=args.linear_state_bf16,
         )
 
         engine_config = EngineConfig(
@@ -1080,7 +1145,7 @@ Examples:
         "--kv-cache-quantization-bits",
         type=int,
         default=8,
-        choices=[4, 8],
+        choices=[2, 3, 4, 6, 8],
         help="Bit width for KV cache quantization (default: 8)",
     )
     serve_parser.add_argument(
@@ -1094,6 +1159,57 @@ Examples:
         type=int,
         default=256,
         help="Minimum tokens for quantization to apply (default: 256)",
+    )
+    serve_parser.add_argument(
+        "--kv-k-bits",
+        type=int,
+        default=None,
+        choices=[2, 3, 4, 6, 8],
+        help="Bit width for key cache quantization (overrides --kv-cache-quantization-bits for keys)",
+    )
+    serve_parser.add_argument(
+        "--kv-v-bits",
+        type=int,
+        default=None,
+        choices=[2, 3, 4, 6, 8],
+        help="Bit width for value cache quantization (overrides --kv-cache-quantization-bits for values)",
+    )
+    serve_parser.add_argument(
+        "--kv-hadamard",
+        action="store_true",
+        default=False,
+        help="Enable Hadamard rotation for KV cache quantization (QuaRot). "
+        "Spreads outlier channels uniformly before quantization, improving "
+        "quality at low bit widths. Requires --kv-cache-quantization.",
+    )
+    # Linear-attention (GatedDeltaNet) state quantization options
+    serve_parser.add_argument(
+        "--linear-state-quantization",
+        action="store_true",
+        help="Quantize stored GatedDeltaNet linear-attention state in the "
+        "prefix cache (Qwen3.5/3.6 hybrid models; 8-bit by default)",
+    )
+    serve_parser.add_argument(
+        "--linear-state-quantization-bits",
+        type=int,
+        default=8,
+        choices=[4, 8],
+        help="Bit width for linear-attention state quantization (default: 8)",
+    )
+    serve_parser.add_argument(
+        "--linear-state-quantization-group-size",
+        type=int,
+        default=64,
+        help="Group size for linear-attention state quantization (default: 64)",
+    )
+    serve_parser.add_argument(
+        "--linear-state-bf16",
+        action="store_true",
+        help="Store GatedDeltaNet recurrent state in a 16-bit dtype instead "
+        "of float32 during live inference (~halves linear-attention state "
+        "memory). The dtype is chosen by the VLLM_MLX_LINEAR_STATE_DTYPE env "
+        "var (bf16 | fp16, default bf16); fp16 tracks float32 more closely. "
+        "Verify quality before production use",
     )
     # SSD cache tiering options
     serve_parser.add_argument(
@@ -1543,7 +1659,7 @@ Examples:
         "--kv-cache-quantization-bits",
         type=int,
         default=8,
-        choices=[4, 8],
+        choices=[2, 3, 4, 6, 8],
         help="Bit width for KV cache quantization (default: 8)",
     )
     bench_parser.add_argument(
@@ -1557,6 +1673,55 @@ Examples:
         type=int,
         default=256,
         help="Minimum tokens for quantization to apply (default: 256)",
+    )
+    bench_parser.add_argument(
+        "--kv-k-bits",
+        type=int,
+        default=None,
+        choices=[2, 3, 4, 6, 8],
+        help="Bit width for key cache quantization (overrides --kv-cache-quantization-bits for keys)",
+    )
+    bench_parser.add_argument(
+        "--kv-v-bits",
+        type=int,
+        default=None,
+        choices=[2, 3, 4, 6, 8],
+        help="Bit width for value cache quantization (overrides --kv-cache-quantization-bits for values)",
+    )
+    bench_parser.add_argument(
+        "--kv-hadamard",
+        action="store_true",
+        default=False,
+        help="Enable Hadamard rotation for KV cache quantization (QuaRot). "
+        "Spreads outlier channels uniformly before quantization, improving "
+        "quality at low bit widths. Requires --kv-cache-quantization.",
+    )
+    # Linear-attention (GatedDeltaNet) state quantization options
+    bench_parser.add_argument(
+        "--linear-state-quantization",
+        action="store_true",
+        help="Quantize stored GatedDeltaNet linear-attention state in the "
+        "prefix cache (Qwen3.5/3.6 hybrid models; 8-bit by default)",
+    )
+    bench_parser.add_argument(
+        "--linear-state-quantization-bits",
+        type=int,
+        default=8,
+        choices=[4, 8],
+        help="Bit width for linear-attention state quantization (default: 8)",
+    )
+    bench_parser.add_argument(
+        "--linear-state-quantization-group-size",
+        type=int,
+        default=64,
+        help="Group size for linear-attention state quantization (default: 64)",
+    )
+    bench_parser.add_argument(
+        "--linear-state-bf16",
+        action="store_true",
+        help="Store GatedDeltaNet recurrent state in a 16-bit dtype instead "
+        "of float32 during live inference (~halves linear-attention state "
+        "memory). Dtype via VLLM_MLX_LINEAR_STATE_DTYPE env var (bf16 | fp16)",
     )
     # Paged cache options (experimental)
     bench_parser.add_argument(

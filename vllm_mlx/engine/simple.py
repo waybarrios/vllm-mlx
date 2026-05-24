@@ -130,6 +130,12 @@ class SimpleEngine(BaseEngine):
         mllm_draft_model: str | None = None,
         mllm_draft_kind: str | None = None,
         mllm_draft_block_size: int | None = None,
+        kv_cache_quantization: bool = False,
+        kv_cache_quantization_bits: int = 8,
+        kv_cache_quantization_group_size: int = 64,
+        kv_cache_k_bits: int | None = None,
+        kv_cache_v_bits: int | None = None,
+        kv_hadamard: bool = False,
     ):
         """
         Initialize the simple engine.
@@ -150,6 +156,17 @@ class SimpleEngine(BaseEngine):
             mllm_draft_model: Optional MLLM speculative draft/assistant model path
             mllm_draft_kind: Optional mlx-vlm draft kind, for example "mtp"
             mllm_draft_block_size: Optional speculative block size for mlx-vlm
+            kv_cache_quantization: Enable live KV cache quantization
+                (BatchQuantizedKVCache) for the SimpleEngine generation path.
+                Off by default to preserve current bf16 behavior.
+            kv_cache_quantization_bits: Symmetric bit width used when neither
+                ``kv_cache_k_bits`` nor ``kv_cache_v_bits`` is set.
+            kv_cache_quantization_group_size: Quantization group size.
+            kv_cache_k_bits: Optional override for key-cache bit width
+                (asymmetric K/V quantization, e.g. K=8 V=3).
+            kv_cache_v_bits: Optional override for value-cache bit width.
+            kv_hadamard: Apply QuaRot R3 Hadamard rotation before quantization
+                to suppress KV outliers (matches BatchedEngine ``--kv-hadamard``).
         """
         self._model_name = model_name
         self._created_at = time.time()
@@ -171,6 +188,17 @@ class SimpleEngine(BaseEngine):
 
         # KV cache size limit
         self._max_kv_size = max_kv_size
+
+        # Live KV cache quantization (BatchQuantizedKVCache, B=1).
+        # Installed once in ``start()`` after the model is loaded so the
+        # ``make_prompt_cache`` monkey-patch is active before the first
+        # ``stream_generate`` call. See utils/quantized_kv_cache.py.
+        self._kv_cache_quantization = kv_cache_quantization
+        self._kv_cache_quantization_bits = kv_cache_quantization_bits
+        self._kv_cache_quantization_group_size = kv_cache_quantization_group_size
+        self._kv_cache_k_bits = kv_cache_k_bits
+        self._kv_cache_v_bits = kv_cache_v_bits
+        self._kv_hadamard = kv_hadamard
 
         self._model = None
         self._loaded = False
@@ -254,6 +282,36 @@ class SimpleEngine(BaseEngine):
         if self._loaded:
             return
         try:
+            # Install live KV cache quantization BEFORE model load so the
+            # patched ``scaled_dot_product_attention`` is the binding that
+            # individual ``mlx_lm.models.<arch>`` modules import. Python's
+            # ``from .base import scaled_dot_product_attention`` captures
+            # the function object at module import time, so patching
+            # ``base.scaled_dot_product_attention`` after the model module
+            # is already loaded does not affect the model's binding.
+            # MLLM path uses mlx_vlm's own cache machinery and is not
+            # covered by this patch — left as a future extension.
+            if self._kv_cache_quantization and not self._is_mllm:
+                from ..utils.quantized_kv_cache import install_quantized_kv_cache
+
+                k_bits = (
+                    self._kv_cache_k_bits
+                    if self._kv_cache_k_bits is not None
+                    else self._kv_cache_quantization_bits
+                )
+                v_bits = (
+                    self._kv_cache_v_bits
+                    if self._kv_cache_v_bits is not None
+                    else self._kv_cache_quantization_bits
+                )
+                install_quantized_kv_cache(
+                    k_bits=k_bits,
+                    v_bits=v_bits,
+                    group_size=self._kv_cache_quantization_group_size,
+                    use_hadamard=self._kv_hadamard,
+                    simple_mode=True,
+                )
+
             if self._model is None:
                 if self._uses_default_prepare_for_start():
                     # MLX generation streams are thread-local. Keep model load on

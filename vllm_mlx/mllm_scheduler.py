@@ -81,6 +81,17 @@ class MLLMSchedulerConfig:
     kv_cache_quantization: bool = False
     kv_cache_quantization_bits: int = 8
     kv_cache_quantization_group_size: int = 64
+    # Asymmetric K/V bits (None = use kv_cache_quantization_bits for both)
+    kv_cache_k_bits: Optional[int] = None
+    kv_cache_v_bits: Optional[int] = None
+    # Hadamard rotation (QuaRot) for KV cache quantization
+    kv_hadamard: bool = False
+    # Linear-attention (GatedDeltaNet) state quantization for prefix cache
+    linear_state_quantization: bool = False
+    linear_state_quantization_bits: int = 8
+    linear_state_quantization_group_size: int = 64
+    # Store GatedDeltaNet recurrent state in bfloat16 during live inference
+    linear_state_bf16: bool = False
     # Interleaved prefill/decode budget per step (0 = disabled, blocking prefill)
     chunked_prefill_tokens: int = 0
     # Maximum KV cache size per sequence (0 = unbounded; >0 enables RotatingKVCache)
@@ -305,6 +316,15 @@ class MLLMScheduler:
                     kv_quantize=self.config.kv_cache_quantization,
                     kv_bits=self.config.kv_cache_quantization_bits,
                     kv_group_size=self.config.kv_cache_quantization_group_size,
+                    kv_k_bits=self.config.kv_cache_k_bits
+                    or self.config.kv_cache_quantization_bits,
+                    kv_v_bits=self.config.kv_cache_v_bits
+                    or self.config.kv_cache_quantization_bits,
+                    linear_state_quantize=self.config.linear_state_quantization,
+                    linear_state_bits=self.config.linear_state_quantization_bits,
+                    linear_state_group_size=(
+                        self.config.linear_state_quantization_group_size
+                    ),
                 )
 
             self.batch_generator = MLLMBatchGenerator(
@@ -319,6 +339,7 @@ class MLLMScheduler:
                 prefill_step_size=self.config.prefill_step_size,
                 prefix_cache_config=prefix_cache_config,
                 max_kv_size=self.config.max_kv_size,
+                linear_state_bf16=self.config.linear_state_bf16,
             )
 
             # Install chunked prefill BEFORE MTP (MTP wraps _next,
@@ -342,6 +363,27 @@ class MLLMScheduler:
                         lm,
                         num_draft_tokens=self.config.mtp_num_draft_tokens,
                     )
+
+            # Install live KV cache quantization if enabled
+            if self.config.kv_cache_quantization:
+                k_bits = (
+                    self.config.kv_cache_k_bits
+                    or self.config.kv_cache_quantization_bits
+                )
+                v_bits = (
+                    self.config.kv_cache_v_bits
+                    or self.config.kv_cache_quantization_bits
+                )
+                from vllm_mlx.utils.quantized_kv_cache import (
+                    install_quantized_kv_cache,
+                )
+
+                install_quantized_kv_cache(
+                    k_bits=k_bits,
+                    v_bits=v_bits,
+                    group_size=self.config.kv_cache_quantization_group_size,
+                    use_hadamard=self.config.kv_hadamard,
+                )
 
     # ========== Sync API (step-based) ==========
 

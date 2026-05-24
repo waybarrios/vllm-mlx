@@ -340,6 +340,19 @@ class BatchedEngine(BaseEngine):
         kv_group_size = getattr(
             self._scheduler_config, "kv_cache_quantization_group_size", 64
         )
+        kv_k_bits = getattr(self._scheduler_config, "kv_cache_k_bits", None)
+        kv_v_bits = getattr(self._scheduler_config, "kv_cache_v_bits", None)
+        kv_hadamard = getattr(self._scheduler_config, "kv_hadamard", False)
+        linear_quant = getattr(
+            self._scheduler_config, "linear_state_quantization", False
+        )
+        linear_quant_bits = getattr(
+            self._scheduler_config, "linear_state_quantization_bits", 8
+        )
+        linear_quant_group_size = getattr(
+            self._scheduler_config, "linear_state_quantization_group_size", 64
+        )
+        linear_state_bf16 = getattr(self._scheduler_config, "linear_state_bf16", False)
 
         chunked_prefill_tokens = getattr(
             self._scheduler_config, "chunked_prefill_tokens", 0
@@ -370,6 +383,13 @@ class BatchedEngine(BaseEngine):
             kv_cache_quantization=kv_quant,
             kv_cache_quantization_bits=kv_bits,
             kv_cache_quantization_group_size=kv_group_size,
+            kv_cache_k_bits=kv_k_bits,
+            kv_cache_v_bits=kv_v_bits,
+            kv_hadamard=kv_hadamard,
+            linear_state_quantization=linear_quant,
+            linear_state_quantization_bits=linear_quant_bits,
+            linear_state_quantization_group_size=linear_quant_group_size,
+            linear_state_bf16=linear_state_bf16,
             chunked_prefill_tokens=chunked_prefill_tokens,
             max_kv_size=max_kv_size,
             **mllm_extra,

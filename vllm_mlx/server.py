@@ -2921,6 +2921,12 @@ def load_model(
     warm_prompts_path: str | None = None,
     auto_unload_idle_seconds: float = 0.0,
     lazy_load_model: bool = False,
+    kv_cache_quantization: bool = False,
+    kv_cache_quantization_bits: int = 8,
+    kv_cache_quantization_group_size: int = 64,
+    kv_cache_k_bits: int | None = None,
+    kv_cache_v_bits: int | None = None,
+    kv_hadamard: bool = False,
 ):
     """
     Load a model (auto-detects MLLM vs LLM).
@@ -3091,6 +3097,12 @@ def load_model(
             mllm_draft_model=mllm_draft_model,
             mllm_draft_kind=mllm_draft_kind,
             mllm_draft_block_size=mllm_draft_block_size,
+            kv_cache_quantization=kv_cache_quantization,
+            kv_cache_quantization_bits=kv_cache_quantization_bits,
+            kv_cache_quantization_group_size=kv_cache_quantization_group_size,
+            kv_cache_k_bits=kv_cache_k_bits,
+            kv_cache_v_bits=kv_cache_v_bits,
+            kv_hadamard=kv_hadamard,
         )
         # Start SimpleEngine synchronously (no background loop)
         # Use new_event_loop() for Python 3.10+ compatibility (get_event_loop() is deprecated)
