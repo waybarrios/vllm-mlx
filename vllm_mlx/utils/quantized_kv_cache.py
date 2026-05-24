@@ -452,20 +452,38 @@ def install_quantized_kv_cache(
     v_bits: int = 8,
     group_size: int = 64,
     use_hadamard: bool = False,
+    simple_mode: bool = False,
 ):
     """Monkey-patch mlx_lm to use BatchQuantizedKVCache for live inference.
 
     Patches:
       1. _make_cache in mlx_lm.generate: KVCache -> BatchQuantizedKVCache
+         (used by BatchedEngine continuous-batching path)
       2. _merge_caches in mlx_lm.generate: merge with quantization
-      3. scaled_dot_product_attention in mlx_lm.models.base: asymmetric SDPA routing
+         (used by BatchedEngine continuous-batching path)
+      3. scaled_dot_product_attention in mlx_lm.models.base: asymmetric SDPA
+         routing (used by both Simple and Batched paths)
+      4. make_prompt_cache in mlx_lm.models.cache: KVCache ->
+         BatchQuantizedKVCache (used by SimpleEngine via stream_generate path).
+         Only applied when ``simple_mode=True``.
 
     When ``use_hadamard`` is True, Hadamard rotation (QuaRot) is applied before
     quantization and undone during attention, dramatically improving quantization
     quality by spreading outlier channels uniformly.
+
+    Args:
+        k_bits: bit width for key quantization (typically 3, 4, or 8).
+        v_bits: bit width for value quantization (typically 3, 4, or 8).
+        group_size: quantization group size (default 64).
+        use_hadamard: apply QuaRot R3 Hadamard before quantization.
+        simple_mode: also patch ``mlx_lm.models.cache.make_prompt_cache`` so
+            SimpleEngine (single-sequence) generation picks up the quantized
+            cache. Required for non-batched serving paths; harmless to omit
+            for pure batched serving.
     """
     gen_module = importlib.import_module("mlx_lm.generate")
     base_module = importlib.import_module("mlx_lm.models.base")
+    cache_module = importlib.import_module("mlx_lm.models.cache")
 
     from mlx_lm.models.cache import (
         ArraysCache,
@@ -612,8 +630,70 @@ def install_quantized_kv_cache(
 
     base_module.scaled_dot_product_attention = _patched_sdpa
 
+    # Also retrofit any ``mlx_lm.models.<arch>`` modules that already
+    # imported ``scaled_dot_product_attention`` before this install ran.
+    # ``from .base import scaled_dot_product_attention`` captures the
+    # function object at module-import time, so patching ``base`` alone
+    # leaves those bindings pointing at the original mlx-only SDPA. The
+    # SimpleEngine path now installs *before* model load so freshly
+    # imported model modules pick up the patched binding directly, but
+    # we still update already-loaded modules so re-loads or test runs
+    # behave consistently.
+    import sys as _sys
+
+    for _mod_name, _mod in list(_sys.modules.items()):
+        if (
+            _mod_name.startswith("mlx_lm.models.")
+            and _mod is not None
+            and getattr(_mod, "scaled_dot_product_attention", None) is _original_sdpa
+        ):
+            _mod.scaled_dot_product_attention = _patched_sdpa
+
+    # --- Patch 4 (simple_mode only): make_prompt_cache ---
+    # SimpleEngine uses mlx_lm.generate.stream_generate -> generate_step ->
+    # cache.make_prompt_cache(model), which constructs plain ``KVCache``
+    # instances. We wrap the returned list to swap those for batched
+    # quantized caches (B=1, left_padding=[0]). Non-KVCache layers (e.g.
+    # ArraysCache for GatedDeltaNet, RotatingKVCache for sliding windows)
+    # pass through unchanged with a warning — they need their own
+    # quantization story.
+    if simple_mode:
+        _original_make_prompt_cache = cache_module.make_prompt_cache
+
+        def _patched_make_prompt_cache(model, max_kv_size=None):
+            raw = _original_make_prompt_cache(model, max_kv_size=max_kv_size)
+            single_left_padding = [0]
+            wrapped = []
+            unsupported_seen = set()
+            for layer in raw:
+                if type(layer) is _KVCache:
+                    wrapped.append(
+                        BatchQuantizedKVCache(
+                            single_left_padding,
+                            k_bits=k_bits,
+                            v_bits=v_bits,
+                            group_size=group_size,
+                            use_hadamard=use_hadamard,
+                        )
+                    )
+                else:
+                    tn = type(layer).__name__
+                    if tn not in unsupported_seen:
+                        logger.warning(
+                            "SimpleEngine KV quantization: %s layer left "
+                            "unquantized (only plain KVCache is supported "
+                            "for single-sequence path).",
+                            tn,
+                        )
+                        unsupported_seen.add(tn)
+                    wrapped.append(layer)
+            return wrapped
+
+        cache_module.make_prompt_cache = _patched_make_prompt_cache
+
     hadamard_tag = ", QuaRot=ON" if use_hadamard else ""
+    mode_tag = "simple+batched" if simple_mode else "batched"
     logger.info(
         f"Installed BatchQuantizedKVCache: K={k_bits}-bit, V={v_bits}-bit, "
-        f"group_size={group_size}{hadamard_tag}"
+        f"group_size={group_size}{hadamard_tag}, mode={mode_tag}"
     )

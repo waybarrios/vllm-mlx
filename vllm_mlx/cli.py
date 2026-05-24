@@ -367,6 +367,22 @@ def serve_command(args):
                 f"(draft={mllm_draft_model}, kind={mllm_draft_kind}, "
                 f"block_size={mllm_draft_block_size})"
             )
+        if args.kv_cache_quantization:
+            kv_k = args.kv_k_bits or args.kv_cache_quantization_bits
+            kv_v = args.kv_v_bits or args.kv_cache_quantization_bits
+            hadamard_tag = " +QuaRot" if args.kv_hadamard else ""
+            if kv_k == kv_v:
+                print(
+                    f"KV cache quantization: {kv_k}-bit, "
+                    f"group_size={args.kv_cache_quantization_group_size}"
+                    f"{hadamard_tag}"
+                )
+            else:
+                print(
+                    f"KV cache quantization: K={kv_k}-bit, V={kv_v}-bit, "
+                    f"group_size={args.kv_cache_quantization_group_size}"
+                    f"{hadamard_tag}"
+                )
 
     if models_config:
         defaults = RegistryServeDefaults(
@@ -410,6 +426,16 @@ def serve_command(args):
             warm_prompts_path=getattr(args, "warm_prompts", None),
             auto_unload_idle_seconds=args.auto_unload_idle_seconds,
             lazy_load_model=args.lazy_load_model,
+            # KV cache quantization (live, BatchQuantizedKVCache). For
+            # SimpleEngine these flags activate the make_prompt_cache
+            # monkey-patch; for BatchedEngine the same values are read
+            # from scheduler_config (also built from these args above).
+            kv_cache_quantization=args.kv_cache_quantization,
+            kv_cache_quantization_bits=args.kv_cache_quantization_bits,
+            kv_cache_quantization_group_size=args.kv_cache_quantization_group_size,
+            kv_cache_k_bits=args.kv_k_bits,
+            kv_cache_v_bits=args.kv_v_bits,
+            kv_hadamard=args.kv_hadamard,
         )
 
     # Start server
