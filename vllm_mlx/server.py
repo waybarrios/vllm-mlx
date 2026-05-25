@@ -1751,10 +1751,21 @@ def _parse_tool_calls_with_parser(
                 for tc in result.tool_calls
             ]
             return result.content or "", tool_calls
-        else:
-            # Fallback: specific parser didn't find tool calls,
-            # try generic parser which handles more formats (e.g. Nemotron XML)
-            return parse_tool_calls(output_text, request_dict)
+
+        # Specific parser didn't find any tool calls. Try the generic parser
+        # which handles additional formats (e.g. Nemotron XML).
+        fallback_text, fallback_calls = parse_tool_calls(output_text, request_dict)
+        if fallback_calls:
+            return fallback_text, fallback_calls
+
+        # Neither parser found tool calls. Prefer the specific parser's cleaned
+        # content (which may have stripped truncated tool-call markup left by
+        # max_tokens cut-offs) over the raw model output. Falling back to the
+        # raw text here leaks partial <tool_call>/<function= markup into the
+        # response `content` when generation was cut mid-tool-call.
+        if result.content is not None:
+            return result.content, None
+        return fallback_text, None
     except Exception as e:
         logger.warning("Tool parser error: %s", _sanitize_log_text(e, limit=500))
         return parse_tool_calls(output_text, request_dict)
