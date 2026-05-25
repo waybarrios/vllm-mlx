@@ -81,6 +81,13 @@ vision = [
     "torch>=2.8.0",
     "torchvision>=0.23.0",
 ]
+# Harmony prompt rendering for GPT-OSS models (see #568). With this installed
+# and ``--tool-call-parser harmony``/``gpt-oss`` set, the engine routes prompt
+# building through OpenAI's canonical renderer instead of the Jinja chat
+# template (bypasses the bracket-text fallback that loses ``tool_calls``).
+harmony = [
+    "openai-harmony>=0.0.8",
+]
 # Audio dependencies for TTS/STT (mlx-audio)
 audio = [
     "mlx-audio>=0.2.9",
