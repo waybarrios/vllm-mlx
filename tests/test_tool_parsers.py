@@ -231,6 +231,86 @@ class TestLlamaToolParser:
         assert result.tools_called
         assert result.content == "Computing result"
 
+    # ------------------------------------------------------------------
+    # Tests for the python-tag and bare-JSON formats. The legacy
+    # `<function=name>{...}</function>` format above still works; these
+    # cover the additional shapes Llama 3.1+ / 3.3 / 4 actually emit at
+    # inference time.
+    # ------------------------------------------------------------------
+
+    def test_python_tag_json_format(self, parser):
+        """Llama 3.1+ / 4 canonical: <|python_tag|>{name, parameters}."""
+        text = '<|python_tag|>{"name": "read_file", "parameters": {"path": "foo.py"}}'
+        result = parser.extract_tool_calls(text)
+
+        assert result.tools_called
+        assert len(result.tool_calls) == 1
+        assert result.tool_calls[0]["name"] == "read_file"
+        args = json.loads(result.tool_calls[0]["arguments"])
+        assert args == {"path": "foo.py"}
+
+    def test_python_tag_arguments_alias(self, parser):
+        """Same wire shape with `arguments` instead of `parameters`."""
+        text = '<|python_tag|>{"name": "run_command", "arguments": {"cmd": "ls"}}'
+        result = parser.extract_tool_calls(text)
+
+        assert result.tools_called
+        assert result.tool_calls[0]["name"] == "run_command"
+        assert json.loads(result.tool_calls[0]["arguments"]) == {"cmd": "ls"}
+
+    def test_python_tag_multiple_calls(self, parser):
+        """Two python_tag calls in one response."""
+        text = (
+            '<|python_tag|>{"name": "read_file", "parameters": {"path": "a.py"}}'
+            '<|python_tag|>{"name": "read_file", "parameters": {"path": "b.py"}}'
+        )
+        result = parser.extract_tool_calls(text)
+
+        assert result.tools_called
+        assert len(result.tool_calls) == 2
+
+    def test_bare_json_format(self, parser):
+        """Llama 3.3: bare {type, name, parameters} JSON envelope, no marker."""
+        text = '{"type": "function", "name": "read_file", "parameters": {"path": "foo.py"}}'
+        result = parser.extract_tool_calls(text)
+
+        assert result.tools_called
+        assert len(result.tool_calls) == 1
+        assert result.tool_calls[0]["name"] == "read_file"
+        assert json.loads(result.tool_calls[0]["arguments"]) == {"path": "foo.py"}
+
+    def test_bare_json_without_type(self, parser):
+        """Bare JSON envelope without the `type` field still parses."""
+        text = '{"name": "grep", "parameters": {"pattern": "TODO"}}'
+        result = parser.extract_tool_calls(text)
+
+        assert result.tools_called
+        assert result.tool_calls[0]["name"] == "grep"
+
+    def test_plain_text_is_not_a_tool_call(self, parser):
+        """Plain text without any marker or JSON envelope must NOT be flagged."""
+        text = "I cannot find the file you mentioned."
+        result = parser.extract_tool_calls(text)
+
+        assert not result.tools_called
+        assert result.tool_calls == []
+        assert result.content == text
+
+    def test_non_tool_json_is_not_a_tool_call(self, parser):
+        """Bare JSON that lacks the `name`+`parameters` shape must NOT be flagged."""
+        text = '{"value": 42, "summary": "computed"}'
+        result = parser.extract_tool_calls(text)
+
+        assert not result.tools_called
+
+    def test_python_tag_takes_precedence_over_bare_json(self, parser):
+        """When a python_tag call is present, the bare-JSON path is skipped to
+        avoid double-counting."""
+        text = '<|python_tag|>{"name": "read_file", "parameters": {"path": "foo.py"}}'
+        result = parser.extract_tool_calls(text)
+
+        assert len(result.tool_calls) == 1
+
 
 class TestHermesToolParser:
     """Test the Hermes tool parser."""
