@@ -9,11 +9,12 @@ These models define the request and response schemas for:
 - MCP (Model Context Protocol) integration
 """
 
+import re
 import time
 import uuid
 from typing import Any
 
-from pydantic import AliasChoices, BaseModel, Field, model_serializer
+from pydantic import AliasChoices, BaseModel, Field, model_serializer, model_validator
 
 # =============================================================================
 # Content Types (for multimodal messages)
@@ -88,6 +89,9 @@ class Message(BaseModel):
 # =============================================================================
 
 
+_OPENAI_FUNCTION_NAME_RE = re.compile(r"[A-Za-z0-9_-]{1,64}")
+
+
 class FunctionCall(BaseModel):
     """A function call with name and arguments."""
 
@@ -108,6 +112,15 @@ class ToolDefinition(BaseModel):
 
     type: str = "function"
     function: dict
+
+    @model_validator(mode="after")
+    def _validate_openai_function_name(self):
+        if self.type != "function":
+            return self
+        name = self.function.get("name")
+        if not isinstance(name, str) or not _OPENAI_FUNCTION_NAME_RE.fullmatch(name):
+            raise ValueError("function.name must match ^[A-Za-z0-9_-]{1,64}$")
+        return self
 
 
 # =============================================================================

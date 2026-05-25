@@ -8,6 +8,9 @@ These are pure Pydantic models with no MLX dependency.
 
 import time
 
+import pytest
+from pydantic import ValidationError
+
 from vllm_mlx.api.models import (
     AssistantMessage,
     AudioSeparationRequest,
@@ -196,6 +199,25 @@ class TestToolCalling:
         assert td.type == "function"
         assert td.function["name"] == "get_weather"
 
+    def test_tool_definition_allows_openai_function_name_characters(self):
+        td = ToolDefinition(
+            function={
+                "name": "get-weather_2",
+                "description": "Get weather",
+            }
+        )
+
+        assert td.function["name"] == "get-weather_2"
+
+    def test_tool_definition_rejects_function_name_with_spaces(self):
+        with pytest.raises(ValidationError, match="function.name"):
+            ToolDefinition(
+                function={
+                    "name": "Answer Tool",
+                    "description": "Return hobbies",
+                }
+            )
+
 
 class TestResponseFormat:
     """Tests for structured output models."""
@@ -273,6 +295,22 @@ class TestChatCompletion:
         assert req.stream_options.include_usage is True
         assert req.tools is not None
         assert req.timeout == 30.0
+
+    def test_request_rejects_tool_name_with_spaces(self):
+        with pytest.raises(ValidationError, match="function.name"):
+            ChatCompletionRequest(
+                model="test-model",
+                messages=[Message(role="user", content="Use the Answer Tool.")],
+                tools=[
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "Answer Tool",
+                            "description": "Return hobbies",
+                        },
+                    }
+                ],
+            )
 
     def test_mllm_request_params(self):
         req = ChatCompletionRequest(
