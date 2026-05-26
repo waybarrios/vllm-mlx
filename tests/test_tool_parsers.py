@@ -311,6 +311,83 @@ class TestLlamaToolParser:
 
         assert len(result.tool_calls) == 1
 
+    # ------------------------------------------------------------------
+    # Streaming tests. Each test drives ``extract_tool_calls_streaming``
+    # incrementally with the chunks the runtime would deliver and checks
+    # that the parser buffers until the call(s) parse, then emits exactly
+    # once. Plain assistant content must still stream per chunk.
+    # ------------------------------------------------------------------
+
+    def _stream(self, parser, chunks):
+        """Drive the streaming parser with successive deltas; return the list
+        of non-``None`` events it emits."""
+        events = []
+        prev = ""
+        for delta in chunks:
+            curr = prev + delta
+            ev = parser.extract_tool_calls_streaming(prev, curr, delta)
+            if ev is not None:
+                events.append(ev)
+            prev = curr
+        return events
+
+    def test_streaming_xml_format_still_works(self, parser):
+        """Existing legacy XML behaviour must not regress."""
+        chunks = [
+            '<function=read_file>{"path": "',
+            "foo.py",
+            '"}</function>',
+        ]
+        events = self._stream(parser, chunks)
+        # Only the final chunk (containing </function>) emits a tool_calls event;
+        # the preceding chunks return None while we buffer.
+        tool_events = [e for e in events if "tool_calls" in e]
+        content_events = [e for e in events if "content" in e]
+        assert len(tool_events) == 1
+        assert tool_events[0]["tool_calls"][0]["function"]["name"] == "read_file"
+        assert content_events == []
+
+    def test_streaming_python_tag_emits_tool_call(self, parser):
+        """Llama 3.1+/4 python_tag format streams through cleanly without
+        leaking the JSON payload as assistant content."""
+        chunks = [
+            "<|python_tag|>",
+            '{"name": "run_command", ',
+            '"parameters": {"cmd": "',
+            'ls"}}',
+        ]
+        events = self._stream(parser, chunks)
+        tool_events = [e for e in events if "tool_calls" in e]
+        content_events = [e for e in events if "content" in e]
+        assert len(tool_events) == 1
+        assert tool_events[0]["tool_calls"][0]["function"]["name"] == "run_command"
+        # Critical: none of the JSON payload should have been streamed
+        # back to the client as assistant content.
+        assert content_events == []
+
+    def test_streaming_bare_json_emits_tool_call(self, parser):
+        """Llama 3.3 bare-JSON envelope must also be detected without a
+        leading marker — the discriminator is the ``"name"`` field."""
+        chunks = [
+            '{"type": "function", ',
+            '"name": "read_file", ',
+            '"parameters": {"path": "foo.py"}}',
+        ]
+        events = self._stream(parser, chunks)
+        tool_events = [e for e in events if "tool_calls" in e]
+        content_events = [e for e in events if "content" in e]
+        assert len(tool_events) == 1
+        assert tool_events[0]["tool_calls"][0]["function"]["name"] == "read_file"
+        assert content_events == []
+
+    def test_streaming_plain_text_streams_as_content(self, parser):
+        """Plain assistant text without a tool marker must stream per chunk
+        as ``{"content": delta_text}``."""
+        chunks = ["I will ", "look at ", "foo.py for you."]
+        events = self._stream(parser, chunks)
+        assert all("content" in e for e in events)
+        assert [e["content"] for e in events] == chunks
+
 
 class TestHermesToolParser:
     """Test the Hermes tool parser."""

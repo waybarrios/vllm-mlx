@@ -80,7 +80,11 @@ class LlamaToolParser(ToolParser):
                     {
                         "id": generate_tool_id(),
                         "name": str(obj["name"]).strip(),
-                        "arguments": json.dumps(args, ensure_ascii=False) if isinstance(args, (dict, list)) else str(args),
+                        "arguments": (
+                            json.dumps(args, ensure_ascii=False)
+                            if isinstance(args, (dict, list))
+                            else str(args)
+                        ),
                     }
                 )
             cleaned = cleaned[:idx] + cleaned[abs_end:]
@@ -105,13 +109,21 @@ class LlamaToolParser(ToolParser):
             obj = json.loads(stripped)
         except json.JSONDecodeError:
             return [], text
-        if not (isinstance(obj, dict) and "name" in obj and ("parameters" in obj or "arguments" in obj)):
+        if not (
+            isinstance(obj, dict)
+            and "name" in obj
+            and ("parameters" in obj or "arguments" in obj)
+        ):
             return [], text
         args = obj.get("parameters", obj.get("arguments", {}))
         call = {
             "id": generate_tool_id(),
             "name": str(obj["name"]).strip(),
-            "arguments": json.dumps(args, ensure_ascii=False) if isinstance(args, (dict, list)) else str(args),
+            "arguments": (
+                json.dumps(args, ensure_ascii=False)
+                if isinstance(args, (dict, list))
+                else str(args)
+            ),
         }
         return [call], ""
 
@@ -197,28 +209,50 @@ class LlamaToolParser(ToolParser):
     ) -> dict[str, Any] | None:
         """
         Extract tool calls from streaming Llama model output.
+
+        Recognises all three formats handled by ``extract_tool_calls``:
+        - legacy XML ``<function=name>{...}</function>``
+        - python-tag JSON ``<|python_tag|>{"name":...,"parameters":...}``
+        - bare JSON envelope ``{"name":...,"parameters":...}`` (Llama 3.3)
+
+        While the response is shaping up like a tool call the parser
+        buffers (returns ``None``); once the call(s) parse end-to-end the
+        result is emitted in one shot. Plain assistant content streams
+        through as ``{"content": delta_text}`` per chunk, matching the
+        existing behaviour for non-tool responses.
         """
-        # Check for tool call markers
-        if "<function=" not in current_text:
+        has_xml_marker = "<function=" in current_text
+        has_python_tag = self.PYTHON_TAG in current_text
+        # Bare-JSON discriminator: opening brace at the start of the
+        # buffered text. Mirrors the existing XML behaviour — once we see
+        # the opening marker we buffer until the call parses, accepting
+        # that arbitrary user-output JSON also gets buffered (the same
+        # trade-off the XML path makes when `<function=` lacks a close).
+        looks_like_bare_envelope = current_text.lstrip().startswith("{")
+
+        if not (has_xml_marker or has_python_tag or looks_like_bare_envelope):
+            # Plain content; stream as-is.
             return {"content": delta_text}
 
-        # If we detect end of function, parse
-        if "</function>" in delta_text:
-            result = self.extract_tool_calls(current_text)
-            if result.tools_called:
-                return {
-                    "tool_calls": [
-                        {
-                            "index": i,
-                            "id": tc["id"],
-                            "type": "function",
-                            "function": {
-                                "name": tc["name"],
-                                "arguments": tc["arguments"],
-                            },
-                        }
-                        for i, tc in enumerate(result.tool_calls)
-                    ]
-                }
+        # Looks like (or is partway through) a tool call. Try the full
+        # extractor — it succeeds only when at least one call parses
+        # end-to-end, so we naturally buffer until then.
+        result = self.extract_tool_calls(current_text)
+        if result.tools_called:
+            return {
+                "tool_calls": [
+                    {
+                        "index": i,
+                        "id": tc["id"],
+                        "type": "function",
+                        "function": {
+                            "name": tc["name"],
+                            "arguments": tc["arguments"],
+                        },
+                    }
+                    for i, tc in enumerate(result.tool_calls)
+                ]
+            }
 
+        # Still in flight — wait for more deltas before emitting.
         return None
