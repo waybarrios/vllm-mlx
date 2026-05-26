@@ -950,13 +950,21 @@ class SimpleEngine(BaseEngine):
                 )
             else:
                 try:
-                    prompt = tokenizer.apply_chat_template(safe_messages, **template_kwargs)
+                    prompt = tokenizer.apply_chat_template(
+                        safe_messages, **template_kwargs
+                    )
                 except TypeError:
                     # Some templates don't support all kwargs
-                    for key in ["tools", "enable_thinking", *chat_template_kwargs.keys()]:
+                    for key in [
+                        "tools",
+                        "enable_thinking",
+                        *chat_template_kwargs.keys(),
+                    ]:
                         if key in template_kwargs:
                             del template_kwargs[key]
-                    prompt = tokenizer.apply_chat_template(safe_messages, **template_kwargs)
+                    prompt = tokenizer.apply_chat_template(
+                        safe_messages, **template_kwargs
+                    )
         else:
             prompt = "\n".join(f"{m['role']}: {m['content']}" for m in messages)
             prompt += "\nassistant:"

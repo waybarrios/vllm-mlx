@@ -262,7 +262,9 @@ def render_messages(
                 sys_content = sys_content.with_reasoning_effort(level)
             except Exception:  # noqa: BLE001
                 pass
-        h_messages.append(_oh.Message.from_role_and_content(_oh.Role.SYSTEM, sys_content))
+        h_messages.append(
+            _oh.Message.from_role_and_content(_oh.Role.SYSTEM, sys_content)
+        )
 
     # 2. Developer block (tool schema). If caller passed an explicit
     #    developer message, render that; otherwise synthesize from tools.
@@ -271,7 +273,9 @@ def render_messages(
             h_messages.extend(_convert_message(m))
     elif tool_descs:
         dev_content = _oh.DeveloperContent.new().with_function_tools(tool_descs)
-        h_messages.append(_oh.Message.from_role_and_content(_oh.Role.DEVELOPER, dev_content))
+        h_messages.append(
+            _oh.Message.from_role_and_content(_oh.Role.DEVELOPER, dev_content)
+        )
 
     # 3. Everything else, in original order.
     for m in other_msgs:

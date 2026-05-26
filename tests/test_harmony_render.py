@@ -1,4 +1,3 @@
-# SPDX-License-Identifier: Apache-2.0
 """Regression tests for ``vllm_mlx.utils.harmony_render``.
 
 Targets the harmony rendering path enabled when ``--tool-call-parser harmony``
@@ -11,6 +10,8 @@ installed; skipped otherwise.
 """
 
 from __future__ import annotations
+
+import json
 
 import pytest
 
@@ -224,3 +225,151 @@ class TestHarmonyRender:
         the model knows it's its turn to generate."""
         prompt = render_messages([{"role": "user", "content": "Hi."}])
         assert prompt.rstrip().endswith("<|start|>assistant")
+
+
+class TestServerPathPreservesNativeForHarmony:
+    """End-to-end regression: messages with ``tool_calls`` must survive the
+    server's prep step without being flattened to bracket text, so the
+    harmony renderer downstream sees structured calls.
+
+    Without the ``use_harmony_rendering=True`` plumbing in
+    ``_prepare_chat_messages``, ``extract_multimodal_content`` runs with
+    ``preserve_native_format=False`` (because ``HarmonyToolParser`` keeps
+    ``SUPPORTS_NATIVE_TOOL_FORMAT=False`` by default) and converts assistant
+    ``tool_calls`` into ``[Calling tool: …]`` strings + tool messages into
+    ``[Tool Result …]`` strings before the LLM path's render call. The
+    rendered prompt then leaks that bracket text through into the
+    final-channel slot, defeating the entire harmony rendering effort.
+
+    These assertions fail loudly if that regression ever returns.
+    """
+
+    @pytest.fixture
+    def harmony_engine(self):
+        class _Engine:
+            is_mllm = False
+            preserve_native_tool_format = False  # harmony parser keeps this False
+            use_harmony_rendering = True  # set by _detect_harmony_rendering()
+
+        return _Engine()
+
+    def test_prep_path_preserves_tool_calls_for_harmony(self, harmony_engine):
+        from vllm_mlx.server import _prepare_chat_messages
+
+        request_messages = [
+            {"role": "user", "content": "Find the bug in foo.py."},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "c1",
+                        "type": "function",
+                        "function": {
+                            "name": "run_command",
+                            "arguments": '{"cmd": "cat foo.py"}',
+                        },
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "c1",
+                "content": "def foo():\n    return None",
+            },
+            {"role": "user", "content": "Continue."},
+        ]
+        messages, _images, _videos, _audios, _has_media = _prepare_chat_messages(
+            harmony_engine, request_messages
+        )
+
+        # The bracket-text fallback must not have run.
+        for m in messages:
+            content = m.get("content")
+            if isinstance(content, str):
+                assert "[Calling tool:" not in content
+                assert "[Tool Result" not in content
+
+        # Assistant tool_calls survived structurally.
+        assistant = next(m for m in messages if m.get("role") == "assistant")
+        assert assistant.get("tool_calls"), "tool_calls were dropped on prep"
+        assert assistant["tool_calls"][0]["function"]["name"] == "run_command"
+
+        # Tool message survived as role=tool (not flattened to role=user).
+        tool_msg = next(m for m in messages if m.get("role") == "tool")
+        assert tool_msg.get("content") == "def foo():\n    return None"
+
+    def test_rendered_prompt_after_prep_has_no_bracket_text(self, harmony_engine):
+        """The whole point: end-to-end, the harmony renderer must produce
+        commentary-channel calls — not the bracket-text leftovers from
+        ``extract_multimodal_content``'s legacy flatten path."""
+        from vllm_mlx.server import _prepare_chat_messages
+
+        request_messages = [
+            {"role": "user", "content": "Look at foo.py."},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "c1",
+                        "type": "function",
+                        "function": {
+                            "name": "run_command",
+                            "arguments": '{"cmd": "cat foo.py"}',
+                        },
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "c1",
+                "content": "def foo():\n    return None",
+            },
+            {"role": "user", "content": "Continue."},
+        ]
+        prepped, *_ = _prepare_chat_messages(harmony_engine, request_messages)
+        prompt = render_messages(prepped, tools=TOOLS)
+
+        assert "[Calling tool:" not in prompt
+        assert "[Tool Result" not in prompt
+        # Structural harmony shape did make it through.
+        assert "<|channel|>commentary" in prompt
+        assert "to=functions.run_command" in prompt
+        assert "<|start|>functions.run_command to=assistant" in prompt
+
+    def test_non_harmony_engine_falls_through_unchanged(self):
+        """When ``use_harmony_rendering`` is False (default for all
+        non-harmony parsers), the prep path must behave exactly as before
+        this patch — i.e., honor ``preserve_native_tool_format`` and
+        nothing else. Guards against accidentally flipping native
+        preservation for unrelated parsers."""
+        from vllm_mlx.server import _prepare_chat_messages
+
+        class _NoHarmonyEngine:
+            is_mllm = False
+            preserve_native_tool_format = False
+            # use_harmony_rendering deliberately absent — exercises the
+            # default-False branch via getattr().
+
+        engine = _NoHarmonyEngine()
+        request_messages = [
+            {"role": "user", "content": "Hi"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "c1",
+                        "type": "function",
+                        "function": {"name": "fn", "arguments": "{}"},
+                    }
+                ],
+            },
+        ]
+        messages, *_ = _prepare_chat_messages(engine, request_messages)
+        # Without harmony rendering AND without preserve_native_tool_format,
+        # the legacy bracket-text flatten still runs — that's the existing
+        # behaviour this PR doesn't change.
+        assistant = next(m for m in messages if m.get("role") == "assistant")
+        assert "[Calling tool: fn" in (assistant.get("content") or "")

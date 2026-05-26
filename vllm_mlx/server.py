@@ -313,6 +313,16 @@ def _prepare_chat_messages(
 
     is_mllm = bool(getattr(engine, "is_mllm", False))
     preserve_native = bool(getattr(engine, "preserve_native_tool_format", False))
+    # Harmony rendering needs the structural ``tool_calls`` / ``role=tool``
+    # shape to survive ``extract_multimodal_content`` — otherwise prior
+    # assistant tool calls reach ``render_messages()`` as ``[Calling tool: …]``
+    # bracket text and the harmony renderer can't reconstruct the
+    # commentary channel. The flag is set by ``_detect_harmony_rendering()``
+    # only when the harmony parser is active AND ``openai-harmony`` is
+    # importable, so non-harmony parsers and the no-extras install path see
+    # no change.
+    if bool(getattr(engine, "use_harmony_rendering", False)):
+        preserve_native = True
 
     if is_mllm:
         # For MLLM models, keep original messages with embedded images
