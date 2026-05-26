@@ -11,8 +11,6 @@ installed; skipped otherwise.
 
 from __future__ import annotations
 
-import json
-
 import pytest
 
 from vllm_mlx.utils.harmony_render import HAS_HARMONY, render_messages
