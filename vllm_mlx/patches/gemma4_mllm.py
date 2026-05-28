@@ -71,36 +71,41 @@ def patch_gemma4_attention_for_batching() -> bool:
         x: mx.array,
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
-    ) -> mx.array:
+        shared_kv: Optional[tuple] = None,
+        offset: Optional[Any] = None,
+    ) -> tuple:
         B, L, _ = x.shape
 
         queries = self.q_proj(x).reshape(B, L, self.n_heads, self.head_dim)
         queries = self.q_norm(queries)
 
-        # Snapshot offset BEFORE update_and_fetch can mutate it in-place.
-        # Preserves per-sequence mx.array offsets for correct batched RoPE.
-        offset = _snapshot_cache_offset(cache)
-
-        if self.is_kv_shared_layer and cache is not None:
-            state = cache.state
-            keys, values = state[0], state[1]
+        if shared_kv is not None:
+            keys, values = shared_kv
         else:
-            keys = self.k_proj(x).reshape(B, L, self.n_kv_heads, self.head_dim)
+            # Snapshot offset BEFORE update_and_fetch can mutate it in-place.
+            # Preserves per-sequence mx.array offsets for correct batched RoPE.
+            offset = _snapshot_cache_offset(cache)
 
-            if self.use_k_eq_v:
-                values = keys
+            if self.is_kv_shared_layer and cache is not None:
+                state = cache.state
+                keys, values = state[0], state[1]
             else:
-                values = self.v_proj(x).reshape(B, L, self.n_kv_heads, self.head_dim)
+                keys = self.k_proj(x).reshape(B, L, self.n_kv_heads, self.head_dim)
 
-            keys = self.k_norm(keys)
-            values = self.v_norm(values)
-            values = values.transpose(0, 2, 1, 3)
+                if self.use_k_eq_v:
+                    values = keys
+                else:
+                    values = self.v_proj(x).reshape(B, L, self.n_kv_heads, self.head_dim)
 
-            keys = keys.transpose(0, 2, 1, 3)
-            keys = self.rope(keys, offset=offset)
+                keys = self.k_norm(keys)
+                values = self.v_norm(values)
+                values = values.transpose(0, 2, 1, 3)
 
-            if cache is not None:
-                keys, values = cache.update_and_fetch(keys, values)
+                keys = keys.transpose(0, 2, 1, 3)
+                keys = self.rope(keys, offset=offset)
+
+                if cache is not None:
+                    keys, values = cache.update_and_fetch(keys, values)
 
         queries = queries.transpose(0, 2, 1, 3)
         queries = self.rope(queries, offset=offset)
@@ -113,7 +118,7 @@ def patch_gemma4_attention_for_batching() -> bool:
             queries, keys, values, cache=cache, scale=self.scale, mask=mask
         )
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
-        return self.o_proj(output)
+        return self.o_proj(output), (keys, values), offset
 
     Gemma4Attention.__call__ = _patched_call
     Gemma4Attention._batch_patched = True
