@@ -7,14 +7,25 @@ performance when serving a single user at a time.
 """
 
 import asyncio
+import contextvars
 import hashlib
 import logging
 import os
 import threading
 import time
-from collections import OrderedDict
+import uuid
+from collections import OrderedDict, deque
 from collections.abc import AsyncIterator
 from typing import Any
+
+# Re-entrancy guard for SimpleEngine._track_request_stream so that
+# internal fallback paths inside _stream_chat_impl (which call back into
+# self.stream_generate) don't double-count a single external request.
+# contextvars propagates per-asyncio-task, so concurrent requests still
+# each get their own outermost tracking pass.
+_in_tracker: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "_simple_engine_in_tracker", default=False
+)
 
 import mlx.core as mx
 
@@ -160,6 +171,19 @@ class SimpleEngine(BaseEngine):
         self._mtp = mtp
         self._mtp_num_draft_tokens = mtp_num_draft_tokens
         self._prefill_step_size = prefill_step_size
+
+        # Request stats (parity with BatchedEngine for /v1/status monitoring).
+        # Without these, monitoring sees zero traffic for SimpleEngine-backed
+        # servers (e.g. Gemma 4 31B with --mllm-draft-model + MTP).
+        self._total_requests_processed: int = 0
+        self._total_prompt_tokens: int = 0
+        self._total_completion_tokens: int = 0
+        self._num_running: int = 0
+        # Rolling window of (completion_tokens, duration_s) for tps computation.
+        self._recent_completions: deque = deque(maxlen=20)
+        # Live per-request state, mirroring BatchedEngine's "requests" list
+        # in /v1/status (request_id, phase, ttft_s, tokens_per_second, ...).
+        self._active_requests: dict[str, dict[str, Any]] = {}
 
         # SpecPrefill config
         self._specprefill_enabled = specprefill_enabled
@@ -556,7 +580,117 @@ class SimpleEngine(BaseEngine):
             finished=True,
         )
 
+    async def _track_request_stream(
+        self,
+        source_gen: AsyncIterator[GenerationOutput],
+        *,
+        max_tokens: int = 0,
+    ) -> AsyncIterator[GenerationOutput]:
+        """Yield-through wrapper that records per-request live state and
+        final ``prompt_tokens``/``completion_tokens`` counters.
+
+        Mirrors the fields BatchedEngine emits per running request
+        (``request_id``, ``phase``, ``elapsed_s``, ``ttft_s``,
+        ``tokens_per_second``, ``progress``, ...) so dashboards built
+        against ``/v1/status`` show individual in-flight requests for
+        SimpleEngine-backed services as well (Gemma 4 31B + MTP, etc.).
+
+        Re-entrant calls (e.g. the cache-fallback path inside
+        ``_stream_chat_impl`` that delegates to ``self.stream_generate``)
+        are detected via the ``_in_tracker`` context variable and pass
+        through without a second tracking entry, so each external
+        request is counted exactly once.
+
+        Note: we deliberately use ``set(True)``/``set(False)`` rather
+        than ``set(token)``/``reset(token)``. FastAPI/uvicorn finalize
+        streaming generators from a different async context than the
+        one that created them; ``ContextVar.reset(token)`` raises
+        ``ValueError`` in that case ("Token was created in a different
+        Context"), which surfaces as a terminal-frame streaming error.
+        ``set(False)`` works in any context and the contextvar is only
+        consumed inside this method, so there is no value to preserve.
+        """
+        if _in_tracker.get():
+            async for output in source_gen:
+                yield output
+            return
+        _in_tracker.set(True)
+        request_id = str(uuid.uuid4())
+        start = time.time()
+        ttft_s: float | None = None
+        last_p = 0
+        last_c = 0
+        entry: dict[str, Any] = {
+            "request_id": request_id,
+            "status": "running",
+            "phase": "prefill",
+            "elapsed_s": 0.0,
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "max_tokens": max_tokens,
+            "progress": 0.0,
+            "tokens_per_second": 0.0,
+            "ttft_s": None,
+            "cache_hit_type": None,
+            "cached_tokens": 0,
+        }
+        self._active_requests[request_id] = entry
+        self._num_running += 1
+        try:
+            async for output in source_gen:
+                now = time.time()
+                if hasattr(output, "prompt_tokens") and output.prompt_tokens:
+                    last_p = output.prompt_tokens
+                    entry["prompt_tokens"] = last_p
+                if hasattr(output, "completion_tokens") and output.completion_tokens:
+                    if ttft_s is None:
+                        ttft_s = now - start
+                        entry["ttft_s"] = round(ttft_s, 3)
+                        entry["phase"] = "generation"
+                    last_c = output.completion_tokens
+                    entry["completion_tokens"] = last_c
+                entry["elapsed_s"] = round(now - start, 2)
+                if max_tokens > 0:
+                    entry["progress"] = round(min(1.0, last_c / max_tokens), 3)
+                if ttft_s is not None and last_c > 0:
+                    gen_elapsed = max(1e-3, (now - start) - ttft_s)
+                    entry["tokens_per_second"] = round(last_c / gen_elapsed, 1)
+                yield output
+        finally:
+            self._active_requests.pop(request_id, None)
+            self._num_running = max(0, self._num_running - 1)
+            if last_c > 0:
+                duration = time.time() - start
+                self._total_requests_processed += 1
+                self._total_prompt_tokens += last_p
+                self._total_completion_tokens += last_c
+                self._recent_completions.append((last_c, duration))
+            _in_tracker.set(False)
+
     async def stream_generate(
+        self,
+        prompt: str,
+        max_tokens: int = 256,
+        temperature: float = 0.7,
+        top_p: float = 0.9,
+        stop: list[str] | None = None,
+        **kwargs,
+    ) -> AsyncIterator[GenerationOutput]:
+        """Public stream-generate wrapper with request stats tracking."""
+        async for output in self._track_request_stream(
+            self._stream_generate_impl(
+                prompt=prompt,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                stop=stop,
+                **kwargs,
+            ),
+            max_tokens=max_tokens,
+        ):
+            yield output
+
+    async def _stream_generate_impl(
         self,
         prompt: str,
         max_tokens: int = 256,
@@ -816,6 +950,33 @@ class SimpleEngine(BaseEngine):
             )
 
     async def stream_chat(
+        self,
+        messages: list[dict[str, Any]],
+        max_tokens: int = 256,
+        temperature: float = 0.7,
+        top_p: float = 0.9,
+        tools: list[dict] | None = None,
+        images: list[str] | None = None,
+        videos: list[str] | None = None,
+        **kwargs,
+    ) -> AsyncIterator[GenerationOutput]:
+        """Public stream-chat wrapper with request stats tracking."""
+        async for output in self._track_request_stream(
+            self._stream_chat_impl(
+                messages=messages,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                tools=tools,
+                images=images,
+                videos=videos,
+                **kwargs,
+            ),
+            max_tokens=max_tokens,
+        ):
+            yield output
+
+    async def _stream_chat_impl(
         self,
         messages: list[dict[str, Any]],
         max_tokens: int = 256,
@@ -1371,6 +1532,9 @@ class SimpleEngine(BaseEngine):
                         pass
 
             if cache_path_failed_before_first_token:
+                # Internal fallback to the public stream_generate. The
+                # ``_in_tracker`` context flag prevents double counting
+                # in _track_request_stream.
                 async for output in self.stream_generate(
                     prompt=prompt,
                     max_tokens=max_tokens,
@@ -1381,7 +1545,8 @@ class SimpleEngine(BaseEngine):
                     yield output
             return
 
-        # Fallback: no system prefix detected -> original uncached path
+        # Fallback: no system prefix detected -> original uncached path.
+        # Re-entrancy guard in _track_request_stream keeps stats single-counted.
         async for output in self.stream_generate(
             prompt=prompt,
             max_tokens=max_tokens,
@@ -2306,13 +2471,67 @@ class SimpleEngine(BaseEngine):
 
     def get_stats(self) -> dict[str, Any]:
         """Get engine statistics."""
+        # Compute rolling generation_tps from recent completions.
+        gen_tps = 0.0
+        if self._recent_completions:
+            total_tok = sum(c for c, _ in self._recent_completions)
+            total_sec = sum(s for _, s in self._recent_completions)
+            if total_sec > 0:
+                gen_tps = total_tok / total_sec
+        # Snapshot active requests with live elapsed_s refreshed at read time.
+        now = time.time()
+        requests_snapshot: list[dict[str, Any]] = []
+        for entry in self._active_requests.values():
+            snap = dict(entry)
+            # entry stores last-known elapsed at last yield; refresh here so
+            # the snapshot is meaningful even between yields.
+            requests_snapshot.append(snap)
         stats = {
             "engine_type": "simple",
             "model_name": self._model_name,
-            "uptime_seconds": time.time() - self._created_at,
+            "uptime_seconds": now - self._created_at,
             "is_mllm": self._is_mllm,
             "loaded": self._loaded,
+            "running": self._loaded,
+            "num_running": self._num_running,
+            "num_waiting": 0,
+            "num_requests_processed": self._total_requests_processed,
+            "total_prompt_tokens": self._total_prompt_tokens,
+            "total_completion_tokens": self._total_completion_tokens,
+            "batch_generator": {
+                "generation_tps": gen_tps,
+                "prompt_tps": 0.0,
+            },
+            "requests": requests_snapshot,
         }
+
+        # MLLM prefix cache stats, remapped to the shape BatchedEngine emits
+        # under "memory_aware_cache" so monitoring dashboards (which key off
+        # current_memory_mb / max_memory_mb / memory_utilization /
+        # entry_count) render cache utilization for SimpleEngine services.
+        if self._is_mllm and self._model is not None:
+            try:
+                raw_cache = self._model.get_cache_stats()
+            except Exception:
+                raw_cache = None
+            if raw_cache and raw_cache.get("enabled"):
+                current_mb = float(raw_cache.get("memory_used_mb", 0) or 0)
+                max_mb = float(raw_cache.get("max_memory_mb", 0) or 0)
+                stats["memory_aware_cache"] = {
+                    "hits": raw_cache.get("hits", 0),
+                    "misses": raw_cache.get("misses", 0),
+                    "hit_rate": raw_cache.get("hit_rate", 0.0),
+                    "evictions": raw_cache.get("evictions", 0),
+                    "tokens_saved": raw_cache.get("tokens_saved", 0),
+                    "current_memory_mb": round(current_mb, 2),
+                    "max_memory_mb": round(max_mb, 2),
+                    "memory_utilization": (
+                        round(current_mb / max_mb, 4) if max_mb > 0 else 0.0
+                    ),
+                    "entry_count": raw_cache.get(
+                        "cache_entries", raw_cache.get("entries", 0)
+                    ),
+                }
 
         # SpecPrefill stats
         if self._draft_model is not None:
