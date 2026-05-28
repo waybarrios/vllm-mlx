@@ -95,7 +95,9 @@ def patch_gemma4_attention_for_batching() -> bool:
                 if self.use_k_eq_v:
                     values = keys
                 else:
-                    values = self.v_proj(x).reshape(B, L, self.n_kv_heads, self.head_dim)
+                    values = self.v_proj(x).reshape(
+                        B, L, self.n_kv_heads, self.head_dim
+                    )
 
                 keys = self.k_norm(keys)
                 values = self.v_norm(values)
