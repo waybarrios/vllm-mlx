@@ -6,14 +6,17 @@ Tests the JSON parsing, validation, and response_format handling.
 """
 
 import json
+
 import pytest
+from vllm_mlx.api.models import ResponseFormat, ResponseFormatJsonSchema
 from vllm_mlx.api.tool_calling import (
-    validate_json_schema,
+    InvalidResponseFormatOutput,
+    apply_response_format_or_error,
+    build_json_system_prompt,
     extract_json_from_text,
     parse_json_output,
-    build_json_system_prompt,
+    validate_json_schema,
 )
-from vllm_mlx.api.models import ResponseFormat, ResponseFormatJsonSchema
 
 
 class TestValidateJsonSchema:
@@ -399,6 +402,27 @@ class TestParseJsonOutput:
         assert is_valid is True
 
 
+class TestServerResponseFormatBoundary:
+    """Tests for the server boundary after response_format parsing."""
+
+    def test_invalid_response_format_output_fails_before_success_response(self):
+        with pytest.raises(InvalidResponseFormatOutput) as excinfo:
+            apply_response_format_or_error(
+                "I will reason first and then maybe return JSON.",
+                {"type": "json_object"},
+            )
+
+        assert "Failed to extract valid JSON" in excinfo.value.message
+
+    def test_valid_response_format_output_returns_canonical_json(self):
+        content = apply_response_format_or_error(
+            'prefix {"ok": true, "count": 2} suffix',
+            {"type": "json_object"},
+        )
+
+        assert json.loads(content) == {"ok": True, "count": 2}
+
+
 class TestBuildJsonSystemPrompt:
     """Tests for build_json_system_prompt function."""
 
@@ -510,7 +534,7 @@ class TestInjectJsonInstruction:
 
         original = [{"role": "user", "content": "Hello"}]
         original_content = original[0]["content"]
-        result = _inject_json_instruction(original, "Return JSON only")
+        _inject_json_instruction(original, "Return JSON only")
 
         # Original should be unchanged
         assert len(original) == 1

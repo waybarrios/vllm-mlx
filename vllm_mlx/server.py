@@ -133,7 +133,9 @@ from .api.responses_models import (
     ResponsesUsage,
 )
 from .api.tool_calling import (
+    InvalidResponseFormatOutput,
     StreamingJsonFenceStripper,
+    apply_response_format_or_error,
     build_json_logits_processor,
     build_json_system_prompt,
     convert_tools_for_template,
@@ -683,6 +685,26 @@ class _ThinkingAwareLogitsProcessor:
         return self._inner._disabled
 
 
+def _attach_response_format_logits_processor(
+    chat_kwargs: dict, json_logits_processor: object
+) -> object:
+    """Attach response_format constraints and keep thinking disabled.
+
+    response_format content must be constrained from the first generated token.
+    If the processor is hidden behind thinking-state handling, direct JSON
+    emissions can bypass the constraint and run until max_tokens.
+    """
+
+    chat_kwargs["enable_thinking"] = False
+    if "chat_template_kwargs" in chat_kwargs:
+        chat_kwargs["chat_template_kwargs"] = dict(chat_kwargs["chat_template_kwargs"])
+        chat_kwargs["chat_template_kwargs"]["enable_thinking"] = False
+
+    existing = chat_kwargs.get("logits_processors") or []
+    chat_kwargs["logits_processors"] = list(existing) + [json_logits_processor]
+    return json_logits_processor
+
+
 def _prepare_chat_completion_invocation(
     engine: BaseEngine,
     request: ChatCompletionRequest,
@@ -752,33 +774,9 @@ def _prepare_chat_completion_invocation(
         chat_kwargs["stop"] = merged_stop
 
     if json_logits_processor is not None:
-        # Determine the *effective* thinking state: the request field, the
-        # resolved chat_template_kwargs, or the server default can all inject
-        # ``<think>`` into the rendered prompt independently.
-        ctk = chat_kwargs.get("chat_template_kwargs") or {}
-        effective_thinking = (
-            request.enable_thinking is True or ctk.get("enable_thinking") is True
+        json_logits_processor = _attach_response_format_logits_processor(
+            chat_kwargs, json_logits_processor
         )
-
-        if _reasoning_parser and effective_thinking:
-            # User explicitly requested thinking with constrained decoding
-            # (via top-level enable_thinking or chat_template_kwargs).
-            # Wrap the processor so the enforcer only activates after </think>.
-            json_logits_processor = _ThinkingAwareLogitsProcessor(
-                json_logits_processor, prompt_has_think_tag=True
-            )
-        else:
-            # Suppress thinking so the model goes straight to JSON.
-            # The template injects an empty <think></think> block and the
-            # enforcer constrains output from the first token onward.
-            # Force both top-level and chat_template_kwargs to prevent the
-            # Jinja template from rendering an open <think> block.
-            request.enable_thinking = False
-            chat_kwargs["enable_thinking"] = False
-            if "chat_template_kwargs" in chat_kwargs:
-                chat_kwargs["chat_template_kwargs"]["enable_thinking"] = False
-        existing = chat_kwargs.get("logits_processors") or []
-        chat_kwargs["logits_processors"] = list(existing) + [json_logits_processor]
 
     # Thinking-aware logits processor: cap reasoning tokens when a budget is set.
     # Only build when thinking is actually enabled for this request -- a CLI
@@ -850,23 +848,9 @@ def _prepare_anthropic_invocation(
         chat_kwargs["tools"] = template_tools
 
     if json_logits_processor is not None:
-        # Same logic as the OpenAI path: check both top-level and
-        # chat_template_kwargs for an explicit thinking request.
-        ctk = chat_kwargs.get("chat_template_kwargs") or {}
-        effective_thinking = (
-            openai_request.enable_thinking is True or ctk.get("enable_thinking") is True
+        json_logits_processor = _attach_response_format_logits_processor(
+            chat_kwargs, json_logits_processor
         )
-
-        if _reasoning_parser and effective_thinking:
-            json_logits_processor = _ThinkingAwareLogitsProcessor(
-                json_logits_processor, prompt_has_think_tag=True
-            )
-        else:
-            chat_kwargs["enable_thinking"] = False
-            if "chat_template_kwargs" in chat_kwargs:
-                chat_kwargs["chat_template_kwargs"]["enable_thinking"] = False
-        existing = chat_kwargs.get("logits_processors") or []
-        chat_kwargs["logits_processors"] = list(existing) + [json_logits_processor]
 
     return PreparedChatInvocation(
         messages=messages,
@@ -1807,6 +1791,57 @@ def _parse_tool_calls_with_parser(
     except Exception as e:
         logger.warning("Tool parser error: %s", _sanitize_log_text(e, limit=500))
         return parse_tool_calls(output_text, request_dict)
+
+
+def _apply_response_format_or_raise(
+    text: str,
+    response_format: object,
+    *,
+    ensure_ascii: bool = False,
+) -> str:
+    """Return validated JSON content or fail before returning a success response."""
+    try:
+        text = apply_response_format_or_error(
+            text, response_format, ensure_ascii=ensure_ascii
+        )
+    except InvalidResponseFormatOutput as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "error": "invalid_response_format_output",
+                "message": exc.message,
+            },
+        ) from exc
+    return _strip_backslash_before_unicode(text)
+
+
+def _response_format_type(response_format: object | None) -> str | None:
+    if response_format is None:
+        return None
+    if isinstance(response_format, dict):
+        return response_format.get("type")
+    return getattr(response_format, "type", None)
+
+
+def _promote_streaming_response_format_delta(
+    content: str | None,
+    reasoning: str | None,
+    request: ChatCompletionRequest,
+) -> tuple[str | None, str | None]:
+    """Keep response_format JSON on the streaming content channel.
+
+    Some thinking parsers classify direct JSON output as reasoning when the
+    model emits JSON without an explicit reasoning end marker.  For
+    response_format requests, that JSON is the final assistant content.
+    """
+    if content or not reasoning:
+        return content, reasoning
+    if _response_format_type(getattr(request, "response_format", None)) in (
+        "json_object",
+        "json_schema",
+    ):
+        return reasoning, None
+    return content, reasoning
 
 
 def _new_response_item_id(prefix: str) -> str:
@@ -4789,20 +4824,20 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
         # Process response_format if specified (after reasoning parser cleaned the text)
         if prepared.response_format and not tool_calls:
             json_input = cleaned_text or output.text
-            _, parsed_json, is_valid, error = parse_json_output(
-                json_input, prepared.response_format
-            )
-            if parsed_json is not None:
-                # Return JSON as string
-                parsed_json = _strip_backslash_before_unicode(parsed_json)
-                cleaned_text = json.dumps(parsed_json, ensure_ascii=False)
-            if not is_valid:
+            try:
+                cleaned_text = _apply_response_format_or_raise(
+                    json_input,
+                    prepared.response_format,
+                    ensure_ascii=False,
+                )
+            except HTTPException as exc:
                 if prepared.json_logits_processor is not None:
                     logger.error(
-                        "Constrained decoding produced invalid JSON: %s", error
+                        "Constrained decoding produced invalid JSON: %s", exc.detail
                     )
                 else:
-                    logger.warning(f"JSON validation failed: {error}")
+                    logger.warning("JSON validation failed: %s", exc.detail)
+                raise
 
         # Determine finish reason
         finish_reason = "tool_calls" if tool_calls else output.finish_reason
@@ -5218,22 +5253,23 @@ async def create_anthropic_message(
 
         if prepared.response_format and not tool_calls:
             json_input = cleaned_text or output.text
-            _, parsed_json, is_valid, error = parse_json_output(
-                json_input, prepared.response_format
-            )
-            if parsed_json is not None:
-                parsed_json = _strip_backslash_before_unicode(parsed_json)
-                cleaned_text = json.dumps(parsed_json, ensure_ascii=False)
-            if not is_valid:
+            try:
+                cleaned_text = _apply_response_format_or_raise(
+                    json_input,
+                    prepared.response_format,
+                    ensure_ascii=False,
+                )
+            except HTTPException as exc:
                 if prepared.json_logits_processor is not None:
                     logger.error(
                         "Constrained decoding produced invalid JSON on Anthropic endpoint: %s",
-                        error,
+                        exc.detail,
                     )
                 else:
                     logger.warning(
-                        "JSON validation failed on Anthropic endpoint: %s", error
+                        "JSON validation failed on Anthropic endpoint: %s", exc.detail
                     )
+                raise
 
         # Clean output text
         final_content = None
@@ -5903,6 +5939,9 @@ async def stream_chat_completion(
 
                 content = delta_msg.content
                 reasoning = delta_msg.reasoning
+                content, reasoning = _promote_streaming_response_format_delta(
+                    content, reasoning, request
+                )
 
                 # Some models (e.g. MiniMax) wrap tool calls in <think>
                 # blocks, so reasoning parser captures tool call XML as
