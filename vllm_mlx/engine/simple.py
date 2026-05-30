@@ -1681,18 +1681,21 @@ class SimpleEngine(BaseEngine):
         system_tokens = None
         suffix_tokens = None
         full_tokens_list = None
+        cache_blocking_controls = []
+        if not self._supports_system_kv_cache:
+            cache_blocking_controls.append("non_kv_cache_class")
+        if cache_blocking_controls:
+            logger.info(
+                "System KV cache SKIP (text route): request or engine has "
+                "controls/features the cache branch cannot honor (%s); using "
+                "uncached path",
+                cache_blocking_controls,
+            )
 
         # Extract system messages for caching
         has_system = any(m.get("role") == "system" for m in messages)
 
-        # Snapshot-safety: only enter the system-KV cache branch when start()'s
-        # probe verified the derived TextModel returns KVCache entries (and not
-        # RotatingKVCache, which aliases buffers mutated in place).
-        if (
-            has_system
-            and self._text_model is not None
-            and self._supports_system_kv_cache
-        ):
+        if has_system and self._text_model is not None and not cache_blocking_controls:
             # Find system prefix boundary in full prompt text.
             # ChatML format: system section ends where first non-system message begins.
             # Works with tools (rendered inside system section by Qwen templates).
