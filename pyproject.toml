@@ -49,6 +49,7 @@ dependencies = [
     "psutil>=5.9.0",
     # Server
     "fastapi>=0.100.0",
+    "starlette>=1.0.1",
     "uvicorn>=0.23.0",
     "prometheus-client>=0.20.0",
     # MCP (Model Context Protocol) support
