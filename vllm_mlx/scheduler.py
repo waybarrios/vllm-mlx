@@ -2980,12 +2980,28 @@ class Scheduler:
         try:
             from mlx_lm.models.cache import ArraysCache, KVCache
 
+            # Cast restored arrays back to their original dtype if the spill
+            # path upcast for numpy (bf16 → fp32). None = mlx lacks the named
+            # dtype on this version; accept default from mx.array(np_fp32).
+            def _mx_dtype_from_name(name: str):
+                return getattr(mx, name, None)
+
             result = []
             for ld in layer_dicts:
                 if "keys" in ld and "values" in ld:
                     kv = KVCache()
                     kv.keys = mx.array(ld["keys"])
                     kv.values = mx.array(ld["values"])
+                    keys_orig = ld.get("keys_original_dtype")
+                    if keys_orig is not None:
+                        dt = _mx_dtype_from_name(keys_orig)
+                        if dt is not None:
+                            kv.keys = kv.keys.astype(dt)
+                    values_orig = ld.get("values_original_dtype")
+                    if values_orig is not None:
+                        dt = _mx_dtype_from_name(values_orig)
+                        if dt is not None:
+                            kv.values = kv.values.astype(dt)
                     kv.offset = ld["offset"]
                     for attr in ("max_size", "keep", "step", "_idx"):
                         if attr in ld:
@@ -2993,6 +3009,14 @@ class Scheduler:
                     result.append(kv)
                 elif "state" in ld:
                     state_arrays = [mx.array(a) for a in ld["state"]]
+                    state_dtypes = ld.get("state_original_dtypes")
+                    if state_dtypes is not None:
+                        for i, dtype_name in enumerate(state_dtypes):
+                            if dtype_name is None:
+                                continue
+                            dt = _mx_dtype_from_name(dtype_name)
+                            if dt is not None:
+                                state_arrays[i] = state_arrays[i].astype(dt)
                     layer_obj = ArraysCache(len(state_arrays))
                     layer_obj.state = state_arrays
                     result.append(layer_obj)

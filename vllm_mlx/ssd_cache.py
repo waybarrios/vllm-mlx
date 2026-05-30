@@ -416,38 +416,52 @@ SERIALIZER_SUPPORT_MATRIX = {
 class LayerSerializer(ABC):
     """Interface for per-layer cache serialization.
 
-    Each implementation handles a specific cache type's serialization
-    to/from safetensors files with metadata.
+    Spill is split across two threads: ``snapshot_layer`` runs on the
+    producer (request handler) thread so the mx→numpy materialization
+    happens where the per-request Stream(gpu, N) is registered;
+    ``serialize_layer`` then runs on the SSD writer thread with numpy only.
     """
 
     @abstractmethod
+    def snapshot_layer(self, layer: Any) -> dict[str, Any]:
+        """Producer-thread CPU snapshot of an MLX-backed cache layer."""
+        ...
+
+    @abstractmethod
     def serialize_layer(
-        self, layer: Any, layer_idx: int, file_path: str
+        self, snapshot: dict[str, Any], layer_idx: int, file_path: str
     ) -> dict[str, Any]:
-        """Serialize a single cache layer to a file.
+        """Writer-thread: persist a snapshot to safetensors at file_path.
 
-        Args:
-            layer: The cache layer object.
-            layer_idx: Index of this layer in the cache list.
-            file_path: Path to write the safetensors file.
-
-        Returns:
-            Metadata dict with at least 'layer_type' key.
+        Returns metadata dict with at least 'layer_type'.
         """
         ...
 
     @abstractmethod
     def deserialize_layer(self, file_path: str, metadata: dict[str, Any]) -> dict:
-        """Deserialize a single cache layer from a file.
-
-        Args:
-            file_path: Path to the safetensors file.
-            metadata: Metadata dict from serialize_layer.
-
-        Returns:
-            Dict with layer state (keys/values/offset or state list).
-        """
+        """Read a layer back from disk. Returns layer-state dict."""
         ...
+
+
+def _mx_to_numpy_safe(arr: Any) -> tuple[np.ndarray, str | None]:
+    """mx.array → np.ndarray, upcasting numpy-unsupported dtypes (bf16) to fp32.
+
+    Returns (numpy_array, original_dtype_name_or_None). The name is only set
+    when an upcast happened, so the SSD-promote path can cast back.
+    """
+    try:
+        return np.array(arr), None
+    except RuntimeError as exc:
+        # numpy ↔ mlx bf16 buffer-protocol mismatch on mlx ≥ 0.31. Re-raise
+        # anything else — don't swallow unrelated errors.
+        if "buffer format string" not in str(exc):
+            raise
+        import mlx.core as mx
+
+        original_dtype = str(arr.dtype).rsplit(".", 1)[-1]
+        upcast = arr.astype(mx.float32)
+        mx.eval(upcast)  # astype is lazy; force materialization here
+        return np.array(upcast), original_dtype
 
 
 class KVCacheSerializer(LayerSerializer):
@@ -457,29 +471,52 @@ class KVCacheSerializer(LayerSerializer):
     RotatingKVCache also has .max_size, .keep, .step, ._idx.
     """
 
+    # Extra attributes carried by RotatingKVCache (but not vanilla KVCache).
+    # Stored in metadata so deserialize can faithfully reconstruct either type.
+    _ROTATING_ATTRS = ("max_size", "keep", "step", "_idx")
+
+    def snapshot_layer(self, layer: Any) -> dict[str, Any]:
+        keys_np, keys_orig_dtype = _mx_to_numpy_safe(layer.keys)
+        values_np, values_orig_dtype = _mx_to_numpy_safe(layer.values)
+
+        snapshot: dict[str, Any] = {
+            "keys_np": keys_np,
+            "values_np": values_np,
+            "offset": layer.offset,
+        }
+        if keys_orig_dtype is not None:
+            snapshot["keys_original_dtype"] = keys_orig_dtype
+        if values_orig_dtype is not None:
+            snapshot["values_original_dtype"] = values_orig_dtype
+
+        # RotatingKVCache extras (plain Python scalars, no MLX).
+        for attr in self._ROTATING_ATTRS:
+            if hasattr(layer, attr):
+                snapshot[attr] = getattr(layer, attr)
+        return snapshot
+
     def serialize_layer(
-        self, layer: Any, layer_idx: int, file_path: str
+        self, snapshot: dict[str, Any], layer_idx: int, file_path: str
     ) -> dict[str, Any]:
         from safetensors.numpy import save_file
 
-        keys_np = np.array(layer.keys)
-        values_np = np.array(layer.values)
-
         tensors = {
-            f"layer_{layer_idx}_keys": keys_np,
-            f"layer_{layer_idx}_values": values_np,
+            f"layer_{layer_idx}_keys": snapshot["keys_np"],
+            f"layer_{layer_idx}_values": snapshot["values_np"],
         }
         save_file(tensors, file_path)
 
         metadata = {
             "layer_type": "KVCache",
             "layer_idx": layer_idx,
-            "offset": layer.offset,
+            "offset": snapshot["offset"],
         }
-        # Preserve RotatingKVCache extra attributes
-        for attr in ("max_size", "keep", "step", "_idx"):
-            if hasattr(layer, attr):
-                metadata[attr] = getattr(layer, attr)
+        for k in ("keys_original_dtype", "values_original_dtype"):
+            if k in snapshot:
+                metadata[k] = snapshot[k]
+        for attr in self._ROTATING_ATTRS:
+            if attr in snapshot:
+                metadata[attr] = snapshot[attr]
 
         return metadata
 
@@ -494,7 +531,11 @@ class KVCacheSerializer(LayerSerializer):
             "values": tensors[f"layer_{layer_idx}_values"],
             "offset": metadata["offset"],
         }
-        for attr in ("max_size", "keep", "step", "_idx"):
+        # Dtype hints surfaced so _reconstruct_ssd_layers can cast back.
+        for k in ("keys_original_dtype", "values_original_dtype"):
+            if k in metadata:
+                result[k] = metadata[k]
+        for attr in self._ROTATING_ATTRS:
             if attr in metadata:
                 result[attr] = metadata[attr]
         return result
@@ -506,23 +547,40 @@ class ArraysCacheSerializer(LayerSerializer):
     Handles layers with .state attribute containing a list of arrays.
     """
 
+    def snapshot_layer(self, layer: Any) -> dict[str, Any]:
+        state_np: list[np.ndarray] = []
+        original_dtypes: list[str | None] = []
+        for arr in layer.state:
+            np_arr, orig = _mx_to_numpy_safe(arr)
+            state_np.append(np_arr)
+            original_dtypes.append(orig)
+
+        snapshot: dict[str, Any] = {"state_np": state_np}
+        # Skip the dtype list in the common (fp16/fp32) case.
+        if any(d is not None for d in original_dtypes):
+            snapshot["state_original_dtypes"] = original_dtypes
+        return snapshot
+
     def serialize_layer(
-        self, layer: Any, layer_idx: int, file_path: str
+        self, snapshot: dict[str, Any], layer_idx: int, file_path: str
     ) -> dict[str, Any]:
+        # Writer-thread side: pure numpy + disk.
         from safetensors.numpy import save_file
 
-        state = layer.state
-        tensors = {}
-        for i, arr in enumerate(state):
-            tensors[f"layer_{layer_idx}_state_{i}"] = np.array(arr)
-
+        state_np = snapshot["state_np"]
+        tensors = {
+            f"layer_{layer_idx}_state_{i}": arr for i, arr in enumerate(state_np)
+        }
         save_file(tensors, file_path)
 
-        return {
+        metadata = {
             "layer_type": "ArraysCache",
             "layer_idx": layer_idx,
-            "num_arrays": len(state),
+            "num_arrays": len(state_np),
         }
+        if "state_original_dtypes" in snapshot:
+            metadata["state_original_dtypes"] = snapshot["state_original_dtypes"]
+        return metadata
 
     def deserialize_layer(self, file_path: str, metadata: dict[str, Any]) -> dict:
         from safetensors.numpy import load_file
@@ -534,7 +592,10 @@ class ArraysCacheSerializer(LayerSerializer):
         state = []
         for i in range(num_arrays):
             state.append(tensors[f"layer_{layer_idx}_state_{i}"])
-        return {"state": state}
+        result = {"state": state}
+        if "state_original_dtypes" in metadata:
+            result["state_original_dtypes"] = metadata["state_original_dtypes"]
+        return result
 
 
 def get_serializer_for_layer(layer: Any) -> LayerSerializer:
@@ -635,7 +696,7 @@ class SSDCacheTier:
         logger.info("[ssd_cache] writer thread started")
 
     def _writer_loop(self) -> None:
-        """Background loop: drain spill queue and write to disk."""
+        """Drain spill queue and persist entries. Numpy-only — no MLX here."""
         while not self._writer_stop.is_set():
             try:
                 item = self._spill_queue.get(timeout=0.5)
@@ -645,9 +706,9 @@ class SSDCacheTier:
             if item is None:  # Poison pill for shutdown
                 break
 
-            tokens_key, cache_layers, memory_bytes = item
+            tokens_key, layer_snapshots, memory_bytes = item
             try:
-                self._write_entry(tokens_key, cache_layers, memory_bytes)
+                self._write_entry(tokens_key, layer_snapshots, memory_bytes)
             except Exception:
                 logger.exception(
                     f"[ssd_cache] failed to write entry " f"({len(tokens_key)} tokens)"
@@ -661,10 +722,27 @@ class SSDCacheTier:
     ) -> bool:
         """Enqueue a cache entry for async spill to SSD.
 
+        Must be called on the producer thread (the request handler that
+        owns the layer's Stream(gpu, N)) — the snapshot below materializes
+        MLX → numpy here so the writer thread never has to.
+
         Returns True if enqueued, False if queue is full (entry dropped).
         """
         try:
-            self._spill_queue.put_nowait((tokens, cache, memory_bytes))
+            layer_snapshots: list[tuple[LayerSerializer, dict[str, Any]]] = []
+            for layer in cache:
+                serializer = get_serializer_for_layer(layer)
+                snapshot = serializer.snapshot_layer(layer)
+                layer_snapshots.append((serializer, snapshot))
+        except Exception:
+            logger.exception(
+                "[ssd_cache] failed to snapshot layers for spill "
+                f"({len(tokens)} tokens) — entry dropped"
+            )
+            return False
+
+        try:
+            self._spill_queue.put_nowait((tokens, layer_snapshots, memory_bytes))
             return True
         except queue.Full:
             logger.warning(
@@ -676,13 +754,10 @@ class SSDCacheTier:
     def _write_entry(
         self,
         tokens_key: tuple[int, ...],
-        cache_layers: list[Any],
+        layer_snapshots: list[tuple[LayerSerializer, dict[str, Any]]],
         memory_bytes: int,
     ) -> None:
-        """Write a single cache entry to disk atomically.
-
-        Uses temp-file + rename for crash consistency.
-        """
+        """Atomically persist one entry (writer thread; numpy-only input)."""
         import shutil
 
         entry_hash = self._entry_hash(tokens_key)
@@ -698,10 +773,9 @@ class SSDCacheTier:
         layer_manifests = []
         total_file_bytes = 0
 
-        for i, layer in enumerate(cache_layers):
-            serializer = get_serializer_for_layer(layer)
+        for i, (serializer, snapshot) in enumerate(layer_snapshots):
             layer_path = os.path.join(tmp_dir, f"layer_{i}.safetensors")
-            metadata = serializer.serialize_layer(layer, i, layer_path)
+            metadata = serializer.serialize_layer(snapshot, i, layer_path)
             layer_manifests.append(metadata)
 
             # Set file permissions
@@ -710,7 +784,7 @@ class SSDCacheTier:
 
         # Write manifest
         manifest = {
-            "num_layers": len(cache_layers),
+            "num_layers": len(layer_snapshots),
             "layers": layer_manifests,
             "memory_bytes": memory_bytes,
             "num_tokens": len(tokens_key),
