@@ -895,10 +895,10 @@ class SimpleEngine(BaseEngine):
             accumulated_text = ""
             token_count = 0
 
-            # Text-only fallback when no TextModel exists: keep execution on the
-            # current thread. Routing through to_thread can break mlx_vlm stream
-            # ownership on some models (Stream(gpu, N) mismatch).
-            if self._text_model is None and not has_media_content(messages):
+            # Keep mlx_vlm stream_chat on the current thread. Routing through
+            # to_thread can break stream ownership on some models
+            # (Stream(gpu, N) mismatch).
+            if has_media_content(messages) or self._text_model is None:
                 local_kwargs = mllm_call_kwargs()
 
                 async with self._generation_lock:
