@@ -207,7 +207,13 @@ class SimpleEngine(BaseEngine):
         # SpecPrefill draft model (loaded at start if enabled)
         self._draft_model = None
 
-        # Lock to serialize MLX operations (prevents Metal command buffer conflicts)
+        # Lock to serialize MLX operations (prevents Metal command buffer conflicts).
+        # This lock guards Metal command-buffer access only; it is NOT a
+        # request-admission gate. Issue #495 asks that any future serialized
+        # TextModel-direct route must implement fail-fast admission (retryable
+        # 503 with `text_generation_busy`) instead of repurposing this lock as
+        # a wait-mode admission queue, since long waiters cause request pileup
+        # under agent traffic.
         self._generation_lock = asyncio.Lock()
 
         # System prompt KV cache (reduces repeated prefill across requests).
