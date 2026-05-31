@@ -43,6 +43,8 @@ class LMFormatEnforcerNotAvailableError(RuntimeError):
 # No eviction policy — agent workloads typically reuse a small fixed set of
 # tool schemas, so unbounded growth is not a realistic concern.
 _parser_cache: dict[str, tuple[dict, Any]] = {}
+_MAX_NONPROGRESS_WHITESPACE_CHARS = 256
+_JSON_WHITESPACE = frozenset(" \t\r\n")
 
 
 def _canonical_schema_key(schema: dict | None) -> str:
@@ -759,6 +761,37 @@ class JSONSchemaLogitsProcessor:
         """Return True if *prefix* is a prefix of at least one valid key name."""
         return any(name.startswith(prefix) for name in self._valid_key_names)
 
+    def _filter_nonprogress_whitespace_tokens(
+        self, suffix: list[int], allowed: list[int]
+    ) -> list[int]:
+        """Stop constrained JSON from spending a long run on pure whitespace.
+
+        JSON permits arbitrary whitespace around structural tokens. That is
+        valid, but with non-streaming requests a model can keep selecting
+        whitespace-only tokens for minutes without producing useful JSON
+        content. Once the decoded suffix has a long trailing whitespace run
+        outside a string, remove pure-whitespace tokens from the next-step
+        allowed set so generation must make structural/content progress.
+        """
+        text = self._decode_suffix(suffix)
+        if text is None or not text:
+            return allowed
+
+        trailing = len(text) - len(text.rstrip(" \t\r\n"))
+        if trailing < _MAX_NONPROGRESS_WHITESPACE_CHARS:
+            return allowed
+
+        filtered: list[int] = []
+        for tok_id in allowed:
+            tok_text = self._decode_token_cached(tok_id)
+            if tok_text is None:
+                filtered.append(tok_id)
+                continue
+            if tok_text == "" or all(ch in _JSON_WHITESPACE for ch in tok_text):
+                continue
+            filtered.append(tok_id)
+        return filtered if filtered else allowed
+
     def _build_allow_mask(self, allowed: list[int], vocab_size: int) -> mx.array:
         """
         Build a 1-D mask of length ``vocab_size`` where allowed positions are
@@ -822,6 +855,10 @@ class JSONSchemaLogitsProcessor:
             # incremental JSON context state and bracket depth counters
             # are up-to-date for the _suffix_is_complete_json pre-check).
             context = self._get_json_context(suffix)
+            if not self._json_ctx_in_string:
+                allowed_list = self._filter_nonprogress_whitespace_tokens(
+                    suffix, allowed_list
+                )
             if context in ("key_start", "in_key"):
                 allowed_list = self._filter_at_key_context(
                     context, suffix, allowed_list
