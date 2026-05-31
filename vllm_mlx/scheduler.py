@@ -2150,17 +2150,20 @@ class Scheduler:
             # Decode the new token using streaming detokenizer (UTF-8 safe)
             if response.finish_reason == "stop":
                 new_text = ""
+                output_text = ""
             else:
                 detok = self._get_detokenizer(request_id)
                 detok.add_token(response.token)
                 new_text = detok.last_segment
+                output_text = detok.text
 
             # Create output
             output = RequestOutput(
                 request_id=request_id,
                 new_token_ids=[response.token],
                 new_text=new_text,
-                output_token_ids=request.output_token_ids,
+                output_text=output_text,
+                output_token_ids=list(request.output_token_ids),
                 prompt_tokens=request.num_prompt_tokens,
                 completion_tokens=request.num_output_tokens,
             )

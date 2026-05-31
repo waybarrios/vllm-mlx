@@ -5854,11 +5854,8 @@ async def stream_chat_completion(
     # Tools schema for argument coercion is invariant for the request;
     # compute once instead of model_dump()-ing the whole request on every
     # tool-call delta during streaming.
-    tools_dict = (
-        request.model_dump(include={"tools"}).get("tools")
-        if request and request.tools
-        else None
-    )
+    request_dict = request.model_dump() if request is not None else {}
+    tools_dict = request_dict.get("tools") if request and request.tools else None
 
     # Check if we should include usage in the final chunk
     include_usage = request.stream_options and request.stream_options.include_usage
@@ -5915,6 +5912,11 @@ async def stream_chat_completion(
     tool_calls_detected = False
     tool_markup_possible = False  # Fast path: skip parsing until markers appear
     tool_parser = _get_streaming_tool_parser(request, engine)
+    post_tool_stream = any(
+        isinstance(message, dict) and message.get("role") == "tool"
+        for message in request_dict.get("messages", [])
+    )
+    decoded_text_seen = ""
 
     try:
         # Stream content
@@ -5923,6 +5925,23 @@ async def stream_chat_completion(
                 metrics_tracker.observe_ttft()
             delta_text = output.new_text
             last_output = output
+
+            # Some post-tool engine paths expose trustworthy cumulative text
+            # while per-chunk new_text can contain stale decoder fragments.
+            # Preserve streaming by deriving only the newest suffix instead of
+            # waiting for the final chunk.
+            if post_tool_stream:
+                full_text = (
+                    getattr(output, "text", "")
+                    or getattr(output, "output_text", "")
+                    or ""
+                )
+                if full_text:
+                    if full_text.startswith(decoded_text_seen):
+                        delta_text = full_text[len(decoded_text_seen) :]
+                    else:
+                        delta_text = full_text
+                    decoded_text_seen = full_text
 
             # Track token counts from output (updated each chunk)
             if hasattr(output, "prompt_tokens") and output.prompt_tokens:
@@ -5983,9 +6002,19 @@ async def stream_chat_completion(
                             tool_markup_possible = True
                         tool_previous = tool_accumulated_text
                         tool_accumulated_text += content
-                        tool_result = tool_parser.extract_tool_calls_streaming(
-                            tool_previous, tool_accumulated_text, content
-                        )
+                        try:
+                            tool_result = tool_parser.extract_tool_calls_streaming(
+                                tool_previous,
+                                tool_accumulated_text,
+                                content,
+                                request=request_dict,
+                            )
+                        except TypeError as exc:
+                            if "unexpected keyword argument 'request'" not in str(exc):
+                                raise
+                            tool_result = tool_parser.extract_tool_calls_streaming(
+                                tool_previous, tool_accumulated_text, content
+                            )
 
                         if tool_result is None:
                             # Inside tool markup - suppress content output
@@ -6102,9 +6131,19 @@ async def stream_chat_completion(
                             tool_markup_possible = True
                         tool_previous = tool_accumulated_text
                         tool_accumulated_text += delta_text
-                        tool_result = tool_parser.extract_tool_calls_streaming(
-                            tool_previous, tool_accumulated_text, delta_text
-                        )
+                        try:
+                            tool_result = tool_parser.extract_tool_calls_streaming(
+                                tool_previous,
+                                tool_accumulated_text,
+                                delta_text,
+                                request=request_dict,
+                            )
+                        except TypeError as exc:
+                            if "unexpected keyword argument 'request'" not in str(exc):
+                                raise
+                            tool_result = tool_parser.extract_tool_calls_streaming(
+                                tool_previous, tool_accumulated_text, delta_text
+                            )
 
                         if tool_result is None:
                             # Inside tool markup - suppress output
@@ -6180,7 +6219,9 @@ async def stream_chat_completion(
             and not tool_calls_detected
             and _streaming_tool_markup_possible(tool_accumulated_text)
         ):
-            final_parse_result = tool_parser.extract_tool_calls(tool_accumulated_text)
+            final_parse_result = tool_parser.extract_tool_calls(
+                tool_accumulated_text, request_dict
+            )
             if final_parse_result.tools_called:
                 tool_chunk = ChatCompletionChunk(
                     id=response_id,
