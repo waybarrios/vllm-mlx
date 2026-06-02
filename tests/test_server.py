@@ -898,6 +898,71 @@ class TestHelperFunctions:
         assert len(videos) == 0
         assert audios == ["data:audio/wav;base64,abc"]
 
+    def test_extract_reasoning_no_tools_drops_raw_harmony_commentary(self, monkeypatch):
+        """No-tools branch must not preserve raw harmony tokens — regression
+        guard for the `clean_output_text` bypass leaking `<|channel|>`,
+        `<|message|>`, `<|call|>` into response content when the model
+        emits a `to=functions` block but no tools are defined."""
+        import vllm_mlx.server as server
+
+        class FakeReasoningParser:
+            def extract_reasoning(self, text):
+                return "analysis content", None
+
+        raw = (
+            "<|channel|>analysis<|message|>thinking..."
+            "<|channel|>commentary to=functions.read_file"
+            '<|message|>{"path":"/etc/hosts"}<|call|>'
+        )
+        request = SimpleNamespace(tools=None)
+
+        monkeypatch.setattr(server, "_reasoning_parser", FakeReasoningParser())
+
+        reasoning, cleaned, tool_calls = server._extract_reasoning_and_tool_calls(
+            raw, request
+        )
+
+        assert reasoning == "analysis content"
+        assert tool_calls is None
+        assert cleaned == ""
+        assert "<|channel|>" not in (cleaned or "")
+        assert "<|message|>" not in (cleaned or "")
+        assert "<|call|>" not in (cleaned or "")
+
+    def test_extract_reasoning_with_tools_preserves_raw_for_parser(self, monkeypatch):
+        """With-tools branch keeps raw output so the harmony parser can
+        extract the commentary tool block (positive case, guards against
+        over-correction of the no-tools fix)."""
+        import vllm_mlx.server as server
+
+        class FakeReasoningParser:
+            def extract_reasoning(self, text):
+                return "analysis content", None
+
+        seen = []
+
+        def fake_parse(text, request, **_):
+            seen.append(text)
+            return None, ["call_extracted"]
+
+        raw = (
+            "<|channel|>analysis<|message|>thinking..."
+            "<|channel|>commentary to=functions.read_file"
+            '<|message|>{"path":"/etc/hosts"}<|call|>'
+        )
+        request = SimpleNamespace(tools=[{"type": "function"}])
+
+        monkeypatch.setattr(server, "_reasoning_parser", FakeReasoningParser())
+        monkeypatch.setattr(server, "_parse_tool_calls_with_parser", fake_parse)
+
+        reasoning, cleaned, tool_calls = server._extract_reasoning_and_tool_calls(
+            raw, request
+        )
+
+        assert reasoning == "analysis content"
+        assert tool_calls == ["call_extracted"]
+        assert seen == [raw]
+
 
 # =============================================================================
 # Security and Reliability Tests (PR #4)
