@@ -867,6 +867,74 @@ def process_audio_input(audio: str | dict) -> str:
     raise ValueError(f"Cannot process audio: {audio[:50]}...")
 
 
+def _video_has_audio_track(video_path: str) -> bool:
+    """Return True if ffprobe finds an audio stream in the video."""
+    import shutil
+    import subprocess
+
+    if not shutil.which("ffprobe"):
+        return True  # assume yes; extraction will fail loudly if not
+    try:
+        r = subprocess.run(
+            [
+                "ffprobe", "-loglevel", "error", "-select_streams", "a",
+                "-show_entries", "stream=codec_type", "-of", "csv=p=0",
+                video_path,
+            ],
+            capture_output=True, timeout=30, text=True,
+        )
+        return bool(r.stdout.strip())
+    except (subprocess.SubprocessError, OSError):
+        return True
+
+
+def extract_audio_from_video(video_path: str) -> str | None:
+    """Extract the audio track from a video file as 16 kHz mono WAV.
+
+    Returns the path to the WAV (registered with the temp manager so it's
+    cleaned up automatically), or None if the video has no audio or ffmpeg
+    is unavailable.
+    """
+    import os
+    import shutil
+    import subprocess
+
+    if not shutil.which("ffmpeg"):
+        logger.warning(
+            "ffmpeg not found; cannot fuse audio from video_url. "
+            "Install ffmpeg to enable A/V fusion on omni models."
+        )
+        return None
+    if not _video_has_audio_track(video_path):
+        return None
+
+    fd, out_path = tempfile.mkstemp(suffix=".wav", prefix="vllmmlx_va_")
+    os.close(fd)
+    try:
+        r = subprocess.run(
+            [
+                "ffmpeg", "-y", "-i", video_path,
+                "-vn", "-ac", "1", "-ar", "16000",
+                "-c:a", "pcm_s16le", out_path,
+            ],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=600,
+        )
+        if r.returncode != 0 or os.path.getsize(out_path) == 0:
+            try:
+                os.unlink(out_path)
+            except OSError:
+                pass
+            return None
+        return _temp_manager.register(out_path)
+    except (subprocess.SubprocessError, OSError) as e:
+        logger.warning(f"Audio extraction from video failed: {e}")
+        try:
+            os.unlink(out_path)
+        except OSError:
+            pass
+        return None
+
+
 # Cache for base64 images to avoid re-saving the same image
 _base64_image_cache: dict[str, str] = {}  # hash -> temp file path
 
@@ -1132,6 +1200,7 @@ class MLXMultimodalLM:
         self._draft_model = None
         self._loaded = False
         self._video_native = False
+        self._video_native_with_audio = False
 
         # Initialize MLLM prefix cache manager (with vision embedding caching)
         self._cache_manager: MLLMPrefixCacheManager | None = None
@@ -1159,9 +1228,20 @@ class MLXMultimodalLM:
             self._video_native = hasattr(
                 self.model.config, "video_token_id"
             ) or hasattr(self.model.config, "video_token_index")
+            # Omni models expose a sound_encoder; for these, a video_url
+            # without a paired audio_url should auto-extract the video's
+            # audio track so the model can fuse A/V in one forward pass.
+            # Decoupled from _video_native because some omni models (e.g.
+            # Nemotron-H Omni) don't expose video_token_id at config level
+            # and run through the frames-as-images fallback path.
+            self._video_native_with_audio = hasattr(self.model, "sound_encoder")
             logger.info(f"MLLM loaded successfully: {self.model_name}")
             if self._video_native:
                 logger.info("Native video pipeline enabled (temporal 3D conv + M-RoPE)")
+            if self._video_native_with_audio:
+                logger.info(
+                    "Omni model detected: video_url will auto-extract audio for A/V fusion"
+                )
 
         except ImportError:
             raise ImportError(
@@ -1419,14 +1499,32 @@ class MLXMultimodalLM:
             native_messages, return_video_kwargs=True
         )
 
+        # Collect audio paths emitted by the translation step
+        # (explicit audio_url, or auto-extracted from video_url for omni
+        # models).
+        audio_inputs: list[str] = []
+        for nmsg in native_messages:
+            ncontent = nmsg.get("content", [])
+            if not isinstance(ncontent, list):
+                continue
+            for nitem in ncontent:
+                if isinstance(nitem, dict) and nitem.get("type") == "audio":
+                    apath = nitem.get("audio")
+                    if apath:
+                        audio_inputs.append(apath)
+
         # Process through HF processor to get input_ids, pixel_values, grid_thw
-        inputs = self.processor(
-            text=[text],
-            images=image_inputs,
-            videos=video_inputs,
-            padding=True,
-            return_tensors="pt",
-        )
+        # and (for omni models) sound_clips / input_features.
+        processor_kwargs: dict = {
+            "text": [text],
+            "images": image_inputs,
+            "videos": video_inputs,
+            "padding": True,
+            "return_tensors": "pt",
+        }
+        if audio_inputs:
+            processor_kwargs["audio"] = audio_inputs
+        inputs = self.processor(**processor_kwargs)
 
         input_ids = mx.array(inputs["input_ids"])
         pixel_values = inputs.get(
@@ -1441,6 +1539,26 @@ class MLXMultimodalLM:
             gen_kwargs["video_grid_thw"] = mx.array(inputs["video_grid_thw"])
         if inputs.get("image_grid_thw", None) is not None:
             gen_kwargs["image_grid_thw"] = mx.array(inputs["image_grid_thw"])
+
+        # Forward audio embeddings/clips from the processor so the omni
+        # model's sound encoder gets fed alongside the visual stream.
+        for audio_key in (
+            "sound_clips",
+            "input_features",
+            "feature_attention_mask",
+            "audio_feature_lengths",
+            "sound_feature_lengths",
+            "sound_attention_mask",
+        ):
+            val = inputs.get(audio_key, None)
+            if val is not None:
+                gen_kwargs[audio_key] = val
+        if audio_inputs:
+            logger.info(
+                f"Native video: forwarding audio ({len(audio_inputs)} clip(s)) "
+                f"to omni model via "
+                f"{[k for k in gen_kwargs if k in ('sound_clips', 'input_features')]}"
+            )
 
         gen_kwargs["input_ids"] = input_ids
         gen_kwargs["pixel_values"] = pixel_values
@@ -1525,6 +1643,24 @@ class MLXMultimodalLM:
                 translated.append({"role": role, "content": str(content)})
                 continue
 
+            # Pre-pass: does this message have an explicit audio_url/audio
+            # block? If so, we skip auto-extracting audio from a video_url to
+            # honor the caller's explicit choice.
+            has_explicit_audio = False
+            for item in content:
+                if hasattr(item, "model_dump"):
+                    probe = item.model_dump(exclude_none=True)
+                elif hasattr(item, "dict"):
+                    probe = {k: v for k, v in item.dict().items() if v is not None}
+                else:
+                    probe = item
+                if (
+                    isinstance(probe, dict)
+                    and probe.get("type", "") in ("audio", "audio_url")
+                ):
+                    has_explicit_audio = True
+                    break
+
             new_content = []
             for item in content:
                 if hasattr(item, "model_dump"):
@@ -1583,6 +1719,38 @@ class MLXMultimodalLM:
                             "max_frames": video_max_frames,
                         }
                     )
+                    # For omni-capable models, pull the video's audio track
+                    # alongside frames so the model can fuse A/V in one
+                    # forward pass. We extract from the already-resolved local
+                    # path (no raw user URL handed to ffmpeg → avoids URL-
+                    # protocol SSRF via ffmpeg's network demuxers).
+                    if (
+                        not has_explicit_audio
+                        and getattr(self, "_video_native_with_audio", False)
+                    ):
+                        extracted = extract_audio_from_video(video_path)
+                        if extracted is not None:
+                            new_content.append(
+                                {"type": "audio", "audio": extracted}
+                            )
+
+                elif item_type in ("audio", "audio_url"):
+                    if item_type == "audio_url":
+                        aud_url = item.get("audio_url", {})
+                        if isinstance(aud_url, str):
+                            audio_source = aud_url
+                        elif isinstance(aud_url, dict):
+                            audio_source = aud_url.get("url", "")
+                        else:
+                            continue
+                    else:
+                        audio_source = item.get("audio", item.get("url", ""))
+
+                    if not audio_source:
+                        continue
+
+                    audio_path = process_audio_input(audio_source)
+                    new_content.append({"type": "audio", "audio": audio_path})
 
                 else:
                     new_content.append(item)
@@ -1914,11 +2082,35 @@ class MLXMultimodalLM:
 
         # Fallback: extract frames and treat as individual images
         _msg_video_frame_counts: dict[int, int] = {}
+        _msg_extra_audio: dict[int, list[str]] = {}
         all_video_frames: list[str] = []
         all_audio_inputs: list[str] = []
         for msg_idx, vid_inputs in _msg_video_inputs.items():
             total_frames = 0
+            has_explicit_audio = bool(_msg_audio_inputs.get(msg_idx))
             for vid_input in vid_inputs:
+                # For omni models, also extract the video's audio track so
+                # the model can fuse A/V in one forward pass. Skip if the
+                # caller supplied an explicit audio_url for the same message.
+                # We resolve the video to a local path first so the user's
+                # raw URL is never handed to ffmpeg directly (avoids URL-
+                # protocol exposure via ffmpeg's network demuxers).
+                if self._video_native_with_audio and not has_explicit_audio:
+                    try:
+                        video_path_for_audio = process_video_input(vid_input)
+                    except Exception as exc:
+                        logger.warning(
+                            f"Could not resolve video for audio extraction: {exc}"
+                        )
+                        video_path_for_audio = None
+                    if video_path_for_audio:
+                        extracted_audio = extract_audio_from_video(
+                            video_path_for_audio
+                        )
+                        if extracted_audio:
+                            _msg_extra_audio.setdefault(msg_idx, []).append(
+                                extracted_audio
+                            )
                 frames = self._prepare_video(
                     vid_input, fps=video_fps, max_frames=video_max_frames
                 )
@@ -1926,6 +2118,11 @@ class MLXMultimodalLM:
                 total_frames += len(frames)
                 logger.info(f"Added {len(frames)} frames from video: {vid_input}")
             _msg_video_frame_counts[msg_idx] = total_frames
+
+        # Merge auto-extracted audio into the per-message audio map so the
+        # chat-template token-counting loop downstream sees the right count.
+        for msg_idx, extra in _msg_extra_audio.items():
+            _msg_audio_inputs.setdefault(msg_idx, []).extend(extra)
 
         for aud_inputs in _msg_audio_inputs.values():
             all_audio_inputs.extend(aud_inputs)
@@ -2270,11 +2467,29 @@ class MLXMultimodalLM:
 
         # Fallback: frames as images
         _msg_video_frame_counts: dict[int, int] = {}
+        _msg_extra_audio: dict[int, list[str]] = {}
         all_video_frames: list[str] = []
         all_audio_inputs: list[str] = []
         for msg_idx, vid_inputs in _msg_video_inputs.items():
             total_frames = 0
+            has_explicit_audio = bool(_msg_audio_inputs.get(msg_idx))
             for vid_input in vid_inputs:
+                if self._video_native_with_audio and not has_explicit_audio:
+                    try:
+                        video_path_for_audio = process_video_input(vid_input)
+                    except Exception as exc:
+                        logger.warning(
+                            f"Could not resolve video for audio extraction: {exc}"
+                        )
+                        video_path_for_audio = None
+                    if video_path_for_audio:
+                        extracted_audio = extract_audio_from_video(
+                            video_path_for_audio
+                        )
+                        if extracted_audio:
+                            _msg_extra_audio.setdefault(msg_idx, []).append(
+                                extracted_audio
+                            )
                 frames = self._prepare_video(
                     vid_input, fps=video_fps, max_frames=video_max_frames
                 )
@@ -2282,6 +2497,9 @@ class MLXMultimodalLM:
                 total_frames += len(frames)
                 logger.info(f"Added {len(frames)} frames from video: {vid_input}")
             _msg_video_frame_counts[msg_idx] = total_frames
+
+        for msg_idx, extra in _msg_extra_audio.items():
+            _msg_audio_inputs.setdefault(msg_idx, []).extend(extra)
 
         for aud_inputs in _msg_audio_inputs.values():
             all_audio_inputs.extend(aud_inputs)
