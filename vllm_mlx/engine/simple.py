@@ -493,14 +493,9 @@ class SimpleEngine(BaseEngine):
         corrupt the command-buffer state.
         """
         async with self._generation_lock:
-
-            def run_bound():
+            try:
                 _bind_worker_generation_streams()
                 return func(*args, **kwargs)
-
-            task = asyncio.create_task(asyncio.to_thread(run_bound))
-            try:
-                return await asyncio.shield(task)
             except asyncio.CancelledError:
                 if on_cancel is not None:
                     try:
@@ -510,10 +505,6 @@ class SimpleEngine(BaseEngine):
                             "Blocking worker cancellation callback failed",
                             exc_info=True,
                         )
-                try:
-                    await task
-                except BaseException:
-                    pass
                 raise
 
     async def generate(
