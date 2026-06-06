@@ -100,3 +100,22 @@ def test_serve_command_propagates_all_sampling_defaults(monkeypatch):
     assert server._default_min_p == 0.0
     assert server._default_presence_penalty == 0.0
     assert server._default_repetition_penalty == 1.0
+
+
+def test_serve_parser_accepts_registered_step3p5_tool_parser():
+    from vllm_mlx import cli
+
+    parser = cli.create_parser()
+
+    args = parser.parse_args(
+        [
+            "serve",
+            "--model",
+            "local-test-model",
+            "--enable-auto-tool-choice",
+            "--tool-call-parser",
+            "step3p5",
+        ]
+    )
+
+    assert args.tool_call_parser == "step3p5"
