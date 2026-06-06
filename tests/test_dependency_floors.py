@@ -28,13 +28,13 @@ def _has_minimum(requirement: str, minimum: str) -> bool:
     return _version_tuple(version) >= _version_tuple(minimum)
 
 
-def test_mlx_vlm_floor_includes_step37_flash_support():
+def test_mlx_vlm_floor_includes_step37_flash_support_and_followups():
     dependencies = _project_dependencies()
 
-    assert _has_minimum(dependencies["mlx-vlm"], "0.5.0")
+    assert _has_minimum(dependencies["mlx-vlm"], "0.6.2")
 
 
-def test_mlx_lm_floor_matches_mlx_vlm_050_runtime_requirement():
+def test_mlx_lm_floor_matches_current_mlx_vlm_runtime_requirement():
     dependencies = _project_dependencies()
 
     assert _has_minimum(dependencies["mlx-lm"], "0.31.3")
