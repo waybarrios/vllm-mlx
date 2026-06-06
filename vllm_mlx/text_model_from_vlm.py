@@ -22,6 +22,19 @@ import mlx.utils
 logger = logging.getLogger(__name__)
 
 
+def _import_text_model_classes(model_type: str):
+    if model_type == "gemma4_text":
+        from mlx_lm.models.gemma4_text import Model, ModelArgs
+
+        return Model, ModelArgs
+
+    # qwen3_5.TextModel and TextModelArgs handle both dense and MoE natively
+    # (MTPDecoderLayer auto-selects SparseMoeBlock when args.num_experts > 0).
+    from mlx_lm.models.qwen3_5 import TextModel, TextModelArgs
+
+    return TextModel, TextModelArgs
+
+
 def build_text_model(vlm_model: Any, model_path: str | Path) -> Any | None:
     """Build an mlx_lm TextModel from a vlm-loaded model's weights.
 
@@ -42,11 +55,8 @@ def build_text_model(vlm_model: Any, model_path: str | Path) -> Any | None:
     try:
         config = json.loads((model_path / "config.json").read_text())
         text_config = config.get("text_config", config)
-
-        # Always import from qwen3_5 — TextModel and TextModelArgs handle both
-        # dense and MoE natively (MTPDecoderLayer auto-selects SparseMoeBlock
-        # when args.num_experts > 0). qwen3_5_moe.py does NOT export these.
-        from mlx_lm.models.qwen3_5 import TextModel, TextModelArgs
+        model_type = text_config.get("model_type") or config.get("model_type", "")
+        TextModel, TextModelArgs = _import_text_model_classes(model_type)
 
         # Build args with proper __post_init__ (handles partial_rotary_factor,
         # rope_scaling, head_dim derivation)
