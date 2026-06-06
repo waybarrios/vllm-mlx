@@ -186,6 +186,8 @@ class ChatCompletionRequest(BaseModel):
     tool_choice: str | dict | None = None  # "auto", "none", or specific tool
     # Structured output
     response_format: ResponseFormat | dict | None = None
+    # OpenAI-compatible token bias map: token id string -> bias value
+    logit_bias: dict[str, float] | None = None
     # Extra kwargs forwarded to tokenizer.apply_chat_template
     chat_template_kwargs: dict[str, Any] | None = None
     # MLLM-specific parameters

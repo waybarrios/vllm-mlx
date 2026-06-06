@@ -705,6 +705,33 @@ def _attach_response_format_logits_processor(
     return json_logits_processor
 
 
+def _coerce_logit_bias(logit_bias: dict[str, float]) -> dict[int, float]:
+    coerced: dict[int, float] = {}
+    for token_id, bias in logit_bias.items():
+        try:
+            coerced[int(token_id)] = float(bias)
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(
+                status_code=400,
+                detail=f"logit_bias token id must be an integer string: {token_id!r}",
+            ) from exc
+    return coerced
+
+
+def _attach_logit_bias_processor(
+    chat_kwargs: dict, logit_bias: dict[str, float] | None
+):
+    if not logit_bias:
+        return
+
+    from mlx_lm.sample_utils import make_logits_processors
+
+    processors = make_logits_processors(logit_bias=_coerce_logit_bias(logit_bias))
+    if processors:
+        existing = chat_kwargs.get("logits_processors") or []
+        chat_kwargs["logits_processors"] = list(existing) + list(processors)
+
+
 def _prepare_chat_completion_invocation(
     engine: BaseEngine,
     request: ChatCompletionRequest,
@@ -733,6 +760,7 @@ def _prepare_chat_completion_invocation(
         "presence_penalty": _resolve_presence_penalty(request.presence_penalty),
         "repetition_penalty": _resolve_repetition_penalty(request.repetition_penalty),
     }
+    _attach_logit_bias_processor(chat_kwargs, getattr(request, "logit_bias", None))
 
     if has_media:
         chat_kwargs["images"] = images if images else None
@@ -794,7 +822,14 @@ def _prepare_chat_completion_invocation(
         if thinking_proc is not None:
             # Replace the logits_processors list: the thinking processor wraps
             # the JSON processor as its inner delegate, so we don't double-add.
-            chat_kwargs["logits_processors"] = [thinking_proc]
+            existing_processors = list(chat_kwargs.get("logits_processors") or [])
+            if (
+                json_logits_processor is not None
+                and existing_processors
+                and existing_processors[-1] is json_logits_processor
+            ):
+                existing_processors = existing_processors[:-1]
+            chat_kwargs["logits_processors"] = existing_processors + [thinking_proc]
 
     return PreparedChatInvocation(
         messages=messages,

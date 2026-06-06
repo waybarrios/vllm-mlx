@@ -296,6 +296,15 @@ class TestChatCompletion:
         assert req.tools is not None
         assert req.timeout == 30.0
 
+    def test_request_accepts_logit_bias(self):
+        req = ChatCompletionRequest(
+            model="test-model",
+            messages=[Message(role="user", content="Hello")],
+            logit_bias={"123": -100.0, "456": 2.5},
+        )
+
+        assert req.logit_bias == {"123": -100.0, "456": 2.5}
+
     def test_request_rejects_tool_name_with_spaces(self):
         with pytest.raises(ValidationError, match="function.name"):
             ChatCompletionRequest(

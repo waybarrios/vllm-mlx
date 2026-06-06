@@ -209,6 +209,38 @@ class TestPromptCanonicalization:
         )
         assert request.messages[0].content == system_text
 
+    def test_prepare_chat_completion_forwards_logit_bias(self):
+        from unittest.mock import patch
+
+        from vllm_mlx.server import (
+            ChatCompletionRequest,
+            Message,
+            _prepare_chat_completion_invocation,
+        )
+
+        engine = SimpleNamespace(is_mllm=False, preserve_native_tool_format=False)
+        processor = object()
+        calls = []
+
+        def fake_make_logits_processors(**kwargs):
+            calls.append(kwargs)
+            return [processor]
+
+        request = ChatCompletionRequest(
+            model="test-model",
+            messages=[Message(role="user", content="Hello")],
+            logit_bias={"123": -100.0, "456": 2.5},
+        )
+
+        with patch(
+            "mlx_lm.sample_utils.make_logits_processors",
+            side_effect=fake_make_logits_processors,
+        ):
+            prepared = _prepare_chat_completion_invocation(engine, request, 128)
+
+        assert calls == [{"logit_bias": {123: -100.0, 456: 2.5}}]
+        assert prepared.chat_kwargs["logits_processors"] == [processor]
+
 
 class TestCompletionRequest:
     """Test CompletionRequest model."""
