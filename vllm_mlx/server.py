@@ -1168,6 +1168,11 @@ def _get_cache_dir() -> str:
 
 def _build_engine(spec: ModelSpec) -> BaseEngine:
     """Construct an engine instance from a model spec without starting it."""
+    if spec.use_batching and spec.force_mllm:
+        raise ValueError(
+            "--mllm is not supported with continuous batching (it produces empty "
+            "output). Run the model with SimpleEngine by omitting --continuous-batching."
+        )
     if spec.use_batching:
         from .engine.batched import BatchedEngine
 
@@ -3065,6 +3070,11 @@ def load_model(
         raise ValueError("MLLM draft block size must be a positive integer")
     if mllm_draft_model and use_batching:
         raise ValueError("MLLM draft models are supported only by SimpleEngine")
+    if force_mllm and use_batching:
+        raise ValueError(
+            "--mllm is not supported with continuous batching (it produces empty "
+            "output). Run the model with SimpleEngine by omitting --continuous-batching."
+        )
     if mllm_draft_model and (auto_unload_idle_seconds > 0 or lazy_load_model):
         raise ValueError(
             "MLLM draft models are not supported with lifecycle residency yet"
