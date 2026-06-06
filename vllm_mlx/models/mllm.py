@@ -1895,6 +1895,14 @@ class MLXMultimodalLM:
         tools = kwargs.pop("tools", None)
         use_cache = kwargs.pop("use_cache", True)
         enable_thinking = kwargs.pop("enable_thinking", True)
+        # Honor chat_template_kwargs on the MLLM path (parity with the text path in
+        # llm.py). enable_thinking is commonly nested here via
+        # --default-chat-template-kwargs {"enable_thinking": false}; it was previously
+        # dropped for MLLM models, so reasoning could not be disabled and leaked into
+        # the response.
+        chat_template_kwargs = kwargs.pop("chat_template_kwargs", None) or {}
+        if "enable_thinking" in chat_template_kwargs:
+            enable_thinking = chat_template_kwargs.pop("enable_thinking")
 
         # Collect video and audio inputs from messages
         _msg_video_inputs = self._collect_video_inputs(messages)
@@ -1958,8 +1966,22 @@ class MLXMultimodalLM:
         template_extra_kwargs = {}
         if tools:
             template_extra_kwargs["tools"] = tools
+        # Forward any remaining chat_template_kwargs (parity with the text path)
+        template_extra_kwargs.update(chat_template_kwargs)
 
         try:
+            formatted_prompt = get_chat_template(
+                self.processor,
+                chat_messages,
+                add_generation_prompt=True,
+                enable_thinking=enable_thinking,
+                **template_extra_kwargs,
+            )
+        except TypeError:
+            # The processor's chat template doesn't accept some forwarded
+            # chat_template_kwargs — drop them and retry (mirror llm.py).
+            for key in chat_template_kwargs:
+                template_extra_kwargs.pop(key, None)
             formatted_prompt = get_chat_template(
                 self.processor,
                 chat_messages,
@@ -2244,6 +2266,14 @@ class MLXMultimodalLM:
         tools = kwargs.pop("tools", None)
         use_cache = kwargs.pop("use_cache", True)
         enable_thinking = kwargs.pop("enable_thinking", True)
+        # Honor chat_template_kwargs on the MLLM path (parity with the text path in
+        # llm.py). enable_thinking is commonly nested here via
+        # --default-chat-template-kwargs {"enable_thinking": false}; it was previously
+        # dropped for MLLM models, so reasoning could not be disabled and leaked into
+        # the response.
+        chat_template_kwargs = kwargs.pop("chat_template_kwargs", None) or {}
+        if "enable_thinking" in chat_template_kwargs:
+            enable_thinking = chat_template_kwargs.pop("enable_thinking")
 
         # Collect video and audio inputs from messages
         _msg_video_inputs = self._collect_video_inputs(messages)
@@ -2302,8 +2332,22 @@ class MLXMultimodalLM:
         template_extra_kwargs = {}
         if tools:
             template_extra_kwargs["tools"] = tools
+        # Forward any remaining chat_template_kwargs (parity with the text path)
+        template_extra_kwargs.update(chat_template_kwargs)
 
         try:
+            formatted_prompt = get_chat_template(
+                self.processor,
+                chat_messages,
+                add_generation_prompt=True,
+                enable_thinking=enable_thinking,
+                **template_extra_kwargs,
+            )
+        except TypeError:
+            # The processor's chat template doesn't accept some forwarded
+            # chat_template_kwargs — drop them and retry (mirror llm.py).
+            for key in chat_template_kwargs:
+                template_extra_kwargs.pop(key, None)
             formatted_prompt = get_chat_template(
                 self.processor,
                 chat_messages,
