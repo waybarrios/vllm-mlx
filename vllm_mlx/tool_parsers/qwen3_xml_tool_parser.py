@@ -159,6 +159,17 @@ class StreamingXMLToolCallParser:
         self.last_completed_call_id = None
         self.current_function_name = None
         self.current_function_open = False
+        # True when the current tool_call was synthesised because the model
+        # emitted a bare <function=> with no <tool_call> wrapper. The matching
+        # </function> closes the implicit wrapper too so the next bare
+        # <function=> opens a fresh tool_call.
+        self.implicit_tool_call_wrapper = False
+        # Bare-function commitment delay. When auto-opening on <function=Name>,
+        # we hold the function-name delta in _pending_implicit_delta until
+        # something confirms a real tool call (parameter open or function
+        # close). If non-whitespace character data arrives first, the
+        # `<function=...>` was prose and we abandon (no tool_call emitted).
+        self._pending_implicit_delta = None
         self.parameters = {}
         self.current_param_name = None
         self.current_param_value = ""
@@ -442,6 +453,33 @@ class StreamingXMLToolCallParser:
         # Skip blank content
         return not element
 
+    # Known tool-related tag heads — any of these arriving partially in the
+    # streaming buffer should make us wait for more data instead of emitting
+    # the fragment as text or feeding it to expat.
+    _TOOL_TAG_PREFIXES = (
+        "<tool_call>",
+        "</tool_call>",
+        "<function=",
+        "</function>",
+        "<parameter=",
+        "</parameter>",
+    )
+
+    def _looks_like_partial_tool_open(self, fragment: str) -> bool:
+        """True if `fragment` could complete into a tool-related XML tag.
+
+        Covers two shapes:
+          * `fragment` is a prefix of a known tag head (e.g. ``<funct``).
+          * `fragment` already past the ``=`` marker and accumulating the
+            attribute name (e.g. ``<function=Ag``) — waiting on ``>``.
+        """
+        if not fragment.startswith("<"):
+            return False
+        for prefix in self._TOOL_TAG_PREFIXES:
+            if prefix.startswith(fragment) or fragment.startswith(prefix):
+                return True
+        return False
+
     def _find_next_complete_element(self, start_pos: int) -> tuple[Optional[str], int]:
         """
         Find next complete XML element from specified position
@@ -466,29 +504,37 @@ class StreamingXMLToolCallParser:
             if tag_end != -1 and tag_end2 != -1:
                 # Next nearest is <
                 if tag_end < tag_end2:
+                    # If the prefix is the start of a tool-related opening tag
+                    # awaiting its closing '>', wait for more data instead of
+                    # emitting it as an unclosed fragment (which would either
+                    # leak as text or crash expat). Required so the model can
+                    # drop the <tool_call> wrapper and emit a bare <function=>
+                    # block; without it, partial <function=Name fragments leak.
+                    if self._looks_like_partial_tool_open(buffer[:tag_end]):
+                        return None, start_pos
                     return buffer[:tag_end], start_pos + tag_end
                 # Next nearest is >, means found XML element
                 else:
                     return buffer[: tag_end2 + 1], start_pos + tag_end2 + 1
             elif tag_end != -1:
+                if self._looks_like_partial_tool_open(buffer[:tag_end]):
+                    return None, start_pos
                 return buffer[:tag_end], start_pos + tag_end
             elif tag_end2 != -1:
                 return buffer[: tag_end2 + 1], start_pos + tag_end2 + 1
             else:
-                # If currently not parsing tool calls (entering a tool_call),
-                # check if starts with <tool_call>
-                if self.current_call_id is None:
-                    # Check if might be start of <tool_call>
-                    if buffer == "<tool_call>"[: len(buffer)]:
-                        # Might be start of <tool_call>, wait for more data
-                        return None, start_pos
-                    else:
-                        # Not start of <tool_call>, treat as text
-                        return buffer, start_pos + len(buffer)
-                else:
-                    # When parsing tool calls,
-                    # wait for more data to get complete tag
+                # Buffer is `<...` with neither a `>` nor a second `<` yet.
+                # Wait for more data if the buffer could complete into ANY
+                # known tool-related tag (not just <tool_call>) — bare
+                # <function=NAME> / <parameter=NAME> may have dropped the
+                # outer wrapper, and partial chunks of them must not be
+                # emitted as text.
+                if self._looks_like_partial_tool_open(buffer):
                     return None, start_pos
+                if self.current_call_id is None:
+                    return buffer, start_pos + len(buffer)
+                # Inside a tool call, partial non-tag bytes must wait too.
+                return None, start_pos
         else:
             # Find text content (until next < or buffer end)
             next_tag_pos = buffer.find("<")
@@ -727,8 +773,13 @@ class StreamingXMLToolCallParser:
             self.tool_call_index += 1
         elif name.startswith("function") or (name == "function"):
             # If missing tool_call, manually complete
+            implicit_open = False
             if not self.current_call_id:
                 self._start_element("tool_call", {})
+                # Remember the wrapper was synthesised, so </function> can
+                # also close it (the model didn't / won't emit </tool_call>).
+                self.implicit_tool_call_wrapper = True
+                implicit_open = True
             # Before opening new function,
             # automatically complete previous unclosed tags (parameter/function)
             self._auto_close_open_parameter_if_needed("function")
@@ -748,8 +799,16 @@ class StreamingXMLToolCallParser:
                         )
                     ]
                 )
-                self._emit_delta(delta)
+                if implicit_open:
+                    # Defer until <parameter=> or </function> confirms this is
+                    # a real tool call, not prose mentioning `<function=...>`.
+                    self._pending_implicit_delta = delta
+                else:
+                    self._emit_delta(delta)
         elif name.startswith("parameter") or (name == "parameter"):
+            # First <parameter=> after a deferred bare <function=> confirms
+            # this really is a tool call — emit the held function delta.
+            self._flush_pending_implicit_delta()
             # If previous parameter hasn't ended normally,
             # complete its end first, then start new parameter
             self._auto_close_open_parameter_if_needed("parameter")
@@ -800,8 +859,46 @@ class StreamingXMLToolCallParser:
                     self._emit_delta(delta)
                     self.current_param_is_first = False
 
+    def _flush_pending_implicit_delta(self) -> None:
+        """Emit a deferred bare-<function=> delta now that the call is confirmed."""
+        if self._pending_implicit_delta is not None:
+            delta = self._pending_implicit_delta
+            self._pending_implicit_delta = None
+            self._emit_delta(delta)
+
+    def _abandon_pending_implicit_tool_call(self) -> None:
+        """Roll back a deferred bare-<function=> auto-open: prose followed.
+
+        Drops the pending function-name delta and unwinds the synthesised
+        wrapper state so no tool_call is ever emitted for this fragment.
+        """
+        self._pending_implicit_delta = None
+        # Unwind the tool_call/function we synth-opened.
+        self.implicit_tool_call_wrapper = False
+        self.current_function_name = None
+        self.current_function_open = False
+        if self.tool_call_index > 0:
+            self.tool_call_index -= 1
+        if self.current_call_id:
+            self.last_completed_call_id = None
+            self.current_call_id = None
+        # Reset expat so character data that wasn't a tool call doesn't
+        # accumulate inside a phantom open element.
+        self._reset_xml_parser_after_tool_call()
+
     def _char_data(self, data: str):
         """Handle XML character data events"""
+        # Bare-<function=> commitment: character data that ISN'T inside a
+        # parameter and isn't pure whitespace means the `<function=...>` was
+        # prose, not a tool call. Roll back before any user-visible delta.
+        if (
+            self._pending_implicit_delta is not None
+            and self.current_param_name is None
+            and data
+            and data.strip()
+        ):
+            self._abandon_pending_implicit_tool_call()
+            return
         if data and self.current_param_name:
             # If preprocessing stage determines deferred parsing is needed,
             # only cache character data, no streaming output
@@ -990,6 +1087,9 @@ class StreamingXMLToolCallParser:
             self.start_quote_emitted = False
 
         elif name.startswith("function") or name == "function":
+            # </function> after a deferred bare <function=Name> with no
+            # parameters also confirms a real (parameterless) tool call.
+            self._flush_pending_implicit_delta()
             # if there are parameters, close JSON object
             if self.parameters:
                 delta = DeltaMessage(
@@ -1017,6 +1117,12 @@ class StreamingXMLToolCallParser:
                 )
                 self._emit_delta(delta)
             self.current_function_open = False
+            # If the surrounding <tool_call> was synthesised (bare <function=>
+            # with no wrapper), close it now so the next <function=> opens a
+            # fresh tool_call rather than reusing this id/index.
+            if self.implicit_tool_call_wrapper:
+                self.implicit_tool_call_wrapper = False
+                self._end_element("tool_call")
 
         elif name == "tool_call":
             # Before ending tool_call,
