@@ -17,6 +17,28 @@ import json
 import sys
 
 from .cli_arg_types import make_json_object_arg_parser, make_positive_int_arg_parser
+from .tool_parsers import ToolParserManager
+
+_TOOL_PARSER_CHOICES = ToolParserManager.list_registered()
+_TOOL_PARSER_HELP = (
+    "Select the tool call parser for the model. Options: "
+    f"{', '.join(_TOOL_PARSER_CHOICES)}. Required for --enable-auto-tool-choice."
+)
+
+
+def _add_tool_calling_args(serve_parser: argparse.ArgumentParser) -> None:
+    serve_parser.add_argument(
+        "--enable-auto-tool-choice",
+        action="store_true",
+        help="Enable auto tool choice for supported models. Use --tool-call-parser to specify which parser to use.",
+    )
+    serve_parser.add_argument(
+        "--tool-call-parser",
+        type=str,
+        default=None,
+        choices=_TOOL_PARSER_CHOICES,
+        help=_TOOL_PARSER_HELP,
+    )
 
 
 def serve_command(args):
@@ -1323,42 +1345,7 @@ Examples:
         help="Maximum number of characters accepted by /v1/audio/speech (default: 4096)",
     )
     # Tool calling options
-    serve_parser.add_argument(
-        "--enable-auto-tool-choice",
-        action="store_true",
-        help="Enable auto tool choice for supported models. Use --tool-call-parser to specify which parser to use.",
-    )
-    serve_parser.add_argument(
-        "--tool-call-parser",
-        type=str,
-        default=None,
-        choices=[
-            "auto",
-            "mistral",
-            "qwen",
-            "qwen3_coder",
-            "llama",
-            "hermes",
-            "harmony",
-            "gpt-oss",
-            "deepseek",
-            "kimi",
-            "granite",
-            "nemotron",
-            "xlam",
-            "functionary",
-            "gemma4",
-            "glm47",
-            "minimax",
-        ],
-        help=(
-            "Select the tool call parser for the model. Options: "
-            "auto (auto-detect), mistral, qwen, qwen3_coder, llama, hermes, "
-            "harmony, gpt-oss, deepseek, gemma4, kimi, granite, nemotron, "
-            "xlam, functionary, glm47, minimax. "
-            "Required for --enable-auto-tool-choice."
-        ),
-    )
+    _add_tool_calling_args(serve_parser)
     # Reasoning parser options - choices loaded dynamically from registry
     from .reasoning import list_parsers
 
