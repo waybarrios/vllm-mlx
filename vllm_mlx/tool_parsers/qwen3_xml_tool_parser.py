@@ -168,8 +168,15 @@ class StreamingXMLToolCallParser:
         # we hold the function-name delta in _pending_implicit_delta until
         # something confirms a real tool call (parameter open or function
         # close). If non-whitespace character data arrives first, the
-        # `<function=...>` was prose and we abandon (no tool_call emitted).
+        # `<function=...>` was prose and we abandon — the original raw tag
+        # text + any buffered inter-token whitespace + the prose data must
+        # all be emitted as user-visible content (not swallowed).
         self._pending_implicit_delta = None
+        self._pending_implicit_raw_text: str | None = None
+        self._pending_implicit_text_buffer: str = ""
+        # Set transiently around expat parse so _start_element can capture
+        # the raw input fragment in case it ends up needing rollback.
+        self._current_raw_element: str | None = None
         self.parameters = {}
         self.current_param_name = None
         self.current_param_value = ""
@@ -405,8 +412,15 @@ class StreamingXMLToolCallParser:
                     self._emit_delta(final_delta)
                     # Reset XML parser and current call state
                     self._reset_xml_parser_after_tool_call()
-                # Parse preprocessed element
-                self.parser.Parse(preprocessed_element, False)
+                # Parse preprocessed element. Expose the original raw
+                # element so _start_element can stash it on the pending
+                # implicit delta — needed to reconstruct prose if the
+                # bare-<function=> turns out not to be a tool call.
+                self._current_raw_element = element
+                try:
+                    self.parser.Parse(preprocessed_element, False)
+                finally:
+                    self._current_raw_element = None
                 found_any = True
 
             except Exception as e:
@@ -802,7 +816,15 @@ class StreamingXMLToolCallParser:
                 if implicit_open:
                     # Defer until <parameter=> or </function> confirms this is
                     # a real tool call, not prose mentioning `<function=...>`.
+                    # Stash the raw fragment so abandonment can restore it
+                    # as user-visible content instead of swallowing it.
                     self._pending_implicit_delta = delta
+                    self._pending_implicit_raw_text = (
+                        self._current_raw_element
+                        if self._current_raw_element is not None
+                        else f"<function={function_name}>"
+                    )
+                    self._pending_implicit_text_buffer = ""
                 else:
                     self._emit_delta(delta)
         elif name.startswith("parameter") or (name == "parameter"):
@@ -864,15 +886,27 @@ class StreamingXMLToolCallParser:
         if self._pending_implicit_delta is not None:
             delta = self._pending_implicit_delta
             self._pending_implicit_delta = None
+            # Drop the rollback context: the call is confirmed real, so the
+            # raw `<function=...>` tag is structural (not prose) and any
+            # buffered inter-token whitespace belongs to the tool-call frame.
+            self._pending_implicit_raw_text = None
+            self._pending_implicit_text_buffer = ""
             self._emit_delta(delta)
 
-    def _abandon_pending_implicit_tool_call(self) -> None:
+    def _abandon_pending_implicit_tool_call(self) -> tuple[str, str]:
         """Roll back a deferred bare-<function=> auto-open: prose followed.
 
         Drops the pending function-name delta and unwinds the synthesised
         wrapper state so no tool_call is ever emitted for this fragment.
+        Returns ``(raw_text, buffered_text)`` so the caller can restore the
+        original prose (raw `<function=...>` tag + any whitespace held while
+        waiting on commitment) as user-visible content.
         """
+        raw_text = self._pending_implicit_raw_text or ""
+        buffered_text = self._pending_implicit_text_buffer
         self._pending_implicit_delta = None
+        self._pending_implicit_raw_text = None
+        self._pending_implicit_text_buffer = ""
         # Unwind the tool_call/function we synth-opened.
         self.implicit_tool_call_wrapper = False
         self.current_function_name = None
@@ -885,19 +919,31 @@ class StreamingXMLToolCallParser:
         # Reset expat so character data that wasn't a tool call doesn't
         # accumulate inside a phantom open element.
         self._reset_xml_parser_after_tool_call()
+        return raw_text, buffered_text
 
     def _char_data(self, data: str):
         """Handle XML character data events"""
-        # Bare-<function=> commitment: character data that ISN'T inside a
-        # parameter and isn't pure whitespace means the `<function=...>` was
-        # prose, not a tool call. Roll back before any user-visible delta.
+        # Bare-<function=> commitment window: until <parameter=> or </function>
+        # confirms, every character data event has to be reasoned about
+        # against the possibility that the `<function=...>` was prose.
         if (
             self._pending_implicit_delta is not None
             and self.current_param_name is None
             and data
-            and data.strip()
         ):
-            self._abandon_pending_implicit_tool_call()
+            if data.strip():
+                # Non-whitespace → commit was wrong, this is prose. Roll back
+                # and emit (raw tag + buffered whitespace + this data) as
+                # user-visible content so we don't swallow the original text.
+                raw_text, buffered_text = self._abandon_pending_implicit_tool_call()
+                restored = raw_text + buffered_text + data
+                if restored:
+                    self._emit_delta(DeltaMessage(content=restored))
+                return
+            # Pure whitespace (newlines between <function=> and <parameter=>
+            # in a real call). Buffer in case we end up abandoning so the
+            # restored prose preserves it; flush will discard it on commit.
+            self._pending_implicit_text_buffer += data
             return
         if data and self.current_param_name:
             # If preprocessing stage determines deferred parsing is needed,

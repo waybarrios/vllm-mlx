@@ -271,6 +271,27 @@ def test_streaming_plain_text_is_not_misclassified_as_tool_call():
     assert aggregated_calls == []
 
 
+@pytest.mark.parametrize("chunk_size", [1, 2, 4, 8, 256])
+def test_streaming_plain_text_preserves_content_across_chunk_sizes(chunk_size):
+    """
+    Regression for the bare-<function=> rollback path swallowing user-
+    visible prose. When the model emits something like
+        "I considered using <function=foo> but decided against it."
+    the parser must (a) not emit any tool_call AND (b) stream back the
+    full original text as content — no characters dropped or rewritten.
+    Pre-fix, the abandonment path in _char_data dropped both the raw
+    `<function=foo>` fragment and the char-data event that triggered the
+    rollback, leaving the response truncated.
+    """
+    parser = Qwen3XMLToolParser(None)
+    text = (
+        "I considered using <function=foo> but decided against it. " "The answer is 42."
+    )
+    streamed = _stream(parser, _fixed_chunks(text, chunk_size))
+    assert streamed["tool_calls"] == []
+    assert streamed["content"] == text
+
+
 # ---------------------------------------------------------------------------
 # Malformed / truncated input
 # ---------------------------------------------------------------------------
@@ -431,9 +452,9 @@ def test_streaming_bare_function_without_tool_call_wrapper(chunk_size):
     assert streamed_calls == expected
     # No leaked tag fragments in user-visible content.
     for fragment in ("<function=", "</function>", "<parameter=", "</parameter>"):
-        assert fragment not in streamed["content"], (
-            f"leaked tag fragment {fragment!r} in streamed content"
-        )
+        assert (
+            fragment not in streamed["content"]
+        ), f"leaked tag fragment {fragment!r} in streamed content"
 
 
 @pytest.mark.parametrize("chunk_size", [1, 5, 7, 24, 256])
