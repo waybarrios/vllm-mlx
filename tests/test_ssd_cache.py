@@ -571,7 +571,7 @@ class TestSpillPath:
 
     def test_evict_lru_calls_ssd_spill(self, tmp_path):
         model = MagicMock()
-        config = MemoryCacheConfig(max_memory_mb=1, max_entries=3)
+        config = MemoryCacheConfig(max_memory_mb=1, max_entries=3, min_prefix_tokens=1)
         cache = MemoryAwarePrefixCache(model, config)
 
         ssd_config = SSDCacheConfig(cache_dir=str(tmp_path / "spill_test"))
@@ -603,7 +603,7 @@ class TestSpillPath:
     def test_evict_without_ssd_tier_still_works(self):
         """Eviction without SSD tier should work as before (discard)."""
         model = MagicMock()
-        config = MemoryCacheConfig(max_memory_mb=1, max_entries=2)
+        config = MemoryCacheConfig(max_memory_mb=1, max_entries=2, min_prefix_tokens=1)
         cache = MemoryAwarePrefixCache(model, config)
 
         for i in range(5):
@@ -836,7 +836,7 @@ class TestMemoryCacheSSDCheck:
 
     def test_check_ssd_returns_candidate_on_miss(self, tmp_path):
         model = MagicMock()
-        config = MemoryCacheConfig(max_memory_mb=1, max_entries=2)
+        config = MemoryCacheConfig(max_memory_mb=1, max_entries=2, min_prefix_tokens=1)
         cache = MemoryAwarePrefixCache(model, config)
 
         ssd_config = SSDCacheConfig(cache_dir=str(tmp_path / "check_ssd_test"))
@@ -870,7 +870,7 @@ class TestMemoryCacheSSDCheck:
 
     def test_check_ssd_returns_none_without_tier(self):
         model = MagicMock()
-        config = MemoryCacheConfig(max_memory_mb=1)
+        config = MemoryCacheConfig(max_memory_mb=1, min_prefix_tokens=1)
         cache = MemoryAwarePrefixCache(model, config)
 
         candidate = cache.check_ssd([1, 2, 3])
@@ -879,7 +879,7 @@ class TestMemoryCacheSSDCheck:
     def test_check_ssd_returns_none_on_ram_hit(self, tmp_path):
         """When RAM has a hit, check_ssd should return None (not needed)."""
         model = MagicMock()
-        config = MemoryCacheConfig(max_memory_mb=1)
+        config = MemoryCacheConfig(max_memory_mb=1, min_prefix_tokens=1)
         cache = MemoryAwarePrefixCache(model, config)
 
         kv = [MockKVCacheForSpill(1000)]
@@ -901,7 +901,7 @@ class TestIntegrationSpillAndFetch:
     def cache_with_ssd(self, tmp_path):
         """RAM cache + SSD tier, small limits to force eviction."""
         model = MagicMock()
-        config = MemoryCacheConfig(max_memory_mb=1, max_entries=2)
+        config = MemoryCacheConfig(max_memory_mb=1, max_entries=2, min_prefix_tokens=1)
         ram_cache = MemoryAwarePrefixCache(model, config)
 
         ssd_config = SSDCacheConfig(
@@ -1086,3 +1086,142 @@ class TestIntegrationSpillAndFetch:
             assert stats["ssd_hits"] >= 1
             assert stats["reload_bytes"] > 0
             assert stats["avg_reload_latency_ms"] > 0
+
+
+# ---------------------------------------------------------------------------
+# Real-array quantized spill paths (no MLX-stack mocks).
+#
+# The other tests in this file use mock layers; these exercise the actual
+# `enqueue_spill` quantized-layer detection + dequantization that runs in
+# production when `--kv-cache-quantization` is on.
+# ---------------------------------------------------------------------------
+
+
+def _mlx_available():
+    try:
+        import mlx.core  # noqa: F401
+        from mlx_lm.models.cache import KVCache  # noqa: F401
+
+        return True
+    except ImportError:
+        return False
+
+
+@pytest.mark.skipif(not _mlx_available(), reason="mlx-lm not installed")
+class TestQuantizedSpillRoundtrip:
+    """End-to-end: real KV layers → quantize → spill → read back.
+
+    Pre-patch, every one of these would crash the writer thread because the
+    `enqueue_spill` dequantize-on-caller-thread gate was wrapper-only and
+    `np.array(layer.keys)` couldn't read the bfloat16 buffer.
+    """
+
+    def _build_kv(self, dtype_name="float16", seq=128):
+        import mlx.core as mx
+        from mlx_lm.models.cache import KVCache
+
+        dtype = getattr(mx, dtype_name)
+        kv = KVCache()
+        kv.update_and_fetch(
+            mx.random.normal((1, 4, seq, 128), dtype=dtype),
+            mx.random.normal((1, 4, seq, 128), dtype=dtype),
+        )
+        mx.eval(kv.keys, kv.values)
+        return kv
+
+    def _wait_for_spill(self, tier, n=1, timeout=10.0):
+        import time
+
+        deadline = time.time() + timeout
+        while time.time() < deadline and tier._stats.spill_count < n:
+            time.sleep(0.05)
+
+    def test_wrapper_quantized_layer_round_trips(self, tmp_path):
+        """`_QuantizedCacheWrapper` (our fork's wrapper) spills + reloads."""
+        from vllm_mlx.memory_cache import _quantize_cache
+
+        kv = self._build_kv()
+        wrapped = _quantize_cache([kv], bits=8, group_size=64)
+        tier = SSDCacheTier(SSDCacheConfig(cache_dir=str(tmp_path)))
+        tier.start_writer()
+        try:
+            tokens = tuple(range(128))
+            assert tier.enqueue_spill(tokens, wrapped, 1_000_000)
+            self._wait_for_spill(tier)
+            assert tier._stats.spill_count >= 1
+            meta = tier._index.lookup_exact(tokens)
+            assert meta is not None
+            reloaded = tier._read_entry(tokens, meta["file_path"])
+            assert reloaded is not None and len(reloaded) == 1
+            assert reloaded[0]["keys"].shape == (1, 4, 128, 128)
+        finally:
+            tier.close()
+
+    def test_native_quantized_kv_cache_round_trips(self, tmp_path):
+        """mlx-lm's native ``QuantizedKVCache`` also spills+reloads.
+
+        Pre-patch, this layer class slipped through the wrapper-only gate
+        in ``enqueue_spill`` and crashed the writer with an
+        ``inhomogeneous shape`` ValueError on ``np.array(layer.keys)``.
+        """
+        import mlx.core as mx
+        from mlx_lm.models.cache import QuantizedKVCache
+
+        kv = QuantizedKVCache(group_size=64, bits=8)
+        kv.update_and_fetch(
+            mx.random.normal((1, 4, 128, 128), dtype=mx.float16),
+            mx.random.normal((1, 4, 128, 128), dtype=mx.float16),
+        )
+        mx.eval(kv.keys, kv.values)
+        assert isinstance(kv.keys, tuple) and len(kv.keys) == 3
+
+        tier = SSDCacheTier(SSDCacheConfig(cache_dir=str(tmp_path)))
+        tier.start_writer()
+        try:
+            tokens = tuple(range(128))
+            assert tier.enqueue_spill(tokens, [kv], 1_000_000)
+            self._wait_for_spill(tier)
+            assert tier._stats.spill_count >= 1
+            meta = tier._index.lookup_exact(tokens)
+            assert meta is not None
+            reloaded = tier._read_entry(tokens, meta["file_path"])
+            assert reloaded is not None and len(reloaded) == 1
+            # Reloaded shape matches the dequantized form (offset-sliced
+            # back from the over-allocation that update_and_fetch reserves).
+            assert reloaded[0]["keys"].shape == (1, 4, 128, 128)
+        finally:
+            tier.close()
+
+    def test_bfloat16_layer_round_trips_via_fp16_cast(self, tmp_path):
+        """bfloat16 KV layers must spill even though numpy's PEP 3118 buffer
+        protocol cannot interpret ``mlx.core.bfloat16`` directly.
+
+        Pre-patch (no bf16→fp16 cast), this raised
+        ``RuntimeError: Item size 2 for PEP 3118 buffer format string B
+        does not match the dtype B item size 1.`` at ``np.array(layer.keys)``.
+        """
+        import numpy as np
+
+        from vllm_mlx.memory_cache import _quantize_cache
+
+        # Force the model output to be bfloat16 (Qwen-3-Coder defaults to bf16
+        # internally when run with --kv-cache-quantization).
+        kv = self._build_kv(dtype_name="bfloat16")
+        wrapped = _quantize_cache([kv], bits=8, group_size=64)
+        tier = SSDCacheTier(SSDCacheConfig(cache_dir=str(tmp_path)))
+        tier.start_writer()
+        try:
+            tokens = tuple(range(128))
+            assert tier.enqueue_spill(tokens, wrapped, 1_000_000)
+            self._wait_for_spill(tier)
+            assert tier._stats.spill_count >= 1, (
+                "bf16 layers must spill via the fp16 cast path"
+            )
+            meta = tier._index.lookup_exact(tokens)
+            assert meta is not None
+            reloaded = tier._read_entry(tokens, meta["file_path"])
+            assert reloaded is not None
+            # Persisted as float16 (the casting target).
+            assert reloaded[0]["keys"].dtype == np.float16
+        finally:
+            tier.close()
