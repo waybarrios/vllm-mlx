@@ -205,6 +205,99 @@ class TestGemma4ToolParserExtract:
         assert args == {"tags": ["alpha", "beta", "gamma"]}
 
 
+class TestGemma4ToolParserFallbackForms:
+    """Fallback Python-style forms Gemma 4 emits under load (issue #80).
+
+    Under a long system prompt + multi-turn + several tools, Gemma 4 stops using
+    the canonical <|"|>-brace form and leaks its call as plain content using
+    Python call syntax. These must still parse into tool_calls.
+    """
+
+    def setup_method(self):
+        self.parser = Gemma4ToolParser()
+
+    def test_e4b_paren_form_with_tool_call_marker(self):
+        """e4b: <|tool_call>call:fn(kwargs) — parens instead of braces, no end."""
+        output = '<|tool_call>call:radarr_get_movies(search="Dune")'
+        result = self.parser.extract_tool_calls(output)
+        assert result.tools_called is True
+        assert len(result.tool_calls) == 1
+        tc = result.tool_calls[0]
+        assert tc["name"] == "radarr_get_movies"
+        assert json.loads(tc["arguments"]) == {"search": "Dune"}
+        assert result.content is None
+
+    def test_e2b_tool_code_block(self):
+        """e2b: ```tool_code\\nfn(kwargs)\\n``` — bare call in a code fence."""
+        output = '```tool_code\nradarr_get_movies(search="Dune")\n```'
+        result = self.parser.extract_tool_calls(output)
+        assert result.tools_called is True
+        assert len(result.tool_calls) == 1
+        tc = result.tool_calls[0]
+        assert tc["name"] == "radarr_get_movies"
+        assert json.loads(tc["arguments"]) == {"search": "Dune"}
+        assert result.content is None
+
+    def test_paren_form_mixed_arg_types(self):
+        output = '<|tool_call>call:search(query="hello world", limit=10, verbose=False)'
+        result = self.parser.extract_tool_calls(output)
+        assert result.tools_called is True
+        args = json.loads(result.tool_calls[0]["arguments"])
+        assert args == {"query": "hello world", "limit": 10, "verbose": False}
+
+    def test_paren_form_paren_inside_string(self):
+        """A ) inside a string value must not end the arg list early."""
+        output = '<|tool_call>call:run(code="f(x) + g(y)")'
+        result = self.parser.extract_tool_calls(output)
+        assert result.tools_called is True
+        args = json.loads(result.tool_calls[0]["arguments"])
+        assert args == {"code": "f(x) + g(y)"}
+
+    def test_tool_code_block_with_content_before(self):
+        output = (
+            "Let me look that up.\n"
+            "```tool_code\nget_weather(city=\"Paris\")\n```"
+        )
+        result = self.parser.extract_tool_calls(output)
+        assert result.tools_called is True
+        assert result.content == "Let me look that up."
+        args = json.loads(result.tool_calls[0]["arguments"])
+        assert args == {"city": "Paris"}
+
+    def test_tool_code_block_multiple_calls(self):
+        output = (
+            "```tool_code\n"
+            'radarr_get_movies(search="Dune")\n'
+            'radarr_get_movies(search="Arrival")\n'
+            "```"
+        )
+        result = self.parser.extract_tool_calls(output)
+        assert result.tools_called is True
+        assert len(result.tool_calls) == 2
+        assert json.loads(result.tool_calls[0]["arguments"]) == {"search": "Dune"}
+        assert json.loads(result.tool_calls[1]["arguments"]) == {"search": "Arrival"}
+
+    def test_canonical_still_preferred_over_fallback(self):
+        """A well-formed brace call must not be double-counted by the fallback."""
+        output = '<|tool_call>call:read_file{path:<|"|>/tmp/foo<|"|>}<tool_call|>'
+        result = self.parser.extract_tool_calls(output)
+        assert result.tools_called is True
+        assert len(result.tool_calls) == 1
+        assert result.tool_calls[0]["name"] == "read_file"
+
+    def test_prose_with_function_mention_is_not_a_call(self):
+        """Ordinary prose mentioning a function must stay content."""
+        output = "You can call foo() to do that, or use bar(x)."
+        result = self.parser.extract_tool_calls(output)
+        assert result.tools_called is False
+        assert result.content == output
+
+    def test_paren_form_id_generated(self):
+        output = '<|tool_call>call:ping(host="a")'
+        tc = self.parser.extract_tool_calls(output).tool_calls[0]
+        assert tc["id"].startswith("call_")
+
+
 class TestGemma4ToolParserStreaming:
     """Test streaming tool call extraction."""
 
@@ -261,6 +354,50 @@ class TestGemma4ToolParserStreaming:
         assert tc["function"]["name"] == "read_file"
         assert tc["type"] == "function"
         assert tc["index"] == 0
+
+    def test_streaming_paren_form_emits_when_complete(self):
+        """e4b paren form has no end delimiter — emit when parens balance."""
+        # Partial: parens not yet closed -> suppress.
+        r1 = self.parser.extract_tool_calls_streaming(
+            previous_text="<|tool_call>call:search",
+            current_text='<|tool_call>call:search(query="Du',
+            delta_text='(query="Du',
+        )
+        assert r1 is None
+
+        # Completing delta closes the call -> emit tool_calls.
+        r2 = self.parser.extract_tool_calls_streaming(
+            previous_text='<|tool_call>call:search(query="Du',
+            current_text='<|tool_call>call:search(query="Dune")',
+            delta_text='ne")',
+        )
+        assert r2 is not None
+        assert r2["tool_calls"][0]["function"]["name"] == "search"
+        assert json.loads(r2["tool_calls"][0]["function"]["arguments"]) == {
+            "query": "Dune"
+        }
+
+    def test_streaming_paren_form_emits_once(self):
+        """Once emitted, later deltas must not re-emit the same call."""
+        prev = '<|tool_call>call:search(query="Dune")'
+        r = self.parser.extract_tool_calls_streaming(
+            previous_text=prev,
+            current_text=prev + " ",
+            delta_text=" ",
+        )
+        assert r is None
+
+    def test_streaming_tool_code_block_emits_on_close(self):
+        """e2b code-fence form: emit when the fenced call first parses."""
+        prev = "```tool_code\nget_weather(city="
+        cur = '```tool_code\nget_weather(city="Paris")\n```'
+        r = self.parser.extract_tool_calls_streaming(
+            previous_text=prev,
+            current_text=cur,
+            delta_text='"Paris")\n```',
+        )
+        assert r is not None
+        assert r["tool_calls"][0]["function"]["name"] == "get_weather"
 
 
 class TestGemma4Registration:
