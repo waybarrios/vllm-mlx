@@ -1544,6 +1544,10 @@ class TestSimpleEngineConcurrency:
             captured["kwargs"] = kwargs
             yield SimpleNamespace(text="B", finish_reason="stop")
 
+        def fake_select_chunks(_importance, **kwargs):
+            captured["select_chunks_kwargs"] = kwargs
+            return mx.array([0, 1, 2], dtype=mx.int32)
+
         tokenizer = MagicMock()
         tokenizer.apply_chat_template.return_value = "<|im_start|>user\nhello"
         tokenizer.bos_token = None
@@ -1588,7 +1592,7 @@ class TestSimpleEngineConcurrency:
             ),
             patch(
                 "vllm_mlx.specprefill.select_chunks",
-                return_value=mx.array([0, 1, 2], dtype=mx.int32),
+                side_effect=fake_select_chunks,
             ),
             patch(
                 "vllm_mlx.specprefill.sparse_prefill",
@@ -1603,6 +1607,7 @@ class TestSimpleEngineConcurrency:
                     max_tokens=4,
                     temperature=0.6,
                     top_p=0.95,
+                    specprefill_backbone_pct=0.25,
                 )
             ]
 
@@ -1618,6 +1623,7 @@ class TestSimpleEngineConcurrency:
         assert captured["kwargs"]["prompt_cache"] == ["backbone-cache", "mtp-cache"]
         assert captured["kwargs"]["max_tokens"] == 3
         assert captured["kwargs"]["logits_processors"] is None
+        assert captured["select_chunks_kwargs"]["backbone_pct"] == 0.25
 
     @pytest.mark.anyio
     async def test_stream_generate_text_forwards_logits_processors_and_sampler_args(
@@ -2132,6 +2138,10 @@ class TestSimpleEngineConcurrency:
             captured["prefill"] = cancel_check
             return mx.zeros((1, 1, 8), dtype=mx.float32)
 
+        def fake_select_chunks(_importance, **kwargs):
+            captured["select_chunks_kwargs"] = kwargs
+            return mx.array([0], dtype=mx.int32)
+
         with patch("vllm_mlx.engine.simple.is_mllm_model", return_value=False):
             engine = SimpleEngine("test-model")
             engine._loaded = True
@@ -2154,7 +2164,7 @@ class TestSimpleEngineConcurrency:
                 ),
                 patch(
                     "vllm_mlx.specprefill.select_chunks",
-                    return_value=mx.array([0], dtype=mx.int32),
+                    side_effect=fake_select_chunks,
                 ),
                 patch(
                     "vllm_mlx.specprefill.sparse_prefill",
@@ -2168,12 +2178,14 @@ class TestSimpleEngineConcurrency:
                     max_tokens=4,
                     temperature=0.7,
                     top_p=0.9,
+                    specprefill_backbone_pct=0.25,
                 ):
                     outputs.append(chunk.new_text)
 
         assert outputs == ["A"]
         assert callable(captured["score"])
         assert captured["score"] is captured["prefill"]
+        assert captured["select_chunks_kwargs"]["backbone_pct"] == 0.25
 
     @pytest.mark.anyio
     async def test_cancelling_specprefill_request_stops_during_scoring(self):
