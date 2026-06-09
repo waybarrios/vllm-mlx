@@ -888,6 +888,18 @@ def _video_has_audio_track(video_path: str) -> bool:
         return True
 
 
+def _model_has_sound_encoder(model) -> bool:
+    """Whether a loaded model exposes a usable sound encoder.
+
+    Uses ``getattr(..., None) is not None`` rather than ``hasattr`` so model
+    wrappers that declare ``sound_encoder`` in ``__init__`` but leave it as
+    ``None`` until the first encoder pass are correctly treated as not yet
+    enabled. A bare ``hasattr`` check would spuriously enable A/V fusion
+    against a missing encoder and crash the processor downstream.
+    """
+    return getattr(model, "sound_encoder", None) is not None
+
+
 def extract_audio_from_video(video_path: str) -> str | None:
     """Extract the audio track from a video file as 16 kHz mono WAV.
 
@@ -1234,7 +1246,7 @@ class MLXMultimodalLM:
             # Decoupled from _video_native because some omni models (e.g.
             # Nemotron-H Omni) don't expose video_token_id at config level
             # and run through the frames-as-images fallback path.
-            self._video_native_with_audio = hasattr(self.model, "sound_encoder")
+            self._video_native_with_audio = _model_has_sound_encoder(self.model)
             logger.info(f"MLLM loaded successfully: {self.model_name}")
             if self._video_native:
                 logger.info("Native video pipeline enabled (temporal 3D conv + M-RoPE)")
@@ -1359,6 +1371,7 @@ class MLXMultimodalLM:
         video_input: str | dict,
         fps: float = DEFAULT_FPS,
         max_frames: int = MAX_FRAMES,
+        resolved_path: str | None = None,
     ) -> list[str]:
         """
         Process video input and extract frames.
@@ -1372,12 +1385,16 @@ class MLXMultimodalLM:
             video_input: Video in any supported format
             fps: Frames per second to extract
             max_frames: Maximum frames to extract
+            resolved_path: Optional pre-resolved local path. Callers that
+                already ran process_video_input (e.g. for parallel audio
+                extraction) pass it here to avoid re-downloading / re-decoding.
 
         Returns:
             List of paths to extracted frame images
         """
-        # Process video input (download if URL, decode if base64)
-        video_path = process_video_input(video_input)
+        # Reuse caller's resolved path when supplied; otherwise resolve here
+        # (downloads if URL, decodes if base64).
+        video_path = resolved_path or process_video_input(video_input)
 
         # Extract frames
         frames = extract_video_frames_smart(
@@ -2089,30 +2106,37 @@ class MLXMultimodalLM:
             total_frames = 0
             has_explicit_audio = bool(_msg_audio_inputs.get(msg_idx))
             for vid_input in vid_inputs:
-                # For omni models, also extract the video's audio track so
-                # the model can fuse A/V in one forward pass. Skip if the
-                # caller supplied an explicit audio_url for the same message.
-                # We resolve the video to a local path first so the user's
-                # raw URL is never handed to ffmpeg directly (avoids URL-
-                # protocol exposure via ffmpeg's network demuxers).
-                if self._video_native_with_audio and not has_explicit_audio:
-                    try:
-                        video_path_for_audio = process_video_input(vid_input)
-                    except Exception as exc:
-                        logger.warning(
-                            f"Could not resolve video for audio extraction: {exc}"
+                # Resolve the video to a local path ONCE per input. Both
+                # audio extraction (when this is an omni model with no
+                # explicit audio block) and frame extraction need a local
+                # file; resolving twice would re-download remote URLs and
+                # re-decode base64. Resolving up front also keeps user-
+                # supplied raw URLs out of ffmpeg's URL-protocol demuxers
+                # (avoids SSRF via http://, rtsp://, etc.).
+                try:
+                    resolved_video_path = process_video_input(vid_input)
+                except Exception as exc:
+                    logger.warning(f"Could not resolve video: {exc}")
+                    resolved_video_path = None
+
+                if (
+                    resolved_video_path
+                    and self._video_native_with_audio
+                    and not has_explicit_audio
+                ):
+                    extracted_audio = extract_audio_from_video(
+                        resolved_video_path
+                    )
+                    if extracted_audio:
+                        _msg_extra_audio.setdefault(msg_idx, []).append(
+                            extracted_audio
                         )
-                        video_path_for_audio = None
-                    if video_path_for_audio:
-                        extracted_audio = extract_audio_from_video(
-                            video_path_for_audio
-                        )
-                        if extracted_audio:
-                            _msg_extra_audio.setdefault(msg_idx, []).append(
-                                extracted_audio
-                            )
+
                 frames = self._prepare_video(
-                    vid_input, fps=video_fps, max_frames=video_max_frames
+                    vid_input,
+                    fps=video_fps,
+                    max_frames=video_max_frames,
+                    resolved_path=resolved_video_path,
                 )
                 all_video_frames.extend(frames)
                 total_frames += len(frames)
@@ -2474,24 +2498,32 @@ class MLXMultimodalLM:
             total_frames = 0
             has_explicit_audio = bool(_msg_audio_inputs.get(msg_idx))
             for vid_input in vid_inputs:
-                if self._video_native_with_audio and not has_explicit_audio:
-                    try:
-                        video_path_for_audio = process_video_input(vid_input)
-                    except Exception as exc:
-                        logger.warning(
-                            f"Could not resolve video for audio extraction: {exc}"
+                # Resolve once; reused for audio extraction and frame prep.
+                # See the matching block in chat() for rationale.
+                try:
+                    resolved_video_path = process_video_input(vid_input)
+                except Exception as exc:
+                    logger.warning(f"Could not resolve video: {exc}")
+                    resolved_video_path = None
+
+                if (
+                    resolved_video_path
+                    and self._video_native_with_audio
+                    and not has_explicit_audio
+                ):
+                    extracted_audio = extract_audio_from_video(
+                        resolved_video_path
+                    )
+                    if extracted_audio:
+                        _msg_extra_audio.setdefault(msg_idx, []).append(
+                            extracted_audio
                         )
-                        video_path_for_audio = None
-                    if video_path_for_audio:
-                        extracted_audio = extract_audio_from_video(
-                            video_path_for_audio
-                        )
-                        if extracted_audio:
-                            _msg_extra_audio.setdefault(msg_idx, []).append(
-                                extracted_audio
-                            )
+
                 frames = self._prepare_video(
-                    vid_input, fps=video_fps, max_frames=video_max_frames
+                    vid_input,
+                    fps=video_fps,
+                    max_frames=video_max_frames,
+                    resolved_path=resolved_video_path,
                 )
                 all_video_frames.extend(frames)
                 total_frames += len(frames)
