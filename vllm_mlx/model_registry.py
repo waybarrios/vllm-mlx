@@ -115,6 +115,7 @@ class RegistryServeDefaults:
     specprefill_enabled: bool
     specprefill_threshold: int
     specprefill_keep_pct: float
+    specprefill_backbone_pct: float
     specprefill_draft_model: str | None
     stream_interval: int
     gpu_memory_utilization: float
@@ -154,6 +155,7 @@ class RegisteredModel:
     specprefill_enabled: bool | None = None
     specprefill_threshold: int | None = None
     specprefill_keep_pct: float | None = None
+    specprefill_backbone_pct: float | None = None
     specprefill_draft_model: str | None = None
     stream_interval: int | None = None
     gpu_memory_utilization: float | None = None
@@ -173,6 +175,7 @@ class ResolvedModelConfig:
     specprefill_enabled: bool
     specprefill_threshold: int
     specprefill_keep_pct: float
+    specprefill_backbone_pct: float
     specprefill_draft_model: str | None
     stream_interval: int
     gpu_memory_utilization: float
@@ -348,6 +351,7 @@ def load_registry_config(
             specprefill_enabled=item.get("specprefill"),
             specprefill_threshold=item.get("specprefill_threshold"),
             specprefill_keep_pct=item.get("specprefill_keep_pct"),
+            specprefill_backbone_pct=item.get("specprefill_backbone_pct"),
             specprefill_draft_model=item.get("specprefill_draft_model"),
             stream_interval=item.get("stream_interval"),
             gpu_memory_utilization=item.get("gpu_memory_utilization"),
@@ -797,6 +801,7 @@ class ModelManager:
                 specprefill_enabled=config.specprefill_enabled,
                 specprefill_threshold=config.specprefill_threshold,
                 specprefill_keep_pct=config.specprefill_keep_pct,
+                specprefill_backbone_pct=config.specprefill_backbone_pct,
                 specprefill_draft_model=config.specprefill_draft_model,
             )
 
@@ -891,6 +896,11 @@ class ModelManager:
             if entry.specprefill_keep_pct is not None
             else self._defaults.specprefill_keep_pct
         )
+        specprefill_backbone_pct = (
+            entry.specprefill_backbone_pct
+            if entry.specprefill_backbone_pct is not None
+            else self._defaults.specprefill_backbone_pct
+        )
         specprefill_draft_model = (
             entry.specprefill_draft_model
             if entry.specprefill_draft_model is not None
@@ -918,6 +928,7 @@ class ModelManager:
             specprefill_enabled=specprefill_enabled,
             specprefill_threshold=specprefill_threshold,
             specprefill_keep_pct=specprefill_keep_pct,
+            specprefill_backbone_pct=specprefill_backbone_pct,
             specprefill_draft_model=specprefill_draft_model,
             stream_interval=stream_interval,
             gpu_memory_utilization=gpu_memory_utilization,

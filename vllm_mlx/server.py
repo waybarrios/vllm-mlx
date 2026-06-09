@@ -748,6 +748,9 @@ def _prepare_chat_completion_invocation(
         chat_kwargs["specprefill"] = request.specprefill
     if request.specprefill_keep_pct is not None:
         chat_kwargs["specprefill_keep_pct"] = request.specprefill_keep_pct
+    specprefill_backbone_pct = getattr(request, "specprefill_backbone_pct", None)
+    if specprefill_backbone_pct is not None:
+        chat_kwargs["specprefill_backbone_pct"] = specprefill_backbone_pct
     resolved_chat_template_kwargs = _resolve_chat_template_kwargs(
         request.chat_template_kwargs
     )
@@ -1204,6 +1207,7 @@ def _build_engine(spec: ModelSpec) -> BaseEngine:
         specprefill_enabled=spec.specprefill_enabled,
         specprefill_threshold=spec.specprefill_threshold,
         specprefill_keep_pct=spec.specprefill_keep_pct,
+        specprefill_backbone_pct=spec.specprefill_backbone_pct,
         specprefill_draft_model=spec.specprefill_draft_model,
         max_kv_size=max_kv_size,
     )
@@ -3021,6 +3025,7 @@ def load_model(
     specprefill_enabled: bool = False,
     specprefill_threshold: int = 8192,
     specprefill_keep_pct: float = 0.3,
+    specprefill_backbone_pct: float = 0.0,
     specprefill_draft_model: str = None,
     mllm_draft_model: str | None = None,
     mllm_draft_kind: str | None = None,
@@ -3046,6 +3051,7 @@ def load_model(
         specprefill_enabled: Enable SpecPrefill (SimpleEngine only)
         specprefill_threshold: Minimum suffix tokens to trigger SpecPrefill (default: 8192)
         specprefill_keep_pct: Fraction of tokens to keep (default: 0.3)
+        specprefill_backbone_pct: Fraction of chunks reserved for evenly spaced coverage
         specprefill_draft_model: Path to small draft model for SpecPrefill scoring
         mllm_draft_model: Optional MLLM speculative draft/assistant model path.
         mllm_draft_kind: Optional mlx-vlm draft kind, for example "mtp".
@@ -3142,6 +3148,7 @@ def load_model(
             specprefill_enabled=specprefill_enabled,
             specprefill_threshold=specprefill_threshold,
             specprefill_keep_pct=specprefill_keep_pct,
+            specprefill_backbone_pct=specprefill_backbone_pct,
             specprefill_draft_model=specprefill_draft_model,
         )
         _residency_manager = ResidencyManager(
@@ -3193,6 +3200,7 @@ def load_model(
             specprefill_enabled=specprefill_enabled,
             specprefill_threshold=specprefill_threshold,
             specprefill_keep_pct=specprefill_keep_pct,
+            specprefill_backbone_pct=specprefill_backbone_pct,
             specprefill_draft_model=specprefill_draft_model,
             max_kv_size=_max_kv,
             mllm_draft_model=mllm_draft_model,
@@ -4635,6 +4643,11 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
                 generate_kwargs["specprefill"] = request.specprefill
             if request.specprefill_keep_pct is not None:
                 generate_kwargs["specprefill_keep_pct"] = request.specprefill_keep_pct
+            specprefill_backbone_pct = getattr(
+                request, "specprefill_backbone_pct", None
+            )
+            if specprefill_backbone_pct is not None:
+                generate_kwargs["specprefill_backbone_pct"] = specprefill_backbone_pct
             try:
                 if raw_request is None:
                     output = await engine.generate(**generate_kwargs)
@@ -5804,6 +5817,9 @@ async def stream_completion(
         generate_kwargs["specprefill"] = request.specprefill
     if request.specprefill_keep_pct is not None:
         generate_kwargs["specprefill_keep_pct"] = request.specprefill_keep_pct
+    specprefill_backbone_pct = getattr(request, "specprefill_backbone_pct", None)
+    if specprefill_backbone_pct is not None:
+        generate_kwargs["specprefill_backbone_pct"] = specprefill_backbone_pct
 
     try:
         async for output in engine.stream_generate(**generate_kwargs):

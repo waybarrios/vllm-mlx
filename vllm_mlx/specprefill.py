@@ -396,13 +396,14 @@ def score_tokens(
     return importance
 
 
-def select_chunks(importance, keep_pct=0.3, chunk_size=32):
+def select_chunks(importance, keep_pct=0.3, chunk_size=32, backbone_pct=0.0):
     """Select top-k% token chunks by average importance.
 
     Args:
         importance: (M,) per-token importance scores
         keep_pct: fraction of chunks to keep (default 0.3)
         chunk_size: tokens per chunk (default 32)
+        backbone_pct: fraction of chunks reserved for evenly-spaced coverage
 
     Returns:
         sorted mx.array of kept token indices
@@ -412,7 +413,10 @@ def select_chunks(importance, keep_pct=0.3, chunk_size=32):
         return mx.arange(M)
 
     n_chunks = math.ceil(M / chunk_size)
+    target_tokens = max(1, math.ceil(M * keep_pct))
     keep_n = max(1, math.ceil(n_chunks * keep_pct))
+    backbone_n = max(0, math.ceil(n_chunks * backbone_pct)) if backbone_pct > 0 else 0
+    top_n = max(0, keep_n - backbone_n)
 
     chunk_scores = []
     for i in range(n_chunks):
@@ -420,10 +424,39 @@ def select_chunks(importance, keep_pct=0.3, chunk_size=32):
         end = min(start + chunk_size, M)
         chunk_scores.append(mx.mean(importance[start:end]).item())
 
-    top_chunks = sorted(range(n_chunks), key=lambda i: chunk_scores[i], reverse=True)[
-        :keep_n
-    ]
-    top_chunks.sort()
+    selected_chunks = set(
+        sorted(range(n_chunks), key=lambda i: chunk_scores[i], reverse=True)[:top_n]
+    )
+    if backbone_n > 0:
+        if backbone_n >= n_chunks:
+            selected_chunks.update(range(n_chunks))
+        else:
+            for i in range(backbone_n):
+                selected_chunks.add(round(i * (n_chunks - 1) / max(1, backbone_n - 1)))
+
+    def _selected_token_count(chunks):
+        total = 0
+        for chunk_idx in chunks:
+            start = chunk_idx * chunk_size
+            end = min(start + chunk_size, M)
+            total += end - start
+        return total
+
+    if (
+        len(selected_chunks) < keep_n
+        or _selected_token_count(selected_chunks) < target_tokens
+    ):
+        for chunk_idx in sorted(
+            range(n_chunks), key=lambda i: chunk_scores[i], reverse=True
+        ):
+            selected_chunks.add(chunk_idx)
+            if (
+                len(selected_chunks) >= keep_n
+                and _selected_token_count(selected_chunks) >= target_tokens
+            ):
+                break
+
+    top_chunks = sorted(selected_chunks)
 
     indices = []
     for ci in top_chunks:

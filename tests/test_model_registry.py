@@ -74,6 +74,7 @@ def _defaults() -> RegistryServeDefaults:
         specprefill_enabled=False,
         specprefill_threshold=8192,
         specprefill_keep_pct=0.3,
+        specprefill_backbone_pct=0.0,
         specprefill_draft_model=None,
         stream_interval=1,
         gpu_memory_utilization=0.9,

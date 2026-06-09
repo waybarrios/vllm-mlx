@@ -139,6 +139,7 @@ class SimpleEngine(BaseEngine):
         specprefill_enabled: bool = False,
         specprefill_threshold: int = 8192,
         specprefill_keep_pct: float = 0.3,
+        specprefill_backbone_pct: float = 0.0,
         specprefill_draft_model: str | None = None,
         max_kv_size: int = 0,
         mllm_draft_model: str | None = None,
@@ -159,6 +160,8 @@ class SimpleEngine(BaseEngine):
             specprefill_enabled: Enable SpecPrefill (attention-based sparse prefill)
             specprefill_threshold: Minimum suffix tokens to trigger SpecPrefill
             specprefill_keep_pct: Fraction of tokens to keep (default: 0.3)
+            specprefill_backbone_pct: Fraction of chunks to reserve for evenly
+                spaced coverage (default: 0.0)
             specprefill_draft_model: Path to small draft model for importance scoring
             max_kv_size: Maximum KV cache size per sequence (0 = unbounded)
             mllm_draft_model: Optional MLLM speculative draft/assistant model path
@@ -191,6 +194,7 @@ class SimpleEngine(BaseEngine):
         self._specprefill_enabled = specprefill_enabled
         self._specprefill_threshold = specprefill_threshold
         self._specprefill_keep_pct = specprefill_keep_pct
+        self._specprefill_backbone_pct = specprefill_backbone_pct
         self._specprefill_draft_model_path = specprefill_draft_model
         self._mllm_draft_model_path = mllm_draft_model
         self._mllm_draft_kind = mllm_draft_kind
@@ -803,6 +807,7 @@ class SimpleEngine(BaseEngine):
         # Per-request specprefill overrides (from extra_body)
         specprefill_override = kwargs.pop("specprefill", None)
         specprefill_keep_pct_override = kwargs.pop("specprefill_keep_pct", None)
+        specprefill_backbone_pct_override = kwargs.pop("specprefill_backbone_pct", None)
         request_id = str(kwargs.pop("request_id", "") or f"simple-{id(prompt):x}")
 
         # SpecPrefill for non-MLLM models (MLLM+MTP handles it in _stream_generate_text)
@@ -846,6 +851,7 @@ class SimpleEngine(BaseEngine):
                         top_p,
                         stop=stop,
                         specprefill_keep_pct=specprefill_keep_pct_override,
+                        specprefill_backbone_pct=specprefill_backbone_pct_override,
                         **kwargs,
                     ):
                         yield output
@@ -1680,6 +1686,7 @@ class SimpleEngine(BaseEngine):
         top_p: float,
         stop: list[str] | None = None,
         specprefill_keep_pct: float | None = None,
+        specprefill_backbone_pct: float | None = None,
         **kwargs,
     ) -> AsyncIterator[GenerationOutput]:
         """SpecPrefill path for non-MTP models (Nemotron, GPT-OSS, etc).
@@ -1743,7 +1750,16 @@ class SimpleEngine(BaseEngine):
                 # Phase 2: Select important chunks
                 _cancel_check()
                 effective_keep = specprefill_keep_pct or self._specprefill_keep_pct
-                selected = select_chunks(importance, keep_pct=effective_keep)
+                effective_backbone = (
+                    specprefill_backbone_pct
+                    if specprefill_backbone_pct is not None
+                    else self._specprefill_backbone_pct
+                )
+                selected = select_chunks(
+                    importance,
+                    keep_pct=effective_keep,
+                    backbone_pct=effective_backbone,
+                )
                 n_selected = selected.shape[0]
 
                 # Phase 3: Sparse prefill on target model
@@ -1897,6 +1913,7 @@ class SimpleEngine(BaseEngine):
         # Per-request specprefill overrides (from extra_body)
         specprefill_override = kwargs.pop("specprefill", None)
         specprefill_keep_pct = kwargs.pop("specprefill_keep_pct", None)
+        specprefill_backbone_pct = kwargs.pop("specprefill_backbone_pct", None)
         chat_template_kwargs = dict(kwargs.pop("chat_template_kwargs", {}) or {})
         top_k = kwargs.pop("top_k", 0)
         min_p = kwargs.pop("min_p", 0.0)
@@ -2376,7 +2393,16 @@ class SimpleEngine(BaseEngine):
 
                 # Phase 2: Select important chunks
                 effective_keep = specprefill_keep_pct or self._specprefill_keep_pct
-                selected = select_chunks(importance, keep_pct=effective_keep)
+                effective_backbone = (
+                    specprefill_backbone_pct
+                    if specprefill_backbone_pct is not None
+                    else self._specprefill_backbone_pct
+                )
+                selected = select_chunks(
+                    importance,
+                    keep_pct=effective_keep,
+                    backbone_pct=effective_backbone,
+                )
                 n_selected = selected.shape[0]
                 n_total = len(specprefill_tokens)
 
@@ -2660,6 +2686,7 @@ class SimpleEngine(BaseEngine):
                 "draft_model": self._specprefill_draft_model_path,
                 "threshold": self._specprefill_threshold,
                 "keep_pct": self._specprefill_keep_pct,
+                "backbone_pct": self._specprefill_backbone_pct,
             }
 
         # System KV cache stats (LRU over multiple system prefixes)

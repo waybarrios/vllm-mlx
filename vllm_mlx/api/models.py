@@ -199,6 +199,8 @@ class ChatCompletionRequest(BaseModel):
     specprefill: bool | None = None
     # SpecPrefill: per-request keep percentage (0.0-1.0, None = use server default)
     specprefill_keep_pct: float | None = None
+    # SpecPrefill: per-request evenly spaced backbone percentage.
+    specprefill_backbone_pct: float | None = None
     # Enable/disable thinking mode (None = server default, typically True)
     enable_thinking: bool | None = None
     # MLLM assistant-drafter path: opt in to using a configured drafter.
@@ -301,6 +303,8 @@ class CompletionRequest(BaseModel):
     specprefill: bool | None = None
     # SpecPrefill: per-request keep percentage (0.0-1.0, None = use server default)
     specprefill_keep_pct: float | None = None
+    # SpecPrefill: per-request evenly spaced backbone percentage.
+    specprefill_backbone_pct: float | None = None
 
 
 class CompletionChoice(BaseModel):
