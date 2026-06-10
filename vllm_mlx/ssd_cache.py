@@ -768,7 +768,9 @@ class SSDCacheTier:
                     bits = getattr(layer, "bits", 8)
                     group_size = getattr(layer, "group_size", 64)
                     kv = _KVCache.__new__(_KVCache)
-                    kv.keys = mx.dequantize(*layer.keys, group_size=group_size, bits=bits)
+                    kv.keys = mx.dequantize(
+                        *layer.keys, group_size=group_size, bits=bits
+                    )
                     kv.values = mx.dequantize(
                         *layer.values, group_size=group_size, bits=bits
                     )
