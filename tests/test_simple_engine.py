@@ -1469,7 +1469,14 @@ class TestSimpleEngineConcurrency:
             await engine.start()
 
         assert engine._text_model is text_model
-        assert engine._text_tokenizer is tokenizer
+        # The text route wraps the processor tokenizer with the model's
+        # full EOS set; the wrapper must delegate to the original.
+        from mlx_lm.tokenizer_utils import TokenizerWrapper
+
+        assert isinstance(engine._text_tokenizer, TokenizerWrapper)
+        assert engine._text_tokenizer._tokenizer is tokenizer
+        # Qwen3 <|im_end|> fix feeds the wrapper's stop set
+        assert 42 in engine._text_tokenizer.eos_token_ids
 
     @pytest.mark.anyio
     async def test_mllm_nonstream_text_only_routes_without_mtp(self):

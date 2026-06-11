@@ -282,6 +282,10 @@ async def test_simple_engine_stream_generate_text_applies_chat_template_kwargs()
         engine._is_mllm = True
         engine._text_tokenizer = MagicMock()
         engine._text_tokenizer.apply_chat_template.return_value = "prompt"
+        # Realistic tokenizer attrs: the up-front usage tokenization reads
+        # bos_token and encode() on every request.
+        engine._text_tokenizer.bos_token = None
+        engine._text_tokenizer.encode.return_value = [1, 2, 3]
         engine._text_model = MagicMock()
         engine._text_model.model = MagicMock()
 

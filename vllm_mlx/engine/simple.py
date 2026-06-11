@@ -506,16 +506,12 @@ class SimpleEngine(BaseEngine):
 
                         from ..utils.tokenizer import collect_eos_token_ids
 
-                        eos_ids = collect_eos_token_ids(
-                            raw_tokenizer, self._model_name
-                        )
+                        eos_ids = collect_eos_token_ids(raw_tokenizer, self._model_name)
                         self._text_tokenizer = TokenizerWrapper(
                             raw_tokenizer,
                             eos_token_ids=eos_ids or None,
                         )
-                        logger.info(
-                            "Text route stop tokens: %s", sorted(eos_ids)
-                        )
+                        logger.info("Text route stop tokens: %s", sorted(eos_ids))
 
                         # Probe the derived TextModel's prompt cache for snapshot-safety
                         # (same gate stream_chat uses for the pure-LLM path).
