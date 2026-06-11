@@ -145,6 +145,9 @@ class SimpleEngine(BaseEngine):
         mllm_draft_model: str | None = None,
         mllm_draft_kind: str | None = None,
         mllm_draft_block_size: int | None = None,
+        prefix_trie_cache: bool = False,
+        prefix_trie_cache_size: int = 32,
+        prefix_trie_cache_memory_mb: int | None = None,
     ):
         """
         Initialize the simple engine.
@@ -167,6 +170,9 @@ class SimpleEngine(BaseEngine):
             mllm_draft_model: Optional MLLM speculative draft/assistant model path
             mllm_draft_kind: Optional mlx-vlm draft kind, for example "mtp"
             mllm_draft_block_size: Optional speculative block size for mlx-vlm
+            prefix_trie_cache: Enable mlx-lm LRUPromptCache on pure-LLM stream_chat
+            prefix_trie_cache_size: Maximum prompt-cache trie entries
+            prefix_trie_cache_memory_mb: Optional prompt-cache trie memory cap in MB
         """
         self._model_name = model_name
         self._created_at = time.time()
@@ -199,6 +205,19 @@ class SimpleEngine(BaseEngine):
         self._mllm_draft_model_path = mllm_draft_model
         self._mllm_draft_kind = mllm_draft_kind
         self._mllm_draft_block_size = mllm_draft_block_size
+        self._prefix_trie_cache_enabled = prefix_trie_cache
+        self._prefix_trie_cache_size = max(1, prefix_trie_cache_size)
+        self._prefix_trie_cache_memory_mb = prefix_trie_cache_memory_mb
+        self._prefix_trie_cache = None
+        self._prefix_trie_cache_lock = threading.Lock()
+        self._prefix_trie_cache_stats = {
+            "lookups": 0,
+            "hits": 0,
+            "misses": 0,
+            "inserts": 0,
+            "skips": 0,
+            "tokens_saved": 0,
+        }
 
         # KV cache size limit
         self._max_kv_size = max_kv_size
@@ -254,6 +273,87 @@ class SimpleEngine(BaseEngine):
         # aliases buffers ``update_and_fetch`` mutates in place — snapshot
         # restore would silently desynchronize. Probed once in ``start()``.
         self._supports_system_kv_cache: bool = False
+
+    def _ensure_prefix_trie_cache(self) -> Any | None:
+        """Return the optional mlx-lm prompt trie cache, creating it lazily."""
+        if not self._prefix_trie_cache_enabled:
+            return None
+        if self._is_mllm:
+            self._prefix_trie_cache_stats["skips"] += 1
+            return None
+        with self._prefix_trie_cache_lock:
+            if self._prefix_trie_cache is None:
+                from mlx_lm.models.cache import LRUPromptCache
+
+                max_bytes = (
+                    self._prefix_trie_cache_memory_mb * 1024 * 1024
+                    if self._prefix_trie_cache_memory_mb is not None
+                    else 1 << 63
+                )
+                self._prefix_trie_cache = LRUPromptCache(
+                    max_size=self._prefix_trie_cache_size,
+                    max_bytes=max_bytes,
+                )
+        return self._prefix_trie_cache
+
+    def _fetch_prefix_trie_cache(
+        self, model: Any, tokens: list[int]
+    ) -> tuple[Any | None, list[int] | None, int]:
+        """Fetch a nearest prompt-cache trie entry for a full prompt token list."""
+        prefix_trie = self._ensure_prefix_trie_cache()
+        if prefix_trie is None:
+            return None, None, 0
+
+        self._prefix_trie_cache_stats["lookups"] += 1
+        try:
+            with self._prefix_trie_cache_lock:
+                trie_cache, trie_rest = prefix_trie.fetch_nearest_cache(model, tokens)
+            if trie_cache is None or trie_rest is None or len(trie_rest) >= len(tokens):
+                self._prefix_trie_cache_stats["misses"] += 1
+                return None, None, 0
+
+            if len(trie_rest) == 0:
+                from mlx_lm.models.cache import can_trim_prompt_cache, trim_prompt_cache
+
+                if not can_trim_prompt_cache(trie_cache):
+                    raise ValueError("exact prefix-trie cache hit is not trimmable")
+                trim_prompt_cache(trie_cache, 1)
+                trie_rest = [tokens[-1]]
+
+            tokens_saved = len(tokens) - len(trie_rest)
+            self._prefix_trie_cache_stats["hits"] += 1
+            self._prefix_trie_cache_stats["tokens_saved"] += tokens_saved
+            return trie_cache, list(trie_rest), tokens_saved
+        except Exception as e:
+            self._prefix_trie_cache_stats["skips"] += 1
+            logger.debug("Prefix trie cache lookup skipped after failure (%s)", e)
+            return None, None, 0
+
+    def _insert_prefix_trie_cache(
+        self, model: Any, cache_key: list[int], prompt_cache: Any
+    ) -> None:
+        """Insert a completed prompt cache into the optional prompt trie cache."""
+        prefix_trie = self._ensure_prefix_trie_cache()
+        if prefix_trie is None or not cache_key:
+            return
+        try:
+            with self._prefix_trie_cache_lock:
+                prefix_trie.insert_cache(model, cache_key, prompt_cache)
+            self._prefix_trie_cache_stats["inserts"] += 1
+        except Exception as e:
+            self._prefix_trie_cache_stats["skips"] += 1
+            logger.debug("Prefix trie cache insert skipped (%s)", e)
+
+    def _prefix_trie_cache_snapshot(self) -> tuple[int, int]:
+        """Return current prompt-trie entry and byte counts."""
+        with self._prefix_trie_cache_lock:
+            entries = (
+                len(self._prefix_trie_cache)
+                if self._prefix_trie_cache is not None
+                else 0
+            )
+            nbytes = self._prefix_trie_cache.nbytes if self._prefix_trie_cache else 0
+        return entries, nbytes
 
     @property
     def model_name(self) -> str:
@@ -544,6 +644,8 @@ class SimpleEngine(BaseEngine):
         for k in self._system_kv_cache_stats:
             self._system_kv_cache_stats[k] = 0
         self._supports_system_kv_cache = False
+        with self._prefix_trie_cache_lock:
+            self._prefix_trie_cache = None
         logger.info("SimpleEngine stopped")
 
     def _should_route_text_through_text_model(
@@ -1293,8 +1395,12 @@ class SimpleEngine(BaseEngine):
         system_tokens = None
         system_token_count = 0
         full_token_count = 0
+        full_tokens_list: list[int] | None = None
         system_hash = None
         kv_cache_eligible = False
+        prefix_trie_hit = False
+        prefix_trie_rest_tokens: list[int] | None = None
+        prefix_trie_tokens_saved = 0
         # Snapshot reference captured at gate time so a concurrent MISS that
         # mutates ``self._system_kv_cache`` between the gate and the restore
         # (which runs later inside ``_run_blocking_serialized``) can't
@@ -1481,6 +1587,22 @@ class SimpleEngine(BaseEngine):
                                 len(suffix_tokens),
                                 system_hash,
                             )
+                            trie_cache, trie_rest, trie_tokens_saved = (
+                                self._fetch_prefix_trie_cache(
+                                    self._model.model, full_tokens_list
+                                )
+                            )
+                            if trie_cache is not None and trie_rest is not None:
+                                prefix_trie_hit = True
+                                hit_snapshot = trie_cache
+                                prefix_trie_rest_tokens = trie_rest
+                                prefix_trie_tokens_saved = trie_tokens_saved
+                                logger.info(
+                                    "Prefix trie cache HIT (stream_chat): "
+                                    "reusing %d tokens, prefilling %d new",
+                                    prefix_trie_tokens_saved,
+                                    len(trie_rest),
+                                )
 
         if kv_cache_eligible:
             # Cache-aware path: drive mlx-lm directly with a pre-populated cache.
@@ -1510,7 +1632,11 @@ class SimpleEngine(BaseEngine):
                 model = self._model.model
                 sampler = make_sampler(temp=temperature, top_p=top_p)
 
-                if cache_hit:
+                cache_key = list(full_tokens_list or [])
+
+                if prefix_trie_hit:
+                    bc = hit_snapshot
+                elif cache_hit:
                     bc = make_prompt_cache(model)
                     # Restore from the closure-local reference captured at the
                     # gate, never from ``self._system_kv_cache`` directly:
@@ -1575,7 +1701,10 @@ class SimpleEngine(BaseEngine):
                         cache_mb,
                     )
 
-                prompt_arr = mx.array(suffix_tokens)
+                prompt_tokens_for_decode = (
+                    prefix_trie_rest_tokens if prefix_trie_hit else suffix_tokens
+                )
+                prompt_arr = mx.array(prompt_tokens_for_decode)
                 for resp in mlx_stream_generate(
                     model,
                     tokenizer,
@@ -1586,7 +1715,16 @@ class SimpleEngine(BaseEngine):
                 ):
                     if abort_event.is_set():
                         break
+                    token = getattr(resp, "token", None)
+                    if token is not None:
+                        try:
+                            cache_key.append(int(token))
+                        except TypeError:
+                            cache_key.append(int(token.item()))
                     _emit_response(resp)
+
+                if not abort_event.is_set() and bc is not None:
+                    self._insert_prefix_trie_cache(model, cache_key, bc)
 
             async def _produce_responses() -> None:
                 try:
@@ -2719,6 +2857,15 @@ class SimpleEngine(BaseEngine):
                 "total_memory_mb": round(total_bytes / 1e6, 1),
                 "slots": slots,
                 "counters": counters,
+            }
+
+        if self._prefix_trie_cache_enabled:
+            trie_entries, trie_bytes = self._prefix_trie_cache_snapshot()
+            stats["prefix_trie_cache"] = {
+                "enabled": True,
+                **self._prefix_trie_cache_stats,
+                "entries": trie_entries,
+                "memory_mb": round(trie_bytes / 1e6, 1),
             }
 
         # Include Metal memory stats

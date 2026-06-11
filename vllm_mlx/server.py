@@ -1210,6 +1210,9 @@ def _build_engine(spec: ModelSpec) -> BaseEngine:
         specprefill_backbone_pct=spec.specprefill_backbone_pct,
         specprefill_draft_model=spec.specprefill_draft_model,
         max_kv_size=max_kv_size,
+        prefix_trie_cache=spec.prefix_trie_cache,
+        prefix_trie_cache_size=spec.prefix_trie_cache_size,
+        prefix_trie_cache_memory_mb=spec.prefix_trie_cache_memory_mb,
     )
 
 
@@ -3027,6 +3030,9 @@ def load_model(
     specprefill_keep_pct: float = 0.3,
     specprefill_backbone_pct: float = 0.0,
     specprefill_draft_model: str = None,
+    prefix_trie_cache: bool = False,
+    prefix_trie_cache_size: int = 32,
+    prefix_trie_cache_memory_mb: int | None = None,
     mllm_draft_model: str | None = None,
     mllm_draft_kind: str | None = None,
     mllm_draft_block_size: int | None = None,
@@ -3053,6 +3059,9 @@ def load_model(
         specprefill_keep_pct: Fraction of tokens to keep (default: 0.3)
         specprefill_backbone_pct: Fraction of chunks reserved for evenly spaced coverage
         specprefill_draft_model: Path to small draft model for SpecPrefill scoring
+        prefix_trie_cache: Enable mlx-lm LRUPromptCache for pure-LLM SimpleEngine chat
+        prefix_trie_cache_size: Maximum prompt-cache trie entries
+        prefix_trie_cache_memory_mb: Optional prompt-cache trie memory cap in MB
         mllm_draft_model: Optional MLLM speculative draft/assistant model path.
         mllm_draft_kind: Optional mlx-vlm draft kind, for example "mtp".
         mllm_draft_block_size: Optional speculative block size passed to mlx-vlm.
@@ -3150,6 +3159,9 @@ def load_model(
             specprefill_keep_pct=specprefill_keep_pct,
             specprefill_backbone_pct=specprefill_backbone_pct,
             specprefill_draft_model=specprefill_draft_model,
+            prefix_trie_cache=prefix_trie_cache,
+            prefix_trie_cache_size=prefix_trie_cache_size,
+            prefix_trie_cache_memory_mb=prefix_trie_cache_memory_mb,
         )
         _residency_manager = ResidencyManager(
             _engine_factory,
@@ -3206,6 +3218,9 @@ def load_model(
             mllm_draft_model=mllm_draft_model,
             mllm_draft_kind=mllm_draft_kind,
             mllm_draft_block_size=mllm_draft_block_size,
+            prefix_trie_cache=prefix_trie_cache,
+            prefix_trie_cache_size=prefix_trie_cache_size,
+            prefix_trie_cache_memory_mb=prefix_trie_cache_memory_mb,
         )
         # Start SimpleEngine synchronously (no background loop)
         # Use new_event_loop() for Python 3.10+ compatibility (get_event_loop() is deprecated)
@@ -6498,6 +6513,9 @@ def main():
         mllm_draft_model=args.mllm_draft_model,
         mllm_draft_kind=args.mllm_draft_kind,
         mllm_draft_block_size=args.mllm_draft_block_size,
+        prefix_trie_cache=args.prefix_trie_cache,
+        prefix_trie_cache_size=args.prefix_trie_cache_size,
+        prefix_trie_cache_memory_mb=args.prefix_trie_cache_memory_mb,
         auto_unload_idle_seconds=args.auto_unload_idle_seconds,
         lazy_load_model=args.lazy_load_model,
     )
@@ -6581,6 +6599,27 @@ Examples:
         type=make_positive_int_arg_parser("--mllm-draft-block-size"),
         default=None,
         help="Draft block size passed to mlx-vlm for --mllm-draft-model.",
+    )
+    parser.add_argument(
+        "--prefix-trie-cache",
+        action="store_true",
+        default=False,
+        help=(
+            "Enable mlx-lm LRUPromptCache for pure-LLM SimpleEngine chat. "
+            "Default off; exact system-prefix snapshots still take precedence."
+        ),
+    )
+    parser.add_argument(
+        "--prefix-trie-cache-size",
+        type=make_positive_int_arg_parser("--prefix-trie-cache-size"),
+        default=32,
+        help="Maximum prompt-cache trie entries for --prefix-trie-cache.",
+    )
+    parser.add_argument(
+        "--prefix-trie-cache-memory-mb",
+        type=make_positive_int_arg_parser("--prefix-trie-cache-memory-mb"),
+        default=None,
+        help="Optional prompt-cache trie memory cap in MB.",
     )
     parser.add_argument(
         "--mcp-config",
