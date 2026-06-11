@@ -76,11 +76,28 @@ def build_text_model(vlm_model: Any, model_path: str | Path) -> Any | None:
         # This prevents quantizing layers like mtp.fc which are BF16.
         quantization = text_config.get("quantization", config.get("quantization", None))
         if quantization is not None:
+            # Per-layer quantization overrides (e.g. 8-bit MoE gates over a 4-bit
+            # body) may be keyed with the source checkpoint's "language_model."
+            # wrapper prefix, which the extracted TextModel doesn't carry. Index
+            # them by suffix so the prefix-stripped module path resolves to the
+            # correct bits/group_size; without this the override is ignored and the
+            # layer is quantized at the global width, producing a quantized_matmul
+            # shape mismatch at decode.
+            per_layer_overrides = {
+                k: v for k, v in quantization.items() if isinstance(v, dict)
+            }
 
             def _class_predicate(path, module):
                 if not hasattr(module, "to_quantized"):
                     return False
-                return f"{path}.scales" in all_weight_names
+                if f"{path}.scales" not in all_weight_names:
+                    return False
+                if path in quantization:
+                    return quantization[path]
+                for key, override in per_layer_overrides.items():
+                    if key.endswith("." + path):
+                        return override
+                return True
 
             nn.quantize(
                 text_model,
