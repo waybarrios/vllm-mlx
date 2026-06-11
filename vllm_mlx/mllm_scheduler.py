@@ -243,46 +243,19 @@ class MLLMScheduler:
         self._clear_cache_interval = 32
 
     def _get_stop_tokens(self) -> Set[int]:
-        """Get stop token IDs from tokenizer and generation_config.json."""
-        stop_tokens = set()
+        """Get stop token IDs from tokenizer and config/generation_config.
+
+        (e.g., Gemma 4 has <turn|>=106, <|tool_response>=50 as EOS, declared
+        only in the config EOS list — never as ``tokenizer.eos_token``.)
+        """
+        from .utils.tokenizer import collect_eos_token_ids
+
         tokenizer = (
             self.processor.tokenizer
             if hasattr(self.processor, "tokenizer")
             else self.processor
         )
-
-        if hasattr(tokenizer, "eos_token_id") and tokenizer.eos_token_id is not None:
-            if isinstance(tokenizer.eos_token_id, list):
-                stop_tokens.update(tokenizer.eos_token_id)
-            else:
-                stop_tokens.add(tokenizer.eos_token_id)
-
-        if hasattr(tokenizer, "eos_token_ids") and tokenizer.eos_token_ids is not None:
-            if isinstance(tokenizer.eos_token_ids, (list, set, tuple)):
-                stop_tokens.update(tokenizer.eos_token_ids)
-            else:
-                stop_tokens.add(tokenizer.eos_token_ids)
-
-        # Also read generation_config.json which may have additional EOS tokens
-        # (e.g., Gemma 4 has <turn|>=106, <|tool_response>=50 as EOS)
-        model_path = getattr(tokenizer, "name_or_path", None)
-        if model_path:
-            import json
-            from pathlib import Path
-
-            gc_path = Path(model_path) / "generation_config.json"
-            if gc_path.exists():
-                try:
-                    gc = json.loads(gc_path.read_text())
-                    gc_eos = gc.get("eos_token_id")
-                    if isinstance(gc_eos, list):
-                        stop_tokens.update(gc_eos)
-                    elif gc_eos is not None:
-                        stop_tokens.add(gc_eos)
-                except Exception:
-                    pass
-
-        return stop_tokens
+        return collect_eos_token_ids(tokenizer)
 
     def _ensure_batch_generator(self) -> None:
         """Ensure batch generator exists."""
