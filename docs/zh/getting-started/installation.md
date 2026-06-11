@@ -87,3 +87,11 @@ huggingface-cli login
 ```bash
 vllm-mlx serve mlx-community/Llama-3.2-1B-Instruct-4bit
 ```
+
+### 长时间运行时服务器可能因 macOS 进入睡眠而中断
+
+长时间作为服务器运行时，macOS 设备可能会进入睡眠。可以使用 `caffeinate` 来阻止进入睡眠：
+
+```bash
+caffeinate -dimsu
+```
