@@ -2841,6 +2841,21 @@ def _extract_reasoning_and_tool_calls(
     reasoning_text = None
     text_for_tool_parse = output_text
 
+    if _reasoning_parser and not allow_reasoning:
+        # Thinking is disabled for this request, but models can open an
+        # explicit reasoning block regardless (Gemma 4 emits
+        # <|channel>thought even when the template disables thinking).
+        # The allow_reasoning gate exists to keep implicit-thinking
+        # parsers from swallowing plain content into reasoning — with
+        # explicit markers present that hazard cannot occur, while
+        # skipping the parser leaks the raw markers into content.
+        # Parse iff markers are present.
+        start = getattr(_reasoning_parser, "start_token", None)
+        end = getattr(_reasoning_parser, "end_token", None)
+        allow_reasoning = bool(
+            (start and start in output_text) or (end and end in output_text)
+        )
+
     if _reasoning_parser and allow_reasoning:
         reasoning_text, cleaned_reasoning_text = _reasoning_parser.extract_reasoning(
             output_text
