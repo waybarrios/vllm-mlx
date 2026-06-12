@@ -85,3 +85,29 @@ def test_corrupt_config_ignored(tmp_path):
 def test_missing_model_path_ok():
     tok = FakeTokenizer(eos_token_id=2)
     assert collect_eos_token_ids(tok, "/nonexistent/path") == {2}
+
+
+def test_mllm_scheduler_batched_path_pins_gemma4_stop_set(tmp_path):
+    """Pin the Gemma 4 stop set {1, 106, 50} through the batched path.
+
+    Behavioral change vs the old MLLMScheduler._get_stop_tokens: that
+    implementation read only generation_config.json, while the shared
+    helper also reads config.json — Gemma 4 (MLX export) declares
+    eos_token_id [1, 106, 50] in config.json only. Models that list extra
+    ids (e.g. pad/bos) in the config EOS set now stop on tokens the
+    batched path previously ignored; that union is the point of the fix.
+    """
+    from types import SimpleNamespace
+
+    from vllm_mlx.mllm_scheduler import MLLMScheduler
+
+    _write_config(tmp_path, "config.json", [1, 106, 50])
+    tokenizer = FakeTokenizer(eos_token_id=1, name_or_path=str(tmp_path))
+
+    # Processor wrapping a tokenizer (the usual MLLM shape)
+    scheduler = SimpleNamespace(processor=SimpleNamespace(tokenizer=tokenizer))
+    assert MLLMScheduler._get_stop_tokens(scheduler) == {1, 106, 50}
+
+    # Bare tokenizer as processor (no .tokenizer attribute)
+    scheduler = SimpleNamespace(processor=tokenizer)
+    assert MLLMScheduler._get_stop_tokens(scheduler) == {1, 106, 50}
