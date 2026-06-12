@@ -32,6 +32,7 @@ from urllib.parse import urljoin, urlparse
 import numpy as np
 import requests
 
+from vllm_mlx.engine.chat_template_safety import normalize_messages_for_chat_template
 from vllm_mlx.mllm_cache import MLLMPrefixCacheManager
 
 logger = logging.getLogger(__name__)
@@ -253,6 +254,20 @@ def _build_ordered_mllm_message_content(
     return built_parts, bool(built_parts)
 
 
+def _normalize_mllm_tool_calls(tool_calls: list) -> list:
+    """Normalize replayed assistant tool calls for chat templates.
+
+    Mirrors ``_normalize_tool_call_arguments_for_template`` in
+    ``vllm_mlx/engine/batched.py``: JSON argument strings become mappings so
+    templates that iterate argument keys render correctly.
+    """
+    plain_calls = [_normalize_content_part(call) for call in tool_calls]
+    normalized = normalize_messages_for_chat_template(
+        [{"role": "assistant", "tool_calls": plain_calls}]
+    )
+    return normalized[0].get("tool_calls", plain_calls)
+
+
 def _build_mllm_chat_messages(
     messages: list[dict],
     *,
@@ -272,8 +287,31 @@ def _build_mllm_chat_messages(
             all_image_urls=all_image_urls,
             video_frame_count=video_frame_counts.get(msg_idx, 0),
         )
+        chat_message = {"role": role, "content": content}
+
+        if role == "assistant":
+            tool_calls = msg.get("tool_calls")
+            if isinstance(tool_calls, list) and tool_calls:
+                # Keep tool-call turns even when text content is empty so
+                # templates render the assistant -> tool exchange (issue #608).
+                chat_message["tool_calls"] = _normalize_mllm_tool_calls(tool_calls)
+                reasoning_content = msg.get("reasoning_content")
+                if reasoning_content:
+                    chat_message["reasoning_content"] = reasoning_content
+                has_content = True
+        elif role == "tool":
+            tool_call_id = msg.get("tool_call_id")
+            if tool_call_id:
+                chat_message["tool_call_id"] = tool_call_id
+                # Tools may legitimately return empty output; keep the message
+                # anyway so the assistant tool_call still has its anchor and
+                # template forward-scans pair calls to responses (issue #608).
+                if not has_content:
+                    chat_message["content"] = ""
+                    has_content = True
+
         if has_content:
-            chat_messages.append({"role": role, "content": content})
+            chat_messages.append(chat_message)
     return chat_messages
 
 
