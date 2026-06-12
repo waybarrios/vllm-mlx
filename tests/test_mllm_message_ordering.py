@@ -161,9 +161,7 @@ def test_mllm_chat_messages_keep_assistant_tool_calls_without_text():
 
 
 def test_mllm_chat_messages_keep_tool_call_id_on_tool_messages():
-    messages = [
-        {"role": "tool", "tool_call_id": "call_1", "content": '{"temp_c": 19}'}
-    ]
+    messages = [{"role": "tool", "tool_call_id": "call_1", "content": '{"temp_c": 19}'}]
 
     chat_messages = _build_mllm_chat_messages(
         messages,
