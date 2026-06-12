@@ -151,6 +151,23 @@ def build_text_model(vlm_model: Any, model_path: str | Path) -> Any | None:
         # to the slow Python recurrence instead of the Metal kernel.
         text_model.train(False)
 
+        # Realize every array the model holds before it leaves the build
+        # thread — including underscore-private module attributes such as
+        # RoPE._freqs, which parameters() excludes. MLX lazy graphs are tagged
+        # to the stream of the thread that recorded them; a lazy array
+        # surviving into generation dies with "There is no Stream(gpu, N) in
+        # current thread" the moment a worker on another thread evaluates it
+        # (Gemma 4: the scaled-RoPE _freqs of the first full_attention layer).
+        if hasattr(text_model, "modules"):
+            mx.eval(
+                [
+                    v
+                    for module in text_model.modules()
+                    for v in module.values()
+                    if isinstance(v, mx.array)
+                ]
+            )
+
         return text_model
 
     except ImportError as e:
