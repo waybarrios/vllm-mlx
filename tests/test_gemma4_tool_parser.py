@@ -297,6 +297,44 @@ class TestGemma4ToolParserFallbackForms:
         tc = self.parser.extract_tool_calls(output).tool_calls[0]
         assert tc["id"].startswith("call_")
 
+    def test_e2b_unfenced_tool_code_assignment(self):
+        """e2b: `tool_code = fn(...)\nprint(tool_code)` — no fence, assignment form.
+
+        Exact output shape observed in live trajectories (2026-06-13).  The parser
+        must dispatch the call and leave content=None (the print line is noise).
+        """
+        output = 'tool_code = radarr_get_movies(search="Dune")\nprint(tool_code)'
+        result = self.parser.extract_tool_calls(output)
+        assert result.tools_called is True
+        assert len(result.tool_calls) == 1
+        tc = result.tool_calls[0]
+        assert tc["name"] == "radarr_get_movies"
+        assert json.loads(tc["arguments"]) == {"search": "Dune"}
+        assert result.content is None
+
+    def test_e2b_unfenced_tool_code_assignment_mixed_args(self):
+        """Unfenced assignment with multiple kwargs of mixed types."""
+        output = 'tool_code = search_movies(query="Interstellar", limit=5)\nprint(tool_code)'
+        result = self.parser.extract_tool_calls(output)
+        assert result.tools_called is True
+        assert result.tool_calls[0]["name"] == "search_movies"
+        assert json.loads(result.tool_calls[0]["arguments"]) == {
+            "query": "Interstellar",
+            "limit": 5,
+        }
+        assert result.content is None
+
+    def test_plain_assignment_is_not_a_tool_call(self):
+        """An ordinary assignment like `x = foo(y=1)` must NOT be dispatched.
+
+        The `tool_code =` literal is the required anchor; bare variable names
+        without it must remain content to avoid false positives in prose.
+        """
+        output = "x = foo(y=1)"
+        result = self.parser.extract_tool_calls(output)
+        assert result.tools_called is False
+        assert result.content == output
+
 
 class TestGemma4ToolParserStreaming:
     """Test streaming tool call extraction."""

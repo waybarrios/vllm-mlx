@@ -19,6 +19,8 @@ its call as plain text in `content`, using Python-style call syntax:
   e2b: ```tool_code
        radarr_get_movies(search="Dune")
        ```
+  e2b: tool_code = radarr_get_movies(search="Dune")
+       print(tool_code)
 
 These are parsed by a fallback layer (ast-based) when the canonical parse finds
 no calls, so the host can still dispatch the tool.
@@ -77,8 +79,14 @@ _MAX_ARG_BLOCK_LEN = 1_048_576
 _CALL_PAREN_RE = re.compile(r"call:(\w+)\s*\(")
 # ```tool_code ... ``` fenced block (Gemma's code-call convention).
 _TOOL_CODE_FENCE_RE = re.compile(r"```tool_code\b[^\n]*\n(.*?)```", re.DOTALL)
+# Unfenced `tool_code = fn(...)` assignment (e2b omits the fence, issue #83).
+# The literal `tool_code =` anchor prevents ordinary assignments like
+# `x = foo()` from being mistaken for a tool call.
+_TOOL_CODE_ASSIGN_RE = re.compile(r"(?m)^[ \t]*tool_code\s*=\s*(\w+)\s*\(")
 # Cheap marker used by the streaming path to know a fallback call may be forming.
-_FALLBACK_MARKER_RE = re.compile(r"```tool_code\b|call:\w+\s*\(")
+_FALLBACK_MARKER_RE = re.compile(
+    r"```tool_code\b|call:\w+\s*\(|tool_code\s*=\s*\w+\s*\("
+)
 
 
 def _find_balanced_brace(text: str, start: int) -> int:
@@ -418,12 +426,38 @@ class Gemma4ToolParser(ToolParser):
             )
             spans.append((m.start(), paren_close + 1))
 
+        # Unfenced `tool_code = fn(...)` assignment form (e2b, issue #83).
+        # Only handle lines NOT already captured by a fence or call: span.
+        for m in _TOOL_CODE_ASSIGN_RE.finditer(cleaned):
+            if any(s <= m.start() < e for s, e in spans):
+                continue  # inside an already-captured block
+            paren_open = m.end() - 1
+            paren_close = _find_balanced_paren(cleaned, paren_open)
+            if paren_close == -1:
+                continue
+            call_src = m.group(1) + cleaned[paren_open : paren_close + 1]
+            parsed = _parse_python_call(call_src)
+            if parsed is None:
+                continue
+            name, args = parsed
+            tool_calls.append(
+                {
+                    "id": generate_tool_id(),
+                    "name": name,
+                    "arguments": json.dumps(args),
+                }
+            )
+            spans.append((m.start(), paren_close + 1))
+
         if not tool_calls:
             return None
 
         content = _strip_spans(cleaned, spans)
         # Drop any stray Gemma tool-call markers left in the surrounding text.
         content = content.replace(TOOL_CALL_START, "").replace(TOOL_CALL_END, "")
+        # Drop residual `print(tool_code)` lines left by the unfenced assignment
+        # convention — they are bookkeeping noise, not reply content.
+        content = re.sub(r"(?m)^[ \t]*print\([^\n]*\)[ \t]*$", "", content)
         content = content.strip() or None
 
         return ExtractedToolCallInformation(
