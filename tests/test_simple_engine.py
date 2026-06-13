@@ -186,6 +186,18 @@ class TestSimpleEngineConcurrency:
             release.set()
             await first
 
+    def test_lock_admission_env_wait_is_preserved(self, monkeypatch):
+        """VLLM_MLX_SIMPLE_ENGINE_LOCK_ADMISSION=wait keeps queued behavior."""
+        from vllm_mlx.engine.simple import SimpleEngine
+
+        monkeypatch.setenv("VLLM_MLX_SIMPLE_ENGINE_LOCK_ADMISSION", "wait")
+
+        with patch("vllm_mlx.engine.simple.is_mllm_model", return_value=False):
+            engine = SimpleEngine("test-model")
+
+        assert engine._generation_lock_admission == "wait"
+        assert engine.get_stats()["generation_lock"]["admission"] == "wait"
+
     @pytest.mark.anyio
     async def test_blocking_serialized_tracks_active_request(self):
         """Busy errors include the current blocking serialized holder."""

@@ -225,7 +225,7 @@ class SimpleEngine(BaseEngine):
                 "Invalid VLLM_MLX_SIMPLE_ENGINE_LOCK_ADMISSION=%r; using fail_fast",
                 self._generation_lock_admission,
             )
-        self._generation_lock_admission = "fail_fast"
+            self._generation_lock_admission = "fail_fast"
         self._generation_waiters = 0
         self._generation_busy_rejections = 0
 
