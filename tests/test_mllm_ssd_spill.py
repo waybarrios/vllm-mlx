@@ -85,9 +85,7 @@ def test_ssd_tier_attached_when_dir_set(monkeypatch, tmp_path):
     prefix_cache = SimpleNamespace()
     set_calls, tiers = _install_fakes(monkeypatch, prefix_cache)
 
-    cfg = MLLMSchedulerConfig(
-        ssd_cache_dir=str(tmp_path), ssd_cache_max_gb=7.0
-    )
+    cfg = MLLMSchedulerConfig(ssd_cache_dir=str(tmp_path), ssd_cache_max_gb=7.0)
     sched = _bare_scheduler(cfg)
     sched._ensure_batch_generator()
 
