@@ -155,9 +155,7 @@ def _base_scheduler_config(**overrides):
 def test_start_mllm_forwards_ssd_cache_fields(monkeypatch):
     captured = _run_start_mllm(
         monkeypatch,
-        _base_scheduler_config(
-            ssd_cache_dir="/tmp/ssd-kv", ssd_cache_max_gb=42.0
-        ),
+        _base_scheduler_config(ssd_cache_dir="/tmp/ssd-kv", ssd_cache_max_gb=42.0),
     )
     assert captured["config_kwargs"]["ssd_cache_dir"] == "/tmp/ssd-kv"
     assert captured["config_kwargs"]["ssd_cache_max_gb"] == 42.0
