@@ -3169,6 +3169,8 @@ def load_model(
     _engine.use_harmony_rendering = _detect_harmony_rendering()
     if _engine.preserve_native_tool_format:
         logger.info(f"Native tool format enabled for parser: {_tool_call_parser}")
+    if _engine.use_harmony_rendering:
+        logger.info(f"Harmony prompt rendering enabled for parser: {_tool_call_parser}")
 
     logger.info(f"Default max tokens: {_default_max_tokens}")
     logger.info(f"Max request tokens: {_max_request_tokens}")
