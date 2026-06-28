@@ -886,6 +886,11 @@ _STREAMING_TOOL_MARKERS = (
     "[TOOL_CALLS]",
     "<minimax:tool_call>",
     '<invoke name="',
+    # Llama 3.1+/4 emit tool calls as <|python_tag|>{...}; gate streaming
+    # dispatch on the special token. Bare-JSON ({...}) Llama 3.3 calls are
+    # not gated here (a leading "{" is too ambiguous to match safely) and so
+    # only resolve in non-streaming mode.
+    "<|python_tag|>",
 )
 _STREAMING_BARE_BRACKET_MARKER = re.compile(r"\[\w+\(\{")
 _STREAMING_BARE_BRACKET_PARTIAL = re.compile(r"\[\w+\($")
