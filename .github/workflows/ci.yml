@@ -63,7 +63,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install pytest anyio pytest-cov pydantic fastapi jsonschema httpx psutil transformers requests openai-harmony
+          pip install pytest anyio pytest-cov pydantic fastapi jsonschema httpx psutil transformers requests
 
       - name: Run unit tests (no MLX required)
         run: |
@@ -83,7 +83,6 @@ jobs:
             tests/test_anthropic_models.py \
             tests/test_anthropic_adapter.py \
             tests/test_harmony_parsers.py \
-            tests/test_harmony_render.py \
             tests/test_endpoint_model_policies.py \
             tests/test_gemma4_openai_format.py \
             tests/test_gemma4_streaming_edge.py \
@@ -125,7 +124,7 @@ jobs:
       - name: Install project and dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -e ".[dev,vision]"
+          pip install -e ".[dev,vision,harmony]"
 
       - name: Verify Apple Silicon
         run: |
@@ -155,6 +154,7 @@ jobs:
             tests/test_thinking_aware_processor.py \
             tests/test_tool_choice_forced.py \
             tests/test_tool_choice_none.py \
+            tests/test_harmony_render.py \
             -v --tb=short \
             -m "not slow" \
             -k "not Integration"
