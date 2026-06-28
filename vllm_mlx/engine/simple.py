@@ -1337,14 +1337,41 @@ class SimpleEngine(BaseEngine):
                 template_kwargs["tools"] = template_tools
             safe_messages = normalize_messages_for_chat_template(messages)
 
-            try:
-                prompt = tokenizer.apply_chat_template(safe_messages, **template_kwargs)
-            except TypeError:
-                # Some templates don't support all kwargs
-                for key in ["tools", "enable_thinking", *chat_template_kwargs.keys()]:
-                    if key in template_kwargs:
-                        del template_kwargs[key]
-                prompt = tokenizer.apply_chat_template(safe_messages, **template_kwargs)
+            if getattr(self, "use_harmony_rendering", False):
+                # GPT-OSS / harmony-format models: render via openai-harmony
+                # instead of the Jinja chat_template. Bypasses the
+                # ``extract_multimodal_content`` text-flattening upstream
+                # (which drops structural ``tool_calls`` for non-native
+                # parsers) and uses OpenAI's canonical renderer. See #568.
+                from ..utils.harmony_render import (
+                    render_messages as _harmony_render_messages,
+                )
+
+                _reasoning_effort = None
+                if chat_template_kwargs:
+                    _reasoning_effort = chat_template_kwargs.get("reasoning_effort")
+                prompt = _harmony_render_messages(
+                    safe_messages,
+                    tools=template_tools,
+                    reasoning_effort=_reasoning_effort,
+                )
+            else:
+                try:
+                    prompt = tokenizer.apply_chat_template(
+                        safe_messages, **template_kwargs
+                    )
+                except TypeError:
+                    # Some templates don't support all kwargs
+                    for key in [
+                        "tools",
+                        "enable_thinking",
+                        *chat_template_kwargs.keys(),
+                    ]:
+                        if key in template_kwargs:
+                            del template_kwargs[key]
+                    prompt = tokenizer.apply_chat_template(
+                        safe_messages, **template_kwargs
+                    )
         else:
             prompt = "\n".join(f"{m['role']}: {m['content']}" for m in messages)
             prompt += "\nassistant:"
@@ -1437,6 +1464,15 @@ class SimpleEngine(BaseEngine):
         # exposes any non-KVCache entries or the probe failed.
         if not self._supports_system_kv_cache:
             cache_blocking_controls.append("non_kv_cache_class")
+        # The system-prefix probe (re-renders the conversation with two different
+        # user contents and compares the rendered strings) goes through
+        # ``tokenizer.apply_chat_template``. When the harmony rendering path is
+        # active the actual prompt is built by ``openai-harmony`` instead, so the
+        # probe and the prompt would diverge and the cache would never hit.
+        # Falling back to the uncached path keeps correctness without splitting
+        # the probe across both renderers.
+        if getattr(self, "use_harmony_rendering", False):
+            cache_blocking_controls.append("harmony_rendering")
 
         if cache_blocking_controls:
             logger.info(

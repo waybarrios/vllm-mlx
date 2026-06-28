@@ -318,6 +318,16 @@ def _prepare_chat_messages(
 
     is_mllm = bool(getattr(engine, "is_mllm", False))
     preserve_native = bool(getattr(engine, "preserve_native_tool_format", False))
+    # Harmony rendering needs the structural ``tool_calls`` / ``role=tool``
+    # shape to survive ``extract_multimodal_content`` — otherwise prior
+    # assistant tool calls reach ``render_messages()`` as ``[Calling tool: …]``
+    # bracket text and the harmony renderer can't reconstruct the
+    # commentary channel. The flag is set by ``_detect_harmony_rendering()``
+    # only when the harmony parser is active AND ``openai-harmony`` is
+    # importable, so non-harmony parsers and the no-extras install path see
+    # no change.
+    if bool(getattr(engine, "use_harmony_rendering", False)):
+        preserve_native = True
 
     if is_mllm:
         # For MLLM models, keep original messages with embedded images
@@ -1055,6 +1065,7 @@ async def _acquire_request_model(request_model: str) -> RequestModelContext:
     if _model_manager is None:
         engine = get_engine()
         engine.preserve_native_tool_format = _detect_native_tool_support()
+        engine.use_harmony_rendering = _detect_harmony_rendering()
         return RequestModelContext(
             model_name=_model_name or request_model, engine=engine
         )
@@ -1065,6 +1076,8 @@ async def _acquire_request_model(request_model: str) -> RequestModelContext:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
 
     lease.engine.preserve_native_tool_format = _detect_native_tool_support()
+
+    lease.engine.use_harmony_rendering = _detect_harmony_rendering()
     return RequestModelContext(
         model_name=request_model,
         engine=lease.engine,
@@ -1296,6 +1309,7 @@ def _activate_engine(engine: BaseEngine | None) -> BaseEngine | None:
     _engine = engine
     if _engine is not None:
         _engine.preserve_native_tool_format = _detect_native_tool_support()
+        _engine.use_harmony_rendering = _detect_harmony_rendering()
     return _engine
 
 
@@ -2904,6 +2918,42 @@ def _detect_native_tool_support() -> bool:
         return False
 
 
+def _detect_harmony_rendering() -> bool:
+    """Detect whether the harmony rendering path should handle prompt building.
+
+    Returns True when ALL of:
+    - ``--tool-call-parser`` is set to ``harmony`` or ``gpt-oss``
+    - ``--enable-auto-tool-choice`` is on
+    - the optional ``openai-harmony`` Python package is importable
+
+    The third condition keeps non-gpt-oss deployments free of an extra
+    runtime dependency: if the package isn't installed, the engine falls
+    back to the standard ``tokenizer.apply_chat_template`` path. The
+    HarmonyToolParser's existing text-flatten behavior also stays in force
+    in that fallback so the response side is unchanged.
+    """
+    if not _enable_auto_tool_choice or not _tool_call_parser:
+        return False
+    try:
+        from .utils.harmony_render import (
+            HAS_HARMONY,
+            is_harmony_parser_name,
+        )
+    except ImportError:
+        return False
+    if not is_harmony_parser_name(_tool_call_parser):
+        return False
+    if not HAS_HARMONY:
+        logger.warning(
+            "tool-call-parser=%s requested but `openai-harmony` is not "
+            "installed; falling back to tokenizer.apply_chat_template. "
+            "`pip install openai-harmony` to enable harmony rendering.",
+            _tool_call_parser,
+        )
+        return False
+    return True
+
+
 def _tool_choice_disabled(request: ChatCompletionRequest | None) -> bool:
     """Return True when tool_choice explicitly disables tool calling."""
     if request is None:
@@ -3266,8 +3316,11 @@ def load_model(
 
     # Set native tool format support on the engine (thread-safe via instance property)
     _engine.preserve_native_tool_format = _detect_native_tool_support()
+    _engine.use_harmony_rendering = _detect_harmony_rendering()
     if _engine.preserve_native_tool_format:
         logger.info(f"Native tool format enabled for parser: {_tool_call_parser}")
+    if _engine.use_harmony_rendering:
+        logger.info(f"Harmony prompt rendering enabled for parser: {_tool_call_parser}")
 
     logger.info(f"Default max tokens: {_default_max_tokens}")
     logger.info(f"Max request tokens: {_max_request_tokens}")
