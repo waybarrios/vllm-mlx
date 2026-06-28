@@ -6028,11 +6028,7 @@ async def stream_chat_completion(
                 # to the content stream so the tool parser can handle it.
                 if tool_parser and reasoning and not content:
                     _check = tool_accumulated_text + reasoning
-                    if (
-                        "<minimax:tool_call>" in _check
-                        or "<tool_call>" in _check
-                        or '<invoke name="' in _check
-                    ):
+                    if _streaming_tool_markup_possible(_check):
                         content = reasoning
                         reasoning = None
 
