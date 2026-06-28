@@ -373,9 +373,7 @@ class Gemma4ToolParser(ToolParser):
 
         return tool_calls, content_before
 
-    def _extract_fallback(
-        self, cleaned: str
-    ) -> ExtractedToolCallInformation | None:
+    def _extract_fallback(self, cleaned: str) -> ExtractedToolCallInformation | None:
         """Parse the Python-style fallback forms (issue #80).
 
         Handles ```tool_code``` blocks (bare `fn(...)` calls) and the
@@ -430,9 +428,7 @@ class Gemma4ToolParser(ToolParser):
             tools_called=True, tool_calls=tool_calls, content=content
         )
 
-    def _format_streaming(
-        self, result: ExtractedToolCallInformation
-    ) -> dict[str, Any]:
+    def _format_streaming(self, result: ExtractedToolCallInformation) -> dict[str, Any]:
         """Render extracted tool calls into the streaming delta shape."""
         return {
             "tool_calls": [
@@ -475,9 +471,7 @@ class Gemma4ToolParser(ToolParser):
 
         # Fallback forms (`call:fn(...)` / ```tool_code```) have no end delimiter.
         # Emit once, on the delta that first makes the call parseable.
-        if has_fallback and not self.extract_tool_calls(
-            previous_text
-        ).tools_called:
+        if has_fallback and not self.extract_tool_calls(previous_text).tools_called:
             result = self.extract_tool_calls(current_text)
             if result.tools_called:
                 return self._format_streaming(result)

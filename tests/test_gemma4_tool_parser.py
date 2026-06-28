@@ -254,10 +254,7 @@ class TestGemma4ToolParserFallbackForms:
         assert args == {"code": "f(x) + g(y)"}
 
     def test_tool_code_block_with_content_before(self):
-        output = (
-            "Let me look that up.\n"
-            "```tool_code\nget_weather(city=\"Paris\")\n```"
-        )
+        output = "Let me look that up.\n" '```tool_code\nget_weather(city="Paris")\n```'
         result = self.parser.extract_tool_calls(output)
         assert result.tools_called is True
         assert result.content == "Let me look that up."
