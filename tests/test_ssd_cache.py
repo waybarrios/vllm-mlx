@@ -381,6 +381,88 @@ class TestLayerSerializer:
         with pytest.raises(ValueError, match="Unsupported"):
             get_serializer_for_layer("not a cache layer")
 
+    def test_support_matrix_includes_quantized_kv_cache(self):
+        """SUPPORT_MATRIX must surface both quantized cache types so the
+        diagnostics table reflects what enqueue_spill's dequant path handles."""
+        assert (
+            SERIALIZER_SUPPORT_MATRIX["QuantizedKVCache"]
+            == "supported_via_dequant_on_spill"
+        )
+        assert (
+            SERIALIZER_SUPPORT_MATRIX["_QuantizedCacheWrapper"]
+            == "supported_via_dequant_on_spill"
+        )
+
+    def test_snapshot_layer_honors_original_dtype_sentinel(self):
+        """When enqueue_spill's dequant path stashed a pre-cast dtype on the
+        layer, snapshot_layer must surface it in the snapshot — without this,
+        the reload path leaves the model holding fp16 KV where it computed
+        bf16. Regression for the dtype-round-trip gap @waybarrios flagged on
+        PR #605 (the fp16-cast layers carried no dtype hint because
+        _mx_to_numpy_safe only sets a hint on its own upcast path)."""
+        keys = MockMLXArray(np.random.randn(1, 8, 4, 16).astype(np.float16))
+        values = MockMLXArray(np.random.randn(1, 8, 4, 16).astype(np.float16))
+        layer = MockKVCacheLayer(keys=keys, values=values, offset=4)
+        layer._ssd_keys_original_dtype = "bfloat16"
+        layer._ssd_values_original_dtype = "bfloat16"
+
+        snapshot = KVCacheSerializer().snapshot_layer(layer)
+
+        assert snapshot["keys_original_dtype"] == "bfloat16"
+        assert snapshot["values_original_dtype"] == "bfloat16"
+
+    def test_snapshot_layer_sentinel_overrides_autodetect(self):
+        """When both the sentinel and the _mx_to_numpy_safe autodetect produce
+        a dtype, the explicit sentinel wins. This pins down the precedence so
+        a future cast-chain (e.g. bf16 → fp16 → bf16 round-trip pre-snapshot)
+        can't silently lose the original dtype."""
+
+        class _BF16RaisingArray(MockMLXArray):
+            def __init__(self, data):
+                super().__init__(data)
+                # Simulate the bf16 buffer-protocol RuntimeError so
+                # _mx_to_numpy_safe reports "bfloat16" via autodetect; the
+                # sentinel below should still win.
+                self.dtype = type(
+                    "dtype",
+                    (),
+                    {"size": 2, "__str__": lambda self: "mlx.core.bfloat16"},
+                )()
+
+            def __array__(self):
+                raise RuntimeError("buffer format string mismatch")
+
+            def astype(self, _dt):
+                return MockMLXArray(self._data)
+
+        keys = _BF16RaisingArray(np.random.randn(1, 4, 2, 8).astype(np.float32))
+        values = _BF16RaisingArray(np.random.randn(1, 4, 2, 8).astype(np.float32))
+        layer = MockKVCacheLayer(keys=keys, values=values, offset=2)
+        layer._ssd_keys_original_dtype = "bfloat16"
+        layer._ssd_values_original_dtype = "bfloat16"
+
+        snapshot = KVCacheSerializer().snapshot_layer(layer)
+
+        # Sentinel must win over the upcast-recovered hint either way; both
+        # paths point to bfloat16 here, but the assertion guards that the
+        # sentinel branch is the one actually consulted.
+        assert snapshot["keys_original_dtype"] == "bfloat16"
+        assert snapshot["values_original_dtype"] == "bfloat16"
+
+    def test_snapshot_layer_no_sentinel_falls_back_to_autodetect(self):
+        """Without a sentinel, snapshot_layer must keep the prior behavior:
+        plain fp16/fp32 layers record no dtype hint (None), bf16 layers get
+        the autodetected upcast dtype via _mx_to_numpy_safe. Guards against
+        the sentinel logic eating the plain path."""
+        keys = MockMLXArray(np.random.randn(1, 4, 4, 8).astype(np.float16))
+        values = MockMLXArray(np.random.randn(1, 4, 4, 8).astype(np.float16))
+        layer = MockKVCacheLayer(keys=keys, values=values, offset=4)
+
+        snapshot = KVCacheSerializer().snapshot_layer(layer)
+
+        assert "keys_original_dtype" not in snapshot
+        assert "values_original_dtype" not in snapshot
+
 
 from vllm_mlx.ssd_cache import SSDCacheTier
 

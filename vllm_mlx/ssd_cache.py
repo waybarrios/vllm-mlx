@@ -410,6 +410,7 @@ SERIALIZER_SUPPORT_MATRIX = {
     "ArraysCache": "supported",
     "MambaCache": "supported",  # Legacy name for ArraysCache
     "_QuantizedCacheWrapper": "supported_via_dequant_on_spill",
+    "QuantizedKVCache": "supported_via_dequant_on_spill",
 }
 
 
@@ -478,6 +479,20 @@ class KVCacheSerializer(LayerSerializer):
     def snapshot_layer(self, layer: Any) -> dict[str, Any]:
         keys_np, keys_orig_dtype = _mx_to_numpy_safe(layer.keys)
         values_np, values_orig_dtype = _mx_to_numpy_safe(layer.values)
+
+        # Quantized-spill cast-back sentinel: the enqueue_spill dequant path
+        # may have cast bf16 → fp16 before snapshot to dodge numpy's PEP 3118
+        # buffer-protocol mismatch. The cast loses the original-dtype signal
+        # _mx_to_numpy_safe would otherwise capture (since fp16 IS numpy-
+        # supported, _mx_to_numpy_safe returns dtype=None). Honor an explicit
+        # sentinel on the layer when present so the reload path can restore
+        # bf16 instead of leaving the model with fp16 KV.
+        keys_orig_dtype = (
+            getattr(layer, "_ssd_keys_original_dtype", None) or keys_orig_dtype
+        )
+        values_orig_dtype = (
+            getattr(layer, "_ssd_values_original_dtype", None) or values_orig_dtype
+        )
 
         snapshot: dict[str, Any] = {
             "keys_np": keys_np,
@@ -792,14 +807,19 @@ class SSDCacheTier:
             # are 2 bytes, so np.array() raises a RuntimeError mismatch. Cast
             # to float16 here on the CALLER's stream: KV values sit well within
             # the fp16 ±65504 range, fp16 has MORE mantissa bits than bf16, and
-            # the byte size is identical. Then force eval so the writer thread
-            # sees materialized host buffers.
+            # the byte size is identical. Stash the pre-cast dtype as a sentinel
+            # so KVCacheSerializer.snapshot_layer can record it and the reload
+            # path (scheduler._reconstruct_ssd_layers) can cast back to bf16 —
+            # otherwise the model receives fp16 KV where it computed bf16.
+            # Then force eval so the writer thread sees materialized host buffers.
             for layer in cache:
                 k = getattr(layer, "keys", None)
                 v = getattr(layer, "values", None)
                 if k is None or v is None or isinstance(k, (tuple, list)):
                     continue
                 if str(getattr(k, "dtype", "")).endswith("bfloat16"):
+                    layer._ssd_keys_original_dtype = "bfloat16"
+                    layer._ssd_values_original_dtype = "bfloat16"
                     layer.keys = k.astype(mx.float16)
                     layer.values = v.astype(mx.float16)
                 mx.eval(layer.keys, layer.values)
