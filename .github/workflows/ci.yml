@@ -63,7 +63,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install pytest anyio pytest-cov pydantic fastapi jsonschema httpx psutil transformers requests
+          pip install pytest anyio pytest-cov pydantic fastapi jsonschema httpx psutil transformers requests openai-harmony
 
       - name: Run unit tests (no MLX required)
         run: |
@@ -83,6 +83,7 @@ jobs:
             tests/test_anthropic_models.py \
             tests/test_anthropic_adapter.py \
             tests/test_harmony_parsers.py \
+            tests/test_harmony_render.py \
             tests/test_endpoint_model_policies.py \
             tests/test_gemma4_openai_format.py \
             tests/test_gemma4_streaming_edge.py \
