@@ -477,7 +477,7 @@ class SimpleEngine(BaseEngine):
                     )
 
                     if self._text_model is not None:
-                        self._text_tokenizer = self._model.get_tokenizer()
+                        raw_tokenizer = self._model.get_tokenizer()
                         self._supports_system_kv_cache = (
                             self._probe_system_kv_cache_support(
                                 self._text_model,
@@ -487,10 +487,31 @@ class SimpleEngine(BaseEngine):
 
                         # Apply Qwen3.5 eos_token fix (matches MLXLanguageModel.load)
                         if "qwen3" in self._model_name.lower():
-                            self._text_tokenizer.eos_token = "<|im_end|>"
-                            self._text_tokenizer.eos_token_id = (
-                                self._text_tokenizer.convert_tokens_to_ids("<|im_end|>")
+                            raw_tokenizer.eos_token = "<|im_end|>"
+                            raw_tokenizer.eos_token_id = (
+                                raw_tokenizer.convert_tokens_to_ids("<|im_end|>")
                             )
+
+                        # Wrap with the full EOS set (tokenizer attrs +
+                        # config.json + generation_config.json). Passing the
+                        # raw HF tokenizer to mlx_lm.stream_generate makes it
+                        # wrap with eos_token_ids={tokenizer.eos_token_id},
+                        # dropping turn terminators declared only in the
+                        # config EOS list (Gemma 4's <turn|>=106,
+                        # <|tool_response>=50) — the model then generates
+                        # straight through end-of-turn until max_tokens.
+                        # Mirrors MLLMScheduler stop-token handling on the
+                        # batched path.
+                        from mlx_lm.tokenizer_utils import TokenizerWrapper
+
+                        from ..utils.tokenizer import collect_eos_token_ids
+
+                        eos_ids = collect_eos_token_ids(raw_tokenizer)
+                        self._text_tokenizer = TokenizerWrapper(
+                            raw_tokenizer,
+                            eos_token_ids=eos_ids or None,
+                        )
+                        logger.info("Text route stop tokens: %s", sorted(eos_ids))
 
                         # Probe the derived TextModel's prompt cache for snapshot-safety
                         # (same gate stream_chat uses for the pure-LLM path).
@@ -2079,11 +2100,9 @@ class SimpleEngine(BaseEngine):
         prompt_to_send = full_prompt  # Default: send full prompt text
         cache_hit = False
         system_token_count = 0
-        full_token_count = 0
         system_hash = None
         system_tokens = None
         suffix_tokens = None
-        full_tokens_list = None
         cache_blocking_controls = []
         if not self._supports_system_kv_cache:
             cache_blocking_controls.append("non_kv_cache_class")
@@ -2094,6 +2113,18 @@ class SimpleEngine(BaseEngine):
                 "uncached path",
                 cache_blocking_controls,
             )
+
+        # Tokenize the full prompt up front so usage.prompt_tokens is always
+        # reported. Previously this only happened inside the system-KV-cache
+        # branch (which requires a system message AND ChatML markers) or for
+        # specprefill — every other request reported prompt_tokens=0.
+        _add_special = self._text_tokenizer.bos_token is None or not (
+            full_prompt.startswith(self._text_tokenizer.bos_token)
+        )
+        full_tokens_list = self._text_tokenizer.encode(
+            full_prompt, add_special_tokens=_add_special
+        )
+        full_token_count = len(full_tokens_list)
 
         # Extract system messages for caching
         has_system = any(m.get("role") == "system" for m in messages)
@@ -2115,18 +2146,10 @@ class SimpleEngine(BaseEngine):
                     :16
                 ]
 
-                # Tokenize both (matching stream_generate's tokenization logic)
-                tokenizer = self._text_tokenizer
-                add_special = tokenizer.bos_token is None or not full_prompt.startswith(
-                    tokenizer.bos_token
-                )
-                full_tokens_list = tokenizer.encode(
-                    full_prompt, add_special_tokens=add_special
-                )
-                full_token_count = len(full_tokens_list)
-
-                system_tokens_list = tokenizer.encode(
-                    system_prefix_text, add_special_tokens=add_special
+                # Tokenize the system prefix (full prompt is tokenized above,
+                # matching stream_generate's tokenization logic)
+                system_tokens_list = self._text_tokenizer.encode(
+                    system_prefix_text, add_special_tokens=_add_special
                 )
                 system_token_count = len(system_tokens_list)
 
@@ -2211,18 +2234,8 @@ class SimpleEngine(BaseEngine):
         else:
             use_specprefill = self._draft_model is not None
 
-        # For specprefill, ensure we have token IDs (not just prompt text)
-        if use_specprefill and suffix_tokens is None and full_tokens_list is None:
-            tokenizer = self._text_tokenizer
-            add_special = tokenizer.bos_token is None or not full_prompt.startswith(
-                tokenizer.bos_token
-            )
-            full_tokens_list = tokenizer.encode(
-                full_prompt, add_special_tokens=add_special
-            )
-            full_token_count = len(full_tokens_list)
-
         # Tokens for specprefill: suffix (if system KV) or full prompt
+        # (full_tokens_list is always populated by the up-front tokenization)
         specprefill_tokens = (
             suffix_tokens if suffix_tokens is not None else full_tokens_list
         )
