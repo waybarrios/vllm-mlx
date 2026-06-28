@@ -506,7 +506,7 @@ class SimpleEngine(BaseEngine):
 
                         from ..utils.tokenizer import collect_eos_token_ids
 
-                        eos_ids = collect_eos_token_ids(raw_tokenizer, self._model_name)
+                        eos_ids = collect_eos_token_ids(raw_tokenizer)
                         self._text_tokenizer = TokenizerWrapper(
                             raw_tokenizer,
                             eos_token_ids=eos_ids or None,
