@@ -29,7 +29,6 @@ from vllm_mlx.models.mllm import (
     extract_audio_from_video,
 )
 
-
 # ---------------------------------------------------------------------------
 # Test helpers
 # ---------------------------------------------------------------------------
@@ -107,11 +106,14 @@ class TestNativeRoutingContract:
         model = _make_model(video_native_with_audio=True)
         messages = [_user_msg(_video_url())]
 
-        with patch.object(
-            mllm_mod, "process_video_input", return_value="/tmp/local.mp4"
-        ), patch.object(
-            mllm_mod, "extract_audio_from_video", return_value="/tmp/local.wav"
-        ) as extract:
+        with (
+            patch.object(
+                mllm_mod, "process_video_input", return_value="/tmp/local.mp4"
+            ),
+            patch.object(
+                mllm_mod, "extract_audio_from_video", return_value="/tmp/local.wav"
+            ) as extract,
+        ):
             translated = model._translate_messages_for_native_video(
                 messages, video_fps=2.0, video_max_frames=60
             )
@@ -128,13 +130,15 @@ class TestNativeRoutingContract:
         model = _make_model(video_native_with_audio=True)
         messages = [_user_msg(_video_url(), _audio_url())]
 
-        with patch.object(
-            mllm_mod, "process_video_input", return_value="/tmp/local.mp4"
-        ), patch.object(
-            mllm_mod, "process_audio_input", return_value="/tmp/explicit.wav"
-        ), patch.object(
-            mllm_mod, "extract_audio_from_video"
-        ) as extract:
+        with (
+            patch.object(
+                mllm_mod, "process_video_input", return_value="/tmp/local.mp4"
+            ),
+            patch.object(
+                mllm_mod, "process_audio_input", return_value="/tmp/explicit.wav"
+            ),
+            patch.object(mllm_mod, "extract_audio_from_video") as extract,
+        ):
             translated = model._translate_messages_for_native_video(
                 messages, video_fps=2.0, video_max_frames=60
             )
@@ -142,9 +146,7 @@ class TestNativeRoutingContract:
         # the explicit caller-provided audio must win
         extract.assert_not_called()
         audio_paths = [
-            it["audio"]
-            for it in translated[0]["content"]
-            if it["type"] == "audio"
+            it["audio"] for it in translated[0]["content"] if it["type"] == "audio"
         ]
         assert audio_paths == ["/tmp/explicit.wav"]
 
@@ -153,11 +155,12 @@ class TestNativeRoutingContract:
         model = _make_model(video_native_with_audio=False)
         messages = [_user_msg(_video_url())]
 
-        with patch.object(
-            mllm_mod, "process_video_input", return_value="/tmp/local.mp4"
-        ), patch.object(
-            mllm_mod, "extract_audio_from_video"
-        ) as extract:
+        with (
+            patch.object(
+                mllm_mod, "process_video_input", return_value="/tmp/local.mp4"
+            ),
+            patch.object(mllm_mod, "extract_audio_from_video") as extract,
+        ):
             translated = model._translate_messages_for_native_video(
                 messages, video_fps=2.0, video_max_frames=60
             )
@@ -171,10 +174,11 @@ class TestNativeRoutingContract:
         model = _make_model(video_native_with_audio=True)
         messages = [_user_msg(_video_url())]
 
-        with patch.object(
-            mllm_mod, "process_video_input", return_value="/tmp/local.mp4"
-        ), patch.object(
-            mllm_mod, "extract_audio_from_video", return_value=None
+        with (
+            patch.object(
+                mllm_mod, "process_video_input", return_value="/tmp/local.mp4"
+            ),
+            patch.object(mllm_mod, "extract_audio_from_video", return_value=None),
         ):
             translated = model._translate_messages_for_native_video(
                 messages, video_fps=2.0, video_max_frames=60
@@ -223,22 +227,25 @@ class TestNativePrepareInputsForwardsAudio:
         messages = [_user_msg(*items)]
 
         # Patch mlx_vlm process_vision_info and the resolution helpers.
-        process_vision_info = MagicMock(
-            return_value=(["frame1.jpg"], ["v.mp4"], {})
-        )
-        with patch.object(
-            mllm_mod, "process_video_input", return_value="/tmp/local.mp4"
-        ), patch.object(
-            mllm_mod, "process_audio_input", return_value="/tmp/explicit.wav"
-        ), patch.object(
-            mllm_mod, "extract_audio_from_video", return_value="/tmp/local.wav"
-        ), patch.dict(
-            "sys.modules",
-            {
-                "mlx_vlm.video_generate": MagicMock(
-                    process_vision_info=process_vision_info
-                ),
-            },
+        process_vision_info = MagicMock(return_value=(["frame1.jpg"], ["v.mp4"], {}))
+        with (
+            patch.object(
+                mllm_mod, "process_video_input", return_value="/tmp/local.mp4"
+            ),
+            patch.object(
+                mllm_mod, "process_audio_input", return_value="/tmp/explicit.wav"
+            ),
+            patch.object(
+                mllm_mod, "extract_audio_from_video", return_value="/tmp/local.wav"
+            ),
+            patch.dict(
+                "sys.modules",
+                {
+                    "mlx_vlm.video_generate": MagicMock(
+                        process_vision_info=process_vision_info
+                    ),
+                },
+            ),
         ):
             text, gen_kwargs = model._prepare_native_video_inputs(messages)
 
@@ -312,10 +319,11 @@ class TestFallbackDedupAndMerge:
             process_calls.append(vid)
             return f"/tmp/local_{vid}.mp4"
 
-        with patch.object(
-            mllm_mod, "process_video_input", side_effect=fake_resolve
-        ), patch.object(
-            mllm_mod, "extract_audio_from_video", return_value="/tmp/x.wav"
+        with (
+            patch.object(mllm_mod, "process_video_input", side_effect=fake_resolve),
+            patch.object(
+                mllm_mod, "extract_audio_from_video", return_value="/tmp/x.wav"
+            ),
         ):
             # This mirrors the chat() / stream_chat() dedup body verbatim.
             for msg_idx, vids in vid_inputs.items():
@@ -332,9 +340,7 @@ class TestFallbackDedupAndMerge:
                     ):
                         extracted = mllm_mod.extract_audio_from_video(resolved)
                         if extracted:
-                            _msg_extra_audio.setdefault(msg_idx, []).append(
-                                extracted
-                            )
+                            _msg_extra_audio.setdefault(msg_idx, []).append(extracted)
                     model._prepare_video(
                         vid_input,
                         fps=2.0,
@@ -386,12 +392,13 @@ class TestFallbackDedupAndMerge:
             )
         )
 
-        with patch.object(
-            mllm_mod,
-            "process_video_input",
-            side_effect=lambda v: f"/tmp/local_{v}.mp4",
-        ), patch.object(
-            mllm_mod, "extract_audio_from_video", return_value=None
+        with (
+            patch.object(
+                mllm_mod,
+                "process_video_input",
+                side_effect=lambda v: f"/tmp/local_{v}.mp4",
+            ),
+            patch.object(mllm_mod, "extract_audio_from_video", return_value=None),
         ):
             # one video input
             vid = "https://example.com/v.mp4"
@@ -420,8 +427,9 @@ class TestExtractAudioFromVideo:
         v = tmp_path / "fake.mp4"
         v.write_bytes(b"\x00" * 16)
 
-        with patch("shutil.which", return_value="/usr/bin/ffmpeg"), patch.object(
-            mllm_mod, "_video_has_audio_track", return_value=False
+        with (
+            patch("shutil.which", return_value="/usr/bin/ffmpeg"),
+            patch.object(mllm_mod, "_video_has_audio_track", return_value=False),
         ):
             assert extract_audio_from_video(str(v)) is None
 
@@ -429,11 +437,14 @@ class TestExtractAudioFromVideo:
         v = tmp_path / "fake.mp4"
         v.write_bytes(b"\x00" * 16)
 
-        with patch("shutil.which", return_value="/usr/bin/ffmpeg"), patch.object(
-            mllm_mod, "_video_has_audio_track", return_value=True
-        ), patch.object(
-            subprocess, "run",
-            return_value=MagicMock(returncode=1),
+        with (
+            patch("shutil.which", return_value="/usr/bin/ffmpeg"),
+            patch.object(mllm_mod, "_video_has_audio_track", return_value=True),
+            patch.object(
+                subprocess,
+                "run",
+                return_value=MagicMock(returncode=1),
+            ),
         ):
             result = extract_audio_from_video(str(v))
 
@@ -454,9 +465,11 @@ class TestExtractAudioFromVideo:
             captured_paths.append(out_path)
             return MagicMock(returncode=0)
 
-        with patch("shutil.which", return_value="/usr/bin/ffmpeg"), patch.object(
-            mllm_mod, "_video_has_audio_track", return_value=True
-        ), patch.object(subprocess, "run", side_effect=fake_run):
+        with (
+            patch("shutil.which", return_value="/usr/bin/ffmpeg"),
+            patch.object(mllm_mod, "_video_has_audio_track", return_value=True),
+            patch.object(subprocess, "run", side_effect=fake_run),
+        ):
             result = extract_audio_from_video(str(v))
 
         assert result is None
@@ -475,9 +488,11 @@ class TestExtractAudioFromVideo:
             captured_paths.append(out_path)
             raise subprocess.TimeoutExpired(cmd=cmd, timeout=kwargs.get("timeout"))
 
-        with patch("shutil.which", return_value="/usr/bin/ffmpeg"), patch.object(
-            mllm_mod, "_video_has_audio_track", return_value=True
-        ), patch.object(subprocess, "run", side_effect=fake_run):
+        with (
+            patch("shutil.which", return_value="/usr/bin/ffmpeg"),
+            patch.object(mllm_mod, "_video_has_audio_track", return_value=True),
+            patch.object(subprocess, "run", side_effect=fake_run),
+        ):
             result = extract_audio_from_video(str(v))
 
         assert result is None
@@ -504,12 +519,11 @@ class TestExtractAudioFromVideo:
             registered.append(path)
             return path
 
-        with patch("shutil.which", return_value="/usr/bin/ffmpeg"), patch.object(
-            mllm_mod, "_video_has_audio_track", return_value=True
-        ), patch.object(
-            subprocess, "run", side_effect=fake_run
-        ), patch.object(
-            mllm_mod._temp_manager, "register", side_effect=fake_register
+        with (
+            patch("shutil.which", return_value="/usr/bin/ffmpeg"),
+            patch.object(mllm_mod, "_video_has_audio_track", return_value=True),
+            patch.object(subprocess, "run", side_effect=fake_run),
+            patch.object(mllm_mod._temp_manager, "register", side_effect=fake_register),
         ):
             result = extract_audio_from_video(str(v))
 
@@ -548,9 +562,18 @@ def test_extract_audio_from_video_integration_smoke(tmp_path):
         [
             "ffmpeg",
             "-y",
-            "-f", "lavfi", "-i", "color=c=black:s=128x128:d=1",
-            "-f", "lavfi", "-i", "anullsrc=channel_layout=mono:sample_rate=22050",
-            "-c:v", "libx264", "-c:a", "aac",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=c=black:s=128x128:d=1",
+            "-f",
+            "lavfi",
+            "-i",
+            "anullsrc=channel_layout=mono:sample_rate=22050",
+            "-c:v",
+            "libx264",
+            "-c:a",
+            "aac",
             "-shortest",
             str(video),
         ],
@@ -572,9 +595,9 @@ def test_extract_audio_from_video_integration_smoke(tmp_path):
 
     # The path must be registered with the temp manager so the request
     # cleanup loop will sweep it.
-    assert out in mllm_mod._temp_manager._files, (
-        "extracted audio path was not registered with _temp_manager"
-    )
+    assert (
+        out in mllm_mod._temp_manager._files
+    ), "extracted audio path was not registered with _temp_manager"
 
     # Manual cleanup so we don't leak the synthetic output across tests.
     mllm_mod._temp_manager.cleanup(out)

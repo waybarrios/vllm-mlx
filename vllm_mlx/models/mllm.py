@@ -877,11 +877,20 @@ def _video_has_audio_track(video_path: str) -> bool:
     try:
         r = subprocess.run(
             [
-                "ffprobe", "-loglevel", "error", "-select_streams", "a",
-                "-show_entries", "stream=codec_type", "-of", "csv=p=0",
+                "ffprobe",
+                "-loglevel",
+                "error",
+                "-select_streams",
+                "a",
+                "-show_entries",
+                "stream=codec_type",
+                "-of",
+                "csv=p=0",
                 video_path,
             ],
-            capture_output=True, timeout=30, text=True,
+            capture_output=True,
+            timeout=30,
+            text=True,
         )
         return bool(r.stdout.strip())
     except (subprocess.SubprocessError, OSError):
@@ -925,11 +934,22 @@ def extract_audio_from_video(video_path: str) -> str | None:
     try:
         r = subprocess.run(
             [
-                "ffmpeg", "-y", "-i", video_path,
-                "-vn", "-ac", "1", "-ar", "16000",
-                "-c:a", "pcm_s16le", out_path,
+                "ffmpeg",
+                "-y",
+                "-i",
+                video_path,
+                "-vn",
+                "-ac",
+                "1",
+                "-ar",
+                "16000",
+                "-c:a",
+                "pcm_s16le",
+                out_path,
             ],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=600,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=600,
         )
         if r.returncode != 0 or os.path.getsize(out_path) == 0:
             try:
@@ -1671,9 +1691,9 @@ class MLXMultimodalLM:
                     probe = {k: v for k, v in item.dict().items() if v is not None}
                 else:
                     probe = item
-                if (
-                    isinstance(probe, dict)
-                    and probe.get("type", "") in ("audio", "audio_url")
+                if isinstance(probe, dict) and probe.get("type", "") in (
+                    "audio",
+                    "audio_url",
                 ):
                     has_explicit_audio = True
                     break
@@ -1741,15 +1761,12 @@ class MLXMultimodalLM:
                     # forward pass. We extract from the already-resolved local
                     # path (no raw user URL handed to ffmpeg → avoids URL-
                     # protocol SSRF via ffmpeg's network demuxers).
-                    if (
-                        not has_explicit_audio
-                        and getattr(self, "_video_native_with_audio", False)
+                    if not has_explicit_audio and getattr(
+                        self, "_video_native_with_audio", False
                     ):
                         extracted = extract_audio_from_video(video_path)
                         if extracted is not None:
-                            new_content.append(
-                                {"type": "audio", "audio": extracted}
-                            )
+                            new_content.append({"type": "audio", "audio": extracted})
 
                 elif item_type in ("audio", "audio_url"):
                     if item_type == "audio_url":
@@ -2124,13 +2141,9 @@ class MLXMultimodalLM:
                     and self._video_native_with_audio
                     and not has_explicit_audio
                 ):
-                    extracted_audio = extract_audio_from_video(
-                        resolved_video_path
-                    )
+                    extracted_audio = extract_audio_from_video(resolved_video_path)
                     if extracted_audio:
-                        _msg_extra_audio.setdefault(msg_idx, []).append(
-                            extracted_audio
-                        )
+                        _msg_extra_audio.setdefault(msg_idx, []).append(extracted_audio)
 
                 frames = self._prepare_video(
                     vid_input,
@@ -2511,13 +2524,9 @@ class MLXMultimodalLM:
                     and self._video_native_with_audio
                     and not has_explicit_audio
                 ):
-                    extracted_audio = extract_audio_from_video(
-                        resolved_video_path
-                    )
+                    extracted_audio = extract_audio_from_video(resolved_video_path)
                     if extracted_audio:
-                        _msg_extra_audio.setdefault(msg_idx, []).append(
-                            extracted_audio
-                        )
+                        _msg_extra_audio.setdefault(msg_idx, []).append(extracted_audio)
 
                 frames = self._prepare_video(
                     vid_input,
