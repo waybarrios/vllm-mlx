@@ -369,6 +369,10 @@ class BatchedEngine(BaseEngine):
         mtp_num_draft = getattr(self._scheduler_config, "mtp_num_draft_tokens", 1)
         kv_quant = getattr(self._scheduler_config, "kv_cache_quantization", False)
         kv_bits = getattr(self._scheduler_config, "kv_cache_quantization_bits", 8)
+        # SSD cold tier — same SchedulerConfig fields the standard path reads
+        # (cli.py populates ssd_cache_dir/ssd_cache_max_gb).  None = disabled.
+        ssd_cache_dir = getattr(self._scheduler_config, "ssd_cache_dir", None)
+        ssd_cache_max_gb = getattr(self._scheduler_config, "ssd_cache_max_gb", 10.0)
         kv_group_size = getattr(
             self._scheduler_config, "kv_cache_quantization_group_size", 64
         )
@@ -404,6 +408,8 @@ class BatchedEngine(BaseEngine):
             kv_cache_quantization_group_size=kv_group_size,
             chunked_prefill_tokens=chunked_prefill_tokens,
             max_kv_size=max_kv_size,
+            ssd_cache_dir=ssd_cache_dir,
+            ssd_cache_max_gb=ssd_cache_max_gb,
             **mllm_extra,
         )
 
