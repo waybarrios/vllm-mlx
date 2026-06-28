@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import json
 import logging
+from functools import lru_cache
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -38,6 +39,18 @@ try:
 except ImportError:
     _oh = None
     HAS_HARMONY = False
+
+
+@lru_cache(maxsize=1)
+def _harmony_encoding() -> Any:
+    """Load the harmony encoding once and reuse it across requests.
+
+    ``load_harmony_encoding`` reads the harmony tokenizer assets, so calling
+    it on every ``render_messages`` invocation would add latency to the
+    per-request prompt build. Callers reach this only after the HAS_HARMONY
+    guard in ``render_messages``, so ``_oh`` is never None here.
+    """
+    return _oh.load_harmony_encoding(_oh.HarmonyEncodingName.HARMONY_GPT_OSS)
 
 
 def is_harmony_parser_name(parser_name: str | None) -> bool:
@@ -283,7 +296,7 @@ def render_messages(
             h_messages.extend(_convert_message(m))
 
     conv = _oh.Conversation.from_messages(h_messages)
-    enc = _oh.load_harmony_encoding(_oh.HarmonyEncodingName.HARMONY_GPT_OSS)
+    enc = _harmony_encoding()
     token_ids = enc.render_conversation_for_completion(
         conv, next_turn_role=_oh.Role.ASSISTANT
     )
