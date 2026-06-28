@@ -34,11 +34,14 @@ def _generate_tool_id() -> str:
     return f"call_{uuid.uuid4().hex[:8]}"
 
 
-# Pattern: <|channel|>commentary to=functions.tool_name ... <|call|>
+# Terminator captured as named group: \Z (end-of-string) is treated more
+# strictly than explicit terminators — truncated mid-block output must not
+# become a structured tool call with malformed args.
 _COMMENTARY_BLOCK_PATTERN = re.compile(
     r"<\|channel\|>commentary\s+to=functions\.(\w+)"
     r"(?:\s*<\|constrain\|>\w+)?"
-    r"\s*<\|message\|>(.*?)<\|call\|>",
+    r"\s*<\|message\|>(.*?)"
+    r"(?P<terminator><\|call\|>|<\|end\|>|<\|return\|>|<\|start\|>|\Z)",
     re.DOTALL,
 )
 
@@ -79,6 +82,7 @@ class HarmonyToolParser(ToolParser):
         for match in _COMMENTARY_BLOCK_PATTERN.finditer(model_output):
             tool_name = match.group(1)
             args_str = match.group(2).strip()
+            matched_at_eos = match.group("terminator") == ""
 
             try:
                 arguments = json.loads(args_str)
@@ -94,7 +98,11 @@ class HarmonyToolParser(ToolParser):
                     }
                 )
             except json.JSONDecodeError:
-                # Keep the raw arguments string
+                if matched_at_eos:
+                    # No terminator + invalid JSON: treat as truncated, not
+                    # a tool call.
+                    continue
+                # Explicit terminator + invalid JSON: keep raw-args fallback.
                 tool_calls.append(
                     {
                         "id": _generate_tool_id(),

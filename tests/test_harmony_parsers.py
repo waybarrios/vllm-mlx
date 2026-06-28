@@ -632,12 +632,41 @@ class TestHarmonyToolDefinitionConverter:
 class TestHarmonyEdgeCases:
     """Edge case tests for Harmony parsers."""
 
-    def test_tool_parser_incomplete_call(self):
-        """Incomplete tool call (missing <|call|>) is not parsed."""
+    def test_tool_parser_incomplete_call_with_valid_args(self):
+        """Tool call without trailing <|call|> IS parsed when args are valid JSON."""
+        import json as _json
+
         parser = HarmonyToolParser()
         text = "<|channel|>commentary to=functions.func\n" '<|message|>{"arg": "value"}'
         result = parser.extract_tool_calls(text)
+        assert result.tools_called
+        assert result.tool_calls[0]["name"] == "func"
+        assert _json.loads(result.tool_calls[0]["arguments"]) == {"arg": "value"}
+
+    def test_tool_parser_truncated_at_eos_does_not_extract(self):
+        """Truncated args at end-of-string MUST NOT become a tool call."""
+        parser = HarmonyToolParser()
+        # Missing trailing `}` — JSON is truncated mid-object, no terminator.
+        text = (
+            "<|channel|>commentary to=functions.read_file\n"
+            '<|message|>{"path": "/etc/hosts"'
+        )
+        result = parser.extract_tool_calls(text)
         assert not result.tools_called
+        assert result.tool_calls == []
+
+    def test_tool_parser_explicit_terminator_with_invalid_json_keeps_raw(self):
+        """Explicit terminator + invalid JSON: preserve raw-args fallback."""
+        parser = HarmonyToolParser()
+        text = (
+            "<|channel|>commentary to=functions.read_file\n"
+            '<|message|>{"path": "/etc/hosts",}'
+            "<|call|>"
+        )
+        result = parser.extract_tool_calls(text)
+        assert result.tools_called
+        assert result.tool_calls[0]["name"] == "read_file"
+        assert result.tool_calls[0]["arguments"] == '{"path": "/etc/hosts",}'
 
     def test_tool_parser_unicode_content(self):
         """Handle unicode in tool arguments."""

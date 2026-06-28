@@ -2862,7 +2862,17 @@ def _extract_reasoning_and_tool_calls(
         if cleaned_reasoning_text is not None:
             text_for_tool_parse = cleaned_reasoning_text
         elif reasoning_text is not None:
-            text_for_tool_parse = ""
+            # Reasoning extracted but no `final` content channel — gpt-oss
+            # jumped from <|channel|>analysis straight into
+            # <|channel|>commentary to=functions.*. Preserve raw output
+            # for the tool parser. Gate on request.tools: without tools
+            # the parser is skipped below, and clean_output_text at the
+            # response boundary intentionally preserves commentary blocks,
+            # so raw harmony tokens would leak into response content.
+            if request is not None and getattr(request, "tools", None):
+                text_for_tool_parse = output_text
+            else:
+                text_for_tool_parse = ""
 
     # Skip tool parsing when the request defines no tools — otherwise the
     # parser can misinterpret JSON output (e.g. response_format) as tool calls.
