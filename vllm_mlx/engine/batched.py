@@ -14,6 +14,7 @@ LLM engine), so text-only requests must also be routed through it.
 import asyncio
 import inspect
 import logging
+import os
 import time
 from collections.abc import AsyncIterator
 from typing import Any
@@ -29,6 +30,32 @@ from .base import (
 from .chat_template_safety import normalize_messages_for_chat_template
 
 logger = logging.getLogger(__name__)
+
+
+def _resolve_metal_buffer_cache_limit(
+    max_recommended: int,
+    gpu_memory_utilization: float,
+) -> tuple[int, str]:
+    """Resolve the MLX retained-buffer cache cap for Metal startup."""
+    env_limit = os.environ.get("MLX_BUFFER_CACHE_LIMIT")
+    if env_limit:
+        try:
+            limit = int(env_limit)
+        except ValueError:
+            logger.warning(
+                "Ignoring invalid MLX_BUFFER_CACHE_LIMIT=%r; using device-scaled cap",
+                env_limit,
+            )
+        else:
+            if limit > 0:
+                return limit, "MLX_BUFFER_CACHE_LIMIT"
+            logger.warning(
+                "Ignoring non-positive MLX_BUFFER_CACHE_LIMIT=%r; "
+                "using device-scaled cap",
+                env_limit,
+            )
+
+    return int(max_recommended * gpu_memory_utilization), "device-scaled"
 
 
 def _normalize_tool_call_arguments_for_template(messages: list[dict]) -> list[dict]:
@@ -285,14 +312,19 @@ class BatchedEngine(BaseEngine):
                 )
                 if max_recommended > 0:
                     soft_limit = int(max_recommended * self._gpu_memory_utilization)
+                    cache_limit, cache_limit_source = _resolve_metal_buffer_cache_limit(
+                        max_recommended,
+                        self._gpu_memory_utilization,
+                    )
                     mx.set_memory_limit(soft_limit)
-                    mx.set_cache_limit(32 * 1024 * 1024 * 1024)  # 32GB
+                    mx.set_cache_limit(cache_limit)
                     pct = self._gpu_memory_utilization * 100
                     logger.info(
                         f"Metal memory limits set: "
                         f"allocation_limit={soft_limit / 1e9:.1f}GB "
                         f"({pct:.0f}% of {max_recommended / 1e9:.1f}GB), "
-                        f"cache_limit=32GB"
+                        f"buffer_cache_limit={cache_limit / 1e9:.1f}GB "
+                        f"({cache_limit_source})"
                     )
         except Exception as e:
             logger.warning(f"Failed to set Metal memory limits: {e}")
@@ -485,14 +517,19 @@ class BatchedEngine(BaseEngine):
                 )
                 if max_recommended > 0:
                     soft_limit = int(max_recommended * self._gpu_memory_utilization)
+                    cache_limit, cache_limit_source = _resolve_metal_buffer_cache_limit(
+                        max_recommended,
+                        self._gpu_memory_utilization,
+                    )
                     mx.set_memory_limit(soft_limit)
-                    mx.set_cache_limit(32 * 1024 * 1024 * 1024)  # 32GB
+                    mx.set_cache_limit(cache_limit)
                     pct = self._gpu_memory_utilization * 100
                     logger.info(
                         f"Metal memory limits set: "
                         f"allocation_limit={soft_limit / 1e9:.1f}GB "
                         f"({pct:.0f}% of {max_recommended / 1e9:.1f}GB), "
-                        f"cache_limit=32GB"
+                        f"buffer_cache_limit={cache_limit / 1e9:.1f}GB "
+                        f"({cache_limit_source})"
                     )
         except Exception as e:
             logger.warning(f"Failed to set Metal memory limits: {e}")
