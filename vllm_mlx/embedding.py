@@ -11,6 +11,13 @@ import time
 
 import mlx.core as mx
 
+from vllm_mlx.utils.truncation import (
+    MAX_LENGTH_CAP,
+    MAX_LENGTH_DEFAULT,
+    inner_tokenizer,
+    resolve_max_length,
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -26,6 +33,7 @@ class EmbeddingEngine:
         self.model_name = model_name
         self._model = None
         self._tokenizer = None
+        self._max_length: int | None = None
 
     @property
     def is_loaded(self) -> bool:
@@ -44,6 +52,17 @@ class EmbeddingEngine:
     def _ensure_loaded(self) -> None:
         if not self.is_loaded:
             self.load()
+
+    def _resolve_max_length(self) -> int:
+        """Tokenizer truncation length from the model config (cached)."""
+        if self._max_length is None:
+            self._max_length = resolve_max_length(
+                getattr(self._model, "config", None),
+                self._tokenizer,
+                cap=MAX_LENGTH_CAP,
+                default=MAX_LENGTH_DEFAULT,
+            )
+        return self._max_length
 
     def embed(self, texts: str | list[str]) -> list[list[float]]:
         """
@@ -64,12 +83,12 @@ class EmbeddingEngine:
         # which has compatibility issues with newer tokenizers (e.g.
         # GemmaTokenizer lacks batch_encode_plus, and the model's __call__
         # expects positional `inputs` not `input_ids` as a kwarg).
-        inner_tok = getattr(self._tokenizer, "_tokenizer", self._tokenizer)
+        inner_tok = inner_tokenizer(self._tokenizer)
         encoded = inner_tok(
             texts,
             padding=True,
             truncation=True,
-            max_length=512,
+            max_length=self._resolve_max_length(),
             return_tensors="np",
         )
 

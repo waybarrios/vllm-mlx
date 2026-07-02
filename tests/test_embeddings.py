@@ -131,6 +131,63 @@ class TestEmbeddingEngine:
 
         assert result[0] == [0.1, 0.2]
 
+    def test_embed_uses_config_max_length(self):
+        """Positive: truncation length follows model.config.max_position_embeddings."""
+        import numpy as np
+
+        from vllm_mlx.embedding import EmbeddingEngine
+
+        engine = EmbeddingEngine("test-model")
+
+        mock_output = MagicMock()
+        mock_output.text_embeds.tolist.return_value = [[0.1, 0.2]]
+        mock_model = MagicMock(return_value=mock_output)
+        mock_model.config.max_position_embeddings = 8192
+
+        mock_inner_tokenizer = MagicMock()
+        mock_inner_tokenizer.return_value = {
+            "input_ids": np.array([[1, 2]]),
+            "attention_mask": np.array([[1, 1]]),
+        }
+        mock_tokenizer = MagicMock()
+        mock_tokenizer._tokenizer = mock_inner_tokenizer
+
+        with patch.object(engine, "_ensure_loaded"):
+            engine._model = mock_model
+            engine._tokenizer = mock_tokenizer
+            engine.embed(["hello"])
+
+        assert mock_inner_tokenizer.call_args.kwargs["max_length"] == 8192
+
+    def test_embed_defaults_to_512_without_config(self):
+        """Negative: no usable config/tokenizer value falls back to 512."""
+        import numpy as np
+
+        from vllm_mlx.embedding import EmbeddingEngine
+
+        engine = EmbeddingEngine("test-model")
+
+        mock_output = MagicMock()
+        mock_output.text_embeds.tolist.return_value = [[0.1, 0.2]]
+        mock_model = MagicMock(return_value=mock_output)
+        # .config.max_position_embeddings is a MagicMock (non-int) -> rejected.
+
+        mock_inner_tokenizer = MagicMock()
+        mock_inner_tokenizer.model_max_length = MagicMock()  # non-int -> rejected
+        mock_inner_tokenizer.return_value = {
+            "input_ids": np.array([[1, 2]]),
+            "attention_mask": np.array([[1, 1]]),
+        }
+        mock_tokenizer = MagicMock()
+        mock_tokenizer._tokenizer = mock_inner_tokenizer
+
+        with patch.object(engine, "_ensure_loaded"):
+            engine._model = mock_model
+            engine._tokenizer = mock_tokenizer
+            engine.embed(["hello"])
+
+        assert mock_inner_tokenizer.call_args.kwargs["max_length"] == 512
+
     def test_embed_normalises_single_string(self):
         """Test that a single string input is wrapped into a list."""
         import numpy as np
