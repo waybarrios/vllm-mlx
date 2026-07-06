@@ -5,8 +5,12 @@ Mistral tool call parser for vllm-mlx.
 Handles Mistral's tool calling format:
 - Format: [TOOL_CALLS] [{"name": "func", "arguments": {...}}]
 - Or newer: [TOOL_CALLS]func_name{"arg": "value"}
+- Or newest (Ministral 3, Devstral Small 2, Dec 2025 tokenizers):
+  [TOOL_CALLS]func_name[ARGS]{"arg": "value"}
+  Confirmed directly in these models' chat_template.jinja:
+  {{- '[TOOL_CALLS]' + tool['function']['name'] + '[ARGS]' + arguments }}
 
-Used with models like Mistral-7B-Instruct, Devstral, etc.
+Used with models like Mistral-7B-Instruct, Devstral, Ministral 3, etc.
 """
 
 import json
@@ -50,11 +54,21 @@ class MistralToolParser(ToolParser):
     SUPPORTS_NATIVE_TOOL_FORMAT = True
 
     BOT_TOKEN = "[TOOL_CALLS]"
+    ARGS_TOKEN = "[ARGS]"
     TOOL_CALL_REGEX = re.compile(r"\[{.*}\]", re.DOTALL)
 
     def __init__(self, tokenizer=None):
         super().__init__(tokenizer)
         self.bot_token_id = self.vocab.get(self.BOT_TOKEN) if self.vocab else None
+        # Streaming state for the name/arguments boundary within the current
+        # tool call. See _parse_streaming_tool_delta.
+        self._args_started: bool = False
+        self._name_buffer: str = ""
+
+    def reset(self) -> None:
+        super().reset()
+        self._args_started = False
+        self._name_buffer = ""
 
     def extract_tool_calls(
         self, model_output: str, request: dict[str, Any] | None = None
@@ -86,7 +100,22 @@ class MistralToolParser(ToolParser):
             if not raw_tool_call:
                 continue
 
-            # Try new format first: func_name{"arg": "value"}
+            # Try newest format first: func_name[ARGS]{"arg": "value"}
+            if not raw_tool_call.startswith("[") and self.ARGS_TOKEN in raw_tool_call:
+                tool_name, _, args_str = raw_tool_call.partition(self.ARGS_TOKEN)
+                tool_name = tool_name.strip()
+
+                if tool_name:
+                    tool_calls.append(
+                        {
+                            "id": generate_mistral_tool_id(),
+                            "name": tool_name,
+                            "arguments": args_str,
+                        }
+                    )
+                continue
+
+            # Try new format: func_name{"arg": "value"}
             if not raw_tool_call.startswith("[") and "{" in raw_tool_call:
                 end_name = raw_tool_call.find("{")
                 tool_name = raw_tool_call[:end_name].strip()
@@ -200,6 +229,8 @@ class MistralToolParser(ToolParser):
 
             # Start tracking tool call
             self.current_tool_id += 1
+            self._args_started = False
+            self._name_buffer = ""
 
             if tool_part:
                 # Try to parse the tool part
@@ -233,25 +264,39 @@ class MistralToolParser(ToolParser):
         return None
 
     def _parse_streaming_tool_delta(self, text: str) -> dict[str, str] | None:
-        """Parse a streaming delta for tool call information."""
+        """Parse a streaming delta for tool call information.
+
+        Once the name/arguments boundary (the `[ARGS]` marker, or a bare `{`
+        for older checkpoints) has been seen for the current tool call, every
+        subsequent delta is argument text and is never re-classified — JSON
+        string content (bare keys/values like `city` or `Paris`) has no
+        distinguishing leading punctuation, so re-evaluating each delta in
+        isolation (the previous approach) misclassified mid-argument
+        fragments as more of the function name.
+        """
         if not text:
             return None
 
-        result: dict[str, str] = {}
+        if self._args_started:
+            return {"arguments": text}
 
-        # Check for function name (before {)
-        if "{" in text:
-            name_part = text[: text.find("{")]
-            args_part = text[text.find("{") :]
-            if name_part.strip():
-                result["name"] = name_part.strip()
-            if args_part:
-                result["arguments"] = args_part
-        else:
-            # Could be name or arguments continuation
-            if text.strip() and not text.startswith(("{", "}", "[", "]", ",")):
-                result["name"] = text.strip()
-            else:
-                result["arguments"] = text
+        # Buffer until we can find the boundary marker — it may itself be
+        # split across two deltas (e.g. "...[AR" / "GS]...").
+        self._name_buffer += text
+        for marker in (self.ARGS_TOKEN, "{"):
+            idx = self._name_buffer.find(marker)
+            if idx == -1:
+                continue
+            name = self._name_buffer[:idx].strip()
+            args_start = idx + len(marker) if marker == self.ARGS_TOKEN else idx
+            args = self._name_buffer[args_start:]
+            self._args_started = True
+            result: dict[str, str] = {}
+            if name:
+                result["name"] = name
+            if args:
+                result["arguments"] = args
+            return result if result else None
 
-        return result if result else None
+        # Marker not seen yet — withhold rather than guess.
+        return None

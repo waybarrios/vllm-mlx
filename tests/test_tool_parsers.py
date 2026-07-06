@@ -139,6 +139,24 @@ class TestMistralToolParser:
         assert len(result.tool_calls) == 1
         assert result.tool_calls[0]["name"] == "get_weather"
 
+    def test_args_token_format(self, parser):
+        """Test parsing the newest Mistral format with an explicit [ARGS]
+        marker between the function name and its arguments, used by Ministral
+        3 and Devstral Small 2 (Dec 2025) tokenizers — confirmed directly in
+        their chat_template.jinja: '[TOOL_CALLS]' + name + '[ARGS]' + args.
+
+        Regression test: without recognizing the marker, the name previously
+        came back as "get_weather[ARGS]" instead of "get_weather".
+        """
+        text = '[TOOL_CALLS]get_weather[ARGS]{"city": "Paris"}'
+        result = parser.extract_tool_calls(text)
+
+        assert result.tools_called
+        assert len(result.tool_calls) == 1
+        assert result.tool_calls[0]["name"] == "get_weather"
+        args = json.loads(result.tool_calls[0]["arguments"])
+        assert args["city"] == "Paris"
+
     def test_no_tool_call(self, parser):
         """Test that regular text is not parsed as tool call."""
         text = "Hello, how can I help you today?"
@@ -754,6 +772,85 @@ class TestStreamingParsing:
             delta_text="[TOOL_CALLS]",
         )
         # Should start tool call parsing
+
+    def test_mistral_streaming_args_token(self):
+        """Regression test: streaming reconstruction of the [ARGS]-marker
+        format must never misclassify mid-argument JSON fragments as more
+        of the function name.
+
+        This replays the literal delta sequence captured from a live
+        vllm-mlx server response for mlx-community/Ministral-3-14B-Instruct-2512-4bit
+        (--tool-call-parser mistral), which previously reconstructed as
+        name="get_weather[ARGS]city\":\"Paris\"}" / arguments='[ARGS]{"'
+        instead of the correct name="get_weather" / arguments='{"city": "Paris"}'.
+        """
+        parser = MistralToolParser()
+        deltas = [
+            "[TOOL_CALLS]get",
+            "_",
+            "weather",
+            "[ARGS]",
+            '{"',
+            "city",
+            '":',
+            '"',
+            "Paris",
+            '"}',
+        ]
+
+        name_parts: list[str] = []
+        args_parts: list[str] = []
+        current = ""
+        for delta in deltas:
+            previous = current
+            current += delta
+            result = parser.extract_tool_calls_streaming(
+                previous_text=previous,
+                current_text=current,
+                delta_text=delta,
+            )
+            if not result:
+                continue
+            for tc in result.get("tool_calls", []):
+                func = tc.get("function", {})
+                if "name" in func:
+                    name_parts.append(func["name"])
+                if "arguments" in func:
+                    args_parts.append(func["arguments"])
+
+        assert "".join(name_parts) == "get_weather"
+        assert "".join(args_parts) == '{"city":"Paris"}'
+
+    def test_mistral_streaming_args_token_split_across_deltas(self):
+        """The [ARGS] marker itself may be split across two deltas
+        (e.g. tokenizer boundaries don't align with the marker). The parser
+        must still find it once both halves have arrived, rather than ever
+        misclassifying the fragments."""
+        parser = MistralToolParser()
+        deltas = ["[TOOL_CALLS]get_weather[AR", 'GS]{"city": "Paris"}']
+
+        name_parts: list[str] = []
+        args_parts: list[str] = []
+        current = ""
+        for delta in deltas:
+            previous = current
+            current += delta
+            result = parser.extract_tool_calls_streaming(
+                previous_text=previous,
+                current_text=current,
+                delta_text=delta,
+            )
+            if not result:
+                continue
+            for tc in result.get("tool_calls", []):
+                func = tc.get("function", {})
+                if "name" in func:
+                    name_parts.append(func["name"])
+                if "arguments" in func:
+                    args_parts.append(func["arguments"])
+
+        assert "".join(name_parts) == "get_weather"
+        assert "".join(args_parts) == '{"city": "Paris"}'
 
     def test_auto_streaming(self):
         """Test auto parser streaming."""
