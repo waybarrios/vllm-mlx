@@ -852,6 +852,46 @@ class TestStreamingParsing:
         assert "".join(name_parts) == "get_weather"
         assert "".join(args_parts) == '{"city": "Paris"}'
 
+    def test_mistral_streaming_args_token_has_stable_id(self):
+        """Regression test: the [ARGS] marker defers the name/arguments
+        boundary past the delta containing BOT_TOKEN, so the tool-call id
+        must not be tied to that specific delta — it needs to land on
+        whichever delta is actually first to carry name/arguments, and only
+        once, so accumulation on the client produces a single stable id
+        rather than dropping it entirely."""
+        parser = MistralToolParser()
+        deltas = [
+            "[TOOL_CALLS]get",
+            "_",
+            "weather",
+            "[ARGS]",
+            '{"',
+            "city",
+            '":',
+            '"',
+            "Paris",
+            '"}',
+        ]
+
+        ids_seen: list[str] = []
+        current = ""
+        for delta in deltas:
+            previous = current
+            current += delta
+            result = parser.extract_tool_calls_streaming(
+                previous_text=previous,
+                current_text=current,
+                delta_text=delta,
+            )
+            if not result:
+                continue
+            for tc in result.get("tool_calls", []):
+                if "id" in tc:
+                    ids_seen.append(tc["id"])
+
+        assert len(ids_seen) == 1
+        assert ids_seen[0]
+
     def test_auto_streaming(self):
         """Test auto parser streaming."""
         parser = AutoToolParser()

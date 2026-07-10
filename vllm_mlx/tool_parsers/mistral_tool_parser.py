@@ -64,11 +64,20 @@ class MistralToolParser(ToolParser):
         # tool call. See _parse_streaming_tool_delta.
         self._args_started: bool = False
         self._name_buffer: str = ""
+        # One id per active tool call, generated when the call starts and
+        # attached to whichever delta is the first to carry real content
+        # (name and/or arguments) — that may not be the delta containing
+        # BOT_TOKEN itself, since the name can still be buffered pending the
+        # [ARGS]/`{` boundary. See _parse_streaming_tool_delta.
+        self._current_tool_call_id: str | None = None
+        self._tool_call_id_emitted: bool = False
 
     def reset(self) -> None:
         super().reset()
         self._args_started = False
         self._name_buffer = ""
+        self._current_tool_call_id = None
+        self._tool_call_id_emitted = False
 
     def extract_tool_calls(
         self, model_output: str, request: dict[str, Any] | None = None
@@ -231,19 +240,21 @@ class MistralToolParser(ToolParser):
             self.current_tool_id += 1
             self._args_started = False
             self._name_buffer = ""
+            self._current_tool_call_id = generate_mistral_tool_id()
+            self._tool_call_id_emitted = False
 
             if tool_part:
                 # Try to parse the tool part
                 tool_delta = self._parse_streaming_tool_delta(tool_part)
                 if tool_delta:
-                    result["tool_calls"] = [
-                        {
-                            "index": self.current_tool_id,
-                            "id": generate_mistral_tool_id(),
-                            "type": "function",
-                            "function": tool_delta,
-                        }
-                    ]
+                    tool_call: dict[str, Any] = {
+                        "index": self.current_tool_id,
+                        "type": "function",
+                        "function": tool_delta,
+                    }
+                    tool_call["id"] = self._current_tool_call_id
+                    self._tool_call_id_emitted = True
+                    result["tool_calls"] = [tool_call]
 
             return result if result else None
 
@@ -251,15 +262,19 @@ class MistralToolParser(ToolParser):
         if self.current_tool_id >= 0:
             tool_delta = self._parse_streaming_tool_delta(delta_text)
             if tool_delta:
-                return {
-                    "tool_calls": [
-                        {
-                            "index": self.current_tool_id,
-                            "type": "function",
-                            "function": tool_delta,
-                        }
-                    ]
+                tool_call = {
+                    "index": self.current_tool_id,
+                    "type": "function",
+                    "function": tool_delta,
                 }
+                # The name may still have been buffered pending the
+                # [ARGS]/`{` boundary when the BOT_TOKEN delta arrived, so
+                # this may be the first delta with real content — attach the
+                # id exactly once, whichever delta that turns out to be.
+                if not self._tool_call_id_emitted:
+                    tool_call["id"] = self._current_tool_call_id
+                    self._tool_call_id_emitted = True
+                return {"tool_calls": [tool_call]}
 
         return None
 
