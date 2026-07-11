@@ -11,12 +11,7 @@ import time
 
 import mlx.core as mx
 
-from vllm_mlx.utils.truncation import (
-    MAX_LENGTH_CAP,
-    MAX_LENGTH_DEFAULT,
-    inner_tokenizer,
-    resolve_max_length,
-)
+from vllm_mlx.utils.truncation import inner_tokenizer, resolve_max_length
 
 logger = logging.getLogger(__name__)
 
@@ -59,8 +54,6 @@ class EmbeddingEngine:
             self._max_length = resolve_max_length(
                 getattr(self._model, "config", None),
                 self._tokenizer,
-                cap=MAX_LENGTH_CAP,
-                default=MAX_LENGTH_DEFAULT,
             )
         return self._max_length
 

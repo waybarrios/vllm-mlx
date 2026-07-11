@@ -16,11 +16,7 @@ import asyncio
 
 import mlx.core as mx
 
-from vllm_mlx.utils.truncation import (
-    MAX_LENGTH_CAP,
-    MAX_LENGTH_DEFAULT,
-    resolve_max_length,
-)
+from vllm_mlx.utils.truncation import resolve_max_length
 
 logger = logging.getLogger(__name__)
 
@@ -257,8 +253,6 @@ class RerankEngine:
         max_length = resolve_max_length(
             getattr(self._model, "config", None),
             self._tokenizer,
-            cap=MAX_LENGTH_CAP,
-            default=MAX_LENGTH_DEFAULT,
         )
 
         # Tokenize each pair individually to measure token counts
