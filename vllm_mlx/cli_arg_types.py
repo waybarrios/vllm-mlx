@@ -3,6 +3,7 @@
 
 import argparse
 import json
+import math
 from collections.abc import Callable
 from typing import Any
 
@@ -58,5 +59,30 @@ def make_positive_int_arg_parser(option_name: str) -> Callable[[str], int]:
 
     def _parser(value: str) -> int:
         return parse_positive_int_arg(value, option_name)
+
+    return _parser
+
+
+def parse_positive_finite_float(value: Any, value_name: str) -> float:
+    """Parse a numeric value that must be positive and finite."""
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{value_name} must be a number") from exc
+    if not math.isfinite(parsed) or parsed <= 0:
+        raise ValueError(f"{value_name} must be a positive finite number")
+    return parsed
+
+
+def make_positive_finite_float_arg_parser(
+    option_name: str,
+) -> Callable[[str], float]:
+    """Create an argparse type parser for positive finite float options."""
+
+    def _parser(value: str) -> float:
+        try:
+            return parse_positive_finite_float(value, option_name)
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError(str(exc)) from exc
 
     return _parser
