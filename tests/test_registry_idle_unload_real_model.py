@@ -107,8 +107,7 @@ def run_idle_unload_memory_check(model_name: str) -> None:
 
     with tempfile.TemporaryDirectory() as tmp_dir:
         config_path = Path(tmp_dir) / "models.yaml"
-        config_path.write_text(
-            f"""
+        config_path.write_text(f"""
 manager:
   memory_budget_gb: 32
   idle_unload_seconds: {IDLE_UNLOAD_SECONDS}
@@ -116,11 +115,12 @@ models:
   - name: idle-test
     path: {snapshot_path}
     estimated_memory_gb: 1
-"""
-        )
+""")
 
-        print(f"\nStarting server on port {PORT} "
-              f"(idle_unload_seconds={IDLE_UNLOAD_SECONDS})...")
+        print(
+            f"\nStarting server on port {PORT} "
+            f"(idle_unload_seconds={IDLE_UNLOAD_SECONDS})..."
+        )
         proc = subprocess.Popen(
             [
                 sys.executable,
@@ -147,9 +147,9 @@ models:
             _send_chat_completion(base_url, "Say hi in one word.")
 
             status = _model_status(base_url)
-            assert status["status"] == "loaded", (
-                f"expected model to be loaded after a request, got {status!r}"
-            )
+            assert (
+                status["status"] == "loaded"
+            ), f"expected model to be loaded after a request, got {status!r}"
             rss_loaded = _rss_mb(proc.pid)
             print(
                 f"RSS after load:   {rss_loaded:.1f} MB  "
@@ -167,8 +167,10 @@ models:
                 status = _model_status(base_url)
 
             if status["status"] != "unloaded":
-                print(f"\nFAIL: model did not unload within {UNLOAD_POLL_TIMEOUT_S}s "
-                      f"(status={status['status']!r})")
+                print(
+                    f"\nFAIL: model did not unload within {UNLOAD_POLL_TIMEOUT_S}s "
+                    f"(status={status['status']!r})"
+                )
                 sys.exit(1)
 
             rss_unloaded = _rss_mb(proc.pid)
@@ -181,9 +183,9 @@ models:
             _send_chat_completion(base_url, "Say hi again.")
 
             status = _model_status(base_url)
-            assert status["status"] == "loaded", (
-                f"expected model to reload transparently, got {status!r}"
-            )
+            assert (
+                status["status"] == "loaded"
+            ), f"expected model to reload transparently, got {status!r}"
             rss_reloaded = _rss_mb(proc.pid)
             print(
                 f"RSS after reload: {rss_reloaded:.1f} MB  "

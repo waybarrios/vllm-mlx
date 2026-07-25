@@ -406,8 +406,7 @@ class TestLoadRegistryConfigIdleUnload:
         model_dir = tmp_path / "alpha"
         model_dir.mkdir()
         config_path = tmp_path / "models.yaml"
-        config_path.write_text(
-            f"""
+        config_path.write_text(f"""
 manager:
   memory_budget_gb: 16
 {manager_extra}
@@ -415,16 +414,13 @@ models:
   - name: alpha
     path: {model_dir}
     estimated_memory_gb: 4
-"""
-        )
+""")
         return config_path
 
     def test_explicit_yaml_value_wins(self, tmp_path):
         from vllm_mlx.model_registry import load_registry_config
 
-        config_path = self._write_config(
-            tmp_path, "  idle_unload_seconds: 120\n"
-        )
+        config_path = self._write_config(tmp_path, "  idle_unload_seconds: 120\n")
         defaults = _defaults()
         defaults = type(defaults)(
             **{**defaults.__dict__, "auto_unload_idle_seconds": 300.0}
