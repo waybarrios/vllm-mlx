@@ -529,14 +529,27 @@ def _quantize_cache(cache: list[Any], bits: int = 8, group_size: int = 64) -> li
     with update_and_fetch logic and cannot survive quantize/dequantize roundtrip.
     RotatingKVCache is typically small (max_size=1024) so skipping it is fine.
     """
+    import mlx.core as mx
     from mlx_lm.models.cache import KVCache
 
     quantized = []
+    eval_targets = []
     for layer in cache:
         if type(layer) is KVCache and getattr(layer, "keys", None) is not None:
-            quantized.append(_QuantizedCacheWrapper(layer, bits, group_size))
+            wrapped = _QuantizedCacheWrapper(layer, bits, group_size)
+            quantized.append(wrapped)
+            eval_targets.extend(wrapped.keys)
+            eval_targets.extend(wrapped.values)
         else:
             quantized.append(layer)
+
+    # ``mx.quantize`` is lazy. Without forcing these arrays here, each cached
+    # quantized tuple retains the full-precision source KV graph. The prefix
+    # cache then reports only the packed size while Metal keeps both copies
+    # alive, which is especially costly for long-context cache misses.
+    if eval_targets:
+        mx.eval(*eval_targets)
+
     return quantized
 
 

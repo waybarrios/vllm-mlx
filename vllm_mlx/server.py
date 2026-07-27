@@ -1239,6 +1239,7 @@ def _build_engine(spec: ModelSpec) -> BaseEngine:
             scheduler_config=spec.scheduler_config,
             stream_interval=spec.stream_interval,
             force_mllm=spec.force_mllm,
+            gpu_memory_utilization=spec.gpu_memory_utilization,
         )
 
     from .engine.simple import SimpleEngine
@@ -3227,6 +3228,7 @@ def load_model(
             scheduler_config=scheduler_config,
             stream_interval=stream_interval if use_batching else 1,
             max_tokens=max_tokens,
+            gpu_memory_utilization=gpu_memory_utilization,
             force_mllm=force_mllm,
             mtp=mtp,
             prefill_step_size=prefill_step_size,
@@ -5633,7 +5635,10 @@ async def _stream_anthropic_messages(
     messages = prepared.messages
     chat_kwargs = dict(prepared.chat_kwargs)
 
-    # Emit message_start
+    # Build message_start now, but emit it after the engine reports the exact
+    # prompt token count. Claude Code uses this usage field for session
+    # accounting; emitting a hard-coded zero makes every streaming turn look
+    # like it consumed no input context.
     message_start = {
         "type": "message_start",
         "message": {
@@ -5650,7 +5655,7 @@ async def _stream_anthropic_messages(
             },
         },
     }
-    yield f"event: message_start\ndata: {json.dumps(message_start)}\n\n"
+    message_started = False
 
     use_reasoning = (
         _reasoning_parser is not None
@@ -5667,11 +5672,6 @@ async def _stream_anthropic_messages(
     text_block_started = False
     thinking_index = 0
     text_index = 1 if use_reasoning else 0
-
-    if not use_reasoning:
-        # No reasoning parser — start text block immediately
-        yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': 0, 'content_block': {'type': 'text', 'text': ''}})}\n\n"
-        text_block_started = True
 
     # Stream content deltas
     accumulated_text = ""
@@ -5692,6 +5692,14 @@ async def _stream_anthropic_messages(
 
             if hasattr(output, "prompt_tokens") and output.prompt_tokens:
                 prompt_tokens = output.prompt_tokens
+
+            if not message_started:
+                message_start["message"]["usage"]["input_tokens"] = prompt_tokens
+                yield f"event: message_start\ndata: {json.dumps(message_start)}\n\n"
+                message_started = True
+                if not use_reasoning:
+                    yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': 0, 'content_block': {'type': 'text', 'text': ''}})}\n\n"
+                    text_block_started = True
 
             # Track token counts
             if hasattr(output, "completion_tokens") and output.completion_tokens:
@@ -5799,6 +5807,16 @@ async def _stream_anthropic_messages(
                     yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': text_index, 'content_block': {'type': 'text', 'text': ''}})}\n\n"
                     text_block_started = True
                 yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': text_index, 'delta': {'type': 'text_delta', 'text': content_to_emit}})}\n\n"
+
+        # Engines normally yield at least one output, even for an empty
+        # completion. Keep the SSE stream valid if an engine does not.
+        if not message_started:
+            message_start["message"]["usage"]["input_tokens"] = prompt_tokens
+            yield f"event: message_start\ndata: {json.dumps(message_start)}\n\n"
+            message_started = True
+            if not use_reasoning:
+                yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': 0, 'content_block': {'type': 'text', 'text': ''}})}\n\n"
+                text_block_started = True
 
         # Close any open thinking block that was never followed by text
         if thinking_block_started and not text_block_started:
