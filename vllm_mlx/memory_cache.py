@@ -707,6 +707,12 @@ class MemoryAwarePrefixCache:
         # Track the match type from the last fetch() call
         self._last_match_type: str | None = None
 
+        # Background TTL sweep
+        self._ttl_sweep_interval = 60  # seconds
+        self._sweep_timer: threading.Timer | None = None
+        if self._config.cache_ttl_seconds > 0:
+            self._start_sweep_timer()
+
         # Optional SSD cold tier (set via set_ssd_tier())
         self._ssd_tier = None
 
@@ -1118,6 +1124,57 @@ class MemoryAwarePrefixCache:
             f"freed {entry.memory_bytes / _BYTES_PER_MB:.2f}MB"
         )
 
+    def _sweep_expired_entries(self) -> int:
+        """Scan all cache entries and evict any that have exceeded TTL.
+
+        Returns:
+            Number of entries evicted.
+        """
+        ttl = self._config.cache_ttl_seconds
+        if ttl <= 0 or not self._entries:
+            return 0
+
+        now = time.time()
+        evicted = 0
+        with self._memory_lock:
+            expired_keys = [
+                key for key, entry in self._entries.items()
+                if now - entry.created_at > ttl
+            ]
+            for key in expired_keys:
+                entry = self._entries.pop(key, None)
+                if entry is not None:
+                    self._current_memory -= entry.memory_bytes
+                    self._remove_from_sorted(key)
+                    evicted += 1
+            if evicted:
+                self._stats.evictions += evicted
+                self._stats.entry_count = len(self._entries)
+                self._stats.current_memory_bytes = self._current_memory
+        if evicted:
+            logger.info(
+                f"[ttl_sweep] evicted {evicted} expired entries, "
+                f"freed {evicted > 0 and (self._current_memory or 0) or 0:.0f}MB, "
+                f"{len(self._entries)} entries remaining"
+            )
+        return evicted
+
+    def _start_sweep_timer(self) -> None:
+        """Start the background TTL sweep timer."""
+        self._sweep_timer = threading.Timer(self._ttl_sweep_interval, self._sweep_loop)
+        self._sweep_timer.daemon = True
+        self._sweep_timer.start()
+
+    def _sweep_loop(self) -> None:
+        """Periodic sweep loop. Runs every ``_ttl_sweep_interval`` seconds."""
+        try:
+            self._sweep_expired_entries()
+        except Exception:
+            logger.warning("[ttl_sweep] sweep failed", exc_info=True)
+        finally:
+            if self._config.cache_ttl_seconds > 0:
+                self._start_sweep_timer()
+
     def remove(self, tokens: list[int]) -> bool:
         """
         Remove a specific cache entry.
@@ -1147,6 +1204,12 @@ class MemoryAwarePrefixCache:
             self._current_memory = 0
             self._stats = CacheStats(max_memory_bytes=self._max_memory)
         logger.debug("Cache cleared")
+
+    def stop(self) -> None:
+        """Stop the background TTL sweep timer."""
+        if self._sweep_timer is not None:
+            self._sweep_timer.cancel()
+            self._sweep_timer = None
 
     def get_stats(self) -> dict[str, Any]:
         """Get cache statistics."""
