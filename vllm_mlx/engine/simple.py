@@ -209,6 +209,8 @@ class SimpleEngine(BaseEngine):
         # Per-request routing state (MLLM+MTP mode)
         self._text_model = None
         self._text_tokenizer = None
+        self._text_model_init_lock = asyncio.Lock()
+        self._text_model_initialization_attempted = False
 
         # SpecPrefill draft model (loaded at start if enabled)
         self._draft_model = None
@@ -465,90 +467,15 @@ class SimpleEngine(BaseEngine):
                     "stream_chat",
                 )
 
-            # Build parallel mlx_lm TextModel for text-only routing.
-            # Even when MTP is disabled, text-only requests should not be trapped
-            # on the slower mlx_vlm multimodal path.
-            if self._is_mllm and self._should_route_text_through_text_model():
-                try:
-                    from ..text_model_from_vlm import build_text_model
-
-                    self._text_model = build_text_model(
-                        self._model.model, self._model_name
-                    )
-
-                    if self._text_model is not None:
-                        self._text_tokenizer = self._model.get_tokenizer()
-                        self._supports_system_kv_cache = (
-                            self._probe_system_kv_cache_support(
-                                self._text_model,
-                                "mllm_text",
-                            )
-                        )
-
-                        # Apply Qwen3.5 eos_token fix (matches MLXLanguageModel.load)
-                        if "qwen3" in self._model_name.lower():
-                            self._text_tokenizer.eos_token = "<|im_end|>"
-                            self._text_tokenizer.eos_token_id = (
-                                self._text_tokenizer.convert_tokens_to_ids("<|im_end|>")
-                            )
-
-                        # Probe the derived TextModel's prompt cache for snapshot-safety
-                        # (same gate stream_chat uses for the pure-LLM path).
-                        # _stream_generate_text only enters the system-KV cache branch
-                        # when this flag is True, so sliding-window text models won't
-                        # desynchronize on restore.
-                        #
-                        # Probe args must match the runtime constructor in
-                        # _stream_generate_text (max_kv_size=self._max_kv_size or None).
-                        # Under bounded-KV serving (max_kv_size > 0) make_prompt_cache
-                        # returns RotatingKVCache for models without a custom
-                        # make_cache; probing with default args would mis-classify that
-                        # path as snapshot-safe.
-                        try:
-                            from mlx_lm.models.cache import KVCache, make_prompt_cache
-
-                            probe_cache = make_prompt_cache(
-                                self._text_model, max_kv_size=self._max_kv_size or None
-                            )
-                            self._supports_system_kv_cache = bool(probe_cache) and all(
-                                isinstance(c, KVCache) for c in probe_cache
-                            )
-                            if not self._supports_system_kv_cache:
-                                cache_types = sorted(
-                                    {type(c).__name__ for c in probe_cache}
-                                )
-                                logger.info(
-                                    "System KV cache snapshot disabled for MLLM "
-                                    "text routing: TextModel returned non-KVCache "
-                                    "entries (%s); _stream_generate_text will use "
-                                    "the uncached path",
-                                    cache_types,
-                                )
-                        except Exception as e:
-                            logger.debug(
-                                "MLLM TextModel KV cache support probe failed "
-                                "(%s); disabling snapshot path",
-                                e,
-                            )
-                            self._supports_system_kv_cache = False
-
-                        has_mtp = (
-                            hasattr(self._text_model, "mtp")
-                            and self._text_model.mtp is not None
-                        )
-                        logger.info(
-                            "MLLM text routing: text-only -> mlx_lm TextModel "
-                            "(MTP=%s), media -> mlx_vlm",
-                            has_mtp and self._mtp,
-                        )
-                    else:
-                        self._text_model = None
-                        self._text_tokenizer = None
-
-                except Exception as e:
-                    logger.error("MLLM text routing setup failed: %s", e)
-                    self._text_model = None
-                    self._text_tokenizer = None
+            # A configured MLLM speculative drafter routes those requests directly
+            # through mlx_vlm. Do not also allocate a parallel TextModel at startup;
+            # build it lazily only if a later request opts out of the drafter path.
+            if self._is_mllm and self._mllm_draft_model_path is None:
+                self._initialize_text_model()
+            elif self._is_mllm:
+                logger.info(
+                    "Deferring MLLM TextModel construction until a non-draft request"
+                )
 
             # Load SpecPrefill draft model (small model for importance scoring)
             if self._specprefill_enabled and self._specprefill_draft_model_path:
@@ -612,6 +539,91 @@ class SimpleEngine(BaseEngine):
     ) -> bool:
         """Return whether text-only MLLM requests may use mlx_lm TextModel."""
         return not (mllm_draft_requested and self._mllm_draft_model_path is not None)
+
+    def _initialize_text_model(self) -> None:
+        """Build the optional text-only MLLM route from already-loaded weights."""
+        self._text_model_initialization_attempted = True
+        try:
+            from ..text_model_from_vlm import build_text_model
+
+            self._text_model = build_text_model(self._model.model, self._model_name)
+
+            if self._text_model is None:
+                self._text_tokenizer = None
+                return
+
+            self._text_tokenizer = self._model.get_tokenizer()
+            self._supports_system_kv_cache = self._probe_system_kv_cache_support(
+                self._text_model,
+                "mllm_text",
+            )
+
+            # Apply Qwen3.5 eos_token fix (matches MLXLanguageModel.load).
+            if "qwen3" in self._model_name.lower():
+                self._text_tokenizer.eos_token = "<|im_end|>"
+                self._text_tokenizer.eos_token_id = (
+                    self._text_tokenizer.convert_tokens_to_ids("<|im_end|>")
+                )
+
+            # Probe the derived TextModel's prompt cache for snapshot-safety.
+            # Probe args match _stream_generate_text's cache construction so a
+            # bounded-KV route cannot be misclassified as snapshot-safe.
+            try:
+                from mlx_lm.models.cache import KVCache, make_prompt_cache
+
+                probe_cache = make_prompt_cache(
+                    self._text_model, max_kv_size=self._max_kv_size or None
+                )
+                self._supports_system_kv_cache = bool(probe_cache) and all(
+                    isinstance(cache, KVCache) for cache in probe_cache
+                )
+                if not self._supports_system_kv_cache:
+                    cache_types = sorted(
+                        {type(cache).__name__ for cache in probe_cache}
+                    )
+                    logger.info(
+                        "System KV cache snapshot disabled for MLLM text routing: "
+                        "TextModel returned non-KVCache entries (%s); "
+                        "_stream_generate_text will use the uncached path",
+                        cache_types,
+                    )
+            except Exception as e:
+                logger.debug(
+                    "MLLM TextModel KV cache support probe failed (%s); "
+                    "disabling snapshot path",
+                    e,
+                )
+                self._supports_system_kv_cache = False
+
+            has_mtp = (
+                hasattr(self._text_model, "mtp") and self._text_model.mtp is not None
+            )
+            logger.info(
+                "MLLM text routing: text-only -> mlx_lm TextModel (MTP=%s), "
+                "media -> mlx_vlm",
+                has_mtp and self._mtp,
+            )
+        except Exception as e:
+            logger.error("MLLM text routing setup failed: %s", e)
+            self._text_model = None
+            self._text_tokenizer = None
+
+    async def _ensure_text_model_for_request(
+        self, *, mllm_draft_requested: bool
+    ) -> None:
+        """Initialize the optional text route only when the request needs it."""
+        if (
+            not self._is_mllm
+            or mllm_draft_requested
+            or self._mllm_draft_model_path is None
+            or self._text_model is not None
+            or self._text_model_initialization_attempted
+        ):
+            return
+
+        async with self._text_model_init_lock:
+            if not self._text_model_initialization_attempted:
+                self._initialize_text_model()
 
     async def _run_blocking_serialized(
         self,
@@ -1198,6 +1210,10 @@ class SimpleEngine(BaseEngine):
 
         chat_template_kwargs = dict(kwargs.pop("chat_template_kwargs", {}) or {})
         mllm_draft_requested = bool(kwargs.pop("mllm_draft", False))
+
+        await self._ensure_text_model_for_request(
+            mllm_draft_requested=mllm_draft_requested
+        )
 
         # Convert tools for template
         template_tools = convert_tools_for_template(tools) if tools else None
