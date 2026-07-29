@@ -1950,6 +1950,94 @@ class TestStreamChatCompletion:
         assert payloads[2]["choices"][0]["finish_reason"] == "stop"
 
     @pytest.mark.anyio
+    async def test_gemma_stream_flushes_pending_content_before_length_finish(
+        self, monkeypatch
+    ):
+        """A terminal length stop must not discard Gemma's buffered tail."""
+        from vllm_mlx.engine.base import GenerationOutput
+        from vllm_mlx.reasoning.gemma4_parser import Gemma4ReasoningParser
+        from vllm_mlx.server import (
+            ChatCompletionRequest,
+            Message,
+            stream_chat_completion,
+        )
+        import vllm_mlx.server as server
+
+        class FakeEngine:
+            model_name = "gemma4-31b-it-8bit"
+
+            async def stream_chat(self, messages, **kwargs):
+                chunks = [
+                    GenerationOutput(
+                        text="<|channel>thought\n",
+                        new_text="<|channel>thought\n",
+                        finished=False,
+                        prompt_tokens=4,
+                        completion_tokens=3,
+                    ),
+                    GenerationOutput(
+                        text="<|channel>thought\nplan",
+                        new_text="plan",
+                        finished=False,
+                        prompt_tokens=4,
+                        completion_tokens=5,
+                    ),
+                    GenerationOutput(
+                        text="<|channel>thought\nplan<channel|>FINAL<|chan",
+                        new_text="<channel|>FINAL<|chan",
+                        finished=True,
+                        finish_reason="length",
+                        prompt_tokens=4,
+                        completion_tokens=9,
+                    ),
+                ]
+                for chunk in chunks:
+                    yield chunk
+
+        monkeypatch.setattr(server, "_model_name", "gemma4-31b-it-8bit")
+        monkeypatch.setattr(server, "_reasoning_parser", Gemma4ReasoningParser())
+        monkeypatch.setattr(server, "_enable_auto_tool_choice", False)
+        monkeypatch.setattr(server, "_tool_call_parser", None)
+        monkeypatch.setattr(server, "_tool_parser_instance", None)
+
+        request = ChatCompletionRequest(
+            model="gemma4-31b-it-8bit",
+            messages=[Message(role="user", content="Write a cover letter.")],
+            stream=True,
+        )
+        chunks = [
+            chunk
+            async for chunk in stream_chat_completion(
+                FakeEngine(), request.messages, request, enable_thinking=True
+            )
+        ]
+        payloads = [
+            json.loads(chunk.removeprefix("data: ").strip())
+            for chunk in chunks
+            if chunk != "data: [DONE]\n\n"
+        ]
+        content = "".join(
+            choice["delta"].get("content") or ""
+            for payload in payloads
+            for choice in payload["choices"]
+        )
+        reasoning = "".join(
+            choice["delta"].get("reasoning_content") or ""
+            for payload in payloads
+            for choice in payload["choices"]
+        )
+        finish_reasons = [
+            choice["finish_reason"]
+            for payload in payloads
+            for choice in payload["choices"]
+            if choice["finish_reason"]
+        ]
+
+        assert reasoning == "plan"
+        assert content == "FINAL<|chan"
+        assert finish_reasons == ["length"]
+
+    @pytest.mark.anyio
     async def test_auto_parser_streams_bare_bracket_tool_calls(self, monkeypatch):
         """Bare bracket tool calls should stream as structured tool_calls."""
         from vllm_mlx.engine.base import GenerationOutput

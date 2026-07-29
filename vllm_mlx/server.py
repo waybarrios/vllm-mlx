@@ -4188,6 +4188,31 @@ async def _ensure_sse_terminal(
             yield terminal_frame
 
 
+def _resolve_reasoning_stream_delta(reasoning_parser, output, delta_msg, request):
+    """Return a stream delta, including parser state buffered at stream end."""
+    if delta_msg is None:
+        if not output.finished:
+            return None
+        content = None
+        reasoning = None
+    else:
+        content = delta_msg.content
+        reasoning = delta_msg.reasoning
+
+    if output.finished:
+        # finalize_stream is defined by ReasoningParser base as a no-op, but
+        # third-party or test-only reasoning parsers may not inherit from it.
+        # Guard so a duck-typed parser without the method still streams.
+        finalize = getattr(reasoning_parser, "finalize_stream", None)
+        final_delta = finalize() if callable(finalize) else None
+        if final_delta is not None:
+            if final_delta.content:
+                content = (content or "") + final_delta.content
+            if final_delta.reasoning:
+                reasoning = (reasoning or "") + final_delta.reasoning
+    return _promote_streaming_response_format_delta(content, reasoning, request)
+
+
 def _find_uvicorn_cycle(obj, depth=0, visited=None):
     """Walk through middleware wrappers to find uvicorn's RequestResponseCycle.
 
@@ -6065,15 +6090,12 @@ async def stream_chat_completion(
                     previous_text, accumulated_text, delta_text
                 )
 
-                if delta_msg is None:
-                    # Skip this chunk (e.g., <think> token itself)
-                    continue
-
-                content = delta_msg.content
-                reasoning = delta_msg.reasoning
-                content, reasoning = _promote_streaming_response_format_delta(
-                    content, reasoning, request
+                resolved_delta = _resolve_reasoning_stream_delta(
+                    _reasoning_parser, output, delta_msg, request
                 )
+                if resolved_delta is None:
+                    continue
+                content, reasoning = resolved_delta
 
                 # Some models (e.g. MiniMax) wrap tool calls in <think>
                 # blocks, so reasoning parser captures tool call XML as
