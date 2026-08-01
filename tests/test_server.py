@@ -756,6 +756,31 @@ class TestLoadModelTrustRemoteCode:
 
         assert mock_engine.call_args.kwargs["trust_remote_code"] is True
 
+    def test_load_model_forwards_default_mllm_draft_to_simple_engine(self):
+        """Configured assistant drafters must not require a private request flag."""
+        from vllm_mlx import server
+
+        fake_engine = MagicMock()
+        fake_loop = MagicMock()
+
+        with (
+            patch.object(
+                server, "SimpleEngine", return_value=fake_engine
+            ) as mock_engine,
+            patch.object(server, "_detect_native_tool_support", return_value=False),
+            patch("vllm_mlx.server.asyncio.new_event_loop", return_value=fake_loop),
+            patch("vllm_mlx.server.asyncio.set_event_loop"),
+        ):
+            server.load_model(
+                "gemma4",
+                force_mllm=True,
+                mllm_draft_model="assistant",
+                mllm_draft_kind="mtp",
+                default_mllm_draft=True,
+            )
+
+        assert mock_engine.call_args.kwargs["default_mllm_draft"] is True
+
 
 # =============================================================================
 # Helper Function Tests

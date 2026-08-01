@@ -158,6 +158,7 @@ class TestLifecycleCli:
             captured["mllm_draft_model"] = args.mllm_draft_model
             captured["mllm_draft_kind"] = args.mllm_draft_kind
             captured["mllm_draft_block_size"] = args.mllm_draft_block_size
+            captured["default_mllm_draft"] = args.default_mllm_draft
 
         monkeypatch.setattr(cli, "serve_command", fake_serve_command)
         monkeypatch.setattr(
@@ -174,6 +175,7 @@ class TestLifecycleCli:
                 "mtp",
                 "--mllm-draft-block-size",
                 "4",
+                "--default-mllm-draft",
             ],
         )
 
@@ -183,6 +185,7 @@ class TestLifecycleCli:
             "mllm_draft_model": "google/gemma-4-E2B-it-assistant",
             "mllm_draft_kind": "mtp",
             "mllm_draft_block_size": 4,
+            "default_mllm_draft": True,
         }
 
     def test_main_rejects_nonpositive_mllm_draft_block_size(self, monkeypatch, capsys):

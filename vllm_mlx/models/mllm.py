@@ -1242,6 +1242,7 @@ class MLXMultimodalLM:
         draft_model: str | None = None,
         draft_kind: str | None = None,
         draft_block_size: int | None = None,
+        default_draft_enabled: bool = False,
     ):
         """
         Initialize the MLX multimodal language model.
@@ -1263,6 +1264,7 @@ class MLXMultimodalLM:
         self.draft_model_path = draft_model
         self.draft_kind = draft_kind
         self.draft_block_size = draft_block_size
+        self.default_draft_enabled = default_draft_enabled
 
         self.model = None
         self.processor = None
@@ -1332,15 +1334,15 @@ class MLXMultimodalLM:
         return draft_model
 
     def _draft_generation_kwargs(self, call_kwargs: dict | None = None) -> dict:
-        """Return mlx-vlm drafter kwargs when the request explicitly opts in.
+        """Return mlx-vlm drafter kwargs when the request enables the drafter.
 
         ``call_kwargs`` is the outbound mlx-vlm kwargs dict. This method removes
         vllm-mlx drafter control keys before the dict is forwarded so caller
         passthrough values cannot conflict with the configured server drafter.
         """
-        draft_requested = False
+        draft_requested = self.default_draft_enabled
         if call_kwargs is not None:
-            draft_requested = bool(call_kwargs.pop("mllm_draft", False))
+            draft_requested = bool(call_kwargs.pop("mllm_draft", draft_requested))
             for key in _DRAFT_KWARG_NAMES:
                 call_kwargs.pop(key, None)
         if not draft_requested or self._draft_model is None:

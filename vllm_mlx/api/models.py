@@ -265,6 +265,8 @@ class GenerationMetadata(BaseModel):
 
     no_final_content_watchdog_tokens: int | None = None
     no_final_content_watchdog_enforced: bool = False
+    mtp_drafts: int | None = None
+    mtp_accepted: int | None = None
 
 
 class ChatCompletionResponse(BaseModel):
