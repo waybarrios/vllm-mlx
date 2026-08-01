@@ -82,6 +82,66 @@ def test_start_mllm_forwards_prefix_cache_disable_to_mllm_scheduler(monkeypatch)
     assert captured["config_kwargs"]["ssd_cache_max_gb"] == 10.0
 
 
+def test_start_mllm_forwards_external_assistant_drafter(monkeypatch):
+    from vllm_mlx.engine.batched import BatchedEngine
+
+    captured = {}
+    loaded_drafter = object()
+
+    class FakeMLXMultimodalLM:
+        def __init__(self, model_name, trust_remote_code=True, **kwargs):
+            captured["model_kwargs"] = kwargs
+            self.model = object()
+            self.processor = object()
+            self._draft_model = loaded_drafter
+
+        def load(self):
+            return None
+
+    class FakeMLLMSchedulerConfig:
+        def __init__(self, **kwargs):
+            self.__dict__.update(kwargs)
+
+    class FakeMLLMScheduler:
+        def __init__(self, model, processor, config, **kwargs):
+            captured["scheduler_kwargs"] = kwargs
+
+        async def start(self):
+            return None
+
+    import vllm_mlx.engine.batched as batched_mod
+
+    fake_scheduler = types.ModuleType("vllm_mlx.mllm_scheduler")
+    fake_scheduler.MLLMScheduler = FakeMLLMScheduler
+    fake_scheduler.MLLMSchedulerConfig = FakeMLLMSchedulerConfig
+    fake_model = types.ModuleType("vllm_mlx.models.mllm")
+    fake_model.MLXMultimodalLM = FakeMLXMultimodalLM
+    monkeypatch.setitem(sys.modules, "vllm_mlx.mllm_scheduler", fake_scheduler)
+    monkeypatch.setitem(sys.modules, "vllm_mlx.models.mllm", fake_model)
+    monkeypatch.setattr(
+        batched_mod.BatchedEngine, "_inject_mtp_mllm", lambda self: None
+    )
+
+    engine = BatchedEngine(
+        model_name="gemma4",
+        scheduler_config=_base_scheduler_config(enable_mtp=False),
+        force_mllm=True,
+        mllm_draft_model="assistant",
+        mllm_draft_kind="mtp",
+        mllm_draft_block_size=6,
+    )
+    asyncio.run(engine._start_mllm())
+
+    assert captured["model_kwargs"]["draft_model"] == "assistant"
+    assert captured["model_kwargs"]["draft_kind"] == "mtp"
+    assert captured["model_kwargs"]["draft_block_size"] == 6
+    assert captured["scheduler_kwargs"] == {
+        "draft_model": loaded_drafter,
+        "draft_kind": "mtp",
+        "draft_block_size": 6,
+    }
+
+
 def _run_start_mllm(monkeypatch, scheduler_config):
     """Run BatchedEngine._start_mllm with fakes, return captured kwargs."""
     from vllm_mlx.engine.batched import BatchedEngine

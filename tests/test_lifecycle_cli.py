@@ -211,6 +211,50 @@ class TestLifecycleCli:
 
         assert "--mllm-draft-block-size" in capsys.readouterr().err
 
+    def test_serve_command_allows_mllm_draft_with_continuous_batching(
+        self, monkeypatch
+    ):
+        """Assistant MTP can use the MLLM continuous-batching scheduler."""
+        import vllm_mlx.cli as cli
+
+        captured = {}
+        import uvicorn
+        import vllm_mlx.server as server
+        import vllm_mlx.utils.download as download
+
+        monkeypatch.setattr(server, "load_model", lambda *a, **k: captured.update(k))
+        monkeypatch.setattr(download, "ensure_model_downloaded", lambda *a, **k: None)
+        monkeypatch.setattr(uvicorn, "run", lambda *a, **k: None)
+
+        args = SimpleNamespace(
+            model="gemma4",
+            models_config=None,
+            served_model_name=None,
+            enable_auto_tool_choice=False,
+            tool_call_parser=None,
+            gpu_memory_utilization=0.90,
+            max_tokens=32768,
+            max_request_tokens=32768,
+            max_kv_size=131072,
+            mllm_draft_model="assistant",
+            mllm_draft_kind="mtp",
+            mllm_draft_block_size=6,
+            continuous_batching=True,
+            auto_unload_idle_seconds=0.0,
+            lazy_load_model=False,
+            mllm=True,
+        )
+        for name, value in vars(
+            cli.build_parser().parse_args(["serve", "gemma4"])
+        ).items():
+            if not hasattr(args, name):
+                setattr(args, name, value)
+
+        cli.serve_command(args)
+
+        assert captured["use_batching"] is True
+        assert captured["mllm_draft_model"] == "assistant"
+
     def test_serve_command_rejects_mllm_draft_without_mllm(self, capsys):
         """Drafter flags should not be silently ignored on text-only models."""
         import vllm_mlx.cli as cli

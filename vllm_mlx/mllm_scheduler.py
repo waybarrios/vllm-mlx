@@ -185,6 +185,9 @@ class MLLMScheduler:
         model: Any,
         processor: Any,
         config: Optional[MLLMSchedulerConfig] = None,
+        draft_model: Any = None,
+        draft_kind: Optional[str] = None,
+        draft_block_size: Optional[int] = None,
     ):
         """
         Initialize MLLM scheduler.
@@ -197,6 +200,9 @@ class MLLMScheduler:
         self.model = model
         self.processor = processor
         self.config = config or MLLMSchedulerConfig()
+        self.draft_model = draft_model
+        self.draft_kind = draft_kind
+        self.draft_block_size = draft_block_size
 
         # Get model config
         self.model_config = getattr(model, "config", None)
@@ -362,7 +368,24 @@ class MLLMScheduler:
                 )
 
             # Install MTP if enabled and language model supports it
-            if self.config.enable_mtp:
+            draft_model = getattr(self, "draft_model", None)
+            if draft_model is not None:
+                if getattr(self, "draft_kind", None) != "mtp":
+                    raise ValueError(
+                        "Continuous-batching assistant drafters require draft_kind='mtp'"
+                    )
+                from .mllm_batch_generator import install_mtp_mllm
+
+                install_mtp_mllm(
+                    self.batch_generator,
+                    self.batch_generator.language_model,
+                    num_draft_tokens=max(
+                        1, (getattr(self, "draft_block_size", None) or 2) - 1
+                    ),
+                    draft_model=draft_model,
+                    draft_block_size=getattr(self, "draft_block_size", None),
+                )
+            elif self.config.enable_mtp:
                 lm = self.batch_generator.language_model
                 if hasattr(lm, "mtp") and lm.mtp is not None:
                     from .mllm_batch_generator import install_mtp_mllm
