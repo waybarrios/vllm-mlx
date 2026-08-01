@@ -2253,6 +2253,9 @@ def install_mtp_mllm(
                     kv_valid_len=mx.array(positions),
                     left_padding=_batch_cache_left_padding(cache),
                 )
+                # Sample-and-compare preserves the target distribution here only
+                # because the external draft is a point mass. Changing greedy=True
+                # requires a rejection-sampling verifier that accounts for q(x).
                 draft_tokens = draft_model.draft_block(
                     primary_tokens,
                     hidden_states[:, -1:, :],
