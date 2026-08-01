@@ -756,9 +756,13 @@ class TestLoadModelTrustRemoteCode:
 
         assert mock_engine.call_args.kwargs["trust_remote_code"] is True
 
-    def test_load_model_forwards_default_mllm_draft_to_simple_engine(self):
+    def test_load_model_forwards_default_mllm_draft_to_simple_engine(self, monkeypatch):
         """Configured assistant drafters must not require a private request flag."""
         from vllm_mlx import server
+
+        # load_model mutates module-level serving state. Register the current
+        # value with monkeypatch so this test cannot affect later request tests.
+        monkeypatch.setattr(server, "_model_name", server._model_name)
 
         fake_engine = MagicMock()
         fake_loop = MagicMock()

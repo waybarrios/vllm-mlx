@@ -236,12 +236,12 @@ def test_simple_engine_defaults_configured_drafter_on_but_allows_opt_out():
     )
 
     assert engine._default_mllm_draft is True
-    assert engine._should_route_text_through_text_model(
-        mllm_draft_requested=True
-    ) is False
-    assert engine._should_route_text_through_text_model(
-        mllm_draft_requested=False
-    ) is True
+    assert (
+        engine._should_route_text_through_text_model(mllm_draft_requested=True) is False
+    )
+    assert (
+        engine._should_route_text_through_text_model(mllm_draft_requested=False) is True
+    )
 
 
 def test_mllm_drafter_defaults_on_and_request_can_opt_out():

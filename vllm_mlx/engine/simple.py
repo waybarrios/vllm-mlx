@@ -1202,9 +1202,7 @@ class SimpleEngine(BaseEngine):
             await self.start()
 
         chat_template_kwargs = dict(kwargs.pop("chat_template_kwargs", {}) or {})
-        mllm_draft_requested = bool(
-            kwargs.pop("mllm_draft", self._default_mllm_draft)
-        )
+        mllm_draft_requested = bool(kwargs.pop("mllm_draft", self._default_mllm_draft))
 
         # Convert tools for template
         template_tools = convert_tools_for_template(tools) if tools else None
