@@ -810,6 +810,19 @@ def _install_mtp(
        Reject: trim KVCache by 1, skip_state from pos 0 (no cold start)
     5. Draft is emitted in the NEXT generation step after primary
     """
+    # The MTP monkey-patch relies on BatchGenerator._step, which was
+    # refactored away in mlx-lm 0.31.x (decode now lives on
+    # GenerationBatch._step).  Skip gracefully when the required API is
+    # absent instead of crashing at generator creation — mirrors the
+    # chunked prefill compatibility guard.
+    if not hasattr(batch_gen, "_step"):
+        logger.warning(
+            "[MTP] disabled: mlx-lm BatchGenerator lacks the _step hook "
+            "required by the MTP monkey-patch (refactored in mlx-lm 0.31.x). "
+            "Generation continues without multi-token prediction."
+        )
+        return
+
     _orig_step = batch_gen._step
 
     # Greedy sampler for MTP draft tokens
