@@ -223,6 +223,68 @@ def test_simple_engine_text_route_stays_default_when_mllm_drafter_configured():
     )
 
 
+def test_simple_engine_defaults_configured_drafter_on_but_allows_opt_out():
+    from vllm_mlx.engine.simple import SimpleEngine
+
+    engine = SimpleEngine(
+        "gemma4",
+        force_mllm=True,
+        mllm_draft_model="assistant",
+        mllm_draft_kind="mtp",
+        mllm_draft_block_size=4,
+        default_mllm_draft=True,
+    )
+
+    assert engine._default_mllm_draft is True
+    assert (
+        engine._should_route_text_through_text_model(mllm_draft_requested=True) is False
+    )
+    assert (
+        engine._should_route_text_through_text_model(mllm_draft_requested=False) is True
+    )
+
+
+def test_mllm_drafter_defaults_on_and_request_can_opt_out():
+    from vllm_mlx.models.mllm import MLXMultimodalLM
+
+    model = MLXMultimodalLM(
+        "target",
+        draft_model="assistant",
+        draft_kind="mtp",
+        default_draft_enabled=True,
+    )
+    model._draft_model = SimpleNamespace(accept_lens=[])
+
+    assert model._draft_generation_kwargs() == {
+        "draft_model": model._draft_model,
+        "draft_kind": "mtp",
+    }
+    assert model._draft_generation_kwargs({"mllm_draft": False}) == {}
+
+
+def test_simple_engine_reports_configured_mllm_drafter_status():
+    from vllm_mlx.engine.simple import SimpleEngine
+
+    engine = SimpleEngine(
+        "gemma4",
+        force_mllm=True,
+        mllm_draft_model="assistant",
+        mllm_draft_kind="mtp",
+        mllm_draft_block_size=4,
+        default_mllm_draft=True,
+    )
+
+    assert engine.get_stats()["mtp"] == {
+        "enabled": True,
+        "implementation": "mlx_vlm_assistant",
+        "draft_model": "assistant",
+        "draft_kind": "mtp",
+        "draft_block_size": 4,
+        "default_enabled": True,
+        "continuous_batching_supported": False,
+    }
+
+
 def test_chat_request_passes_mllm_draft_opt_in():
     from vllm_mlx.server import (
         ChatCompletionRequest,

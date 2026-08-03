@@ -145,6 +145,7 @@ class SimpleEngine(BaseEngine):
         mllm_draft_model: str | None = None,
         mllm_draft_kind: str | None = None,
         mllm_draft_block_size: int | None = None,
+        default_mllm_draft: bool = False,
     ):
         """
         Initialize the simple engine.
@@ -167,6 +168,8 @@ class SimpleEngine(BaseEngine):
             mllm_draft_model: Optional MLLM speculative draft/assistant model path
             mllm_draft_kind: Optional mlx-vlm draft kind, for example "mtp"
             mllm_draft_block_size: Optional speculative block size for mlx-vlm
+            default_mllm_draft: Enable the configured assistant drafter unless a
+                request explicitly sets ``mllm_draft`` to false.
         """
         self._model_name = model_name
         self._created_at = time.time()
@@ -199,6 +202,7 @@ class SimpleEngine(BaseEngine):
         self._mllm_draft_model_path = mllm_draft_model
         self._mllm_draft_kind = mllm_draft_kind
         self._mllm_draft_block_size = mllm_draft_block_size
+        self._default_mllm_draft = default_mllm_draft
 
         # KV cache size limit
         self._max_kv_size = max_kv_size
@@ -413,6 +417,7 @@ class SimpleEngine(BaseEngine):
                 draft_model=self._mllm_draft_model_path,
                 draft_kind=self._mllm_draft_kind,
                 draft_block_size=self._mllm_draft_block_size,
+                default_draft_enabled=self._default_mllm_draft,
             )
         else:
             from ..models.llm import MLXLanguageModel
@@ -1197,7 +1202,7 @@ class SimpleEngine(BaseEngine):
             await self.start()
 
         chat_template_kwargs = dict(kwargs.pop("chat_template_kwargs", {}) or {})
-        mllm_draft_requested = bool(kwargs.pop("mllm_draft", False))
+        mllm_draft_requested = bool(kwargs.pop("mllm_draft", self._default_mllm_draft))
 
         # Convert tools for template
         template_tools = convert_tools_for_template(tools) if tools else None
@@ -2800,6 +2805,17 @@ class SimpleEngine(BaseEngine):
                 "threshold": self._specprefill_threshold,
                 "keep_pct": self._specprefill_keep_pct,
                 "backbone_pct": self._specprefill_backbone_pct,
+            }
+
+        if self._mllm_draft_model_path is not None:
+            stats["mtp"] = {
+                "enabled": True,
+                "implementation": "mlx_vlm_assistant",
+                "draft_model": self._mllm_draft_model_path,
+                "draft_kind": self._mllm_draft_kind,
+                "draft_block_size": self._mllm_draft_block_size,
+                "default_enabled": self._default_mllm_draft,
+                "continuous_batching_supported": False,
             }
 
         # System KV cache stats (LRU over multiple system prefixes)
