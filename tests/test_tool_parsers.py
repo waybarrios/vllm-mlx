@@ -895,7 +895,8 @@ class TestStreamingParsing:
         rather than dropping it entirely."""
         parser = MistralToolParser()
         deltas = [
-            "[TOOL_CALLS]get",
+            "[TOOL_CALLS]",
+            "get",
             "_",
             "weather",
             "[ARGS]",
@@ -908,6 +909,7 @@ class TestStreamingParsing:
         ]
 
         ids_seen: list[str] = []
+        id_function: list[dict] = []
         current = ""
         for delta in deltas:
             previous = current
@@ -922,9 +924,53 @@ class TestStreamingParsing:
             for tc in result.get("tool_calls", []):
                 if "id" in tc:
                     ids_seen.append(tc["id"])
+                    id_function.append(tc.get("function", {}))
 
         assert len(ids_seen) == 1
         assert ids_seen[0]
+        # The id must ride the first delta that carries real content (the
+        # complete buffered name), never the empty BOT_TOKEN delta.
+        assert id_function[0].get("name") == "get_weather"
+
+    def test_mistral_streaming_legacy_brace_reconstruction(self):
+        """The rewritten streaming parser also owns the legacy `{` boundary.
+        Replaying the old format delta by delta must reconstruct the name and
+        arguments correctly — removing "{" from the marker scan must fail
+        this test."""
+        parser = MistralToolParser()
+        deltas = [
+            "[TOOL_CALLS]get",
+            "_",
+            "weather",
+            '{"',
+            "city",
+            '": "',
+            "London",
+            '"}',
+        ]
+
+        name_parts: list[str] = []
+        args_parts: list[str] = []
+        current = ""
+        for delta in deltas:
+            previous = current
+            current += delta
+            result = parser.extract_tool_calls_streaming(
+                previous_text=previous,
+                current_text=current,
+                delta_text=delta,
+            )
+            if not result:
+                continue
+            for tc in result.get("tool_calls", []):
+                func = tc.get("function", {})
+                if "name" in func:
+                    name_parts.append(func["name"])
+                if "arguments" in func:
+                    args_parts.append(func["arguments"])
+
+        assert "".join(name_parts) == "get_weather"
+        assert "".join(args_parts) == '{"city": "London"}'
 
     def test_mistral_streaming_marker_in_arguments_does_not_reset(self):
         """Once the name/arguments boundary was passed, a [TOOL_CALLS] marker
