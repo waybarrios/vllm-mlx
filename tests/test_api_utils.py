@@ -98,6 +98,24 @@ class TestCleanOutputText:
         assert "42" in result
         assert "<|im_start|>" not in result
 
+    def test_gpt_oss_commentary_final_returns_final_text(self):
+        text = (
+            "<|channel|>commentary to=functions.get_weather"
+            '<|message|>{"loc": "SF"}'
+            "<|channel|>final<|message|>Done<|return|>"
+        )
+        assert clean_output_text(text) == "Done"
+        assert "<|channel|>" not in clean_output_text(text)
+        assert "<|message|>" not in clean_output_text(text)
+
+    def test_gpt_oss_commentary_call_returns_args_json(self):
+        text = (
+            "<|channel|>commentary to=functions.get_weather"
+            '<|message|>{"loc": "SF"}<|call|>'
+        )
+        assert clean_output_text(text) == '{"loc": "SF"}'
+        assert "<|call|>" not in clean_output_text(text)
+
 
 class TestSpecialTokensPattern:
     """Tests for the special tokens regex pattern."""

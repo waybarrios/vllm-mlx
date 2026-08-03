@@ -929,10 +929,11 @@ class TestHelperFunctions:
         assert "<|message|>" not in (cleaned or "")
         assert "<|call|>" not in (cleaned or "")
 
-    def test_extract_reasoning_with_tools_preserves_raw_for_parser(self, monkeypatch):
-        """With-tools branch keeps raw output so the harmony parser can
-        extract the commentary tool block (positive case, guards against
-        over-correction of the no-tools fix)."""
+    def test_extract_reasoning_with_tools_strips_analysis_for_parser(self, monkeypatch):
+        """With-tools branch hands the harmony parser the output with the
+        analysis (reasoning) block stripped so the commentary tool block is
+        extracted without reasoning text reaching the parser (positive case,
+        guards against over-correction of the no-tools fix)."""
         import vllm_mlx.server as server
 
         class FakeReasoningParser:
@@ -961,7 +962,10 @@ class TestHelperFunctions:
 
         assert reasoning == "analysis content"
         assert tool_calls == ["call_extracted"]
-        assert seen == [raw]
+        assert seen == [
+            "<|channel|>commentary to=functions.read_file"
+            '<|message|>{"path":"/etc/hosts"}<|call|>'
+        ]
 
 
 # =============================================================================

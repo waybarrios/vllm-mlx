@@ -886,6 +886,11 @@ _STREAMING_TOOL_MARKERS = (
     "[TOOL_CALLS]",
     "<minimax:tool_call>",
     '<invoke name="',
+    # gpt-oss harmony: commentary channel addresses tools, and <|call|>
+    # terminates a tool call. Note the raw (unstripped) delta is what the
+    # streaming gates scan, so the harmony tokens remain present.
+    "<|channel|>commentary",
+    "<|call|>",
 )
 _STREAMING_BARE_BRACKET_MARKER = re.compile(r"\[\w+\(\{")
 _STREAMING_BARE_BRACKET_PARTIAL = re.compile(r"\[\w+\($")
@@ -2676,6 +2681,20 @@ def _responses_sse_event(event_type: str, payload: BaseModel | dict) -> str:
     return f"event: {event_type}\ndata: {data}\n\n"
 
 
+_HARMONY_ANALYSIS_BLOCK_RE = re.compile(
+    r"<\|channel\|>analysis[^<]*(?:<\|constrain\|>[^<]*)?<\|message\|>.*?"
+    r"(?=<\|channel\|>|<\|end\|>|\Z)",
+    re.DOTALL,
+)
+
+
+def _strip_harmony_analysis_blocks(text: str) -> str:
+    """Remove harmony analysis-channel blocks (and their content) so reasoning
+    text is never handed to the tool parser, while commentary/final text is
+    preserved."""
+    return _HARMONY_ANALYSIS_BLOCK_RE.sub("", text)
+
+
 def _extract_reasoning_and_tool_calls(
     output_text: str,
     request: ChatCompletionRequest | None = None,
@@ -2702,15 +2721,14 @@ def _extract_reasoning_and_tool_calls(
         if cleaned_reasoning_text is not None:
             text_for_tool_parse = cleaned_reasoning_text
         elif reasoning_text is not None:
-            # Reasoning extracted but no `final` content channel — gpt-oss
+            # Reasoning extracted but no final content channel - gpt-oss
             # jumped from <|channel|>analysis straight into
-            # <|channel|>commentary to=functions.*. Preserve raw output
-            # for the tool parser. Gate on request.tools: without tools
-            # the parser is skipped below, and clean_output_text at the
-            # response boundary intentionally preserves commentary blocks,
-            # so raw harmony tokens would leak into response content.
+            # <|channel|>commentary to=functions.*. Hand the tool parser the
+            # output with the analysis (reasoning) blocks removed so the
+            # commentary call can be extracted without reasoning text
+            # reaching the generic fallback.
             if request is not None and getattr(request, "tools", None):
-                text_for_tool_parse = output_text
+                text_for_tool_parse = _strip_harmony_analysis_blocks(output_text)
             else:
                 text_for_tool_parse = ""
 
@@ -5504,22 +5522,25 @@ async def _stream_anthropic_messages(
                 accumulated_text += filtered
                 content_to_emit = filtered
 
-                # Filter tool call markup during streaming
-                if tool_parser and content_to_emit:
+                # Filter tool call markup during streaming. The tool parser
+                # must see the raw delta (harmony control tokens intact) so a
+                # gpt-oss commentary block can activate the gate; only the
+                # emitted text stays SPECIAL_TOKENS-stripped.
+                if tool_parser and delta_text:
                     if (
                         not tool_markup_possible
                         and not _streaming_tool_markup_possible_after_delta(
-                            tool_accumulated_text, content_to_emit
+                            tool_accumulated_text, delta_text
                         )
                     ):
-                        tool_accumulated_text += content_to_emit
+                        tool_accumulated_text += delta_text
                     else:
                         if not tool_markup_possible:
                             tool_markup_possible = True
                         tool_previous = tool_accumulated_text
-                        tool_accumulated_text += content_to_emit
+                        tool_accumulated_text += delta_text
                         tool_result = tool_parser.extract_tool_calls_streaming(
-                            tool_previous, tool_accumulated_text, content_to_emit
+                            tool_previous, tool_accumulated_text, delta_text
                         )
                         if tool_result is None or "tool_calls" in tool_result:
                             # Inside tool markup or tool calls detected — suppress
@@ -5602,9 +5623,12 @@ async def _stream_anthropic_messages(
             yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': text_index, 'content_block': {'type': 'text', 'text': ''}})}\n\n"
             text_block_started = True
 
-        # Check for tool calls in accumulated text
+        # Check for tool calls in the raw tool accumulation (harmony control
+        # tokens intact) so a commentary block that ended at EOS still yields
+        # its tool call. Fall back to the stripped accumulation when no tool
+        # parser was active (mirrors prior behavior for non-tool responses).
         _, tool_calls = _parse_tool_calls_with_parser(
-            accumulated_text,
+            tool_accumulated_text or accumulated_text,
             openai_request,
             engine=engine,
         )
@@ -6082,15 +6106,19 @@ async def stream_chat_completion(
                 yield f"data: {chunk.model_dump_json()}\n\n"
 
         # Fallback: if tool parser accumulated text but never emitted tool_calls
-        # (e.g., </tool_call> never arrived, or <function= block still incomplete)
+        # (e.g., </tool_call> never arrived, <function= block still incomplete,
+        # or a harmony commentary block ended at EOS without <|call|>). Parse
+        # the raw accumulation so the closing commentary block yields its call.
         if (
             tool_parser
             and tool_accumulated_text
             and not tool_calls_detected
             and _streaming_tool_markup_possible(tool_accumulated_text)
         ):
-            final_parse_result = tool_parser.extract_tool_calls(tool_accumulated_text)
-            if final_parse_result.tools_called:
+            _, final_tool_calls = _parse_tool_calls_with_parser(
+                tool_accumulated_text, request, engine=engine
+            )
+            if final_tool_calls:
                 tool_chunk = ChatCompletionChunk(
                     id=response_id,
                     model=_response_model_name(request.model),
@@ -6100,18 +6128,18 @@ async def stream_chat_completion(
                                 tool_calls=[
                                     {
                                         "index": i,
-                                        "id": tc["id"],
-                                        "type": "function",
+                                        "id": tc.id,
+                                        "type": tc.type,
                                         "function": {
-                                            "name": tc["name"],
+                                            "name": tc.function.name,
                                             "arguments": _coerce_tool_arguments(
-                                                tc["arguments"], tc["name"], tools_dict
+                                                tc.function.arguments,
+                                                tc.function.name,
+                                                tools_dict,
                                             ),
                                         },
                                     }
-                                    for i, tc in enumerate(
-                                        final_parse_result.tool_calls
-                                    )
+                                    for i, tc in enumerate(final_tool_calls)
                                 ]
                             ),
                             finish_reason="tool_calls",
