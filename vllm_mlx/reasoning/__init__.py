@@ -83,6 +83,7 @@ def _register_builtin_parsers():
     from .mistral_parser import MistralReasoningParser
     from .poolside_v1_parser import PoolsideV1ReasoningParser
     from .qwen3_parser import Qwen3ReasoningParser
+    from .step3p5_parser import Step3p5ReasoningParser
 
     register_parser("qwen3", Qwen3ReasoningParser)
     register_parser("deepseek_r1", DeepSeekR1ReasoningParser)
@@ -92,6 +93,7 @@ def _register_builtin_parsers():
     register_parser("glm4", Glm4ReasoningParser)
     register_parser("mistral", MistralReasoningParser)
     register_parser("poolside_v1", PoolsideV1ReasoningParser)
+    register_parser("step3p5", Step3p5ReasoningParser)
 
 
 # Register built-in parsers on module load
