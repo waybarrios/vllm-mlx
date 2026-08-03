@@ -1484,6 +1484,72 @@ class TestSimpleEngineConcurrency:
         assert engine._text_tokenizer is tokenizer
 
     @pytest.mark.anyio
+    async def test_start_defers_text_model_when_mllm_draft_is_configured(
+        self, monkeypatch
+    ):
+        """Draft-backed MLLM startup must not build an unused TextModel."""
+        from vllm_mlx.engine.simple import SimpleEngine
+
+        class FakeMllmModel:
+            def __init__(self):
+                self.model = object()
+                self.loaded = False
+
+            def load(self):
+                self.loaded = True
+
+        model = FakeMllmModel()
+
+        monkeypatch.setattr(
+            "vllm_mlx.models.mllm.MLXMultimodalLM", lambda *args, **kwargs: model
+        )
+
+        def unexpected_text_model_build(*args, **kwargs):
+            raise AssertionError(
+                "draft-backed startup must defer TextModel construction"
+            )
+
+        monkeypatch.setattr(
+            "vllm_mlx.text_model_from_vlm.build_text_model",
+            unexpected_text_model_build,
+        )
+
+        engine = SimpleEngine(
+            "laguna-test",
+            force_mllm=True,
+            mllm_draft_model="/models/laguna-dflash",
+            mllm_draft_kind="dflash",
+            mllm_draft_block_size=8,
+        )
+        await engine.start()
+
+        assert model.loaded is True
+        assert engine._text_model is None
+
+    @pytest.mark.anyio
+    async def test_non_draft_request_lazily_initializes_mllm_text_model(self):
+        """An explicit draft opt-out retains the existing text-only route."""
+        from vllm_mlx.engine.simple import SimpleEngine
+
+        engine = SimpleEngine(
+            "laguna-test",
+            force_mllm=True,
+            mllm_draft_model="/models/laguna-dflash",
+        )
+        initialized: list[bool] = []
+        engine._initialize_text_model = lambda: initialized.append(True)  # type: ignore[method-assign]
+
+        await engine._ensure_text_model_for_request(mllm_draft_requested=True)
+        assert initialized == []
+
+        await engine._ensure_text_model_for_request(mllm_draft_requested=False)
+        assert initialized == [True]
+
+        engine._text_model_initialization_attempted = True
+        await engine._ensure_text_model_for_request(mllm_draft_requested=False)
+        assert initialized == [True]
+
+    @pytest.mark.anyio
     async def test_mllm_nonstream_text_only_routes_without_mtp(self):
         """Non-stream text-only MLLM chat must aggregate the TextModel route."""
         from vllm_mlx.engine.simple import SimpleEngine
