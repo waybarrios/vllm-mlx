@@ -1,3 +1,5 @@
+[![MseeP.ai Security Assessment Badge](https://mseep.net/pr/waybarrios-vllm-mlx-badge.png)](https://mseep.ai/app/waybarrios-vllm-mlx)
+
 # vllm-mlx
 
 **Read this in other languages:** [English](README.md) · [Español](README.es.md) · [Français](README.fr.md) · [中文](README.zh.md)
