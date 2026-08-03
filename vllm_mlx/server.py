@@ -3191,8 +3191,6 @@ def load_model(
         raise ValueError("MLLM draft models require force_mllm/--mllm")
     if mllm_draft_block_size is not None and mllm_draft_block_size <= 0:
         raise ValueError("MLLM draft block size must be a positive integer")
-    if mllm_draft_model and use_batching:
-        raise ValueError("MLLM draft models are supported only by SimpleEngine")
     if mllm_draft_model and (auto_unload_idle_seconds > 0 or lazy_load_model):
         raise ValueError(
             "MLLM draft models are not supported with lifecycle residency yet"
@@ -3289,6 +3287,9 @@ def load_model(
             stream_interval=stream_interval,
             force_mllm=force_mllm,
             gpu_memory_utilization=gpu_memory_utilization,
+            mllm_draft_model=mllm_draft_model,
+            mllm_draft_kind=mllm_draft_kind,
+            mllm_draft_block_size=mllm_draft_block_size,
         )
         # BatchedEngine will be started in lifespan (uvicorn's event loop)
         # Just log for now

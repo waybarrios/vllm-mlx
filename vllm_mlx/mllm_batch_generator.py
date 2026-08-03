@@ -2040,6 +2040,8 @@ def install_mtp_mllm(
     batch_gen: "MLLMBatchGenerator",
     language_model: Any,
     num_draft_tokens: int = 1,
+    draft_model: Any = None,
+    draft_block_size: Optional[int] = None,
 ) -> None:
     """Install MTP (Multi-Token Prediction) on an MLLMBatchGenerator.
 
@@ -2059,6 +2061,28 @@ def install_mtp_mllm(
 
     _orig_step = batch_gen._step
     _draft_sampler = make_sampler(temp=0.0)
+    external_drafter = draft_model is not None
+    if external_drafter:
+        draft_model.reset(batch_gen.model)
+
+    def _model_parts(output: Any) -> Tuple[mx.array, Optional[mx.array]]:
+        if isinstance(output, tuple):
+            return output[0], output[1]
+        logits = getattr(output, "logits", output)
+        hidden = getattr(output, "hidden_states", None)
+        if isinstance(hidden, list):
+            hidden = hidden[-1] if hidden else None
+        return logits, hidden
+
+    def _shared_kv(cache: List[Any]) -> Dict[str, Any]:
+        from mlx_vlm.speculative.mtp import _mtp_shared_kv_from_prompt_cache
+
+        return _mtp_shared_kv_from_prompt_cache(language_model, cache)
+
+    def _cache_positions(cache: List[Any], batch_size: int) -> Tuple[int, List[int]]:
+        from mlx_vlm.speculative.mtp import _mtp_cache_positions
+
+        return _mtp_cache_positions(cache, batch_size)
 
     # Skip state belongs to a request, not a batch position. Text-only work
     # may join/leave a continuous batch between decode steps; positional state
@@ -2093,6 +2117,9 @@ def install_mtp_mllm(
             "enabled": True,
             "requested_draft_tokens": num_draft_tokens,
             "effective_draft_tokens": 1,
+            "implementation": (
+                "external_assistant" if external_drafter else "native_target_head"
+            ),
             "mode": "request_local_sampler_aware_verified",
             "attempted": attempted,
             "accepted": accepted,
@@ -2169,9 +2196,8 @@ def install_mtp_mllm(
         else:
             # Normal forward with return_hidden
             model_output = language_model(input_tokens, cache=cache, return_hidden=True)
-            if isinstance(model_output, tuple):
-                logits, hidden_states = model_output
-            else:
+            logits, hidden_states = _model_parts(model_output)
+            if hidden_states is None:
                 return _orig_step(
                     input_tokens, cache, logits_processors, output_tokens, samplers
                 )
@@ -2205,18 +2231,50 @@ def install_mtp_mllm(
         try:
             with _mtp_stats_lock:
                 _mtp_stats["attempted"] += 1
-            draft_logits = language_model.mtp_forward(
-                hidden_states[:, -1:, :],
-                primary_tokens[:, None],
-                mtp_cache=None,
-            )
-            draft_logits = draft_logits[:, -1, :]
             sampled_rows = [
                 _request_uses_stochastic_sampling(request)
                 for request in active_requests
             ]
             uses_stochastic_sampling = any(sampled_rows)
-            if uses_stochastic_sampling:
+            if external_drafter:
+                from mlx_vlm.speculative.common import _batch_cache_left_padding
+                from mlx_vlm.speculative.mtp import _mtp_draft_position
+
+                shared_kv = _shared_kv(cache)
+                if not shared_kv:
+                    raise RuntimeError(
+                        "Assistant MTP requires target shared-KV state from the batch cache"
+                    )
+                max_position, positions = _cache_positions(cache, batch_size)
+                draft_model.set_shared_kv(
+                    shared_kv,
+                    kv_offset=max_position,
+                    position=_mtp_draft_position(mx.array(positions)),
+                    kv_valid_len=mx.array(positions),
+                    left_padding=_batch_cache_left_padding(cache),
+                )
+                # Sample-and-compare preserves the target distribution here only
+                # because the external draft is a point mass. Changing greedy=True
+                # requires a rejection-sampling verifier that accounts for q(x).
+                draft_tokens = draft_model.draft_block(
+                    primary_tokens,
+                    hidden_states[:, -1:, :],
+                    None,
+                    2,
+                    _draft_sampler,
+                    primary_tokens.dtype,
+                    greedy=True,
+                )[:, 0]
+                draft_distribution = None
+            else:
+                draft_logits = language_model.mtp_forward(
+                    hidden_states[:, -1:, :],
+                    primary_tokens[:, None],
+                    mtp_cache=None,
+                )
+                draft_logits = draft_logits[:, -1, :]
+
+            if uses_stochastic_sampling and not external_drafter:
                 draft_distribution = mx.concatenate(
                     [
                         _sampling_logprobs(draft_logits[row : row + 1], request)
@@ -2225,7 +2283,7 @@ def install_mtp_mllm(
                     axis=0,
                 )
                 draft_tokens = mx.random.categorical(draft_distribution)
-            else:
+            elif not external_drafter:
                 draft_logprobs = draft_logits - mx.logsumexp(
                     draft_logits, axis=-1, keepdims=True
                 )
@@ -2251,11 +2309,7 @@ def install_mtp_mllm(
             verify_output = language_model(
                 verify_input, cache=cache, return_hidden=True
             )
-            if isinstance(verify_output, tuple):
-                verify_logits, verify_hidden = verify_output
-            else:
-                verify_logits = verify_output
-                verify_hidden = None
+            verify_logits, verify_hidden = _model_parts(verify_output)
 
             # Verify in each request's sampler space. The old argmax equality
             # check was valid only for greedy decoding and silently bypassed
@@ -2263,7 +2317,28 @@ def install_mtp_mllm(
             draft_list = draft_tokens.tolist()
             residual_tokens_by_uid: Dict[int, int] = {}
             residual_logprobs_by_uid: Dict[int, mx.array] = {}
-            if uses_stochastic_sampling:
+            if uses_stochastic_sampling and external_drafter:
+                verify_distribution = mx.concatenate(
+                    [
+                        _sampling_logprobs(verify_logits[row : row + 1, 0, :], request)
+                        for row, request in enumerate(active_requests)
+                    ],
+                    axis=0,
+                )
+                sampled_target = mx.concatenate(
+                    [
+                        (
+                            samplers[row]
+                            if samplers and samplers[row]
+                            else batch_gen.sampler
+                        )(verify_distribution[row : row + 1])
+                        for row in range(batch_size)
+                    ],
+                    axis=0,
+                )
+                mx.eval(sampled_target, draft_tokens)
+                all_accepted = sampled_target.tolist() == draft_list
+            elif uses_stochastic_sampling:
                 verify_distribution = mx.concatenate(
                     [
                         _sampling_logprobs(verify_logits[row : row + 1, 0, :], request)
@@ -2314,6 +2389,9 @@ def install_mtp_mllm(
                     }
                 with _mtp_stats_lock:
                     _mtp_stats["accepted"] += 1
+                if external_drafter:
+                    draft_model.accept_lens.append(1)
+                    draft_model.draft_lens.append(1)
 
             else:
                 # A batch cache cannot roll back an individual row. On a mixed
@@ -2355,11 +2433,7 @@ def install_mtp_mllm(
                         cache=cache,
                         return_hidden=True,
                     )
-                    if isinstance(rerun_out, tuple):
-                        rerun_logits, rerun_hidden = rerun_out
-                    else:
-                        rerun_logits = rerun_out
-                        rerun_hidden = None
+                    rerun_logits, rerun_hidden = _model_parts(rerun_out)
                     if rerun_hidden is not None:
                         mx.async_eval(rerun_logits[:, -1, :], rerun_hidden[:, -1:, :])
                         for row, uid in enumerate(current_uids):
@@ -2388,8 +2462,8 @@ def install_mtp_mllm(
                             cache=cache,
                             return_hidden=True,
                         )
-                        if isinstance(rerun_out, tuple):
-                            rerun_logits, rerun_hidden = rerun_out
+                        if isinstance(rerun_out, tuple) or hasattr(rerun_out, "logits"):
+                            rerun_logits, rerun_hidden = _model_parts(rerun_out)
                             # language_model(...) returns (batch, seq, vocab)/
                             # (batch, seq, hidden); reduce logits to the same
                             # 2-D (batch, vocab) convention every other
@@ -2426,6 +2500,9 @@ def install_mtp_mllm(
                         }
                 with _mtp_stats_lock:
                     _mtp_stats["rejected"] += 1
+                if external_drafter:
+                    draft_model.accept_lens.append(0)
+                    draft_model.draft_lens.append(1)
 
         except Exception as e:
             logger.warning(f"[MTP-MLLM] draft/verify failed: {e}")

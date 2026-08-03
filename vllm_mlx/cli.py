@@ -82,11 +82,6 @@ def serve_command(args):
     if mllm_draft_block_size is not None and mllm_draft_block_size <= 0:
         print("Error: --mllm-draft-block-size must be a positive integer")
         sys.exit(1)
-    if mllm_draft_model and args.continuous_batching:
-        print(
-            "Error: --mllm-draft-model is supported only without --continuous-batching"
-        )
-        sys.exit(1)
     if mllm_draft_model and (args.auto_unload_idle_seconds > 0 or args.lazy_load_model):
         print("Error: --mllm-draft-model is not supported with lifecycle residency yet")
         sys.exit(1)
