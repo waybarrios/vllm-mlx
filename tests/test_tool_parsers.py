@@ -207,6 +207,30 @@ class TestMistralToolParser:
         assert result.tools_called
         assert result.content == "Let me check the weather for you."
 
+    def test_odd_quotes_in_prose_before_marker(self, parser):
+        """Prose before the first [TOOL_CALLS] marker is not JSON. An odd
+        number of double quotes in that prose must not leave the marker
+        treated as inside a string (which would hide the call entirely)."""
+        text = (
+            'The column is called "id.[TOOL_CALLS]get_schema[ARGS]' '{"table":"users"}'
+        )
+        result = parser.extract_tool_calls(text)
+
+        assert result.tools_called
+        assert len(result.tool_calls) == 1
+        assert result.tool_calls[0]["name"] == "get_schema"
+        args = json.loads(result.tool_calls[0]["arguments"])
+        assert args == {"table": "users"}
+
+    def test_odd_quotes_in_prose_legacy_format(self, parser):
+        """Same odd-quote prose guard for the legacy `{` boundary format."""
+        text = 'The column is called "id.[TOOL_CALLS]get_schema' '{"table":"users"}'
+        result = parser.extract_tool_calls(text)
+
+        assert result.tools_called
+        assert len(result.tool_calls) == 1
+        assert result.tool_calls[0]["name"] == "get_schema"
+
 
 class TestQwenToolParser:
     """Test the Qwen tool parser."""
@@ -1034,6 +1058,116 @@ class TestStreamingParsing:
         assert "".join(content_parts).startswith("get_weather then prose")
         assert parser._name_buffer == ""
         assert parser._name_buffer_overflow
+
+    def test_mistral_streaming_parallel_args_calls(self):
+        """Two consecutive [ARGS] tool calls in one streamed response must
+        open separate indices instead of collapsing into a single call with
+        malformed concatenated arguments. Regression: the `_args_started`
+        early return used to swallow the second [TOOL_CALLS] delta."""
+        parser = MistralToolParser()
+        deltas = [
+            "[TOOL_CALLS]",
+            "get_weather",
+            "[ARGS]",
+            '{"city":"Madrid"}',
+            "[TOOL_CALLS]",
+            "get_time",
+            "[ARGS]",
+            '{"tz":"CET"}',
+        ]
+
+        indices: list[int] = []
+        args: dict[int, str] = {}
+        current = ""
+        for delta in deltas:
+            previous = current
+            current += delta
+            result = parser.extract_tool_calls_streaming(
+                previous_text=previous,
+                current_text=current,
+                delta_text=delta,
+            )
+            if not result:
+                continue
+            for tc in result.get("tool_calls", []):
+                idx = tc["index"]
+                indices.append(idx)
+                args[idx] = args.get(idx, "") + tc.get("function", {}).get(
+                    "arguments", ""
+                )
+
+        assert sorted(set(indices)) == [0, 1]
+        assert json.loads(args[0]) == {"city": "Madrid"}
+        assert json.loads(args[1]) == {"tz": "CET"}
+
+    def test_mistral_streaming_parallel_legacy_calls(self):
+        """Same regression check for the legacy `{` boundary format, which
+        main already streamed as separate indices."""
+        parser = MistralToolParser()
+        deltas = [
+            "[TOOL_CALLS]get_weather",
+            '{"city":"Madrid"}',
+            "[TOOL_CALLS]get_time",
+            '{"tz":"CET"}',
+        ]
+
+        indices: list[int] = []
+        args: dict[int, str] = {}
+        current = ""
+        for delta in deltas:
+            previous = current
+            current += delta
+            result = parser.extract_tool_calls_streaming(
+                previous_text=previous,
+                current_text=current,
+                delta_text=delta,
+            )
+            if not result:
+                continue
+            for tc in result.get("tool_calls", []):
+                idx = tc["index"]
+                indices.append(idx)
+                args[idx] = args.get(idx, "") + tc.get("function", {}).get(
+                    "arguments", ""
+                )
+
+        assert sorted(set(indices)) == [0, 1]
+        assert json.loads(args[0]) == {"city": "Madrid"}
+        assert json.loads(args[1]) == {"tz": "CET"}
+
+    def test_mistral_streaming_second_call_in_same_delta(self):
+        """A new call may begin inside an argument delta (the marker is not
+        its own token). The pre-marker text closes the current call and the
+        remainder opens the next index."""
+        parser = MistralToolParser()
+        deltas = [
+            "[TOOL_CALLS]get_weather[ARGS]",
+            '{"city":"Madrid"}[TOOL_CALLS]get_time[ARGS]{"tz":"CET"}',
+        ]
+
+        indices: list[int] = []
+        args: dict[int, str] = {}
+        current = ""
+        for delta in deltas:
+            previous = current
+            current += delta
+            result = parser.extract_tool_calls_streaming(
+                previous_text=previous,
+                current_text=current,
+                delta_text=delta,
+            )
+            if not result:
+                continue
+            for tc in result.get("tool_calls", []):
+                idx = tc["index"]
+                indices.append(idx)
+                args[idx] = args.get(idx, "") + tc.get("function", {}).get(
+                    "arguments", ""
+                )
+
+        assert sorted(set(indices)) == [0, 1]
+        assert json.loads(args[0]) == {"city": "Madrid"}
+        assert json.loads(args[1]) == {"tz": "CET"}
 
     def test_auto_streaming(self):
         """Test auto parser streaming."""

@@ -71,6 +71,12 @@ class MistralToolParser(ToolParser):
         # Streaming state for the name/arguments boundary within the current
         # tool call. See _parse_streaming_tool_delta.
         self._args_started: bool = False
+        # Quote state carried across argument deltas, used to tell a
+        # [TOOL_CALLS] marker inside a JSON string (argument data) from a
+        # marker between two calls (a new index). See
+        # _scan_args_for_new_call.
+        self._args_in_string: bool = False
+        self._args_escaped: bool = False
         self._name_buffer: str = ""
         # Set when the boundary marker never arrives and the withheld text
         # was flushed as content; subsequent deltas pass through as content.
@@ -86,10 +92,56 @@ class MistralToolParser(ToolParser):
     def reset(self) -> None:
         super().reset()
         self._args_started = False
+        self._args_in_string = False
+        self._args_escaped = False
         self._name_buffer = ""
         self._name_buffer_overflow = False
         self._current_tool_call_id = None
         self._tool_call_id_emitted = False
+
+    def _start_new_tool_call(self) -> None:
+        """Begin a new streaming tool call: bump the index and reset the
+        per-call name/arguments and id state."""
+        self.current_tool_id += 1
+        self._args_started = False
+        self._args_in_string = False
+        self._args_escaped = False
+        self._name_buffer = ""
+        self._name_buffer_overflow = False
+        self._current_tool_call_id = generate_mistral_tool_id()
+        self._tool_call_id_emitted = False
+
+    def _scan_args_for_new_call(self, text: str) -> int:
+        """Scan an argument delta, updating the persistent JSON string state,
+        and return the position of the first [TOOL_CALLS] marker that sits
+        outside a string (a new call), or -1 when there is none.
+
+        Quote state is carried across deltas so a marker inside a quoted
+        value (e.g. ``{"city": "[TOOL_CALLS]rm"}``) stays argument data while
+        a marker between two calls opens the next index.
+        """
+        i = 0
+        while i < len(text):
+            ch = text[i]
+            if self._args_escaped:
+                self._args_escaped = False
+                i += 1
+                continue
+            if self._args_in_string:
+                if ch == "\\":
+                    self._args_escaped = True
+                elif ch == '"':
+                    self._args_in_string = False
+                i += 1
+                continue
+            if ch == '"':
+                self._args_in_string = True
+                i += 1
+                continue
+            if text.startswith(self.BOT_TOKEN, i):
+                return i
+            i += 1
+        return -1
 
     def _split_on_tool_call_markers(self, text: str) -> list[str]:
         """Split on [TOOL_CALLS] occurrences that are outside JSON strings.
@@ -97,13 +149,22 @@ class MistralToolParser(ToolParser):
         A marker appearing inside a quoted string value is argument data,
         not a new call — splitting there would let untrusted model output
         forge a second dispatchable call.
+
+        The quote-state scan starts at the first marker, not at index 0: the
+        text before the first marker is prose, not JSON, so an odd number of
+        double quotes there must not leave ``in_string`` set when the marker
+        arrives (that would hide the call entirely).
         """
-        parts: list[str] = []
-        start = 0
+        token = self.BOT_TOKEN
+        first = text.find(token)
+        if first == -1:
+            return [text]
+
+        parts: list[str] = [text[:first]]
+        start = first + len(token)
         in_string = False
         escaped = False
-        i = 0
-        token = self.BOT_TOKEN
+        i = start
         while i < len(text):
             ch = text[i]
             if in_string:
@@ -284,22 +345,49 @@ class MistralToolParser(ToolParser):
         For streaming, we detect when [TOOL_CALLS] appears and start
         accumulating tool call data.
         """
-        # Everything after the name/arguments boundary is arguments text —
-        # never re-scan for new [TOOL_CALLS] markers inside it (a marker in
-        # a quoted string value is data, not a new call). A genuine new call
-        # starts with its own [TOOL_CALLS] delta and is handled below; the
-        # end-of-stream non-streaming re-parse recovers calls that arrive
-        # inside a shared delta.
+        # Everything after the name/arguments boundary is arguments text.
+        # A [TOOL_CALLS] marker inside a quoted JSON string value is argument
+        # data, not a new call; a marker outside a string starts the next
+        # call (its own index). The end-of-stream non-streaming re-parse
+        # recovers calls that arrive inside a shared delta.
         if self._args_started:
-            return {
-                "tool_calls": [
+            new_call_pos = self._scan_args_for_new_call(delta_text)
+            if new_call_pos == -1:
+                return {
+                    "tool_calls": [
+                        {
+                            "index": self.current_tool_id,
+                            "type": "function",
+                            "function": {"arguments": delta_text},
+                        }
+                    ]
+                }
+            # A new call begins inside this delta: close the current call with
+            # the pre-marker text, then start the next one.
+            result: dict[str, Any] = {}
+            pre = delta_text[:new_call_pos]
+            if pre:
+                result["tool_calls"] = [
                     {
                         "index": self.current_tool_id,
                         "type": "function",
-                        "function": {"arguments": delta_text},
+                        "function": {"arguments": pre},
                     }
                 ]
-            }
+            self._start_new_tool_call()
+            tool_delta = self._parse_streaming_tool_delta(
+                delta_text[new_call_pos + len(self.BOT_TOKEN) :]
+            )
+            if tool_delta:
+                tool_call: dict[str, Any] = {
+                    "index": self.current_tool_id,
+                    "type": "function",
+                    "function": tool_delta,
+                }
+                tool_call["id"] = self._current_tool_call_id
+                self._tool_call_id_emitted = True
+                result["tool_calls"] = (result.get("tool_calls") or []) + [tool_call]
+            return result if result else None
 
         # Check if tool call token is in current output
         if self.BOT_TOKEN not in current_text:
@@ -318,12 +406,7 @@ class MistralToolParser(ToolParser):
                 result["content"] = content_part
 
             # Start tracking tool call
-            self.current_tool_id += 1
-            self._args_started = False
-            self._name_buffer = ""
-            self._name_buffer_overflow = False
-            self._current_tool_call_id = generate_mistral_tool_id()
-            self._tool_call_id_emitted = False
+            self._start_new_tool_call()
 
             if tool_part:
                 # Try to parse the tool part
