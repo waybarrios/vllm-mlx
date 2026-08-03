@@ -42,6 +42,9 @@ class ModelSpec:
     specprefill_keep_pct: float = 0.3
     specprefill_backbone_pct: float = 0.0
     specprefill_draft_model: str | None = None
+    prefix_trie_cache: bool = False
+    prefix_trie_cache_size: int = 32
+    prefix_trie_cache_memory_mb: int | None = None
 
 
 @dataclass
