@@ -42,6 +42,28 @@ CACHE_CORRUPTION_PATTERNS = [
 ]
 
 
+def _normalize_logits_processors(logits_processors):
+    """Normalize empty per-sequence processor slots to lists."""
+    if logits_processors is None:
+        return None
+    return [processors or [] for processors in logits_processors]
+
+
+def _sanitize_batch_generator_logits_processors(batch_generator) -> None:
+    """Sanitize stale BatchGenerator processor state before decode."""
+    active_batch = getattr(batch_generator, "active_batch", None)
+    if active_batch is not None and hasattr(active_batch, "logits_processors"):
+        active_batch.logits_processors = _normalize_logits_processors(
+            active_batch.logits_processors
+        )
+
+    partial = getattr(batch_generator, "_partial", None)
+    if isinstance(partial, dict) and "logits_processors" in partial:
+        partial["logits_processors"] = _normalize_logits_processors(
+            partial["logits_processors"]
+        )
+
+
 class SchedulingPolicy(Enum):
     """Scheduling policy for request ordering."""
 
@@ -786,6 +808,7 @@ def _install_mtp(
             logits = logits[:, -1, :]
 
         # --- Apply logits processors + sample primary ---
+        logits_processors = _normalize_logits_processors(logits_processors) or []
         if any(logits_processors):
             logger.debug(
                 f"[logits_proc] applying {sum(len(lp) for lp in logits_processors)} "
@@ -2497,6 +2520,7 @@ class Scheduler:
 
                 # Run generation step if we have running requests
                 if self.batch_generator is not None and self.running:
+                    _sanitize_batch_generator_logits_processors(self.batch_generator)
                     result = self.batch_generator.next()
                     output.has_work = True
 
@@ -2980,12 +3004,28 @@ class Scheduler:
         try:
             from mlx_lm.models.cache import ArraysCache, KVCache
 
+            # Cast restored arrays back to their original dtype if the spill
+            # path upcast for numpy (bf16 → fp32). None = mlx lacks the named
+            # dtype on this version; accept default from mx.array(np_fp32).
+            def _mx_dtype_from_name(name: str):
+                return getattr(mx, name, None)
+
             result = []
             for ld in layer_dicts:
                 if "keys" in ld and "values" in ld:
                     kv = KVCache()
                     kv.keys = mx.array(ld["keys"])
                     kv.values = mx.array(ld["values"])
+                    keys_orig = ld.get("keys_original_dtype")
+                    if keys_orig is not None:
+                        dt = _mx_dtype_from_name(keys_orig)
+                        if dt is not None:
+                            kv.keys = kv.keys.astype(dt)
+                    values_orig = ld.get("values_original_dtype")
+                    if values_orig is not None:
+                        dt = _mx_dtype_from_name(values_orig)
+                        if dt is not None:
+                            kv.values = kv.values.astype(dt)
                     kv.offset = ld["offset"]
                     for attr in ("max_size", "keep", "step", "_idx"):
                         if attr in ld:
@@ -2993,6 +3033,14 @@ class Scheduler:
                     result.append(kv)
                 elif "state" in ld:
                     state_arrays = [mx.array(a) for a in ld["state"]]
+                    state_dtypes = ld.get("state_original_dtypes")
+                    if state_dtypes is not None:
+                        for i, dtype_name in enumerate(state_dtypes):
+                            if dtype_name is None:
+                                continue
+                            dt = _mx_dtype_from_name(dtype_name)
+                            if dt is not None:
+                                state_arrays[i] = state_arrays[i].astype(dt)
                     layer_obj = ArraysCache(len(state_arrays))
                     layer_obj.state = state_arrays
                     result.append(layer_obj)

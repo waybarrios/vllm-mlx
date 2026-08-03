@@ -21,6 +21,14 @@ from jsonschema import validate, ValidationError
 from .models import FunctionCall, ResponseFormat, ToolCall
 
 
+class InvalidResponseFormatOutput(ValueError):
+    """Raised when generated content does not satisfy response_format."""
+
+    def __init__(self, message: str):
+        super().__init__(message)
+        self.message = message
+
+
 def _looks_like_tool_call(obj: Any) -> bool:
     """
     Heuristic: decide whether a parsed JSON object really represents a tool
@@ -845,6 +853,24 @@ def parse_json_output(
 
     # Unknown format type - treat as text
     return text, None, True, None
+
+
+def apply_response_format_or_error(
+    text: str,
+    response_format: object,
+    *,
+    ensure_ascii: bool = False,
+) -> str:
+    """Return canonical JSON content or raise for invalid response_format output."""
+    _, parsed_json, is_valid, error = parse_json_output(text, response_format)
+    if is_valid and parsed_json is not None:
+        return json.dumps(parsed_json, ensure_ascii=ensure_ascii)
+    if is_valid:
+        return text
+
+    raise InvalidResponseFormatOutput(
+        error or "model output did not satisfy response_format"
+    )
 
 
 def build_json_system_prompt(

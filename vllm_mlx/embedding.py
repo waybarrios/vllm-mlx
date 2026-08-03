@@ -82,7 +82,17 @@ class EmbeddingEngine:
         embeds: mx.array = output.text_embeds
 
         # Convert to Python lists for JSON serialization
-        return embeds.tolist()
+        result = embeds.tolist()
+
+        # Release the Metal buffers this pass allocated. MLX keeps freed buffers
+        # in its allocator pool, keyed by size, and `padding=True` above makes
+        # the sequence length vary from batch to batch — so nearly every request
+        # asks for sizes the pool has never seen and cannot reuse. Without this
+        # the pool only grows: measured ~70 MB retained per input text, taking a
+        # fresh process from 2.3 GB to 24 GB over 320 texts.
+        mx.clear_cache()
+
+        return result
 
     def count_tokens(self, texts: str | list[str]) -> int:
         """Approximate token count for usage reporting."""

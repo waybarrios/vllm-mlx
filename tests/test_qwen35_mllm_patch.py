@@ -155,3 +155,26 @@ def test_qwen35_patch_recovers_from_stale_position_ids_between_requests(monkeypa
 
     assert out.shape[1] == 28
     assert call_log[-1] == {"q_len": 28, "cos_len": 28}
+
+
+def test_qwen35_patch_accepts_current_mlx_vlm_attention_kwargs(monkeypatch):
+    """Current mlx-vlm calls attention with position embeddings and target_verify."""
+    attention_cls, cache_cls, call_log = _install_fake_qwen35_modules(monkeypatch)
+
+    assert patch_qwen35_attention_for_batching() is True
+
+    attn = cast(Any, attention_cls())
+    x = mx.zeros((1, 13, 1024), dtype=mx.float32)
+    cache = cache_cls(offset=0)
+    cos = mx.ones((1, 13, 64), dtype=mx.float32)
+    sin = mx.zeros((1, 13, 64), dtype=mx.float32)
+
+    out = attn(
+        x,
+        cache=cache,
+        position_embeddings=(cos, sin),
+        target_verify=True,
+    )
+
+    assert out.shape[1] == 13
+    assert call_log[-1] == {"q_len": 13, "cos_len": 13}

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for BatchedEngine generate() output."""
 
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -126,6 +127,54 @@ class TestBatchedEngineCacheRestore:
         assert loaded == 2
         scheduler._ensure_batch_generator.assert_called_once_with()
         prefix_cache.load_from_disk.assert_called_once_with("/tmp/cache")
+
+
+class TestBatchedEngineMetalCacheLimit:
+    def test_prefers_explicit_mlx_buffer_cache_limit(self, monkeypatch):
+        from vllm_mlx.engine.batched import _resolve_metal_buffer_cache_limit
+
+        monkeypatch.setenv("MLX_BUFFER_CACHE_LIMIT", str(2 * 1024**3))
+
+        limit, source = _resolve_metal_buffer_cache_limit(
+            max_recommended=16 * 1024**3,
+            gpu_memory_utilization=0.5,
+        )
+
+        assert limit == 2 * 1024**3
+        assert source == "MLX_BUFFER_CACHE_LIMIT"
+
+    def test_scales_cache_limit_to_device_when_env_unset(self, monkeypatch):
+        from vllm_mlx.engine.batched import _resolve_metal_buffer_cache_limit
+
+        monkeypatch.delenv("MLX_BUFFER_CACHE_LIMIT", raising=False)
+
+        limit, source = _resolve_metal_buffer_cache_limit(
+            max_recommended=16 * 1024**3,
+            gpu_memory_utilization=0.5,
+        )
+
+        assert limit == 8 * 1024**3
+        assert source == "device-scaled"
+
+    def test_ignores_invalid_mlx_buffer_cache_limit(self, monkeypatch):
+        from vllm_mlx.engine.batched import _resolve_metal_buffer_cache_limit
+
+        monkeypatch.setenv("MLX_BUFFER_CACHE_LIMIT", "invalid")
+
+        limit, source = _resolve_metal_buffer_cache_limit(
+            max_recommended=16 * 1024**3,
+            gpu_memory_utilization=0.5,
+        )
+
+        assert limit == 8 * 1024**3
+        assert source == "device-scaled"
+
+    def test_batched_engine_does_not_hardcode_32gb_cache_limit(self):
+        source = Path(__file__).parents[1] / "vllm_mlx" / "engine" / "batched.py"
+        content = source.read_text()
+
+        assert "MLX_BUFFER_CACHE_LIMIT" in content
+        assert "mx.set_cache_limit(32 * 1024 * 1024 * 1024)" not in content
 
 
 class TestBatchedEngineAbortRequest:

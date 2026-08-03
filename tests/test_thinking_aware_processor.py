@@ -45,7 +45,10 @@ class _FakeInnerProcessor:
 # Import the class under test
 # ---------------------------------------------------------------------------
 
-from vllm_mlx.server import _ThinkingAwareLogitsProcessor
+from vllm_mlx.server import (
+    _attach_response_format_logits_processor,
+    _ThinkingAwareLogitsProcessor,
+)
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -117,6 +120,29 @@ class TestPreambleSkipped:
         assert results[2] == "CONSTRAINED"
         assert proc._active is True
         assert inner._prompt_len == len(prompt) + 0  # { is at gen position 0
+
+    def test_response_format_attachment_suppresses_thinking(self):
+        """response_format constraints must own generation from token one."""
+        tok = _FakeTokenizer({10: "{"})
+        inner = _FakeInnerProcessor(tok)
+        chat_kwargs = {
+            "enable_thinking": True,
+            "chat_template_kwargs": {"enable_thinking": True, "foo": "bar"},
+            "logits_processors": ["existing"],
+        }
+
+        result = _attach_response_format_logits_processor(chat_kwargs, inner)
+
+        assert result is inner
+        assert chat_kwargs["enable_thinking"] is False
+        assert chat_kwargs["chat_template_kwargs"] == {
+            "enable_thinking": False,
+            "foo": "bar",
+        }
+        assert chat_kwargs["logits_processors"] == ["existing", inner]
+        assert not isinstance(
+            chat_kwargs["logits_processors"][-1], _ThinkingAwareLogitsProcessor
+        )
 
 
 class TestThinkThenPreamble:

@@ -32,6 +32,7 @@ from urllib.parse import urljoin, urlparse
 import numpy as np
 import requests
 
+from vllm_mlx.engine.chat_template_safety import normalize_messages_for_chat_template
 from vllm_mlx.mllm_cache import MLLMPrefixCacheManager
 
 logger = logging.getLogger(__name__)
@@ -132,6 +133,186 @@ class UnsafeRemoteURLError(ValueError):
     ) -> None:
         super().__init__(message)
         self.public_message = public_message
+
+
+def _normalize_content_part(item: object) -> object:
+    """Convert Pydantic content parts into plain Python objects."""
+    if hasattr(item, "model_dump"):
+        return item.model_dump(exclude_none=True)
+    if hasattr(item, "dict"):
+        return {k: v for k, v in item.dict().items() if v is not None}
+    return item
+
+
+def _extract_media_url(item: dict, item_type: str) -> str:
+    if item_type == "image_url":
+        media_value = item.get("image_url", {})
+    elif item_type == "video_url":
+        media_value = item.get("video_url", {})
+    elif item_type == "audio_url":
+        media_value = item.get("audio_url", {})
+    elif item_type in {"image", "video", "audio"}:
+        media_value = item.get(item_type, item.get("url", ""))
+    else:
+        return ""
+
+    if isinstance(media_value, dict):
+        media_value = media_value.get("url", "")
+    return media_value if isinstance(media_value, str) else ""
+
+
+def _text_content_part(text: str) -> dict[str, str]:
+    return {"type": "text", "text": text, "content": text}
+
+
+def _append_text_content_part(
+    built_parts: list[dict[str, str]], text_parts: list[str], text: str
+) -> None:
+    if not text:
+        return
+    built_parts.append(_text_content_part(text))
+    text_parts.append(text)
+
+
+def _build_string_mllm_message_content(content: str, role: str) -> tuple[object, bool]:
+    if not content:
+        return "", False
+    if role == "assistant":
+        return content, True
+    return [_text_content_part(content)], True
+
+
+def _append_ordered_mllm_content_part(
+    raw_item: object,
+    *,
+    built_parts: list[dict[str, str]],
+    text_parts: list[str],
+    all_image_urls: list[str],
+    video_frame_count: int,
+) -> int:
+    item = _normalize_content_part(raw_item)
+    if isinstance(item, str):
+        _append_text_content_part(built_parts, text_parts, item)
+        return video_frame_count
+
+    if not isinstance(item, dict):
+        return video_frame_count
+
+    item_type = item.get("type", "")
+    if item_type in {"text", "input_text"}:
+        _append_text_content_part(
+            built_parts, text_parts, item.get("text", "") or item.get("content", "")
+        )
+    elif item_type in {"image_url", "image"}:
+        media_url = _extract_media_url(item, item_type)
+        if media_url:
+            all_image_urls.append(media_url)
+        built_parts.append({"type": "image"})
+    elif item_type in {"audio_url", "audio"}:
+        # Audio inputs are collected once by _collect_audio_inputs before
+        # message reconstruction; this helper only preserves placeholder order.
+        built_parts.append({"type": "audio"})
+    elif item_type in {"video", "video_url"}:
+        # Native video models bypass this helper. For fallback frame extraction,
+        # preserve the video position by inserting that message's frames here.
+        built_parts.extend({"type": "image"} for _ in range(video_frame_count))
+        return 0
+    return video_frame_count
+
+
+def _build_ordered_mllm_message_content(
+    content: object,
+    *,
+    role: str,
+    all_image_urls: list[str],
+    video_frame_count: int = 0,
+) -> tuple[object, bool]:
+    """Build template content while preserving OpenAI media/text part order."""
+    if isinstance(content, str):
+        return _build_string_mllm_message_content(content, role)
+
+    if not isinstance(content, list):
+        return "", False
+
+    built_parts: list[dict[str, str]] = []
+    text_parts: list[str] = []
+    remaining_video_frames = video_frame_count
+
+    for raw_item in content:
+        remaining_video_frames = _append_ordered_mllm_content_part(
+            raw_item,
+            built_parts=built_parts,
+            text_parts=text_parts,
+            all_image_urls=all_image_urls,
+            video_frame_count=remaining_video_frames,
+        )
+
+    if role == "assistant":
+        text = "".join(text_parts)
+        return text, bool(text)
+
+    return built_parts, bool(built_parts)
+
+
+def _normalize_mllm_tool_calls(tool_calls: list) -> list:
+    """Normalize replayed assistant tool calls for chat templates.
+
+    Mirrors ``_normalize_tool_call_arguments_for_template`` in
+    ``vllm_mlx/engine/batched.py``: JSON argument strings become mappings so
+    templates that iterate argument keys render correctly.
+    """
+    plain_calls = [_normalize_content_part(call) for call in tool_calls]
+    normalized = normalize_messages_for_chat_template(
+        [{"role": "assistant", "tool_calls": plain_calls}]
+    )
+    return normalized[0].get("tool_calls", plain_calls)
+
+
+def _build_mllm_chat_messages(
+    messages: list[dict],
+    *,
+    all_image_urls: list[str],
+    video_frame_counts: dict[int, int],
+) -> list[dict]:
+    """Build chat-template messages without reordering multimodal content parts."""
+    chat_messages: list[dict] = []
+    for msg_idx, msg in enumerate(messages):
+        role = msg.get("role", "user")
+        if not isinstance(role, str):
+            role = str(role)
+
+        content, has_content = _build_ordered_mllm_message_content(
+            msg.get("content", ""),
+            role=role,
+            all_image_urls=all_image_urls,
+            video_frame_count=video_frame_counts.get(msg_idx, 0),
+        )
+        chat_message = {"role": role, "content": content}
+
+        if role == "assistant":
+            tool_calls = msg.get("tool_calls")
+            if isinstance(tool_calls, list) and tool_calls:
+                # Keep tool-call turns even when text content is empty so
+                # templates render the assistant -> tool exchange (issue #608).
+                chat_message["tool_calls"] = _normalize_mllm_tool_calls(tool_calls)
+                reasoning_content = msg.get("reasoning_content")
+                if reasoning_content:
+                    chat_message["reasoning_content"] = reasoning_content
+                has_content = True
+        elif role == "tool":
+            tool_call_id = msg.get("tool_call_id")
+            if tool_call_id:
+                chat_message["tool_call_id"] = tool_call_id
+                # Tools may legitimately return empty output; keep the message
+                # anyway so the assistant tool_call still has its anchor and
+                # template forward-scans pair calls to responses (issue #608).
+                if not has_content:
+                    chat_message["content"] = ""
+                    has_content = True
+
+        if has_content:
+            chat_messages.append(chat_message)
+    return chat_messages
 
 
 @dataclass
@@ -724,6 +905,106 @@ def process_audio_input(audio: str | dict) -> str:
     raise ValueError(f"Cannot process audio: {audio[:50]}...")
 
 
+def _video_has_audio_track(video_path: str) -> bool:
+    """Return True if ffprobe finds an audio stream in the video."""
+    import shutil
+    import subprocess
+
+    if not shutil.which("ffprobe"):
+        return True  # assume yes; extraction will fail loudly if not
+    try:
+        r = subprocess.run(
+            [
+                "ffprobe",
+                "-loglevel",
+                "error",
+                "-select_streams",
+                "a",
+                "-show_entries",
+                "stream=codec_type",
+                "-of",
+                "csv=p=0",
+                video_path,
+            ],
+            capture_output=True,
+            timeout=30,
+            text=True,
+        )
+        return bool(r.stdout.strip())
+    except (subprocess.SubprocessError, OSError):
+        return True
+
+
+def _model_has_sound_encoder(model) -> bool:
+    """Whether a loaded model exposes a usable sound encoder.
+
+    Uses ``getattr(..., None) is not None`` rather than ``hasattr`` so model
+    wrappers that declare ``sound_encoder`` in ``__init__`` but leave it as
+    ``None`` until the first encoder pass are correctly treated as not yet
+    enabled. A bare ``hasattr`` check would spuriously enable A/V fusion
+    against a missing encoder and crash the processor downstream.
+    """
+    return getattr(model, "sound_encoder", None) is not None
+
+
+def extract_audio_from_video(video_path: str) -> str | None:
+    """Extract the audio track from a video file as 16 kHz mono WAV.
+
+    Returns the path to the WAV (registered with the temp manager so it's
+    cleaned up automatically), or None if the video has no audio or ffmpeg
+    is unavailable.
+    """
+    import os
+    import shutil
+    import subprocess
+
+    if not shutil.which("ffmpeg"):
+        logger.warning(
+            "ffmpeg not found; cannot fuse audio from video_url. "
+            "Install ffmpeg to enable A/V fusion on omni models."
+        )
+        return None
+    if not _video_has_audio_track(video_path):
+        return None
+
+    fd, out_path = tempfile.mkstemp(suffix=".wav", prefix="vllmmlx_va_")
+    os.close(fd)
+    try:
+        r = subprocess.run(
+            [
+                "ffmpeg",
+                "-y",
+                "-i",
+                video_path,
+                "-vn",
+                "-ac",
+                "1",
+                "-ar",
+                "16000",
+                "-c:a",
+                "pcm_s16le",
+                out_path,
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=600,
+        )
+        if r.returncode != 0 or os.path.getsize(out_path) == 0:
+            try:
+                os.unlink(out_path)
+            except OSError:
+                pass
+            return None
+        return _temp_manager.register(out_path)
+    except (subprocess.SubprocessError, OSError) as e:
+        logger.warning(f"Audio extraction from video failed: {e}")
+        try:
+            os.unlink(out_path)
+        except OSError:
+            pass
+        return None
+
+
 # Cache for base64 images to avoid re-saving the same image
 _base64_image_cache: dict[str, str] = {}  # hash -> temp file path
 
@@ -989,6 +1270,7 @@ class MLXMultimodalLM:
         self._draft_model = None
         self._loaded = False
         self._video_native = False
+        self._video_native_with_audio = False
 
         # Initialize MLLM prefix cache manager (with vision embedding caching)
         self._cache_manager: MLLMPrefixCacheManager | None = None
@@ -1016,9 +1298,20 @@ class MLXMultimodalLM:
             self._video_native = hasattr(
                 self.model.config, "video_token_id"
             ) or hasattr(self.model.config, "video_token_index")
+            # Omni models expose a sound_encoder; for these, a video_url
+            # without a paired audio_url should auto-extract the video's
+            # audio track so the model can fuse A/V in one forward pass.
+            # Decoupled from _video_native because some omni models (e.g.
+            # Nemotron-H Omni) don't expose video_token_id at config level
+            # and run through the frames-as-images fallback path.
+            self._video_native_with_audio = _model_has_sound_encoder(self.model)
             logger.info(f"MLLM loaded successfully: {self.model_name}")
             if self._video_native:
                 logger.info("Native video pipeline enabled (temporal 3D conv + M-RoPE)")
+            if self._video_native_with_audio:
+                logger.info(
+                    "Omni model detected: video_url will auto-extract audio for A/V fusion"
+                )
 
         except ImportError:
             raise ImportError(
@@ -1136,6 +1429,7 @@ class MLXMultimodalLM:
         video_input: str | dict,
         fps: float = DEFAULT_FPS,
         max_frames: int = MAX_FRAMES,
+        resolved_path: str | None = None,
     ) -> list[str]:
         """
         Process video input and extract frames.
@@ -1149,12 +1443,16 @@ class MLXMultimodalLM:
             video_input: Video in any supported format
             fps: Frames per second to extract
             max_frames: Maximum frames to extract
+            resolved_path: Optional pre-resolved local path. Callers that
+                already ran process_video_input (e.g. for parallel audio
+                extraction) pass it here to avoid re-downloading / re-decoding.
 
         Returns:
             List of paths to extracted frame images
         """
-        # Process video input (download if URL, decode if base64)
-        video_path = process_video_input(video_input)
+        # Reuse caller's resolved path when supplied; otherwise resolve here
+        # (downloads if URL, decodes if base64).
+        video_path = resolved_path or process_video_input(video_input)
 
         # Extract frames
         frames = extract_video_frames_smart(
@@ -1276,14 +1574,32 @@ class MLXMultimodalLM:
             native_messages, return_video_kwargs=True
         )
 
+        # Collect audio paths emitted by the translation step
+        # (explicit audio_url, or auto-extracted from video_url for omni
+        # models).
+        audio_inputs: list[str] = []
+        for nmsg in native_messages:
+            ncontent = nmsg.get("content", [])
+            if not isinstance(ncontent, list):
+                continue
+            for nitem in ncontent:
+                if isinstance(nitem, dict) and nitem.get("type") == "audio":
+                    apath = nitem.get("audio")
+                    if apath:
+                        audio_inputs.append(apath)
+
         # Process through HF processor to get input_ids, pixel_values, grid_thw
-        inputs = self.processor(
-            text=[text],
-            images=image_inputs,
-            videos=video_inputs,
-            padding=True,
-            return_tensors="pt",
-        )
+        # and (for omni models) sound_clips / input_features.
+        processor_kwargs: dict = {
+            "text": [text],
+            "images": image_inputs,
+            "videos": video_inputs,
+            "padding": True,
+            "return_tensors": "pt",
+        }
+        if audio_inputs:
+            processor_kwargs["audio"] = audio_inputs
+        inputs = self.processor(**processor_kwargs)
 
         input_ids = mx.array(inputs["input_ids"])
         pixel_values = inputs.get(
@@ -1298,6 +1614,26 @@ class MLXMultimodalLM:
             gen_kwargs["video_grid_thw"] = mx.array(inputs["video_grid_thw"])
         if inputs.get("image_grid_thw", None) is not None:
             gen_kwargs["image_grid_thw"] = mx.array(inputs["image_grid_thw"])
+
+        # Forward audio embeddings/clips from the processor so the omni
+        # model's sound encoder gets fed alongside the visual stream.
+        for audio_key in (
+            "sound_clips",
+            "input_features",
+            "feature_attention_mask",
+            "audio_feature_lengths",
+            "sound_feature_lengths",
+            "sound_attention_mask",
+        ):
+            val = inputs.get(audio_key, None)
+            if val is not None:
+                gen_kwargs[audio_key] = val
+        if audio_inputs:
+            logger.info(
+                f"Native video: forwarding audio ({len(audio_inputs)} clip(s)) "
+                f"to omni model via "
+                f"{[k for k in gen_kwargs if k in ('sound_clips', 'input_features')]}"
+            )
 
         gen_kwargs["input_ids"] = input_ids
         gen_kwargs["pixel_values"] = pixel_values
@@ -1382,6 +1718,24 @@ class MLXMultimodalLM:
                 translated.append({"role": role, "content": str(content)})
                 continue
 
+            # Pre-pass: does this message have an explicit audio_url/audio
+            # block? If so, we skip auto-extracting audio from a video_url to
+            # honor the caller's explicit choice.
+            has_explicit_audio = False
+            for item in content:
+                if hasattr(item, "model_dump"):
+                    probe = item.model_dump(exclude_none=True)
+                elif hasattr(item, "dict"):
+                    probe = {k: v for k, v in item.dict().items() if v is not None}
+                else:
+                    probe = item
+                if isinstance(probe, dict) and probe.get("type", "") in (
+                    "audio",
+                    "audio_url",
+                ):
+                    has_explicit_audio = True
+                    break
+
             new_content = []
             for item in content:
                 if hasattr(item, "model_dump"):
@@ -1440,6 +1794,35 @@ class MLXMultimodalLM:
                             "max_frames": video_max_frames,
                         }
                     )
+                    # For omni-capable models, pull the video's audio track
+                    # alongside frames so the model can fuse A/V in one
+                    # forward pass. We extract from the already-resolved local
+                    # path (no raw user URL handed to ffmpeg → avoids URL-
+                    # protocol SSRF via ffmpeg's network demuxers).
+                    if not has_explicit_audio and getattr(
+                        self, "_video_native_with_audio", False
+                    ):
+                        extracted = extract_audio_from_video(video_path)
+                        if extracted is not None:
+                            new_content.append({"type": "audio", "audio": extracted})
+
+                elif item_type in ("audio", "audio_url"):
+                    if item_type == "audio_url":
+                        aud_url = item.get("audio_url", {})
+                        if isinstance(aud_url, str):
+                            audio_source = aud_url
+                        elif isinstance(aud_url, dict):
+                            audio_source = aud_url.get("url", "")
+                        else:
+                            continue
+                    else:
+                        audio_source = item.get("audio", item.get("url", ""))
+
+                    if not audio_source:
+                        continue
+
+                    audio_path = process_audio_input(audio_source)
+                    new_content.append({"type": "audio", "audio": audio_path})
 
                 else:
                     new_content.append(item)
@@ -1752,6 +2135,14 @@ class MLXMultimodalLM:
         tools = kwargs.pop("tools", None)
         use_cache = kwargs.pop("use_cache", True)
         enable_thinking = kwargs.pop("enable_thinking", True)
+        # Honor chat_template_kwargs on the MLLM path (parity with the text path in
+        # llm.py). enable_thinking is commonly nested here via
+        # --default-chat-template-kwargs {"enable_thinking": false}; it was previously
+        # dropped for MLLM models, so reasoning could not be disabled and leaked into
+        # the response.
+        chat_template_kwargs = kwargs.pop("chat_template_kwargs", None) or {}
+        if "enable_thinking" in chat_template_kwargs:
+            enable_thinking = chat_template_kwargs.pop("enable_thinking")
 
         # Collect video and audio inputs from messages
         _msg_video_inputs = self._collect_video_inputs(messages)
@@ -1771,97 +2162,59 @@ class MLXMultimodalLM:
 
         # Fallback: extract frames and treat as individual images
         _msg_video_frame_counts: dict[int, int] = {}
+        _msg_extra_audio: dict[int, list[str]] = {}
         all_video_frames: list[str] = []
         all_audio_inputs: list[str] = []
         for msg_idx, vid_inputs in _msg_video_inputs.items():
             total_frames = 0
+            has_explicit_audio = bool(_msg_audio_inputs.get(msg_idx))
             for vid_input in vid_inputs:
+                # Resolve the video to a local path ONCE per input. Both
+                # audio extraction (when this is an omni model with no
+                # explicit audio block) and frame extraction need a local
+                # file; resolving twice would re-download remote URLs and
+                # re-decode base64. Resolving up front also keeps user-
+                # supplied raw URLs out of ffmpeg's URL-protocol demuxers
+                # (avoids SSRF via http://, rtsp://, etc.).
+                try:
+                    resolved_video_path = process_video_input(vid_input)
+                except Exception as exc:
+                    logger.warning(f"Could not resolve video: {exc}")
+                    resolved_video_path = None
+
+                if (
+                    resolved_video_path
+                    and self._video_native_with_audio
+                    and not has_explicit_audio
+                ):
+                    extracted_audio = extract_audio_from_video(resolved_video_path)
+                    if extracted_audio:
+                        _msg_extra_audio.setdefault(msg_idx, []).append(extracted_audio)
+
                 frames = self._prepare_video(
-                    vid_input, fps=video_fps, max_frames=video_max_frames
+                    vid_input,
+                    fps=video_fps,
+                    max_frames=video_max_frames,
+                    resolved_path=resolved_video_path,
                 )
                 all_video_frames.extend(frames)
                 total_frames += len(frames)
                 logger.info(f"Added {len(frames)} frames from video: {vid_input}")
             _msg_video_frame_counts[msg_idx] = total_frames
 
+        # Merge auto-extracted audio into the per-message audio map so the
+        # chat-template token-counting loop downstream sees the right count.
+        for msg_idx, extra in _msg_extra_audio.items():
+            _msg_audio_inputs.setdefault(msg_idx, []).extend(extra)
+
         for aud_inputs in _msg_audio_inputs.values():
             all_audio_inputs.extend(aud_inputs)
 
-        # Second pass: build chat messages with image counts that include video frames
-        for msg_idx, msg in enumerate(messages):
-            role = msg.get("role", "user")
-            content = msg.get("content", "")
-            msg_text = ""  # Text content for this message
-            msg_image_count = 0  # Number of images in THIS message
-            msg_audio_count = 0  # Number of audio clips in THIS message
-
-            if isinstance(content, str):
-                msg_text = content
-            elif isinstance(content, list):
-                # OpenAI multimodal format - extract text and count images for THIS message
-                for item in content:
-                    if isinstance(item, str):
-                        msg_text += item
-                        continue
-
-                    # Convert Pydantic models to dicts, excluding None fields
-                    # to avoid null keys like image_url: null on text parts
-                    if hasattr(item, "model_dump"):
-                        item = item.model_dump(exclude_none=True)
-                    elif hasattr(item, "dict"):
-                        item = {k: v for k, v in item.dict().items() if v is not None}
-
-                    if isinstance(item, dict):
-                        item_type = item.get("type", "")
-
-                        if item_type == "text":
-                            msg_text += item.get("text", "")
-
-                        elif item_type == "image_url":
-                            img_url = item.get("image_url", {})
-                            if isinstance(img_url, str):
-                                all_image_urls.append(img_url)
-                            else:
-                                all_image_urls.append(img_url.get("url", ""))
-                            msg_image_count += 1
-
-                        elif item_type == "image":
-                            all_image_urls.append(
-                                item.get("image", item.get("url", ""))
-                            )
-                            msg_image_count += 1
-
-            # Add video frame count to image count for this message
-            msg_image_count += _msg_video_frame_counts.get(msg_idx, 0)
-            msg_audio_count += len(_msg_audio_inputs.get(msg_idx, []))
-
-            # Build properly structured message
-            # Format: {"role": "...", "content": [{"type": "image"}, ..., {"type": "audio"}, ..., {"type": "text", "text": "..."}]}
-            if msg_text or msg_image_count > 0 or msg_audio_count > 0:
-                if role == "user" and (msg_image_count > 0 or msg_audio_count > 0):
-                    # User message WITH images/audio - build content array with media tokens FIRST
-                    content_list = []
-                    for _ in range(msg_image_count):
-                        content_list.append({"type": "image"})
-                    for _ in range(msg_audio_count):
-                        content_list.append({"type": "audio"})
-                    content_list.append(
-                        {"type": "text", "text": msg_text, "content": msg_text}
-                    )
-                    chat_messages.append({"role": role, "content": content_list})
-                elif role == "assistant":
-                    # Assistant messages - just text content (not array)
-                    chat_messages.append({"role": role, "content": msg_text})
-                else:
-                    # User/system message WITHOUT images - still use content array format
-                    chat_messages.append(
-                        {
-                            "role": role,
-                            "content": [
-                                {"type": "text", "text": msg_text, "content": msg_text}
-                            ],
-                        }
-                    )
+        chat_messages = _build_mllm_chat_messages(
+            messages,
+            all_image_urls=all_image_urls,
+            video_frame_counts=_msg_video_frame_counts,
+        )
 
         # Process images
         all_images = []
@@ -1885,8 +2238,22 @@ class MLXMultimodalLM:
         template_extra_kwargs = {}
         if tools:
             template_extra_kwargs["tools"] = tools
+        # Forward any remaining chat_template_kwargs (parity with the text path)
+        template_extra_kwargs.update(chat_template_kwargs)
 
         try:
+            formatted_prompt = get_chat_template(
+                self.processor,
+                chat_messages,
+                add_generation_prompt=True,
+                enable_thinking=enable_thinking,
+                **template_extra_kwargs,
+            )
+        except TypeError:
+            # The processor's chat template doesn't accept some forwarded
+            # chat_template_kwargs — drop them and retry (mirror llm.py).
+            for key in chat_template_kwargs:
+                template_extra_kwargs.pop(key, None)
             formatted_prompt = get_chat_template(
                 self.processor,
                 chat_messages,
@@ -2171,6 +2538,14 @@ class MLXMultimodalLM:
         tools = kwargs.pop("tools", None)
         use_cache = kwargs.pop("use_cache", True)
         enable_thinking = kwargs.pop("enable_thinking", True)
+        # Honor chat_template_kwargs on the MLLM path (parity with the text path in
+        # llm.py). enable_thinking is commonly nested here via
+        # --default-chat-template-kwargs {"enable_thinking": false}; it was previously
+        # dropped for MLLM models, so reasoning could not be disabled and leaked into
+        # the response.
+        chat_template_kwargs = kwargs.pop("chat_template_kwargs", None) or {}
+        if "enable_thinking" in chat_template_kwargs:
+            enable_thinking = chat_template_kwargs.pop("enable_thinking")
 
         # Collect video and audio inputs from messages
         _msg_video_inputs = self._collect_video_inputs(messages)
@@ -2197,86 +2572,52 @@ class MLXMultimodalLM:
 
         # Fallback: frames as images
         _msg_video_frame_counts: dict[int, int] = {}
+        _msg_extra_audio: dict[int, list[str]] = {}
         all_video_frames: list[str] = []
         all_audio_inputs: list[str] = []
         for msg_idx, vid_inputs in _msg_video_inputs.items():
             total_frames = 0
+            has_explicit_audio = bool(_msg_audio_inputs.get(msg_idx))
             for vid_input in vid_inputs:
+                # Resolve once; reused for audio extraction and frame prep.
+                # See the matching block in chat() for rationale.
+                try:
+                    resolved_video_path = process_video_input(vid_input)
+                except Exception as exc:
+                    logger.warning(f"Could not resolve video: {exc}")
+                    resolved_video_path = None
+
+                if (
+                    resolved_video_path
+                    and self._video_native_with_audio
+                    and not has_explicit_audio
+                ):
+                    extracted_audio = extract_audio_from_video(resolved_video_path)
+                    if extracted_audio:
+                        _msg_extra_audio.setdefault(msg_idx, []).append(extracted_audio)
+
                 frames = self._prepare_video(
-                    vid_input, fps=video_fps, max_frames=video_max_frames
+                    vid_input,
+                    fps=video_fps,
+                    max_frames=video_max_frames,
+                    resolved_path=resolved_video_path,
                 )
                 all_video_frames.extend(frames)
                 total_frames += len(frames)
                 logger.info(f"Added {len(frames)} frames from video: {vid_input}")
             _msg_video_frame_counts[msg_idx] = total_frames
 
+        for msg_idx, extra in _msg_extra_audio.items():
+            _msg_audio_inputs.setdefault(msg_idx, []).extend(extra)
+
         for aud_inputs in _msg_audio_inputs.values():
             all_audio_inputs.extend(aud_inputs)
 
-        for msg_idx, msg in enumerate(messages):
-            role = msg.get("role", "user")
-            content = msg.get("content", "")
-            msg_text = ""
-            msg_image_count = 0
-            msg_audio_count = 0
-
-            if isinstance(content, str):
-                msg_text = content
-            elif isinstance(content, list):
-                for item in content:
-                    if isinstance(item, str):
-                        msg_text += item
-                        continue
-
-                    if hasattr(item, "model_dump"):
-                        item = item.model_dump(exclude_none=True)
-                    elif hasattr(item, "dict"):
-                        item = {k: v for k, v in item.dict().items() if v is not None}
-
-                    if isinstance(item, dict):
-                        item_type = item.get("type", "")
-
-                        if item_type == "text":
-                            msg_text += item.get("text", "")
-
-                        elif item_type == "image_url":
-                            img_url = item.get("image_url", {})
-                            if isinstance(img_url, str):
-                                all_image_urls.append(img_url)
-                            else:
-                                all_image_urls.append(img_url.get("url", ""))
-                            msg_image_count += 1
-
-                        elif item_type == "image":
-                            all_image_urls.append(
-                                item.get("image", item.get("url", ""))
-                            )
-                            msg_image_count += 1
-
-            msg_image_count += _msg_video_frame_counts.get(msg_idx, 0)
-            msg_audio_count += len(_msg_audio_inputs.get(msg_idx, []))
-            if msg_text or msg_image_count > 0 or msg_audio_count > 0:
-                if role == "user" and (msg_image_count > 0 or msg_audio_count > 0):
-                    content_list = []
-                    for _ in range(msg_image_count):
-                        content_list.append({"type": "image"})
-                    for _ in range(msg_audio_count):
-                        content_list.append({"type": "audio"})
-                    content_list.append(
-                        {"type": "text", "text": msg_text, "content": msg_text}
-                    )
-                    chat_messages.append({"role": role, "content": content_list})
-                elif role == "assistant":
-                    chat_messages.append({"role": role, "content": msg_text})
-                else:
-                    chat_messages.append(
-                        {
-                            "role": role,
-                            "content": [
-                                {"type": "text", "text": msg_text, "content": msg_text}
-                            ],
-                        }
-                    )
+        chat_messages = _build_mllm_chat_messages(
+            messages,
+            all_image_urls=all_image_urls,
+            video_frame_counts=_msg_video_frame_counts,
+        )
 
         all_images = []
         if all_image_urls:
@@ -2288,8 +2629,22 @@ class MLXMultimodalLM:
         template_extra_kwargs = {}
         if tools:
             template_extra_kwargs["tools"] = tools
+        # Forward any remaining chat_template_kwargs (parity with the text path)
+        template_extra_kwargs.update(chat_template_kwargs)
 
         try:
+            formatted_prompt = get_chat_template(
+                self.processor,
+                chat_messages,
+                add_generation_prompt=True,
+                enable_thinking=enable_thinking,
+                **template_extra_kwargs,
+            )
+        except TypeError:
+            # The processor's chat template doesn't accept some forwarded
+            # chat_template_kwargs — drop them and retry (mirror llm.py).
+            for key in chat_template_kwargs:
+                template_extra_kwargs.pop(key, None)
             formatted_prompt = get_chat_template(
                 self.processor,
                 chat_messages,

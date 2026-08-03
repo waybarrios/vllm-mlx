@@ -271,6 +271,27 @@ def test_streaming_plain_text_is_not_misclassified_as_tool_call():
     assert aggregated_calls == []
 
 
+@pytest.mark.parametrize("chunk_size", [1, 2, 4, 8, 256])
+def test_streaming_plain_text_preserves_content_across_chunk_sizes(chunk_size):
+    """
+    Regression for the bare-<function=> rollback path swallowing user-
+    visible prose. When the model emits something like
+        "I considered using <function=foo> but decided against it."
+    the parser must (a) not emit any tool_call AND (b) stream back the
+    full original text as content — no characters dropped or rewritten.
+    Pre-fix, the abandonment path in _char_data dropped both the raw
+    `<function=foo>` fragment and the char-data event that triggered the
+    rollback, leaving the response truncated.
+    """
+    parser = Qwen3XMLToolParser(None)
+    text = (
+        "I considered using <function=foo> but decided against it. " "The answer is 42."
+    )
+    streamed = _stream(parser, _fixed_chunks(text, chunk_size))
+    assert streamed["tool_calls"] == []
+    assert streamed["content"] == text
+
+
 # ---------------------------------------------------------------------------
 # Malformed / truncated input
 # ---------------------------------------------------------------------------
@@ -368,5 +389,101 @@ def test_object_parameter_with_single_quotes_split_mid_literal():
         {"name": v["name"], "arguments": json.loads(v["arguments"])}
         for v in (aggregated[i] for i in sorted(aggregated))
         if v["name"]
+    ]
+    assert streamed_calls == expected
+
+
+# ---------------------------------------------------------------------------
+# Bare <function=...> (no <tool_call> wrapper)
+#
+# Qwen3-Coder under heavy load (large system prompt + many tools) sometimes
+# drops the outer `<tool_call></tool_call>` wrapper and emits only the inner
+# `<function=NAME><parameter=...>...</function>` block. The streaming parser
+# must still recognise these as tool calls without misclassifying prose that
+# merely contains `<function=foo>` as text (covered by
+# `test_streaming_plain_text_is_not_misclassified_as_tool_call` above).
+# ---------------------------------------------------------------------------
+
+
+_BARE_SINGLE = (
+    "Thinking.\n<function=Agent>\n"
+    "<parameter=description>\nfind bug\n</parameter>\n"
+    "<parameter=prompt>\nlook at code\n</parameter>\n"
+    "<parameter=subagent_type>\nExplore\n</parameter>\n"
+    "</function>"
+)
+
+_BARE_TWO = (
+    "Step 1.\n<function=Read>\n<parameter=file_path>\n/a.py\n</parameter>\n</function>\n"
+    "Step 2.\n<function=Agent>\n<parameter=description>\nfind bug\n</parameter>\n"
+    "<parameter=prompt>\nlook\n</parameter>\n<parameter=subagent_type>\nExplore\n</parameter>\n"
+    "</function>"
+)
+
+
+@pytest.mark.parametrize("chunk_size", [1, 5, 7, 24, 256])
+def test_streaming_bare_function_without_tool_call_wrapper(chunk_size):
+    """A bare <function=...> block must stream into a structured tool call.
+
+    Pins down the contract that the model can drop the outer <tool_call>
+    wrapper (a documented Qwen3-Coder failure mode under heavy CC load)
+    and the streaming parser still emits a correct tool call with
+    name + arguments, regardless of how the input is chunked.
+    """
+    parser = Qwen3XMLToolParser(None)
+    expected = _expected_calls(_BARE_SINGLE, parser)
+    assert expected == [
+        {
+            "name": "Agent",
+            "arguments": {
+                "description": "find bug",
+                "prompt": "look at code",
+                "subagent_type": "Explore",
+            },
+        }
+    ]
+    parser = Qwen3XMLToolParser(None)
+    streamed = _stream(parser, _fixed_chunks(_BARE_SINGLE, chunk_size))
+    streamed_calls = [
+        {"name": tc["name"], "arguments": json.loads(tc["arguments"])}
+        for tc in streamed["tool_calls"]
+        if tc["name"]
+    ]
+    assert streamed_calls == expected
+    # No leaked tag fragments in user-visible content.
+    for fragment in ("<function=", "</function>", "<parameter=", "</parameter>"):
+        assert (
+            fragment not in streamed["content"]
+        ), f"leaked tag fragment {fragment!r} in streamed content"
+
+
+@pytest.mark.parametrize("chunk_size", [1, 5, 7, 24, 256])
+def test_streaming_two_sequential_bare_functions(chunk_size):
+    """Two bare <function=...> blocks back-to-back must become two distinct
+    tool calls with independent indexes and ids.
+
+    Without the implicit-wrapper close, the second function would reuse
+    the first call's id/index and the merged stream would emit a single
+    malformed call with doubled brace closers.
+    """
+    parser = Qwen3XMLToolParser(None)
+    expected = _expected_calls(_BARE_TWO, parser)
+    assert expected == [
+        {"name": "Read", "arguments": {"file_path": "/a.py"}},
+        {
+            "name": "Agent",
+            "arguments": {
+                "description": "find bug",
+                "prompt": "look",
+                "subagent_type": "Explore",
+            },
+        },
+    ]
+    parser = Qwen3XMLToolParser(None)
+    streamed = _stream(parser, _fixed_chunks(_BARE_TWO, chunk_size))
+    streamed_calls = [
+        {"name": tc["name"], "arguments": json.loads(tc["arguments"])}
+        for tc in streamed["tool_calls"]
+        if tc["name"]
     ]
     assert streamed_calls == expected

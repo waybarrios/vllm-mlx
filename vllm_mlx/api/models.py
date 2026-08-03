@@ -9,11 +9,12 @@ These models define the request and response schemas for:
 - MCP (Model Context Protocol) integration
 """
 
+import re
 import time
 import uuid
 from typing import Any
 
-from pydantic import AliasChoices, BaseModel, Field, model_serializer
+from pydantic import AliasChoices, BaseModel, Field, model_serializer, model_validator
 
 # =============================================================================
 # Content Types (for multimodal messages)
@@ -88,6 +89,9 @@ class Message(BaseModel):
 # =============================================================================
 
 
+_OPENAI_FUNCTION_NAME_RE = re.compile(r"[A-Za-z0-9_-]{1,64}")
+
+
 class FunctionCall(BaseModel):
     """A function call with name and arguments."""
 
@@ -108,6 +112,15 @@ class ToolDefinition(BaseModel):
 
     type: str = "function"
     function: dict
+
+    @model_validator(mode="after")
+    def _validate_openai_function_name(self):
+        if self.type != "function":
+            return self
+        name = self.function.get("name")
+        if not isinstance(name, str) or not _OPENAI_FUNCTION_NAME_RE.fullmatch(name):
+            raise ValueError("function.name must match ^[A-Za-z0-9_-]{1,64}$")
+        return self
 
 
 # =============================================================================
@@ -173,6 +186,8 @@ class ChatCompletionRequest(BaseModel):
     tool_choice: str | dict | None = None  # "auto", "none", or specific tool
     # Structured output
     response_format: ResponseFormat | dict | None = None
+    # OpenAI-compatible token bias map: token id string -> bias value
+    logit_bias: dict[str, float] | None = None
     # Extra kwargs forwarded to tokenizer.apply_chat_template
     chat_template_kwargs: dict[str, Any] | None = None
     # MLLM-specific parameters
@@ -186,6 +201,8 @@ class ChatCompletionRequest(BaseModel):
     specprefill: bool | None = None
     # SpecPrefill: per-request keep percentage (0.0-1.0, None = use server default)
     specprefill_keep_pct: float | None = None
+    # SpecPrefill: per-request evenly spaced backbone percentage.
+    specprefill_backbone_pct: float | None = None
     # Enable/disable thinking mode (None = server default, typically True)
     enable_thinking: bool | None = None
     # MLLM assistant-drafter path: opt in to using a configured drafter.
@@ -243,6 +260,13 @@ class Usage(BaseModel):
     total_tokens: int = 0
 
 
+class GenerationMetadata(BaseModel):
+    """Optional generation diagnostics emitted for feature-bearing requests."""
+
+    no_final_content_watchdog_tokens: int | None = None
+    no_final_content_watchdog_enforced: bool = False
+
+
 class ChatCompletionResponse(BaseModel):
     """Response for chat completion."""
 
@@ -252,6 +276,7 @@ class ChatCompletionResponse(BaseModel):
     model: str
     choices: list[ChatCompletionChoice]
     usage: Usage = Field(default_factory=Usage)
+    generation_metadata: GenerationMetadata | None = None
 
 
 # =============================================================================
@@ -280,6 +305,8 @@ class CompletionRequest(BaseModel):
     specprefill: bool | None = None
     # SpecPrefill: per-request keep percentage (0.0-1.0, None = use server default)
     specprefill_keep_pct: float | None = None
+    # SpecPrefill: per-request evenly spaced backbone percentage.
+    specprefill_backbone_pct: float | None = None
 
 
 class CompletionChoice(BaseModel):

@@ -87,3 +87,11 @@ Usa un modelo cuantizado más pequeno:
 ```bash
 vllm-mlx serve mlx-community/Llama-3.2-1B-Instruct-4bit
 ```
+
+### Interrupciones del servidor en ejecuciones largas (suspensión de macOS)
+
+Tu máquina macOS puede entrar en suspensión durante ejecuciones largas como servidor. Prueba usar `caffeinate` para evitar la suspensión:
+
+```bash
+caffeinate -dimsu
+```

@@ -43,6 +43,8 @@ class LMFormatEnforcerNotAvailableError(RuntimeError):
 # No eviction policy — agent workloads typically reuse a small fixed set of
 # tool schemas, so unbounded growth is not a realistic concern.
 _parser_cache: dict[str, tuple[dict, Any]] = {}
+_MAX_NONPROGRESS_WHITESPACE_CHARS = 256
+_JSON_WHITESPACE = frozenset(" \t\r\n")
 
 
 def _canonical_schema_key(schema: dict | None) -> str:
@@ -260,6 +262,41 @@ def _walk_properties(node: Any, names: set[str]) -> None:
         if key in node and isinstance(node[key], list):
             for item in node[key]:
                 _walk_properties(item, names)
+
+
+def _complete_json_eos_logits(
+    eos_set: set[int],
+    suffix: list[int],
+    logits: mx.array,
+    is_complete_json,
+    build_allow_mask,
+) -> mx.array | None:
+    if not eos_set or not is_complete_json(suffix):
+        return None
+    return _eos_logits(eos_set, logits, build_allow_mask)
+
+
+def _eos_logits(
+    eos_set: set[int],
+    logits: mx.array,
+    build_allow_mask,
+) -> mx.array | None:
+    if not eos_set:
+        return None
+    actual_vocab = logits.shape[-1]
+    mask = build_allow_mask(sorted(eos_set), actual_vocab)
+    if logits.ndim == 2 and logits.shape[0] == 1:
+        mask = mask[None, :]
+    return logits + mask
+
+
+def _eos_logits_or_original(
+    eos_set: set[int],
+    logits: mx.array,
+    build_allow_mask,
+) -> mx.array:
+    masked = _eos_logits(eos_set, logits, build_allow_mask)
+    return logits if masked is None else masked
 
 
 class JSONSchemaLogitsProcessor:
@@ -724,6 +761,37 @@ class JSONSchemaLogitsProcessor:
         """Return True if *prefix* is a prefix of at least one valid key name."""
         return any(name.startswith(prefix) for name in self._valid_key_names)
 
+    def _filter_nonprogress_whitespace_tokens(
+        self, suffix: list[int], allowed: list[int]
+    ) -> list[int]:
+        """Stop constrained JSON from spending a long run on pure whitespace.
+
+        JSON permits arbitrary whitespace around structural tokens. That is
+        valid, but with non-streaming requests a model can keep selecting
+        whitespace-only tokens for minutes without producing useful JSON
+        content. Once the decoded suffix has a long trailing whitespace run
+        outside a string, remove pure-whitespace tokens from the next-step
+        allowed set so generation must make structural/content progress.
+        """
+        text = self._decode_suffix(suffix)
+        if text is None or not text:
+            return allowed
+
+        trailing = len(text) - len(text.rstrip(" \t\r\n"))
+        if trailing < _MAX_NONPROGRESS_WHITESPACE_CHARS:
+            return allowed
+
+        filtered: list[int] = []
+        for tok_id in allowed:
+            tok_text = self._decode_token_cached(tok_id)
+            if tok_text is None:
+                filtered.append(tok_id)
+                continue
+            if tok_text == "" or all(ch in _JSON_WHITESPACE for ch in tok_text):
+                continue
+            filtered.append(tok_id)
+        return filtered if filtered else allowed
+
     def _build_allow_mask(self, allowed: list[int], vocab_size: int) -> mx.array:
         """
         Build a 1-D mask of length ``vocab_size`` where allowed positions are
@@ -750,13 +818,11 @@ class JSONSchemaLogitsProcessor:
             # generation produces garbage.  Without this cap the model would
             # generate up to max_tokens (often 262 K) of useless output,
             # blocking the slot for minutes/hours.
-            if self._eos_set:
-                actual_vocab = logits.shape[-1]
-                mask = self._build_allow_mask(sorted(self._eos_set), actual_vocab)
-                if logits.ndim == 2 and logits.shape[0] == 1:
-                    mask = mask[None, :]
-                return logits + mask
-            return logits
+            return _eos_logits_or_original(
+                self._eos_set,
+                logits,
+                self._build_allow_mask,
+            )
 
         try:
             tokens_list = tokens.tolist() if hasattr(tokens, "tolist") else list(tokens)
@@ -766,6 +832,16 @@ class JSONSchemaLogitsProcessor:
                 tokens_list = tokens_list[0]
 
             suffix = self._suffix(tokens_list)
+            eos_logits = _complete_json_eos_logits(
+                self._eos_set,
+                suffix,
+                logits,
+                self._suffix_is_complete_json,
+                self._build_allow_mask,
+            )
+            if eos_logits is not None:
+                return eos_logits
+
             # Use prompt_len directly instead of O(n) list comparison.
             pass_to_enforcer = suffix if self._prompt_len else tokens_list
             allowed_result = self._enforcer.get_allowed_tokens(pass_to_enforcer)
@@ -779,6 +855,10 @@ class JSONSchemaLogitsProcessor:
             # incremental JSON context state and bracket depth counters
             # are up-to-date for the _suffix_is_complete_json pre-check).
             context = self._get_json_context(suffix)
+            if not self._json_ctx_in_string:
+                allowed_list = self._filter_nonprogress_whitespace_tokens(
+                    suffix, allowed_list
+                )
             if context in ("key_start", "in_key"):
                 allowed_list = self._filter_at_key_context(
                     context, suffix, allowed_list

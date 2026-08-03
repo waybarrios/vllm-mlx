@@ -50,7 +50,7 @@ def classifier_forward(
     ln_b = weights[f"{prefix}.embeddings.LayerNorm.bias"]
 
     batch_size, seq_len = input_ids.shape
-    position_ids = mx.arange(seq_len)[None, :]  # (1, seq_len)
+    position_ids = _position_ids_for_config(config, input_ids, attention_mask)
     token_type_ids = mx.zeros_like(input_ids)
 
     hidden = word_emb[input_ids] + pos_emb[position_ids] + tok_type_emb[token_type_ids]
@@ -80,11 +80,46 @@ def classifier_forward(
         pooled = cls_hidden
 
     # --- Classifier head ---
-    clf_w = weights["classifier.weight"]
-    clf_b = weights["classifier.bias"]
-    logits = pooled @ clf_w.T + clf_b  # (batch, num_labels)
+    logits = _classification_head_forward(pooled, weights)
 
     return logits
+
+
+def _position_ids_for_config(
+    config: dict,
+    input_ids: mx.array,
+    attention_mask: mx.array | None,
+) -> mx.array:
+    """Build BERT or RoBERTa-family absolute position IDs."""
+    _, seq_len = input_ids.shape
+    model_type = str(config.get("model_type", "")).lower()
+    if model_type not in {"roberta", "xlm-roberta", "xlm_roberta"}:
+        return mx.arange(seq_len)[None, :]
+
+    padding_idx = int(config.get("pad_token_id", 1))
+    if attention_mask is None:
+        return mx.arange(padding_idx + 1, seq_len + padding_idx + 1)[None, :]
+
+    mask = attention_mask.astype(mx.int32)
+    positions = mx.cumsum(mask, axis=1) * mask + padding_idx
+    return positions.astype(mx.int32)
+
+
+def _classification_head_forward(
+    pooled: mx.array,
+    weights: dict[str, mx.array],
+) -> mx.array:
+    """Run BERT flat or XLM-RoBERTa two-layer sequence-classification head."""
+    if "classifier.dense.weight" in weights:
+        hidden = pooled @ weights["classifier.dense.weight"].T
+        hidden = hidden + weights["classifier.dense.bias"]
+        hidden = mx.tanh(hidden)
+        return (
+            hidden @ weights["classifier.out_proj.weight"].T
+            + weights["classifier.out_proj.bias"]
+        )
+
+    return pooled @ weights["classifier.weight"].T + weights["classifier.bias"]
 
 
 def _detect_prefix(weights: dict) -> str:

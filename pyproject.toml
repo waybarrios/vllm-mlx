@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "vllm-mlx"
-version = "0.4.0rc1"
+version = "0.4.0"
 description = "vLLM-like inference for Apple Silicon - GPU-accelerated Text, Image, Video & Audio on Mac"
 readme = "README.md"
 license = {text = "Apache-2.0"}
@@ -29,8 +29,8 @@ classifiers = [
 
 dependencies = [
     "mlx>=0.29.0",
-    "mlx-lm>=0.31.0",  # 0.31+ required for ArraysCache native batching (hybrid models)
-    "mlx-vlm>=0.4.3",  # 0.4.3+ required for Gemma 4 support
+    "mlx-lm>=0.31.3",  # 0.31.3+ required by current mlx-vlm runtime support
+    "mlx-vlm>=0.6.5",  # 0.6.5+ fixes Qwen3.5 sanitize double-run (#674)
     "transformers>=5.0.0",  # mlx-lm 0.30.5+ requires transformers 5.0 (rc3 bug fixed in stable)
     "tokenizers>=0.19.0",
     "huggingface-hub>=0.23.0",
@@ -49,6 +49,7 @@ dependencies = [
     "psutil>=5.9.0",
     # Server
     "fastapi>=0.100.0",
+    "starlette>=1.0.1",
     "uvicorn>=0.23.0",
     "prometheus-client>=0.20.0",
     # MCP (Model Context Protocol) support
@@ -80,6 +81,13 @@ vllm = [
 vision = [
     "torch>=2.8.0",
     "torchvision>=0.23.0",
+]
+# Harmony prompt rendering for GPT-OSS models (see #568). With this installed
+# and ``--tool-call-parser harmony``/``gpt-oss`` set, the engine routes prompt
+# building through OpenAI's canonical renderer instead of the Jinja chat
+# template (bypasses the bracket-text fallback that loses ``tool_calls``).
+harmony = [
+    "openai-harmony>=0.0.8",
 ]
 # Audio dependencies for TTS/STT (mlx-audio)
 audio = [

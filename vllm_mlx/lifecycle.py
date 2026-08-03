@@ -40,6 +40,7 @@ class ModelSpec:
     specprefill_enabled: bool = False
     specprefill_threshold: int = 8192
     specprefill_keep_pct: float = 0.3
+    specprefill_backbone_pct: float = 0.0
     specprefill_draft_model: str | None = None
 
 

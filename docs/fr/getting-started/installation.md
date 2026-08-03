@@ -87,3 +87,11 @@ Utilisez un modèle quantifié plus petit :
 ```bash
 vllm-mlx serve mlx-community/Llama-3.2-1B-Instruct-4bit
 ```
+
+### Interruptions du serveur pendant les exécutions longues (mise en veille de macOS)
+
+Votre machine macOS peut passer en veille pendant de longues exécutions en tant que serveur. Essayez d'utiliser `caffeinate` pour empêcher la mise en veille :
+
+```bash
+caffeinate -dimsu
+```

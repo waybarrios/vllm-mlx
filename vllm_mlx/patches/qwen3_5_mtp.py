@@ -25,6 +25,17 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
+_MTP_KEY_PREFIXES = ("mtp.", "language_model.mtp.")
+
+
+def _strip_mtp_key_prefix(key: str) -> str | None:
+    """Return an MTP-relative key for supported standalone shard layouts."""
+    for prefix in _MTP_KEY_PREFIXES:
+        if key.startswith(prefix):
+            return key.removeprefix(prefix)
+    return None
+
+
 _QWEN_MTP_RMSNORM_WEIGHT_SUFFIXES = (
     "input_layernorm.weight",
     "post_attention_layernorm.weight",
@@ -231,7 +242,9 @@ def inject_mtp_support(model: Any, model_path, config: dict) -> bool:
     )
     raw = mx.load(str(mtp_file))
     raw_mtp = {
-        k.removeprefix("mtp."): v for k, v in raw.items() if k.startswith("mtp.")
+        clean: value
+        for key, value in raw.items()
+        if (clean := _strip_mtp_key_prefix(key)) is not None
     }
     del raw
 

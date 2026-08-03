@@ -322,7 +322,12 @@ class TestLayerSerializer:
 
         serializer = KVCacheSerializer()
         file_path = str(tmp_path / "layer_0.safetensors")
-        metadata = serializer.serialize_layer(layer, 0, file_path)
+        # serialize_layer now expects a snapshot (CPU-only dict) produced by
+        # snapshot_layer, not the raw MLX-backed layer. This mirrors the
+        # producer/writer thread split: snapshot runs on the request thread,
+        # serialize runs on the SSD writer thread with only the snapshot.
+        snapshot = serializer.snapshot_layer(layer)
+        metadata = serializer.serialize_layer(snapshot, 0, file_path)
 
         assert os.path.exists(file_path)
         assert metadata["layer_type"] == "KVCache"
@@ -346,7 +351,10 @@ class TestLayerSerializer:
 
         serializer = ArraysCacheSerializer()
         file_path = str(tmp_path / "layer_0.safetensors")
-        metadata = serializer.serialize_layer(layer, 0, file_path)
+        # See KVCacheSerializer round-trip test: snapshot is the producer-
+        # side step, serialize is the writer-side step.
+        snapshot = serializer.snapshot_layer(layer)
+        metadata = serializer.serialize_layer(snapshot, 0, file_path)
 
         assert os.path.exists(file_path)
         assert metadata["layer_type"] == "ArraysCache"
@@ -372,6 +380,88 @@ class TestLayerSerializer:
     def test_get_serializer_unknown_raises(self):
         with pytest.raises(ValueError, match="Unsupported"):
             get_serializer_for_layer("not a cache layer")
+
+    def test_support_matrix_includes_quantized_kv_cache(self):
+        """SUPPORT_MATRIX must surface both quantized cache types so the
+        diagnostics table reflects what enqueue_spill's dequant path handles."""
+        assert (
+            SERIALIZER_SUPPORT_MATRIX["QuantizedKVCache"]
+            == "supported_via_dequant_on_spill"
+        )
+        assert (
+            SERIALIZER_SUPPORT_MATRIX["_QuantizedCacheWrapper"]
+            == "supported_via_dequant_on_spill"
+        )
+
+    def test_snapshot_layer_honors_original_dtype_sentinel(self):
+        """When enqueue_spill's dequant path stashed a pre-cast dtype on the
+        layer, snapshot_layer must surface it in the snapshot — without this,
+        the reload path leaves the model holding fp16 KV where it computed
+        bf16. Regression for the dtype-round-trip gap @waybarrios flagged on
+        PR #605 (the fp16-cast layers carried no dtype hint because
+        _mx_to_numpy_safe only sets a hint on its own upcast path)."""
+        keys = MockMLXArray(np.random.randn(1, 8, 4, 16).astype(np.float16))
+        values = MockMLXArray(np.random.randn(1, 8, 4, 16).astype(np.float16))
+        layer = MockKVCacheLayer(keys=keys, values=values, offset=4)
+        layer._ssd_keys_original_dtype = "bfloat16"
+        layer._ssd_values_original_dtype = "bfloat16"
+
+        snapshot = KVCacheSerializer().snapshot_layer(layer)
+
+        assert snapshot["keys_original_dtype"] == "bfloat16"
+        assert snapshot["values_original_dtype"] == "bfloat16"
+
+    def test_snapshot_layer_sentinel_overrides_autodetect(self):
+        """When both the sentinel and the _mx_to_numpy_safe autodetect produce
+        a dtype, the explicit sentinel wins. This pins down the precedence so
+        a future cast-chain (e.g. bf16 → fp16 → bf16 round-trip pre-snapshot)
+        can't silently lose the original dtype."""
+
+        class _BF16RaisingArray(MockMLXArray):
+            def __init__(self, data):
+                super().__init__(data)
+                # Simulate the bf16 buffer-protocol RuntimeError so
+                # _mx_to_numpy_safe reports "bfloat16" via autodetect; the
+                # sentinel below should still win.
+                self.dtype = type(
+                    "dtype",
+                    (),
+                    {"size": 2, "__str__": lambda self: "mlx.core.bfloat16"},
+                )()
+
+            def __array__(self):
+                raise RuntimeError("buffer format string mismatch")
+
+            def astype(self, _dt):
+                return MockMLXArray(self._data)
+
+        keys = _BF16RaisingArray(np.random.randn(1, 4, 2, 8).astype(np.float32))
+        values = _BF16RaisingArray(np.random.randn(1, 4, 2, 8).astype(np.float32))
+        layer = MockKVCacheLayer(keys=keys, values=values, offset=2)
+        layer._ssd_keys_original_dtype = "bfloat16"
+        layer._ssd_values_original_dtype = "bfloat16"
+
+        snapshot = KVCacheSerializer().snapshot_layer(layer)
+
+        # Sentinel must win over the upcast-recovered hint either way; both
+        # paths point to bfloat16 here, but the assertion guards that the
+        # sentinel branch is the one actually consulted.
+        assert snapshot["keys_original_dtype"] == "bfloat16"
+        assert snapshot["values_original_dtype"] == "bfloat16"
+
+    def test_snapshot_layer_no_sentinel_falls_back_to_autodetect(self):
+        """Without a sentinel, snapshot_layer must keep the prior behavior:
+        plain fp16/fp32 layers record no dtype hint (None), bf16 layers get
+        the autodetected upcast dtype via _mx_to_numpy_safe. Guards against
+        the sentinel logic eating the plain path."""
+        keys = MockMLXArray(np.random.randn(1, 4, 4, 8).astype(np.float16))
+        values = MockMLXArray(np.random.randn(1, 4, 4, 8).astype(np.float16))
+        layer = MockKVCacheLayer(keys=keys, values=values, offset=4)
+
+        snapshot = KVCacheSerializer().snapshot_layer(layer)
+
+        assert "keys_original_dtype" not in snapshot
+        assert "values_original_dtype" not in snapshot
 
 
 from vllm_mlx.ssd_cache import SSDCacheTier
@@ -571,7 +661,9 @@ class TestSpillPath:
 
     def test_evict_lru_calls_ssd_spill(self, tmp_path):
         model = MagicMock()
-        config = MemoryCacheConfig(max_memory_mb=1, max_entries=3)
+        # min_prefix_tokens=1: test uses 10-token sequences (prod default 128
+        # would silently reject every store()).
+        config = MemoryCacheConfig(max_memory_mb=1, max_entries=3, min_prefix_tokens=1)
         cache = MemoryAwarePrefixCache(model, config)
 
         ssd_config = SSDCacheConfig(cache_dir=str(tmp_path / "spill_test"))
@@ -603,7 +695,7 @@ class TestSpillPath:
     def test_evict_without_ssd_tier_still_works(self):
         """Eviction without SSD tier should work as before (discard)."""
         model = MagicMock()
-        config = MemoryCacheConfig(max_memory_mb=1, max_entries=2)
+        config = MemoryCacheConfig(max_memory_mb=1, max_entries=2, min_prefix_tokens=1)
         cache = MemoryAwarePrefixCache(model, config)
 
         for i in range(5):
@@ -612,6 +704,57 @@ class TestSpillPath:
 
         # Should not raise, just discard
         assert len(cache) <= 2
+
+    def test_snapshot_runs_on_caller_thread(self, tmp_path):
+        """Regression: enqueue_spill must materialize layers on the caller
+        thread (real mx.array hard-aborts the process if accessed off the
+        Stream(gpu, N) it was created on)."""
+        import threading as _threading
+
+        creator_thread_id = _threading.get_ident()
+
+        class ThreadBoundArray:
+            # Python-level proxy for the MLX cross-thread Stream abort.
+            def __init__(self, data, owner_tid):
+                self._data = data
+                self._owner_tid = owner_tid
+
+            def __array__(self):
+                if _threading.get_ident() != self._owner_tid:
+                    raise RuntimeError("accessed from wrong thread")
+                return self._data
+
+        class ThreadBoundKV:
+            def __init__(self, tid):
+                self.keys = ThreadBoundArray(
+                    np.zeros((1, 1, 1, 1), dtype=np.float16), tid
+                )
+                self.values = ThreadBoundArray(
+                    np.zeros((1, 1, 1, 1), dtype=np.float16), tid
+                )
+                self.offset = 1
+
+        ssd_config = SSDCacheConfig(cache_dir=str(tmp_path / "snapshot_test"))
+        ssd_tier = SSDCacheTier(ssd_config)
+        ssd_tier.start_writer()
+
+        try:
+            tokens = tuple(range(0, 200))
+            enqueued = ssd_tier.enqueue_spill(
+                tokens,
+                [ThreadBoundKV(creator_thread_id)],
+                memory_bytes=64,
+            )
+            assert enqueued is True
+
+            deadline = time.monotonic() + 5.0
+            while time.monotonic() < deadline:
+                if ssd_tier._stats.spill_count >= 1:
+                    break
+                time.sleep(0.05)
+            assert ssd_tier._stats.spill_count == 1
+        finally:
+            ssd_tier.close()
 
 
 import asyncio
@@ -836,7 +979,7 @@ class TestMemoryCacheSSDCheck:
 
     def test_check_ssd_returns_candidate_on_miss(self, tmp_path):
         model = MagicMock()
-        config = MemoryCacheConfig(max_memory_mb=1, max_entries=2)
+        config = MemoryCacheConfig(max_memory_mb=1, max_entries=2, min_prefix_tokens=1)
         cache = MemoryAwarePrefixCache(model, config)
 
         ssd_config = SSDCacheConfig(cache_dir=str(tmp_path / "check_ssd_test"))
@@ -870,7 +1013,7 @@ class TestMemoryCacheSSDCheck:
 
     def test_check_ssd_returns_none_without_tier(self):
         model = MagicMock()
-        config = MemoryCacheConfig(max_memory_mb=1)
+        config = MemoryCacheConfig(max_memory_mb=1, min_prefix_tokens=1)
         cache = MemoryAwarePrefixCache(model, config)
 
         candidate = cache.check_ssd([1, 2, 3])
@@ -879,7 +1022,7 @@ class TestMemoryCacheSSDCheck:
     def test_check_ssd_returns_none_on_ram_hit(self, tmp_path):
         """When RAM has a hit, check_ssd should return None (not needed)."""
         model = MagicMock()
-        config = MemoryCacheConfig(max_memory_mb=1)
+        config = MemoryCacheConfig(max_memory_mb=1, min_prefix_tokens=1)
         cache = MemoryAwarePrefixCache(model, config)
 
         kv = [MockKVCacheForSpill(1000)]
@@ -901,7 +1044,7 @@ class TestIntegrationSpillAndFetch:
     def cache_with_ssd(self, tmp_path):
         """RAM cache + SSD tier, small limits to force eviction."""
         model = MagicMock()
-        config = MemoryCacheConfig(max_memory_mb=1, max_entries=2)
+        config = MemoryCacheConfig(max_memory_mb=1, max_entries=2, min_prefix_tokens=1)
         ram_cache = MemoryAwarePrefixCache(model, config)
 
         ssd_config = SSDCacheConfig(

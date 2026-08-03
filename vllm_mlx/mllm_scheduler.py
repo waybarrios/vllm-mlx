@@ -85,6 +85,11 @@ class MLLMSchedulerConfig:
     chunked_prefill_tokens: int = 0
     # Maximum KV cache size per sequence (0 = unbounded; >0 enables RotatingKVCache)
     max_kv_size: int = 0
+    # SSD cold tier for the prefix cache (mirrors SchedulerConfig).
+    # None = disabled.  When set, the MLLM MemoryAwarePrefixCache spills
+    # evicted entries to disk and promotes them back on hit.
+    ssd_cache_dir: Optional[str] = None
+    ssd_cache_max_gb: float = 10.0
 
 
 @dataclass
@@ -320,6 +325,31 @@ class MLLMScheduler:
                 prefix_cache_config=prefix_cache_config,
                 max_kv_size=self.config.max_kv_size,
             )
+
+            # Wire the SSD cold tier onto the MLLM prefix cache, mirroring the
+            # standard Scheduler path (see scheduler.py ~1226).  Without this
+            # --ssd-cache-dir is a silent no-op for MLLM models (Qwen3.5 et al.)
+            # because the SSD tier was only ever attached to the standard
+            # Scheduler's MemoryAwarePrefixCache.  No-op when the flag is unset.
+            self._ssd_tier = None
+            prefix_cache = getattr(self.batch_generator, "prefix_cache", None)
+            if self.config.ssd_cache_dir is not None and prefix_cache is not None:
+                from .ssd_cache import SSDCacheConfig, SSDCacheTier
+
+                ssd_config = SSDCacheConfig(
+                    cache_dir=self.config.ssd_cache_dir,
+                    max_size_gb=self.config.ssd_cache_max_gb,
+                )
+                self._ssd_tier = SSDCacheTier(ssd_config)
+                self._ssd_tier.start_writer()
+                self._ssd_tier.reconcile()
+                prefix_cache.set_ssd_tier(self._ssd_tier)
+                logger.info(
+                    "[mllm] SSD cache tier enabled on MLLM prefix cache: "
+                    "dir=%s, max=%sGB",
+                    self.config.ssd_cache_dir,
+                    self.config.ssd_cache_max_gb,
+                )
 
             # Install chunked prefill BEFORE MTP (MTP wraps _next,
             # chunked replaces it — MTP then wraps the chunked version)

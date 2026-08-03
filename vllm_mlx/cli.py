@@ -250,6 +250,8 @@ def serve_command(args):
 
     # Build scheduler config for batched mode
     scheduler_config = None
+    specprefill_backbone_pct = getattr(args, "specprefill_backbone_pct", 0.0)
+
     if args.continuous_batching:
         from .scheduler import SchedulerConfig
 
@@ -330,7 +332,8 @@ def serve_command(args):
             print(
                 f"SpecPrefill: enabled (draft={args.specprefill_draft_model}, "
                 f"threshold={args.specprefill_threshold}, "
-                f"keep={args.specprefill_keep_pct*100:.0f}%)"
+                f"keep={args.specprefill_keep_pct*100:.0f}%, "
+                f"backbone={specprefill_backbone_pct*100:.0f}%)"
             )
         if mllm_draft_model:
             print(
@@ -348,6 +351,7 @@ def serve_command(args):
             specprefill_enabled=args.specprefill,
             specprefill_threshold=args.specprefill_threshold,
             specprefill_keep_pct=args.specprefill_keep_pct,
+            specprefill_backbone_pct=specprefill_backbone_pct,
             specprefill_draft_model=args.specprefill_draft_model,
             stream_interval=args.stream_interval if args.continuous_batching else 1,
             gpu_memory_utilization=args.gpu_memory_utilization,
@@ -374,6 +378,7 @@ def serve_command(args):
             specprefill_enabled=args.specprefill,
             specprefill_threshold=args.specprefill_threshold,
             specprefill_keep_pct=args.specprefill_keep_pct,
+            specprefill_backbone_pct=specprefill_backbone_pct,
             specprefill_draft_model=args.specprefill_draft_model,
             mllm_draft_model=mllm_draft_model,
             mllm_draft_kind=mllm_draft_kind,
@@ -1239,6 +1244,13 @@ Examples:
         default=0.3,
         help="Fraction of tokens to keep during sparse prefill (default: 0.3). "
         "Lower = faster prefill but more quality loss.",
+    )
+    serve_parser.add_argument(
+        "--specprefill-backbone-pct",
+        type=float,
+        default=0.0,
+        help="Fraction of chunks reserved for evenly spaced sparse-prefill coverage "
+        "(default: 0.0).",
     )
     serve_parser.add_argument(
         "--specprefill-draft-model",

@@ -134,52 +134,98 @@ class QwenToolParser(ToolParser):
             cleaned_text = self.XML_PATTERN.sub("", cleaned_text).strip()
 
         # Try function-style: <function=name><parameter=key>value</parameter></function>
-        # Qwen3.5 generates this format natively.
-        if not tool_calls:
-            func_matches = self.FUNCTION_PATTERN.findall(cleaned_text)
-            for name, params_block in func_matches:
-                # Try JSON arguments first (e.g. <function=name>{"key": "val"}</function>)
-                params_block_stripped = params_block.strip()
-                if params_block_stripped.startswith("{"):
-                    try:
-                        arguments = json.loads(params_block_stripped)
-                        tool_calls.append(
-                            {
-                                "id": generate_tool_id(),
-                                "name": name.strip(),
-                                "arguments": json.dumps(arguments, ensure_ascii=False),
-                            }
-                        )
-                        continue
-                    except json.JSONDecodeError:
-                        pass
-                # Parse <parameter=key>value</parameter> tags
-                params = self.PARAM_PATTERN.findall(params_block)
-                arguments = {}
-                for p_name, p_value in params:
-                    arguments[p_name.strip()] = _parse_param_value(p_value.strip())
-                tool_calls.append(
-                    {
-                        "id": generate_tool_id(),
-                        "name": name.strip(),
-                        "arguments": json.dumps(arguments, ensure_ascii=False),
-                    }
-                )
-            if func_matches:
-                cleaned_text = self.FUNCTION_PATTERN.sub("", cleaned_text).strip()
+        # Qwen3.5/3.6 emit this format natively, sometimes wrapped in <tool_call>...
+        # </tool_call>. Always run this pass — earlier guards skipped it when an
+        # XML/bracket call had already been extracted, leaking the function-style
+        # markup of subsequent tool calls into `content` (multi-format mixed
+        # responses).
+        func_matches = self.FUNCTION_PATTERN.findall(cleaned_text)
+        for name, params_block in func_matches:
+            # Try JSON arguments first (e.g. <function=name>{"key": "val"}</function>)
+            params_block_stripped = params_block.strip()
+            if params_block_stripped.startswith("{"):
+                try:
+                    arguments = json.loads(params_block_stripped)
+                    tool_calls.append(
+                        {
+                            "id": generate_tool_id(),
+                            "name": name.strip(),
+                            "arguments": json.dumps(arguments, ensure_ascii=False),
+                        }
+                    )
+                    continue
+                except json.JSONDecodeError:
+                    pass
+            # Parse <parameter=key>value</parameter> tags
+            params = self.PARAM_PATTERN.findall(params_block)
+            arguments = {}
+            for p_name, p_value in params:
+                arguments[p_name.strip()] = _parse_param_value(p_value.strip())
+            tool_calls.append(
+                {
+                    "id": generate_tool_id(),
+                    "name": name.strip(),
+                    "arguments": json.dumps(arguments, ensure_ascii=False),
+                }
+            )
+        if func_matches:
+            cleaned_text = self.FUNCTION_PATTERN.sub("", cleaned_text).strip()
 
         if tool_calls:
             # Clean up empty <tool_call> wrappers left after function extraction
             cleaned_text = self.EMPTY_TOOL_CALL.sub("", cleaned_text).strip()
+            # Strip any trailing unclosed tool-call markup left when generation
+            # was truncated mid-call (finish_reason="length" hitting max_tokens).
+            cleaned_text = self._strip_unclosed_markup(cleaned_text)
             return ExtractedToolCallInformation(
                 tools_called=True,
                 tool_calls=tool_calls,
                 content=cleaned_text if cleaned_text else None,
             )
         else:
+            # No complete tool calls were extracted. If the output ends with a
+            # truncated tool-call marker (e.g. max_tokens hit mid <tool_call>...),
+            # strip it so callers don't see raw markup in `content`. We only
+            # strip the trailing partial — earlier complete sentences stay.
+            # Always return a string (empty if fully stripped) so the caller
+            # can distinguish "parser processed this" from "parser declined";
+            # `or None` would conflate stripped-to-empty with no-result and let
+            # a fallback path resurface the raw markup.
+            stripped = self._strip_unclosed_markup(model_output)
             return ExtractedToolCallInformation(
-                tools_called=False, tool_calls=[], content=model_output
+                tools_called=False, tool_calls=[], content=stripped
             )
+
+    @staticmethod
+    def _strip_unclosed_markup(text: str) -> str:
+        """Strip a trailing unclosed tool-call marker (truncated output).
+
+        When generation hits max_tokens mid-tool-call, a partial
+        ``<tool_call>``/``<function=``/``[Calling tool:`` marker remains
+        in the cleaned text. We locate the earliest such *unclosed* marker
+        and drop everything from there to the end so the API response
+        never carries raw markup.
+        """
+        if not text:
+            return text
+        earliest = len(text)
+
+        # <tool_call> without matching </tool_call>
+        idx = text.rfind("<tool_call>")
+        if idx >= 0 and "</tool_call>" not in text[idx:]:
+            earliest = min(earliest, idx)
+
+        # <function=...> without matching </function>
+        idx = text.rfind("<function=")
+        if idx >= 0 and "</function>" not in text[idx:]:
+            earliest = min(earliest, idx)
+
+        # [Calling tool: ... without matching )]
+        idx = text.rfind("[Calling tool:")
+        if idx >= 0 and ")]" not in text[idx:]:
+            earliest = min(earliest, idx)
+
+        return text[:earliest].rstrip()
 
     # Partial marker prefixes — when current_text ends with one of these,
     # we suppress output until the next token confirms or denies a tool call.

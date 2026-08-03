@@ -94,3 +94,11 @@ Use a smaller quantized model:
 ```bash
 vllm-mlx serve mlx-community/Llama-3.2-1B-Instruct-4bit
 ```
+
+### Server interruptions during long runs (macOS sleep)
+
+Your macOS machine may go to sleep during long-running server sessions. Try using `caffeinate` to prevent sleep:
+
+```bash
+caffeinate -dimsu
+```
