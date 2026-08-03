@@ -6068,6 +6068,11 @@ async def stream_chat_completion(
     tool_calls_detected = False
     tool_markup_possible = False  # Fast path: skip parsing until markers appear
     tool_parser = _get_streaming_tool_parser(request, engine)
+    # Whether any emitted chunk carried a terminal finish_reason. The engine's
+    # finished=True output can be swallowed by a parser `continue` below (e.g.
+    # a bare end-of-turn token arriving after a completed tool call); without
+    # the post-loop guard the stream would end with no finish_reason chunk.
+    finish_reason_emitted = False
 
     try:
         # Stream content
@@ -6187,6 +6192,9 @@ async def stream_chat_completion(
                                 usage=get_usage(output) if output.finished else None,
                             )
                             yield f"data: {chunk.model_dump_json()}\n\n"
+                            finish_reason_emitted = finish_reason_emitted or bool(
+                                output.finished
+                            )
                             continue
 
                         # Normal content from tool parser
@@ -6222,6 +6230,7 @@ async def stream_chat_completion(
                     usage=get_usage(output) if output.finished else None,
                 )
                 yield f"data: {chunk.model_dump_json()}\n\n"
+                finish_reason_emitted = finish_reason_emitted or bool(output.finished)
             else:
                 # Standard path without reasoning parsing
                 content = delta_text
@@ -6292,6 +6301,9 @@ async def stream_chat_completion(
                                 usage=get_usage(output) if output.finished else None,
                             )
                             yield f"data: {chunk.model_dump_json()}\n\n"
+                            finish_reason_emitted = finish_reason_emitted or bool(
+                                output.finished
+                            )
                             continue
 
                         # Normal content from tool parser
@@ -6326,6 +6338,7 @@ async def stream_chat_completion(
                     usage=get_usage(output) if output.finished else None,
                 )
                 yield f"data: {chunk.model_dump_json()}\n\n"
+                finish_reason_emitted = finish_reason_emitted or bool(output.finished)
 
         # Fallback: if tool parser accumulated text but never emitted tool_calls
         # (e.g., </tool_call> never arrived, or <function= block still incomplete)
@@ -6367,6 +6380,34 @@ async def stream_chat_completion(
                     ],
                 )
                 yield f"data: {tool_chunk.model_dump_json()}\n\n"
+                finish_reason_emitted = True
+
+        # Terminal-chunk guard: if the engine's finished output was swallowed
+        # by a parser `continue` above (e.g. a bare end-of-turn token arriving
+        # after a completed tool call), no chunk carried finish_reason and
+        # OpenAI clients abort with "stream ended without finish_reason".
+        # Emit the terminal chunk now.
+        if (
+            last_output is not None
+            and getattr(last_output, "finished", False)
+            and not finish_reason_emitted
+        ):
+            terminal_chunk = ChatCompletionChunk(
+                id=response_id,
+                model=_response_model_name(request.model),
+                choices=[
+                    ChatCompletionChunkChoice(
+                        delta=ChatCompletionChunkDelta(),
+                        finish_reason=(
+                            "tool_calls"
+                            if tool_calls_detected
+                            else (getattr(last_output, "finish_reason", None) or "stop")
+                        ),
+                    )
+                ],
+                usage=get_usage(last_output),
+            )
+            yield f"data: {terminal_chunk.model_dump_json()}\n\n"
 
         # Safety-net validation: if response_format was requested, verify the
         # accumulated output still parses.  When constrained decoding is active

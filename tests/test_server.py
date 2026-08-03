@@ -2200,6 +2200,188 @@ class TestStreamChatCompletion:
         }
 
     @pytest.mark.anyio
+    async def test_stream_terminal_finish_reason_when_tool_parser_suppresses_eot(
+        self, monkeypatch
+    ):
+        """A tool_calls stream must still end with finish_reason when the engine's
+        finished output is swallowed by the tool parser's `continue`.
+
+        Reproduces the gemma4 production failure: the model emits the complete
+        canonical call (end marker included) in one delta, then a bare <turn|>
+        end-of-turn token as the terminal output. The tool parser finds nothing
+        new in that delta and suppresses it — without a guard, no chunk ever
+        carries finish_reason and strict OpenAI clients abort with
+        "Stream ended without finish_reason". Ref: #672.
+        """
+        from vllm_mlx.engine.base import GenerationOutput
+        from vllm_mlx.server import (
+            ChatCompletionRequest,
+            Message,
+            stream_chat_completion,
+        )
+        import vllm_mlx.server as server
+
+        class FakeEngine:
+            model_name = "fake-engine"
+            tokenizer = None
+
+            async def stream_chat(self, messages, **kwargs):
+                chunks = [
+                    GenerationOutput(
+                        text="",
+                        new_text=(
+                            '<|tool_call>call:get_weather{<|"|>city<|"|>: '
+                            '<|"|>Paris<|"|>}<tool_call|>'
+                        ),
+                        finished=False,
+                    ),
+                    GenerationOutput(
+                        text="",
+                        new_text="<turn|>",
+                        finished=True,
+                        finish_reason="stop",
+                        prompt_tokens=11,
+                        completion_tokens=5,
+                    ),
+                ]
+                for chunk in chunks:
+                    yield chunk
+
+        monkeypatch.setattr(server, "_model_name", "served-model")
+        monkeypatch.setattr(server, "_reasoning_parser", None)
+        monkeypatch.setattr(server, "_enable_auto_tool_choice", True)
+        monkeypatch.setattr(server, "_tool_call_parser", "gemma4")
+        monkeypatch.setattr(server, "_tool_parser_instance", None)
+
+        request = ChatCompletionRequest(
+            model="request-model",
+            messages=[Message(role="user", content="weather in Paris?")],
+            tools=[
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "get_weather",
+                        "description": "Get weather",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"city": {"type": "string"}},
+                            "required": ["city"],
+                        },
+                    },
+                }
+            ],
+            stream=True,
+        )
+
+        chunks = [
+            chunk
+            async for chunk in stream_chat_completion(
+                FakeEngine(), request.messages, request
+            )
+        ]
+
+        payloads = [
+            json.loads(chunk.removeprefix("data: ").strip())
+            for chunk in chunks
+            if chunk != "data: [DONE]\n\n"
+        ]
+        tool_payloads = [
+            payload
+            for payload in payloads
+            if payload["choices"] and payload["choices"][0]["delta"].get("tool_calls")
+        ]
+
+        assert len(tool_payloads) == 1
+        assert payloads[-1]["choices"][0]["finish_reason"] == "tool_calls"
+
+    @pytest.mark.anyio
+    async def test_stream_terminal_finish_reason_when_reasoning_path_suppresses_eot(
+        self, monkeypatch
+    ):
+        """Same terminal-swallow class through the reasoning-parser branch:
+        the finished output is consumed by the tool parser after a completed
+        call, so the guard must emit the missing finish_reason chunk. Ref: #672.
+        """
+        from vllm_mlx.engine.base import GenerationOutput
+        from vllm_mlx.reasoning import DeltaMessage
+        from vllm_mlx.server import (
+            ChatCompletionRequest,
+            Message,
+            stream_chat_completion,
+        )
+        import vllm_mlx.server as server
+
+        class FakeEngine:
+            model_name = "fake-engine"
+
+            async def stream_chat(self, messages, **kwargs):
+                chunks = [
+                    GenerationOutput(
+                        text="",
+                        new_text=(
+                            '<|tool_call>call:search{<|"|>q<|"|>: <|"|>weather<|"|>}'
+                            "<tool_call|>"
+                        ),
+                        finished=False,
+                    ),
+                    GenerationOutput(
+                        text="",
+                        new_text="<turn|>",
+                        finished=True,
+                        finish_reason="stop",
+                        prompt_tokens=7,
+                        completion_tokens=3,
+                    ),
+                ]
+                for chunk in chunks:
+                    yield chunk
+
+        class FakeReasoningParser:
+            def reset_state(self):
+                pass
+
+            def extract_reasoning_streaming(
+                self, previous_text, current_text, delta_text
+            ):
+                return DeltaMessage(content=delta_text)
+
+        monkeypatch.setattr(server, "_model_name", "served-model")
+        monkeypatch.setattr(server, "_reasoning_parser", FakeReasoningParser())
+        monkeypatch.setattr(server, "_enable_auto_tool_choice", True)
+        monkeypatch.setattr(server, "_tool_call_parser", "gemma4")
+        monkeypatch.setattr(server, "_tool_parser_instance", None)
+
+        class FakeEngineWithTokenizer(FakeEngine):
+            tokenizer = None
+
+        request = ChatCompletionRequest(
+            model="request-model",
+            messages=[Message(role="user", content="hi")],
+            stream=True,
+        )
+
+        chunks = [
+            chunk
+            async for chunk in stream_chat_completion(
+                FakeEngineWithTokenizer(), request.messages, request
+            )
+        ]
+
+        payloads = [
+            json.loads(chunk.removeprefix("data: ").strip())
+            for chunk in chunks
+            if chunk != "data: [DONE]\n\n"
+        ]
+        tool_payloads = [
+            payload
+            for payload in payloads
+            if payload["choices"] and payload["choices"][0]["delta"].get("tool_calls")
+        ]
+
+        assert len(tool_payloads) == 1
+        assert payloads[-1]["choices"][0]["finish_reason"] == "tool_calls"
+
+    @pytest.mark.anyio
     async def test_reasoning_stream_redirects_gemma4_tool_marker(self, monkeypatch):
         """Gemma 4 tool markup inside reasoning should reach the tool parser."""
         from vllm_mlx.engine.base import GenerationOutput
