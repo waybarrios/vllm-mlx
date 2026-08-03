@@ -40,6 +40,28 @@ class TestQuantizeDequantize:
         for layer in quantized:
             assert isinstance(layer, _QuantizedCacheWrapper)
 
+    def test_quantize_materializes_packed_arrays(self, monkeypatch):
+        cache = _make_kv_cache(n_layers=2)
+        original_eval = mx.eval
+        eval_calls = []
+
+        def recording_eval(*arrays):
+            eval_calls.append(arrays)
+            return original_eval(*arrays)
+
+        monkeypatch.setattr(mx, "eval", recording_eval)
+        quantized = _quantize_cache(cache, bits=8, group_size=64)
+
+        assert len(eval_calls) == 1
+        expected = [
+            array
+            for layer in quantized
+            for group in (layer.keys, layer.values)
+            for array in group
+        ]
+        assert len(eval_calls[0]) == len(expected)
+        assert all(actual is wanted for actual, wanted in zip(eval_calls[0], expected))
+
     def test_dequantize_produces_kv_cache(self):
         cache = _make_kv_cache()
         quantized = _quantize_cache(cache, bits=8, group_size=64)

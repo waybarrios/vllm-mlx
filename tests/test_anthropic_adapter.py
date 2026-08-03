@@ -360,6 +360,39 @@ class TestAnthropicToOpenai:
         assert result.messages[1].role == "assistant"
         assert result.messages[2].role == "user"
 
+    def test_mid_stream_system_role_merges_to_single_leading_system(self):
+        msgs = [
+            AnthropicMessage(role="user", content="hello"),
+            AnthropicMessage(role="system", content="Be terse."),
+        ]
+        req = self._make_request(system="You are Claude Code.", messages=msgs)
+
+        result = anthropic_to_openai(req)
+
+        system_messages = [
+            message for message in result.messages if message.role == "system"
+        ]
+        assert len(system_messages) == 1
+        assert result.messages[0].role == "system"
+        assert result.messages[0].content == "You are Claude Code.\n\nBe terse."
+        assert result.messages[1].role == "user"
+        assert result.messages[1].content == "hello"
+
+    def test_mid_stream_system_role_without_top_level_system(self):
+        msgs = [
+            AnthropicMessage(role="user", content="hi"),
+            AnthropicMessage(role="system", content="Answer in one word."),
+        ]
+        req = self._make_request(messages=msgs)
+
+        result = anthropic_to_openai(req)
+
+        assert len(result.messages) == 2
+        assert result.messages[0].role == "system"
+        assert result.messages[0].content == "Answer in one word."
+        assert result.messages[1].role == "user"
+        assert result.messages[1].content == "hi"
+
 
 class TestOpenaiToAnthropic:
     """Tests for openai_to_anthropic conversion."""

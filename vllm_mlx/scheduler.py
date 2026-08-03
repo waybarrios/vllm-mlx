@@ -103,6 +103,9 @@ class SchedulerConfig:
     kv_cache_quantization_group_size: int = 64
     kv_cache_min_quantize_tokens: int = 256
 
+    # Cache TTL (time-based eviction)
+    cache_entry_ttl: int = 0  # 0 = no TTL, >0 = evict entries older than this many seconds
+
     # Paged cache settings (experimental - for memory efficiency)
     use_paged_cache: bool = (
         False  # Use BlockAwarePrefixCache instead of PrefixCacheManager
@@ -1213,6 +1216,7 @@ class Scheduler:
                     kv_bits=self.config.kv_cache_quantization_bits,
                     kv_group_size=self.config.kv_cache_quantization_group_size,
                     kv_min_quantize_tokens=self.config.kv_cache_min_quantize_tokens,
+                    cache_ttl_seconds=self.config.cache_entry_ttl,
                 )
                 self.memory_aware_cache = MemoryAwarePrefixCache(
                     model=model,
