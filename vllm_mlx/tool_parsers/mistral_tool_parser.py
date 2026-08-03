@@ -28,6 +28,8 @@ from .abstract_tool_parser import (
 
 ALPHANUMERIC = ascii_letters + digits
 
+_TOOL_NAME_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+$")
+
 
 def generate_mistral_tool_id() -> str:
     """
@@ -36,6 +38,11 @@ def generate_mistral_tool_id() -> str:
     Mistral Tool Call IDs must be alphanumeric with a length of 9.
     """
     return "".join(choices(ALPHANUMERIC, k=9))
+
+
+def _is_plain_tool_name(name: str) -> bool:
+    """Return True for names that are safe to dispatch as function calls."""
+    return bool(_TOOL_NAME_PATTERN.match(name))
 
 
 @ToolParserManager.register_module("mistral")
@@ -56,6 +63,7 @@ class MistralToolParser(ToolParser):
     BOT_TOKEN = "[TOOL_CALLS]"
     ARGS_TOKEN = "[ARGS]"
     TOOL_CALL_REGEX = re.compile(r"\[{.*}\]", re.DOTALL)
+    _NAME_BUFFER_LIMIT = 256
 
     def __init__(self, tokenizer=None):
         super().__init__(tokenizer)
@@ -64,6 +72,9 @@ class MistralToolParser(ToolParser):
         # tool call. See _parse_streaming_tool_delta.
         self._args_started: bool = False
         self._name_buffer: str = ""
+        # Set when the boundary marker never arrives and the withheld text
+        # was flushed as content; subsequent deltas pass through as content.
+        self._name_buffer_overflow: bool = False
         # One id per active tool call, generated when the call starts and
         # attached to whichever delta is the first to carry real content
         # (name and/or arguments) — that may not be the delta containing
@@ -76,8 +87,46 @@ class MistralToolParser(ToolParser):
         super().reset()
         self._args_started = False
         self._name_buffer = ""
+        self._name_buffer_overflow = False
         self._current_tool_call_id = None
         self._tool_call_id_emitted = False
+
+    def _split_on_tool_call_markers(self, text: str) -> list[str]:
+        """Split on [TOOL_CALLS] occurrences that are outside JSON strings.
+
+        A marker appearing inside a quoted string value is argument data,
+        not a new call — splitting there would let untrusted model output
+        forge a second dispatchable call.
+        """
+        parts: list[str] = []
+        start = 0
+        in_string = False
+        escaped = False
+        i = 0
+        token = self.BOT_TOKEN
+        while i < len(text):
+            ch = text[i]
+            if in_string:
+                if escaped:
+                    escaped = False
+                elif ch == "\\":
+                    escaped = True
+                elif ch == '"':
+                    in_string = False
+                i += 1
+                continue
+            if ch == '"':
+                in_string = True
+                i += 1
+                continue
+            if text.startswith(token, i):
+                parts.append(text[start:i])
+                start = i + len(token)
+                i += len(token)
+                continue
+            i += 1
+        parts.append(text[start:])
+        return parts
 
     def extract_tool_calls(
         self, model_output: str, request: dict[str, Any] | None = None
@@ -98,7 +147,7 @@ class MistralToolParser(ToolParser):
                 tools_called=False, tool_calls=[], content=model_output
             )
 
-        content_and_raw_tool_calls = model_output.split(self.BOT_TOKEN)
+        content_and_raw_tool_calls = self._split_on_tool_call_markers(model_output)
         content = content_and_raw_tool_calls[0].strip()
         raw_tool_calls = content_and_raw_tool_calls[1:]
 
@@ -109,12 +158,27 @@ class MistralToolParser(ToolParser):
             if not raw_tool_call:
                 continue
 
-            # Try newest format first: func_name[ARGS]{"arg": "value"}
-            if not raw_tool_call.startswith("[") and self.ARGS_TOKEN in raw_tool_call:
-                tool_name, _, args_str = raw_tool_call.partition(self.ARGS_TOKEN)
-                tool_name = tool_name.strip()
+            # Try newest format first: func_name[ARGS]{"arg": "value"}.
+            # The marker is the boundary only when it comes before the first
+            # `{` — a legacy call whose JSON arguments contain the literal
+            # "[ARGS]" substring must keep the `{` boundary.
+            args_idx = raw_tool_call.find(self.ARGS_TOKEN)
+            brace_idx = raw_tool_call.find("{")
+            if (
+                not raw_tool_call.startswith("[")
+                and args_idx != -1
+                and (brace_idx == -1 or args_idx < brace_idx)
+            ):
+                tool_name = raw_tool_call[:args_idx].strip()
+                args_str = raw_tool_call[args_idx + len(self.ARGS_TOKEN) :]
 
-                if tool_name:
+                if tool_name and _is_plain_tool_name(tool_name):
+                    try:
+                        json.loads(args_str)
+                    except json.JSONDecodeError:
+                        # Malformed arguments — reject rather than emit a
+                        # corrupted or forged call.
+                        continue
                     tool_calls.append(
                         {
                             "id": generate_mistral_tool_id(),
@@ -220,6 +284,23 @@ class MistralToolParser(ToolParser):
         For streaming, we detect when [TOOL_CALLS] appears and start
         accumulating tool call data.
         """
+        # Everything after the name/arguments boundary is arguments text —
+        # never re-scan for new [TOOL_CALLS] markers inside it (a marker in
+        # a quoted string value is data, not a new call). A genuine new call
+        # starts with its own [TOOL_CALLS] delta and is handled below; the
+        # end-of-stream non-streaming re-parse recovers calls that arrive
+        # inside a shared delta.
+        if self._args_started:
+            return {
+                "tool_calls": [
+                    {
+                        "index": self.current_tool_id,
+                        "type": "function",
+                        "function": {"arguments": delta_text},
+                    }
+                ]
+            }
+
         # Check if tool call token is in current output
         if self.BOT_TOKEN not in current_text:
             # Not a tool call yet, return content delta
@@ -240,6 +321,7 @@ class MistralToolParser(ToolParser):
             self.current_tool_id += 1
             self._args_started = False
             self._name_buffer = ""
+            self._name_buffer_overflow = False
             self._current_tool_call_id = generate_mistral_tool_id()
             self._tool_call_id_emitted = False
 
@@ -260,8 +342,15 @@ class MistralToolParser(ToolParser):
 
         # We're in the middle of a tool call
         if self.current_tool_id >= 0:
+            if self._name_buffer_overflow:
+                # The boundary never arrived; everything is plain text now.
+                return {"content": delta_text}
             tool_delta = self._parse_streaming_tool_delta(delta_text)
             if tool_delta:
+                if self._name_buffer_overflow:
+                    # The withheld name text was flushed as content instead
+                    # of a tool call — pass it through unlabeled.
+                    return {"content": tool_delta["content"]}
                 tool_call = {
                     "index": self.current_tool_id,
                     "type": "function",
@@ -298,12 +387,26 @@ class MistralToolParser(ToolParser):
         # Buffer until we can find the boundary marker — it may itself be
         # split across two deltas (e.g. "...[AR" / "GS]...").
         self._name_buffer += text
-        for marker in (self.ARGS_TOKEN, "{"):
-            idx = self._name_buffer.find(marker)
-            if idx == -1:
-                continue
+        args_idx = self._name_buffer.find(self.ARGS_TOKEN)
+        brace_idx = self._name_buffer.find("{")
+        if args_idx != -1 and (brace_idx == -1 or args_idx < brace_idx):
+            # The [ARGS] marker is the boundary when it precedes the first
+            # `{`. A legacy call whose JSON arguments contain the literal
+            # "[ARGS]" substring must keep the `{` boundary.
+            boundary = self.ARGS_TOKEN
+            idx = args_idx
+            args_start = idx + len(boundary)
+        elif brace_idx != -1:
+            boundary = "{"
+            idx = brace_idx
+            args_start = idx
+        else:
+            boundary = None
+            idx = -1
+            args_start = -1
+
+        if boundary is not None:
             name = self._name_buffer[:idx].strip()
-            args_start = idx + len(marker) if marker == self.ARGS_TOKEN else idx
             args = self._name_buffer[args_start:]
             self._args_started = True
             result: dict[str, str] = {}
@@ -313,5 +416,12 @@ class MistralToolParser(ToolParser):
                 result["arguments"] = args
             return result if result else None
 
-        # Marker not seen yet — withhold rather than guess.
+        # Marker not seen yet — withhold rather than guess. If it never
+        # arrives (truncation, or the model deviating into prose), flush the
+        # withheld text as content so the response is not silently lost.
+        if len(self._name_buffer) > self._NAME_BUFFER_LIMIT:
+            overflowed = self._name_buffer
+            self._name_buffer = ""
+            self._name_buffer_overflow = True
+            return {"content": overflowed}
         return None

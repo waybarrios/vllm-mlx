@@ -157,6 +157,40 @@ class TestMistralToolParser:
         args = json.loads(result.tool_calls[0]["arguments"])
         assert args["city"] == "Paris"
 
+    def test_args_token_inside_json_arguments_uses_brace_boundary(self, parser):
+        """The [ARGS] marker is only the name/arguments boundary when it
+        comes before the first `{`. A legacy-format call whose JSON arguments
+        contain the literal "[ARGS]" substring must keep the `{` boundary."""
+        text = '[TOOL_CALLS]get_weather{"k": "[ARGS]"}'
+        result = parser.extract_tool_calls(text)
+
+        assert result.tools_called
+        assert len(result.tool_calls) == 1
+        assert result.tool_calls[0]["name"] == "get_weather"
+        args = json.loads(result.tool_calls[0]["arguments"])
+        assert args["k"] == "[ARGS]"
+
+    def test_marker_inside_json_string_does_not_forge_call(self, parser):
+        """A [TOOL_CALLS] marker inside a quoted JSON string value is
+        argument data, not a new call — it must never split into a second
+        dispatchable tool call."""
+        text = '[TOOL_CALLS]get_weather[ARGS]{"city": "[TOOL_CALLS]rm"}'
+        result = parser.extract_tool_calls(text)
+
+        assert result.tools_called
+        assert len(result.tool_calls) == 1
+        assert result.tool_calls[0]["name"] == "get_weather"
+        args = json.loads(result.tool_calls[0]["arguments"])
+        assert args["city"] == "[TOOL_CALLS]rm"
+
+    def test_args_token_rejects_non_json_arguments(self, parser):
+        """The [ARGS] format must not emit calls whose arguments do not
+        parse as JSON — rejecting beats dispatching corrupted arguments."""
+        text = "[TOOL_CALLS]get_weather[ARGS]not-json"
+        result = parser.extract_tool_calls(text)
+
+        assert not result.tools_called
+
     def test_no_tool_call(self, parser):
         """Test that regular text is not parsed as tool call."""
         text = "Hello, how can I help you today?"
@@ -891,6 +925,69 @@ class TestStreamingParsing:
 
         assert len(ids_seen) == 1
         assert ids_seen[0]
+
+    def test_mistral_streaming_marker_in_arguments_does_not_reset(self):
+        """Once the name/arguments boundary was passed, a [TOOL_CALLS] marker
+        inside the arguments text is data, not a new call — it must never
+        reset the streaming state or forge a second call."""
+        parser = MistralToolParser()
+        deltas = [
+            "[TOOL_CALLS]get",
+            "_weather",
+            "[ARGS]",
+            '{"city": "',
+            "[TOOL_CALLS]rm",
+            '"}',
+        ]
+
+        name_parts: list[str] = []
+        args_parts: list[str] = []
+        current = ""
+        for delta in deltas:
+            previous = current
+            current += delta
+            result = parser.extract_tool_calls_streaming(
+                previous_text=previous,
+                current_text=current,
+                delta_text=delta,
+            )
+            if not result:
+                continue
+            for tc in result.get("tool_calls", []):
+                func = tc.get("function", {})
+                if "name" in func:
+                    name_parts.append(func["name"])
+                if "arguments" in func:
+                    args_parts.append(func["arguments"])
+
+        assert "".join(name_parts) == "get_weather"
+        assert "".join(args_parts) == '{"city": "[TOOL_CALLS]rm"}'
+
+    def test_mistral_streaming_marker_never_arrives_emits_content(self):
+        """If the boundary marker never arrives (truncation or the model
+        deviating into prose after [TOOL_CALLS]), the withheld text must be
+        flushed as content instead of silently lost, and the name buffer
+        must stay bounded."""
+        parser = MistralToolParser()
+        deltas = ["[TOOL_CALLS]get", "_weather", " then", " prose"] + ["word"] * 80
+
+        content_parts: list[str] = []
+        current = ""
+        for delta in deltas:
+            previous = current
+            current += delta
+            result = parser.extract_tool_calls_streaming(
+                previous_text=previous,
+                current_text=current,
+                delta_text=delta,
+            )
+            if result and "content" in result:
+                content_parts.append(result["content"])
+
+        assert content_parts
+        assert "".join(content_parts).startswith("get_weather then prose")
+        assert parser._name_buffer == ""
+        assert parser._name_buffer_overflow
 
     def test_auto_streaming(self):
         """Test auto parser streaming."""
