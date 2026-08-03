@@ -1131,6 +1131,53 @@ def _build_reasoning_parser(engine: BaseEngine | None = None):
         return type(_reasoning_parser)()
 
 
+def _prepare_streaming_reasoning_parser(
+    engine: BaseEngine,
+    request: ChatCompletionRequest | ResponsesRequest | None,
+    chat_kwargs: dict[str, object],
+    *,
+    allowed: bool = True,
+):
+    """Build and reset request-local reasoning state when thinking is enabled."""
+    if not allowed or _thinking_disabled(request, chat_kwargs):
+        return None
+    parser = _build_reasoning_parser(engine)
+    if parser is not None:
+        parser.reset_state()
+    return parser
+
+
+def _prepare_openai_stream_reasoning_state(
+    engine: BaseEngine,
+    request: ChatCompletionRequest,
+    chat_kwargs: dict[str, object],
+) -> tuple[object | None, bool]:
+    """Return request-local reasoning state and the legacy Nemotron marker state."""
+    parser = _prepare_streaming_reasoning_parser(engine, request, chat_kwargs)
+    is_thinking_model = "nemotron" in (engine.model_name or "").lower() and not parser
+    return parser, is_thinking_model
+
+
+def _request_tool_definitions(request: ChatCompletionRequest) -> list | None:
+    """Return the request tool schema once for streaming argument coercion."""
+    if request and request.tools:
+        return request.model_dump(include={"tools"}).get("tools")
+    return None
+
+
+def _streaming_json_fence_stripper(
+    request: ChatCompletionRequest,
+) -> StreamingJsonFenceStripper | None:
+    """Create a fence stripper only for JSON-constrained streaming responses."""
+    response_format = getattr(request, "response_format", None)
+    response_format_type = getattr(response_format, "type", None)
+    if response_format_type is None and isinstance(response_format, dict):
+        response_format_type = response_format.get("type")
+    if response_format_type in ("json_object", "json_schema"):
+        return StreamingJsonFenceStripper()
+    return None
+
+
 # Lifecycle startup coordination — an Event lets the lifecycle loop block
 # efficiently instead of polling with short sleeps.  Created lazily so
 # it binds to the correct event loop at runtime rather than import time.
@@ -2537,13 +2584,11 @@ async def _stream_responses_request(request: ResponsesRequest) -> AsyncIterator[
             sequence += 1
         return events
 
-    reasoning_parser = _build_reasoning_parser(engine)
-    if reasoning_parser:
-        reasoning_parser.reset_state()
+    reasoning_parser = _prepare_streaming_reasoning_parser(engine, request, chat_kwargs)
 
+    tool_parser = _get_streaming_tool_parser(chat_request, engine)
     tool_accumulated_text = ""
     tool_markup_possible = False
-    tool_parser = _get_streaming_tool_parser(chat_request, engine)
 
     async for output in engine.stream_chat(messages=messages, **chat_kwargs):
         last_output = output
@@ -2560,7 +2605,7 @@ async def _stream_responses_request(request: ResponsesRequest) -> AsyncIterator[
         previous_text = raw_accumulated_text
         raw_accumulated_text += delta_text
 
-        if reasoning_parser and not _thinking_disabled(request, chat_kwargs):
+        if reasoning_parser:
             delta_msg = reasoning_parser.extract_reasoning_streaming(
                 previous_text, raw_accumulated_text, delta_text
             )
@@ -2960,8 +3005,6 @@ def _get_streaming_tool_parser(
     back to the generic auto parser so streaming still matches the generic
     non-streaming tool parsing behavior.
     """
-    global _tool_parser_instance
-
     if request is None:
         return None
     if _tool_choice_disabled(request):
@@ -5682,15 +5725,13 @@ async def _stream_anthropic_messages(
     }
     yield f"event: message_start\ndata: {json.dumps(message_start)}\n\n"
 
-    reasoning_parser = _build_reasoning_parser(engine)
-    use_reasoning = (
-        reasoning_parser is not None
-        and not chat_kwargs.get("logits_processors")
-        and not _thinking_disabled(openai_request, chat_kwargs)
+    reasoning_parser = _prepare_streaming_reasoning_parser(
+        engine,
+        openai_request,
+        chat_kwargs,
+        allowed=not chat_kwargs.get("logits_processors"),
     )
-
-    if use_reasoning:
-        reasoning_parser.reset_state()
+    use_reasoning = reasoning_parser is not None
 
     # Block index tracking: with reasoning parser we use index 0 for
     # thinking and index 1 for text; without parser, index 0 for text.
@@ -6029,15 +6070,10 @@ async def stream_chat_completion(
 
     # Track if we need to add <think> prefix for thinking models (when no reasoning parser)
     # The template adds <think> to the prompt, so the model output starts inside the think block
-    reasoning_parser = _build_reasoning_parser(engine)
-    is_thinking_model = (
-        "nemotron" in (engine.model_name or "").lower() and not reasoning_parser
+    reasoning_parser, is_thinking_model = _prepare_openai_stream_reasoning_state(
+        engine, request, kwargs
     )
     think_prefix_sent = False
-
-    # Reset reasoning parser state for this stream
-    if reasoning_parser:
-        reasoning_parser.reset_state()
 
     # Track accumulated text for reasoning parser
     accumulated_text = ""
@@ -6052,15 +6088,7 @@ async def stream_chat_completion(
     # via ``parse_json_output``; without this, streaming clients see
     # ``"```json{...}```"`` instead of ``"{...}"`` for models that wrap
     # their structured output in markdown (e.g. Gemma 4).
-    fence_stripper: StreamingJsonFenceStripper | None = None
-    _rf = getattr(request, "response_format", None)
-    _rf_type = None
-    if _rf is not None:
-        _rf_type = getattr(_rf, "type", None)
-        if _rf_type is None and isinstance(_rf, dict):
-            _rf_type = _rf.get("type")
-    if _rf_type in ("json_object", "json_schema"):
-        fence_stripper = StreamingJsonFenceStripper()
+    fence_stripper = _streaming_json_fence_stripper(request)
 
     # Tool call streaming state
     tool_parser = None
@@ -6086,11 +6114,7 @@ async def stream_chat_completion(
             # Use reasoning parser if enabled (skip when enable_thinking=False
             # is set either on the request or via the resolved chat template
             # kwargs / server default).
-            if (
-                reasoning_parser
-                and delta_text
-                and not _thinking_disabled(request, kwargs)
-            ):
+            if reasoning_parser and delta_text:
                 previous_text = accumulated_text
                 accumulated_text += delta_text
                 delta_msg = reasoning_parser.extract_reasoning_streaming(

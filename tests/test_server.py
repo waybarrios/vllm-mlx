@@ -832,7 +832,8 @@ class TestHelperFunctions:
         assert isinstance(parser, FakeParser)
         assert parser.tokenizer is FakeEngine.tokenizer
 
-    def test_build_tool_parser_returns_request_local_instances(self, monkeypatch):
+    def test_build_tool_parser_returns_a_fresh_instance_per_stream(self, monkeypatch):
+        """Configured tool parsers must not carry mutable state between streams."""
         import vllm_mlx.server as server
 
         class FakeParser:
@@ -844,7 +845,10 @@ class TestHelperFunctions:
 
         monkeypatch.setattr(server, "_enable_auto_tool_choice", True)
         monkeypatch.setattr(server, "_tool_call_parser", "fake")
-        monkeypatch.setattr(server, "_tool_parser_instance", FakeParser())
+        monkeypatch.setattr(server, "_tool_parser_instance", None)
+        monkeypatch.setattr(
+            server.ToolParserManager, "get_tool_parser", lambda name: FakeParser
+        )
 
         first = server._build_tool_parser(FakeEngine())
         second = server._build_tool_parser(FakeEngine())
@@ -1801,6 +1805,113 @@ class TestEndpointSecurityDependencies:
 
 class TestStreamChatCompletion:
     """Tests for streaming chat completion behavior."""
+
+    @pytest.mark.anyio
+    async def test_interleaved_streams_keep_reasoning_parser_state_isolated(
+        self, monkeypatch
+    ):
+        """One stream closing a think block must not reset another stream's parser."""
+        from vllm_mlx.engine.base import GenerationOutput
+        from vllm_mlx.reasoning import DeltaMessage
+        from vllm_mlx.server import (
+            ChatCompletionRequest,
+            Message,
+            stream_chat_completion,
+        )
+        import vllm_mlx.server as server
+
+        class StatefulReasoningParser:
+            def __init__(self, tokenizer=None):
+                self.in_think = False
+
+            def reset_state(self):
+                self.in_think = False
+
+            def extract_reasoning_streaming(
+                self, previous_text, current_text, delta_text
+            ):
+                if delta_text == "<think>":
+                    self.in_think = True
+                    return None
+                if delta_text == "</think>":
+                    self.in_think = False
+                    return None
+                if self.in_think:
+                    return DeltaMessage(reasoning=delta_text)
+                return DeltaMessage(content=delta_text)
+
+        class FakeEngine:
+            model_name = "fake-engine"
+
+            def __init__(self, chunks):
+                self.chunks = chunks
+
+            async def stream_chat(self, messages, **kwargs):
+                for chunk in self.chunks:
+                    yield chunk
+
+        monkeypatch.setattr(server, "_model_name", "served-model")
+        monkeypatch.setattr(server, "_reasoning_parser_name", "stateful")
+        monkeypatch.setattr(server, "_reasoning_parser", None)
+        monkeypatch.setattr(
+            server, "get_reasoning_parser", lambda name: StatefulReasoningParser
+        )
+        monkeypatch.setattr(server, "_enable_auto_tool_choice", False)
+        monkeypatch.setattr(server, "_tool_call_parser", None)
+        monkeypatch.setattr(server, "_tool_parser_instance", None)
+
+        request = ChatCompletionRequest(
+            model="served-model",
+            messages=[Message(role="user", content="hi")],
+            stream=True,
+        )
+        first_stream = stream_chat_completion(
+            FakeEngine(
+                [
+                    GenerationOutput(text="", new_text="<think>", finished=False),
+                    GenerationOutput(text="", new_text="first", finished=False),
+                    GenerationOutput(text="", new_text="second", finished=False),
+                    GenerationOutput(text="", new_text="</think>", finished=False),
+                    GenerationOutput(
+                        text="",
+                        new_text="answer-a",
+                        finished=True,
+                        finish_reason="stop",
+                    ),
+                ]
+            ),
+            request.messages,
+            request,
+        )
+        second_stream = stream_chat_completion(
+            FakeEngine(
+                [
+                    GenerationOutput(text="", new_text="<think>", finished=False),
+                    GenerationOutput(text="", new_text="other", finished=False),
+                    GenerationOutput(text="", new_text="</think>", finished=False),
+                    GenerationOutput(
+                        text="",
+                        new_text="answer-b",
+                        finished=True,
+                        finish_reason="stop",
+                    ),
+                ]
+            ),
+            request.messages,
+            request,
+        )
+
+        await first_stream.__anext__()  # assistant role
+        first_reasoning = await first_stream.__anext__()
+        second_chunks = [chunk async for chunk in second_stream]
+        second_reasoning = next(
+            chunk for chunk in second_chunks if '"reasoning_content":"other"' in chunk
+        )
+        resumed_reasoning = await first_stream.__anext__()
+
+        assert '"reasoning_content":"first"' in first_reasoning
+        assert '"reasoning_content":"other"' in second_reasoning
+        assert '"reasoning_content":"second"' in resumed_reasoning
 
     @pytest.mark.anyio
     async def test_stream_without_parser_flags_emits_structured_tool_calls(
