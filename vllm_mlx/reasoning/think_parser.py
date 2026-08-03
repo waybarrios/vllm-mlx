@@ -10,11 +10,11 @@ Supports three scenarios:
 2. Only closing tag (think injected in prompt): reasoning</think>content
 3. No tags: pure content
 
-Performance: The streaming parser uses a simple state machine to track the
-current phase (pre-think / thinking / content). Tag completion is detected
-against the accumulated text for correctness when `<think>` / `</think>` are
-split across delta boundaries, but phase tracking still avoids the old
-whole-output rescanning behavior.
+Performance: The streaming parser uses a state machine to track the current
+phase (pre-think / thinking / content). A tag that arrives split across delta
+boundaries is handled by withholding the fragment until it either completes or
+is ruled out, so every search stays inside the current delta and the per-token
+cost does not grow with output length.
 """
 
 import logging
@@ -24,6 +24,19 @@ from abc import abstractmethod
 from .base import DeltaMessage, ReasoningParser
 
 logger = logging.getLogger(__name__)
+
+
+def _partial_suffix_len(text: str, markers: tuple[str, ...]) -> int:
+    """Length of the trailing run of ``text`` that is still a prefix of a marker.
+
+    Returns 0 when the tail cannot grow into any of them.
+    """
+    longest = max((len(m) for m in markers), default=0)
+    for size in range(min(len(text), longest - 1), 0, -1):
+        tail = text[-size:]
+        if any(m.startswith(tail) for m in markers):
+            return size
+    return 0
 
 
 class BaseThinkingReasoningParser(ReasoningParser):
@@ -41,8 +54,10 @@ class BaseThinkingReasoningParser(ReasoningParser):
 
         pre_think -> thinking -> content
 
-    Transitions are tracked by parser state. Accumulated text is consulted only
-    to detect when a start/end tag has completed across delta boundaries.
+    Transitions are tracked by parser state. A delta whose tail could still grow
+    into a tag is withheld rather than emitted, so a tag split across deltas is
+    never leaked into the reasoning stream and never has to be searched for in
+    the accumulated text.
     """
 
     @property
@@ -69,6 +84,8 @@ class BaseThinkingReasoningParser(ReasoningParser):
         # Tool call promotion state.
         self._in_tool_call = False
         self._tool_call_buffer = ""
+        # Trailing text withheld because it might be the start of a tag.
+        self._pending = ""
 
     def reset_state(self):
         """Reset state machine for a new streaming request."""
@@ -77,6 +94,32 @@ class BaseThinkingReasoningParser(ReasoningParser):
         self._content_buffer = ""
         self._in_tool_call = False
         self._tool_call_buffer = ""
+        self._pending = ""
+
+    def _merge_pending(self, delta_text: str) -> str:
+        """Prepend previously withheld text to this delta.
+
+        Whatever this returns can be searched on its own: a tag's earlier
+        characters are never released, so a tag completing now is contained in
+        it. That is what keeps the scan off the accumulated text.
+        """
+        text = self._pending + delta_text
+        self._pending = ""
+        return text
+
+    def _hold(self, text: str, markers: tuple[str, ...]) -> str:
+        """Return the emittable prefix, withholding a trailing partial tag.
+
+        Applied to whatever is about to be emitted rather than to the raw delta,
+        so text that follows a tag completing in this same delta is covered too
+        — otherwise a withheld fragment would be stranded when the phase moves
+        on and would resurface out of order at the end of the stream.
+        """
+        hold = _partial_suffix_len(text, markers)
+        if not hold:
+            return text
+        self._pending = text[len(text) - hold :]
+        return text[: len(text) - hold]
 
     def extract_reasoning(
         self,
@@ -141,6 +184,7 @@ class BaseThinkingReasoningParser(ReasoningParser):
 
         start_tok = self.start_token
         end_tok = self.end_token
+        tc_start = self._TOOL_CALL_START
 
         # ── Phase: pre_think ──────────────────────────────────────
         # Haven't seen a completed tag yet. Could be:
@@ -148,10 +192,13 @@ class BaseThinkingReasoningParser(ReasoningParser):
         # - Already inside implicit reasoning (think was in prompt)
         # - No reasoning at all (pure content model)
         if self._phase == "pre_think":
-            if start_tok in current_text:
+            delta_text = self._merge_pending(delta_text)
+            idx = delta_text.find(start_tok)
+            eidx = delta_text.find(end_tok)
+
+            if idx != -1 and (eidx == -1 or idx < eidx):
                 self._phase = "thinking"
-                idx = delta_text.find(start_tok)
-                after = delta_text[idx + len(start_tok) :] if idx >= 0 else delta_text
+                after = delta_text[idx + len(start_tok) :]
 
                 if end_tok in after:
                     self._phase = "content"
@@ -160,7 +207,6 @@ class BaseThinkingReasoningParser(ReasoningParser):
                     content = after[eidx + len(end_tok) :]
                     return self._transition_to_content(reasoning, content)
 
-                tc_start = self._TOOL_CALL_START
                 if tc_start in after:
                     tc_idx = after.find(tc_start)
                     self._in_tool_call = True
@@ -168,25 +214,26 @@ class BaseThinkingReasoningParser(ReasoningParser):
                     before = after[:tc_idx]
                     return DeltaMessage(reasoning=before) if before else None
 
+                after = self._hold(after, (tc_start, end_tok))
                 return DeltaMessage(reasoning=after) if after else None
 
             # Implicit mode: </think> completed without an explicit <think>.
-            if end_tok in current_text:
+            if eidx != -1:
                 self._phase = "content"
-                idx = delta_text.find(end_tok)
-                if idx >= 0:
-                    reasoning = delta_text[:idx]
-                    content = delta_text[idx + len(end_tok) :]
-                else:
-                    reasoning = None
-                    content = delta_text
+                reasoning = delta_text[:eidx]
+                content = delta_text[eidx + len(end_tok) :]
                 return self._transition_to_content(reasoning, content)
 
             # No tags — default to reasoning (implicit mode assumption).
             # If the model doesn't use thinking at all, the server's
             # non-parser path handles it. This path only activates when
             # a reasoning parser is explicitly configured.
-            return DeltaMessage(reasoning=delta_text)
+            #
+            # <tool_call> is withheld alongside the tags: an explicit <think>
+            # can hand the rest of a delta straight to the thinking phase,
+            # which needs that marker intact to promote the block.
+            delta_text = self._hold(delta_text, (start_tok, end_tok, tc_start))
+            return DeltaMessage(reasoning=delta_text) if delta_text else None
 
         # ── Phase: thinking ───────────────────────────────────────
         # Inside a reasoning block, waiting for end tag.
@@ -195,33 +242,28 @@ class BaseThinkingReasoningParser(ReasoningParser):
             if self._in_tool_call:
                 return self._thinking_tool_call(previous_text, current_text, delta_text)
 
-            tc_start = self._TOOL_CALL_START
-            if tc_start in current_text and tc_start not in previous_text:
+            delta_text = self._merge_pending(delta_text)
+            tc_idx = delta_text.find(tc_start)
+            idx = delta_text.find(end_tok)
+
+            if tc_idx != -1 and (idx == -1 or tc_idx < idx):
                 self._in_tool_call = True
-                idx = delta_text.find(tc_start)
-                if idx >= 0:
-                    reasoning = delta_text[:idx]
-                    self._tool_call_buffer = delta_text[idx:]
-                else:
-                    self._tool_call_buffer = tc_start
-                    reasoning = delta_text
+                reasoning = delta_text[:tc_idx]
+                self._tool_call_buffer = delta_text[tc_idx:]
                 return DeltaMessage(reasoning=reasoning) if reasoning else None
 
-            if end_tok in current_text and end_tok not in previous_text:
+            if idx != -1:
                 self._phase = "content"
-                idx = delta_text.find(end_tok)
-                if idx >= 0:
-                    reasoning = delta_text[:idx]
-                    content = delta_text[idx + len(end_tok) :]
-                else:
-                    reasoning = delta_text
-                    content = None
+                reasoning = delta_text[:idx]
+                content = delta_text[idx + len(end_tok) :]
                 return self._transition_to_content(reasoning, content)
-            return DeltaMessage(reasoning=delta_text)
+
+            delta_text = self._hold(delta_text, (tc_start, end_tok))
+            return DeltaMessage(reasoning=delta_text) if delta_text else None
 
         # ── Phase: content ────────────────────────────────────────
         # Past the reasoning block — everything is content.
-        return self._content_delta(delta_text)
+        return self._content_delta(self._merge_pending(delta_text))
 
     def _extract_complete_reasoning(self, text: str) -> tuple[str | None, str | None]:
         """Split complete output into leading reasoning spans and final content."""
@@ -334,7 +376,10 @@ class BaseThinkingReasoningParser(ReasoningParser):
         tc_end = self._TOOL_CALL_END
         end_tok = self.end_token
 
-        if tc_end in current_text and tc_end not in previous_text:
+        # The buffer already holds everything since the tool call opened, so a
+        # marker completing now is inside it — no need to search the whole
+        # accumulated output for it.
+        if tc_end in self._tool_call_buffer + delta_text:
             self._tool_call_buffer += delta_text
             idx = self._tool_call_buffer.find(tc_end)
             promoted = self._tool_call_buffer[: idx + len(tc_end)]
@@ -370,7 +415,7 @@ class BaseThinkingReasoningParser(ReasoningParser):
             reasoning = remainder.strip() or None
             return DeltaMessage(content=promoted, reasoning=reasoning)
 
-        if end_tok in current_text and end_tok not in previous_text:
+        if end_tok in self._tool_call_buffer + delta_text:
             self._tool_call_buffer += delta_text
             self._in_tool_call = False
             self._phase = "content"
@@ -396,13 +441,26 @@ class BaseThinkingReasoningParser(ReasoningParser):
         return None
 
     def finalize_stream(self) -> DeltaMessage | None:
-        """Flush any buffered tool call text at end of stream."""
+        """Flush text buffered mid-stream: a tool call or a partial tag.
+
+        A generation that stops on a tag prefix — say the model's last token is
+        a bare ``<`` — would otherwise drop those characters, since they were
+        withheld pending a tag that never arrived.
+        """
         if self._in_tool_call and self._tool_call_buffer:
             promoted = self._tool_call_buffer
             self._tool_call_buffer = ""
             self._in_tool_call = False
+            self._pending = ""
             logger.warning("Promoted unclosed streaming tool_call at stream end")
             return DeltaMessage(content=promoted)
+
+        if self._pending:
+            leftover = self._pending
+            self._pending = ""
+            if self._phase == "content":
+                return DeltaMessage(content=leftover)
+            return DeltaMessage(reasoning=leftover)
         return None
 
     @classmethod
