@@ -696,6 +696,64 @@ def _install_chunked_prefill(
     logger.info(f"[chunked_prefill] installed with budget={budget} tokens per step")
 
 
+def _configure_chunked_prefill(
+    scheduler: "Scheduler",
+    batch_gen: "BatchGenerator",
+    budget: int,
+    prompt_cache_save,
+) -> None:
+    """Enable the matching legacy or native mlx-lm chunked-prefill API."""
+    legacy_api = hasattr(batch_gen, "_process_prompts") and hasattr(
+        batch_gen, "active_batch"
+    )
+    if legacy_api:
+        save_interval = scheduler.config.mid_prefill_save_interval
+        mid_prefill_save = None
+        if save_interval > 0 and scheduler.memory_aware_cache is not None:
+            mid_prefill_save = scheduler._make_mid_prefill_save_callback(save_interval)
+            logger.info(
+                "[mid_prefill_cache] enabled, interval=%s",
+                save_interval,
+            )
+        _install_chunked_prefill(
+            batch_gen,
+            budget,
+            mid_prefill_save,
+            prompt_cache_save=prompt_cache_save,
+            pending_abort_ids=scheduler._pending_abort_ids,
+            uid_to_request_id=scheduler.uid_to_request_id,
+            requests=scheduler.requests,
+        )
+        return
+
+    native_api = all(
+        hasattr(batch_gen, attribute)
+        for attribute in (
+            "_prompt_batch",
+            "_generation_batch",
+            "_unprocessed_sequences",
+            "_next",
+        )
+    )
+    if native_api:
+        # Native mlx-lm chunking processes at most this many prompt tokens per
+        # scheduler turn and returns to generation between turns. Its internal
+        # API has no safe extension point for the legacy prompt-cache and
+        # mid-prefill callbacks, which were already unavailable on this layout.
+        batch_gen.prefill_step_size = budget
+        logger.info(
+            "Chunked prefill enabled through native mlx-lm BatchGenerator: "
+            "budget=%s tokens per step",
+            budget,
+        )
+        return
+
+    logger.warning(
+        "Chunked prefill disabled: mlx-lm BatchGenerator matches neither "
+        "the legacy nor native chunked-prefill API."
+    )
+
+
 def _install_mtp(
     batch_gen: "BatchGenerator",
     model: Any,
@@ -1360,40 +1418,16 @@ class Scheduler:
         chunked_budget = self.config.chunked_prefill_tokens
         need_chunked = chunked_budget > 0
 
-        # The chunked prefill monkey-patch relies on BatchGenerator internals
-        # (_process_prompts, active_batch, _step, etc.) that were refactored
-        # in mlx-lm 0.31.x.  Skip gracefully when the required API is absent.
-        chunked_compatible = hasattr(bg, "_process_prompts") and hasattr(
-            bg, "active_batch"
-        )
-
         prompt_cache_cb = None
         if self.memory_aware_cache is not None:
             prompt_cache_cb = self._make_prompt_cache_save_callback()
 
-        if need_chunked and chunked_compatible:
-            # Full chunked prefill with mid-prefill saves and prompt cache
-            # save wired through the chunked next() and _process_prompts
-            # monkey-patches inside _install_chunked_prefill.
-            mid_prefill_cb = None
-            save_interval = self.config.mid_prefill_save_interval
-            if save_interval > 0 and self.memory_aware_cache is not None:
-                mid_prefill_cb = self._make_mid_prefill_save_callback(save_interval)
-                logger.info(f"[mid_prefill_cache] enabled, interval={save_interval}")
-            _install_chunked_prefill(
+        if need_chunked:
+            _configure_chunked_prefill(
+                self,
                 bg,
                 chunked_budget,
-                mid_prefill_cb,
-                prompt_cache_save=prompt_cache_cb,
-                pending_abort_ids=self._pending_abort_ids,
-                uid_to_request_id=self.uid_to_request_id,
-                requests=self.requests,
-            )
-        elif need_chunked and not chunked_compatible:
-            logger.warning(
-                "Chunked prefill disabled: mlx-lm BatchGenerator lacks required "
-                "internals (_process_prompts, active_batch). Upgrade mlx-lm or "
-                "check compatibility."
+                prompt_cache_cb,
             )
 
         # When chunked prefill is off but memory_aware_cache is active,

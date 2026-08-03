@@ -9,6 +9,7 @@ for the vLLM-style continuous batching implementation.
 import asyncio
 import importlib
 import pytest
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 import mlx.core as mx
 
@@ -215,6 +216,26 @@ class TestSchedulerBasic:
     def mock_model(self):
         """Create a mock model."""
         return MagicMock()
+
+    def test_native_batch_generator_uses_chunked_prefill_budget(self):
+        """mlx-lm's current BatchGenerator owns chunking through its step size."""
+        scheduler = Scheduler(
+            model=object(),
+            tokenizer=SimpleNamespace(eos_token_id=0, eos_token_ids={0}),
+            config=SchedulerConfig(
+                enable_prefix_cache=False,
+                prefill_step_size=2048,
+                chunked_prefill_tokens=1024,
+            ),
+        )
+
+        batch_generator = scheduler._create_batch_generator(SamplingParams())
+
+        assert hasattr(batch_generator, "_prompt_batch")
+        assert hasattr(batch_generator, "_generation_batch")
+        assert hasattr(batch_generator, "_unprocessed_sequences")
+        assert batch_generator.prefill_step_size == 1024
+        assert not hasattr(batch_generator, "_partial")
 
     def test_chunked_prefill_accepts_prompt_checkpoints(self, monkeypatch):
         """Chunked prefill must match mlx-lm's 7-field prompt tuples."""
