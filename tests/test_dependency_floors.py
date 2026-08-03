@@ -32,20 +32,10 @@ def _has_minimum(requirement: str, minimum: str) -> bool:
     return _version_tuple(version) >= _version_tuple(minimum)
 
 
-def _excludes_version(requirement: str, version: str) -> bool:
-    return f"!={version}" in {part.strip() for part in requirement.split(",")}
-
-
-def test_mlx_vlm_floor_includes_step37_flash_support_and_followups():
+def test_mlx_vlm_floor_includes_loader_guard_and_step37_flash():
     dependencies = _project_dependencies()
 
-    assert _has_minimum(dependencies["mlx-vlm"], "0.6.2")
-
-
-def test_mlx_vlm_excludes_corrupt_qwen35_release():
-    dependencies = _project_dependencies()
-
-    assert _excludes_version(dependencies["mlx-vlm"], "0.6.4")
+    assert _has_minimum(dependencies["mlx-vlm"], "0.6.5")
 
 
 def test_mlx_lm_floor_matches_current_mlx_vlm_runtime_requirement():
