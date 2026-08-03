@@ -137,6 +137,10 @@ class EngineCore:
         # chance to clean up (e.g. it was never started).  The call is
         # idempotent — _close_batch_generator checks for None.
         self.scheduler._close_batch_generator()
+        # Safety net: close_ssd_tier() is idempotent (no-ops once _ssd_tier
+        # is None), so this is safe even if _engine_loop's finally already
+        # closed it.
+        self.scheduler.close_ssd_tier()
         logger.info("Engine stopped")
 
     def is_running(self) -> bool:
@@ -331,6 +335,9 @@ class EngineCore:
                 else:
                     self.scheduler._close_batch_generator()
             finally:
+                # Close the SSD writer before joining the worker so any
+                # queued spills flush while the engine is still alive.
+                self.scheduler.close_ssd_tier()
                 worker.shutdown(wait=True)
 
     async def add_request(

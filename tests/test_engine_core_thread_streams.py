@@ -50,6 +50,9 @@ async def test_engine_core_runs_all_scheduler_steps_on_one_worker_thread(monkeyp
         def _close_batch_generator(self):
             self.close_threads.append(threading.get_ident())
 
+        def close_ssd_tier(self):
+            pass
+
     scheduler = FakeScheduler()
     engine.scheduler = scheduler
 
