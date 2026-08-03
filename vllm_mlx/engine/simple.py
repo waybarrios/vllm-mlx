@@ -473,7 +473,7 @@ class SimpleEngine(BaseEngine):
                     from ..text_model_from_vlm import build_text_model
 
                     self._text_model = build_text_model(
-                        self._model.model, self._model_name
+                        self._model.model, self._model_name, enable_mtp=self._mtp
                     )
 
                     if self._text_model is not None:
