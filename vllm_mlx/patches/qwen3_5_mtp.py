@@ -376,7 +376,9 @@ def inject_mtp_support(model: Any, model_path, config: dict) -> bool:
                 out = self.lm_head(normed)
 
             if return_hidden:
-                return out, normed  # post-norm hidden states (MTP expects post-norm)
+                # The MTP head applies pre_fc_norm_hidden itself. Returning the
+                # backbone's pre-norm state avoids normalizing it twice.
+                return out, hidden_states
             return out
 
         def mtp_forward(
