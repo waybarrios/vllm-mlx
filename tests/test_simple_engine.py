@@ -2676,3 +2676,30 @@ class TestSimpleEngineClearRuntimeCaches:
 
         # Non-MLLM, empty LRU, zeroed counters → nothing to report.
         assert result is None
+
+
+class TestSimpleEngineStop:
+    """stop() must actually release MLX's Metal buffer cache, not just drop
+    Python references — otherwise idle-unload frees objects but not memory.
+    """
+
+    async def test_stop_calls_mx_clear_cache(self, monkeypatch):
+        from vllm_mlx.engine import simple as simple_mod
+        from vllm_mlx.engine.simple import SimpleEngine
+
+        calls = {"count": 0}
+        monkeypatch.setattr(
+            simple_mod.mx,
+            "clear_cache",
+            lambda: calls.__setitem__("count", calls["count"] + 1),
+        )
+
+        engine = SimpleEngine("test-model")
+        engine._model = object()
+        engine._loaded = True
+
+        await engine.stop()
+
+        assert calls["count"] == 1
+        assert engine._model is None
+        assert engine._loaded is False

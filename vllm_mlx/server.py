@@ -210,6 +210,7 @@ _auto_unload_idle_seconds: float = 0.0
 _lazy_load_model: bool = False
 _residency_manager: ResidencyManager | None = None
 _lifecycle_task: asyncio.Task | None = None
+_registry_idle_reaper_task: asyncio.Task | None = None
 _lifespan_active: bool = False
 
 _FALLBACK_TEMPERATURE = 0.7
@@ -1411,6 +1412,7 @@ async def _release_default_engine(*, count_activity: bool = True) -> None:
 async def lifespan(app: FastAPI):
     """FastAPI lifespan for startup/shutdown events."""
     global _engine, _mcp_manager, _model_manager, _lifecycle_task, _lifespan_active
+    global _registry_idle_reaper_task
     primary_exc: BaseException | None = None
     try:
         _get_idle_unload_event().clear()
@@ -1427,6 +1429,10 @@ async def lifespan(app: FastAPI):
             await _engine.start()
         if _model_manager is not None:
             await _model_manager.preload()
+            if _model_manager.idle_unload_seconds > 0:
+                _registry_idle_reaper_task = asyncio.create_task(
+                    _model_manager.run_idle_reaper()
+                )
 
         # Load persisted cache from disk (AFTER engine start — AsyncEngineCore must exist)
         if (
@@ -1509,6 +1515,11 @@ async def lifespan(app: FastAPI):
             await _engine.stop()
             _engine = None
             logger.info("Engine stopped")
+        if _registry_idle_reaper_task is not None:
+            _registry_idle_reaper_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await _registry_idle_reaper_task
+            _registry_idle_reaper_task = None
         if _model_manager is not None:
             await _model_manager.shutdown()
             logger.info("Model manager stopped")
@@ -3500,6 +3511,7 @@ async def status():
                 "memory_budget_gb": round(
                     _model_manager.memory_budget_bytes / (1024**3), 2
                 ),
+                "idle_unload_seconds": _model_manager.idle_unload_seconds,
                 "models": _model_manager.list_models(),
             },
         }

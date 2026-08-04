@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from pathlib import Path
 from typing import Any
 
@@ -90,9 +91,11 @@ def _manager_config(
     strategy: str = "wait_then_fail",
     wait_timeout_s: float | None = 1.0,
     preempt_after_s: float | None = None,
+    idle_unload_seconds: float = 0.0,
 ) -> RegistryManagerConfig:
     return RegistryManagerConfig(
         memory_budget_bytes=int(budget_gb * (1024**3)),
+        idle_unload_seconds=idle_unload_seconds,
         policy=ContentionPolicy(
             strategy=strategy,
             wait_timeout_s=wait_timeout_s,
@@ -259,4 +262,192 @@ def test_non_local_registry_entry_requires_explicit_memory_estimate():
         with pytest.raises(ValueError, match="estimated_memory_gb"):
             await manager.acquire("remote")
 
+
+def test_unload_idle_unloads_stale_models_and_skips_busy_ones(tmp_path):
+    """Idle-timeout unload must fire without any competing model ever being
+    requested, unlike memory-budget eviction which only triggers on acquire().
+    """
+
+    async def _run():
+        registry = _registry(tmp_path, {"alpha": 4, "beta": 4})
+        created: dict[str, FakeEngine] = {}
+
+        def engine_factory(config: ResolvedModelConfig) -> FakeEngine:
+            engine = FakeEngine(config)
+            created[config.entry.name] = engine
+            return engine
+
+        manager = ModelManager(
+            _manager_config(budget_gb=16, idle_unload_seconds=999),
+            registry,
+            _defaults(),
+            engine_factory=engine_factory,
+        )
+
+        alpha_lease = await manager.acquire("alpha")
+        await alpha_lease.release()
+
+        # beta stays busy (never released) so it must survive the sweep.
+        await manager.acquire("beta")
+
+        manager._loaded["alpha"].last_used_at = time.time() - 1000
+        manager._loaded["beta"].last_used_at = time.time() - 1000
+
+        unloaded = await manager.unload_idle()
+
+        assert unloaded == ["alpha"]
+        assert "alpha" not in manager._loaded
+        assert "beta" in manager._loaded
+        assert created["alpha"].stopped == 1
+        assert created["beta"].stopped == 0
+
     asyncio.run(_run())
+
+
+def test_unload_idle_noop_when_disabled(tmp_path):
+    async def _run():
+        registry = _registry(tmp_path, {"alpha": 4})
+        manager = ModelManager(
+            _manager_config(budget_gb=16, idle_unload_seconds=0.0),
+            registry,
+            _defaults(),
+            engine_factory=lambda config: FakeEngine(config),
+        )
+
+        lease = await manager.acquire("alpha")
+        await lease.release()
+        manager._loaded["alpha"].last_used_at = time.time() - 100000
+
+        unloaded = await manager.unload_idle()
+
+        assert unloaded == []
+        assert "alpha" in manager._loaded
+
+    asyncio.run(_run())
+
+
+def test_unload_idle_leaves_fresh_models_alone(tmp_path):
+    async def _run():
+        registry = _registry(tmp_path, {"alpha": 4})
+        manager = ModelManager(
+            _manager_config(budget_gb=16, idle_unload_seconds=999),
+            registry,
+            _defaults(),
+            engine_factory=lambda config: FakeEngine(config),
+        )
+
+        lease = await manager.acquire("alpha")
+        await lease.release()
+
+        unloaded = await manager.unload_idle()
+
+        assert unloaded == []
+        assert "alpha" in manager._loaded
+
+    asyncio.run(_run())
+
+
+def test_run_idle_reaper_unloads_after_timeout(tmp_path):
+    async def _run():
+        registry = _registry(tmp_path, {"alpha": 4})
+        created: dict[str, FakeEngine] = {}
+
+        def engine_factory(config: ResolvedModelConfig) -> FakeEngine:
+            engine = FakeEngine(config)
+            created[config.entry.name] = engine
+            return engine
+
+        manager = ModelManager(
+            _manager_config(budget_gb=16, idle_unload_seconds=0.2),
+            registry,
+            _defaults(),
+            engine_factory=engine_factory,
+        )
+
+        lease = await manager.acquire("alpha")
+        await lease.release()
+
+        reaper = asyncio.create_task(manager.run_idle_reaper())
+        try:
+            for _ in range(50):
+                if "alpha" not in manager._loaded:
+                    break
+                await asyncio.sleep(0.05)
+        finally:
+            reaper.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await reaper
+
+        assert "alpha" not in manager._loaded
+        assert created["alpha"].stopped == 1
+
+    asyncio.run(_run())
+
+
+def test_run_idle_reaper_returns_immediately_when_disabled(tmp_path):
+    async def _run():
+        registry = _registry(tmp_path, {"alpha": 4})
+        manager = ModelManager(
+            _manager_config(budget_gb=16, idle_unload_seconds=0.0),
+            registry,
+            _defaults(),
+            engine_factory=lambda config: FakeEngine(config),
+        )
+
+        await asyncio.wait_for(manager.run_idle_reaper(), timeout=1.0)
+
+    asyncio.run(_run())
+
+
+class TestLoadRegistryConfigIdleUnload:
+    """YAML-level wiring for the manager.idle_unload_seconds knob."""
+
+    def _write_config(self, tmp_path: Path, manager_extra: str = "") -> Path:
+        model_dir = tmp_path / "alpha"
+        model_dir.mkdir()
+        config_path = tmp_path / "models.yaml"
+        config_path.write_text(f"""
+manager:
+  memory_budget_gb: 16
+{manager_extra}
+models:
+  - name: alpha
+    path: {model_dir}
+    estimated_memory_gb: 4
+""")
+        return config_path
+
+    def test_explicit_yaml_value_wins(self, tmp_path):
+        from vllm_mlx.model_registry import load_registry_config
+
+        config_path = self._write_config(tmp_path, "  idle_unload_seconds: 120\n")
+        defaults = _defaults()
+        defaults = type(defaults)(
+            **{**defaults.__dict__, "auto_unload_idle_seconds": 300.0}
+        )
+
+        manager_config, _ = load_registry_config(config_path, defaults)
+
+        assert manager_config.idle_unload_seconds == 120.0
+
+    def test_falls_back_to_cli_default_when_unset(self, tmp_path):
+        from vllm_mlx.model_registry import load_registry_config
+
+        config_path = self._write_config(tmp_path)
+        defaults = _defaults()
+        defaults = type(defaults)(
+            **{**defaults.__dict__, "auto_unload_idle_seconds": 300.0}
+        )
+
+        manager_config, _ = load_registry_config(config_path, defaults)
+
+        assert manager_config.idle_unload_seconds == 300.0
+
+    def test_defaults_to_disabled(self, tmp_path):
+        from vllm_mlx.model_registry import load_registry_config
+
+        config_path = self._write_config(tmp_path)
+
+        manager_config, _ = load_registry_config(config_path, _defaults())
+
+        assert manager_config.idle_unload_seconds == 0.0

@@ -19,6 +19,8 @@ import time
 from collections.abc import AsyncIterator
 from typing import Any
 
+import mlx.core as mx
+
 from ..api.tool_calling import convert_tools_for_template
 from ..api.utils import clean_output_text, extract_multimodal_content, is_mllm_model
 from .base import (
@@ -594,6 +596,7 @@ class BatchedEngine(BaseEngine):
         self._processor = None
         self._mllm_instance = None
         self._loaded = False
+        mx.clear_cache()
         logger.info("BatchedEngine stopped")
 
     def _apply_chat_template(

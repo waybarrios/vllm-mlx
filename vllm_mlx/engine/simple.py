@@ -605,6 +605,7 @@ class SimpleEngine(BaseEngine):
         for k in self._system_kv_cache_stats:
             self._system_kv_cache_stats[k] = 0
         self._supports_system_kv_cache = False
+        mx.clear_cache()
         logger.info("SimpleEngine stopped")
 
     def _should_route_text_through_text_model(

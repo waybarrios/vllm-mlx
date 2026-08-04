@@ -358,6 +358,7 @@ def serve_command(args):
             scheduler_config=scheduler_config,
             max_tokens=args.max_tokens,
             download_config=download_config,
+            auto_unload_idle_seconds=args.auto_unload_idle_seconds,
         )
         load_model_registry(models_config, defaults=defaults)
     else:
