@@ -571,3 +571,178 @@ class TestDequantizeCacheSlice:
         # No private data (7.0) visible — only shared prefix (~1.0 with quantization noise)
         assert float(mx.max(tc.keys).item()) < 2.0
         assert remaining == [999, 1000]
+
+
+class TestDetachCacheForStorage:
+    """Tests for ``_detach_cache_for_storage``: stored entries must not alias
+    live batch state or retain lazy computation graphs.
+
+    Regression: ``MemoryAwarePrefixCache.store()`` stored per-request cache
+    layers by reference.  For hybrid models (e.g. Qwen3.5/3.6, whose
+    ``ArraysCache`` layers expose their mutable ``cache`` list via
+    ``.state``), the stored entry aliased the live state container (same
+    class of bug as the SimpleEngine snapshot aliasing, #575) and — because
+    the extracted per-request arrays are lazy slices of batch-wide arrays —
+    retained the entire upstream computation graph.  Under sustained traffic
+    each stored entry pinned Metal buffer handles roughly proportional to
+    generated tokens, until the process hit the device resource limit
+    (``[metal::malloc] Resource limit (N) exceeded``) and aborted.
+    """
+
+    def test_arrays_cache_container_not_aliased(self):
+        """The stored ArraysCache snapshot must not follow later mutation."""
+        import mlx.core as mx
+        from mlx_lm.models.cache import ArraysCache
+
+        from vllm_mlx.memory_cache import _detach_cache_for_storage
+
+        parent = mx.arange(32, dtype=mx.float32).reshape(4, 8)
+        mx.eval(parent)
+        lazy = parent[1:2]
+        for _ in range(5):
+            lazy = lazy + 1
+        expected = [[float(v) + 5 for v in range(8, 16)]]
+
+        layer = ArraysCache(size=1)
+        layer[0] = lazy
+
+        detached = _detach_cache_for_storage([layer])
+
+        assert detached[0] is not layer
+        assert detached[0].cache is not layer.cache
+        assert detached[0][0].tolist() == expected
+
+        # Simulate the batch generator advancing the live state after the
+        # snapshot was stored — the stored copy must not change.
+        layer[0] = mx.zeros((1, 8))
+        assert detached[0][0].tolist() == expected
+
+    def test_kv_cache_layer_snapshotted_with_equal_arrays(self):
+        """KVCache layers are snapshotted; array contents are preserved."""
+        import mlx.core as mx
+        from mlx_lm.models.cache import KVCache
+
+        from vllm_mlx.memory_cache import _detach_cache_for_storage
+
+        layer = KVCache()
+        layer.keys = mx.arange(1 * 2 * 4 * 3, dtype=mx.float32).reshape(1, 2, 4, 3)
+        layer.values = mx.ones((1, 2, 4, 3))
+        layer.offset = 4
+
+        detached = _detach_cache_for_storage([layer])
+
+        assert detached[0] is not layer
+        assert detached[0].offset == 4
+        assert detached[0].keys.tolist() == layer.keys.tolist()
+        assert detached[0].values.tolist() == layer.values.tolist()
+
+    def test_lazy_graph_is_cut(self):
+        """Detaching must not retain the upstream lazy graph / parent buffers.
+
+        Builds a long lazy op chain rooted at a large parent array, detaches,
+        then drops every reference except the detached copy.  If the graph
+        were retained, active memory would still include the parent (8MB+);
+        the detached copy itself is only 16KB.
+        """
+        import mlx.core as mx
+        from mlx_lm.models.cache import ArraysCache
+
+        from vllm_mlx.memory_cache import _detach_cache_for_storage
+
+        mx.eval(mx.zeros((1,)))
+        base = mx.get_active_memory()
+
+        big_parent = mx.random.normal((512, 4096))  # ~8MB
+        chain = big_parent[0:1]
+        for _ in range(200):
+            chain = chain * 1.0001
+        layer = ArraysCache(size=1)
+        layer[0] = chain
+
+        detached = _detach_cache_for_storage([layer])
+
+        del big_parent, chain, layer
+        mx.eval(mx.zeros((1,)))
+
+        retained = mx.get_active_memory() - base
+        assert retained < 1_000_000, (
+            f"lazy graph retained: {retained / 1e6:.1f}MB still active "
+            f"after dropping originals (expected < 1MB)"
+        )
+        assert detached[0][0].shape == (1, 4096)
+
+    def test_cache_list_children_snapshotted_without_write_through(self):
+        """CacheList's ``state`` setter writes through to child caches in
+        place; the detach path must snapshot children recursively instead."""
+        import mlx.core as mx
+        from mlx_lm.models.cache import CacheList, KVCache
+
+        from vllm_mlx.memory_cache import _detach_cache_for_storage
+
+        inner = KVCache()
+        inner.keys = mx.arange(1 * 2 * 3 * 4, dtype=mx.float32).reshape(1, 2, 3, 4)
+        inner.values = mx.ones((1, 2, 3, 4))
+        inner.offset = 3
+        original_keys = inner.keys
+
+        cl = CacheList(inner)
+
+        detached = _detach_cache_for_storage([cl])
+
+        assert detached[0] is not cl
+        assert detached[0].caches is not cl.caches
+        assert detached[0].caches[0] is not inner
+        assert detached[0].caches[0].keys.tolist() == original_keys.tolist()
+        # The live child must be untouched (no setter write-through)
+        assert cl.caches[0] is inner
+        assert inner.keys is original_keys
+
+    def test_slots_class_snapshotted(self):
+        """Layers using ``__slots__`` (no ``__dict__``), like
+        ``_QuantizedCacheWrapper``, must snapshot without crashing."""
+        import mlx.core as mx
+        from mlx_lm.models.cache import KVCache
+
+        from vllm_mlx.memory_cache import (
+            _detach_cache_for_storage,
+            _QuantizedCacheWrapper,
+        )
+
+        kv = KVCache()
+        kv.keys = mx.ones((1, 2, 4, 64))
+        kv.values = mx.ones((1, 2, 4, 64))
+        kv.offset = 4
+        mx.eval(kv.keys, kv.values)
+        wrapper = _QuantizedCacheWrapper(kv, bits=8, group_size=32)
+
+        detached = _detach_cache_for_storage([wrapper])
+
+        assert detached[0] is not wrapper
+        assert isinstance(detached[0], _QuantizedCacheWrapper)
+        assert detached[0].offset == wrapper.offset
+        # mx.quantize returns a (data, scales, biases) container; the
+        # snapshot must preserve its type and contents.
+        assert type(detached[0].keys) is type(wrapper.keys)
+        assert len(detached[0].keys) == len(wrapper.keys)
+        for got, orig in zip(detached[0].keys, wrapper.keys):
+            assert got.tolist() == orig.tolist()
+
+    def test_undetachable_layer_falls_back_to_reference(self):
+        """A layer that cannot be snapshotted is stored by reference with a
+        warning instead of failing the whole store()."""
+        from vllm_mlx.memory_cache import _detach_cache_for_storage
+
+        class Undetachable:
+            def __init__(self):
+                self.values = None
+                self.offset = 0
+
+            @property
+            def keys(self):  # read-only: snapshot assignment must fail
+                return None
+
+        layer = Undetachable()
+
+        detached = _detach_cache_for_storage([layer])
+
+        assert detached[0] is layer

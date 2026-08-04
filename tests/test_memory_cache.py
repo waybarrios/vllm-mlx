@@ -308,7 +308,12 @@ class TestMemoryAwarePrefixCache:
 
         # Fetch exact match
         result, remaining = small_cache.fetch(tokens)
-        assert result is kv  # Same reference, no copy
+        # store() snapshots layer containers so stored entries never alias
+        # live caches; the underlying arrays are shared (or detached copies
+        # for real MLX arrays).
+        assert result is not kv
+        assert result[0].keys is kv[0].keys
+        assert result[0].values is kv[0].values
         assert remaining == []
 
     def test_short_prefix_reuse_is_rejected(self, model, mock_kv_cache):
@@ -341,7 +346,9 @@ class TestMemoryAwarePrefixCache:
         long_tokens = [1, 2, 3, 4, 5, 6]
         result, remaining = small_cache.fetch(long_tokens)
 
-        assert result is kv
+        assert result is not kv  # snapshot, not alias
+        assert result[0].keys is kv[0].keys
+        assert result[0].values is kv[0].values
         assert remaining == [4, 5, 6]
 
     def test_fetch_miss(self, small_cache, mock_kv_cache):
