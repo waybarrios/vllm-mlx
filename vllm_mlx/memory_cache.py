@@ -25,6 +25,7 @@ Example:
 from __future__ import annotations
 
 import bisect
+import copy
 import logging
 import math
 import threading
@@ -486,6 +487,107 @@ def _trim_to_offset(cache: list[Any]) -> list[Any]:
         mx.eval(*eval_targets)
 
     return trimmed
+
+
+def _detach_cache_for_storage(cache: list[Any]) -> list[Any]:
+    """Materialize and detach cache arrays before storage.
+
+    Per-request caches handed to ``store()`` are built from lazy slices of
+    live batch arrays (``extract_cache`` / ``_trim_cache_offset``), and
+    hybrid layers such as ``ArraysCache`` expose their mutable state
+    container by reference via ``.state``.  Storing those references has two
+    failure modes:
+
+    - the stored entry aliases containers/buffers the batch generator keeps
+      mutating (same class of bug as the SimpleEngine snapshot aliasing,
+      #575), and
+    - unevaluated arrays retain their entire lazy computation graph, pinning
+      every upstream batch-wide buffer.  Under sustained traffic this leaks
+      Metal buffer handles roughly proportional to generated tokens per
+      stored entry, until the process hits the device resource limit
+      (``[metal::malloc] Resource limit (N) exceeded``) and aborts.
+
+    Force a compact, evaluated copy of every array so the stored entry owns
+    exactly its own data and nothing else.
+    """
+    import mlx.core as mx
+
+    eval_targets: list[Any] = []
+
+    def _detach(arr: Any) -> Any:
+        if arr is None or not (hasattr(arr, "shape") and hasattr(arr, "dtype")):
+            return arr
+        out = mx.contiguous(arr)
+        eval_targets.append(out)
+        return out
+
+    def _detach_container(value: Any) -> Any:
+        if isinstance(value, tuple):
+            return tuple(_detach_container(v) for v in value)
+        if isinstance(value, list):
+            return [_detach_container(v) for v in value]
+        return _detach(value)
+
+    def _detach_layer(layer: Any) -> Any:
+        if layer is None:
+            return layer
+        if isinstance(layer, dict):
+            if "state" in layer:
+                snap_dict = dict(layer)
+                snap_dict["state"] = _detach_container(layer["state"])
+                return snap_dict
+            return layer
+        # copy.copy (not __new__ + __dict__.update) so classes using
+        # __slots__ (e.g. _QuantizedCacheWrapper) snapshot correctly too.
+        if hasattr(layer, "keys") and not callable(getattr(layer, "keys")):
+            # KVCache / RotatingKVCache / _QuantizedCacheWrapper style.
+            snap = copy.copy(layer)
+            snap.keys = _detach_container(layer.keys)
+            snap.values = _detach_container(layer.values)
+            return snap
+        if hasattr(layer, "caches") and isinstance(
+            getattr(layer, "caches"), (list, tuple)
+        ):
+            # Container caches (e.g. ``CacheList``): their ``state`` setter
+            # writes through to the child caches in place, so going through
+            # the setter would mutate the caller's children.  Snapshot the
+            # children recursively instead.
+            snap = copy.copy(layer)
+            children = _detach_cache_for_storage(list(layer.caches))
+            snap.caches = (
+                tuple(children) if isinstance(layer.caches, tuple) else children
+            )
+            return snap
+        if hasattr(layer, "state"):
+            # Hybrid state-container layers (e.g. ``ArraysCache``): ``.state``
+            # returns the live mutable list — clone the container and detach
+            # its arrays instead of aliasing it.
+            snap = copy.copy(layer)
+            snap.state = _detach_container(layer.state)
+            for attr in ("left_padding", "lengths"):
+                if getattr(snap, attr, None) is not None:
+                    setattr(snap, attr, _detach(getattr(snap, attr)))
+            return snap
+        return layer
+
+    detached: list[Any] = []
+    for layer in cache:
+        try:
+            detached.append(_detach_layer(layer))
+        except Exception as e:
+            logger.warning(
+                "[cache_store] failed to detach %s (%s: %s); "
+                "storing by reference",
+                type(layer).__name__,
+                type(e).__name__,
+                e,
+            )
+            detached.append(layer)
+
+    if eval_targets:
+        mx.eval(*eval_targets)
+
+    return detached
 
 
 class _QuantizedCacheWrapper:
@@ -970,6 +1072,10 @@ class MemoryAwarePrefixCache:
 
             # Trim oversized KV arrays to actual used size
             cache = _trim_to_offset(cache)
+
+            # Detach from live batch buffers and lazy graphs so the stored
+            # entry owns its data (prevents aliasing + Metal handle leak).
+            cache = _detach_cache_for_storage(cache)
 
             # Quantize if enabled and sequence is long enough
             if (
