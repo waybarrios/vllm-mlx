@@ -16,6 +16,7 @@ import time
 import uuid
 from collections import OrderedDict, deque
 from collections.abc import AsyncIterator
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from typing import Any
 
@@ -35,6 +36,7 @@ from ..api.utils import clean_output_text, has_media_content, is_mllm_model
 from .base import (
     BaseEngine,
     EngineBusy,
+    EngineStopped,
     GenerationOutput,
     cleanup_startup_cancellation,
     run_blocking_startup_work,
@@ -48,6 +50,15 @@ logger = logging.getLogger(__name__)
 def _bind_worker_generation_streams() -> None:
     """Rebind mlx generation streams inside the current worker thread."""
     bind_generation_streams()
+
+
+def _join_executors(executors: list[ThreadPoolExecutor]) -> None:
+    """Wait for detached generation workers to finish, on a worker thread."""
+    for executor in executors:
+        try:
+            executor.shutdown(wait=True)
+        except Exception:  # pragma: no cover - shutdown is already idempotent
+            logger.debug("Draining a previous generation worker failed", exc_info=True)
 
 
 def _seed_logits_processors(
@@ -113,6 +124,11 @@ def _processors_retired(processors: list[Any] | None) -> bool:
     return bool(processors) and any(
         getattr(p, "is_retired", False) is True for p in processors
     )
+
+
+# Sentinel for "the generation iterator is exhausted", pulled across the
+# worker-thread boundary where StopIteration cannot travel.
+_STREAM_DONE = object()
 
 
 class _SpecPrefillCancelled(Exception):
@@ -215,6 +231,13 @@ class SimpleEngine(BaseEngine):
 
         # Lock to serialize MLX operations (prevents Metal command buffer conflicts)
         self._generation_lock = asyncio.Lock()
+        # NOTE: "fail_fast" rejects whenever the lock is held. That used to be
+        # rare for streaming requests by accident — generation ran on the event
+        # loop, so a second request could not reach this check until the first
+        # had finished. Now that generation has its own thread the loop stays
+        # responsive and genuinely concurrent requests reach it, so operators
+        # who prefer queuing to 503s want
+        # VLLM_MLX_SIMPLE_ENGINE_LOCK_ADMISSION=wait.
         self._generation_lock_admission = (
             os.environ.get("VLLM_MLX_SIMPLE_ENGINE_LOCK_ADMISSION", "fail_fast")
             .strip()
@@ -255,6 +278,142 @@ class SimpleEngine(BaseEngine):
         # cache classes such as ``RotatingKVCache`` remain disabled because
         # their extra cursor metadata is not captured by ``.state`` alone.
         self._supports_system_kv_cache: bool = False
+
+        # Every MLX generation call runs on this one thread; see
+        # ``_generation_worker``.
+        self._generation_executor: ThreadPoolExecutor | None = None
+        self._generation_streams_bound: bool = False
+        # Set by ``stop()``. In-flight pumps check it between chunks so a stop
+        # costs one token rather than one whole generation.
+        self._stopping: bool = False
+        # Workers ``stop()`` left running because MLX was still busy. The next
+        # worker thread joins them before it touches MLX itself.
+        self._draining_executors: list[ThreadPoolExecutor] = []
+        # Number of routes currently driving the generation worker, and an
+        # event that is set exactly while that number is zero. ``stop()`` waits
+        # on it briefly so generators close on the thread that owns them.
+        self._generation_users: int = 0
+        self._generation_idle: asyncio.Event = asyncio.Event()
+        self._generation_idle.set()
+        # ``on_cancel`` hooks of in-flight blocking work, so ``stop()`` can use
+        # the abort paths those routes already implement.
+        self._generation_abort_hooks: dict[str, Any] = {}
+
+    # How long ``stop()`` gives in-flight MLX work to wind down before it
+    # detaches the worker and returns. Streaming routes check the stopping flag
+    # between chunks, so they land well inside this; a monolithic
+    # ``mlx_lm.generate()`` call cannot be interrupted at all and is left to
+    # finish in the background rather than stalling the event loop.
+    STOP_DRAIN_TIMEOUT_S: float = 5.0
+
+    def _generation_worker(self) -> ThreadPoolExecutor:
+        """Return the single thread that owns every MLX generation call.
+
+        MLX streams exist only in the thread that created them, and a pending
+        array carries the stream its primitives were built on. Anything that
+        outlives one request therefore cannot be handed to a different thread:
+        the prompt cache built during load or a previous turn blows up in
+        ``mx.eval([c.state for c in prompt_cache])`` with "There is no
+        Stream(gpu, N) in current thread".
+
+        ``asyncio.to_thread`` spreads work over the default executor, so this
+        failed on every request once a cache survived a turn. Rebinding the
+        module-level generation streams cannot help — the cache already holds
+        the old stream, so the rebind changes a global nothing reads. Pinning
+        the work is the fix, and it is what BatchedEngine already does
+        (``engine_core.py``: ``ThreadPoolExecutor(max_workers=1)``).
+        """
+        if self._generation_executor is None:
+            self._generation_executor = ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="simple-generate"
+            )
+            self._generation_streams_bound = False
+            # A previous stop() detached its worker while MLX was still busy so
+            # the event loop stayed responsive. Two threads must never be inside
+            # Metal at once, so the new thread's first job is to wait the old
+            # ones out. max_workers=1 keeps that ordered ahead of the model
+            # load, and the wait lands on the worker, never on the loop.
+            draining, self._draining_executors = self._draining_executors, []
+            if draining:
+                self._generation_executor.submit(_join_executors, draining)
+        return self._generation_executor
+
+    @asynccontextmanager
+    async def _generation_worker_in_use(self):
+        """Mark the generation worker busy for the length of one route.
+
+        ``stop()`` waits on the idle event so a route gets to close its MLX
+        generator on the thread that owns it, instead of having the executor
+        pulled out from under it.
+        """
+        self._generation_users += 1
+        self._generation_idle.clear()
+        try:
+            yield
+        finally:
+            self._generation_users -= 1
+            if self._generation_users <= 0:
+                self._generation_users = 0
+                self._generation_idle.set()
+                self._retire_detached_workers()
+
+    def _retire_detached_workers(self) -> None:
+        """Shut down workers ``stop()`` detached, once nothing is using them.
+
+        ``stop()`` leaves a busy worker running and alive: the route still
+        holding it has an MLX generator to close, and that close belongs on the
+        thread that owns it. Ownership therefore passes to the last user, which
+        is here. The executors stay listed so the next worker thread can still
+        join them before it touches MLX itself.
+        """
+        for executor in self._draining_executors:
+            executor.shutdown(wait=False)
+
+    def _generation_worker_is_live(
+        self, worker: ThreadPoolExecutor | None, *, ignore_stopping: bool = False
+    ) -> bool:
+        """True while ``worker`` is still this engine's usable generation thread."""
+        if worker is None:
+            return False
+        if worker is self._generation_executor:
+            return ignore_stopping or not self._stopping
+        # Detached by stop() but not yet retired: still good for the cleanup its
+        # own route owes, never for new generation.
+        return ignore_stopping and worker in self._draining_executors
+
+    async def _submit_to_generation_worker(
+        self,
+        worker: ThreadPoolExecutor | None,
+        fn,
+        /,
+        *args,
+        during_shutdown: bool = False,
+    ):
+        """Run ``fn`` on the pinned thread, reporting shutdown as EngineStopped.
+
+        Routes capture the worker once and then submit per chunk, so a stop can
+        land between two submits. Without this the next submit surfaces
+        ``RuntimeError("cannot schedule new futures after shutdown")`` in the
+        middle of a client response.
+
+        ``during_shutdown`` is for the cleanup a stopping route still owes its
+        generator: the stopping flag alone must not block it, because ``stop()``
+        is waiting for exactly that work before it tears the thread down.
+        """
+        blocked_by_stop = self._stopping and not during_shutdown
+        if blocked_by_stop or not self._generation_worker_is_live(
+            worker, ignore_stopping=during_shutdown
+        ):
+            raise EngineStopped("SimpleEngine stopped while generation was in flight")
+        loop = asyncio.get_running_loop()
+        try:
+            return await loop.run_in_executor(worker, fn, *args)
+        except RuntimeError as exc:
+            if "cannot schedule new futures" in str(exc):
+                raise EngineStopped(
+                    "SimpleEngine stopped while generation was in flight"
+                ) from exc
+            raise
 
     @staticmethod
     def _clone_cache_state(value: Any) -> Any:
@@ -435,17 +594,20 @@ class SimpleEngine(BaseEngine):
         """Start the engine (load model if not loaded)."""
         if self._loaded:
             return
+        # A previous stop() latched this; clear it before anything asks
+        # _generation_worker_is_live, or the fresh worker looks dead on arrival.
+        self._stopping = False
         try:
             if self._model is None:
-                if self._uses_default_prepare_for_start():
-                    # MLX generation streams are thread-local. Keep model load on
-                    # the event-loop thread so default LLM stream_generate() runs
-                    # on the same thread that owns model-associated streams.
-                    self.prepare_for_start()
-                else:
-                    # Test doubles and custom overrides may block; preserve the
-                    # cancellation-safe threaded startup helper for those cases.
-                    await run_blocking_startup_work(self.prepare_for_start)
+                # MLX streams are thread-local and buffers built at load carry
+                # the stream they were built on, so load must happen on the very
+                # thread that later generates: the dedicated generation worker.
+                # This applies to an overridden prepare_for_start too — a
+                # subclass that loads on some other thread hits exactly the same
+                # failure, so there is no reason to split on which one it is.
+                await run_blocking_startup_work(
+                    self.prepare_for_start, executor=self._generation_worker()
+                )
             self._loaded = True
 
             if self._mtp and self._mtp_num_draft_tokens != 1:
@@ -595,7 +757,36 @@ class SimpleEngine(BaseEngine):
             raise
 
     async def stop(self) -> None:
-        """Stop the engine and cleanup resources."""
+        """Stop the engine and cleanup resources.
+
+        Must not block the event loop. The generation worker is handed whole
+        requests, and the server default is ``max_tokens=32768``, so waiting for
+        it here would freeze health checks, timers and cancellation for minutes.
+        Instead: signal, let in-flight routes wind down for a bounded moment,
+        then detach the worker and return.
+        """
+        self._stopping = True
+
+        executor = self._generation_executor
+        if executor is not None and self._generation_users > 0:
+            # Use the abort paths the long routes already implement, so the
+            # wait below usually resolves rather than times out.
+            for hook in list(self._generation_abort_hooks.values()):
+                try:
+                    hook()
+                except Exception:
+                    logger.debug("Generation abort hook failed", exc_info=True)
+            try:
+                await asyncio.wait_for(
+                    self._generation_idle.wait(), timeout=self.STOP_DRAIN_TIMEOUT_S
+                )
+            except (asyncio.TimeoutError, TimeoutError):
+                logger.warning(
+                    "SimpleEngine.stop: generation worker still busy after %.1fs; "
+                    "detaching it to finish in the background",
+                    self.STOP_DRAIN_TIMEOUT_S,
+                )
+
         self._model = None
         self._text_model = None
         self._text_tokenizer = None
@@ -605,6 +796,20 @@ class SimpleEngine(BaseEngine):
         for k in self._system_kv_cache_stats:
             self._system_kv_cache_stats[k] = 0
         self._supports_system_kv_cache = False
+
+        if executor is not None:
+            # Streams and any cache built on that thread die with it.
+            self._generation_executor = None
+            self._generation_streams_bound = False
+            if self._generation_users > 0:
+                # Something is still inside MLX. Detach the executor but leave
+                # it running: the route holding it still has a generator to
+                # close, and that has to happen on this thread. The last user
+                # retires it, and the next worker joins it before loading a
+                # model of its own.
+                self._draining_executors.append(executor)
+            else:
+                executor.shutdown(wait=False, cancel_futures=True)
         logger.info("SimpleEngine stopped")
 
     def _should_route_text_through_text_model(
@@ -642,28 +847,47 @@ class SimpleEngine(BaseEngine):
             }
 
             def run_bound():
-                _bind_worker_generation_streams()
+                # One thread owns generation, so binding once is enough and
+                # rebinding per request would only churn streams.
+                if not self._generation_streams_bound:
+                    _bind_worker_generation_streams()
+                    self._generation_streams_bound = True
                 return func(*args, **kwargs)
 
-            task = asyncio.create_task(asyncio.to_thread(run_bound))
-            try:
-                return await asyncio.shield(task)
-            except asyncio.CancelledError:
+            worker = self._generation_worker()
+
+            async def _run_on_generation_worker():
+                return await self._submit_to_generation_worker(worker, run_bound)
+
+            # create_task over a coroutine, exactly as the asyncio.to_thread
+            # version did. Wrapping the executor future directly changes how
+            # cancellation and exception retrieval behave, which breaks
+            # SpecPrefill's cancel-during-scoring path.
+            async with self._generation_worker_in_use():
                 if on_cancel is not None:
-                    try:
-                        on_cancel()
-                    except Exception:
-                        logger.debug(
-                            "Blocking worker cancellation callback failed",
-                            exc_info=True,
-                        )
+                    # stop() drives these so a shutdown uses the same abort path
+                    # a client disconnect does.
+                    self._generation_abort_hooks[request_id] = on_cancel
+                task = asyncio.create_task(_run_on_generation_worker())
                 try:
-                    await task
-                except BaseException:
-                    pass
-                raise
-            finally:
-                self._active_requests.pop(request_id, None)
+                    return await asyncio.shield(task)
+                except asyncio.CancelledError:
+                    if on_cancel is not None:
+                        try:
+                            on_cancel()
+                        except Exception:
+                            logger.debug(
+                                "Blocking worker cancellation callback failed",
+                                exc_info=True,
+                            )
+                    try:
+                        await task
+                    except BaseException:
+                        pass
+                    raise
+                finally:
+                    self._generation_abort_hooks.pop(request_id, None)
+                    self._active_requests.pop(request_id, None)
 
     async def generate(
         self,
@@ -929,83 +1153,133 @@ class SimpleEngine(BaseEngine):
                 "elapsed_s": 0.0,
                 "started_at": started_at,
             }
-            # Non-stream chat runs in a worker thread and rebinds generation
-            # streams there. Rebind again on the current thread before
-            # stream_generate so nonstream->stream mode switches remain valid.
-            _bind_worker_generation_streams()
+            # Streaming has to run on the same thread as the non-stream route.
+            # Both share the prompt cache, and an MLX array can only be
+            # evaluated on the thread whose stream built its primitives, so
+            # pumping the generator here on the event loop thread meant every
+            # request after a non-stream turn died in generate_step with
+            # "There is no Stream(gpu, N) in current thread". Rebinding the
+            # module-level stream cannot bridge the two threads, because the
+            # cache already carries the stream it was built on.
+            worker = self._generation_worker()
+            iterator = None
+            aborted_by_stop = False
 
-            try:
-                accumulated_text = ""
-                prompt_tokens = 0
-                completion_tokens = 0
-                finished = False
+            def _next_chunk():
+                if not self._generation_streams_bound:
+                    _bind_worker_generation_streams()
+                    self._generation_streams_bound = True
+                try:
+                    return next(iterator)
+                except StopIteration:
+                    return _STREAM_DONE
 
-                for chunk in self._model.stream_generate(
-                    prompt=prompt,
-                    max_tokens=max_tokens,
-                    temperature=temperature,
-                    top_p=top_p,
-                    stop=stop,
-                    **kwargs,
-                ):
-                    prompt_tokens = (
-                        chunk.prompt_tokens
-                        if hasattr(chunk, "prompt_tokens") and chunk.prompt_tokens
-                        else prompt_tokens
+            async with self._generation_worker_in_use():
+                try:
+                    accumulated_text = ""
+                    prompt_tokens = 0
+                    completion_tokens = 0
+                    finished = False
+
+                    iterator = self._model.stream_generate(
+                        prompt=prompt,
+                        max_tokens=max_tokens,
+                        temperature=temperature,
+                        top_p=top_p,
+                        stop=stop,
+                        **kwargs,
                     )
-                    completion_tokens += 1
-                    if request_id in self._active_requests:
-                        self._active_requests[request_id].update(
-                            {
-                                "prompt_tokens": prompt_tokens,
-                                "completion_tokens": completion_tokens,
-                                "elapsed_s": round(time.time() - started_at, 1),
-                            }
+
+                    while True:
+                        if not self._generation_worker_is_live(worker):
+                            # stop() ran. End the response here rather than
+                            # submitting to a dead executor, which would raise
+                            # in the middle of a client stream.
+                            aborted_by_stop = True
+                            break
+                        chunk = await self._submit_to_generation_worker(
+                            worker, _next_chunk
                         )
-                    new_text = chunk.text if hasattr(chunk, "text") else str(chunk)
-                    accumulated_text += new_text
-
-                    finished = (
-                        getattr(chunk, "finished", False)
-                        or completion_tokens >= max_tokens
-                    )
-                    finish_reason = None
-                    if finished:
-                        finish_reason = getattr(chunk, "finish_reason", "stop")
-
-                    yield GenerationOutput(
-                        text=accumulated_text,
-                        new_text=new_text,
-                        prompt_tokens=prompt_tokens,
-                        completion_tokens=completion_tokens,
-                        finished=finished,
-                        finish_reason=finish_reason,
-                    )
-
-                    if finished:
-                        break
-
-                if not finished:
-                    if prompt_tokens == 0:
-                        prompt_tokens = len(self._model.tokenizer.encode(prompt))
-                    if request_id in self._active_requests:
-                        self._active_requests[request_id].update(
-                            {
-                                "prompt_tokens": prompt_tokens,
-                                "completion_tokens": completion_tokens,
-                                "elapsed_s": round(time.time() - started_at, 1),
-                            }
+                        if chunk is _STREAM_DONE:
+                            break
+                        prompt_tokens = (
+                            chunk.prompt_tokens
+                            if hasattr(chunk, "prompt_tokens") and chunk.prompt_tokens
+                            else prompt_tokens
                         )
-                    yield GenerationOutput(
-                        text=accumulated_text,
-                        new_text="",
-                        prompt_tokens=prompt_tokens,
-                        completion_tokens=completion_tokens,
-                        finished=True,
-                        finish_reason=None,
-                    )
-            finally:
-                self._active_requests.pop(request_id, None)
+                        completion_tokens += 1
+                        if request_id in self._active_requests:
+                            self._active_requests[request_id].update(
+                                {
+                                    "prompt_tokens": prompt_tokens,
+                                    "completion_tokens": completion_tokens,
+                                    "elapsed_s": round(time.time() - started_at, 1),
+                                }
+                            )
+                        new_text = chunk.text if hasattr(chunk, "text") else str(chunk)
+                        accumulated_text += new_text
+
+                        finished = (
+                            getattr(chunk, "finished", False)
+                            or completion_tokens >= max_tokens
+                        )
+                        finish_reason = None
+                        if finished:
+                            finish_reason = getattr(chunk, "finish_reason", "stop")
+
+                        yield GenerationOutput(
+                            text=accumulated_text,
+                            new_text=new_text,
+                            prompt_tokens=prompt_tokens,
+                            completion_tokens=completion_tokens,
+                            finished=finished,
+                            finish_reason=finish_reason,
+                        )
+
+                        if finished:
+                            break
+
+                    if not finished:
+                        if prompt_tokens == 0 and self._model is not None:
+                            prompt_tokens = len(self._model.tokenizer.encode(prompt))
+                        if request_id in self._active_requests:
+                            self._active_requests[request_id].update(
+                                {
+                                    "prompt_tokens": prompt_tokens,
+                                    "completion_tokens": completion_tokens,
+                                    "elapsed_s": round(time.time() - started_at, 1),
+                                }
+                            )
+                        yield GenerationOutput(
+                            text=accumulated_text,
+                            new_text="",
+                            prompt_tokens=prompt_tokens,
+                            completion_tokens=completion_tokens,
+                            finished=True,
+                            finish_reason="abort" if aborted_by_stop else None,
+                        )
+                finally:
+                    # Generator cleanup touches MLX, so it belongs on the worker
+                    # too — closing it here would evaluate on the loop thread.
+                    # during_shutdown lets it through while stop() is draining,
+                    # which is the whole point of that wait.
+                    if iterator is not None:
+                        try:
+                            await self._submit_to_generation_worker(
+                                worker, iterator.close, during_shutdown=True
+                            )
+                        except EngineStopped:
+                            # The worker is already gone, so no thread is left
+                            # that may evaluate these buffers; its teardown is
+                            # what releases them.
+                            logger.debug(
+                                "stream_generate close skipped: worker already down"
+                            )
+                        except Exception:
+                            logger.warning(
+                                "stream_generate close failed", exc_info=True
+                            )
+                    self._active_requests.pop(request_id, None)
 
     async def chat(
         self,
@@ -1252,34 +1526,85 @@ class SimpleEngine(BaseEngine):
             if self._text_model is None and not has_media_content(messages):
                 local_kwargs = mllm_call_kwargs()
 
-                async with self._generation_lock:
-                    _bind_worker_generation_streams()
-                    for chunk in self._model.stream_chat(
+                # Same thread rule as the text route: the MLLM model was loaded
+                # on the generation worker, so stream_chat has to be pumped
+                # there too. Running it on the event loop thread and rebinding
+                # the module-level stream cannot work, because the model
+                # buffers already carry the stream they were built on.
+                worker = self._generation_worker()
+                iterator = None
+
+                def _next_chat_chunk():
+                    if not self._generation_streams_bound:
+                        _bind_worker_generation_streams()
+                        self._generation_streams_bound = True
+                    try:
+                        return next(iterator)
+                    except StopIteration:
+                        return _STREAM_DONE
+
+                async with self._generation_lock, self._generation_worker_in_use():
+                    iterator = self._model.stream_chat(
                         messages=messages,
                         max_tokens=max_tokens,
                         temperature=temperature,
                         tools=template_tools,
                         **local_kwargs,
-                    ):
-                        token_count += 1
-                        new_text = chunk.text if hasattr(chunk, "text") else str(chunk)
-                        accumulated_text += new_text
+                    )
+                    try:
+                        while True:
+                            if not self._generation_worker_is_live(worker):
+                                # stop() ran; close the response out instead of
+                                # submitting to a dead executor mid-stream.
+                                yield GenerationOutput(
+                                    text=accumulated_text,
+                                    new_text="",
+                                    prompt_tokens=0,
+                                    completion_tokens=token_count,
+                                    finished=True,
+                                    finish_reason="abort",
+                                )
+                                break
+                            chunk = await self._submit_to_generation_worker(
+                                worker, _next_chat_chunk
+                            )
+                            if chunk is _STREAM_DONE:
+                                break
 
-                        finished = chunk.finish_reason is not None
+                            token_count += 1
+                            new_text = (
+                                chunk.text if hasattr(chunk, "text") else str(chunk)
+                            )
+                            accumulated_text += new_text
 
-                        yield GenerationOutput(
-                            text=accumulated_text,
-                            new_text=new_text,
-                            prompt_tokens=getattr(chunk, "prompt_tokens", 0),
-                            completion_tokens=token_count,
-                            finished=finished,
-                            finish_reason=chunk.finish_reason if finished else None,
-                            mtp_drafts=getattr(chunk, "mtp_drafts", 0),
-                            mtp_accepted=getattr(chunk, "mtp_accepted", 0),
-                        )
+                            finished = chunk.finish_reason is not None
 
-                        if finished:
-                            break
+                            yield GenerationOutput(
+                                text=accumulated_text,
+                                new_text=new_text,
+                                prompt_tokens=getattr(chunk, "prompt_tokens", 0),
+                                completion_tokens=token_count,
+                                finished=finished,
+                                finish_reason=(
+                                    chunk.finish_reason if finished else None
+                                ),
+                                mtp_drafts=getattr(chunk, "mtp_drafts", 0),
+                                mtp_accepted=getattr(chunk, "mtp_accepted", 0),
+                            )
+
+                            if finished:
+                                break
+                    finally:
+                        try:
+                            await self._submit_to_generation_worker(
+                                worker, iterator.close, during_shutdown=True
+                            )
+                        except EngineStopped:
+                            logger.debug(
+                                "stream_chat close skipped: worker already down"
+                            )
+                        except Exception:
+                            logger.warning("stream_chat close failed", exc_info=True)
                 return
 
             # Run stream_chat in thread pool since it's synchronous
