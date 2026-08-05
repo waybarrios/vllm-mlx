@@ -25,6 +25,10 @@ Keep single-model serving when you want the smallest operational surface and the
 vllm-mlx serve --models-config /etc/vllm-mlx/models.yaml --host 0.0.0.0 --port 8000
 ```
 
+Use `--memory-budget-gb` to override `manager.memory_budget_gb` (or the legacy
+`manager.memory_budget`) for a particular launch. The CLI value takes precedence
+over the YAML value and can supply the budget when the YAML field is absent.
+
 You can still use global serve flags such as:
 
 - `--api-key`
@@ -84,7 +88,9 @@ models:
 
 Total resident-model budget for the registry manager.
 
-This is the eviction budget, not the full system RAM size. Leave headroom for:
+This estimates the model-weight residency managed by registry eviction. It is not
+a total runtime-memory limit or a guarantee against Metal/MLX OOM. Leave headroom
+for:
 
 - KV cache
 - request batching
