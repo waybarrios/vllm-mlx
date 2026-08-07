@@ -1498,7 +1498,25 @@ class MLLMBatchGenerator:
                 # running them through the language model alone.
                 cached_kv = None
                 remaining_ids = None
-                if self.prefix_cache is not None and req.input_ids is not None:
+                # The prefix cache is keyed on token IDs alone, and every
+                # image/audio clip occupies identical placeholder IDs — so for
+                # media requests "same prompt text" is a full-prefix hit that
+                # replays a DIFFERENT image's KV (the existing image-token
+                # check below only inspects the REMAINING ids, which a full
+                # hit leaves empty). Only text-only requests may touch the
+                # prompt prefix cache; media requests still benefit from
+                # VisionEmbeddingCache, which hashes image bytes.
+                if (
+                    self.prefix_cache is not None
+                    and req.input_ids is not None
+                    # getattr with a permissive default: request-like objects that
+                    # predate this flag (test doubles, external callers) keep the old
+                    # behaviour, so this change only ever RESTRICTS caching for a
+                    # request that explicitly reports media. The real Request dataclass
+                    # defaults the field to False, so a request that never reached
+                    # _process_prompts is still treated as media here.
+                    and getattr(req, "is_text_only", True)
+                ):
                     input_ids_list = req.input_ids.reshape(-1).tolist()
                     # Strip think suffix from lookup key so stored entries
                     # (also stripped) match as clean PREFIX.
@@ -1927,8 +1945,15 @@ class MLLMBatchGenerator:
         elif self.unprocessed_requests and getattr(
             self, "_allow_mid_batch_extend", True
         ):
+            # Audio counts as media too: an audio request selected here would reach
+            # the prompt prefix cache with placeholder-only token keys, which is the
+            # same image-blindness this commit fixes.
             text_only = self._compatible_pending_requests(
-                [r for r in self.unprocessed_requests if not r.images and not r.videos],
+                [
+                    r
+                    for r in self.unprocessed_requests
+                    if not r.images and not r.videos and not r.audio
+                ],
                 self.completion_batch_size,
             )
 
@@ -2144,7 +2169,10 @@ class MLLMBatchGenerator:
             return
         for i in end_indices:
             req = batch.requests[i]
-            if req.input_ids is not None:
+            # Text-only KV only: a media request's KV stored under a
+            # token-only key would be replayed for any other media with the
+            # same prompt text (the docstring above always said text-only).
+            if req.input_ids is not None and getattr(req, "is_text_only", True):
                 try:
                     extracted = batch.extract_cache(i)
                     input_ids_list = req.input_ids.reshape(-1).tolist()
@@ -3188,8 +3216,13 @@ def install_chunked_prefill_mllm(
                     new_batch.cache = merged_cache
                     batch_gen.active_batch = new_batch
 
-                # Store in prefix cache (prompt-only)
-                if batch_gen.prefix_cache is not None and req.input_ids is not None:
+                # Store in prefix cache (prompt-only). Text-only requests
+                # only — see _maybe_store_prefix_cache.
+                if (
+                    batch_gen.prefix_cache is not None
+                    and req.input_ids is not None
+                    and getattr(req, "is_text_only", True)
+                ):
                     try:
                         input_ids_list = req.input_ids.reshape(-1).tolist()
                         S = batch_gen._think_suffix_len
@@ -3234,7 +3267,9 @@ def install_chunked_prefill_mllm(
                 len(batch_gen.unprocessed_requests),
             )
             for r in compatible_pending:
-                if not r.images and not r.videos:
+                # Audio counts as media too: an audio request here would reach the
+                # prefix cache with placeholder-only token keys.
+                if not r.images and not r.videos and not r.audio:
                     text_only_req = r
                     break
 
