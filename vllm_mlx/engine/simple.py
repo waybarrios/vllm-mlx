@@ -971,7 +971,11 @@ class SimpleEngine(BaseEngine):
                     )
                     finish_reason = None
                     if finished:
-                        finish_reason = getattr(chunk, "finish_reason", "stop")
+                        finish_reason = getattr(chunk, "finish_reason", None)
+                        if finish_reason is None:
+                            finish_reason = (
+                                "length" if completion_tokens >= max_tokens else "stop"
+                            )
 
                     yield GenerationOutput(
                         text=accumulated_text,
@@ -1002,7 +1006,7 @@ class SimpleEngine(BaseEngine):
                         prompt_tokens=prompt_tokens,
                         completion_tokens=completion_tokens,
                         finished=True,
-                        finish_reason=None,
+                        finish_reason="stop",
                     )
             finally:
                 self._active_requests.pop(request_id, None)
