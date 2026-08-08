@@ -536,5 +536,13 @@ def test_load_rejects_v3_cache_after_rewind_semantics_change(tmp_path, caplog):
     )
     cache = MemoryAwarePrefixCache(MagicMock(), MemoryCacheConfig(max_memory_mb=1))
 
-    assert cache.load_from_disk(str(tmp_path)) == 0
+    with patch.dict(
+        "sys.modules",
+        {
+            "mlx_lm": None,
+            "mlx_lm.models": None,
+            "mlx_lm.models.cache": None,
+        },
+    ):
+        assert cache.load_from_disk(str(tmp_path)) == 0
     assert "version mismatch: disk=3 current=4" in caplog.text
