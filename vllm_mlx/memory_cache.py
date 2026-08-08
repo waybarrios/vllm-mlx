@@ -88,6 +88,23 @@ def _array_memory(arr) -> int:
     return 0
 
 
+def _nested_array_memory(value: Any) -> int:
+    """Sum ``_array_memory`` over an arbitrarily nested state structure.
+
+    Cache ``state`` payloads are not always a flat ``(keys, values)`` pair:
+    CacheList yields a list of sub-cache states and PoolingCache yields
+    ``(buf_kv, buf_gate, pooled)`` with possible ``None`` members. Unpacking
+    those as two values raised, was swallowed, and the entry was accounted as
+    zero bytes — so the dashboard showed 0% cache memory and, far worse, the
+    byte-based LRU eviction never fired for such models.
+    """
+    if value is None:
+        return 0
+    if isinstance(value, (list, tuple)):
+        return sum(_nested_array_memory(v) for v in value)
+    return _array_memory(value)
+
+
 def estimate_kv_cache_memory(cache: list[Any]) -> int:
     """
     Estimate memory usage of a KV cache in bytes.
@@ -125,11 +142,11 @@ def estimate_kv_cache_memory(cache: list[Any]) -> int:
                 total_bytes += _array_memory(arr)
             continue
         elif hasattr(layer_cache, "state") and not isinstance(layer_cache, dict):
-            # Cache with state property returning (keys, values)
+            # Cache with a state property. Walk it recursively: the payload may
+            # be a plain (keys, values) pair, but CacheList/PoolingCache nest
+            # further, and the old two-way unpack silently measured those as 0.
             try:
-                keys, values = layer_cache.state
-                total_bytes += _array_memory(keys)
-                total_bytes += _array_memory(values)
+                total_bytes += _nested_array_memory(layer_cache.state)
             except (TypeError, ValueError):
                 pass
         elif hasattr(layer_cache, "keys") and hasattr(layer_cache, "values"):
