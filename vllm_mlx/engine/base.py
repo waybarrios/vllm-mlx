@@ -43,6 +43,19 @@ class EngineBusy(RuntimeError):
     code = "text_generation_busy"
 
 
+class EngineStopped(RuntimeError):
+    """Raised when generation work is submitted after the engine has stopped.
+
+    Engines that pin MLX work to one thread tear that thread down in ``stop()``.
+    Anything still holding a reference to it gets a defined error instead of the
+    raw ``RuntimeError("cannot schedule new futures after shutdown")`` that
+    ``ThreadPoolExecutor`` raises, so callers can tell a shutdown apart from a
+    real generation failure.
+    """
+
+    code = "engine_stopped"
+
+
 @contextmanager
 def suspend_cancellation():
     """Temporarily clear task cancellation so cleanup can finish deterministically."""
@@ -67,9 +80,18 @@ def suspend_cancellation():
             task.cancel()
 
 
-async def run_blocking_startup_work(work: Callable[[], Any]) -> None:
-    """Run blocking startup work off-loop without leaking cancellation races."""
-    task = asyncio.create_task(asyncio.to_thread(work))
+async def run_blocking_startup_work(
+    work: Callable[[], Any], executor: Any | None = None
+) -> None:
+    """Run blocking startup work off-loop without leaking cancellation races.
+
+    Pass ``executor`` to pin the work to a specific thread. MLX buffers carry
+    the stream of the thread that built them, so a model must be loaded on the
+    same thread that later generates from it; ``None`` keeps the previous
+    behaviour of using asyncio's default thread pool.
+    """
+    loop = asyncio.get_running_loop()
+    task = asyncio.ensure_future(loop.run_in_executor(executor, work))
     try:
         await asyncio.shield(task)
     except asyncio.CancelledError:

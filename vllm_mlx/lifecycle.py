@@ -416,14 +416,41 @@ class ResidencyManager:
         if prepare_for_start is None:
             return
 
-        uses_default_prepare = getattr(engine, "_uses_default_prepare_for_start", None)
-        if callable(uses_default_prepare) and uses_default_prepare():
-            # Keep default engine prepare on the event-loop thread so MLX
-            # thread-local stream ownership matches subsequent streaming calls.
-            prepare_for_start()
-            return
+        # MLX buffers carry the stream of the thread that built them, so load
+        # has to land on the very thread the engine generates on. Engines that
+        # pin generation name that thread: ``_model_load_executor`` when the
+        # answer depends on the path (BatchedEngine returns None for MLLM,
+        # which steps on the event loop), otherwise ``_generation_worker``.
+        load_executor = getattr(engine, "_model_load_executor", None)
+        if not callable(load_executor):
+            load_executor = getattr(engine, "_generation_worker", None)
 
-        prepare_task = asyncio.create_task(asyncio.to_thread(prepare_for_start))
+        if callable(load_executor):
+            executor = load_executor()
+            if executor is None:
+                # The engine generates on the event loop, so it must load here.
+                prepare_for_start()
+                return
+        else:
+            uses_default_prepare = getattr(
+                engine, "_uses_default_prepare_for_start", None
+            )
+            if callable(uses_default_prepare) and uses_default_prepare():
+                # Engines without a pinned worker still depend on loading on the
+                # event-loop thread to match their stream ownership.
+                prepare_for_start()
+                return
+            executor = None
+
+        loop = asyncio.get_running_loop()
+
+        async def _prepare_off_loop():
+            return await loop.run_in_executor(executor, prepare_for_start)
+
+        # create_task over a coroutine, as the asyncio.to_thread version did:
+        # wrapping the executor future directly changes cancellation and
+        # exception-retrieval behaviour during shutdown unwinding.
+        prepare_task = asyncio.create_task(_prepare_off_loop())
         async with self._lock:
             resident._prepare_task = prepare_task
 

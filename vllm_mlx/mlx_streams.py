@@ -15,16 +15,18 @@ _STREAM_REBIND_LOCK = threading.Lock()
 def bind_generation_streams(
     module_names: Iterable[str] = ("mlx_lm.generate", "mlx_vlm.generate"),
 ) -> object:
-    """Bind mlx-lm/mlx-vlm generation streams to the current thread.
+    """Give the calling thread a stream and point mlx-lm/mlx-vlm at it.
 
-    MLX streams are thread-local. If a model is loaded on one thread and
-    generation runs on another, module-level generation streams created during
-    import can point at a stream that does not exist in the worker thread.
+    Call this **once**, on the single thread that owns MLX work, before any
+    model is loaded on it.
 
-    This intentionally creates a fresh stream for the current worker call and
-    replaces module-level generation_stream handles under a process-local lock.
-    It is an admission/ownership fix, not a batching optimization; callers
-    should invoke it at worker-entry boundaries rather than inside token loops.
+    It does not make state portable between threads, and must not be used to
+    try. MLX streams exist only in the thread that created them, and an array
+    with pending primitives carries the stream those primitives were built on.
+    Once a model or a prompt cache exists, rebinding this module-level handle
+    changes a global that the existing buffers do not consult, so evaluating
+    them from another thread still raises "There is no Stream(gpu, N) in
+    current thread". Load and generation must simply share one thread.
     """
     with _STREAM_REBIND_LOCK:
         default_stream = mx.new_stream(mx.default_device())
