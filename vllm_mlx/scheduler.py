@@ -138,6 +138,17 @@ class SchedulerConfig:
         if self.mllm_prefill_step_size is not None and self.mllm_prefill_step_size <= 0:
             raise ValueError("mllm_prefill_step_size must be > 0 when provided")
 
+        # Normalize once, here, rather than on every scheduling pass. A
+        # negative value is a startup mistake: warning about it per request
+        # turns one bad flag into a log flood, and it would say nothing new
+        # the second time.
+        if not isinstance(self.max_kv_size, int) or self.max_kv_size < 0:
+            logger.warning(
+                "Ignoring invalid max_kv_size=%r; treating as unbounded",
+                self.max_kv_size,
+            )
+            self.max_kv_size = 0
+
 
 @dataclass
 class SchedulerOutput:
@@ -1346,6 +1357,12 @@ class Scheduler:
             prefill_batch_size=self.config.prefill_batch_size,
             completion_batch_size=self.config.completion_batch_size,
             prefill_step_size=self.config.prefill_step_size,
+            # BatchGenerator builds caches for any sequence inserted without
+            # one, and its rule is the correct one: it post-processes the
+            # model's own cache, converting KVCache layers to RotatingKVCache.
+            # make_prompt_cache(model, max_kv_size=...) cannot do that — it
+            # ignores max_kv_size entirely for models that define make_cache.
+            max_kv_size=self._bounded_kv_size(),
         )
         # Set callback as attribute — used by _install_chunked_prefill
         # monkey-patch. Not a BatchGenerator constructor parameter.
@@ -1590,6 +1607,40 @@ class Scheduler:
             self._close_batch_generator()
             self.batch_generator = self._create_batch_generator(sampling_params)
             self._current_sampler_params = sampler_params
+
+    def _bounded_kv_size(self) -> int | None:
+        """Configured KV bound, or None when there is none to apply.
+
+        Only a positive value is a bound; ``0`` means unbounded. Negatives are
+        normalized away in ``SchedulerConfig.__post_init__``, so this stays a
+        pure accessor and never logs — it runs on every scheduling pass.
+        """
+        size = self.config.max_kv_size
+        return size if isinstance(size, int) and size > 0 else None
+
+    @staticmethod
+    def _bound_cache_layers(cache: Any, max_kv_size: int) -> Any:
+        """Bound plain KV layers, descending into cache containers.
+
+        mlx-lm's own rule (``BatchGenerator._make_new_cache``) only converts
+        flat ``KVCache`` layers, so a ``KVCache`` nested inside a ``CacheList``
+        stays unbounded — and the architectures that nest are exactly the ones
+        running out of memory. Layers that are already something else keep
+        their own type: a rotating, pooling or Mamba cache carries its own
+        bounding and replacing it would break the model.
+        """
+        from mlx_lm.models.cache import KVCache, RotatingKVCache
+
+        def _bound(layer: Any) -> Any:
+            children = getattr(layer, "caches", None)
+            if children:
+                layer.caches = type(children)([_bound(c) for c in children])
+                return layer
+            if type(layer) is KVCache:
+                return RotatingKVCache(max_size=max_kv_size)
+            return layer
+
+        return [_bound(layer) for layer in cache]
 
     def _validate_cache(self, cache: Any) -> bool:
         """
@@ -2023,25 +2074,40 @@ class Scheduler:
                 tokens_to_process = request.prompt_token_ids
             cache_to_use = request.prompt_cache  # May be None
 
-            # Create bounded cache when max_kv_size is configured and no cache exists
-            if cache_to_use is None and self.config.max_kv_size > 0:
-                from mlx_lm.models.cache import make_prompt_cache
-
-                cache_to_use = make_prompt_cache(
-                    self.model, max_kv_size=self.config.max_kv_size
-                )
-
-            # Validate cache before using it
+            # Validate cache before using it (restored entries only).
+            # This has to run before the bounded cache is built below, not
+            # after: it rejects any layer whose ``keys`` are still None, which
+            # is true of every freshly created cache. Running it afterwards
+            # discarded the bounded cache on every request and left
+            # --max-kv-size a no-op.
             if cache_to_use is not None and not self._validate_cache(cache_to_use):
                 logger.debug(
                     f"Request {request.request_id}: invalid cache detected, "
                     f"proceeding without cache"
                 )
                 cache_to_use = None
+                # The request has to fall back to a full prefill whatever
+                # happens next. Leaving this to the bounded-cache branch below
+                # meant a rejected cache with max_kv_size=0 kept stale
+                # cached_tokens/remaining_tokens, and the scheduler inserted
+                # only the prompt's suffix.
                 request.prompt_cache = None
                 request.cached_tokens = 0
                 request.remaining_tokens = request.prompt_token_ids
                 tokens_to_process = request.prompt_token_ids
+
+            # Build the bounded cache ourselves rather than leaving it to
+            # BatchGenerator. Its rule only converts flat KVCache layers, so a
+            # KVCache nested inside a CacheList stays unbounded and the flag is
+            # a no-op on those architectures (DeepSeek-V4 groups three caches
+            # per layer). BatchGenerator still gets max_kv_size as a backstop
+            # for any sequence inserted without a cache.
+            if cache_to_use is None and self._bounded_kv_size() is not None:
+                from mlx_lm.models.cache import make_prompt_cache
+
+                cache_to_use = self._bound_cache_layers(
+                    make_prompt_cache(self.model), self._bounded_kv_size()
+                )
 
             # Build per-request logits_processors from repetition_penalty and
             # any caller-supplied extras (e.g. JSON schema constrained
