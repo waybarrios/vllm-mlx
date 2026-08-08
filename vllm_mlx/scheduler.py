@@ -2015,8 +2015,25 @@ class Scheduler:
                 request.remaining_tokens is not None
                 and len(request.remaining_tokens) == 0
             ):
-                # Exact cache match - pass only last token for generation kickoff
-                tokens_to_process = request.prompt_token_ids[-1:]
+                # Exact cache match. Re-feeding the last token is only correct
+                # when the cached state stops one token short of the key; for a
+                # state that already covers the whole key it duplicates that
+                # token in the KV cache and the model then answers from a
+                # corrupted context (measured: same prompt, different output).
+                # Entries stored post-prefill cover the full key, so drop the
+                # cache and prefill instead of guessing which kind this is.
+                if getattr(request, "cache_hit_type", None) == "exact":
+                    logger.debug(
+                        "[cache] exact match on a full-coverage entry; "
+                        "prefilling to avoid duplicating the last token"
+                    )
+                    cache_to_use = None
+                    request.prompt_cache = None
+                    request.cached_tokens = 0
+                    request.remaining_tokens = request.prompt_token_ids
+                    tokens_to_process = request.prompt_token_ids
+                else:
+                    tokens_to_process = request.prompt_token_ids[-1:]
             elif request.remaining_tokens:
                 tokens_to_process = request.remaining_tokens
             else:
@@ -2137,6 +2154,311 @@ class Scheduler:
 
         return scheduled
 
+    @staticmethod
+    def _copy_cache_state(value: Any) -> Any:
+        """Deep-copy a cache ``state`` payload.
+
+        Sharing the arrays is not safe: RotatingKVCache writes into its ring
+        buffer and PoolingCache writes into its remainder buffer, both in
+        place, so a snapshot that aliases them would be rewritten by the very
+        generation it is supposed to predate. ``x + 0`` forces a fresh array
+        while staying on the GPU.
+        """
+        import mlx.core as mx
+
+        if isinstance(value, mx.array):
+            return value + 0
+        if isinstance(value, (list, tuple)):
+            copied = [Scheduler._copy_cache_state(v) for v in value]
+            return type(value)(copied) if isinstance(value, tuple) else copied
+        return value
+
+    # How much a prompt must have grown before its cache snapshot is worth
+    # re-taking. Copying the KV cache is O(context), so refreshing every turn
+    # dominates prefill on long agentic conversations.
+    SNAPSHOT_REFRESH_TOKENS = 4096
+
+    @staticmethod
+    def _prompt_output_entry_is_useless(cache: Any) -> bool:
+        """Would a prompt+output entry built from this cache ever be reusable?
+
+        Only via a trim: any later query is shorter than a prompt+output key, so
+        the generated tail has to come off first. When the cache cannot be
+        trimmed the entry is dead weight — and far from free, since each one
+        holds a full-length KV copy and Metal runs out of buffers long before
+        the byte budget is reached.
+        """
+        try:
+            from mlx_lm.models.cache import can_trim_prompt_cache
+
+            return not can_trim_prompt_cache(cache)
+        except Exception:
+            return False
+
+    def _extract_cache_for_uid(self, uid: int) -> Any:
+        """Pull one sequence's cache out of the live BatchGenerator batch."""
+        bg = self.batch_generator
+        if bg is None:
+            return None
+        for attr in ("_generation_batch", "_prompt_batch"):
+            batch = getattr(bg, attr, None)
+            uids = getattr(batch, "uids", None)
+            if not uids or uid not in uids:
+                continue
+            extract = getattr(batch, "extract_cache", None)
+            if extract is None:
+                continue
+            try:
+                return extract(uids.index(uid))
+            except Exception as e:
+                logger.debug("extract_cache(%s) on %s failed: %s", uid, attr, e)
+        return None
+
+    def _make_snapshot_destination(self, live_cache: Any) -> Any:
+        """Build a destination cache with the same topology as the live one.
+
+        ``make_prompt_cache(model)`` is not a safe source for this. A plain
+        ``KVCache`` destination cannot take a ``RotatingKVCache``'s state or
+        meta_state; the assignment raises, the broad handler below logs a
+        warning, and the snapshot is silently never stored — on exactly the
+        sliding-window configurations this feature exists for.
+
+        Deriving it from ``config.max_kv_size`` instead is also wrong, which I
+        only found by measuring: ``_create_batch_generator`` does not pass
+        ``max_kv_size`` to ``BatchGenerator``, so with ``max_kv_size=512``
+        configured the live layers were still plain ``KVCache`` and a
+        config-derived destination mismatched in the opposite direction.
+
+        So mirror the live objects themselves. A shallow copy keeps the class
+        and every scalar attribute (``max_size``, ``keep``, ``step``, ``_idx``)
+        and the caller overwrites the arrays, which is the only part that must
+        not be shared.
+        """
+        import copy
+
+        def _mirror(layer: Any) -> Any:
+            children = getattr(layer, "caches", None)
+            if children:
+                # copy.copy on a container shares the child cache objects, so
+                # the "snapshot" would follow live generation. Rebuild it from
+                # mirrored children instead.
+                mirrored = [_mirror(child) for child in children]
+                container = copy.copy(layer)
+                container.caches = type(children)(mirrored)
+                return container
+            return copy.copy(layer)
+
+        try:
+            return [_mirror(layer) for layer in live_cache]
+        except Exception:
+            logger.warning(
+                "[cache_store_prompt] could not mirror live cache topology; "
+                "not storing",
+                exc_info=True,
+            )
+            return None
+
+    @staticmethod
+    def _cache_coverage(cache: Any) -> int | None:
+        """How many tokens the live cache actually holds.
+
+        Containers have to be descended into: ``CacheList`` carries no
+        ``offset`` of its own, so reading the attribute off the layer returns
+        None and the caller silently falls back to a prompt-only key — the
+        misalignment this is here to prevent, on exactly the architectures
+        (DeepSeek-V4) that group several caches per layer.
+        """
+
+        def _offset_of(layer: Any) -> int | None:
+            offset = getattr(layer, "offset", None)
+            if isinstance(offset, int):
+                return offset
+            children = getattr(layer, "caches", None)
+            if children:
+                for child in children:
+                    found = _offset_of(child)
+                    if found is not None:
+                        return found
+            return None
+
+        for layer in cache:
+            found = _offset_of(layer)
+            if found is not None:
+                return found
+        return None
+
+    def _cache_key_for_snapshot(
+        self, request: Any, response: Any, raw_cache: Any
+    ) -> list[int] | None:
+        """Key the entry by the tokens the cache covers, not by the prompt.
+
+        The snapshot is taken while processing the response that carries the
+        first generated token, and by then the batch has already fed that token
+        through the cache: measured ``prompt_len=5, cache_offset=6``. Storing
+        that under ``prompt_token_ids`` leaves every warm reuse one token ahead
+        of its key.
+
+        Trimming the overshoot off is not available here — these are precisely
+        the caches that cannot be trimmed — so the key is extended instead. The
+        extra token is the first token of the reply, which the next turn's
+        prompt also contains, so the entry still matches by strict prefix.
+
+        Returns None rather than storing a misaligned entry.
+        """
+        covered = self._cache_coverage(raw_cache)
+        prompt_ids = list(request.prompt_token_ids)
+        if covered is None:
+            # Fail closed. A cache that exposes no offset — a pure ArraysCache,
+            # for instance — still has the first generated token folded into it
+            # by the time the first response arrives, so assuming prompt-only
+            # coverage stores state under a key one token short. The next turn
+            # then replays that token into cumulative recurrent state and
+            # corrupts it, and for these models this is the only entry that
+            # ever gets stored. Skipping costs a prefill; guessing costs
+            # correctness.
+            logger.debug(
+                "[cache_store_prompt] coverage unknown for %s; not storing",
+                ", ".join(sorted({type(layer).__name__ for layer in raw_cache})),
+            )
+            return None
+
+        overshoot = covered - len(prompt_ids)
+        if overshoot == 0:
+            return prompt_ids
+        if overshoot < 0:
+            logger.debug(
+                "[cache_store_prompt] cache covers %d of %d prompt tokens; "
+                "not storing",
+                covered,
+                len(prompt_ids),
+            )
+            return None
+
+        token = getattr(response, "token", None)
+        generated = [] if token is None else [int(token)]
+        if overshoot > len(generated):
+            logger.debug(
+                "[cache_store_prompt] cache is %d tokens past the prompt but "
+                "only %d are known; not storing",
+                overshoot,
+                len(generated),
+            )
+            return None
+        return prompt_ids + generated[:overshoot]
+
+    def _store_prompt_only_cache(self, request: Any, response: Any) -> None:
+        """Store the post-prefill cache under the prompt tokens alone.
+
+        Called once per request, at the point where the cache covers exactly
+        the prompt. Entries keyed this way are reusable without any trimming,
+        which is what models with sliding-window or pooled KV need.
+        """
+        if self.memory_aware_cache is None:
+            return
+
+        # Do not refresh an entry that already covers nearly all of this
+        # prompt: the older one still gives a prefix hit next turn, only a few
+        # tokens shorter, so the refresh buys almost nothing. The copy itself is
+        # cheap (measured make/copy/eval at 0.00/0.00/0.01s for a 43-layer,
+        # 11k-token cache), but it allocates a fresh set of per-layer arrays
+        # every turn, and buffer count — not bytes — is what Metal runs out of.
+        # One copy per SNAPSHOT_REFRESH_TOKENS of growth instead of one per turn.
+        # Only throttle REFRESHES. covered > 0 means an existing entry served
+        # this prompt as a prefix hit; if it already covers all but a small
+        # tail, re-copying the whole cache buys a few tokens at the cost of a
+        # fresh set of per-layer arrays every turn. A cold prompt (covered ==
+        # 0) must always be stored — gating it on the same threshold silently
+        # disabled caching for every conversation shorter than the threshold.
+        covered = getattr(request, "cached_tokens", 0) or 0
+        if (
+            covered > 0
+            and len(request.prompt_token_ids) - covered <= self.SNAPSHOT_REFRESH_TOKENS
+        ):
+            return
+
+        try:
+            raw_cache = getattr(response, "prompt_cache", None)
+            if callable(raw_cache):
+                raw_cache = raw_cache()
+            if not raw_cache:
+                # mlx-lm only attaches prompt_cache to the response that
+                # carries a finish_reason; mid-generation it is None. Pull the
+                # per-sequence cache out of the live batch instead, which is
+                # what that attribute is built from anyway.
+                raw_cache = self._extract_cache_for_uid(response.uid)
+            if not raw_cache:
+                return
+
+            # Only topologies whose completion-time entry is unusable need this.
+            # A trimmable cache already gets a correct entry from the normal
+            # path; adding an N+1 snapshot here would evict it and leave an
+            # identical N-token prompt matching a supersequence, where the
+            # scheduler replays prompt[-1] and duplicates that token. It would
+            # also copy and evaluate the whole context before the first token
+            # goes out, for no benefit.
+            if not self._prompt_output_entry_is_useless(raw_cache):
+                return
+
+            cache_key = self._cache_key_for_snapshot(request, response, raw_cache)
+            if cache_key is None:
+                return
+
+            import mlx.core as mx
+
+            import time as _t
+
+            _t0 = _t.monotonic()
+            snapshot = self._make_snapshot_destination(raw_cache)
+            _t1 = _t.monotonic()
+            if snapshot is None:
+                return
+            states = []
+            for dst, src in zip(snapshot, raw_cache):
+                state = self._copy_cache_state(src.state)
+                meta = getattr(src, "meta_state", None)
+                if meta is not None:
+                    dst.meta_state = meta
+                dst.state = state
+                states.append(state)
+            _t2 = _t.monotonic()
+            mx.eval(states)
+            _t3 = _t.monotonic()
+            logger.debug(
+                "[snapshot_timing] make=%.2fs copy=%.2fs eval=%.2fs layers=%d",
+                _t1 - _t0,
+                _t2 - _t1,
+                _t3 - _t2,
+                len(snapshot),
+            )
+
+            # evict_prefixes=True is essential here, not cosmetic. In an
+            # agentic loop each turn's prompt extends the previous one, so
+            # without it every turn adds another full-length KV copy: measured
+            # 45 entries of a 46k-token cache, which exhausted Metal's buffer
+            # count ("[metal::malloc] Resource limit (499000) exceeded") and
+            # aborted generation mid-request. Evicting the superseded prefix
+            # keeps one entry per conversation.
+            stored = self.memory_aware_cache.store(
+                cache_key,
+                snapshot,
+                evict_prefixes=True,
+            )
+            logger.info(
+                "[cache_store_prompt] request=%s key_tokens=%d prompt_tokens=%d "
+                "stored=%s entries=%d",
+                request.request_id[:12],
+                len(cache_key),
+                len(request.prompt_token_ids),
+                stored,
+                len(self.memory_aware_cache._entries),
+            )
+        except Exception as e:
+            logger.warning(
+                "[cache_store_prompt] request=%s snapshot failed: %s",
+                request.request_id[:12],
+                e,
+            )
+
     def _process_batch_responses(
         self, responses: List[Any]
     ) -> Tuple[List[RequestOutput], Set[str]]:
@@ -2160,6 +2482,23 @@ class Scheduler:
             request = self.running.get(request_id)
             if request is None:
                 continue
+
+            # Snapshot the cache while it still covers exactly the prompt, i.e.
+            # before the first generated token is appended. Storing that under
+            # the prompt tokens is the only reuse path open to caches that
+            # cannot be trimmed: a later request whose prompt repeats or
+            # extends this one then gets an exact or strict-prefix match, and
+            # neither needs a trim.
+            #
+            # The prompt+output entry stored at completion can never be reused
+            # by such models. Any future query is shorter than that key, so it
+            # would have to trim the generated tail away — and DeepSeek-V4's
+            # sliding-window layers physically overwrite older KV once the
+            # window wraps (RotatingKVCache.is_trimmable() is offset<max_size),
+            # while its PoolingCache cannot split a pooled window. That data is
+            # gone, so no trim can recover it.
+            if request.num_output_tokens == 0:
+                self._store_prompt_only_cache(request, response)
 
             # Append token to request
             request.append_output_token(response.token)
@@ -2218,7 +2557,9 @@ class Scheduler:
                         else:
                             raw_cache = response.prompt_cache
 
-                        if raw_cache:
+                        if raw_cache and not self._prompt_output_entry_is_useless(
+                            raw_cache
+                        ):
                             # For paged cache, extract actual tensor states
                             # This allows cache to survive BatchGenerator recreation
                             if self.block_aware_cache is not None:
