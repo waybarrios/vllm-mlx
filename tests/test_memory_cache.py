@@ -525,3 +525,16 @@ class TestGetAvailableMemory:
             # Should return 0 when psutil not available
             # Note: This test may not work as expected due to import caching
             pass
+
+
+def test_load_rejects_v3_cache_after_rewind_semantics_change(tmp_path, caplog):
+    """Caches written before safe MLLM rewind must not survive an upgrade."""
+    import json
+
+    (tmp_path / "index.json").write_text(
+        json.dumps({"version": 3, "model_fingerprint": "", "entries": []})
+    )
+    cache = MemoryAwarePrefixCache(MagicMock(), MemoryCacheConfig(max_memory_mb=1))
+
+    assert cache.load_from_disk(str(tmp_path)) == 0
+    assert "version mismatch: disk=3 current=4" in caplog.text
