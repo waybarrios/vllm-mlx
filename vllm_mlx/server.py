@@ -2588,10 +2588,42 @@ async def _stream_responses_request(request: ResponsesRequest) -> AsyncIterator[
                 )
                 sequence += 1
 
-            if delta_msg.content:
+            reasoning_content = delta_msg.content
+            if reasoning_content and tool_parser:
+                # The reasoning branch used to emit this and `continue`, so the
+                # tool parser never saw it: tool markup left the reasoning
+                # parser as ordinary text and went out as visible output with
+                # no tool calls parsed at all. Route it the same way the
+                # non-reasoning branch below does.
+                if (
+                    not tool_markup_possible
+                    and not _streaming_tool_markup_possible_after_delta(
+                        tool_accumulated_text, reasoning_content
+                    )
+                ):
+                    tool_accumulated_text += reasoning_content
+                else:
+                    if not tool_markup_possible:
+                        tool_markup_possible = True
+                    tool_accumulated_text, tool_result = _extract_streaming_tool_delta(
+                        tool_parser,
+                        tool_accumulated_text,
+                        reasoning_content,
+                        tool_request_context,
+                    )
+                    if tool_result is None:
+                        reasoning_content = ""
+                    else:
+                        reasoning_content = tool_result.get("content", "")
+                        if reasoning_content:
+                            reasoning_content = _TOOL_MARKUP_PATTERN.sub(
+                                "", reasoning_content
+                            )
+
+            if reasoning_content:
                 for event in _start_text_item():
                     yield event
-                accumulated_text += delta_msg.content
+                accumulated_text += reasoning_content
                 yield _responses_sse_event(
                     "response.output_text.delta",
                     ResponseOutputTextDeltaEvent(
@@ -2599,7 +2631,7 @@ async def _stream_responses_request(request: ResponsesRequest) -> AsyncIterator[
                         item_id=text_item_id,
                         output_index=text_output_index,
                         content_index=0,
-                        delta=delta_msg.content,
+                        delta=reasoning_content,
                     ),
                 )
                 sequence += 1
@@ -2630,9 +2662,11 @@ async def _stream_responses_request(request: ResponsesRequest) -> AsyncIterator[
                 )
                 if tool_result is None:
                     continue
-                if "tool_calls" in tool_result:
-                    continue
+                # Text may accompany the tool calls in the same delta; emit it
+                # rather than dropping it with them.
                 content = tool_result.get("content", "")
+                if "tool_calls" in tool_result and not content:
+                    continue
 
         if not content:
             continue
@@ -3061,7 +3095,11 @@ def _parse_streaming_tool_content(
         delta_text,
         request_context,
     )
-    suppress = result is None or "tool_calls" in result
+    # A delta may legitimately carry both. A parser that has buffered prose and
+    # then sees the whole tool-call block arrive in one delta has nowhere else
+    # to put that prose, and dropping it loses user-visible assistant text.
+    # Suppress only when there is nothing to show.
+    suppress = result is None or ("tool_calls" in result and not result.get("content"))
     return accumulated_text, result, suppress
 
 
@@ -6194,6 +6232,17 @@ async def stream_chat_completion(
                             continue
 
                         if "tool_calls" in tool_result:
+                            # Text buffered ahead of the block arrives in the
+                            # same delta when the whole block lands at once.
+                            # Emit it as its own chunk first — dropping it with
+                            # the `continue` below loses assistant text the
+                            # non-streaming path returns.
+                            leading = tool_result.get("content", "")
+                            if leading:
+                                leading = _TOOL_MARKUP_PATTERN.sub("", leading)
+                            if leading:
+                                yield f"data: {ChatCompletionChunk(id=response_id, model=_response_model_name(request.model), choices=[ChatCompletionChunkChoice(delta=ChatCompletionChunkDelta(content=leading))]).model_dump_json()}\n\n"
+
                             # Emit structured tool calls
                             tool_calls_detected = True
                             # Coerce arguments against tool schemas
@@ -6300,6 +6349,17 @@ async def stream_chat_completion(
                             continue
 
                         if "tool_calls" in tool_result:
+                            # Text buffered ahead of the block arrives in the
+                            # same delta when the whole block lands at once.
+                            # Emit it as its own chunk first — dropping it with
+                            # the `continue` below loses assistant text the
+                            # non-streaming path returns.
+                            leading = tool_result.get("content", "")
+                            if leading:
+                                leading = _TOOL_MARKUP_PATTERN.sub("", leading)
+                            if leading:
+                                yield f"data: {ChatCompletionChunk(id=response_id, model=_response_model_name(request.model), choices=[ChatCompletionChunkChoice(delta=ChatCompletionChunkDelta(content=leading))]).model_dump_json()}\n\n"
+
                             # Emit structured tool calls
                             tool_calls_detected = True
                             # Coerce arguments against tool schemas
