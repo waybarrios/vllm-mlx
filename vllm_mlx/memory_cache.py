@@ -264,6 +264,33 @@ class _CacheEntry:
         )
 
 
+def _is_cache_layer_trimmable(layer_cache: Any) -> bool:
+    """Return whether a cache layer can safely be rewound for partial reuse."""
+    if isinstance(layer_cache, _QuantizedCacheWrapper):
+        if "max_size" in layer_cache.orig_attrs:
+            return False
+        return hasattr(layer_cache, "offset") and hasattr(layer_cache, "keys")
+
+    # _trim_cache_offset does not currently rewind container children.
+    if hasattr(layer_cache, "caches"):
+        return False
+
+    is_trimmable = getattr(layer_cache, "is_trimmable", None)
+    if callable(is_trimmable):
+        try:
+            return bool(is_trimmable())
+        except Exception:
+            logger.debug(
+                "Failed to check cache layer trimmability for %s",
+                type(layer_cache).__name__,
+                exc_info=True,
+            )
+            return False
+
+    # Compatibility fallback for simple KV-like cache implementations.
+    return hasattr(layer_cache, "offset") and hasattr(layer_cache, "keys")
+
+
 def _trim_cache_offset(cache: list[Any], trim_by: int) -> list[Any]:
     """Create copies of cache layers with the last ``trim_by`` positions removed.
 
@@ -792,8 +819,7 @@ class MemoryAwarePrefixCache:
             excess = n_cached - n_requested
 
             has_non_trimmable = any(
-                not (hasattr(lc, "offset") and hasattr(lc, "keys"))
-                for lc in best_super.cache
+                not _is_cache_layer_trimmable(lc) for lc in best_super.cache
             )
 
             if excess > 0 and has_non_trimmable:
@@ -886,8 +912,7 @@ class MemoryAwarePrefixCache:
             excess = len(best_lcp_entry.tokens) - best_lcp_length
 
             has_non_trimmable = any(
-                not (hasattr(lc, "offset") and hasattr(lc, "keys"))
-                for lc in best_lcp_entry.cache
+                not _is_cache_layer_trimmable(lc) for lc in best_lcp_entry.cache
             )
             logger.debug(
                 f"[cache_fetch] LCP candidate: lcp={best_lcp_length} "

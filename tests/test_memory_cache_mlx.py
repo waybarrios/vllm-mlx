@@ -282,6 +282,125 @@ class TestTrimCacheOffset:
         assert remaining == [999, 1000, 1001]
 
 
+class TestRotatingCachePartialReuse:
+    """Regression coverage for saturated rotating caches in prefix reuse (#678)."""
+
+    @staticmethod
+    def _full_cache(length):
+        import mlx.core as mx
+        from mlx_lm.models.cache import KVCache
+
+        layer = KVCache()
+        layer.keys = mx.ones((1, 1, length, 4), dtype=mx.float32)
+        layer.values = layer.keys
+        layer.offset = length
+        return layer
+
+    @staticmethod
+    def _saturated_rotating_cache(offset=12, max_size=8):
+        import mlx.core as mx
+        from mlx_lm.models.cache import RotatingKVCache
+
+        layer = RotatingKVCache(max_size=max_size, keep=0)
+        layer.keys = mx.ones((1, 1, max_size, 4), dtype=mx.float32)
+        layer.values = layer.keys
+        layer.offset = offset
+        layer._idx = max_size
+        return layer
+
+    @staticmethod
+    def _prefix_cache():
+        from vllm_mlx.memory_cache import MemoryAwarePrefixCache, MemoryCacheConfig
+
+        return MemoryAwarePrefixCache(
+            MagicMock(),
+            MemoryCacheConfig(max_memory_mb=64, max_entries=10, min_prefix_tokens=1),
+        )
+
+    def test_supersequence_skips_saturated_rotating_cache(self):
+        cache = self._prefix_cache()
+        rotating = self._saturated_rotating_cache()
+        cache.store(
+            [1, 2, 3, 4, 5, 6],
+            [self._full_cache(6), rotating],
+        )
+
+        fetched, remaining = cache.fetch([1, 2, 3, 4])
+
+        assert fetched is None
+        assert remaining == [1, 2, 3, 4]
+        assert rotating.offset == 12
+
+    def test_lcp_skips_saturated_rotating_cache(self):
+        cache = self._prefix_cache()
+        rotating = self._saturated_rotating_cache()
+        cache.store(
+            [1, 2, 3, 4, 5, 6],
+            [self._full_cache(6), rotating],
+        )
+
+        fetched, remaining = cache.fetch([1, 2, 9])
+
+        assert fetched is None
+        assert remaining == [1, 2, 9]
+        assert rotating.offset == 12
+
+    def test_exact_and_prefix_hits_do_not_require_rewind(self):
+        cache = self._prefix_cache()
+        cache.store(
+            [1, 2, 3, 4],
+            [self._full_cache(4), self._saturated_rotating_cache()],
+        )
+
+        exact, exact_remaining = cache.fetch([1, 2, 3, 4])
+        prefix, prefix_remaining = cache.fetch([1, 2, 3, 4, 5])
+
+        assert exact is not None
+        assert exact_remaining == []
+        assert prefix is not None
+        assert prefix_remaining == [5]
+
+    def test_cache_list_is_rejected_even_when_children_are_trimmable(self):
+        from mlx_lm.models.cache import CacheList
+
+        from vllm_mlx.memory_cache import _is_cache_layer_trimmable
+
+        layer = CacheList(self._full_cache(8), self._full_cache(8))
+
+        assert not _is_cache_layer_trimmable(layer)
+
+    def test_supersequence_skips_cache_list_container(self):
+        from mlx_lm.models.cache import CacheList
+
+        cache = self._prefix_cache()
+        container = CacheList(self._full_cache(6), self._full_cache(6))
+        cache.store([1, 2, 3, 4, 5, 6], [container])
+
+        fetched, remaining = cache.fetch([1, 2, 3, 4])
+
+        assert fetched is None
+        assert remaining == [1, 2, 3, 4]
+        assert all(child.offset == 6 for child in container.caches)
+
+    def test_quantized_wrapper_rejects_rotating_metadata(self):
+        from vllm_mlx.memory_cache import (
+            _QuantizedCacheWrapper,
+            _is_cache_layer_trimmable,
+        )
+
+        wrapper = _QuantizedCacheWrapper.__new__(_QuantizedCacheWrapper)
+        wrapper.keys = object()
+        wrapper.values = object()
+        wrapper.bits = 8
+        wrapper.group_size = 64
+        wrapper.orig_type = object
+        wrapper.orig_attrs = {"max_size": 8}
+
+        for offset in (4, 8):
+            wrapper.offset = offset
+            assert not _is_cache_layer_trimmable(wrapper)
+
+
 class TestDequantizeCacheSlice:
     """Tests for _dequantize_cache slicing after dequantization.
 
