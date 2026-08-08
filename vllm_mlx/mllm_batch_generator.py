@@ -22,12 +22,12 @@ import os
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 
 import mlx.core as mx
 import mlx.nn as nn
 
-from .memory_cache import MemoryAwarePrefixCache, MemoryCacheConfig, _trim_cache_offset
+from .memory_cache import MemoryAwarePrefixCache, MemoryCacheConfig
 from .multimodal_processor import MultimodalProcessor
 from .vision_embedding_cache import VisionEmbeddingCache
 
@@ -1017,87 +1017,185 @@ class MLLMBatchGenerator:
         )
 
     @staticmethod
-    def _copy_prefix_cache(cache_list):
-        """Create shallow copies of cache objects to prevent mutation of stored prefix cache.
-
-        MLX arrays are immutable and safe to share, but cache objects have mutable
-        Python attributes (offset, _idx) that get modified by update_and_fetch().
-        Without copying, the stored prefix cache entry is corrupted after each use.
-        """
-        from mlx_lm.models.cache import KVCache, RotatingKVCache
-
-        copies = []
-        for c in cache_list:
-            if isinstance(c, RotatingKVCache):
-                new_c = RotatingKVCache(c.max_size, c.keep)
-                new_c.step = c.step
-                new_c.keys = c.keys
-                new_c.values = c.values
-                new_c.offset = c.offset
-                new_c._idx = c._idx
-                copies.append(new_c)
-            elif isinstance(c, KVCache):
-                new_c = KVCache()
-                new_c.step = c.step
-                new_c.keys = c.keys
-                new_c.values = c.values
-                new_c.offset = c.offset
-                copies.append(new_c)
-            else:
-                copies.append(c)
-        return copies
+    def _copy_cache_state(value):
+        """Copy mutable state containers while sharing immutable MLX arrays."""
+        if isinstance(value, list):
+            return [MLLMBatchGenerator._copy_cache_state(v) for v in value]
+        if isinstance(value, tuple):
+            return tuple(MLLMBatchGenerator._copy_cache_state(v) for v in value)
+        if isinstance(value, dict):
+            return {
+                k: MLLMBatchGenerator._copy_cache_state(v) for k, v in value.items()
+            }
+        return value
 
     @staticmethod
-    def _has_empty_rotating_cache(cache_list):
+    def _cache_class_families():
+        """Return cache classes shared by the mlx-lm and mlx-vlm families."""
+        from mlx_lm.models import cache as mlx_lm_cache
+        from mlx_vlm.models import cache as mlx_vlm_cache
+
+        return (
+            (mlx_lm_cache.CacheList, mlx_vlm_cache.CacheList),
+            (mlx_lm_cache.KVCache, mlx_vlm_cache.KVCache),
+            (mlx_lm_cache.RotatingKVCache, mlx_vlm_cache.RotatingKVCache),
+        )
+
+    @classmethod
+    def _copy_cache_layer(cls, cache):
+        """Clone one cache wrapper without copying its immutable MLX arrays."""
+        cache_lists, kv_caches, rotating_caches = cls._cache_class_families()
+
+        if isinstance(cache, cache_lists):
+            return type(cache)(*(cls._copy_cache_layer(c) for c in cache.caches))
+        if type(cache) in rotating_caches:
+            copied = type(cache)(cache.max_size, cache.keep)
+            copied.step = cache.step
+            copied.keys = cache.keys
+            copied.values = cache.values
+            copied.offset = cache.offset
+            copied._idx = cache._idx
+            return copied
+        if type(cache) in kv_caches:
+            copied = type(cache)()
+            copied.step = cache.step
+            copied.keys = cache.keys
+            copied.values = cache.values
+            copied.offset = cache.offset
+            return copied
+
+        from_state = getattr(type(cache), "from_state", None)
+        if not callable(from_state):
+            raise TypeError(f"Unsupported prefix cache layer: {type(cache).__name__}")
+        state = cls._copy_cache_state(cache.state)
+        meta_state = cls._copy_cache_state(cache.meta_state)
+        copied = from_state(state, meta_state)
+        if "step" in getattr(cache, "__dict__", {}):
+            copied.step = cache.step
+        return copied
+
+    @classmethod
+    def _copy_prefix_cache(cls, cache_list):
+        """Clone cache wrappers recursively so reuse cannot mutate storage."""
+        try:
+            return [cls._copy_cache_layer(c) for c in cache_list]
+        except (AttributeError, TypeError, ValueError) as exc:
+            logger.warning("Prefix cache copy rejected: %s", exc)
+            return None
+
+    @classmethod
+    def _cache_leaves(cls, cache_list) -> Iterator[Any]:
+        """Yield cache leaves from a possibly nested CacheList topology."""
+        cache_lists, _, _ = cls._cache_class_families()
+
+        for cache in cache_list:
+            if isinstance(cache, cache_lists):
+                yield from cls._cache_leaves(cache.caches)
+            else:
+                yield cache
+
+    @classmethod
+    def _cache_storage_is_accounted(cls, cache_list) -> bool:
+        """Return whether MemoryAwarePrefixCache can account this topology.
+
+        Its current estimator treats each top-level layer state as one KV pair
+        and does not recurse through CacheList. Until shared recursive
+        accounting lands, storing a nested container would bypass the byte cap.
+        Reads remain supported so existing entries can be handled safely.
+        """
+        cache_lists, _, _ = cls._cache_class_families()
+        return not any(isinstance(cache, cache_lists) for cache in cache_list)
+
+    @classmethod
+    def _has_empty_rotating_cache(cls, cache_list):
         """Check if any RotatingKVCache layer has no data (keys=None).
 
         This happens when prefix cache stores a long response where all
         sliding-window entries were trimmed (entries_to_keep=0).
         Using such a cache produces garbage — fall through to full prefill.
         """
-        from mlx_lm.models.cache import RotatingKVCache
+        _, _, rotating_caches = cls._cache_class_families()
 
-        for c in cache_list:
-            if isinstance(c, RotatingKVCache) and c.keys is None:
+        for c in cls._cache_leaves(cache_list):
+            if isinstance(c, rotating_caches) and c.keys is None:
                 return True
         return False
 
-    @staticmethod
-    def _trim_rotating_caches(cache_list):
-        """Trim RotatingKVCache buffers restored from prefix cache.
+    @classmethod
+    def _prepare_rotating_caches(cls, cache_list) -> bool:
+        """Normalize oversized rotating buffers without changing positions.
 
-        Prefix cache stores the full KV state (offset may exceed max_size for
-        sliding-window layers).  RotatingKVCache._update_in_place computes
-        ``new_size = min(step, max_size - prev)`` which goes negative when
-        ``prev > max_size``, crashing with "Negative dimensions not allowed".
-
-        Trimming the buffer to max_size and clamping offset/idx prevents this.
+        A saturated cache legitimately has ``offset > max_size``: offset is the
+        absolute sequence position and must not be clamped to the window size.
+        Oversized prefill buffers are reduced to the configured window while
+        preserving that offset. Inconsistent undersized buffers fail closed.
         """
-        from mlx_lm.models.cache import RotatingKVCache
+        _, _, rotating_caches = cls._cache_class_families()
 
-        for layer_cache in cache_list:
-            if not isinstance(layer_cache, RotatingKVCache):
+        for layer_cache in cls._cache_leaves(cache_list):
+            # Buffered subclasses deliberately retain rollback slack beyond the
+            # attention window; only normalize the two plain implementations.
+            if type(layer_cache) not in rotating_caches:
                 continue
             if layer_cache.keys is None:
-                layer_cache.offset = 0
-                continue
+                if layer_cache.offset == 0:
+                    continue
+                return False
             buf_len = layer_cache.keys.shape[2]
             if buf_len > layer_cache.max_size:
                 trim_size = buf_len - layer_cache.max_size
                 layer_cache.keys = layer_cache._trim(trim_size, layer_cache.keys)
                 layer_cache.values = layer_cache._trim(trim_size, layer_cache.values)
                 layer_cache._idx = layer_cache.max_size
-            layer_cache.offset = min(layer_cache.offset, layer_cache.max_size)
-            # Defensive: ensure size() <= keys.shape[2] to prevent merge crash.
-            # Prefix cache trimming can create offset > keys.shape[2] when
-            # a supersequence/LCP trim crosses the max_size boundary.
             buf_len = layer_cache.keys.shape[2]
-            if min(layer_cache.offset, layer_cache.max_size) > buf_len:
+            required = min(layer_cache.offset, layer_cache.max_size)
+            if required > buf_len:
                 logger.warning(
-                    f"RotatingKVCache offset ({layer_cache.offset}) > "
-                    f"buffer ({buf_len}), capping to buffer size"
+                    "Prefix cache has inconsistent RotatingKVCache state: "
+                    "offset=%s max_size=%s buffer=%s",
+                    layer_cache.offset,
+                    layer_cache.max_size,
+                    buf_len,
                 )
-                layer_cache.offset = buf_len
+                return False
+        return True
+
+    @classmethod
+    def _can_rewind_prefix_cache(cls, cache_list, trim_by: int) -> bool:
+        """Return whether every cache leaf retains the positions to rewind."""
+        if trim_by <= 0:
+            return True
+        for cache in cls._cache_leaves(cache_list):
+            keys = getattr(cache, "keys", None)
+            offset = getattr(cache, "offset", None)
+            if keys is None or offset is None or offset < trim_by:
+                return False
+            if isinstance(keys, (list, tuple)):
+                return False
+            is_trimmable = getattr(cache, "is_trimmable", None)
+            if not callable(is_trimmable) or not is_trimmable():
+                return False
+        return True
+
+    @classmethod
+    def _rewind_prefix_cache(cls, cache_list, trim_by: int):
+        """Clone and safely rewind every leaf, or return None to fail closed."""
+        if not cls._can_rewind_prefix_cache(cache_list, trim_by):
+            return None
+        copied = cls._copy_prefix_cache(cache_list)
+        if copied is None or trim_by <= 0:
+            return copied
+
+        # Use each cache implementation's own trim contract after cloning.
+        # This preserves type-specific metadata such as ChunkedKVCache's
+        # chunk_size/start_position instead of reconstructing a generic KV
+        # wrapper. Verify the full rewind so a partially retained window cannot
+        # be stored under a longer token key.
+        for cache in cls._cache_leaves(copied):
+            trim = getattr(cache, "trim", None)
+            if not callable(trim) or trim(trim_by) != trim_by:
+                return None
+        return copied
 
     def _run_chunked_text_prefill(
         self, request: MLLMBatchRequest, cache: List[Any]
@@ -1434,11 +1532,34 @@ class MLLMBatchGenerator:
                     cached_kv = None
                     remaining_ids = None
 
+                prepared_cache = None
+                if cached_kv is not None and remaining_ids:
+                    prepared_cache = self._copy_prefix_cache(cached_kv)
+                    if prepared_cache is None or not self._prepare_rotating_caches(
+                        prepared_cache
+                    ):
+                        logger.warning(
+                            "Prefix cache hit for %s has unsupported or inconsistent "
+                            "cache state — falling through to full prefill",
+                            req.request_id,
+                        )
+                        cached_kv = None
+                        remaining_ids = None
+                        prepared_cache = None
+                elif cached_kv is not None and not remaining_ids:
+                    prepared_cache = self._rewind_prefix_cache(cached_kv, 1)
+                    if prepared_cache is None:
+                        logger.debug(
+                            "Prefix cache exact hit for %s cannot be rewound "
+                            "safely — falling through to full prefill",
+                            req.request_id,
+                        )
+                        cached_kv = None
+
                 if cached_kv is not None and remaining_ids:
                     # Prefix/LCP match — run language model on remaining tokens.
-                    # Copy cache to prevent mutation of stored prefix cache entry.
-                    request_cache = self._copy_prefix_cache(cached_kv)
-                    self._trim_rotating_caches(request_cache)
+                    # The prepared cache is an isolated recursive copy.
+                    request_cache = prepared_cache
                     remaining = mx.array(remaining_ids)[None, :]
                     cached_count = len(input_ids_list) - len(remaining_ids)
                     total_tokens = len(input_ids_list)
@@ -1514,9 +1635,8 @@ class MLLMBatchGenerator:
                     # but we still need logits for the last position.
                     # Trim by 1 so re-running the last token produces correct
                     # logits for the next-token prediction.
-                    # _trim_cache_offset creates new cache objects (safe for
-                    # stored entry).
-                    request_cache = _trim_cache_offset(cached_kv, 1)
+                    # The prepared cache is a safe recursive one-token rewind.
+                    request_cache = prepared_cache
                     last_token = req.input_ids[:, -1:]
                     total_tokens = len(input_ids_list)
                     self._prefill_progress[req.request_id] = (
@@ -1604,7 +1724,8 @@ class MLLMBatchGenerator:
         from mlx_lm.models.cache import RotatingKVCache
 
         for rc in per_request_caches:
-            self._trim_rotating_caches(rc)
+            if not self._prepare_rotating_caches(rc):
+                raise RuntimeError("Cannot merge inconsistent rotating cache state")
             for layer_cache in rc:
                 if isinstance(layer_cache, RotatingKVCache):
                     if layer_cache.keys is not None:
@@ -1977,6 +2098,38 @@ class MLLMBatchGenerator:
         self._stats.peak_memory = mx.get_peak_memory() / 1e9
         return self._stats
 
+    def _store_prefix_snapshot(
+        self,
+        cache_key: List[int],
+        cache: List[Any],
+        trim_by: int,
+        request_id: str,
+        source: str,
+    ) -> bool:
+        """Store an isolated, key-aligned cache snapshot when rewind is safe."""
+        if self.prefix_cache is None:
+            return False
+        if not self._cache_storage_is_accounted(cache):
+            logger.debug(
+                "Skipping %s prefix cache store for %s: nested cache "
+                "memory is not recursively accounted",
+                source,
+                request_id,
+            )
+            return False
+        snapshot = self._rewind_prefix_cache(cache, trim_by)
+        if snapshot is None:
+            logger.debug(
+                "Skipping %s prefix cache store for %s: cache cannot be "
+                "rewound safely by %s token(s)",
+                source,
+                request_id,
+                trim_by,
+            )
+            return False
+        self.prefix_cache.store(cache_key, snapshot)
+        return True
+
     def _maybe_store_prefix_cache(
         self, batch: MLLMBatch, end_indices: List[int]
     ) -> None:
@@ -1999,9 +2152,14 @@ class MLLMBatchGenerator:
                     output_count = batch.num_tokens[i]
                     S = self._think_suffix_len
                     total_trim = output_count + S
-                    prompt_cache = _trim_cache_offset(extracted, total_trim)
                     cache_key = input_ids_list[:-S] if S > 0 else input_ids_list
-                    self.prefix_cache.store(cache_key, prompt_cache)
+                    self._store_prefix_snapshot(
+                        cache_key,
+                        extracted,
+                        total_trim,
+                        req.request_id,
+                        "completion",
+                    )
                 except Exception as e:
                     logger.warning(
                         f"Failed to store prefix cache for {req.request_id}: {type(e).__name__}: {e}"
@@ -2861,7 +3019,10 @@ def install_chunked_prefill_mllm(
                     from mlx_lm.models.cache import RotatingKVCache
 
                     request_cache = partial["cache"]
-                    batch_gen._trim_rotating_caches(request_cache)
+                    if not batch_gen._prepare_rotating_caches(request_cache):
+                        raise RuntimeError(
+                            "Cannot merge inconsistent rotating cache state"
+                        )
                     for layer_cache in request_cache:
                         if isinstance(layer_cache, RotatingKVCache):
                             if layer_cache.keys is not None:
@@ -2904,8 +3065,13 @@ def install_chunked_prefill_mllm(
                         # trim by S only (matching canonical path's
                         # output_count + S invariant).
                         trim_amount = S
-                        store_cache = _trim_cache_offset(partial["cache"], trim_amount)
-                        batch_gen.prefix_cache.store(cache_key, store_cache)
+                        batch_gen._store_prefix_snapshot(
+                            cache_key,
+                            partial["cache"],
+                            trim_amount,
+                            req.request_id,
+                            "interleaved prefill",
+                        )
                     except Exception as e:
                         logger.warning(
                             f"Failed to store prefix cache after chunked "
@@ -2979,17 +3145,31 @@ def install_chunked_prefill_mllm(
                         cached_kv = None
                         remaining_ids = None
 
+                prepared_cache = None
+                if cached_kv is not None and remaining_ids:
+                    prepared_cache = batch_gen._copy_prefix_cache(cached_kv)
+                    if (
+                        prepared_cache is None
+                        or not batch_gen._prepare_rotating_caches(prepared_cache)
+                    ):
+                        cached_kv = None
+                        remaining_ids = None
+                        prepared_cache = None
+                elif cached_kv is not None and not remaining_ids:
+                    prepared_cache = batch_gen._rewind_prefix_cache(cached_kv, 1)
+                    if prepared_cache is None:
+                        cached_kv = None
+
                 if cached_kv is not None and remaining_ids:
                     # Prefix cache hit
-                    request_cache = batch_gen._copy_prefix_cache(cached_kv)
-                    batch_gen._trim_rotating_caches(request_cache)
+                    request_cache = prepared_cache
                     remaining = mx.array(remaining_ids)[None, :]
                     cached_count = total_tokens - len(remaining_ids)
                     remaining_count = len(remaining_ids)
                 elif cached_kv is not None and not remaining_ids:
                     # Exact hit — trim cache by 1 so replaying the last token
                     # produces correct logits (same as _process_prompts path).
-                    request_cache = _trim_cache_offset(cached_kv, 1)
+                    request_cache = prepared_cache
                     remaining = input_ids[:, -1:]
                     cached_count = total_tokens - 1
                     remaining_count = 1

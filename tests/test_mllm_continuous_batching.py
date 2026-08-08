@@ -851,6 +851,72 @@ if __name__ == "__main__":
 
 
 class TestMLLMBatchGeneratorMTPGuards:
+    def test_process_prompts_rejects_unsafe_exact_rotating_hit(self, monkeypatch):
+        from mlx_lm.models.cache import CacheList, KVCache, RotatingKVCache
+
+        from vllm_mlx.mllm_batch_generator import (
+            MLLMBatchGenerator,
+            MLLMBatchRequest,
+            MLLMBatchStats,
+        )
+
+        class FreshCache:
+            def merge(self, caches):
+                return self
+
+        full = KVCache()
+        full.update_and_fetch(mx.zeros((1, 1, 6, 2)), mx.zeros((1, 1, 6, 2)))
+        rotating = RotatingKVCache(max_size=4)
+        rotating.keys = mx.zeros((1, 1, 4, 2))
+        rotating.values = mx.zeros((1, 1, 4, 2))
+        rotating.offset = 6
+        rotating._idx = 4
+        stored = CacheList(full, rotating)
+
+        class PrefixCache:
+            def fetch(self, _):
+                return [stored], []
+
+        monkeypatch.setattr(mx, "stream", lambda stream: nullcontext())
+        monkeypatch.setattr(
+            "mlx_lm.models.cache.make_prompt_cache", lambda *_, **__: [FreshCache()]
+        )
+        monkeypatch.setattr(
+            "mlx_lm.sample_utils.make_sampler",
+            lambda **_: MagicMock(return_value=mx.array([1], dtype=mx.uint32)),
+        )
+        monkeypatch.setattr(
+            "mlx_lm.sample_utils.make_logits_processors", lambda **_: []
+        )
+
+        generator = MLLMBatchGenerator.__new__(MLLMBatchGenerator)
+        generator.max_kv_size = 0
+        generator._stats = MLLMBatchStats()
+        generator._pending_error_responses = []
+        generator._aborted_request_ids = set()
+        generator._prefill_progress = {}
+        generator.prefix_cache = PrefixCache()
+        generator._think_suffix_len = 0
+        generator.prefill_step_size = 512
+        generator.language_model = object()
+        generator.model = MagicMock()
+        generator.sampler = MagicMock()
+        generator._preprocess_request = lambda req: None
+        full_prefill = MagicMock(
+            return_value=mx.array([[[0.0, 1.0]]], dtype=mx.float32)
+        )
+        generator._run_chunked_text_prefill = full_prefill
+
+        request = MLLMBatchRequest(uid=1, request_id="unsafe-exact", prompt="x")
+        request.input_ids = mx.array([[1, 2, 3, 4, 5, 6]])
+        request.is_text_only = True
+
+        MLLMBatchGenerator._process_prompts(generator, [request])
+
+        full_prefill.assert_called_once()
+        assert full_prefill.call_args.kwargs["cache"][0].__class__ is FreshCache
+        assert [child.offset for child in stored.caches] == [6, 6]
+
     def test_process_prompts_applies_request_sampling_to_first_token(self, monkeypatch):
         from vllm_mlx.mllm_batch_generator import (
             MLLMBatchGenerator,
@@ -1780,9 +1846,8 @@ class TestChunkedPrefillCacheHandling:
             mx.eval(cache.keys, cache.values)
         return cache
 
-    def test_exact_hit_uses_trim_cache_offset(self, monkeypatch):
-        """Exact prefix-cache hit must use _trim_cache_offset(kv, 1),
-        NOT _copy_prefix_cache, to reduce the cache offset by 1."""
+    def test_exact_hit_uses_safe_rewind(self):
+        """An exact hit must use the type-preserving safe rewind path."""
         from vllm_mlx.mllm_batch_generator import (
             MLLMBatchRequest,
             install_chunked_prefill_mllm,
@@ -1791,21 +1856,14 @@ class TestChunkedPrefillCacheHandling:
         gen = self._make_fake_batch_gen()
 
         # Track which functions are called
-        trim_calls = []
-        copy_calls = []
+        rewind_calls = []
+        original_rewind = gen._rewind_prefix_cache
 
-        import vllm_mlx.mllm_batch_generator as bg_mod
+        def tracking_rewind(cache, n):
+            rewind_calls.append(n)
+            return original_rewind(cache, n)
 
-        orig_trim = bg_mod._trim_cache_offset
-
-        def tracking_trim(cache, n):
-            trim_calls.append(n)
-            return orig_trim(cache, n)
-
-        monkeypatch.setattr(bg_mod, "_trim_cache_offset", tracking_trim)
-
-        gen._copy_prefix_cache = lambda kv: (copy_calls.append(1), kv)[1]
-        gen._trim_rotating_caches = lambda cache: None
+        gen._rewind_prefix_cache = tracking_rewind
 
         # Fake prefix cache: exact hit → remaining_ids = [] (empty)
         fake_kv = [self._make_fake_kv_cache(offset=50)]
@@ -1837,15 +1895,52 @@ class TestChunkedPrefillCacheHandling:
 
         gen._next()
 
-        # _trim_cache_offset should have been called with trim_by=1
-        assert trim_calls == [
-            1
-        ], f"Expected _trim_cache_offset(kv, 1), got {trim_calls}"
-        # _copy_prefix_cache should NOT have been called
-        assert copy_calls == [], "Exact hit should NOT call _copy_prefix_cache"
+        assert rewind_calls == [1]
+
+    def test_saturated_rotating_exact_hit_falls_back(self, monkeypatch):
+        from mlx_lm.models.cache import CacheList, RotatingKVCache
+
+        from vllm_mlx.mllm_batch_generator import (
+            MLLMBatchRequest,
+            install_chunked_prefill_mllm,
+        )
+
+        gen = self._make_fake_batch_gen()
+        full = self._make_fake_kv_cache(offset=6)
+        rotating = RotatingKVCache(max_size=4)
+        rotating.keys = mx.zeros((1, 1, 4, 4))
+        rotating.values = mx.zeros((1, 1, 4, 4))
+        rotating.offset = 6
+        rotating._idx = 4
+        stored = [CacheList(full, rotating)]
+
+        class PrefixCache:
+            def fetch(self, _):
+                return stored, []
+
+        fresh_cache = object()
+        make_cache = MagicMock(return_value=[fresh_cache])
+        monkeypatch.setattr("mlx_lm.models.cache.make_prompt_cache", make_cache)
+        gen.prefix_cache = PrefixCache()
+        gen.language_model = MagicMock()
+        original_next = MagicMock(return_value=[])
+        gen._next = original_next
+        install_chunked_prefill_mllm(gen, budget=1024)
+
+        request = MLLMBatchRequest(uid=3, request_id="unsafe-exact", prompt="x")
+        request.input_ids = mx.array([[1, 2, 3, 4, 5, 6]])
+        request.is_text_only = True
+        gen.unprocessed_requests.append(request)
+        gen._preprocess_request = lambda _: None
+
+        gen._next()
+
+        make_cache.assert_called_once()
+        original_next.assert_called_once()
+        assert [child.offset for child in stored[0].caches] == [6, 6]
 
     def test_partial_hit_uses_copy_prefix_cache(self, monkeypatch):
-        """Partial prefix-cache hit must use _copy_prefix_cache (not _trim_cache_offset)."""
+        """A partial hit clones storage and does not use exact-hit rewind."""
         from vllm_mlx.mllm_batch_generator import (
             MLLMBatchRequest,
             install_chunked_prefill_mllm,
@@ -1853,21 +1948,11 @@ class TestChunkedPrefillCacheHandling:
 
         gen = self._make_fake_batch_gen()
 
-        trim_calls = []
+        rewind_calls = []
         copy_calls = []
 
-        import vllm_mlx.mllm_batch_generator as bg_mod
-
-        orig_trim = bg_mod._trim_cache_offset
-
-        def tracking_trim(cache, n):
-            trim_calls.append(n)
-            return orig_trim(cache, n)
-
-        monkeypatch.setattr(bg_mod, "_trim_cache_offset", tracking_trim)
-
         gen._copy_prefix_cache = lambda kv: (copy_calls.append(1), kv)[1]
-        gen._trim_rotating_caches = lambda cache: None
+        gen._rewind_prefix_cache = lambda kv, n: (rewind_calls.append(n), kv)[1]
 
         # Fake prefix cache: partial hit → remaining_ids has tokens
         fake_kv = [self._make_fake_kv_cache(offset=3)]
@@ -1894,13 +1979,10 @@ class TestChunkedPrefillCacheHandling:
 
         gen._next()
 
-        # Partial hit uses _copy_prefix_cache, NOT _trim_cache_offset
         assert copy_calls == [
             1
         ], f"Expected _copy_prefix_cache called once, got {copy_calls}"
-        assert (
-            trim_calls == []
-        ), f"Partial hit should NOT call _trim_cache_offset, got {trim_calls}"
+        assert rewind_calls == []
 
     def test_abort_cleans_up_partial_prefill(self):
         """Aborting a request during chunked prefill must clean up _partial."""

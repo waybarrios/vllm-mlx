@@ -41,7 +41,7 @@ _MIN_MEMORY_BYTES = 100 * _BYTES_PER_MB  # Minimum 100MB
 _MAX_ENTRIES_FALLBACK = 50  # Fallback if memory detection fails
 # Bump this when the cache on-disk format or KV semantics change.
 # Loading a cache with a different version is rejected automatically.
-_CACHE_PERSIST_VERSION = 3
+_CACHE_PERSIST_VERSION = 4
 
 
 def _get_available_memory() -> int:
@@ -1313,12 +1313,6 @@ class MemoryAwarePrefixCache:
 
         t0 = _time.monotonic()
 
-        try:
-            from mlx_lm.models.cache import load_prompt_cache
-        except ImportError:
-            logger.warning("[cache_persist] mlx_lm not available, cannot load")
-            return 0
-
         with open(index_path) as f:
             index = json.load(f)
 
@@ -1328,6 +1322,12 @@ class MemoryAwarePrefixCache:
                 f"[cache_persist] version mismatch: disk={version} "
                 f"current={_CACHE_PERSIST_VERSION}, discarding stale cache"
             )
+            return 0
+
+        try:
+            from mlx_lm.models.cache import load_prompt_cache
+        except ImportError:
+            logger.warning("[cache_persist] mlx_lm not available, cannot load")
             return 0
 
         disk_fp = index.get("model_fingerprint", "")
