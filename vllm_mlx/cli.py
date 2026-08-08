@@ -1354,6 +1354,8 @@ Examples:
             "harmony",
             "gpt-oss",
             "deepseek",
+            "deepseek_v4",
+            "dsml",
             "kimi",
             "granite",
             "nemotron",
@@ -1366,7 +1368,8 @@ Examples:
         help=(
             "Select the tool call parser for the model. Options: "
             "auto (auto-detect), mistral, qwen, qwen3_coder, llama, hermes, "
-            "harmony, gpt-oss, deepseek, gemma4, kimi, granite, nemotron, "
+            "harmony, gpt-oss, deepseek, deepseek_v4, dsml, gemma4, kimi, "
+            "granite, nemotron, "
             "xlam, functionary, glm47, minimax. "
             "Required for --enable-auto-tool-choice."
         ),

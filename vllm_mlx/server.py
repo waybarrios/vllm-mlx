@@ -972,6 +972,9 @@ _STREAMING_TOOL_MARKERS = (
     # streaming gates scan, so the harmony tokens remain present.
     "<|channel|>commentary",
     "<|call|>",
+    # DeepSeek-V4 DSML. Listed as the bare token rather than the full
+    # <｜DSML｜tool_calls> marker so a partial chunk still trips the gate.
+    "｜DSML｜",
 )
 _STREAMING_BARE_BRACKET_MARKER = re.compile(r"\[\w+\(\{")
 _STREAMING_BARE_BRACKET_PARTIAL = re.compile(r"\[\w+\($")
