@@ -16,7 +16,7 @@ import time
 import uuid
 from collections import OrderedDict, deque
 from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+from contextlib import aclosing, asynccontextmanager
 from typing import Any
 
 # Re-entrancy guard for SimpleEngine._track_request_stream so that
@@ -760,8 +760,9 @@ class SimpleEngine(BaseEngine):
         consumed inside this method, so there is no value to preserve.
         """
         if _in_tracker.get():
-            async for output in source_gen:
-                yield output
+            async with aclosing(source_gen):
+                async for output in source_gen:
+                    yield output
             return
         _in_tracker.set(True)
         request_id = str(uuid.uuid4())
@@ -786,25 +787,29 @@ class SimpleEngine(BaseEngine):
         self._active_requests[request_id] = entry
         self._num_running += 1
         try:
-            async for output in source_gen:
-                now = time.time()
-                if hasattr(output, "prompt_tokens") and output.prompt_tokens:
-                    last_p = output.prompt_tokens
-                    entry["prompt_tokens"] = last_p
-                if hasattr(output, "completion_tokens") and output.completion_tokens:
-                    if ttft_s is None:
-                        ttft_s = now - start
-                        entry["ttft_s"] = round(ttft_s, 3)
-                        entry["phase"] = "generation"
-                    last_c = output.completion_tokens
-                    entry["completion_tokens"] = last_c
-                entry["elapsed_s"] = round(now - start, 2)
-                if max_tokens > 0:
-                    entry["progress"] = round(min(1.0, last_c / max_tokens), 3)
-                if ttft_s is not None and last_c > 0:
-                    gen_elapsed = max(1e-3, (now - start) - ttft_s)
-                    entry["tokens_per_second"] = round(last_c / gen_elapsed, 1)
-                yield output
+            async with aclosing(source_gen):
+                async for output in source_gen:
+                    now = time.time()
+                    if hasattr(output, "prompt_tokens") and output.prompt_tokens:
+                        last_p = output.prompt_tokens
+                        entry["prompt_tokens"] = last_p
+                    if (
+                        hasattr(output, "completion_tokens")
+                        and output.completion_tokens
+                    ):
+                        if ttft_s is None:
+                            ttft_s = now - start
+                            entry["ttft_s"] = round(ttft_s, 3)
+                            entry["phase"] = "generation"
+                        last_c = output.completion_tokens
+                        entry["completion_tokens"] = last_c
+                    entry["elapsed_s"] = round(now - start, 2)
+                    if max_tokens > 0:
+                        entry["progress"] = round(min(1.0, last_c / max_tokens), 3)
+                    if ttft_s is not None and last_c > 0:
+                        gen_elapsed = max(1e-3, (now - start) - ttft_s)
+                        entry["tokens_per_second"] = round(last_c / gen_elapsed, 1)
+                    yield output
         finally:
             self._active_requests.pop(request_id, None)
             self._num_running = max(0, self._num_running - 1)
@@ -826,7 +831,7 @@ class SimpleEngine(BaseEngine):
         **kwargs,
     ) -> AsyncIterator[GenerationOutput]:
         """Public stream-generate wrapper with request stats tracking."""
-        async for output in self._track_request_stream(
+        tracked_stream = self._track_request_stream(
             self._stream_generate_impl(
                 prompt=prompt,
                 max_tokens=max_tokens,
@@ -836,8 +841,10 @@ class SimpleEngine(BaseEngine):
                 **kwargs,
             ),
             max_tokens=max_tokens,
-        ):
-            yield output
+        )
+        async with aclosing(tracked_stream):
+            async for output in tracked_stream:
+                yield output
 
     async def _stream_generate_impl(
         self,
@@ -904,7 +911,7 @@ class SimpleEngine(BaseEngine):
                     use_specprefill = False
 
                 if use_specprefill:
-                    async for output in self._stream_generate_specprefill(
+                    specprefill_stream = self._stream_generate_specprefill(
                         prompt,
                         tokens_list,
                         max_tokens,
@@ -914,8 +921,10 @@ class SimpleEngine(BaseEngine):
                         specprefill_keep_pct=specprefill_keep_pct_override,
                         specprefill_backbone_pct=specprefill_backbone_pct_override,
                         **kwargs,
-                    ):
-                        yield output
+                    )
+                    async with aclosing(specprefill_stream):
+                        async for output in specprefill_stream:
+                            yield output
                     return
 
         async with self._acquire_generation_slot(request_id):
@@ -1151,7 +1160,7 @@ class SimpleEngine(BaseEngine):
         **kwargs,
     ) -> AsyncIterator[GenerationOutput]:
         """Public stream-chat wrapper with request stats tracking."""
-        async for output in self._track_request_stream(
+        tracked_stream = self._track_request_stream(
             self._stream_chat_impl(
                 messages=messages,
                 max_tokens=max_tokens,
@@ -1163,8 +1172,10 @@ class SimpleEngine(BaseEngine):
                 **kwargs,
             ),
             max_tokens=max_tokens,
-        ):
-            yield output
+        )
+        async with aclosing(tracked_stream):
+            async for output in tracked_stream:
+                yield output
 
     async def _stream_chat_impl(
         self,
@@ -1217,15 +1228,17 @@ class SimpleEngine(BaseEngine):
             logger.info("Text-only request → LLM path (MTP=%s)", has_mtp and self._mtp)
             if chat_template_kwargs:
                 kwargs["chat_template_kwargs"] = chat_template_kwargs
-            async for chunk in self._stream_generate_text(
+            text_stream = self._stream_generate_text(
                 messages,
                 max_tokens,
                 temperature,
                 top_p,
                 tools=template_tools,
                 **kwargs,
-            ):
-                yield chunk
+            )
+            async with aclosing(text_stream):
+                async for chunk in text_stream:
+                    yield chunk
             return
 
         def mllm_call_kwargs() -> dict:
@@ -1762,26 +1775,30 @@ class SimpleEngine(BaseEngine):
                 # Internal fallback to the public stream_generate. The
                 # ``_in_tracker`` context flag prevents double counting
                 # in _track_request_stream.
-                async for output in self.stream_generate(
+                fallback_stream = self.stream_generate(
                     prompt=prompt,
                     max_tokens=max_tokens,
                     temperature=temperature,
                     top_p=top_p,
                     **kwargs,
-                ):
-                    yield output
+                )
+                async with aclosing(fallback_stream):
+                    async for output in fallback_stream:
+                        yield output
             return
 
         # Fallback: no system prefix detected -> original uncached path.
         # Re-entrancy guard in _track_request_stream keeps stats single-counted.
-        async for output in self.stream_generate(
+        fallback_stream = self.stream_generate(
             prompt=prompt,
             max_tokens=max_tokens,
             temperature=temperature,
             top_p=top_p,
             **kwargs,
-        ):
-            yield output
+        )
+        async with aclosing(fallback_stream):
+            async for output in fallback_stream:
+                yield output
 
     async def _stream_generate_specprefill(
         self,
