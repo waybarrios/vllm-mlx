@@ -62,6 +62,7 @@ class EngineCore:
         config: Optional[EngineConfig] = None,
         engine_id: Optional[str] = None,
         force_model_ownership: bool = True,
+        generation_worker: Optional[ThreadPoolExecutor] = None,
     ):
         """
         Initialize the engine.
@@ -74,10 +75,18 @@ class EngineCore:
             force_model_ownership: If True (default), forcibly take model ownership
                                    from any existing engine. If False, raises
                                    ModelOwnershipError if model is in use.
+            generation_worker: Single thread that already owns the model. MLX
+                               buffers carry the stream of the thread that built
+                               them, so stepping has to happen where the model
+                               was loaded. Callers that load on their own pinned
+                               thread pass it here; otherwise the engine makes
+                               its own, which only works if the model was loaded
+                               on that same thread.
         """
         self.model = model
         self.tokenizer = tokenizer
         self.config = config or EngineConfig()
+        self._external_generation_worker = generation_worker
         self._engine_id = engine_id or str(uuid.uuid4())
         self._owns_model = False
         self._closed = False
@@ -146,12 +155,22 @@ class EngineCore:
     async def _engine_loop(self) -> None:
         """Main engine loop.
 
-        scheduler.step runs on one dedicated worker thread. MLX streams are
-        thread-local, so we rebind generation streams inside that worker.
+        scheduler.step runs on one dedicated worker thread, and that thread has
+        to be the one that loaded the model: MLX streams exist only in their
+        creating thread, and BatchGenerator captures ``generation_stream`` into
+        ``self._stream`` when it is built. Callers that load on a pinned thread
+        pass it in as ``generation_worker``; without one this creates a thread
+        of its own, which only matches if the model was loaded there too.
         """
 
         loop = asyncio.get_running_loop()
-        worker = ThreadPoolExecutor(max_workers=1, thread_name_prefix="engine-core")
+        # getattr, not attribute access: tests and older callers build
+        # EngineCore without going through __init__.
+        external_worker = getattr(self, "_external_generation_worker", None)
+        owns_worker = external_worker is None
+        worker = external_worker or ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="engine-core"
+        )
         worker_stream_bound = False
         model_thread_stream_bound = False
         use_worker_thread = True
@@ -331,7 +350,10 @@ class EngineCore:
                 else:
                     self.scheduler._close_batch_generator()
             finally:
-                worker.shutdown(wait=True)
+                # Only tear down a worker this loop created. A caller-supplied
+                # one owns the loaded model and outlives the engine loop.
+                if owns_worker:
+                    worker.shutdown(wait=True)
 
     async def add_request(
         self,
@@ -714,8 +736,11 @@ class AsyncEngineCore:
         model: Any,
         tokenizer: Any,
         config: Optional[EngineConfig] = None,
+        generation_worker: Optional[ThreadPoolExecutor] = None,
     ):
-        self.engine = EngineCore(model, tokenizer, config)
+        self.engine = EngineCore(
+            model, tokenizer, config, generation_worker=generation_worker
+        )
 
     async def __aenter__(self) -> "AsyncEngineCore":
         await self.engine.start()

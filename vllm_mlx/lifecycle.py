@@ -418,10 +418,19 @@ class ResidencyManager:
 
         # MLX buffers carry the stream of the thread that built them, so load
         # has to land on the very thread the engine generates on. Engines that
-        # pin generation expose that thread through ``_generation_worker``.
-        generation_worker = getattr(engine, "_generation_worker", None)
-        if callable(generation_worker):
-            executor = generation_worker()
+        # pin generation name that thread: ``_model_load_executor`` when the
+        # answer depends on the path (BatchedEngine returns None for MLLM,
+        # which steps on the event loop), otherwise ``_generation_worker``.
+        load_executor = getattr(engine, "_model_load_executor", None)
+        if not callable(load_executor):
+            load_executor = getattr(engine, "_generation_worker", None)
+
+        if callable(load_executor):
+            executor = load_executor()
+            if executor is None:
+                # The engine generates on the event loop, so it must load here.
+                prepare_for_start()
+                return
         else:
             uses_default_prepare = getattr(
                 engine, "_uses_default_prepare_for_start", None
