@@ -61,51 +61,94 @@ class TestPromptOutputEntryIsUseless:
 class TestSnapshotOwnsItsMemory:
     """A snapshot that aliases the live cache is rewritten by the generation
     it is supposed to predate: RotatingKVCache writes into its ring buffer and
-    PoolingCache into its remainder buffer, both in place."""
+    PoolingCache into its remainder buffer, both in place.
 
-    def test_copy_is_not_a_view_of_the_source(self):
-        src = mx.array([1.0, 2.0, 3.0])
-        copy = Scheduler._copy_cache_state(src)
-        mx.eval(copy)
-        assert copy is not src
-        assert mx.array_equal(copy, src)
+    Ownership of copying lives at the storage boundary: ``store()`` detaches
+    every array into a freshly allocated, evaluated copy, so the scheduler
+    hands over a structure mirror whose state deliberately aliases the live
+    caches.  These tests pin the guarantee where it is now enforced.
+    (Container-shape coverage — nested lists/tuples/mappings, pass-through of
+    non-array metadata — lives in tests/test_memory_cache_mlx.py.)
+    """
 
-    def test_copy_survives_in_place_mutation_of_the_source(self):
-        src = mx.zeros((4,))
-        copy = Scheduler._copy_cache_state(src)
-        mx.eval(copy)
-        src[0:4] = mx.array([9.0, 9.0, 9.0, 9.0])
-        mx.eval(src)
-        assert copy.tolist() == [
-            0.0,
-            0.0,
-            0.0,
-            0.0,
-        ], "snapshot aliased the live cache and was overwritten by generation"
+    @staticmethod
+    def _store(cache_layers, tokens=(1, 2, 3)):
+        from vllm_mlx.memory_cache import MemoryAwarePrefixCache, MemoryCacheConfig
 
-    def test_nested_containers_are_copied_through(self):
-        src = [mx.array([1.0]), (mx.array([2.0]), mx.array([3.0])), None, 7]
-        copy = Scheduler._copy_cache_state(src)
+        class _Model:
+            pass
 
-        assert isinstance(copy, list) and isinstance(copy[1], tuple)
-        assert copy[0] is not src[0]
-        assert copy[1][0] is not src[1][0]
-        # Non-arrays are metadata, passed through as-is.
-        assert copy[2] is None and copy[3] == 7
+        mc = MemoryAwarePrefixCache(
+            _Model(), MemoryCacheConfig(max_memory_mb=64, min_prefix_tokens=1)
+        )
+        assert mc.store(list(tokens), cache_layers)
+        return mc
 
-    def test_real_rotating_cache_state_is_detached(self):
+    def test_stored_snapshot_is_not_a_view_of_the_source(self):
         live = cache_mod.RotatingKVCache(max_size=8)
         live.update_and_fetch(mx.ones((1, 1, 4, 4)), mx.ones((1, 1, 4, 4)))
-        snapshot = Scheduler._copy_cache_state(live.state)
-        mx.eval(snapshot)
 
-        before = [mx.sum(a).item() for a in snapshot if isinstance(a, mx.array)]
+        mc = self._store([live])
+        got, remaining = mc.fetch([1, 2, 3])
+
+        assert remaining == []
+        assert got[0] is not live
+        assert got[0].keys is not live.keys
+        assert mx.array_equal(got[0].keys, live.keys)
+
+    def test_stored_snapshot_survives_in_place_mutation_of_the_source(self):
+        live = cache_mod.RotatingKVCache(max_size=8)
+        live.update_and_fetch(mx.zeros((1, 1, 4, 4)), mx.zeros((1, 1, 4, 4)))
+
+        mc = self._store([live])
+        got, _ = mc.fetch([1, 2, 3])
+        before = mx.sum(got[0].keys).item()
+
         # Keep generating: the ring buffer is written in place past max_size.
         for _ in range(6):
             live.update_and_fetch(mx.ones((1, 1, 4, 4)) * 5, mx.ones((1, 1, 4, 4)) * 5)
-        after = [mx.sum(a).item() for a in snapshot if isinstance(a, mx.array)]
 
+        got, _ = mc.fetch([1, 2, 3])
+        after = mx.sum(got[0].keys).item()
         assert before == after, "continued generation mutated the stored snapshot"
+
+    def test_scheduler_mirror_flow_stores_detached_state(self):
+        """The rewired snapshot path end-to-end THROUGH the real scheduler
+        method: _store_prompt_only_cache mirrors structure, aliases state,
+        and relies on store() as the sole copy/eval owner."""
+        from vllm_mlx.memory_cache import MemoryAwarePrefixCache, MemoryCacheConfig
+
+        # Untrimmable: wrapped past max_size, 12 tokens total.
+        live = cache_mod.RotatingKVCache(max_size=8)
+        live.update_and_fetch(mx.ones((1, 1, 12, 4)), mx.ones((1, 1, 12, 4)))
+
+        class _Model:
+            pass
+
+        sched = _bare_scheduler()
+        sched.memory_aware_cache = MemoryAwarePrefixCache(
+            _Model(), MemoryCacheConfig(max_memory_mb=64, min_prefix_tokens=1)
+        )
+        request = _FakeRequest(list(range(1, 12)))  # 11 prompt tokens
+        response = _FakeResponse(token=77, uid=0)
+        response.prompt_cache = [live]
+
+        Scheduler._store_prompt_only_cache(sched, request, response)
+
+        key = list(range(1, 12)) + [77]  # prompt + first generated token
+        got, remaining = sched.memory_aware_cache.fetch(key)
+        assert got is not None and remaining == [], "snapshot was not stored"
+        before = mx.sum(got[0].keys).item()
+
+        # Ring buffer writes in place once wrapped: continued generation on
+        # the live cache must not reach the stored snapshot.
+        for _ in range(6):
+            live.update_and_fetch(mx.ones((1, 1, 1, 4)) * 5, mx.ones((1, 1, 1, 4)) * 5)
+        mx.eval(live.keys, live.values)
+
+        got, _ = sched.memory_aware_cache.fetch(key)
+        after = mx.sum(got[0].keys).item()
+        assert before == after, "aliasing mirror leaked live mutation into the store"
 
 
 class _FakeRequest:
@@ -223,17 +266,19 @@ class TestSnapshotDestinationTopology:
         ]
 
     def test_state_assignment_round_trips_on_a_rotating_layer(self):
-        """The assignment that used to raise and get swallowed."""
+        """The assignment that used to raise and get swallowed.
+
+        The mirror's state now aliases the live layer on purpose — store()
+        owns the copy — so this pins only the structural round-trip.
+        """
         sched = _bare_scheduler()
         live = _rotating_past_its_window()
         dest = Scheduler._make_snapshot_destination(sched, live)
 
-        state = Scheduler._copy_cache_state(live[0].state)
         meta = getattr(live[0], "meta_state", None)
         if meta is not None:
             dest[0].meta_state = meta
-        dest[0].state = state
-        mx.eval([a for a in state if isinstance(a, mx.array)])
+        dest[0].state = live[0].state
 
         assert dest[0].offset == live[0].offset
 
@@ -292,33 +337,41 @@ class TestNestedCacheListInvariants:
             assert mirrored is not original, "container copied shallowly"
 
     def test_snapshot_survives_continued_generation_on_the_live_cache(self):
-        """The invariant that matters: the snapshot must predate what follows."""
+        """The invariant that matters: the snapshot must predate what follows.
+
+        The mirror's state aliases the live children by design; store() is the
+        sole copy/eval owner, so the invariant is asserted on what fetch()
+        returns after storing the aliasing mirror.
+        """
         sched = _bare_scheduler()
         live = [self._nested(tokens=4, max_size=8)]
         dest = Scheduler._make_snapshot_destination(sched, live)
 
         for mirrored, original in zip(dest[0].caches, live[0].caches):
-            state = Scheduler._copy_cache_state(original.state)
-            mirrored.state = state
-            mx.eval([a for a in state if isinstance(a, mx.array)])
+            meta = getattr(original, "meta_state", None)
+            if meta is not None:
+                mirrored.meta_state = meta
+            mirrored.state = original.state
 
-        before = [
-            mx.sum(a).item()
-            for child in dest[0].caches
-            for a in child.state
-            if isinstance(a, mx.array)
-        ]
+        mc = TestSnapshotOwnsItsMemory._store(dest)
+
+        def _sums(entry):
+            return [
+                mx.sum(a).item()
+                for child in entry[0].caches
+                for a in child.state
+                if isinstance(a, mx.array)
+            ]
+
+        got, _ = mc.fetch([1, 2, 3])
+        before = _sums(got)
         for child in live[0].caches:
             for _ in range(6):
                 child.update_and_fetch(
                     mx.ones((1, 1, 1, 4)) * 5, mx.ones((1, 1, 1, 4)) * 5
                 )
-        after = [
-            mx.sum(a).item()
-            for child in dest[0].caches
-            for a in child.state
-            if isinstance(a, mx.array)
-        ]
+        got, _ = mc.fetch([1, 2, 3])
+        after = _sums(got)
 
         assert before == after, "live generation mutated the stored snapshot"
 

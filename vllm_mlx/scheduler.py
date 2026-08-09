@@ -2275,25 +2275,6 @@ class Scheduler:
 
         return scheduled
 
-    @staticmethod
-    def _copy_cache_state(value: Any) -> Any:
-        """Deep-copy a cache ``state`` payload.
-
-        Sharing the arrays is not safe: RotatingKVCache writes into its ring
-        buffer and PoolingCache writes into its remainder buffer, both in
-        place, so a snapshot that aliases them would be rewritten by the very
-        generation it is supposed to predate. ``x + 0`` forces a fresh array
-        while staying on the GPU.
-        """
-        import mlx.core as mx
-
-        if isinstance(value, mx.array):
-            return value + 0
-        if isinstance(value, (list, tuple)):
-            copied = [Scheduler._copy_cache_state(v) for v in value]
-            return type(value)(copied) if isinstance(value, tuple) else copied
-        return value
-
     # How much a prompt must have grown before its cache snapshot is worth
     # re-taking. Copying the KV cache is O(context), so refreshing every turn
     # dominates prefill on long agentic conversations.
@@ -2524,8 +2505,6 @@ class Scheduler:
             if cache_key is None:
                 return
 
-            import mlx.core as mx
-
             import time as _t
 
             _t0 = _t.monotonic()
@@ -2533,22 +2512,22 @@ class Scheduler:
             _t1 = _t.monotonic()
             if snapshot is None:
                 return
-            states = []
+            # The destination mirrors structure only; its state aliases the
+            # live caches on purpose.  store() is the single owner of
+            # copying and evaluation: its detach pass replaces every array
+            # with a freshly allocated, evaluated copy before the entry is
+            # kept (and rejects the entry instead of storing an alias if it
+            # cannot).
             for dst, src in zip(snapshot, raw_cache):
-                state = self._copy_cache_state(src.state)
                 meta = getattr(src, "meta_state", None)
                 if meta is not None:
                     dst.meta_state = meta
-                dst.state = state
-                states.append(state)
+                dst.state = src.state
             _t2 = _t.monotonic()
-            mx.eval(states)
-            _t3 = _t.monotonic()
             logger.debug(
-                "[snapshot_timing] make=%.2fs copy=%.2fs eval=%.2fs layers=%d",
+                "[snapshot_timing] make=%.2fs mirror=%.2fs layers=%d",
                 _t1 - _t0,
                 _t2 - _t1,
-                _t3 - _t2,
                 len(snapshot),
             )
 
