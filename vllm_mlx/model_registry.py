@@ -260,6 +260,166 @@ def _safe_available_memory_bytes() -> int:
     return int(psutil.virtual_memory().available)
 
 
+def _device_working_set_bytes() -> int | None:
+    """Best-effort Metal recommended working-set size, or None when unavailable."""
+    try:
+        import mlx.core as mx
+
+        if not mx.metal.is_available():
+            return None
+        info = mx.device_info()
+        raw = info.get(
+            "max_recommended_working_set_size",
+            info.get("memory_size", 0),
+        )
+        working_set = int(raw or 0)
+    except Exception as exc:  # pragma: no cover - platform dependent
+        logger.debug("Could not query MLX device memory: %s", exc)
+        return None
+    return working_set or None
+
+
+@dataclass(frozen=True)
+class MemoryBudgetReport:
+    """Reconciliation of the manager weight budget with the Metal ceiling.
+
+    The manager budget counts model *weights* only. The Metal allocation
+    ceiling (``gpu_memory_utilization`` x device working set) has to hold the
+    weights plus the KV cache plus activations, so a budget that sits above the
+    ceiling — or above the ceiling minus an explicit cache reservation — cannot
+    be honoured by eviction and will surface as an MLX allocation failure.
+    """
+
+    budget_bytes: int
+    device_working_set_bytes: int | None
+    gpu_memory_utilization: float
+    gpu_memory_utilization_source: str
+    cache_reservation_bytes: int | None
+    cache_reservation_percent: float | None
+
+    @property
+    def allocation_ceiling_bytes(self) -> int | None:
+        """Metal soft allocation limit that will be installed at engine start."""
+        if self.device_working_set_bytes is None:
+            return None
+        return int(self.device_working_set_bytes * self.gpu_memory_utilization)
+
+    @property
+    def weights_headroom_bytes(self) -> int | None:
+        """Ceiling minus any statically known cache reservation."""
+        ceiling = self.allocation_ceiling_bytes
+        if ceiling is None:
+            return None
+        return ceiling - (self.cache_reservation_bytes or 0)
+
+    @property
+    def exceeds_ceiling(self) -> bool:
+        headroom = self.weights_headroom_bytes
+        return headroom is not None and self.budget_bytes > headroom
+
+
+def build_memory_budget_report(
+    manager_config: RegistryManagerConfig,
+    registry: dict[str, RegisteredModel],
+    defaults: RegistryServeDefaults,
+    *,
+    device_working_set_bytes: int | None = None,
+) -> MemoryBudgetReport:
+    """Reconcile the manager weight budget against the Metal allocation ceiling.
+
+    ``gpu_memory_utilization`` is process-wide but per-entry overrides re-install
+    the Metal limits every time a model loads, so the *lowest* effective value
+    across the registry is the ceiling the manager actually has to live under.
+    """
+    if device_working_set_bytes is None:
+        device_working_set_bytes = _device_working_set_bytes()
+
+    utilization = defaults.gpu_memory_utilization
+    utilization_source = "serve default"
+    for name in sorted(registry):
+        override = registry[name].gpu_memory_utilization
+        if override is not None and override < utilization:
+            utilization = override
+            utilization_source = f"models-config entry '{name}'"
+
+    scheduler_config = defaults.scheduler_config
+    cache_reservation_bytes: int | None = None
+    cache_reservation_percent: float | None = None
+    if scheduler_config is not None:
+        cache_memory_mb = getattr(scheduler_config, "cache_memory_mb", None)
+        if cache_memory_mb:
+            cache_reservation_bytes = int(cache_memory_mb) * (1024**2)
+        else:
+            percent = getattr(scheduler_config, "cache_memory_percent", None)
+            if percent:
+                cache_reservation_percent = float(percent)
+
+    return MemoryBudgetReport(
+        budget_bytes=manager_config.memory_budget_bytes,
+        device_working_set_bytes=device_working_set_bytes,
+        gpu_memory_utilization=utilization,
+        gpu_memory_utilization_source=utilization_source,
+        cache_reservation_bytes=cache_reservation_bytes,
+        cache_reservation_percent=cache_reservation_percent,
+    )
+
+
+def log_memory_budget_report(report: MemoryBudgetReport) -> None:
+    """Log the budget/ceiling reconciliation, warning when they conflict."""
+    gb = 1024**3
+    ceiling = report.allocation_ceiling_bytes
+
+    if ceiling is None:
+        logger.info(
+            "Registry memory budget: %.1f GB of model weights "
+            "(Metal allocation ceiling unavailable on this host, so the budget "
+            "cannot be reconciled with it)",
+            report.budget_bytes / gb,
+        )
+        return
+
+    if report.cache_reservation_bytes is not None:
+        cache_desc = f"{report.cache_reservation_bytes / gb:.1f} GB (--cache-memory-mb)"
+    elif report.cache_reservation_percent is not None:
+        cache_desc = (
+            f"~{report.cache_reservation_percent * 100:.0f}% of available RAM "
+            "(--cache-memory-percent, not statically known)"
+        )
+    else:
+        cache_desc = "none configured"
+
+    logger.info(
+        "Registry memory budget: %.1f GB of model weights; "
+        "Metal allocation ceiling %.1f GB (%.0f%% of %.1f GB, from %s); "
+        "prefix-cache reservation %s",
+        report.budget_bytes / gb,
+        ceiling / gb,
+        report.gpu_memory_utilization * 100,
+        (report.device_working_set_bytes or 0) / gb,
+        report.gpu_memory_utilization_source,
+        cache_desc,
+    )
+
+    if report.exceeds_ceiling:
+        headroom = report.weights_headroom_bytes or 0
+        logger.warning(
+            "models-config manager.memory_budget_gb (%.1f GB) exceeds the memory "
+            "actually allocatable for model weights (%.1f GB). The budget counts "
+            "weights only, so the manager will keep models resident that MLX "
+            "cannot allocate, and the process can hit an out-of-memory failure "
+            "instead of evicting. Lower the budget to at most %.1f GB (minus KV "
+            "cache and activation headroom), or raise --gpu-memory-utilization.",
+            report.budget_bytes / gb,
+            headroom / gb,
+            headroom / gb,
+        )
+    else:
+        logger.info(
+            "The registry budget covers model weights only; KV cache and "
+            "activations are additional and are not reserved by it."
+        )
+
+
 def _estimate_model_bytes_from_source(source: str) -> int:
     """Estimate model footprint from local artifact size when possible."""
     path = Path(source)

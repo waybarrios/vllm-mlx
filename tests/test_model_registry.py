@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
+import logging
 from pathlib import Path
 from typing import Any
 
@@ -17,6 +19,8 @@ from vllm_mlx.model_registry import (
     RegistryManagerConfig,
     RegistryServeDefaults,
     ResolvedModelConfig,
+    build_memory_budget_report,
+    log_memory_budget_report,
 )
 from vllm_mlx.utils.download import DownloadConfig
 
@@ -260,3 +264,171 @@ def test_non_local_registry_entry_requires_explicit_memory_estimate():
             await manager.acquire("remote")
 
     asyncio.run(_run())
+
+
+# ---------------------------------------------------------------------------
+# Memory budget vs Metal allocation ceiling reconciliation (issue #627)
+# ---------------------------------------------------------------------------
+
+
+GB = 1024**3
+
+
+def _defaults_with(**overrides: Any) -> RegistryServeDefaults:
+    base = _defaults()
+    return dataclasses.replace(base, **overrides)
+
+
+def test_budget_report_flags_budget_above_allocation_ceiling(tmp_path):
+    """A weights budget larger than gpu_memory_utilization x device RAM is a conflict."""
+    report = build_memory_budget_report(
+        _manager_config(budget_gb=68),
+        _registry(tmp_path, {"alpha": 32}),
+        _defaults_with(gpu_memory_utilization=0.5),
+        device_working_set_bytes=128 * GB,
+    )
+
+    assert report.allocation_ceiling_bytes == 64 * GB
+    assert report.weights_headroom_bytes == 64 * GB
+    assert report.exceeds_ceiling
+
+
+def test_budget_report_accepts_budget_under_ceiling(tmp_path):
+    report = build_memory_budget_report(
+        _manager_config(budget_gb=60),
+        _registry(tmp_path, {"alpha": 32}),
+        _defaults_with(gpu_memory_utilization=0.5),
+        device_working_set_bytes=128 * GB,
+    )
+
+    assert not report.exceeds_ceiling
+
+
+def test_budget_report_subtracts_explicit_cache_reservation(tmp_path):
+    """--cache-memory-mb is carved out of the ceiling before the weights fit-check."""
+    from vllm_mlx.scheduler import SchedulerConfig
+
+    registry = _registry(tmp_path, {"alpha": 32})
+    ceiling_gb = 64  # 0.5 x 128 GB
+
+    fits = build_memory_budget_report(
+        _manager_config(budget_gb=ceiling_gb - 1),
+        registry,
+        _defaults_with(gpu_memory_utilization=0.5, scheduler_config=SchedulerConfig()),
+        device_working_set_bytes=128 * GB,
+    )
+    assert fits.cache_reservation_bytes is None
+    assert fits.cache_reservation_percent == pytest.approx(0.20)
+    assert not fits.exceeds_ceiling
+
+    reserved = build_memory_budget_report(
+        _manager_config(budget_gb=ceiling_gb - 1),
+        registry,
+        _defaults_with(
+            gpu_memory_utilization=0.5,
+            scheduler_config=SchedulerConfig(cache_memory_mb=20480),
+        ),
+        device_working_set_bytes=128 * GB,
+    )
+    assert reserved.cache_reservation_bytes == 20 * GB
+    assert reserved.weights_headroom_bytes == (ceiling_gb - 20) * GB
+    assert reserved.exceeds_ceiling
+
+
+def test_budget_report_uses_tightest_per_entry_utilization(tmp_path):
+    """A per-model override lowers the process-wide ceiling once that model loads."""
+    registry = _registry(tmp_path, {"alpha": 8, "beta": 8})
+    registry["beta"] = dataclasses.replace(registry["beta"], gpu_memory_utilization=0.4)
+
+    report = build_memory_budget_report(
+        _manager_config(budget_gb=60),
+        registry,
+        _defaults_with(gpu_memory_utilization=0.9),
+        device_working_set_bytes=128 * GB,
+    )
+
+    assert report.gpu_memory_utilization == pytest.approx(0.4)
+    assert "beta" in report.gpu_memory_utilization_source
+    assert report.allocation_ceiling_bytes == int(0.4 * 128 * GB)
+    assert report.exceeds_ceiling
+
+
+def test_budget_report_is_inconclusive_without_device_memory(tmp_path, monkeypatch):
+    """Non-Metal hosts get no false warning — the ceiling simply is not knowable."""
+    monkeypatch.setattr(
+        "vllm_mlx.model_registry._device_working_set_bytes", lambda: None
+    )
+    report = build_memory_budget_report(
+        _manager_config(budget_gb=10_000),
+        _registry(tmp_path, {"alpha": 8}),
+        _defaults(),
+    )
+
+    assert report.allocation_ceiling_bytes is None
+    assert report.weights_headroom_bytes is None
+    assert not report.exceeds_ceiling
+
+
+def test_log_memory_budget_report_warns_only_on_conflict(tmp_path, caplog):
+    over = build_memory_budget_report(
+        _manager_config(budget_gb=68),
+        _registry(tmp_path, {"alpha": 32}),
+        _defaults_with(gpu_memory_utilization=0.5),
+        device_working_set_bytes=128 * GB,
+    )
+    with caplog.at_level(logging.WARNING, logger="vllm_mlx.model_registry"):
+        log_memory_budget_report(over)
+    assert "exceeds the memory actually allocatable" in caplog.text
+    assert "64.0 GB" in caplog.text
+
+    caplog.clear()
+    under = build_memory_budget_report(
+        _manager_config(budget_gb=40),
+        _registry(tmp_path, {"beta": 32}),
+        _defaults_with(gpu_memory_utilization=0.5),
+        device_working_set_bytes=128 * GB,
+    )
+    with caplog.at_level(logging.WARNING, logger="vllm_mlx.model_registry"):
+        log_memory_budget_report(under)
+    assert caplog.text == ""
+
+
+def test_log_memory_budget_report_reports_ceiling_and_cache(tmp_path, caplog):
+    from vllm_mlx.scheduler import SchedulerConfig
+
+    report = build_memory_budget_report(
+        _manager_config(budget_gb=40),
+        _registry(tmp_path, {"alpha": 32}),
+        _defaults_with(
+            gpu_memory_utilization=0.5,
+            scheduler_config=SchedulerConfig(cache_memory_mb=20480),
+        ),
+        device_working_set_bytes=128 * GB,
+    )
+    with caplog.at_level(logging.INFO, logger="vllm_mlx.model_registry"):
+        log_memory_budget_report(report)
+
+    assert "Registry memory budget: 40.0 GB" in caplog.text
+    assert "Metal allocation ceiling 64.0 GB" in caplog.text
+    assert "20.0 GB (--cache-memory-mb)" in caplog.text
+
+
+def test_log_memory_budget_report_says_so_when_ceiling_unknown(
+    tmp_path, monkeypatch, caplog
+):
+    monkeypatch.setattr(
+        "vllm_mlx.model_registry._device_working_set_bytes", lambda: None
+    )
+    report = build_memory_budget_report(
+        _manager_config(budget_gb=68),
+        _registry(tmp_path, {"alpha": 32}),
+        _defaults(),
+    )
+
+    with caplog.at_level(logging.INFO, logger="vllm_mlx.model_registry"):
+        log_memory_budget_report(report)
+
+    assert "cannot be reconciled" in caplog.text
+    assert not [
+        record for record in caplog.records if record.levelno >= logging.WARNING
+    ]

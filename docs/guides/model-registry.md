@@ -84,14 +84,72 @@ models:
 
 Total resident-model budget for the registry manager.
 
-This is the eviction budget, not the full system RAM size. Leave headroom for:
+**This budget counts model weights only.** It is the number the manager compares
+against when deciding whether a new model fits or an idle one must be evicted.
+It does not include, and does not reserve room for:
 
 - KV cache
-- request batching
+- activations during prefill and decode
 - OS / filesystem cache
 - other colocated services
 
 On a 128 GB machine, a practical starting point is often `80-100 GB`.
+
+### Budget vs. the Metal allocation ceiling
+
+The manager budget and the MLX allocation ceiling are two separate numbers, and
+the budget does not derive from the ceiling. The ceiling is installed at engine
+start from `--gpu-memory-utilization`:
+
+```
+allocation_ceiling = gpu_memory_utilization x device_working_set_size
+```
+
+The weights *plus* the KV cache *plus* activations all have to fit under that
+ceiling, while the budget only accounts for the weights. If the budget is set
+above what is actually allocatable, the manager's arithmetic says N models fit,
+it keeps them all resident, and MLX hits the ceiling — so you get a hard
+out-of-memory failure instead of the graceful eviction the budget exists to
+provide.
+
+The invariant to maintain is:
+
+```
+memory_budget_gb  <=  gpu_memory_utilization x device_RAM
+                      - cache_memory_mb
+                      - KV/activation headroom
+```
+
+The server reconciles the first three terms at startup and logs them:
+
+```
+Registry memory budget: 68.0 GB of model weights; Metal allocation ceiling
+64.0 GB (50% of 128.0 GB, from serve default); prefix-cache reservation
+20.0 GB (--cache-memory-mb)
+```
+
+When the declared budget does not fit below the ceiling, startup emits a
+warning naming the largest budget that would:
+
+```
+WARNING models-config manager.memory_budget_gb (68.0 GB) exceeds the memory
+actually allocatable for model weights (44.0 GB). ...
+```
+
+This is a diagnostic, not a clamp — the server still starts with the budget you
+configured. KV and activation headroom are workload-dependent, so the reported
+figure is an upper bound, not a safe target: leave margin below it.
+
+Notes on how the ceiling is computed:
+
+- A per-entry `gpu_memory_utilization` override re-installs the process-wide
+  Metal limits whenever that model loads, so the check uses the *lowest*
+  effective utilization across the serve default and every registry entry.
+- `--cache-memory-mb` is subtracted when set. The default
+  `--cache-memory-percent` reservation scales with available RAM at runtime and
+  is reported but not subtracted.
+- On hosts where MLX cannot report a Metal working-set size, the check reports
+  that the budget could not be reconciled and issues no warning.
 
 ### `contention_policy`
 
@@ -141,6 +199,18 @@ For deterministic eviction behavior:
 - non-local model ids should set `estimated_memory_gb`
 
 If a registry entry points at a non-local source and no `estimated_memory_gb` is provided, startup will reject the config. This prevents the manager from making bad eviction decisions from guesswork.
+
+Both sizing paths are **weight estimates, not total runtime memory**:
+
+- for a local source, the estimate is the summed on-disk size of the entry's
+  `.safetensors` / `.gguf` files
+- for a declared model id, the estimate is the operator-supplied
+  `estimated_memory_gb`
+
+Neither includes KV cache or activations, so a model's real peak footprint is
+larger than the number the manager charges against `memory_budget_gb`. Size the
+budget with that gap in mind — see
+[Budget vs. the Metal allocation ceiling](#budget-vs-the-metal-allocation-ceiling).
 
 ## Request Routing
 
@@ -204,6 +274,8 @@ Then repeat with a second model id to verify:
 
 - Bad or missing `estimated_memory_gb` on non-local sources: config load failure
 - Too-small `memory_budget_gb`: repeated capacity failures or unnecessary preemption
+- Too-large `memory_budget_gb` relative to `--gpu-memory-utilization`: MLX
+  out-of-memory instead of eviction (the startup log warns about this)
 - Over-aggressive `preempt` policy: active requests get cancelled during model swaps
 - Too many `preload: true` entries: startup load storm and immediate budget pressure
 

@@ -168,7 +168,9 @@ from .model_registry import (
     ModelLease,
     ModelManager,
     RegistryServeDefaults,
+    build_memory_budget_report,
     load_registry_config,
+    log_memory_budget_report,
 )
 from .metrics import metrics as _metrics
 from .models.mllm import UnsafeRemoteURLError, _validate_url_safety, is_url
@@ -3400,6 +3402,9 @@ def load_model_registry(
         config_path,
         len(registry),
         manager_config.memory_budget_bytes / (1024**3),
+    )
+    log_memory_budget_report(
+        build_memory_budget_report(manager_config, registry, defaults)
     )
 
 
