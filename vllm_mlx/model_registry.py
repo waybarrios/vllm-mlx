@@ -283,19 +283,28 @@ def _device_working_set_bytes() -> int | None:
 class MemoryBudgetReport:
     """Reconciliation of the manager weight budget with the Metal ceiling.
 
-    The manager budget counts model *weights* only. The Metal allocation
-    ceiling (``gpu_memory_utilization`` x device working set) has to hold the
-    weights plus the KV cache plus activations, so a budget that sits above the
-    ceiling — or above the ceiling minus an explicit cache reservation — cannot
-    be honoured by eviction and will surface as an MLX allocation failure.
+    The manager budget counts model *weights* only, and the Metal allocation
+    ceiling (``gpu_memory_utilization`` x device working set) is process-wide.
+    Those two are directly comparable, so a budget above the ceiling is a
+    deterministic conflict: the manager will keep models resident that MLX
+    cannot allocate, and the load fails instead of evicting.
+
+    The prefix-cache limit is deliberately *not* folded into that comparison.
+    ``cache_memory_mb`` is a per-engine maximum — it is cloned into each
+    resident continuous-batching engine and allocated lazily, and simple-mode
+    entries never receive it at all — so it is neither a single process-wide
+    reservation nor a bound that can be subtracted once. It is reported
+    alongside the ceiling instead, with its own conflict check.
     """
 
     budget_bytes: int
     device_working_set_bytes: int | None
     gpu_memory_utilization: float
     gpu_memory_utilization_source: str
-    cache_reservation_bytes: int | None
-    cache_reservation_percent: float | None
+    per_engine_cache_limit_bytes: int | None
+    per_engine_cache_percent: float | None
+    continuous_batching_entries: int
+    total_entries: int
 
     @property
     def allocation_ceiling_bytes(self) -> int | None:
@@ -305,17 +314,21 @@ class MemoryBudgetReport:
         return int(self.device_working_set_bytes * self.gpu_memory_utilization)
 
     @property
-    def weights_headroom_bytes(self) -> int | None:
-        """Ceiling minus any statically known cache reservation."""
+    def exceeds_ceiling(self) -> bool:
+        """True when the weights budget alone cannot fit under the ceiling.
+
+        Both sides are process-wide totals, so this is the deterministic check.
+        """
         ceiling = self.allocation_ceiling_bytes
-        if ceiling is None:
-            return None
-        return ceiling - (self.cache_reservation_bytes or 0)
+        return ceiling is not None and self.budget_bytes > ceiling
 
     @property
-    def exceeds_ceiling(self) -> bool:
-        headroom = self.weights_headroom_bytes
-        return headroom is not None and self.budget_bytes > headroom
+    def cache_limit_exceeds_ceiling(self) -> bool:
+        """True when one engine's prefix cache could alone fill the ceiling."""
+        ceiling = self.allocation_ceiling_bytes
+        if ceiling is None or self.per_engine_cache_limit_bytes is None:
+            return False
+        return self.per_engine_cache_limit_bytes >= ceiling
 
 
 def build_memory_budget_report(
@@ -342,25 +355,46 @@ def build_memory_budget_report(
             utilization = override
             utilization_source = f"models-config entry '{name}'"
 
+    continuous_batching_entries = sum(
+        1
+        for entry in registry.values()
+        if (
+            entry.continuous_batching
+            if entry.continuous_batching is not None
+            else defaults.continuous_batching
+        )
+    )
+
+    # cache_memory_mb only binds for continuous-batching engines, and only when
+    # the memory-aware prefix cache is the one actually in use.
     scheduler_config = defaults.scheduler_config
-    cache_reservation_bytes: int | None = None
-    cache_reservation_percent: float | None = None
-    if scheduler_config is not None:
+    per_engine_cache_limit_bytes: int | None = None
+    per_engine_cache_percent: float | None = None
+    cache_applies = (
+        scheduler_config is not None
+        and continuous_batching_entries > 0
+        and getattr(scheduler_config, "enable_prefix_cache", False)
+        and not getattr(scheduler_config, "use_paged_cache", False)
+        and getattr(scheduler_config, "use_memory_aware_cache", False)
+    )
+    if cache_applies:
         cache_memory_mb = getattr(scheduler_config, "cache_memory_mb", None)
         if cache_memory_mb:
-            cache_reservation_bytes = int(cache_memory_mb) * (1024**2)
+            per_engine_cache_limit_bytes = int(cache_memory_mb) * (1024**2)
         else:
             percent = getattr(scheduler_config, "cache_memory_percent", None)
             if percent:
-                cache_reservation_percent = float(percent)
+                per_engine_cache_percent = float(percent)
 
     return MemoryBudgetReport(
         budget_bytes=manager_config.memory_budget_bytes,
         device_working_set_bytes=device_working_set_bytes,
         gpu_memory_utilization=utilization,
         gpu_memory_utilization_source=utilization_source,
-        cache_reservation_bytes=cache_reservation_bytes,
-        cache_reservation_percent=cache_reservation_percent,
+        per_engine_cache_limit_bytes=per_engine_cache_limit_bytes,
+        per_engine_cache_percent=per_engine_cache_percent,
+        continuous_batching_entries=continuous_batching_entries,
+        total_entries=len(registry),
     )
 
 
@@ -378,12 +412,17 @@ def log_memory_budget_report(report: MemoryBudgetReport) -> None:
         )
         return
 
-    if report.cache_reservation_bytes is not None:
-        cache_desc = f"{report.cache_reservation_bytes / gb:.1f} GB (--cache-memory-mb)"
-    elif report.cache_reservation_percent is not None:
+    engines = f"{report.continuous_batching_entries} of {report.total_entries} entries"
+    if report.per_engine_cache_limit_bytes is not None:
         cache_desc = (
-            f"~{report.cache_reservation_percent * 100:.0f}% of available RAM "
-            "(--cache-memory-percent, not statically known)"
+            f"{report.per_engine_cache_limit_bytes / gb:.1f} GB per "
+            f"continuous-batching engine (--cache-memory-mb, {engines})"
+        )
+    elif report.per_engine_cache_percent is not None:
+        cache_desc = (
+            f"~{report.per_engine_cache_percent * 100:.0f}% of available RAM per "
+            f"continuous-batching engine (--cache-memory-percent, {engines}); "
+            "scales at runtime"
         )
     else:
         cache_desc = "none configured"
@@ -391,7 +430,7 @@ def log_memory_budget_report(report: MemoryBudgetReport) -> None:
     logger.info(
         "Registry memory budget: %.1f GB of model weights; "
         "Metal allocation ceiling %.1f GB (%.0f%% of %.1f GB, from %s); "
-        "prefix-cache reservation %s",
+        "prefix-cache maximum %s",
         report.budget_bytes / gb,
         ceiling / gb,
         report.gpu_memory_utilization * 100,
@@ -401,22 +440,35 @@ def log_memory_budget_report(report: MemoryBudgetReport) -> None:
     )
 
     if report.exceeds_ceiling:
-        headroom = report.weights_headroom_bytes or 0
         logger.warning(
-            "models-config manager.memory_budget_gb (%.1f GB) exceeds the memory "
-            "actually allocatable for model weights (%.1f GB). The budget counts "
-            "weights only, so the manager will keep models resident that MLX "
-            "cannot allocate, and the process can hit an out-of-memory failure "
-            "instead of evicting. Lower the budget to at most %.1f GB (minus KV "
-            "cache and activation headroom), or raise --gpu-memory-utilization.",
+            "models-config manager.memory_budget_gb (%.1f GB) exceeds the Metal "
+            "allocation ceiling (%.1f GB). The budget counts model weights only, "
+            "so the manager will keep models resident that MLX cannot allocate, "
+            "and a load can fail with an out-of-memory error instead of evicting. "
+            "Lower the budget below %.1f GB — further still, since the KV cache "
+            "and activations also come out of the ceiling — or raise "
+            "--gpu-memory-utilization.",
             report.budget_bytes / gb,
-            headroom / gb,
-            headroom / gb,
+            ceiling / gb,
+            ceiling / gb,
         )
-    else:
+
+    if report.cache_limit_exceeds_ceiling:
+        logger.warning(
+            "--cache-memory-mb (%.1f GB per continuous-batching engine) is at or "
+            "above the Metal allocation ceiling (%.1f GB) on its own, leaving no "
+            "room for model weights. Note this is a per-engine maximum: it is "
+            "cloned into every resident continuous-batching engine, so the "
+            "aggregate grows with the number of resident models.",
+            (report.per_engine_cache_limit_bytes or 0) / gb,
+            ceiling / gb,
+        )
+
+    if not report.exceeds_ceiling and not report.cache_limit_exceeds_ceiling:
         logger.info(
-            "The registry budget covers model weights only; KV cache and "
-            "activations are additional and are not reserved by it."
+            "The registry budget covers model weights only; the KV cache, the "
+            "prefix cache and activations are additional and are not reserved "
+            "by it."
         )
 
 

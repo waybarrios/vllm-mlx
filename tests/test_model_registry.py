@@ -6,6 +6,7 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import logging
+import re
 from pathlib import Path
 from typing import Any
 
@@ -289,7 +290,6 @@ def test_budget_report_flags_budget_above_allocation_ceiling(tmp_path):
     )
 
     assert report.allocation_ceiling_bytes == 64 * GB
-    assert report.weights_headroom_bytes == 64 * GB
     assert report.exceeds_ceiling
 
 
@@ -304,35 +304,113 @@ def test_budget_report_accepts_budget_under_ceiling(tmp_path):
     assert not report.exceeds_ceiling
 
 
-def test_budget_report_subtracts_explicit_cache_reservation(tmp_path):
-    """--cache-memory-mb is carved out of the ceiling before the weights fit-check."""
+def test_cache_limit_is_reported_per_engine_not_subtracted_once(tmp_path):
+    """--cache-memory-mb is a per-engine maximum, so it never moves the fit-check.
+
+    It is cloned into each resident continuous-batching engine, so it is neither
+    a single process-wide reservation nor a subtractable bound.
+    """
     from vllm_mlx.scheduler import SchedulerConfig
 
     registry = _registry(tmp_path, {"alpha": 32})
     ceiling_gb = 64  # 0.5 x 128 GB
 
-    fits = build_memory_budget_report(
-        _manager_config(budget_gb=ceiling_gb - 1),
-        registry,
-        _defaults_with(gpu_memory_utilization=0.5, scheduler_config=SchedulerConfig()),
-        device_working_set_bytes=128 * GB,
-    )
-    assert fits.cache_reservation_bytes is None
-    assert fits.cache_reservation_percent == pytest.approx(0.20)
-    assert not fits.exceeds_ceiling
-
-    reserved = build_memory_budget_report(
+    without_cache = build_memory_budget_report(
         _manager_config(budget_gb=ceiling_gb - 1),
         registry,
         _defaults_with(
             gpu_memory_utilization=0.5,
+            continuous_batching=True,
+            scheduler_config=SchedulerConfig(),
+        ),
+        device_working_set_bytes=128 * GB,
+    )
+    assert without_cache.per_engine_cache_limit_bytes is None
+    assert without_cache.per_engine_cache_percent == pytest.approx(0.20)
+    assert not without_cache.exceeds_ceiling
+
+    with_cache = build_memory_budget_report(
+        _manager_config(budget_gb=ceiling_gb - 1),
+        registry,
+        _defaults_with(
+            gpu_memory_utilization=0.5,
+            continuous_batching=True,
             scheduler_config=SchedulerConfig(cache_memory_mb=20480),
         ),
         device_working_set_bytes=128 * GB,
     )
-    assert reserved.cache_reservation_bytes == 20 * GB
-    assert reserved.weights_headroom_bytes == (ceiling_gb - 20) * GB
-    assert reserved.exceeds_ceiling
+    assert with_cache.per_engine_cache_limit_bytes == 20 * GB
+    # The budget still fits: the cache limit does not shrink the weight capacity.
+    assert not with_cache.exceeds_ceiling
+    assert not with_cache.cache_limit_exceeds_ceiling
+
+
+def test_cache_limit_ignored_for_simple_mode_entries(tmp_path):
+    """SimpleEngine never receives scheduler_config, so the cap does not apply."""
+    from vllm_mlx.scheduler import SchedulerConfig
+
+    report = build_memory_budget_report(
+        _manager_config(budget_gb=10),
+        _registry(tmp_path, {"alpha": 8}),
+        _defaults_with(
+            continuous_batching=False,
+            scheduler_config=SchedulerConfig(cache_memory_mb=20480),
+        ),
+        device_working_set_bytes=128 * GB,
+    )
+
+    assert report.continuous_batching_entries == 0
+    assert report.total_entries == 1
+    assert report.per_engine_cache_limit_bytes is None
+    assert report.per_engine_cache_percent is None
+
+
+def test_cache_limit_ignored_when_paged_cache_supersedes_it(tmp_path):
+    """cache_memory_mb only binds for the memory-aware prefix cache."""
+    from vllm_mlx.scheduler import SchedulerConfig
+
+    report = build_memory_budget_report(
+        _manager_config(budget_gb=10),
+        _registry(tmp_path, {"alpha": 8}),
+        _defaults_with(
+            continuous_batching=True,
+            scheduler_config=SchedulerConfig(
+                cache_memory_mb=20480, use_paged_cache=True
+            ),
+        ),
+        device_working_set_bytes=128 * GB,
+    )
+
+    assert report.continuous_batching_entries == 1
+    assert report.per_engine_cache_limit_bytes is None
+
+
+def test_cache_limit_above_ceiling_warns_without_negative_numbers(tmp_path, caplog):
+    """Regression: an 8 GiB ceiling with a 20 GiB cache cap must not report -12 GiB."""
+    from vllm_mlx.scheduler import SchedulerConfig
+
+    report = build_memory_budget_report(
+        _manager_config(budget_gb=4),
+        _registry(tmp_path, {"alpha": 2}),
+        _defaults_with(
+            gpu_memory_utilization=0.5,
+            continuous_batching=True,
+            scheduler_config=SchedulerConfig(cache_memory_mb=20480),
+        ),
+        device_working_set_bytes=16 * GB,
+    )
+
+    assert report.allocation_ceiling_bytes == 8 * GB
+    assert report.cache_limit_exceeds_ceiling
+    # The weights budget itself still fits under the ceiling.
+    assert not report.exceeds_ceiling
+
+    with caplog.at_level(logging.INFO, logger="vllm_mlx.model_registry"):
+        log_memory_budget_report(report)
+
+    assert "is at or above the Metal allocation ceiling" in caplog.text
+    # No negative quantity may ever reach the operator (the -12 GiB regression).
+    assert not re.search(r"-\d", caplog.text)
 
 
 def test_budget_report_uses_tightest_per_entry_utilization(tmp_path):
@@ -353,6 +431,29 @@ def test_budget_report_uses_tightest_per_entry_utilization(tmp_path):
     assert report.exceeds_ceiling
 
 
+def test_budget_report_ignores_cache_limit_in_the_fit_check(tmp_path):
+    """The deterministic check compares process-wide quantities only."""
+    from vllm_mlx.scheduler import SchedulerConfig
+
+    registry = _registry(tmp_path, {"alpha": 32})
+    args = dict(gpu_memory_utilization=0.5, continuous_batching=True)
+
+    bare = build_memory_budget_report(
+        _manager_config(budget_gb=63),
+        registry,
+        _defaults_with(**args, scheduler_config=SchedulerConfig()),
+        device_working_set_bytes=128 * GB,
+    )
+    capped = build_memory_budget_report(
+        _manager_config(budget_gb=63),
+        registry,
+        _defaults_with(**args, scheduler_config=SchedulerConfig(cache_memory_mb=20480)),
+        device_working_set_bytes=128 * GB,
+    )
+
+    assert bare.exceeds_ceiling == capped.exceeds_ceiling is False
+
+
 def test_budget_report_is_inconclusive_without_device_memory(tmp_path, monkeypatch):
     """Non-Metal hosts get no false warning — the ceiling simply is not knowable."""
     monkeypatch.setattr(
@@ -365,8 +466,8 @@ def test_budget_report_is_inconclusive_without_device_memory(tmp_path, monkeypat
     )
 
     assert report.allocation_ceiling_bytes is None
-    assert report.weights_headroom_bytes is None
     assert not report.exceeds_ceiling
+    assert not report.cache_limit_exceeds_ceiling
 
 
 def test_log_memory_budget_report_warns_only_on_conflict(tmp_path, caplog):
@@ -378,7 +479,7 @@ def test_log_memory_budget_report_warns_only_on_conflict(tmp_path, caplog):
     )
     with caplog.at_level(logging.WARNING, logger="vllm_mlx.model_registry"):
         log_memory_budget_report(over)
-    assert "exceeds the memory actually allocatable" in caplog.text
+    assert "exceeds the Metal allocation ceiling" in caplog.text
     assert "64.0 GB" in caplog.text
 
     caplog.clear()
@@ -398,9 +499,10 @@ def test_log_memory_budget_report_reports_ceiling_and_cache(tmp_path, caplog):
 
     report = build_memory_budget_report(
         _manager_config(budget_gb=40),
-        _registry(tmp_path, {"alpha": 32}),
+        _registry(tmp_path, {"alpha": 32, "beta": 4}),
         _defaults_with(
             gpu_memory_utilization=0.5,
+            continuous_batching=True,
             scheduler_config=SchedulerConfig(cache_memory_mb=20480),
         ),
         device_working_set_bytes=128 * GB,
@@ -410,7 +512,8 @@ def test_log_memory_budget_report_reports_ceiling_and_cache(tmp_path, caplog):
 
     assert "Registry memory budget: 40.0 GB" in caplog.text
     assert "Metal allocation ceiling 64.0 GB" in caplog.text
-    assert "20.0 GB (--cache-memory-mb)" in caplog.text
+    assert "20.0 GB per continuous-batching engine" in caplog.text
+    assert "2 of 2 entries" in caplog.text
 
 
 def test_log_memory_budget_report_says_so_when_ceiling_unknown(

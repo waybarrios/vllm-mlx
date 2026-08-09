@@ -116,38 +116,50 @@ The invariant to maintain is:
 
 ```
 memory_budget_gb  <=  gpu_memory_utilization x device_RAM
-                      - cache_memory_mb
                       - KV/activation headroom
+                      - prefix cache actually resident
 ```
 
-The server reconciles the first three terms at startup and logs them:
+The server reconciles the two process-wide terms at startup and logs them
+together with the prefix-cache setting:
 
 ```
 Registry memory budget: 68.0 GB of model weights; Metal allocation ceiling
-64.0 GB (50% of 128.0 GB, from serve default); prefix-cache reservation
-20.0 GB (--cache-memory-mb)
+64.0 GB (50% of 128.0 GB, from serve default); prefix-cache maximum
+20.0 GB per continuous-batching engine (--cache-memory-mb, 2 of 3 entries)
 ```
 
-When the declared budget does not fit below the ceiling, startup emits a
-warning naming the largest budget that would:
+When the weights budget alone does not fit below the ceiling, startup warns:
 
 ```
-WARNING models-config manager.memory_budget_gb (68.0 GB) exceeds the memory
-actually allocatable for model weights (44.0 GB). ...
+WARNING models-config manager.memory_budget_gb (68.0 GB) exceeds the Metal
+allocation ceiling (64.0 GB). ...
 ```
 
 This is a diagnostic, not a clamp — the server still starts with the budget you
-configured. KV and activation headroom are workload-dependent, so the reported
-figure is an upper bound, not a safe target: leave margin below it.
+configured. It is also a *necessary, not sufficient* condition: passing the
+check does not mean you will not run out of memory, because the KV cache,
+prefix cache and activations all come out of the same ceiling and are
+workload-dependent. Treat the ceiling as an upper bound and leave real margin
+below it.
 
-Notes on how the ceiling is computed:
+Notes on how the check is computed:
 
 - A per-entry `gpu_memory_utilization` override re-installs the process-wide
   Metal limits whenever that model loads, so the check uses the *lowest*
   effective utilization across the serve default and every registry entry.
-- `--cache-memory-mb` is subtracted when set. The default
-  `--cache-memory-percent` reservation scales with available RAM at runtime and
-  is reported but not subtracted.
+- The conflict check compares **only** the weights budget against the ceiling,
+  because both are process-wide totals and therefore directly comparable.
+- `--cache-memory-mb` is **not** subtracted from the ceiling. It is a per-engine
+  maximum: it is cloned into each resident continuous-batching engine and
+  allocated lazily, and simple-mode entries never receive it at all. Subtracting
+  it once would understate capacity with one resident model and overstate it
+  with several, so it is reported next to the ceiling rather than folded into
+  it. It is reported only when it can actually bind — that is, for
+  continuous-batching entries using the memory-aware prefix cache (not
+  `--use-paged-cache`).
+- A separate warning fires when `--cache-memory-mb` alone is at or above the
+  ceiling, which is a configuration error in its own right.
 - On hosts where MLX cannot report a Metal working-set size, the check reports
   that the budget could not be reconciled and issues no warning.
 
