@@ -38,6 +38,12 @@ def test_resolve_trusts_large_explicit_config_value():
     assert resolve_max_length(cfg, _Tok()) == 100000
 
 
+def test_resolve_uses_finite_tokenizer_limit_as_safe_upper_bound():
+    """A finite tokenizer limit constrains the architecture table size."""
+    cfg = {"max_position_embeddings": 514}
+    assert resolve_max_length(cfg, _Tok(model_max_length=512)) == 512
+
+
 def test_resolve_falls_back_to_tokenizer():
     """No config value falls back to tokenizer.model_max_length."""
     assert resolve_max_length(None, _Tok(model_max_length=2048)) == 2048

@@ -4,12 +4,10 @@ Shared resolution of the tokenizer truncation length for embedding and
 reranker models.
 
 The input token limit follows each model's own context window
-(``max_position_embeddings``) instead of a hard-coded 512. That value is an
-explicit architecture value supplied by the model config, so it is trusted
-as-is. Only the tokenizer-derived fallback (``model_max_length``) is subject
-to sentinel detection: HuggingFace leaves that field at a huge placeholder
-(commonly ~1e30) when no real limit was ever configured, and such a value
-must not be mistaken for a genuine context length.
+(``max_position_embeddings``) instead of a hard-coded 512. A finite tokenizer
+limit further constrains that architecture value, while HuggingFace's huge
+unset placeholder is ignored. This keeps position-table offsets safe for
+RoBERTa-family models without losing model-derived limits for sentinel values.
 """
 
 from typing import Any
@@ -56,10 +54,10 @@ def resolve_max_length(
 
     Source order:
       1. ``config.max_position_embeddings`` — an explicit value supplied by
-         the model's own architecture. Trusted as-is, uncapped.
-      2. ``tokenizer.model_max_length`` — only used when the config didn't
-         supply a value. Rejected as unreliable when it is at or above
-         ``sentinel_threshold`` (the HuggingFace "unset" placeholder).
+         the model's own architecture.
+      2. A finite ``tokenizer.model_max_length`` further constrains the
+         architecture value. This matters for RoBERTa-family models, whose
+         position table includes reserved padding positions.
       3. ``default``, when neither source yields a usable value.
 
     Args:
@@ -72,14 +70,14 @@ def resolve_max_length(
     Returns:
         The truncation length to pass as ``max_length``.
     """
-    resolved = _positive_int(_config_get(config, "max_position_embeddings"))
-    if resolved is None:
-        tok_val = _positive_int(
-            getattr(inner_tokenizer(tokenizer), "model_max_length", None)
-        )
-        resolved = (
-            tok_val if tok_val is not None and tok_val < sentinel_threshold else None
-        )
+    config_val = _positive_int(_config_get(config, "max_position_embeddings"))
+    tok_val = _positive_int(
+        getattr(inner_tokenizer(tokenizer), "model_max_length", None)
+    )
+    if tok_val is not None and tok_val < sentinel_threshold:
+        resolved = min(config_val, tok_val) if config_val is not None else tok_val
+    else:
+        resolved = config_val
     if resolved is None:
         resolved = default
     return resolved

@@ -85,6 +85,7 @@ jobs:
             tests/test_dependency_floors.py \
             tests/test_harmony_parsers.py \
             tests/test_endpoint_model_policies.py \
+            tests/test_truncation.py \
             tests/test_gemma4_openai_format.py \
             tests/test_gemma4_streaming_edge.py \
             tests/test_gemma4_tool_parser.py \
@@ -157,6 +158,8 @@ jobs:
             tests/test_tool_choice_forced.py \
             tests/test_tool_choice_none.py \
             tests/test_harmony_render.py \
+            tests/test_embeddings.py \
+            tests/test_rerank.py \
             -v --tb=short \
             -m "not slow" \
             -k "not Integration"
