@@ -145,9 +145,17 @@ below it.
 
 Notes on how the check is computed:
 
-- A per-entry `gpu_memory_utilization` override re-installs the process-wide
-  Metal limits whenever that model loads, so the check uses the *lowest*
-  effective utilization across the serve default and every registry entry.
+- The Metal limit is installed only by continuous-batching entries — that is the
+  one path calling `mx.set_memory_limit`, and simple-mode entries are not even
+  constructed with a `gpu_memory_utilization`. The check therefore considers
+  only the effective utilization of continuous-batching entries, taking the
+  *lowest*, since each such load re-installs the process-wide limit. A
+  `gpu_memory_utilization` set on a simple-mode entry has no effect on the
+  ceiling and is ignored here.
+- A registry with no continuous-batching entries gets **no** attributed ceiling:
+  nothing installs one, so the report says so rather than deriving a figure from
+  a value that is never applied. The serve default likewise only competes when
+  some continuous-batching entry actually inherits it.
 - The conflict check compares **only** the weights budget against the ceiling,
   because both are process-wide totals and therefore directly comparable.
 - `--cache-memory-mb` is **not** subtracted from the ceiling. It is a per-engine

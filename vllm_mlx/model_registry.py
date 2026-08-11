@@ -299,8 +299,8 @@ class MemoryBudgetReport:
 
     budget_bytes: int
     device_working_set_bytes: int | None
-    gpu_memory_utilization: float
-    gpu_memory_utilization_source: str
+    gpu_memory_utilization: float | None
+    gpu_memory_utilization_source: str | None
     per_engine_cache_limit_bytes: int | None
     per_engine_cache_percent: float | None
     continuous_batching_entries: int
@@ -308,8 +308,13 @@ class MemoryBudgetReport:
 
     @property
     def allocation_ceiling_bytes(self) -> int | None:
-        """Metal soft allocation limit that will be installed at engine start."""
-        if self.device_working_set_bytes is None:
+        """Metal soft allocation limit that will be installed at engine start.
+
+        ``None`` when no ceiling can be attributed: either MLX cannot report a
+        device working set, or no entry will install one (only ``BatchedEngine``
+        calls ``mx.set_memory_limit``).
+        """
+        if self.device_working_set_bytes is None or self.gpu_memory_utilization is None:
             return None
         return int(self.device_working_set_bytes * self.gpu_memory_utilization)
 
@@ -340,30 +345,45 @@ def build_memory_budget_report(
 ) -> MemoryBudgetReport:
     """Reconcile the manager weight budget against the Metal allocation ceiling.
 
-    ``gpu_memory_utilization`` is process-wide but per-entry overrides re-install
-    the Metal limits every time a model loads, so the *lowest* effective value
-    across the registry is the ceiling the manager actually has to live under.
+    The Metal limit is process-wide but is re-installed by every
+    ``BatchedEngine`` start, so the ceiling the manager has to live under is the
+    *lowest* utilization among the entries that actually install one. Only
+    continuous-batching entries qualify: ``SimpleEngine`` never calls
+    ``mx.set_memory_limit`` and is not even given a ``gpu_memory_utilization``.
+    A registry with no continuous-batching entries therefore gets no attributed
+    ceiling rather than one derived from a value nothing installs.
     """
     if device_working_set_bytes is None:
         device_working_set_bytes = _device_working_set_bytes()
 
-    utilization = defaults.gpu_memory_utilization
-    utilization_source = "serve default"
+    # Only BatchedEngine installs a Metal allocation limit — SimpleEngine is not
+    # even constructed with a gpu_memory_utilization — so a simple-mode entry's
+    # override is inert and must not be treated as a ceiling candidate.
+    candidates: list[tuple[float, int, str]] = []
     for name in sorted(registry):
-        override = registry[name].gpu_memory_utilization
-        if override is not None and override < utilization:
-            utilization = override
-            utilization_source = f"models-config entry '{name}'"
-
-    continuous_batching_entries = sum(
-        1
-        for entry in registry.values()
-        if (
+        entry = registry[name]
+        entry_continuous_batching = (
             entry.continuous_batching
             if entry.continuous_batching is not None
             else defaults.continuous_batching
         )
-    )
+        if not entry_continuous_batching:
+            continue
+        if entry.gpu_memory_utilization is not None:
+            # Rank 1: an override is only attributable to the entry declaring it.
+            candidates.append(
+                (entry.gpu_memory_utilization, 1, f"models-config entry '{name}'")
+            )
+        else:
+            # Rank 0: prefer the serve default as the named source on ties.
+            candidates.append((defaults.gpu_memory_utilization, 0, "serve default"))
+
+    continuous_batching_entries = len(candidates)
+
+    utilization: float | None = None
+    utilization_source: str | None = None
+    if candidates:
+        utilization, _, utilization_source = min(candidates)
 
     # cache_memory_mb only binds for continuous-batching engines, and only when
     # the memory-aware prefix cache is the one actually in use.
@@ -404,11 +424,18 @@ def log_memory_budget_report(report: MemoryBudgetReport) -> None:
     ceiling = report.allocation_ceiling_bytes
 
     if ceiling is None:
+        if report.gpu_memory_utilization is None:
+            reason = (
+                "no continuous-batching entries, and --gpu-memory-utilization "
+                "installs a Metal limit only for those"
+            )
+        else:
+            reason = "MLX cannot report a device working set on this host"
         logger.info(
-            "Registry memory budget: %.1f GB of model weights "
-            "(Metal allocation ceiling unavailable on this host, so the budget "
-            "cannot be reconciled with it)",
+            "Registry memory budget: %.1f GB of model weights; no Metal "
+            "allocation ceiling to reconcile it with (%s)",
             report.budget_bytes / gb,
+            reason,
         )
         return
 

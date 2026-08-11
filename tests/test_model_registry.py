@@ -285,7 +285,7 @@ def test_budget_report_flags_budget_above_allocation_ceiling(tmp_path):
     report = build_memory_budget_report(
         _manager_config(budget_gb=68),
         _registry(tmp_path, {"alpha": 32}),
-        _defaults_with(gpu_memory_utilization=0.5),
+        _defaults_with(gpu_memory_utilization=0.5, continuous_batching=True),
         device_working_set_bytes=128 * GB,
     )
 
@@ -297,10 +297,12 @@ def test_budget_report_accepts_budget_under_ceiling(tmp_path):
     report = build_memory_budget_report(
         _manager_config(budget_gb=60),
         _registry(tmp_path, {"alpha": 32}),
-        _defaults_with(gpu_memory_utilization=0.5),
+        _defaults_with(gpu_memory_utilization=0.5, continuous_batching=True),
         device_working_set_bytes=128 * GB,
     )
 
+    # Guard against passing vacuously: a ceiling must actually exist here.
+    assert report.allocation_ceiling_bytes == 64 * GB
     assert not report.exceeds_ceiling
 
 
@@ -421,7 +423,7 @@ def test_budget_report_uses_tightest_per_entry_utilization(tmp_path):
     report = build_memory_budget_report(
         _manager_config(budget_gb=60),
         registry,
-        _defaults_with(gpu_memory_utilization=0.9),
+        _defaults_with(gpu_memory_utilization=0.9, continuous_batching=True),
         device_working_set_bytes=128 * GB,
     )
 
@@ -429,6 +431,102 @@ def test_budget_report_uses_tightest_per_entry_utilization(tmp_path):
     assert "beta" in report.gpu_memory_utilization_source
     assert report.allocation_ceiling_bytes == int(0.4 * 128 * GB)
     assert report.exceeds_ceiling
+
+
+def test_no_ceiling_attributed_when_no_entry_installs_one(tmp_path):
+    """Only BatchedEngine calls mx.set_memory_limit, so an all-simple registry
+    must not attribute a ceiling to --gpu-memory-utilization."""
+    report = build_memory_budget_report(
+        _manager_config(budget_gb=10_000),
+        _registry(tmp_path, {"alpha": 8, "beta": 8}),
+        _defaults_with(gpu_memory_utilization=0.5, continuous_batching=False),
+        device_working_set_bytes=128 * GB,
+    )
+
+    assert report.continuous_batching_entries == 0
+    assert report.gpu_memory_utilization is None
+    assert report.gpu_memory_utilization_source is None
+    assert report.allocation_ceiling_bytes is None
+    # A wildly oversized budget must not warn against a ceiling nothing installs.
+    assert not report.exceeds_ceiling
+
+
+def test_simple_mode_entry_override_is_not_a_ceiling_candidate(tmp_path):
+    """A lower override on a simple-mode entry is inert and must be ignored."""
+    registry = _registry(tmp_path, {"batched": 8, "simple": 8})
+    registry["simple"] = dataclasses.replace(
+        registry["simple"], continuous_batching=False, gpu_memory_utilization=0.1
+    )
+    registry["batched"] = dataclasses.replace(
+        registry["batched"], continuous_batching=True
+    )
+
+    report = build_memory_budget_report(
+        _manager_config(budget_gb=10),
+        registry,
+        _defaults_with(gpu_memory_utilization=0.8, continuous_batching=False),
+        device_working_set_bytes=128 * GB,
+    )
+
+    assert report.continuous_batching_entries == 1
+    assert report.gpu_memory_utilization == pytest.approx(0.8)
+    assert report.gpu_memory_utilization_source == "serve default"
+    assert report.allocation_ceiling_bytes == int(0.8 * 128 * GB)
+
+
+def test_serve_default_does_not_win_when_every_batched_entry_overrides(tmp_path):
+    """The default only competes when some batched entry actually inherits it."""
+    registry = _registry(tmp_path, {"alpha": 8, "beta": 8})
+    registry["alpha"] = dataclasses.replace(
+        registry["alpha"], gpu_memory_utilization=0.7
+    )
+    registry["beta"] = dataclasses.replace(registry["beta"], gpu_memory_utilization=0.9)
+
+    report = build_memory_budget_report(
+        _manager_config(budget_gb=10),
+        registry,
+        _defaults_with(gpu_memory_utilization=0.5, continuous_batching=True),
+        device_working_set_bytes=128 * GB,
+    )
+
+    # 0.5 is never installed by anything, so the tightest installed value wins.
+    assert report.gpu_memory_utilization == pytest.approx(0.7)
+    assert "alpha" in report.gpu_memory_utilization_source
+
+
+def test_tied_utilization_is_attributed_to_the_serve_default(tmp_path):
+    """On a tie the default is the broader cause, so name it rather than an entry."""
+    registry = _registry(tmp_path, {"alpha": 8, "beta": 8})
+    registry["alpha"] = dataclasses.replace(
+        registry["alpha"], gpu_memory_utilization=0.5
+    )
+
+    report = build_memory_budget_report(
+        _manager_config(budget_gb=10),
+        registry,
+        _defaults_with(gpu_memory_utilization=0.5, continuous_batching=True),
+        device_working_set_bytes=128 * GB,
+    )
+
+    assert report.gpu_memory_utilization == pytest.approx(0.5)
+    assert report.gpu_memory_utilization_source == "serve default"
+
+
+def test_log_says_why_when_no_entry_installs_a_ceiling(tmp_path, caplog):
+    report = build_memory_budget_report(
+        _manager_config(budget_gb=10_000),
+        _registry(tmp_path, {"alpha": 8}),
+        _defaults_with(continuous_batching=False),
+        device_working_set_bytes=128 * GB,
+    )
+
+    with caplog.at_level(logging.INFO, logger="vllm_mlx.model_registry"):
+        log_memory_budget_report(report)
+
+    assert "no continuous-batching entries" in caplog.text
+    assert not [
+        record for record in caplog.records if record.levelno >= logging.WARNING
+    ]
 
 
 def test_budget_report_ignores_cache_limit_in_the_fit_check(tmp_path):
@@ -462,9 +560,11 @@ def test_budget_report_is_inconclusive_without_device_memory(tmp_path, monkeypat
     report = build_memory_budget_report(
         _manager_config(budget_gb=10_000),
         _registry(tmp_path, {"alpha": 8}),
-        _defaults(),
+        _defaults_with(continuous_batching=True),
     )
 
+    # A utilization IS attributable here; only the device working set is unknown.
+    assert report.gpu_memory_utilization is not None
     assert report.allocation_ceiling_bytes is None
     assert not report.exceeds_ceiling
     assert not report.cache_limit_exceeds_ceiling
@@ -474,7 +574,7 @@ def test_log_memory_budget_report_warns_only_on_conflict(tmp_path, caplog):
     over = build_memory_budget_report(
         _manager_config(budget_gb=68),
         _registry(tmp_path, {"alpha": 32}),
-        _defaults_with(gpu_memory_utilization=0.5),
+        _defaults_with(gpu_memory_utilization=0.5, continuous_batching=True),
         device_working_set_bytes=128 * GB,
     )
     with caplog.at_level(logging.WARNING, logger="vllm_mlx.model_registry"):
@@ -486,7 +586,7 @@ def test_log_memory_budget_report_warns_only_on_conflict(tmp_path, caplog):
     under = build_memory_budget_report(
         _manager_config(budget_gb=40),
         _registry(tmp_path, {"beta": 32}),
-        _defaults_with(gpu_memory_utilization=0.5),
+        _defaults_with(gpu_memory_utilization=0.5, continuous_batching=True),
         device_working_set_bytes=128 * GB,
     )
     with caplog.at_level(logging.WARNING, logger="vllm_mlx.model_registry"):
@@ -525,13 +625,14 @@ def test_log_memory_budget_report_says_so_when_ceiling_unknown(
     report = build_memory_budget_report(
         _manager_config(budget_gb=68),
         _registry(tmp_path, {"alpha": 32}),
-        _defaults(),
+        _defaults_with(continuous_batching=True),
     )
 
     with caplog.at_level(logging.INFO, logger="vllm_mlx.model_registry"):
         log_memory_budget_report(report)
 
-    assert "cannot be reconciled" in caplog.text
+    assert "no Metal allocation ceiling to reconcile it with" in caplog.text
+    assert "MLX cannot report a device working set" in caplog.text
     assert not [
         record for record in caplog.records if record.levelno >= logging.WARNING
     ]
