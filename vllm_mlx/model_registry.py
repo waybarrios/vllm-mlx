@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import os
 import time
 from collections.abc import Awaitable, Callable
@@ -579,6 +580,24 @@ def load_registry_config(
             int(float(estimated) * (1024**3)) if estimated is not None else None
         )
 
+        raw_gpu_memory_utilization = item.get("gpu_memory_utilization")
+        gpu_memory_utilization = None
+        if raw_gpu_memory_utilization is not None:
+            try:
+                gpu_memory_utilization = float(raw_gpu_memory_utilization)
+            except (TypeError, ValueError):
+                raise ValueError(
+                    f"models-config entry '{name}' gpu_memory_utilization must "
+                    "be finite and within (0, 1]"
+                ) from None
+            if not math.isfinite(gpu_memory_utilization) or not (
+                0.0 < gpu_memory_utilization <= 1.0
+            ):
+                raise ValueError(
+                    f"models-config entry '{name}' gpu_memory_utilization must "
+                    "be finite and within (0, 1]"
+                )
+
         registry[name] = RegisteredModel(
             name=name,
             source=str(source),
@@ -593,7 +612,7 @@ def load_registry_config(
             specprefill_backbone_pct=item.get("specprefill_backbone_pct"),
             specprefill_draft_model=item.get("specprefill_draft_model"),
             stream_interval=item.get("stream_interval"),
-            gpu_memory_utilization=item.get("gpu_memory_utilization"),
+            gpu_memory_utilization=gpu_memory_utilization,
             estimated_memory_bytes=estimated_bytes,
         )
 

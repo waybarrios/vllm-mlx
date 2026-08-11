@@ -21,6 +21,7 @@ from vllm_mlx.model_registry import (
     RegistryServeDefaults,
     ResolvedModelConfig,
     build_memory_budget_report,
+    load_registry_config,
     log_memory_budget_report,
 )
 from vllm_mlx.utils.download import DownloadConfig
@@ -117,6 +118,28 @@ def _registry(tmp_path: Path, sizes_gb: dict[str, float]) -> dict[str, Registere
             estimated_memory_bytes=int(size_gb * (1024**3)),
         )
     return registry
+
+
+@pytest.mark.parametrize("raw_value", [".nan", ".inf", "0", "-0.1", "1.1"])
+def test_registry_rejects_invalid_per_entry_gpu_memory_utilization(tmp_path, raw_value):
+    config_path = tmp_path / "models.yaml"
+    config_path.write_text(f"""
+manager:
+  memory_budget_gb: 8
+models:
+  - name: alpha
+    path: /tmp/alpha
+    gpu_memory_utilization: {raw_value}
+""")
+
+    with pytest.raises(
+        ValueError,
+        match=(
+            r"models-config entry 'alpha' gpu_memory_utilization must be finite "
+            r"and within \(0, 1\]"
+        ),
+    ):
+        load_registry_config(config_path, _defaults())
 
 
 def test_acquire_shares_single_inflight_load(tmp_path):
