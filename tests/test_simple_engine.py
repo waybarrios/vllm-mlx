@@ -2617,6 +2617,70 @@ class TestSimpleEngineConcurrency:
         assert await asyncio.to_thread(prefill_cancelled.wait, 1.0)
 
 
+class TestSimpleEngineStreamTermination:
+    """Regression coverage for SimpleEngine streaming termination."""
+
+    @staticmethod
+    def _make_engine(stream_generate):
+        from vllm_mlx.engine.simple import SimpleEngine
+
+        with patch("vllm_mlx.engine.simple.is_mllm_model", return_value=False):
+            engine = SimpleEngine("test-model")
+        engine._loaded = True
+        engine._model = MagicMock()
+        engine._model.stream_generate = MagicMock(side_effect=stream_generate)
+        return engine
+
+    async def test_natural_exhaustion_emits_one_final_stop_chunk(self):
+        def stream_generate(**kwargs):
+            yield SimpleNamespace(text="Hel", prompt_tokens=3, finish_reason=None)
+            yield SimpleNamespace(text="lo", prompt_tokens=3, finish_reason="stop")
+
+        engine = self._make_engine(stream_generate)
+
+        outputs = [
+            output
+            async for output in engine.stream_generate(prompt="hi", max_tokens=50)
+        ]
+        finished = [output for output in outputs if output.finished]
+
+        assert len(finished) == 1
+        assert finished[0] is outputs[-1]
+        assert finished[0].new_text == ""
+        assert finished[0].finish_reason == "stop"
+
+    async def test_max_tokens_keeps_length_reason(self):
+        def stream_generate(**kwargs):
+            yield SimpleNamespace(text="a", prompt_tokens=3, finish_reason=None)
+            yield SimpleNamespace(text="b", prompt_tokens=3, finish_reason=None)
+            yield SimpleNamespace(text="c", prompt_tokens=3, finish_reason="length")
+
+        engine = self._make_engine(stream_generate)
+
+        outputs = [
+            output async for output in engine.stream_generate(prompt="hi", max_tokens=3)
+        ]
+        finished = [output for output in outputs if output.finished]
+
+        assert len(finished) == 1
+        assert finished[0] is outputs[-1]
+        assert finished[0].finish_reason == "length"
+
+    async def test_stream_exception_is_not_mislabeled_as_stop(self):
+        def stream_generate(**kwargs):
+            yield SimpleNamespace(text="partial", prompt_tokens=3, finish_reason=None)
+            raise RuntimeError("backend exploded mid-generation")
+
+        engine = self._make_engine(stream_generate)
+        outputs = []
+
+        with pytest.raises(RuntimeError, match="backend exploded mid-generation"):
+            async for output in engine.stream_generate(prompt="hi", max_tokens=50):
+                outputs.append(output)
+
+        assert not any(output.finished for output in outputs)
+
+
 class TestSimpleEngineClearRuntimeCaches:
     """Operational reset (DELETE /v1/cache) must actually release the
     multi-slot system-prompt KV cache state introduced in the LRU patch —
