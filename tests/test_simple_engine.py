@@ -2000,6 +2000,7 @@ class TestSimpleEngineConcurrency:
 
         assert outputs[-1].text == "Hello"
         assert captured_prompts == [tokenizer.apply_chat_template.return_value]
+        tokenizer.encode.assert_not_called()
 
     @pytest.mark.anyio
     async def test_stream_generate_text_disables_mtp_when_logits_processors_active(
@@ -2617,68 +2618,87 @@ class TestSimpleEngineConcurrency:
         assert await asyncio.to_thread(prefill_cancelled.wait, 1.0)
 
 
-class TestSimpleEngineStreamTermination:
-    """Regression coverage for SimpleEngine streaming termination."""
-
+class TestSimpleEngineNaturalStop:
     @staticmethod
-    def _make_engine(stream_generate):
+    def _engine(stream_generate):
         from vllm_mlx.engine.simple import SimpleEngine
 
         with patch("vllm_mlx.engine.simple.is_mllm_model", return_value=False):
             engine = SimpleEngine("test-model")
         engine._loaded = True
         engine._model = MagicMock()
-        engine._model.stream_generate = MagicMock(side_effect=stream_generate)
+        engine._model.tokenizer.encode.return_value = [1, 2, 3]
+        engine._model.stream_generate.side_effect = stream_generate
         return engine
 
-    async def test_natural_exhaustion_emits_one_final_stop_chunk(self):
-        def stream_generate(**kwargs):
+    @pytest.mark.anyio
+    async def test_generator_exhaustion_emits_one_stop(self):
+        def generate(**kwargs):
             yield SimpleNamespace(text="Hel", prompt_tokens=3, finish_reason=None)
             yield SimpleNamespace(text="lo", prompt_tokens=3, finish_reason="stop")
 
-        engine = self._make_engine(stream_generate)
-
         outputs = [
             output
-            async for output in engine.stream_generate(prompt="hi", max_tokens=50)
+            async for output in self._engine(generate).stream_generate(
+                prompt="hi", max_tokens=50
+            )
         ]
-        finished = [output for output in outputs if output.finished]
 
+        finished = [output for output in outputs if output.finished]
         assert len(finished) == 1
         assert finished[0] is outputs[-1]
         assert finished[0].new_text == ""
         assert finished[0].finish_reason == "stop"
 
-    async def test_max_tokens_keeps_length_reason(self):
-        def stream_generate(**kwargs):
+    @pytest.mark.anyio
+    async def test_token_limit_keeps_length_reason(self):
+        def generate(**kwargs):
             yield SimpleNamespace(text="a", prompt_tokens=3, finish_reason=None)
             yield SimpleNamespace(text="b", prompt_tokens=3, finish_reason=None)
-            yield SimpleNamespace(text="c", prompt_tokens=3, finish_reason="length")
-
-        engine = self._make_engine(stream_generate)
+            yield SimpleNamespace(text="c", prompt_tokens=3, finish_reason=None)
 
         outputs = [
-            output async for output in engine.stream_generate(prompt="hi", max_tokens=3)
+            output
+            async for output in self._engine(generate).stream_generate(
+                prompt="hi", max_tokens=3
+            )
         ]
-        finished = [output for output in outputs if output.finished]
 
+        finished = [output for output in outputs if output.finished]
         assert len(finished) == 1
         assert finished[0] is outputs[-1]
         assert finished[0].finish_reason == "length"
 
-    async def test_stream_exception_is_not_mislabeled_as_stop(self):
-        def stream_generate(**kwargs):
+    @pytest.mark.anyio
+    async def test_exception_is_not_reported_as_stop(self):
+        def generate(**kwargs):
             yield SimpleNamespace(text="partial", prompt_tokens=3, finish_reason=None)
-            raise RuntimeError("backend exploded mid-generation")
+            raise RuntimeError("backend failed")
 
-        engine = self._make_engine(stream_generate)
+        engine = self._engine(generate)
         outputs = []
-
-        with pytest.raises(RuntimeError, match="backend exploded mid-generation"):
+        with pytest.raises(RuntimeError, match="backend failed"):
             async for output in engine.stream_generate(prompt="hi", max_tokens=50):
                 outputs.append(output)
 
         assert not any(output.finished for output in outputs)
+        assert not engine._active_requests
+
+    @pytest.mark.anyio
+    async def test_empty_generator_emits_stop(self):
+        def generate(**kwargs):
+            yield from ()
+
+        outputs = [
+            output
+            async for output in self._engine(generate).stream_generate(
+                prompt="hi", max_tokens=50
+            )
+        ]
+
+        assert len(outputs) == 1
+        assert outputs[0].finished
+        assert outputs[0].finish_reason == "stop"
 
 
 class TestSimpleEngineClearRuntimeCaches:

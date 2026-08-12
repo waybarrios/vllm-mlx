@@ -38,6 +38,12 @@ that envelope fall back to the normal scheduler path instead of using MTP. This
 keeps sampling correctness ahead of throughput until the MLLM verifier is
 sampler-aware.
 
+Injected Qwen3.5 and Qwen3.6 MTP checkpoints use the established post-norm
+backbone state by default. A checkpoint qualified for pre-norm input can opt in
+by setting `mtp_hidden_state_mode` to `pre_norm` in its `text_config`. Leave the
+setting unset for existing checkpoints. Unknown values fall back to post-norm
+and emit a warning.
+
 Thinking/logits processors stay active by default for the whole request. The
 experimental retirement-to-MTP handoff is opt-in via
 `VLLM_MLX_ENABLE_THINKING_RETIREMENT_RESUME=1`; leave it unset unless you have

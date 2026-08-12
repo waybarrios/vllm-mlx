@@ -5,6 +5,7 @@ import mlx.core as mx
 
 from vllm_mlx.patches.qwen3_5_mtp import (
     _apply_qwen_mtp_rmsnorm_offset_fixups,
+    _strip_mtp_key_prefix,
 )
 
 
@@ -45,3 +46,12 @@ def test_qwen_mtp_non_norm_one_dimensional_weights_are_not_shifted():
 
     assert shifted == 0
     assert mx.allclose(weights["layers.0.mlp.shared_expert_gate.weight"], original)
+
+
+def test_qwen_mtp_standalone_shards_accept_both_supported_prefixes():
+    assert _strip_mtp_key_prefix("mtp.layers.0.fc.weight") == "layers.0.fc.weight"
+    assert (
+        _strip_mtp_key_prefix("language_model.mtp.layers.0.fc.weight")
+        == "layers.0.fc.weight"
+    )
+    assert _strip_mtp_key_prefix("language_model.model.norm.weight") is None

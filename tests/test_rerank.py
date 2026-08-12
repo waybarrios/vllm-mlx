@@ -146,13 +146,13 @@ class TestRerankAdapterContract:
             "input_ids": [[101, 2054, 102, 3793, 102]],
             "attention_mask": [[1, 1, 1, 1, 1]],
         }
-        result = adapter.tokenize_pair(mock_tokenizer, "query", "document")
+        result = adapter.tokenize_pair(mock_tokenizer, "query", "document", 8192)
         mock_tokenizer.assert_called_once_with(
             "query",
             "document",
             padding=True,
             truncation=True,
-            max_length=512,
+            max_length=8192,
             return_tensors="np",
         )
         assert "input_ids" in result
@@ -215,6 +215,61 @@ class TestRerankEngine:
         expected_1 = 1.0 / (1.0 + math.exp(1.0))
         assert abs(scores[0] - expected_0) < 1e-6
         assert abs(scores[1] - expected_1) < 1e-6
+
+    def test_score_pairs_resolves_max_length_from_config(self):
+        """Positive: a large-context model tokenizes with its own max_length."""
+        import numpy as np
+
+        from vllm_mlx.rerank import RerankEngine, SigmoidAdapter
+
+        engine = RerankEngine("test-model")
+
+        mock_model = MagicMock()
+        mock_model.config = {"max_position_embeddings": 8192}
+        mock_logits = MagicMock()
+        mock_logits.tolist.return_value = [[1.0, 0.0]]
+        mock_model.return_value = MagicMock(logits=mock_logits)
+
+        mock_tokenizer = MagicMock()
+        mock_tokenizer.return_value = {
+            "input_ids": np.array([[1, 2, 3]]),
+            "attention_mask": np.array([[1, 1, 1]]),
+        }
+
+        engine._model = mock_model
+        engine._tokenizer = mock_tokenizer
+        engine._adapter = SigmoidAdapter()
+
+        engine.score_pairs("query", ["doc"])
+        assert mock_tokenizer.call_args.kwargs["max_length"] == 8192
+
+    def test_score_pairs_defaults_to_512_without_config(self):
+        """Negative: no usable config/tokenizer value falls back to 512."""
+        import numpy as np
+
+        from vllm_mlx.rerank import RerankEngine, SigmoidAdapter
+
+        engine = RerankEngine("test-model")
+
+        mock_model = MagicMock()  # .config is a MagicMock (non-int)
+        mock_logits = MagicMock()
+        mock_logits.tolist.return_value = [[1.0, 0.0]]
+        mock_model.return_value = MagicMock(logits=mock_logits)
+
+        mock_tokenizer = MagicMock()
+        # model_max_length as a non-int so the resolver rejects it too
+        mock_tokenizer.model_max_length = MagicMock()
+        mock_tokenizer.return_value = {
+            "input_ids": np.array([[1, 2, 3]]),
+            "attention_mask": np.array([[1, 1, 1]]),
+        }
+
+        engine._model = mock_model
+        engine._tokenizer = mock_tokenizer
+        engine._adapter = SigmoidAdapter()
+
+        engine.score_pairs("query", ["doc"])
+        assert mock_tokenizer.call_args.kwargs["max_length"] == 512
 
     def test_score_pairs_token_budget_batching(self):
         """Test that score_pairs splits work into batches by token budget."""

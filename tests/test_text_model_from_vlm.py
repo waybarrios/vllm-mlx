@@ -2,6 +2,7 @@
 """Tests for building mlx_lm TextModel from mlx_vlm-loaded weights."""
 
 import json
+import os
 import sys
 import types
 from pathlib import Path
@@ -16,6 +17,15 @@ VLM_MTP_MODEL = Path.home() / "ai-models/mlx_models/Qwen3.5-35B-A3B-VLM-MTP-8bit
 
 # Text-only MTP model (no vision tower — can't test VLM loading)
 TEXT_MTP_MODEL = Path.home() / "ai-models/mlx_models/Qwen3.5-35B-A3B-8bit"
+
+# Deliberately opt in to the large Qwen3.6 MTP artifact. This regression is
+# exercised in an isolated model-qualification window, never by the ordinary
+# unit suite on developer machines or CI.
+QWEN36_VLM_MTP_MODEL = (
+    Path(os.environ["VLLM_MLX_QWEN36_VLM_MTP_MODEL"])
+    if os.environ.get("VLLM_MLX_QWEN36_VLM_MTP_MODEL")
+    else None
+)
 
 
 def test_build_text_model_no_config():
@@ -175,6 +185,52 @@ def test_text_model_return_hidden():
     logits, hidden = result
     assert logits.shape[-1] == text_config["vocab_size"]
     assert hidden.shape[-1] == text_config["hidden_size"]
+
+
+@pytest.mark.skipif(
+    QWEN36_VLM_MTP_MODEL is None or not QWEN36_VLM_MTP_MODEL.exists(),
+    reason="set VLLM_MLX_QWEN36_VLM_MTP_MODEL for the isolated Qwen3.6 MTP regression",
+)
+def test_qwen36_text_model_return_hidden_is_pre_norm_for_mtp():
+    """MTP receives the pre-final-norm backbone state exactly once."""
+    import mlx.core as mx
+    import runtime_patches
+
+    runtime_patches.apply()
+
+    from mlx_lm.models.base import create_attention_mask, create_ssm_mask
+    from mlx_vlm import load as vlm_load
+
+    assert QWEN36_VLM_MTP_MODEL is not None
+    config = json.loads((QWEN36_VLM_MTP_MODEL / "config.json").read_text())
+    text_config = config.get("text_config", config)
+    assert text_config.get("mtp_hidden_state_mode") == "pre_norm", (
+        "qualification artifact must explicitly declare "
+        "mtp_hidden_state_mode=pre_norm"
+    )
+    vlm_model, _ = vlm_load(str(QWEN36_VLM_MTP_MODEL))
+    text_model = build_text_model(vlm_model, QWEN36_VLM_MTP_MODEL)
+    tokens = mx.array([[1, 2, 3]])
+
+    reference_cache = text_model.make_cache()
+    inner = text_model.model
+    pre_norm = inner.embed_tokens(tokens)
+    fa_mask = create_attention_mask(pre_norm, reference_cache[inner.fa_idx])
+    ssm_mask = create_ssm_mask(pre_norm, reference_cache[inner.ssm_idx])
+    for layer, cache in zip(inner.layers, reference_cache):
+        pre_norm = layer(
+            pre_norm,
+            mask=ssm_mask if layer.is_linear else fa_mask,
+            cache=cache,
+        )
+
+    _, returned_hidden = text_model(
+        tokens,
+        cache=text_model.make_cache(),
+        return_hidden=True,
+    )
+
+    assert bool(mx.allclose(returned_hidden, pre_norm).item())
 
 
 @pytest.mark.skipif(not VLM_MTP_MODEL.exists(), reason="VLM+MTP model not on disk")

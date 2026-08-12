@@ -971,7 +971,11 @@ class SimpleEngine(BaseEngine):
                     )
                     finish_reason = None
                     if finished:
-                        finish_reason = getattr(chunk, "finish_reason", "stop")
+                        finish_reason = getattr(chunk, "finish_reason", None)
+                        if finish_reason is None:
+                            finish_reason = (
+                                "length" if completion_tokens >= max_tokens else "stop"
+                            )
 
                     yield GenerationOutput(
                         text=accumulated_text,
