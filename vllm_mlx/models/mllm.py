@@ -1271,6 +1271,7 @@ class MLXMultimodalLM:
         self._loaded = False
         self._video_native = False
         self._video_native_with_audio = False
+        self._runtime_model_identity: dict[str, str | None] = {}
 
         # Initialize MLLM prefix cache manager (with vision embedding caching)
         self._cache_manager: MLLMPrefixCacheManager | None = None
@@ -1290,6 +1291,32 @@ class MLXMultimodalLM:
 
             self.model, self.processor = load(self.model_name)
             self.config = load_config(self.model_name)
+            language_model = getattr(self.model, "language_model", None)
+            self._runtime_model_identity = {
+                "model_module": type(self.model).__module__,
+                "model_class": type(self.model).__qualname__,
+                "language_module": (
+                    type(language_model).__module__
+                    if language_model is not None
+                    else None
+                ),
+                "language_class": (
+                    type(language_model).__qualname__
+                    if language_model is not None
+                    else None
+                ),
+                "model_type": getattr(
+                    getattr(self.model, "config", None), "model_type", None
+                ),
+            }
+            logger.info(
+                "MLLM runtime identity: model_type=%s model=%s.%s language=%s.%s",
+                self._runtime_model_identity["model_type"],
+                self._runtime_model_identity["model_module"],
+                self._runtime_model_identity["model_class"],
+                self._runtime_model_identity["language_module"],
+                self._runtime_model_identity["language_class"],
+            )
             if self.draft_model_path:
                 self._draft_model = self._load_draft_model()
                 _install_draft_metrics_hooks(self._draft_model)
@@ -2867,6 +2894,9 @@ class MLXMultimodalLM:
 
         if self.config:
             info["model_type"] = getattr(self.config, "model_type", "unknown")
+
+        if self._runtime_model_identity:
+            info["runtime_model_identity"] = dict(self._runtime_model_identity)
 
         if self._cache_manager is not None:
             info["cache_stats"] = self._cache_manager.get_stats()

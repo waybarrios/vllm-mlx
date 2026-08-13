@@ -265,6 +265,16 @@ class GenerationMetadata(BaseModel):
 
     no_final_content_watchdog_tokens: int | None = None
     no_final_content_watchdog_enforced: bool = False
+    specprefill_requested: bool | None = None
+    specprefill_engaged: bool | None = None
+    specprefill_reason: str | None = None
+    specprefill_route: str | None = None
+    specprefill_model_module: str | None = None
+    specprefill_language_module: str | None = None
+    specprefill_model_type: str | None = None
+    specprefill_original_tokens: int | None = None
+    specprefill_selected_tokens: int | None = None
+    specprefill_cached_tokens: int | None = None
 
 
 class ChatCompletionResponse(BaseModel):
@@ -573,3 +583,4 @@ class ChatCompletionChunk(BaseModel):
     model: str
     choices: list[ChatCompletionChunkChoice]
     usage: Usage | None = None  # Included when stream_options.include_usage=true
+    generation_metadata: GenerationMetadata | None = None

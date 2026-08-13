@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Union
 
 if TYPE_CHECKING:
+    from .mllm_specprefill import SpecPrefillOutcome
     from .paged_cache import BlockTable
 
 
@@ -216,6 +217,8 @@ class RequestOutput:
     # MTP speculative decoding counters. Zero means no MTP attempt occurred.
     mtp_drafts: int = 0
     mtp_accepted: int = 0
+    # Request-level sparse-prefill decision and diagnostics.
+    specprefill_outcome: Optional["SpecPrefillOutcome"] = None
 
     @property
     def usage(self) -> Dict[str, int]:

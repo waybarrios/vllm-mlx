@@ -393,6 +393,30 @@ class TestCopyPrefixCache:
         assert original.offset == 50
         assert original._idx == 50
 
+    def test_copy_arrays_cache_prevents_recurrent_state_mutation(self):
+        """Hybrid cache slot and metadata updates must not alter stored state."""
+        mx = pytest.importorskip("mlx.core")
+        mlx_lm_cache = pytest.importorskip("mlx_lm.models.cache")
+        ArraysCache = mlx_lm_cache.ArraysCache
+
+        from vllm_mlx.mllm_batch_generator import MLLMBatchGenerator
+
+        original = ArraysCache(size=2)
+        original.cache = [mx.zeros((1, 2)), mx.ones((1, 2))]
+        original.left_padding = mx.array([3])
+        original.lengths = mx.array([7])
+
+        copied = MLLMBatchGenerator._copy_prefix_cache([original])[0]
+        copied.cache[0] = mx.ones((1, 2))
+        copied.left_padding = mx.array([1])
+        copied.lengths = mx.array([2])
+
+        assert copied is not original
+        assert copied.cache is not original.cache
+        assert original.cache[0].tolist() == [[0.0, 0.0]]
+        assert original.left_padding.tolist() == [3]
+        assert original.lengths.tolist() == [7]
+
 
 class TestHasEmptyRotatingCache:
     """Tests for _has_empty_rotating_cache detection."""

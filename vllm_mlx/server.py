@@ -570,8 +570,9 @@ def _resolve_no_final_content_token_limit() -> int | None:
 
 def _generation_metadata(
     thinking_processor: object | None,
+    specprefill_outcome: object | None = None,
 ) -> GenerationMetadata | None:
-    if thinking_processor is None:
+    if thinking_processor is None and specprefill_outcome is None:
         return None
     return GenerationMetadata(
         no_final_content_watchdog_tokens=getattr(
@@ -580,6 +581,26 @@ def _generation_metadata(
         no_final_content_watchdog_enforced=bool(
             getattr(thinking_processor, "watchdog_was_enforced", False)
         ),
+        specprefill_requested=getattr(specprefill_outcome, "requested", None),
+        specprefill_engaged=(
+            getattr(specprefill_outcome, "engaged", None)
+            if specprefill_outcome is not None
+            else None
+        ),
+        specprefill_reason=getattr(specprefill_outcome, "reason", None),
+        specprefill_route=getattr(specprefill_outcome, "route", None),
+        specprefill_model_module=getattr(specprefill_outcome, "model_module", None),
+        specprefill_language_module=getattr(
+            specprefill_outcome, "language_module", None
+        ),
+        specprefill_model_type=getattr(specprefill_outcome, "model_type", None),
+        specprefill_original_tokens=getattr(
+            specprefill_outcome, "original_tokens", None
+        ),
+        specprefill_selected_tokens=getattr(
+            specprefill_outcome, "selected_tokens", None
+        ),
+        specprefill_cached_tokens=getattr(specprefill_outcome, "cached_tokens", None),
     )
 
 
@@ -1299,6 +1320,11 @@ def _build_engine(spec: ModelSpec) -> BaseEngine:
             scheduler_config=spec.scheduler_config,
             stream_interval=spec.stream_interval,
             force_mllm=spec.force_mllm,
+            specprefill_enabled=spec.specprefill_enabled,
+            specprefill_threshold=spec.specprefill_threshold,
+            specprefill_keep_pct=spec.specprefill_keep_pct,
+            specprefill_backbone_pct=spec.specprefill_backbone_pct,
+            specprefill_draft_model=spec.specprefill_draft_model,
         )
 
     from .engine.simple import SimpleEngine
@@ -3236,7 +3262,7 @@ def load_model(
         trust_remote_code: Allow HuggingFace remote code execution during model/tokenizer loading
         mtp: Enable native MTP speculative decoding (SimpleEngine only)
         prefill_step_size: Chunk size for prompt prefill processing (default: 2048)
-        specprefill_enabled: Enable SpecPrefill (SimpleEngine only)
+        specprefill_enabled: Enable SpecPrefill
         specprefill_threshold: Minimum suffix tokens to trigger SpecPrefill (default: 8192)
         specprefill_keep_pct: Fraction of tokens to keep (default: 0.3)
         specprefill_backbone_pct: Fraction of chunks reserved for evenly spaced coverage
@@ -3366,6 +3392,11 @@ def load_model(
             stream_interval=stream_interval,
             force_mllm=force_mllm,
             gpu_memory_utilization=gpu_memory_utilization,
+            specprefill_enabled=specprefill_enabled,
+            specprefill_threshold=specprefill_threshold,
+            specprefill_keep_pct=specprefill_keep_pct,
+            specprefill_backbone_pct=specprefill_backbone_pct,
+            specprefill_draft_model=specprefill_draft_model,
         )
         # BatchedEngine will be started in lifespan (uvicorn's event loop)
         # Just log for now
@@ -5105,7 +5136,10 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
                 completion_tokens=output.completion_tokens,
                 total_tokens=output.prompt_tokens + output.completion_tokens,
             ),
-            generation_metadata=_generation_metadata(prepared.thinking_processor),
+            generation_metadata=_generation_metadata(
+                prepared.thinking_processor,
+                getattr(output, "specprefill_outcome", None),
+            ),
         )
     finally:
         if release_on_exit:
@@ -6125,6 +6159,7 @@ async def stream_chat_completion(
     prompt_tokens = 0
     completion_tokens = 0
     last_output = None
+    terminal_metadata_emitted = False
 
     # Response-format streaming filter — strip markdown code fences from
     # content when client asked for JSON. Non-streaming path strips fences
@@ -6222,6 +6257,7 @@ async def stream_chat_completion(
                                         )
                                     ],
                                     usage=None,
+                                    generation_metadata=None,
                                 )
                                 yield f"data: {chunk.model_dump_json()}\n\n"
                             continue
@@ -6252,6 +6288,17 @@ async def stream_chat_completion(
                                     )
                                 ],
                                 usage=get_usage(output) if output.finished else None,
+                                generation_metadata=(
+                                    _generation_metadata(
+                                        None,
+                                        getattr(output, "specprefill_outcome", None),
+                                    )
+                                    if output.finished
+                                    else None
+                                ),
+                            )
+                            terminal_metadata_emitted |= (
+                                chunk.generation_metadata is not None
                             )
                             yield f"data: {chunk.model_dump_json()}\n\n"
                             continue
@@ -6287,7 +6334,15 @@ async def stream_chat_completion(
                         )
                     ],
                     usage=get_usage(output) if output.finished else None,
+                    generation_metadata=(
+                        _generation_metadata(
+                            None, getattr(output, "specprefill_outcome", None)
+                        )
+                        if output.finished
+                        else None
+                    ),
                 )
+                terminal_metadata_emitted |= chunk.generation_metadata is not None
                 yield f"data: {chunk.model_dump_json()}\n\n"
             else:
                 # Standard path without reasoning parsing
@@ -6357,6 +6412,17 @@ async def stream_chat_completion(
                                     )
                                 ],
                                 usage=get_usage(output) if output.finished else None,
+                                generation_metadata=(
+                                    _generation_metadata(
+                                        None,
+                                        getattr(output, "specprefill_outcome", None),
+                                    )
+                                    if output.finished
+                                    else None
+                                ),
+                            )
+                            terminal_metadata_emitted |= (
+                                chunk.generation_metadata is not None
                             )
                             yield f"data: {chunk.model_dump_json()}\n\n"
                             continue
@@ -6391,7 +6457,15 @@ async def stream_chat_completion(
                         )
                     ],
                     usage=get_usage(output) if output.finished else None,
+                    generation_metadata=(
+                        _generation_metadata(
+                            None, getattr(output, "specprefill_outcome", None)
+                        )
+                        if output.finished
+                        else None
+                    ),
                 )
+                terminal_metadata_emitted |= chunk.generation_metadata is not None
                 yield f"data: {chunk.model_dump_json()}\n\n"
 
         # Fallback: if tool parser accumulated text but never emitted tool_calls
@@ -6477,6 +6551,14 @@ async def stream_chat_completion(
             f"Chat completion (stream): {completion_tokens} tokens in {elapsed:.2f}s ({tokens_per_sec:.1f} tok/s)"
         )
 
+        terminal_metadata = (
+            _generation_metadata(
+                None, getattr(last_output, "specprefill_outcome", None)
+            )
+            if last_output is not None
+            else None
+        )
+
         # Send final chunk with usage if requested
         if include_usage:
             usage_chunk = ChatCompletionChunk(
@@ -6488,8 +6570,17 @@ async def stream_chat_completion(
                     completion_tokens=completion_tokens,
                     total_tokens=prompt_tokens + completion_tokens,
                 ),
+                generation_metadata=terminal_metadata,
             )
             yield f"data: {usage_chunk.model_dump_json()}\n\n"
+        elif terminal_metadata is not None and not terminal_metadata_emitted:
+            metadata_chunk = ChatCompletionChunk(
+                id=response_id,
+                model=_response_model_name(request.model),
+                choices=[],
+                generation_metadata=terminal_metadata,
+            )
+            yield f"data: {metadata_chunk.model_dump_json()}\n\n"
 
         yield "data: [DONE]\n\n"
     except HTTPException as exc:

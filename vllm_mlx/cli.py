@@ -1229,7 +1229,8 @@ Examples:
         default=False,
         help="Enable SpecPrefill: use a small draft model to score token importance, "
         "then sparse-prefill only the important tokens on the target model. "
-        "Reduces TTFT on long prompts. Requires --specprefill-draft-model.",
+        "Reduces TTFT on long prompts. Supported Qwen media routes preserve "
+        "visual embeddings and MRoPE state. Requires --specprefill-draft-model.",
     )
     serve_parser.add_argument(
         "--specprefill-threshold",

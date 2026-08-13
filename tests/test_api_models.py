@@ -32,6 +32,7 @@ from vllm_mlx.api.models import (
     EmbeddingResponse,
     EmbeddingUsage,
     FunctionCall,
+    GenerationMetadata,
     ImageUrl,
     MCPExecuteRequest,
     MCPExecuteResponse,
@@ -669,6 +670,24 @@ class TestStreamingModels:
             usage=Usage(prompt_tokens=10, completion_tokens=5, total_tokens=15),
         )
         assert chunk.usage.total_tokens == 15
+
+    def test_chat_completion_chunk_with_specprefill_metadata(self):
+        chunk = ChatCompletionChunk(
+            model="test-model",
+            choices=[],
+            generation_metadata=GenerationMetadata(
+                specprefill_requested=True,
+                specprefill_engaged=True,
+                specprefill_reason="engaged",
+                specprefill_route="mllm_media",
+                specprefill_original_tokens=100,
+                specprefill_selected_tokens=40,
+            ),
+        )
+
+        data = chunk.model_dump()
+        assert data["generation_metadata"]["specprefill_engaged"] is True
+        assert data["generation_metadata"]["specprefill_selected_tokens"] == 40
 
 
 class TestModelSerialization:

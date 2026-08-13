@@ -1643,8 +1643,9 @@ class TestBatchedMLLMConfigWiring:
                 self.__dict__.update(kwargs)
 
         class FakeMLLMScheduler:
-            def __init__(self, model, processor, config):
+            def __init__(self, model, processor, config, **kwargs):
                 captured["scheduler_config"] = config
+                captured["scheduler_kwargs"] = kwargs
 
             async def start(self):
                 return None
@@ -1684,6 +1685,7 @@ class TestBatchedMLLMConfigWiring:
         assert captured["config_kwargs"]["use_memory_aware_cache"] is False
         assert captured["config_kwargs"]["cache_memory_mb"] == 123
         assert captured["config_kwargs"]["prefix_cache_memory_mb"] == 123
+        assert captured["scheduler_kwargs"]["specprefill_draft_model"] is None
 
 
 class TestPreprocessIdempotent:

@@ -206,10 +206,20 @@ Optional:
 - `specprefill`
 - `specprefill_threshold`
 - `specprefill_keep_pct`
+- `specprefill_backbone_pct`
 - `specprefill_draft_model`
 - `stream_interval`
 - `gpu_memory_utilization`
 - `estimated_memory_gb`
+
+For continuous-batching multimodal routes, SpecPrefill is opt-in and currently
+supports exact Qwen3-VL and Qwen3.5 dense and MoE runtime modules. It preserves
+visual placeholders, fused media embeddings, deep-stack visual state, and
+request-local MRoPE positions. Unsupported models and incompatible MTP,
+interleaved chunked-prefill, rotating-cache, audio, or draft configurations use
+the normal dense media prefill path. The final OpenAI chat response reports the
+decision in `generation_metadata.specprefill_engaged` and
+`generation_metadata.specprefill_reason`.
 
 ## Sizing Rules
 

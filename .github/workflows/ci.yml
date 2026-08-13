@@ -77,6 +77,8 @@ jobs:
             tests/test_memory_cache.py \
             tests/test_prefix_cache.py \
             tests/test_mllm_cache.py \
+            tests/test_mllm_media_specprefill.py \
+            tests/test_batched_engine_mllm_config.py \
             tests/test_api_models.py \
             tests/test_api_utils.py \
             tests/test_request.py \
@@ -145,6 +147,7 @@ jobs:
             tests/test_qwen35_mtp_patch.py \
             tests/test_mllm_continuous_batching.py \
             tests/test_mllm_cache.py \
+            tests/test_prefix_cache.py \
             tests/test_optimizations.py \
             tests/test_simple_engine.py \
             tests/test_text_model_dispatch.py \

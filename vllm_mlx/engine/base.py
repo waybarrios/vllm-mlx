@@ -9,7 +9,10 @@ from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from ..mllm_specprefill import SpecPrefillOutcome
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +38,8 @@ class GenerationOutput:
     # MTP speculative decoding counters. Zero means no MTP attempt occurred.
     mtp_drafts: int = 0
     mtp_accepted: int = 0
+    # Request-level sparse-prefill decision and diagnostics.
+    specprefill_outcome: "SpecPrefillOutcome | None" = None
 
 
 class EngineBusy(RuntimeError):

@@ -26,7 +26,7 @@ import uuid
 import mlx.core as mx
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Any, AsyncIterator, Dict, List, Optional, Set, Tuple
+from typing import TYPE_CHECKING, Any, AsyncIterator, Dict, List, Optional, Set, Tuple
 
 from mlx_lm.tokenizer_utils import NaiveStreamingDetokenizer
 
@@ -38,6 +38,9 @@ from .mllm_batch_generator import (
 from .mlx_streams import bind_generation_streams
 from .multimodal_processor import MultimodalProcessor
 from .request import RequestOutput, RequestStatus, SamplingParams
+
+if TYPE_CHECKING:
+    from .mllm_specprefill import SpecPrefillOutcome, SpecPrefillRequestConfig
 
 logger = logging.getLogger(__name__)
 
@@ -90,6 +93,11 @@ class MLLMSchedulerConfig:
     # evicted entries to disk and promotes them back on hit.
     ssd_cache_dir: Optional[str] = None
     ssd_cache_max_gb: float = 10.0
+    # Attention-based sparse prefill for eligible media-bearing requests.
+    specprefill_enabled: bool = False
+    specprefill_threshold: int = 8192
+    specprefill_keep_pct: float = 0.3
+    specprefill_backbone_pct: float = 0.0
 
 
 @dataclass
@@ -107,6 +115,8 @@ class MLLMRequest:
     audio: Optional[List[str]] = None
     sampling_params: SamplingParams = field(default_factory=SamplingParams)
     arrival_time: float = field(default_factory=time.time)
+    specprefill_config: Optional["SpecPrefillRequestConfig"] = None
+    specprefill_outcome: Optional["SpecPrefillOutcome"] = None
 
     # Batch generator UID (assigned when scheduled)
     batch_uid: Optional[int] = None
@@ -185,6 +195,7 @@ class MLLMScheduler:
         model: Any,
         processor: Any,
         config: Optional[MLLMSchedulerConfig] = None,
+        specprefill_draft_model: Optional[Any] = None,
     ):
         """
         Initialize MLLM scheduler.
@@ -193,10 +204,12 @@ class MLLMScheduler:
             model: The VLM model
             processor: The VLM processor
             config: Scheduler configuration
+            specprefill_draft_model: Loaded draft model used for token scoring
         """
         self.model = model
         self.processor = processor
         self.config = config or MLLMSchedulerConfig()
+        self.specprefill_draft_model = specprefill_draft_model
 
         # Get model config
         self.model_config = getattr(model, "config", None)
@@ -324,6 +337,24 @@ class MLLMScheduler:
                 prefill_step_size=self.config.prefill_step_size,
                 prefix_cache_config=prefix_cache_config,
                 max_kv_size=self.config.max_kv_size,
+                specprefill_draft_model=getattr(self, "specprefill_draft_model", None),
+                specprefill_enabled=self.config.specprefill_enabled,
+                specprefill_threshold=self.config.specprefill_threshold,
+                specprefill_keep_pct=self.config.specprefill_keep_pct,
+                specprefill_backbone_pct=self.config.specprefill_backbone_pct,
+                specprefill_runtime_reason=(
+                    "mtp_incompatible" if self.config.enable_mtp else None
+                )
+                or (
+                    "chunked_prefill_incompatible"
+                    if self.config.chunked_prefill_tokens > 0
+                    else None
+                )
+                or (
+                    "rotating_cache_incompatible"
+                    if self.config.max_kv_size > 0
+                    else None
+                ),
             )
 
             # Wire the SSD cold tier onto the MLLM prefix cache, mirroring the
@@ -409,6 +440,14 @@ class MLLMScheduler:
         if request_id is None:
             request_id = str(uuid.uuid4())
 
+        from .mllm_specprefill import SpecPrefillRequestConfig
+
+        specprefill_config = SpecPrefillRequestConfig(
+            enabled=kwargs.pop("specprefill", None),
+            keep_pct=kwargs.pop("specprefill_keep_pct", None),
+            backbone_pct=kwargs.pop("specprefill_backbone_pct", None),
+        )
+
         sampling_params = SamplingParams(
             max_tokens=max_tokens,
             temperature=temperature,
@@ -427,6 +466,7 @@ class MLLMScheduler:
             videos=videos,
             audio=audio,
             sampling_params=sampling_params,
+            specprefill_config=specprefill_config,
         )
 
         # Estimate prompt token count for monitoring (text tokens only;
@@ -574,6 +614,7 @@ class MLLMScheduler:
                 presence_penalty=request.sampling_params.presence_penalty,
                 repetition_penalty=request.sampling_params.repetition_penalty,
                 logits_processors=request.sampling_params.logits_processors,
+                specprefill_config=request.specprefill_config,
             )
             batch_requests.append(batch_req)
 
@@ -626,6 +667,9 @@ class MLLMScheduler:
             if request is None:
                 continue
 
+            if response.specprefill_outcome is not None:
+                request.specprefill_outcome = response.specprefill_outcome
+
             # Handle error responses from failed preprocessing
             if response.finish_reason == "error":
                 output = RequestOutput(
@@ -637,6 +681,7 @@ class MLLMScheduler:
                     completion_tokens=0,
                     finished=True,
                     finish_reason="error",
+                    specprefill_outcome=request.specprefill_outcome,
                 )
                 request.status = RequestStatus.FINISHED_ABORTED
                 request.output_text = ""
@@ -680,6 +725,7 @@ class MLLMScheduler:
                 completion_tokens=request.num_output_tokens,
                 mtp_drafts=request.mtp_drafts,
                 mtp_accepted=request.mtp_accepted,
+                specprefill_outcome=request.specprefill_outcome,
             )
 
             # Check if finished
@@ -1170,6 +1216,7 @@ class MLLMScheduler:
             stats["vision_embedding_cache"] = vec_stats
             if hasattr(self.batch_generator, "get_mtp_stats"):
                 stats["mtp"] = self.batch_generator.get_mtp_stats()
+            stats["specprefill"] = self.batch_generator.get_specprefill_stats()
 
         # Include Metal memory stats
         try:

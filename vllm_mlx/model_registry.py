@@ -1049,6 +1049,11 @@ class ModelManager:
                 stream_interval=config.stream_interval,
                 force_mllm=config.force_mllm,
                 gpu_memory_utilization=config.gpu_memory_utilization,
+                specprefill_enabled=config.specprefill_enabled,
+                specprefill_threshold=config.specprefill_threshold,
+                specprefill_keep_pct=config.specprefill_keep_pct,
+                specprefill_backbone_pct=config.specprefill_backbone_pct,
+                specprefill_draft_model=config.specprefill_draft_model,
             )
         else:
             engine = SimpleEngine(
