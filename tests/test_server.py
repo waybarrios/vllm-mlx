@@ -2624,6 +2624,91 @@ class TestStreamChatCompletion:
 
         # The last payload before [DONE] must carry finish_reason="stop".
         assert payloads[-1]["choices"][0]["finish_reason"] == "stop"
+        usage_payloads = [payload for payload in payloads if payload.get("usage")]
+        assert len(usage_payloads) == 1
+        assert usage_payloads[0] == payloads[-1]
+        assert usage_payloads[0]["usage"] == {
+            "prompt_tokens": 3,
+            "completion_tokens": 1,
+            "total_tokens": 4,
+        }
+
+    @pytest.mark.anyio
+    async def test_stream_terminal_when_reasoning_parser_swallows_finished_delta(
+        self, monkeypatch
+    ):
+        """A reasoning parser may consume the finished delta directly."""
+        from vllm_mlx.engine.base import GenerationOutput
+        from vllm_mlx.reasoning import DeltaMessage
+        from vllm_mlx.server import (
+            ChatCompletionRequest,
+            Message,
+            stream_chat_completion,
+        )
+        import vllm_mlx.server as server
+
+        class FakeEngine:
+            model_name = "fake-engine"
+            tokenizer = None
+
+            async def stream_chat(self, messages, **kwargs):
+                yield GenerationOutput(
+                    text="",
+                    new_text="visible",
+                    finished=False,
+                )
+                yield GenerationOutput(
+                    text="",
+                    new_text="</think>",
+                    finished=True,
+                    finish_reason=None,
+                    prompt_tokens=5,
+                    completion_tokens=2,
+                )
+
+        class FakeReasoningParser:
+            def reset_state(self):
+                pass
+
+            def extract_reasoning_streaming(
+                self, previous_text, current_text, delta_text
+            ):
+                if delta_text == "</think>":
+                    return None
+                return DeltaMessage(content=delta_text)
+
+        monkeypatch.setattr(server, "_model_name", "served-model")
+        monkeypatch.setattr(server, "_reasoning_parser", FakeReasoningParser())
+        monkeypatch.setattr(server, "_enable_auto_tool_choice", False)
+        monkeypatch.setattr(server, "_tool_call_parser", None)
+        monkeypatch.setattr(server, "_tool_parser_instance", None)
+
+        request = ChatCompletionRequest(
+            model="request-model",
+            messages=[Message(role="user", content="hi")],
+            stream=True,
+        )
+        chunks = [
+            chunk
+            async for chunk in stream_chat_completion(
+                FakeEngine(), request.messages, request
+            )
+        ]
+        payloads = [
+            json.loads(chunk.removeprefix("data: ").strip())
+            for chunk in chunks
+            if chunk != "data: [DONE]\n\n"
+        ]
+
+        assert payloads[-1]["choices"][0]["finish_reason"] == "stop"
+        usage_payloads = [payload for payload in payloads if payload.get("usage")]
+        assert len(usage_payloads) == 1
+        assert usage_payloads[0] == payloads[-1]
+        assert usage_payloads[0]["usage"] == {
+            "prompt_tokens": 5,
+            "completion_tokens": 2,
+            "total_tokens": 7,
+        }
 
     @pytest.mark.anyio
     async def test_reasoning_stream_redirects_gemma4_tool_marker(self, monkeypatch):

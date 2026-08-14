@@ -6294,7 +6294,12 @@ async def stream_chat_completion(
                             ),
                         )
                     ],
-                    usage=get_usage(output) if output.finished else None,
+                    usage=(
+                        get_usage(output)
+                        if output.finished
+                        and (tool_calls_detected or output.finish_reason)
+                        else None
+                    ),
                 )
                 yield f"data: {chunk.model_dump_json()}\n\n"
                 finish_reason_emitted = finish_reason_emitted or bool(
@@ -6404,7 +6409,12 @@ async def stream_chat_completion(
                             ),
                         )
                     ],
-                    usage=get_usage(output) if output.finished else None,
+                    usage=(
+                        get_usage(output)
+                        if output.finished
+                        and (tool_calls_detected or output.finish_reason)
+                        else None
+                    ),
                 )
                 yield f"data: {chunk.model_dump_json()}\n\n"
                 finish_reason_emitted = finish_reason_emitted or bool(
