@@ -18,25 +18,27 @@ pip install -e ".[dev]"
 ### Running Tests
 
 ```bash
-# Run all tests
+# Run the full suite on Apple Silicon
 pytest tests/
 
-# Run specific test file
+# Run a focused test first
 pytest tests/test_paged_cache.py -v
-
-# Run with coverage
-pytest --cov=vllm_mlx tests/
 ```
+
+MLX-dependent tests require an Apple Silicon environment. Other platforms can
+still run supported static checks and non-MLX tests.
 
 ### Code Style
 
 ```bash
-# Format code
-black vllm_mlx/
-isort vllm_mlx/
+# Lint
+ruff check vllm_mlx/ tests/ --select E,F,W --ignore E402,E501,E731,F811,F841
 
-# Type checking
-mypy vllm_mlx/
+# Check formatting
+black --check vllm_mlx/ tests/
+
+# Type-check relevant changes
+mypy vllm_mlx/ --ignore-missing-imports --no-error-summary
 ```
 
 ### Running Benchmarks
@@ -63,11 +65,12 @@ vllm-mlx-bench --model mlx-community/Qwen3-VL-8B-Instruct-4bit --video
 
 ## Pull Request Process
 
-1. Fork the repository
-2. Create a feature branch
-3. Make your changes
-4. Run tests to ensure they pass
-5. Submit a pull request
+1. Fork the repository.
+2. Create a focused feature branch.
+3. Make the smallest coherent change that resolves the problem.
+4. Add regression coverage when practical.
+5. Run the relevant tests and code-quality checks.
+6. Submit a pull request describing the impact and verification performed.
 
 ## Code Structure
 

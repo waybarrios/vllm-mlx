@@ -971,7 +971,11 @@ class SimpleEngine(BaseEngine):
                     )
                     finish_reason = None
                     if finished:
-                        finish_reason = getattr(chunk, "finish_reason", "stop")
+                        finish_reason = getattr(chunk, "finish_reason", None)
+                        if finish_reason is None:
+                            finish_reason = (
+                                "length" if completion_tokens >= max_tokens else "stop"
+                            )
 
                     yield GenerationOutput(
                         text=accumulated_text,
@@ -1002,7 +1006,7 @@ class SimpleEngine(BaseEngine):
                         prompt_tokens=prompt_tokens,
                         completion_tokens=completion_tokens,
                         finished=True,
-                        finish_reason=None,
+                        finish_reason="stop",
                     )
             finally:
                 self._active_requests.pop(request_id, None)
@@ -1198,6 +1202,7 @@ class SimpleEngine(BaseEngine):
 
         chat_template_kwargs = dict(kwargs.pop("chat_template_kwargs", {}) or {})
         mllm_draft_requested = bool(kwargs.pop("mllm_draft", False))
+        has_media = has_media_content(messages)
 
         # Convert tools for template
         template_tools = convert_tools_for_template(tools) if tools else None
@@ -1209,7 +1214,7 @@ class SimpleEngine(BaseEngine):
             and self._should_route_text_through_text_model(
                 mllm_draft_requested=mllm_draft_requested
             )
-            and not has_media_content(messages)
+            and not has_media
         ):
             has_mtp = (
                 hasattr(self._text_model, "mtp") and self._text_model.mtp is not None
@@ -1239,20 +1244,26 @@ class SimpleEngine(BaseEngine):
         # Build prompt using tokenizer
         if self._is_mllm:
             if self._text_model is not None:
-                logger.info("Media request → MLLM path")
+                route_kind = "Media" if has_media else "Text-only"
+                logger.info("%s request → MLLM path", route_kind)
             # For MLLM, use stream_chat which yields tokens incrementally.
-            # Must hold _generation_lock to prevent concurrent Metal access
+            # Must hold the generation slot to prevent concurrent Metal access
             # (e.g. OpenCode sends title + main request simultaneously).
             accumulated_text = ""
             token_count = 0
+            request_id = str(kwargs.pop("request_id", "") or f"simple-{id(messages):x}")
+            native_video_request = bool(
+                getattr(self._model, "_video_native", False) is True
+                and self._model._collect_video_inputs(messages)
+            )
 
-            # Text-only fallback when no TextModel exists: keep execution on the
-            # current thread. Routing through to_thread can break mlx_vlm stream
-            # ownership on some models (Stream(gpu, N) mismatch).
-            if self._text_model is None and not has_media_content(messages):
+            if not native_video_request:
+                # Incremental mlx_vlm streams must stay on the model-owner
+                # thread. Moving them through to_thread can raise a
+                # Stream(gpu, N) ownership mismatch.
                 local_kwargs = mllm_call_kwargs()
 
-                async with self._generation_lock:
+                async with self._acquire_generation_slot(request_id):
                     _bind_worker_generation_streams()
                     for chunk in self._model.stream_chat(
                         messages=messages,
@@ -1282,8 +1293,10 @@ class SimpleEngine(BaseEngine):
                             break
                 return
 
-            # Run stream_chat in thread pool since it's synchronous
-            def run_stream():
+            # mlx_vlm's native-video path is non-streaming and performs
+            # blocking preprocessing and generation. Keep it off the event
+            # loop while preserving serialized admission.
+            def run_native_video():
                 local_kwargs = mllm_call_kwargs()
                 return list(
                     self._model.stream_chat(
@@ -1295,15 +1308,15 @@ class SimpleEngine(BaseEngine):
                     )
                 )
 
-            chunks = await self._run_blocking_serialized(run_stream)
-
+            chunks = await self._run_blocking_serialized(
+                run_native_video,
+                request_id=request_id,
+            )
             for chunk in chunks:
                 token_count += 1
                 new_text = chunk.text if hasattr(chunk, "text") else str(chunk)
                 accumulated_text += new_text
-
                 finished = chunk.finish_reason is not None
-
                 yield GenerationOutput(
                     text=accumulated_text,
                     new_text=new_text,
@@ -1314,9 +1327,6 @@ class SimpleEngine(BaseEngine):
                     mtp_drafts=getattr(chunk, "mtp_drafts", 0),
                     mtp_accepted=getattr(chunk, "mtp_accepted", 0),
                 )
-
-                if finished:
-                    break
             return
 
         # For LLM, apply chat template and stream

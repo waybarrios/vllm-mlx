@@ -227,6 +227,58 @@ class TestHarmonyToolParser:
         result = parser.extract_tool_calls_streaming("", current, '{"a":')
         assert result is None
 
+    def test_streaming_emits_tool_call_on_final_channel_transition(self, parser):
+        """Streaming: a commentary block (valid JSON, no <|call|>) that the
+        model closes by moving to the final channel emits the tool call."""
+        previous = (
+            "<|channel|>commentary to=functions.get_weather\n"
+            '<|message|>{"loc": "SF"}'
+        )
+        current = previous + "\n<|channel|>final<|message|>Done<|return|>"
+        result = parser.extract_tool_calls_streaming(
+            previous, current, "<|channel|>final<|message|>Done<|return|>"
+        )
+
+        assert result is not None
+        assert "tool_calls" in result
+        assert result["tool_calls"][0]["function"]["name"] == "get_weather"
+        assert json.loads(result["tool_calls"][0]["function"]["arguments"]) == {
+            "loc": "SF"
+        }
+
+    def test_streaming_does_not_reemit_same_call(self, parser):
+        """Streaming: the same completed call is not emitted twice on later
+        deltas (deduplicated by name + arguments)."""
+        previous = (
+            "<|channel|>commentary to=functions.get_weather\n"
+            '<|message|>{"loc": "SF"}'
+        )
+        current = previous + "\n<|call|>"
+        first = parser.extract_tool_calls_streaming(previous, current, "<|call|>")
+        assert first is not None
+        assert "tool_calls" in first
+
+        # The same call is still present in the accumulated text on the next
+        # delta (the final channel), but it must not be re-emitted.
+        next_current = current + "\n<|channel|>final<|message|>ok"
+        second = parser.extract_tool_calls_streaming(
+            current, next_current, "\n<|channel|>final<|message|>ok"
+        )
+        assert second is None or "tool_calls" not in second
+
+    def test_streaming_reset_clears_dedup_state(self, parser):
+        """Streaming: reset() clears emitted-signature state for a new request."""
+        previous = (
+            "<|channel|>commentary to=functions.get_weather\n"
+            '<|message|>{"loc": "SF"}'
+        )
+        current = previous + "\n<|call|>"
+        parser.extract_tool_calls_streaming(previous, current, "<|call|>")
+        parser.reset()
+        again = parser.extract_tool_calls_streaming(previous, current, "<|call|>")
+        assert again is not None
+        assert "tool_calls" in again
+
 
 # ============================================================================
 # Reasoning Parser Tests
@@ -632,12 +684,68 @@ class TestHarmonyToolDefinitionConverter:
 class TestHarmonyEdgeCases:
     """Edge case tests for Harmony parsers."""
 
-    def test_tool_parser_incomplete_call(self):
-        """Incomplete tool call (missing <|call|>) is not parsed."""
+    def test_tool_parser_incomplete_call_with_valid_args(self):
+        """Tool call without trailing <|call|> IS parsed when args are valid JSON."""
+        import json as _json
+
         parser = HarmonyToolParser()
         text = "<|channel|>commentary to=functions.func\n" '<|message|>{"arg": "value"}'
         result = parser.extract_tool_calls(text)
+        assert result.tools_called
+        assert result.tool_calls[0]["name"] == "func"
+        assert _json.loads(result.tool_calls[0]["arguments"]) == {"arg": "value"}
+
+    def test_tool_parser_truncated_at_eos_does_not_extract(self):
+        """Truncated args at end-of-string MUST NOT become a tool call."""
+        parser = HarmonyToolParser()
+        # Missing trailing `}` — JSON is truncated mid-object, no terminator.
+        text = (
+            "<|channel|>commentary to=functions.read_file\n"
+            '<|message|>{"path": "/etc/hosts"'
+        )
+        result = parser.extract_tool_calls(text)
         assert not result.tools_called
+        assert result.tool_calls == []
+
+    def test_tool_parser_explicit_terminator_with_invalid_json_keeps_raw(self):
+        """Explicit terminator + invalid JSON: preserve raw-args fallback."""
+        parser = HarmonyToolParser()
+        text = (
+            "<|channel|>commentary to=functions.read_file\n"
+            '<|message|>{"path": "/etc/hosts",}'
+            "<|call|>"
+        )
+        result = parser.extract_tool_calls(text)
+        assert result.tools_called
+        assert result.tool_calls[0]["name"] == "read_file"
+        assert result.tool_calls[0]["arguments"] == '{"path": "/etc/hosts",}'
+
+    def test_tool_parser_commentary_followed_by_final_extracts_clean_args(self):
+        """Valid JSON args before a final channel (no <|call|>) become a tool call
+        with CLEAN args - the final-answer text must not be glued on."""
+        parser = HarmonyToolParser()
+        text = (
+            "<|channel|>commentary to=functions.get_weather"
+            '<|message|>{"loc": "SF"}\n'
+            "<|channel|>final<|message|>Done<|return|>"
+        )
+        result = parser.extract_tool_calls(text)
+        assert result.tools_called
+        assert result.tool_calls[0]["name"] == "get_weather"
+        assert json.loads(result.tool_calls[0]["arguments"]) == {"loc": "SF"}
+
+    def test_tool_parser_truncated_commentary_followed_by_final_no_call(self):
+        """Invalid/truncated args before a following channel must NOT become a
+        raw-args tool call with later-channel text glued on (F2 regression)."""
+        parser = HarmonyToolParser()
+        text = (
+            "<|channel|>commentary to=functions.read_file\n"
+            '<|message|>{"path": "/etc/hosts"\n'
+            "<|channel|>final<|message|>Done<|return|>"
+        )
+        result = parser.extract_tool_calls(text)
+        assert not result.tools_called
+        assert result.tool_calls == []
 
     def test_tool_parser_unicode_content(self):
         """Handle unicode in tool arguments."""

@@ -9,6 +9,7 @@ for the vLLM-style continuous batching implementation.
 import asyncio
 import importlib
 import pytest
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 import mlx.core as mx
 
@@ -215,6 +216,26 @@ class TestSchedulerBasic:
     def mock_model(self):
         """Create a mock model."""
         return MagicMock()
+
+    def test_native_batch_generator_uses_chunked_prefill_budget(self):
+        """mlx-lm's current BatchGenerator owns chunking through its step size."""
+        scheduler = Scheduler(
+            model=object(),
+            tokenizer=SimpleNamespace(eos_token_id=0, eos_token_ids={0}),
+            config=SchedulerConfig(
+                enable_prefix_cache=False,
+                prefill_step_size=2048,
+                chunked_prefill_tokens=1024,
+            ),
+        )
+
+        batch_generator = scheduler._create_batch_generator(SamplingParams())
+
+        assert hasattr(batch_generator, "_prompt_batch")
+        assert hasattr(batch_generator, "_generation_batch")
+        assert hasattr(batch_generator, "_unprocessed_sequences")
+        assert batch_generator.prefill_step_size == 1024
+        assert not hasattr(batch_generator, "_partial")
 
     def test_chunked_prefill_accepts_prompt_checkpoints(self, monkeypatch):
         """Chunked prefill must match mlx-lm's 7-field prompt tuples."""
@@ -669,6 +690,109 @@ class TestSchedulerBasic:
         assert "num_requests_processed" in stats
         assert stats["num_waiting"] == 0
         assert stats["num_running"] == 0
+
+    def test_get_stats_exposes_native_mtp_snapshot(self, mock_model, mock_tokenizer):
+        """Expose installed native-MTP counters through scheduler status."""
+        scheduler = Scheduler(
+            model=mock_model,
+            tokenizer=mock_tokenizer,
+        )
+        expected = {
+            "enabled": True,
+            "requested_draft_tokens": 4,
+            "effective_draft_tokens": 1,
+            "mode": "always_advance_verified",
+            "attempted": 7,
+            "accepted": 5,
+            "rejected": 1,
+            "errors": 1,
+            "acceptance_rate": 5 / 6,
+            "bypass_counts": {"prefill": 3},
+        }
+
+        class NativeMTPBatchGenerator:
+            @staticmethod
+            def get_mtp_stats():
+                return expected
+
+        scheduler.batch_generator = NativeMTPBatchGenerator()
+
+        assert scheduler.get_stats()["mtp"] == expected
+
+    def test_install_mtp_attaches_native_status_snapshot(self):
+        """Native MTP reports its enabled state and guarded-step reason."""
+        from vllm_mlx.scheduler import _install_mtp
+
+        class FakeBatchGenerator:
+            active_batch = None
+
+            @staticmethod
+            def _step(input_tokens, prompt_cache, samplers, logits_processors, tokens):
+                return input_tokens, []
+
+            @staticmethod
+            def _next():
+                return []
+
+        batch_gen = FakeBatchGenerator()
+        _install_mtp(batch_gen, model=object(), num_draft_tokens=4)
+
+        initial = batch_gen.get_mtp_stats()
+        assert initial["enabled"] is True
+        assert initial["requested_draft_tokens"] == 4
+        assert initial["effective_draft_tokens"] == 1
+        assert initial["attempted"] == 0
+
+        batch_gen._step(mx.array([[1]]), [], None, None, None)
+
+        assert batch_gen.get_mtp_stats()["bypass_counts"]["no_active_batch"] == 1
+
+    def test_mtp_stats_survive_sampler_driven_generator_replacement(
+        self, mock_model, mock_tokenizer, monkeypatch
+    ):
+        """Replacing BatchGenerator must not reset cumulative MTP counters."""
+
+        class FakeBatchGenerator:
+            active_batch = None
+
+            def __init__(self, **kwargs):
+                self.sampler = kwargs["sampler"]
+
+            @staticmethod
+            def _step(input_tokens, prompt_cache, samplers, logits_processors, tokens):
+                return input_tokens, []
+
+            @staticmethod
+            def _next():
+                return []
+
+        monkeypatch.setattr("vllm_mlx.scheduler.BatchGenerator", FakeBatchGenerator)
+        mock_model.mtp = object()
+        scheduler = Scheduler(
+            model=mock_model,
+            tokenizer=mock_tokenizer,
+            config=SchedulerConfig(enable_prefix_cache=False, enable_mtp=True),
+        )
+        first_params = SamplingParams(temperature=0.0, top_p=1.0, min_p=0.0)
+        scheduler._ensure_batch_generator(first_params)
+        first_generator = scheduler.batch_generator
+
+        first_generator._step(
+            mx.array([[1]]),
+            [],
+            None,
+            None,
+            None,
+        )
+        before = scheduler.get_stats()["mtp"]
+        assert before["bypass_counts"]["no_active_batch"] == 1
+
+        second_params = SamplingParams(temperature=0.7, top_p=0.9, min_p=0.0)
+        scheduler._ensure_batch_generator(second_params)
+
+        after = scheduler.get_stats()["mtp"]
+        assert scheduler.batch_generator is not first_generator
+        assert after["bypass_counts"] == before["bypass_counts"]
 
     def test_reset(self, mock_model, mock_tokenizer):
         """Test resetting scheduler."""

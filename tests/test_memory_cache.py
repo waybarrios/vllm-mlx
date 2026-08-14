@@ -198,6 +198,36 @@ class TestArrayMemory:
         expected = 2 * (1 * 8 * 100 * 64 * 2)
         assert estimate_kv_cache_memory([layer]) == expected
 
+    def test_estimate_handles_nested_cachelist_state(self):
+        """Regression: DeepSeek-V4's CacheList.state nests three sub-states.
+
+        The old two-way unpack raised ValueError, was swallowed, and the whole
+        entry counted as 0 bytes — so the dashboard's Prefix Cache bar stayed
+        at 0% and byte-based LRU eviction never fired for such models.
+        """
+
+        class NestedStateCache:
+            def __init__(self):
+                rot = (
+                    MockShapeArray(shape=(1, 8, 128, 64), dtype_size=2),
+                    MockShapeArray(shape=(1, 8, 128, 64), dtype_size=2),
+                )
+                pool_a = (
+                    MockShapeArray(shape=(1, 3, 512), dtype_size=2),
+                    MockShapeArray(shape=(1, 3, 128), dtype_size=2),
+                    MockShapeArray(shape=(1, 40, 512), dtype_size=2),
+                )
+                pool_b = (None, None, None)  # empty PoolingCache members
+                self.state = [rot, pool_a, pool_b]
+
+        expected = (
+            2 * (1 * 8 * 128 * 64 * 2)
+            + (1 * 3 * 512 * 2)
+            + (1 * 3 * 128 * 2)
+            + (1 * 40 * 512 * 2)
+        )
+        assert estimate_kv_cache_memory([NestedStateCache()]) == expected
+
 
 class TestEstimateKvCacheMemory:
     """Tests for estimate_kv_cache_memory function."""

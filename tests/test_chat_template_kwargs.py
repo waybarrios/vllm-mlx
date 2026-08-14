@@ -334,6 +334,59 @@ def test_thinking_disabled_helper(enable_thinking, ctk, expected):
 
 
 @pytest.mark.anyio
+async def test_stream_chat_does_not_add_nemotron_prefix_when_thinking_disabled(
+    monkeypatch,
+):
+    class FakeReasoningParser:
+        def __init__(self, tokenizer=None):
+            self.tokenizer = tokenizer
+
+        def reset_state(self):
+            pass
+
+        def extract_reasoning_streaming(self, previous_text, current_text, delta_text):
+            raise AssertionError("disabled reasoning parser should not consume deltas")
+
+    class FakeEngine:
+        model_name = "Nemotron-test"
+        tokenizer = object()
+
+        async def stream_chat(self, messages, **kwargs):
+            yield GenerationOutput(
+                text="plain answer",
+                new_text="plain answer",
+                finished=True,
+                finish_reason="stop",
+                prompt_tokens=4,
+                completion_tokens=2,
+            )
+
+    monkeypatch.setattr(srv, "_model_name", "test-model")
+    monkeypatch.setattr(srv, "_reasoning_parser_name", "fake")
+    monkeypatch.setattr(srv, "_reasoning_parser", FakeReasoningParser())
+    monkeypatch.setattr(srv, "get_reasoning_parser", lambda _name: FakeReasoningParser)
+    monkeypatch.setattr(srv, "_enable_auto_tool_choice", False)
+    monkeypatch.setattr(srv, "_tool_call_parser", None)
+
+    request = srv.ChatCompletionRequest(
+        model="test-model",
+        messages=[srv.Message(role="user", content="Hello")],
+        stream=True,
+        enable_thinking=False,
+    )
+    chunks = [
+        chunk
+        async for chunk in srv.stream_chat_completion(
+            FakeEngine(), request.messages, request
+        )
+    ]
+
+    body = "".join(chunks)
+    assert "plain answer" in body
+    assert "<think>" not in body
+
+
+@pytest.mark.anyio
 async def test_stream_anthropic_skips_reasoning_parser_when_thinking_disabled():
     from vllm_mlx.reasoning import DeltaMessage
 

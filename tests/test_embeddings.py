@@ -96,6 +96,98 @@ class TestEmbeddingEngine:
         assert len(result) == 2
         assert result[0] == [0.1, 0.2]
 
+    @patch("vllm_mlx.embedding.EmbeddingEngine.load")
+    @patch(
+        "vllm_mlx.embedding.EmbeddingEngine.is_loaded",
+        new_callable=lambda: property(lambda self: True),
+    )
+    def test_embed_clears_mlx_cache_after_batch(self, _mock_loaded, mock_load):
+        """Test embed releases MLX buffers after converting to Python lists."""
+        import numpy as np
+
+        from vllm_mlx.embedding import EmbeddingEngine
+
+        engine = EmbeddingEngine("test-model")
+
+        mock_output = MagicMock()
+        mock_output.text_embeds.tolist.return_value = [[0.1, 0.2], [0.3, 0.4]]
+
+        mock_model = MagicMock(return_value=mock_output)
+
+        mock_inner_tokenizer = MagicMock()
+        mock_inner_tokenizer.return_value = {
+            "input_ids": np.array([[1, 2], [3, 4]]),
+            "attention_mask": np.array([[1, 1], [1, 1]]),
+        }
+        mock_tokenizer = MagicMock()
+        mock_tokenizer._tokenizer = mock_inner_tokenizer
+
+        engine._model = mock_model
+        engine._tokenizer = mock_tokenizer
+
+        with patch("vllm_mlx.embedding.mx.clear_cache") as mock_clear_cache:
+            result = engine.embed(["hello", "world"])
+            mock_clear_cache.assert_called_once()
+
+        assert result[0] == [0.1, 0.2]
+
+    def test_embed_uses_config_max_length(self):
+        """Positive: truncation length follows model.config.max_position_embeddings."""
+        import numpy as np
+
+        from vllm_mlx.embedding import EmbeddingEngine
+
+        engine = EmbeddingEngine("test-model")
+
+        mock_output = MagicMock()
+        mock_output.text_embeds.tolist.return_value = [[0.1, 0.2]]
+        mock_model = MagicMock(return_value=mock_output)
+        mock_model.config.max_position_embeddings = 8192
+
+        mock_inner_tokenizer = MagicMock()
+        mock_inner_tokenizer.return_value = {
+            "input_ids": np.array([[1, 2]]),
+            "attention_mask": np.array([[1, 1]]),
+        }
+        mock_tokenizer = MagicMock()
+        mock_tokenizer._tokenizer = mock_inner_tokenizer
+
+        with patch.object(engine, "_ensure_loaded"):
+            engine._model = mock_model
+            engine._tokenizer = mock_tokenizer
+            engine.embed(["hello"])
+
+        assert mock_inner_tokenizer.call_args.kwargs["max_length"] == 8192
+
+    def test_embed_defaults_to_512_without_config(self):
+        """Negative: no usable config/tokenizer value falls back to 512."""
+        import numpy as np
+
+        from vllm_mlx.embedding import EmbeddingEngine
+
+        engine = EmbeddingEngine("test-model")
+
+        mock_output = MagicMock()
+        mock_output.text_embeds.tolist.return_value = [[0.1, 0.2]]
+        mock_model = MagicMock(return_value=mock_output)
+        # .config.max_position_embeddings is a MagicMock (non-int) -> rejected.
+
+        mock_inner_tokenizer = MagicMock()
+        mock_inner_tokenizer.model_max_length = MagicMock()  # non-int -> rejected
+        mock_inner_tokenizer.return_value = {
+            "input_ids": np.array([[1, 2]]),
+            "attention_mask": np.array([[1, 1]]),
+        }
+        mock_tokenizer = MagicMock()
+        mock_tokenizer._tokenizer = mock_inner_tokenizer
+
+        with patch.object(engine, "_ensure_loaded"):
+            engine._model = mock_model
+            engine._tokenizer = mock_tokenizer
+            engine.embed(["hello"])
+
+        assert mock_inner_tokenizer.call_args.kwargs["max_length"] == 512
+
     def test_embed_normalises_single_string(self):
         """Test that a single string input is wrapped into a list."""
         import numpy as np

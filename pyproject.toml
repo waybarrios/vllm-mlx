@@ -4,15 +4,26 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "vllm-mlx"
-version = "0.4.0"
-description = "vLLM-like inference for Apple Silicon - GPU-accelerated Text, Image, Video & Audio on Mac"
+version = "0.4.1"
+description = "OpenAI and Anthropic compatible LLM inference server for Apple Silicon, powered by MLX"
 readme = "README.md"
 license = {text = "Apache-2.0"}
 requires-python = ">=3.10"
 authors = [
     {name = "vllm-mlx contributors"}
 ]
-keywords = ["llm", "mlx", "apple-silicon", "vllm", "inference", "transformers"]
+keywords = [
+    "llm",
+    "mlx",
+    "apple-silicon",
+    "vllm",
+    "inference-server",
+    "openai-api",
+    "anthropic-api",
+    "continuous-batching",
+    "multimodal",
+    "local-llm",
+]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
@@ -30,7 +41,7 @@ classifiers = [
 dependencies = [
     "mlx>=0.29.0",
     "mlx-lm>=0.31.3",  # 0.31.3+ required by current mlx-vlm runtime support
-    "mlx-vlm>=0.6.2",  # 0.6.2+ includes Step 3.7 Flash and follow-up fixes
+    "mlx-vlm>=0.6.5",  # 0.6.5+ fixes Qwen3.5 sanitize double-run (#674)
     "transformers>=5.0.0",  # mlx-lm 0.30.5+ requires transformers 5.0 (rc3 bug fixed in stable)
     "tokenizers>=0.19.0",
     "huggingface-hub>=0.23.0",
@@ -111,9 +122,11 @@ audio = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/vllm-mlx/vllm-mlx"
-Documentation = "https://github.com/vllm-mlx/vllm-mlx#readme"
-Repository = "https://github.com/vllm-mlx/vllm-mlx"
+Homepage = "https://github.com/waybarrios/vllm-mlx"
+Documentation = "https://github.com/waybarrios/vllm-mlx/tree/main/docs"
+Repository = "https://github.com/waybarrios/vllm-mlx"
+Issues = "https://github.com/waybarrios/vllm-mlx/issues"
+"Release Notes" = "https://github.com/waybarrios/vllm-mlx/releases"
 
 [project.entry-points."vllm.platform_plugins"]
 mlx = "vllm_mlx.plugin:mlx_platform_plugin"

@@ -22,17 +22,48 @@ import mlx.utils
 logger = logging.getLogger(__name__)
 
 
+# Text-model classes keyed by config ``model_type`` *prefix*, longest first.
+# A family has to cover its variants: Gemma 4 reports ``gemma4_text`` on some
+# checkpoints and ``gemma4_unified_text`` on others, and an exact match on the
+# former silently sent the latter to the generic fallback below.
+_TEXT_MODEL_FAMILIES: tuple[tuple[str, str, tuple[str, str]], ...] = (
+    ("gemma4", "mlx_lm.models.gemma4_text", ("Model", "ModelArgs")),
+)
+
+# Fallback. qwen3_5.TextModel and TextModelArgs handle both dense and MoE
+# natively (MTPDecoderLayer auto-selects SparseMoeBlock when
+# args.num_experts > 0), which makes them a reasonable generic choice — but it
+# is a guess, and a wrong guess dies deep inside the constructor with an error
+# that names neither the model nor the class. Hence the logging either side.
+_DEFAULT_TEXT_MODEL = ("mlx_lm.models.qwen3_5", ("TextModel", "TextModelArgs"))
+
+
 def _import_text_model_classes(model_type: str):
-    if model_type == "gemma4_text":
-        from mlx_lm.models.gemma4_text import Model, ModelArgs
+    """Return ``(Model, ModelArgs)`` for a text config's ``model_type``."""
+    import importlib
 
-        return Model, ModelArgs
+    module_name, (model_attr, args_attr) = _DEFAULT_TEXT_MODEL
+    matched = False
+    for prefix, family_module, (family_model, family_args) in sorted(
+        _TEXT_MODEL_FAMILIES, key=lambda f: len(f[0]), reverse=True
+    ):
+        if model_type.startswith(prefix):
+            module_name, model_attr, args_attr = (
+                family_module,
+                family_model,
+                family_args,
+            )
+            matched = True
+            break
 
-    # qwen3_5.TextModel and TextModelArgs handle both dense and MoE natively
-    # (MTPDecoderLayer auto-selects SparseMoeBlock when args.num_experts > 0).
-    from mlx_lm.models.qwen3_5 import TextModel, TextModelArgs
-
-    return TextModel, TextModelArgs
+    if not matched:
+        logger.debug(
+            "No text-model family matches model_type=%r; falling back to %s",
+            model_type,
+            module_name,
+        )
+    module = importlib.import_module(module_name)
+    return getattr(module, model_attr), getattr(module, args_attr)
 
 
 def build_text_model(vlm_model: Any, model_path: str | Path) -> Any | None:
@@ -52,11 +83,17 @@ def build_text_model(vlm_model: Any, model_path: str | Path) -> Any | None:
     if model_path is None or not (model_path / "config.json").exists():
         return None
 
+    model_type = ""
+    text_model_cls = None
     try:
         config = json.loads((model_path / "config.json").read_text())
         text_config = config.get("text_config", config)
         model_type = text_config.get("model_type") or config.get("model_type", "")
         TextModel, TextModelArgs = _import_text_model_classes(model_type)
+        text_model_cls = f"{TextModel.__module__}.{TextModel.__qualname__}"
+        logger.debug(
+            "Building TextModel for model_type=%r using %s", model_type, text_model_cls
+        )
 
         # Build args with proper __post_init__ (handles partial_rotary_factor,
         # rope_scaling, head_dim derivation)
@@ -174,7 +211,17 @@ def build_text_model(vlm_model: Any, model_path: str | Path) -> Any | None:
         logger.error("Cannot import mlx_lm TextModel (need PR #990): %s", e)
         return None
     except Exception as e:
-        logger.error("Failed to build TextModel from vlm: %s", e)
+        # Name the model_type and the class that was picked. Without them this
+        # is a bare TypeError from inside someone else's constructor, and the
+        # engine carries on with _text_model=None — a route quietly losing its
+        # backend, which reads like a warning rather than the failure it is.
+        logger.error(
+            "Failed to build TextModel from vlm (model_type=%r, class=%s): %s",
+            model_type,
+            text_model_cls or "<not selected>",
+            e,
+            exc_info=True,
+        )
         return None
 
 

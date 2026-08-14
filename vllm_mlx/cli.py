@@ -269,7 +269,6 @@ def serve_command(args):
             cache_memory_mb=args.cache_memory_mb,
             cache_memory_percent=args.cache_memory_percent,
             # Paged cache options
-            cache_entry_ttl=args.cache_entry_ttl,
             use_paged_cache=args.use_paged_cache,
             paged_cache_block_size=args.paged_cache_block_size,
             max_cache_blocks=args.max_cache_blocks,
@@ -532,7 +531,6 @@ def bench_command(args):
             use_memory_aware_cache=not args.no_memory_aware_cache,
             cache_memory_mb=args.cache_memory_mb,
             cache_memory_percent=args.cache_memory_percent,
-            cache_entry_ttl=args.cache_entry_ttl,
             # Paged cache options
             use_paged_cache=args.use_paged_cache,
             paged_cache_block_size=args.paged_cache_block_size,
@@ -1071,12 +1069,6 @@ Examples:
         type=float,
         default=0.20,
         help="Fraction of available RAM for cache if auto-detecting (default: 0.20)",
-    )
-    serve_parser.add_argument(
-        "--cache-entry-ttl",
-        type=int,
-        default=0,
-        help="Cache entry TTL in seconds (0 = no TTL, entries older than this are evicted on next access)",
     )
     serve_parser.add_argument(
         "--no-memory-aware-cache",

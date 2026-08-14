@@ -1484,6 +1484,239 @@ class TestSimpleEngineConcurrency:
         assert engine._text_tokenizer is tokenizer
 
     @pytest.mark.anyio
+    async def test_mllm_media_stream_stays_on_owner_thread_with_text_route(self):
+        """Media requests must not move mlx_vlm generation to a worker thread."""
+        from vllm_mlx.engine.simple import SimpleEngine
+
+        class FakeMllmModel:
+            def __init__(self):
+                self._owner_thread = threading.get_ident()
+
+            def stream_chat(self, **_kwargs):
+                if threading.get_ident() != self._owner_thread:
+                    raise RuntimeError("There is no Stream(gpu, 3) in current thread.")
+                yield SimpleNamespace(
+                    text="image described",
+                    finish_reason="stop",
+                    prompt_tokens=5,
+                )
+
+        async def fail_if_called(*_args, **_kwargs):
+            raise AssertionError("MLLM requests must not use worker routing")
+
+        engine = SimpleEngine("test-model", force_mllm=True, mtp=False)
+        engine._loaded = True
+        engine._text_model = MagicMock()
+        engine._text_tokenizer = MagicMock()
+        engine._model = FakeMllmModel()
+        engine._run_blocking_serialized = fail_if_called  # type: ignore[method-assign]
+
+        outputs = [
+            chunk
+            async for chunk in engine.stream_chat(
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": "describe this"},
+                            {
+                                "type": "image_url",
+                                "image_url": {"url": "data:image/png;base64,AAAA"},
+                            },
+                        ],
+                    }
+                ],
+                max_tokens=16,
+            )
+        ]
+
+        assert outputs[-1].text == "image described"
+        assert outputs[-1].finish_reason == "stop"
+
+    @pytest.mark.anyio
+    async def test_mllm_draft_stream_stays_on_owner_thread_with_text_route(self):
+        """Text-only MLLM draft requests share mlx_vlm's owner thread."""
+        from vllm_mlx.engine.simple import SimpleEngine
+
+        captured = {}
+
+        class FakeMllmModel:
+            def __init__(self):
+                self._owner_thread = threading.get_ident()
+
+            def stream_chat(self, **kwargs):
+                if threading.get_ident() != self._owner_thread:
+                    raise RuntimeError("There is no Stream(gpu, 3) in current thread.")
+                captured.update(kwargs)
+                yield SimpleNamespace(
+                    text="drafted",
+                    finish_reason="stop",
+                    prompt_tokens=3,
+                )
+
+        engine = SimpleEngine(
+            "test-model",
+            force_mllm=True,
+            mllm_draft_model="assistant",
+            mllm_draft_kind="mtp",
+        )
+        engine._loaded = True
+        engine._text_model = MagicMock()
+        engine._model = FakeMllmModel()
+
+        outputs = [
+            chunk
+            async for chunk in engine.stream_chat(
+                messages=[{"role": "user", "content": "hello"}],
+                max_tokens=8,
+                mllm_draft=True,
+            )
+        ]
+
+        assert captured["mllm_draft"] is True
+        assert outputs[-1].text == "drafted"
+
+    @pytest.mark.anyio
+    async def test_mllm_media_stream_uses_fail_fast_admission(self):
+        """A concurrent media request must receive EngineBusy instead of queueing."""
+        from vllm_mlx.engine.base import EngineBusy
+        from vllm_mlx.engine.simple import SimpleEngine
+
+        class FakeMllmModel:
+            def stream_chat(self, **_kwargs):
+                yield SimpleNamespace(
+                    text="first",
+                    finish_reason=None,
+                    prompt_tokens=5,
+                )
+                yield SimpleNamespace(
+                    text=" second",
+                    finish_reason="stop",
+                    prompt_tokens=5,
+                )
+
+        def media_messages(label):
+            return [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": label},
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": "data:image/png;base64,AAAA"},
+                        },
+                    ],
+                }
+            ]
+
+        engine = SimpleEngine("test-model", force_mllm=True, mtp=False)
+        engine._loaded = True
+        engine._text_model = MagicMock()
+        engine._model = FakeMllmModel()
+
+        first_started = asyncio.Event()
+        release_first = asyncio.Event()
+
+        async def consume_first():
+            outputs = []
+            async for output in engine.stream_chat(
+                messages=media_messages("first"),
+                request_id="first-media",
+            ):
+                outputs.append(output)
+                if len(outputs) == 1:
+                    first_started.set()
+                    await release_first.wait()
+            return outputs
+
+        first_task = asyncio.create_task(consume_first())
+        await asyncio.wait_for(first_started.wait(), timeout=1.0)
+
+        try:
+            with pytest.raises(EngineBusy) as excinfo:
+                _ = [
+                    output
+                    async for output in engine.stream_chat(
+                        messages=media_messages("second"),
+                        request_id="second-media",
+                    )
+                ]
+
+            assert excinfo.value.code == "text_generation_busy"
+            assert "request_id=second-media" in str(excinfo.value)
+            assert "active=none" not in str(excinfo.value)
+            assert engine._generation_busy_rejections == 1
+        finally:
+            release_first.set()
+
+        outputs = await first_task
+        assert outputs[-1].finish_reason == "stop"
+
+    @pytest.mark.anyio
+    async def test_mllm_native_video_stream_stays_off_event_loop(self):
+        """Native video generation must not block the asyncio event loop."""
+        from vllm_mlx.engine.simple import SimpleEngine
+
+        owner_thread = threading.get_ident()
+        release = threading.Event()
+        worker_thread = None
+
+        class FakeMllmModel:
+            _video_native = True
+
+            def _collect_video_inputs(self, _messages):
+                return {0: ["video.mp4"]}
+
+            def stream_chat(self, **_kwargs):
+                nonlocal worker_thread
+                worker_thread = threading.get_ident()
+                release.wait(timeout=0.2)
+                yield SimpleNamespace(
+                    text="video described",
+                    finish_reason="stop",
+                    prompt_tokens=5,
+                )
+
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "video_url", "video_url": {"url": "video.mp4"}},
+                    {"type": "text", "text": "describe this"},
+                ],
+            }
+        ]
+        engine = SimpleEngine("test-model", force_mllm=True, mtp=False)
+        engine._loaded = True
+        engine._text_model = MagicMock()
+        engine._model = FakeMllmModel()
+
+        async def consume():
+            return [
+                output
+                async for output in engine.stream_chat(
+                    messages=messages,
+                    request_id="native-video",
+                )
+            ]
+
+        release_timer = threading.Timer(0.2, release.set)
+        release_timer.start()
+        started_at = asyncio.get_running_loop().time()
+        stream_task = asyncio.create_task(consume())
+        try:
+            await asyncio.sleep(0.02)
+            loop_delay = asyncio.get_running_loop().time() - started_at
+        finally:
+            release.set()
+            release_timer.cancel()
+
+        outputs = await stream_task
+        assert loop_delay < 0.1
+        assert worker_thread != owner_thread
+        assert outputs[-1].text == "video described"
+
+    @pytest.mark.anyio
     async def test_mllm_nonstream_text_only_routes_without_mtp(self):
         """Non-stream text-only MLLM chat must aggregate the TextModel route."""
         from vllm_mlx.engine.simple import SimpleEngine
@@ -2000,6 +2233,7 @@ class TestSimpleEngineConcurrency:
 
         assert outputs[-1].text == "Hello"
         assert captured_prompts == [tokenizer.apply_chat_template.return_value]
+        tokenizer.encode.assert_not_called()
 
     @pytest.mark.anyio
     async def test_stream_generate_text_disables_mtp_when_logits_processors_active(
@@ -2615,6 +2849,89 @@ class TestSimpleEngineConcurrency:
                 with pytest.raises(asyncio.CancelledError):
                     await task
         assert await asyncio.to_thread(prefill_cancelled.wait, 1.0)
+
+
+class TestSimpleEngineNaturalStop:
+    @staticmethod
+    def _engine(stream_generate):
+        from vllm_mlx.engine.simple import SimpleEngine
+
+        with patch("vllm_mlx.engine.simple.is_mllm_model", return_value=False):
+            engine = SimpleEngine("test-model")
+        engine._loaded = True
+        engine._model = MagicMock()
+        engine._model.tokenizer.encode.return_value = [1, 2, 3]
+        engine._model.stream_generate.side_effect = stream_generate
+        return engine
+
+    @pytest.mark.anyio
+    async def test_generator_exhaustion_emits_one_stop(self):
+        def generate(**kwargs):
+            yield SimpleNamespace(text="Hel", prompt_tokens=3, finish_reason=None)
+            yield SimpleNamespace(text="lo", prompt_tokens=3, finish_reason="stop")
+
+        outputs = [
+            output
+            async for output in self._engine(generate).stream_generate(
+                prompt="hi", max_tokens=50
+            )
+        ]
+
+        finished = [output for output in outputs if output.finished]
+        assert len(finished) == 1
+        assert finished[0] is outputs[-1]
+        assert finished[0].new_text == ""
+        assert finished[0].finish_reason == "stop"
+
+    @pytest.mark.anyio
+    async def test_token_limit_keeps_length_reason(self):
+        def generate(**kwargs):
+            yield SimpleNamespace(text="a", prompt_tokens=3, finish_reason=None)
+            yield SimpleNamespace(text="b", prompt_tokens=3, finish_reason=None)
+            yield SimpleNamespace(text="c", prompt_tokens=3, finish_reason=None)
+
+        outputs = [
+            output
+            async for output in self._engine(generate).stream_generate(
+                prompt="hi", max_tokens=3
+            )
+        ]
+
+        finished = [output for output in outputs if output.finished]
+        assert len(finished) == 1
+        assert finished[0] is outputs[-1]
+        assert finished[0].finish_reason == "length"
+
+    @pytest.mark.anyio
+    async def test_exception_is_not_reported_as_stop(self):
+        def generate(**kwargs):
+            yield SimpleNamespace(text="partial", prompt_tokens=3, finish_reason=None)
+            raise RuntimeError("backend failed")
+
+        engine = self._engine(generate)
+        outputs = []
+        with pytest.raises(RuntimeError, match="backend failed"):
+            async for output in engine.stream_generate(prompt="hi", max_tokens=50):
+                outputs.append(output)
+
+        assert not any(output.finished for output in outputs)
+        assert not engine._active_requests
+
+    @pytest.mark.anyio
+    async def test_empty_generator_emits_stop(self):
+        def generate(**kwargs):
+            yield from ()
+
+        outputs = [
+            output
+            async for output in self._engine(generate).stream_generate(
+                prompt="hi", max_tokens=50
+            )
+        ]
+
+        assert len(outputs) == 1
+        assert outputs[0].finished
+        assert outputs[0].finish_reason == "stop"
 
 
 class TestSimpleEngineClearRuntimeCaches:

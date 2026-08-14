@@ -28,7 +28,6 @@ import bisect
 import logging
 import math
 import threading
-import time
 from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Any
@@ -89,6 +88,23 @@ def _array_memory(arr) -> int:
     return 0
 
 
+def _nested_array_memory(value: Any) -> int:
+    """Sum ``_array_memory`` over an arbitrarily nested state structure.
+
+    Cache ``state`` payloads are not always a flat ``(keys, values)`` pair:
+    CacheList yields a list of sub-cache states and PoolingCache yields
+    ``(buf_kv, buf_gate, pooled)`` with possible ``None`` members. Unpacking
+    those as two values raised, was swallowed, and the entry was accounted as
+    zero bytes — so the dashboard showed 0% cache memory and, far worse, the
+    byte-based LRU eviction never fired for such models.
+    """
+    if value is None:
+        return 0
+    if isinstance(value, (list, tuple)):
+        return sum(_nested_array_memory(v) for v in value)
+    return _array_memory(value)
+
+
 def estimate_kv_cache_memory(cache: list[Any]) -> int:
     """
     Estimate memory usage of a KV cache in bytes.
@@ -126,11 +142,11 @@ def estimate_kv_cache_memory(cache: list[Any]) -> int:
                 total_bytes += _array_memory(arr)
             continue
         elif hasattr(layer_cache, "state") and not isinstance(layer_cache, dict):
-            # Cache with state property returning (keys, values)
+            # Cache with a state property. Walk it recursively: the payload may
+            # be a plain (keys, values) pair, but CacheList/PoolingCache nest
+            # further, and the old two-way unpack silently measured those as 0.
             try:
-                keys, values = layer_cache.state
-                total_bytes += _array_memory(keys)
-                total_bytes += _array_memory(values)
+                total_bytes += _nested_array_memory(layer_cache.state)
             except (TypeError, ValueError):
                 pass
         elif hasattr(layer_cache, "keys") and hasattr(layer_cache, "values"):
@@ -172,7 +188,6 @@ class MemoryCacheConfig:
     kv_group_size: int = 64
     kv_min_quantize_tokens: int = 256
     min_prefix_tokens: int = 128
-    cache_ttl_seconds: int = 0  # 0 = no TTL, >0 = evict entries older than this
 
     def __post_init__(self) -> None:
         if not 0.0 < self.max_memory_percent <= 1.0:
@@ -249,27 +264,48 @@ class CacheStats:
 
 @dataclass
 class _CacheEntry:
-    """Internal cache entry with memory tracking and optional TTL."""
+    """Internal cache entry with memory tracking."""
 
     tokens: tuple[int, ...]
     cache: list[Any]
     memory_bytes: int
-    created_at: float = 0.0
 
     @classmethod
-    def create(cls, tokens: list[int], cache: list[Any], ttl_seconds: int = 0) -> _CacheEntry:
+    def create(cls, tokens: list[int], cache: list[Any]) -> _CacheEntry:
         """Create a cache entry with memory estimation."""
         memory = estimate_kv_cache_memory(cache)
         return cls(
             tokens=tuple(tokens),
             cache=cache,
             memory_bytes=memory,
-            created_at=time.time(),
         )
 
-    def is_expired(self, ttl_seconds: int) -> bool:
-        """Check if this entry has exceeded its TTL."""
-        return ttl_seconds > 0 and time.time() - self.created_at > ttl_seconds
+
+def _is_cache_layer_trimmable(layer_cache: Any) -> bool:
+    """Return whether a cache layer can safely be rewound for partial reuse."""
+    if isinstance(layer_cache, _QuantizedCacheWrapper):
+        if "max_size" in layer_cache.orig_attrs:
+            return False
+        return hasattr(layer_cache, "offset") and hasattr(layer_cache, "keys")
+
+    # _trim_cache_offset does not currently rewind container children.
+    if hasattr(layer_cache, "caches"):
+        return False
+
+    is_trimmable = getattr(layer_cache, "is_trimmable", None)
+    if callable(is_trimmable):
+        try:
+            return bool(is_trimmable())
+        except Exception:
+            logger.debug(
+                "Failed to check cache layer trimmability for %s",
+                type(layer_cache).__name__,
+                exc_info=True,
+            )
+            return False
+
+    # Compatibility fallback for simple KV-like cache implementations.
+    return hasattr(layer_cache, "offset") and hasattr(layer_cache, "keys")
 
 
 def _trim_cache_offset(cache: list[Any], trim_by: int) -> list[Any]:
@@ -537,27 +573,14 @@ def _quantize_cache(cache: list[Any], bits: int = 8, group_size: int = 64) -> li
     with update_and_fetch logic and cannot survive quantize/dequantize roundtrip.
     RotatingKVCache is typically small (max_size=1024) so skipping it is fine.
     """
-    import mlx.core as mx
     from mlx_lm.models.cache import KVCache
 
     quantized = []
-    eval_targets = []
     for layer in cache:
         if type(layer) is KVCache and getattr(layer, "keys", None) is not None:
-            wrapped = _QuantizedCacheWrapper(layer, bits, group_size)
-            quantized.append(wrapped)
-            eval_targets.extend(wrapped.keys)
-            eval_targets.extend(wrapped.values)
+            quantized.append(_QuantizedCacheWrapper(layer, bits, group_size))
         else:
             quantized.append(layer)
-
-    # ``mx.quantize`` is lazy. Without forcing these arrays here, each cached
-    # quantized tuple retains the full-precision source KV graph. The prefix
-    # cache then reports only the packed size while Metal keeps both copies
-    # alive, which is especially costly for long-context cache misses.
-    if eval_targets:
-        mx.eval(*eval_targets)
-
     return quantized
 
 
@@ -707,12 +730,6 @@ class MemoryAwarePrefixCache:
         # Track the match type from the last fetch() call
         self._last_match_type: str | None = None
 
-        # Background TTL sweep
-        self._ttl_sweep_interval = 60  # seconds
-        self._sweep_timer: threading.Timer | None = None
-        if self._config.cache_ttl_seconds > 0:
-            self._start_sweep_timer()
-
         # Optional SSD cold tier (set via set_ssd_tier())
         self._ssd_tier = None
 
@@ -755,12 +772,6 @@ class MemoryAwarePrefixCache:
         # --- O(1) exact match ---
         if tokens_key in self._entries:
             entry = self._entries[tokens_key]
-            # Lazy TTL eviction: if entry has expired, evict and treat as miss
-            if entry.is_expired(self._config.cache_ttl_seconds):
-                self._evict_entry(tokens_key, entry, "ttl")
-                self._stats.misses += 1
-                self._last_match_type = "miss_ttl"
-                return None, tokens
             self._entries.move_to_end(tokens_key)
             self._stats.hits += 1
             self._stats.tokens_saved += len(tokens)
@@ -825,8 +836,7 @@ class MemoryAwarePrefixCache:
             excess = n_cached - n_requested
 
             has_non_trimmable = any(
-                not (hasattr(lc, "offset") and hasattr(lc, "keys"))
-                for lc in best_super.cache
+                not _is_cache_layer_trimmable(lc) for lc in best_super.cache
             )
 
             if excess > 0 and has_non_trimmable:
@@ -919,8 +929,7 @@ class MemoryAwarePrefixCache:
             excess = len(best_lcp_entry.tokens) - best_lcp_length
 
             has_non_trimmable = any(
-                not (hasattr(lc, "offset") and hasattr(lc, "keys"))
-                for lc in best_lcp_entry.cache
+                not _is_cache_layer_trimmable(lc) for lc in best_lcp_entry.cache
             )
             logger.debug(
                 f"[cache_fetch] LCP candidate: lcp={best_lcp_length} "
@@ -1110,71 +1119,6 @@ class MemoryAwarePrefixCache:
             f"{'  (spilled to SSD)' if self._ssd_tier is not None else ''}"
         )
 
-    def _evict_entry(self, tokens_key: tuple[int, ...], entry: _CacheEntry, reason: str = "unknown") -> None:
-        """Evict a specific cache entry (used for TTL expiry, etc.)."""
-        with self._memory_lock:
-            self._entries.pop(tokens_key, None)
-            self._current_memory -= entry.memory_bytes
-            self._remove_from_sorted(tokens_key)
-            self._stats.evictions += 1
-            self._stats.entry_count = len(self._entries)
-            self._stats.current_memory_bytes = self._current_memory
-        logger.debug(
-            f"[{reason}_evict] removed {len(tokens_key)} tokens, "
-            f"freed {entry.memory_bytes / _BYTES_PER_MB:.2f}MB"
-        )
-
-    def _sweep_expired_entries(self) -> int:
-        """Scan all cache entries and evict any that have exceeded TTL.
-
-        Returns:
-            Number of entries evicted.
-        """
-        ttl = self._config.cache_ttl_seconds
-        if ttl <= 0 or not self._entries:
-            return 0
-
-        now = time.time()
-        evicted = 0
-        with self._memory_lock:
-            expired_keys = [
-                key for key, entry in self._entries.items()
-                if now - entry.created_at > ttl
-            ]
-            for key in expired_keys:
-                entry = self._entries.pop(key, None)
-                if entry is not None:
-                    self._current_memory -= entry.memory_bytes
-                    self._remove_from_sorted(key)
-                    evicted += 1
-            if evicted:
-                self._stats.evictions += evicted
-                self._stats.entry_count = len(self._entries)
-                self._stats.current_memory_bytes = self._current_memory
-        if evicted:
-            logger.info(
-                f"[ttl_sweep] evicted {evicted} expired entries, "
-                f"freed {evicted > 0 and (self._current_memory or 0) or 0:.0f}MB, "
-                f"{len(self._entries)} entries remaining"
-            )
-        return evicted
-
-    def _start_sweep_timer(self) -> None:
-        """Start the background TTL sweep timer."""
-        self._sweep_timer = threading.Timer(self._ttl_sweep_interval, self._sweep_loop)
-        self._sweep_timer.daemon = True
-        self._sweep_timer.start()
-
-    def _sweep_loop(self) -> None:
-        """Periodic sweep loop. Runs every ``_ttl_sweep_interval`` seconds."""
-        try:
-            self._sweep_expired_entries()
-        except Exception:
-            logger.warning("[ttl_sweep] sweep failed", exc_info=True)
-        finally:
-            if self._config.cache_ttl_seconds > 0:
-                self._start_sweep_timer()
-
     def remove(self, tokens: list[int]) -> bool:
         """
         Remove a specific cache entry.
@@ -1204,12 +1148,6 @@ class MemoryAwarePrefixCache:
             self._current_memory = 0
             self._stats = CacheStats(max_memory_bytes=self._max_memory)
         logger.debug("Cache cleared")
-
-    def stop(self) -> None:
-        """Stop the background TTL sweep timer."""
-        if self._sweep_timer is not None:
-            self._sweep_timer.cancel()
-            self._sweep_timer = None
 
     def get_stats(self) -> dict[str, Any]:
         """Get cache statistics."""

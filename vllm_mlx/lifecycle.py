@@ -34,7 +34,6 @@ class ModelSpec:
     scheduler_config: Any | None = None
     stream_interval: int = 1
     max_tokens: int = 32768
-    gpu_memory_utilization: float = 0.90
     force_mllm: bool = False
     mtp: bool = False
     prefill_step_size: int = 2048

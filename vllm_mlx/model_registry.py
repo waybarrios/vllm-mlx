@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import os
 import time
 from collections.abc import Awaitable, Callable
@@ -260,6 +261,245 @@ def _safe_available_memory_bytes() -> int:
     return int(psutil.virtual_memory().available)
 
 
+def _device_working_set_bytes() -> int | None:
+    """Best-effort Metal recommended working-set size, or None when unavailable."""
+    try:
+        import mlx.core as mx
+
+        if not mx.metal.is_available():
+            return None
+        info = mx.device_info()
+        raw = info.get(
+            "max_recommended_working_set_size",
+            info.get("memory_size", 0),
+        )
+        working_set = int(raw or 0)
+    except Exception as exc:  # pragma: no cover - platform dependent
+        logger.debug("Could not query MLX device memory: %s", exc)
+        return None
+    return working_set or None
+
+
+@dataclass(frozen=True)
+class MemoryBudgetReport:
+    """Reconciliation of the manager weight budget with the Metal ceiling.
+
+    The manager budget counts model *weights* only, and the Metal allocation
+    ceiling (``gpu_memory_utilization`` x device working set) is process-wide.
+    Those two are directly comparable, so a budget above the ceiling is a
+    deterministic conflict: the manager will keep models resident that MLX
+    cannot allocate, and the load fails instead of evicting.
+
+    The prefix-cache limit is deliberately *not* folded into that comparison.
+    ``cache_memory_mb`` is a per-engine maximum — it is cloned into each
+    resident continuous-batching engine and allocated lazily, and simple-mode
+    entries never receive it at all — so it is neither a single process-wide
+    reservation nor a bound that can be subtracted once. It is reported
+    alongside the ceiling instead, with its own conflict check.
+    """
+
+    budget_bytes: int
+    device_working_set_bytes: int | None
+    gpu_memory_utilization: float | None
+    gpu_memory_utilization_source: str | None
+    per_engine_cache_limit_bytes: int | None
+    per_engine_cache_percent: float | None
+    continuous_batching_entries: int
+    total_entries: int
+
+    @property
+    def allocation_ceiling_bytes(self) -> int | None:
+        """Metal soft allocation limit that will be installed at engine start.
+
+        ``None`` when no ceiling can be attributed: either MLX cannot report a
+        device working set, or no entry will install one (only ``BatchedEngine``
+        calls ``mx.set_memory_limit``).
+        """
+        if self.device_working_set_bytes is None or self.gpu_memory_utilization is None:
+            return None
+        return int(self.device_working_set_bytes * self.gpu_memory_utilization)
+
+    @property
+    def exceeds_ceiling(self) -> bool:
+        """True when the weights budget alone cannot fit under the ceiling.
+
+        Both sides are process-wide totals, so this is the deterministic check.
+        """
+        ceiling = self.allocation_ceiling_bytes
+        return ceiling is not None and self.budget_bytes > ceiling
+
+    @property
+    def cache_limit_exceeds_ceiling(self) -> bool:
+        """True when one engine's prefix cache could alone fill the ceiling."""
+        ceiling = self.allocation_ceiling_bytes
+        if ceiling is None or self.per_engine_cache_limit_bytes is None:
+            return False
+        return self.per_engine_cache_limit_bytes >= ceiling
+
+
+def build_memory_budget_report(
+    manager_config: RegistryManagerConfig,
+    registry: dict[str, RegisteredModel],
+    defaults: RegistryServeDefaults,
+    *,
+    device_working_set_bytes: int | None = None,
+) -> MemoryBudgetReport:
+    """Reconcile the manager weight budget against the Metal allocation ceiling.
+
+    The Metal limit is process-wide but is re-installed by every
+    ``BatchedEngine`` start, so the ceiling the manager has to live under is the
+    *lowest* utilization among the entries that actually install one. Only
+    continuous-batching entries qualify: ``SimpleEngine`` never calls
+    ``mx.set_memory_limit`` and is not even given a ``gpu_memory_utilization``.
+    A registry with no continuous-batching entries therefore gets no attributed
+    ceiling rather than one derived from a value nothing installs.
+    """
+    if device_working_set_bytes is None:
+        device_working_set_bytes = _device_working_set_bytes()
+
+    # Only BatchedEngine installs a Metal allocation limit — SimpleEngine is not
+    # even constructed with a gpu_memory_utilization — so a simple-mode entry's
+    # override is inert and must not be treated as a ceiling candidate.
+    candidates: list[tuple[float, int, str]] = []
+    for name in sorted(registry):
+        entry = registry[name]
+        entry_continuous_batching = (
+            entry.continuous_batching
+            if entry.continuous_batching is not None
+            else defaults.continuous_batching
+        )
+        if not entry_continuous_batching:
+            continue
+        if entry.gpu_memory_utilization is not None:
+            # Rank 1: an override is only attributable to the entry declaring it.
+            candidates.append(
+                (entry.gpu_memory_utilization, 1, f"models-config entry '{name}'")
+            )
+        else:
+            # Rank 0: prefer the serve default as the named source on ties.
+            candidates.append((defaults.gpu_memory_utilization, 0, "serve default"))
+
+    continuous_batching_entries = len(candidates)
+
+    utilization: float | None = None
+    utilization_source: str | None = None
+    if candidates:
+        utilization, _, utilization_source = min(candidates)
+
+    # cache_memory_mb only binds for continuous-batching engines, and only when
+    # the memory-aware prefix cache is the one actually in use.
+    scheduler_config = defaults.scheduler_config
+    per_engine_cache_limit_bytes: int | None = None
+    per_engine_cache_percent: float | None = None
+    cache_applies = (
+        scheduler_config is not None
+        and continuous_batching_entries > 0
+        and getattr(scheduler_config, "enable_prefix_cache", False)
+        and not getattr(scheduler_config, "use_paged_cache", False)
+        and getattr(scheduler_config, "use_memory_aware_cache", False)
+    )
+    if cache_applies:
+        cache_memory_mb = getattr(scheduler_config, "cache_memory_mb", None)
+        if cache_memory_mb:
+            per_engine_cache_limit_bytes = int(cache_memory_mb) * (1024**2)
+        else:
+            percent = getattr(scheduler_config, "cache_memory_percent", None)
+            if percent:
+                per_engine_cache_percent = float(percent)
+
+    return MemoryBudgetReport(
+        budget_bytes=manager_config.memory_budget_bytes,
+        device_working_set_bytes=device_working_set_bytes,
+        gpu_memory_utilization=utilization,
+        gpu_memory_utilization_source=utilization_source,
+        per_engine_cache_limit_bytes=per_engine_cache_limit_bytes,
+        per_engine_cache_percent=per_engine_cache_percent,
+        continuous_batching_entries=continuous_batching_entries,
+        total_entries=len(registry),
+    )
+
+
+def log_memory_budget_report(report: MemoryBudgetReport) -> None:
+    """Log the budget/ceiling reconciliation, warning when they conflict."""
+    gb = 1024**3
+    ceiling = report.allocation_ceiling_bytes
+
+    if ceiling is None:
+        if report.gpu_memory_utilization is None:
+            reason = (
+                "no continuous-batching entries, and --gpu-memory-utilization "
+                "installs a Metal limit only for those"
+            )
+        else:
+            reason = "MLX cannot report a device working set on this host"
+        logger.info(
+            "Registry memory budget: %.1f GB of model weights; no Metal "
+            "allocation ceiling to reconcile it with (%s)",
+            report.budget_bytes / gb,
+            reason,
+        )
+        return
+
+    engines = f"{report.continuous_batching_entries} of {report.total_entries} entries"
+    if report.per_engine_cache_limit_bytes is not None:
+        cache_desc = (
+            f"{report.per_engine_cache_limit_bytes / gb:.1f} GB per "
+            f"continuous-batching engine (--cache-memory-mb, {engines})"
+        )
+    elif report.per_engine_cache_percent is not None:
+        cache_desc = (
+            f"~{report.per_engine_cache_percent * 100:.0f}% of available RAM per "
+            f"continuous-batching engine (--cache-memory-percent, {engines}); "
+            "scales at runtime"
+        )
+    else:
+        cache_desc = "none configured"
+
+    logger.info(
+        "Registry memory budget: %.1f GB of model weights; "
+        "Metal allocation ceiling %.1f GB (%.0f%% of %.1f GB, from %s); "
+        "prefix-cache maximum %s",
+        report.budget_bytes / gb,
+        ceiling / gb,
+        report.gpu_memory_utilization * 100,
+        (report.device_working_set_bytes or 0) / gb,
+        report.gpu_memory_utilization_source,
+        cache_desc,
+    )
+
+    if report.exceeds_ceiling:
+        logger.warning(
+            "models-config manager.memory_budget_gb (%.1f GB) exceeds the Metal "
+            "allocation ceiling (%.1f GB). The budget counts model weights only, "
+            "so the manager will keep models resident that MLX cannot allocate, "
+            "and a load can fail with an out-of-memory error instead of evicting. "
+            "Lower the budget below %.1f GB — further still, since the KV cache "
+            "and activations also come out of the ceiling — or raise "
+            "--gpu-memory-utilization.",
+            report.budget_bytes / gb,
+            ceiling / gb,
+            ceiling / gb,
+        )
+
+    if report.cache_limit_exceeds_ceiling:
+        logger.warning(
+            "--cache-memory-mb (%.1f GB per continuous-batching engine) is at or "
+            "above the Metal allocation ceiling (%.1f GB) on its own, leaving no "
+            "room for model weights. Note this is a per-engine maximum: it is "
+            "cloned into every resident continuous-batching engine, so the "
+            "aggregate grows with the number of resident models.",
+            (report.per_engine_cache_limit_bytes or 0) / gb,
+            ceiling / gb,
+        )
+
+    if not report.exceeds_ceiling and not report.cache_limit_exceeds_ceiling:
+        logger.info(
+            "The registry budget covers model weights only; the KV cache, the "
+            "prefix cache and activations are additional and are not reserved "
+            "by it."
+        )
+
+
 def _estimate_model_bytes_from_source(source: str) -> int:
     """Estimate model footprint from local artifact size when possible."""
     path = Path(source)
@@ -340,6 +580,24 @@ def load_registry_config(
             int(float(estimated) * (1024**3)) if estimated is not None else None
         )
 
+        raw_gpu_memory_utilization = item.get("gpu_memory_utilization")
+        gpu_memory_utilization = None
+        if raw_gpu_memory_utilization is not None:
+            try:
+                gpu_memory_utilization = float(raw_gpu_memory_utilization)
+            except (TypeError, ValueError):
+                raise ValueError(
+                    f"models-config entry '{name}' gpu_memory_utilization must "
+                    "be finite and within (0, 1]"
+                ) from None
+            if not math.isfinite(gpu_memory_utilization) or not (
+                0.0 < gpu_memory_utilization <= 1.0
+            ):
+                raise ValueError(
+                    f"models-config entry '{name}' gpu_memory_utilization must "
+                    "be finite and within (0, 1]"
+                )
+
         registry[name] = RegisteredModel(
             name=name,
             source=str(source),
@@ -354,7 +612,7 @@ def load_registry_config(
             specprefill_backbone_pct=item.get("specprefill_backbone_pct"),
             specprefill_draft_model=item.get("specprefill_draft_model"),
             stream_interval=item.get("stream_interval"),
-            gpu_memory_utilization=item.get("gpu_memory_utilization"),
+            gpu_memory_utilization=gpu_memory_utilization,
             estimated_memory_bytes=estimated_bytes,
         )
 

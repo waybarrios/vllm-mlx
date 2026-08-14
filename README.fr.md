@@ -5,7 +5,7 @@
 **Continuous batching + API OpenAI et Anthropic dans un seul serveur. Inférence native sur Apple Silicon.**
 
 [![PyPI version](https://img.shields.io/pypi/v/vllm-mlx.svg)](https://pypi.org/project/vllm-mlx/)
-[![PyPI Downloads](https://img.shields.io/pypi/dm/vllm-mlx.svg)](https://pypi.org/project/vllm-mlx/)
+[![PyPI Downloads](https://static.pepy.tech/badge/vllm-mlx)](https://pepy.tech/projects/vllm-mlx)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 [![Apple Silicon](https://img.shields.io/badge/Apple-Silicon-black.svg)](https://support.apple.com/en-us/HT211814)

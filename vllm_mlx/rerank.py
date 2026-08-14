@@ -16,6 +16,8 @@ import asyncio
 
 import mlx.core as mx
 
+from vllm_mlx.utils.truncation import resolve_max_length
+
 logger = logging.getLogger(__name__)
 
 
@@ -34,7 +36,9 @@ class RerankAdapter(ABC):
     """
 
     @abstractmethod
-    def tokenize_pair(self, tokenizer, query: str, document: str) -> dict:
+    def tokenize_pair(
+        self, tokenizer, query: str, document: str, max_length: int
+    ) -> dict:
         """
         Tokenize a (query, document) pair for the cross-encoder.
 
@@ -42,6 +46,7 @@ class RerankAdapter(ABC):
             tokenizer: The HuggingFace tokenizer instance.
             query: The query string.
             document: The document string.
+            max_length: Truncation length (from the model's context window).
 
         Returns:
             Dict with 'input_ids' and 'attention_mask' as numpy arrays.
@@ -84,14 +89,16 @@ class SigmoidAdapter(RerankAdapter):
     normalized via sigmoid.
     """
 
-    def tokenize_pair(self, tokenizer, query: str, document: str) -> dict:
+    def tokenize_pair(
+        self, tokenizer, query: str, document: str, max_length: int
+    ) -> dict:
         """Tokenize as a sentence pair (query, document)."""
         return tokenizer(
             query,
             document,
             padding=True,
             truncation=True,
-            max_length=512,
+            max_length=max_length,
             return_tensors="np",
         )
 
@@ -243,11 +250,16 @@ class RerankEngine:
         """
         self._ensure_loaded()
 
+        max_length = resolve_max_length(
+            getattr(self._model, "config", None),
+            self._tokenizer,
+        )
+
         # Tokenize each pair individually to measure token counts
         pair_encodings = []
         pair_token_counts = []
         for doc in documents:
-            enc = self._adapter.tokenize_pair(self._tokenizer, query, doc)
+            enc = self._adapter.tokenize_pair(self._tokenizer, query, doc, max_length)
             pair_encodings.append(enc)
             seq_len = (
                 len(enc["input_ids"][0])

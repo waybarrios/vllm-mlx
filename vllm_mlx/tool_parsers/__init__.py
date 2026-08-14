@@ -57,6 +57,7 @@ from .llama_tool_parser import LlamaToolParser
 from .mistral_tool_parser import MistralToolParser
 from .nemotron_tool_parser import NemotronToolParser
 from .qwen_tool_parser import QwenToolParser
+from .poolside_v1_tool_parser import PoolsideV1ToolParser
 from .xlam_tool_parser import xLAMToolParser
 from .glm47_tool_parser import Glm47ToolParser
 from .harmony_tool_parser import HarmonyToolParser
@@ -99,6 +100,7 @@ __all__ = [
     "Gemma4ToolParser",
     "MistralToolParser",
     "QwenToolParser",
+    "PoolsideV1ToolParser",
     "Qwen3XMLToolParser",
     "LlamaToolParser",
     "HermesToolParser",

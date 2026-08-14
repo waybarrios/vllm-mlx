@@ -1111,12 +1111,6 @@ class BatchedEngine(BaseEngine):
             tools,
             chat_template_kwargs=chat_template_kwargs,
         )
-        logger.info(
-            "[CACHE] prefix_boundary=%s, messages=%s, last_role=%s",
-            prefix_boundary,
-            len(messages),
-            messages[-1].get("role", "?") if messages else "none",
-        )
         if prefix_boundary > 0:
             kwargs["prefix_boundary"] = prefix_boundary
 

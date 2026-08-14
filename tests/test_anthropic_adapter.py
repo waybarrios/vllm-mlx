@@ -393,6 +393,28 @@ class TestAnthropicToOpenai:
         assert result.messages[1].role == "user"
         assert result.messages[1].content == "hi"
 
+    def test_multiple_system_messages_preserve_system_and_turn_order(self):
+        msgs = [
+            AnthropicMessage(role="user", content="first question"),
+            AnthropicMessage(role="system", content="First instruction."),
+            AnthropicMessage(role="assistant", content="first answer"),
+            AnthropicMessage(role="system", content="Second instruction."),
+            AnthropicMessage(role="user", content="second question"),
+        ]
+        req = self._make_request(system="Top-level instruction.", messages=msgs)
+
+        result = anthropic_to_openai(req)
+
+        assert [(message.role, message.content) for message in result.messages] == [
+            (
+                "system",
+                "Top-level instruction.\n\nFirst instruction.\n\nSecond instruction.",
+            ),
+            ("user", "first question"),
+            ("assistant", "first answer"),
+            ("user", "second question"),
+        ]
+
 
 class TestOpenaiToAnthropic:
     """Tests for openai_to_anthropic conversion."""
