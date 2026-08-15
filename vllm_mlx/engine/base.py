@@ -5,6 +5,7 @@ Base engine interface for vllm-mlx inference.
 
 import asyncio
 import logging
+import weakref
 from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import contextmanager
@@ -80,6 +81,16 @@ def suspend_cancellation():
             task.cancel()
 
 
+# Per-task bookkeeping for shield_task(), keyed weakly so a task that's
+# never (fully) shielded to completion doesn't outlive its own lifetime
+# because of this cache. Each entry's "waiters" list holds every waiter
+# Future currently interested in `task`'s outcome -- shield_task() may be
+# called concurrently, or repeatedly in a retry loop, for the same task.
+_shield_waiters: "weakref.WeakKeyDictionary[asyncio.Task, list[asyncio.Future]]" = (
+    weakref.WeakKeyDictionary()
+)
+
+
 async def shield_task(task: asyncio.Task) -> Any:
     """Equivalent to ``await asyncio.shield(task)``, minus one asyncio quirk.
 
@@ -102,35 +113,79 @@ async def shield_task(task: asyncio.Task) -> Any:
     still fires but explicitly calls `inner.exception()` to mark it
     retrieved before discarding it -- so nothing is ever logged. This
     helper is therefore a forward-compatibility fix for 3.14+, not a fix
-    for the currently declared/CI-tested versions; it must preserve that
-    same "always mark a discarded exception as retrieved" guarantee for
-    the caller-already-cancelled race, or it reintroduces the very
-    "Task exception was never retrieved" warning it exists to avoid.
+    for the currently declared/CI-tested versions.
+
+    Two more invariants, both required by callers that re-shield the same
+    still-running `task` in a retry loop (see run_blocking_startup_work):
+
+    - If `task` is already done, this returns/raises immediately via a
+      plain `await task` -- matching asyncio.shield()'s own fast path --
+      instead of adding a callback and waiter that cost an extra event
+      loop turn.
+    - Exactly one done-callback is ever registered on `task`, for its
+      entire lifetime, regardless of how many times it gets shielded and
+      cancelled. A caller that re-shields the same task after every
+      cancellation (exactly what the retry loop above does) only adds and
+      removes its own *waiter* from a shared per-task waiter list --
+      never a fresh done-callback -- so callback count on `task` never
+      grows with the number of cancellations. A naive add-then-remove
+      done-callback per call would bound growth to "at most one at a
+      time" too, but only by *dropping* the exception-retrieval guarantee
+      the moment nobody is left waiting; keeping the one callback
+      permanently attached (it self-retrieves via `completed_task.exception()`
+      when the waiter list is empty) preserves that guarantee unconditionally,
+      not just for callers that happen to retry.
     """
+    if task.done():
+        return await task  # matches asyncio.shield()'s own fast path
+
     loop = asyncio.get_running_loop()
     waiter = loop.create_future()
 
-    def _propagate(completed_task: asyncio.Task) -> None:
-        if waiter.done():
-            if not completed_task.cancelled():
-                # Caller was already cancelled before `task` finished --
-                # nobody else will retrieve this exception via `waiter`.
-                # Mark it retrieved so a later GC of `completed_task`
-                # doesn't log "Task exception was never retrieved"
-                # (mirrors CPython shield()'s own _inner_done_callback).
-                completed_task.exception()
-            return
-        if completed_task.cancelled():
-            waiter.cancel()
-            return
-        exc = completed_task.exception()
-        if exc is not None:
-            waiter.set_exception(exc)
-        else:
-            waiter.set_result(completed_task.result())
+    # Shared per-task waiter list: repeated/concurrent shield_task(task)
+    # calls reuse the one _propagate callback below instead of each adding
+    # their own, bounding callback growth on `task` to exactly one.
+    waiters = _shield_waiters.get(task)
+    if waiters is None:
+        waiters = []
+        _shield_waiters[task] = waiters
 
-    task.add_done_callback(_propagate)
-    return await waiter
+        def _propagate(completed_task: asyncio.Task) -> None:
+            pending, waiters[:] = waiters[:], []
+            if not pending:
+                if not completed_task.cancelled():
+                    # Nobody is waiting right now -- mark the exception
+                    # retrieved so a later GC of `completed_task` doesn't
+                    # log "Task exception was never retrieved".
+                    completed_task.exception()
+                return
+            if completed_task.cancelled():
+                # `task` itself was cancelled directly (not via a
+                # shield_task() awaiter -- cancelling those only cancels
+                # their own `waiter`, see below). Propagate to every waiter.
+                for w in pending:
+                    if not w.done():
+                        w.cancel()
+                return
+            exc = completed_task.exception()
+            for w in pending:
+                if w.done():
+                    continue
+                if exc is not None:
+                    w.set_exception(exc)
+                else:
+                    w.set_result(completed_task.result())
+
+        task.add_done_callback(_propagate)
+
+    waiters.append(waiter)
+    try:
+        return await waiter
+    except asyncio.CancelledError:
+        # Only our own waiter is cancelled here, not `task` itself.
+        if waiter in waiters:
+            waiters.remove(waiter)
+        raise
 
 
 async def run_blocking_startup_work(
@@ -148,6 +203,9 @@ async def run_blocking_startup_work(
     try:
         await shield_task(task)
     except asyncio.CancelledError:
+        # `task` (e.g. an in-progress model load) must run to completion even
+        # though our own caller gave up -- keep re-shielding it, ignoring
+        # further cancels of *this* coroutine, until it's actually done.
         with suspend_cancellation():
             while not task.done():
                 try:
@@ -155,7 +213,7 @@ async def run_blocking_startup_work(
                 except asyncio.CancelledError:
                     continue
                 except Exception:
-                    break
+                    break  # task's own exception -- already retrieved above
         raise
 
 

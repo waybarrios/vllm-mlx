@@ -5,6 +5,7 @@ import asyncio
 import gc
 import time
 
+import anyio
 import pytest
 
 from vllm_mlx.engine.base import shield_task
@@ -173,3 +174,134 @@ class TestShieldTask:
             loop.set_exception_handler(original_handler)
 
         assert logged_contexts == []
+
+    @pytest.mark.anyio
+    async def test_already_done_task_returns_result_via_fast_path(self):
+        """asyncio.shield() returns an already-done task immediately instead
+        of adding a done-callback and waiting an extra event loop turn.
+        shield_task() must match that (PR #643 review, blocker 2) -- a
+        scheduled cancellation racing the extra turn could otherwise replace
+        an already-available result with CancelledError."""
+        task = asyncio.create_task(asyncio.sleep(0, result="done"))
+        while not task.done():
+            await asyncio.sleep(0)
+        assert await shield_task(task) == "done"
+
+    @pytest.mark.anyio
+    async def test_already_done_task_reraises_exception_via_fast_path(self):
+        async def boom():
+            raise ValueError("kaboom")
+
+        task = asyncio.create_task(boom())
+        while not task.done():
+            await asyncio.sleep(0)
+        with pytest.raises(ValueError, match="kaboom"):
+            await shield_task(task)
+
+    @pytest.mark.anyio
+    async def test_already_cancelled_task_reraises_cancelled_via_fast_path(self):
+        task = asyncio.create_task(asyncio.sleep(10))
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert task.cancelled()
+
+        with pytest.raises(asyncio.CancelledError):
+            await shield_task(task)
+
+    @pytest.mark.anyio
+    async def test_repeated_cancellation_does_not_leak_propagate_callbacks(self):
+        """Regression for PR #643 review blocker 1: every shield_task() call
+        left its `_propagate` done-callback attached to `task` even after the
+        awaiter moved on, so a retry loop that re-shields the same still-
+        running task after each cancellation (see run_blocking_startup_work)
+        accumulated one abandoned callback per cancellation -- reported by
+        review as 8,516 callbacks and ~2x cancellation latency under
+        repeated AnyIO cancellation. Growth must be bounded: at most one
+        _propagate callback attached to `task` at a time, however many
+        times it gets re-shielded and re-cancelled.
+        """
+        started = asyncio.Event()
+
+        async def work():
+            started.set()
+            await asyncio.sleep(10)
+
+        task = asyncio.create_task(work())
+        await started.wait()
+
+        for _ in range(50):
+            scope = anyio.CancelScope()
+            with scope:
+                scope.cancel()
+                await shield_task(task)
+            assert scope.cancelled_caught
+            assert not task.done()
+            # `_callbacks` is None (not an empty list) once every callback
+            # has been removed -- CPython lazily allocates it.
+            assert len(task._callbacks or ()) <= 1
+
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    @pytest.mark.anyio
+    async def test_concurrent_shielders_of_same_task_all_receive_result(self):
+        """shield_task() must support multiple concurrent callers shielding
+        the same task -- real asyncio.shield() does this (each call gets its
+        own outer future), and shield_task()'s docstring claims equivalence.
+        The single per-task done-callback fans a result out to every
+        currently-registered waiter, not just the first one."""
+        task = asyncio.create_task(asyncio.sleep(0, result="done"))
+
+        results = await asyncio.gather(
+            shield_task(task), shield_task(task), shield_task(task)
+        )
+        assert results == ["done", "done", "done"]
+
+    @pytest.mark.anyio
+    async def test_concurrent_shielders_of_same_task_all_receive_exception(self):
+        async def boom():
+            await asyncio.sleep(0)
+            raise ValueError("kaboom")
+
+        task = asyncio.create_task(boom())
+
+        async def shield_and_capture():
+            try:
+                await shield_task(task)
+                return None
+            except ValueError as exc:
+                return exc
+
+        results = await asyncio.gather(shield_and_capture(), shield_and_capture())
+        assert all(isinstance(r, ValueError) for r in results)
+
+    @pytest.mark.anyio
+    async def test_cancelling_one_shielder_does_not_affect_concurrent_shielders(self):
+        """One caller cancelling its own shield_task() await must not
+        disturb a second, concurrent caller shielding the exact same task --
+        proving the shared per-task waiter list removes only the cancelled
+        caller's own entry, leaving the other waiter registered."""
+        started = asyncio.Event()
+
+        async def work():
+            started.set()
+            await asyncio.sleep(0.05)
+            return "finished"
+
+        task = asyncio.create_task(work())
+        await started.wait()
+
+        async def consume():
+            return await shield_task(task)
+
+        consumer_a = asyncio.create_task(consume())
+        consumer_b = asyncio.create_task(consume())
+        await asyncio.sleep(0)  # let both register as waiters
+
+        consumer_a.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await consumer_a
+
+        assert await consumer_b == "finished"
