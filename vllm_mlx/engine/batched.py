@@ -20,6 +20,8 @@ from collections.abc import AsyncIterator
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
+import mlx.core as mx
+
 from ..api.tool_calling import convert_tools_for_template
 from ..api.utils import clean_output_text, extract_multimodal_content, is_mllm_model
 from .base import (
@@ -647,6 +649,7 @@ class BatchedEngine(BaseEngine):
             # The model and its streams lived on this thread; both go with it.
             self._generation_executor.shutdown(wait=True)
             self._generation_executor = None
+        mx.clear_cache()
         logger.info("BatchedEngine stopped")
 
     def _apply_chat_template(

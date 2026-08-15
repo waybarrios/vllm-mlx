@@ -37,6 +37,8 @@ def restore_server_globals():
         "_lazy_load_model",
         "_residency_manager",
         "_lifecycle_task",
+        "_model_manager",
+        "_registry_idle_reaper_task",
         "_lifespan_active",
         "_mcp_manager",
         "_mcp_executor",
@@ -65,6 +67,8 @@ def restore_server_globals():
         "_force_mllm_model": None,
         "_residency_manager": None,
         "_lifecycle_task": None,
+        "_model_manager": None,
+        "_registry_idle_reaper_task": None,
         "_lifespan_active": False,
         "_mcp_manager": None,
         "_mcp_executor": None,
@@ -90,6 +94,16 @@ def restore_server_globals():
         and not leaked_task.done()
     ):
         leaked_task.cancel()
+
+    leaked_reaper = getattr(srv, "_registry_idle_reaper_task", None)
+    original_reaper = snapshot["_registry_idle_reaper_task"]
+    if (
+        leaked_reaper is not sentinel
+        and leaked_reaper is not None
+        and leaked_reaper is not original_reaper
+        and not leaked_reaper.done()
+    ):
+        leaked_reaper.cancel()
 
     for name, value in snapshot.items():
         if value is sentinel:
@@ -1849,6 +1863,89 @@ class TestLifecycleFailureHandling:
             await srv._lifecycle_loop()
 
         assert sleeps == [0.25]
+
+    @pytest.mark.anyio
+    async def test_registry_idle_reaper_task_starts_and_stops_with_lifespan(
+        self, monkeypatch
+    ):
+        """The registry idle reaper must start on lifespan startup when
+        idle_unload_seconds is configured, and be cleanly cancelled on
+        shutdown — mirroring how _lifecycle_task is managed for the
+        single-model residency path.
+        """
+        import vllm_mlx.server as srv
+
+        reaper_started = asyncio.Event()
+        reaper_cancelled = asyncio.Event()
+
+        class FakeModelManager:
+            idle_unload_seconds = 30.0
+
+            async def preload(self):
+                return None
+
+            async def run_idle_reaper(self):
+                reaper_started.set()
+                try:
+                    await asyncio.sleep(60)
+                except asyncio.CancelledError:
+                    reaper_cancelled.set()
+                    raise
+
+            async def shutdown(self):
+                return None
+
+        monkeypatch.setattr(srv, "_engine", None, raising=False)
+        monkeypatch.setattr(srv, "_residency_manager", None, raising=False)
+        monkeypatch.setattr(srv, "_default_model_key", None, raising=False)
+        monkeypatch.setattr(srv, "_mcp_manager", None, raising=False)
+        monkeypatch.setattr(srv, "_lifecycle_task", None, raising=False)
+        monkeypatch.setattr(srv, "_registry_idle_reaper_task", None, raising=False)
+        monkeypatch.setattr(srv, "_model_manager", FakeModelManager(), raising=False)
+
+        lifespan = srv.lifespan(srv.app)
+        await lifespan.__anext__()
+
+        await asyncio.wait_for(reaper_started.wait(), timeout=1.0)
+        assert srv._registry_idle_reaper_task is not None
+
+        with pytest.raises(StopAsyncIteration):
+            await lifespan.__anext__()
+
+        await asyncio.wait_for(reaper_cancelled.wait(), timeout=1.0)
+        assert srv._registry_idle_reaper_task is None
+
+    @pytest.mark.anyio
+    async def test_registry_idle_reaper_task_not_started_when_disabled(
+        self, monkeypatch
+    ):
+        """No background reaper should run when idle_unload_seconds is 0."""
+        import vllm_mlx.server as srv
+
+        class FakeModelManager:
+            idle_unload_seconds = 0.0
+
+            async def preload(self):
+                return None
+
+            async def shutdown(self):
+                return None
+
+        monkeypatch.setattr(srv, "_engine", None, raising=False)
+        monkeypatch.setattr(srv, "_residency_manager", None, raising=False)
+        monkeypatch.setattr(srv, "_default_model_key", None, raising=False)
+        monkeypatch.setattr(srv, "_mcp_manager", None, raising=False)
+        monkeypatch.setattr(srv, "_lifecycle_task", None, raising=False)
+        monkeypatch.setattr(srv, "_registry_idle_reaper_task", None, raising=False)
+        monkeypatch.setattr(srv, "_model_manager", FakeModelManager(), raising=False)
+
+        lifespan = srv.lifespan(srv.app)
+        await lifespan.__anext__()
+
+        assert srv._registry_idle_reaper_task is None
+
+        with pytest.raises(StopAsyncIteration):
+            await lifespan.__anext__()
 
     @pytest.mark.anyio
     async def test_cache_restore_hook_does_not_block_event_loop(self, monkeypatch):

@@ -965,6 +965,7 @@ class SimpleEngine(BaseEngine):
                 executor.shutdown(wait=False, cancel_futures=True)
                 if pre_bind is not None:
                     restore_generation_streams(pre_bind)
+        mx.clear_cache()
         logger.info("SimpleEngine stopped")
 
     def _should_route_text_through_text_model(
