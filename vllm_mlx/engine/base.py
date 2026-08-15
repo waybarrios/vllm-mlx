@@ -83,22 +83,42 @@ def suspend_cancellation():
 async def shield_task(task: asyncio.Task) -> Any:
     """Equivalent to ``await asyncio.shield(task)``, minus one asyncio quirk.
 
-    asyncio.shield()'s own implementation unconditionally reassigns `task`'s
-    done-callback to an internal "log on exception" handler the instant its
-    wrapper future is cancelled (CPython asyncio.tasks.shield /
-    _outer_done_callback). That handler calls loop.call_exception_handler()
-    for whatever `task` eventually raises, regardless of whether the caller
-    goes on to retrieve that exception itself afterward -- and pytest-anyio
-    (and similar loop exception hooks) treat that call as an
-    unhandled-exception test failure even when the exception is fully
-    expected and handled. Waiting on our own plain Future sidesteps that
-    reassignment entirely.
+    On CPython 3.14+, asyncio.shield()'s implementation unconditionally
+    reassigns `task`'s done-callback to an internal "log on exception"
+    handler the instant its wrapper future is cancelled (CPython
+    asyncio.tasks.shield / _outer_done_callback / _log_on_exception). That
+    handler calls loop.call_exception_handler() for whatever `task`
+    eventually raises, regardless of whether the caller goes on to retrieve
+    that exception itself afterward -- and pytest-anyio (and similar loop
+    exception hooks) treat that call as an unhandled-exception test failure
+    even when the exception is fully expected and handled.
+
+    This does not reproduce on the currently supported CPython 3.10-3.13:
+    there, shield() uses two callbacks instead of one -- an outer-cancel
+    callback that removes the inner task's done-callback once the caller
+    cancels (so a later `await task` by the caller is the only thing that
+    retrieves the exception), and, for the race where the inner task
+    finishes before that removal lands, the inner done-callback itself
+    still fires but explicitly calls `inner.exception()` to mark it
+    retrieved before discarding it -- so nothing is ever logged. This
+    helper is therefore a forward-compatibility fix for 3.14+, not a fix
+    for the currently declared/CI-tested versions; it must preserve that
+    same "always mark a discarded exception as retrieved" guarantee for
+    the caller-already-cancelled race, or it reintroduces the very
+    "Task exception was never retrieved" warning it exists to avoid.
     """
     loop = asyncio.get_running_loop()
     waiter = loop.create_future()
 
     def _propagate(completed_task: asyncio.Task) -> None:
         if waiter.done():
+            if not completed_task.cancelled():
+                # Caller was already cancelled before `task` finished --
+                # nobody else will retrieve this exception via `waiter`.
+                # Mark it retrieved so a later GC of `completed_task`
+                # doesn't log "Task exception was never retrieved"
+                # (mirrors CPython shield()'s own _inner_done_callback).
+                completed_task.exception()
             return
         if completed_task.cancelled():
             waiter.cancel()

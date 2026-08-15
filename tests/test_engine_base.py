@@ -2,6 +2,7 @@
 """Tests for shared engine helpers in vllm_mlx/engine/base.py."""
 
 import asyncio
+import gc
 import time
 
 import pytest
@@ -107,6 +108,66 @@ class TestShieldTask:
 
             # Let the event loop process any pending callbacks (including a
             # would-be call_exception_handler invocation) before asserting.
+            await asyncio.sleep(0)
+        finally:
+            loop.set_exception_handler(original_handler)
+
+        assert logged_contexts == []
+
+    @pytest.mark.anyio
+    async def test_cancel_before_task_exception_does_not_leak_unretrieved_exception(
+        self,
+    ):
+        """Deterministic regression test for the race inside `_propagate`
+        itself (not asyncio.shield()): if the awaiter is cancelled *before*
+        `task` finishes, `waiter` is already done by the time `_propagate`
+        runs. Unlike test_cancellation_does_not_trigger_loop_exception_handler
+        above, this test never separately does `await task` afterward --
+        emulating a retry loop that gives up rather than re-awaiting. If
+        `_propagate` doesn't retrieve `task`'s exception on that
+        already-done-`waiter` path, Python logs "Task exception was never
+        retrieved" once `task` is garbage collected, reproducing the exact
+        symptom this PR exists to eliminate via a different path.
+        """
+        loop = asyncio.get_running_loop()
+        logged_contexts = []
+        original_handler = loop.get_exception_handler()
+        loop.set_exception_handler(
+            lambda _loop, context: logged_contexts.append(context)
+        )
+        try:
+            release_task = asyncio.Event()
+
+            async def work():
+                await release_task.wait()
+                raise RuntimeError("expected background failure")
+
+            task = asyncio.create_task(work())
+
+            async def consume():
+                return await shield_task(task)
+
+            consumer = asyncio.create_task(consume())
+            await asyncio.sleep(0)  # let consumer start awaiting shield_task
+            consumer.cancel()
+
+            with pytest.raises(asyncio.CancelledError):
+                await consumer
+
+            # The race window: `waiter` inside shield_task is already
+            # cancelled, but `task` is still running.
+            assert not task.done()
+
+            release_task.set()
+            # Let `task` raise WITHOUT the caller ever awaiting it or
+            # reading its exception itself.
+            for _ in range(10):
+                await asyncio.sleep(0)
+            assert task.done()
+
+            task = None
+            consumer = None
+            gc.collect()
             await asyncio.sleep(0)
         finally:
             loop.set_exception_handler(original_handler)
