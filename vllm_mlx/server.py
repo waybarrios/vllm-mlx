@@ -193,6 +193,10 @@ _warm_prompts_path: str | None = None  # Path to JSON of prompts to pre-warm at 
 _default_model_key: str | None = None
 _default_max_tokens: int = 32768
 _max_request_tokens: int = 32768
+_embedding_max_length: int | None = (
+    None  # Set via --embedding-max-length ('auto' = None)
+)
+_embedding_overflow_policy: str = "truncate"  # Set via --embedding-overflow-policy
 _default_timeout: float = 300.0  # Default request timeout in seconds (5 minutes)
 _default_temperature: float | None = None  # Set via --default-temperature
 _default_top_p: float | None = None  # Set via --default-top-p
@@ -3118,7 +3122,11 @@ def load_embedding_model(
 
     from .embedding import EmbeddingEngine
 
-    _embedding_engine = EmbeddingEngine(model_name)
+    _embedding_engine = EmbeddingEngine(
+        model_name,
+        max_length_ceiling=_embedding_max_length,
+        overflow_policy=_embedding_overflow_policy,
+    )
     _embedding_engine.load()
 
 
@@ -3495,6 +3503,17 @@ async def health():
     return payload
 
 
+def _embedding_status() -> dict[str, object] | None:
+    """Effective embedding config, for status/config reporting."""
+    if _embedding_engine is None:
+        return None
+    return {
+        "model": _embedding_engine.model_name,
+        "max_length": _embedding_max_length or "auto",
+        "overflow_policy": _embedding_overflow_policy,
+    }
+
+
 @app.get("/v1/status", dependencies=[Depends(verify_api_key)])
 async def status():
     """Real-time status with per-request details for debugging and monitoring."""
@@ -3507,6 +3526,7 @@ async def status():
                 ),
                 "models": _model_manager.list_models(),
             },
+            "embedding": _embedding_status(),
         }
     lifecycle = _public_lifecycle_status(_get_lifecycle_status())
     if _engine is None:
@@ -3515,6 +3535,7 @@ async def status():
             "model": _model_name,
             "residency": lifecycle,
             "requests": [],
+            "embedding": _embedding_status(),
         }
 
     stats = _engine.get_stats()
@@ -3526,6 +3547,7 @@ async def status():
         "status": "running" if stats.get("running") else "stopped",
         "model": _model_name,
         "residency": lifecycle,
+        "embedding": _embedding_status(),
         "uptime_s": round(stats.get("uptime_seconds", 0), 1),
         "steps_executed": stats.get("steps_executed", 0),
         "num_running": stats.get("num_running", 0),
@@ -3788,6 +3810,8 @@ async def create_embeddings(request: EmbeddingRequest) -> EmbeddingResponse:
     server startup.
     """
     global _embedding_engine
+    from .embedding import EmbeddingLengthExceededError
+
     tracker = _metrics.track_inference("embeddings", stream=False)
 
     try:
@@ -3839,6 +3863,18 @@ async def create_embeddings(request: EmbeddingRequest) -> EmbeddingResponse:
         )
         return response
 
+    except EmbeddingLengthExceededError as exc:
+        tracker.finish(result="error")
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "embedding_input_too_long",
+                "message": str(exc),
+                "input_index": exc.text_index,
+                "token_count": exc.token_count,
+                "max_length": exc.max_length,
+            },
+        ) from exc
     except ImportError:
         tracker.finish(result="error")
         raise HTTPException(

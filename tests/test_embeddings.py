@@ -59,6 +59,72 @@ class TestEmbeddingModels:
 # =============================================================================
 
 
+class TestEmbeddingEngineLoadWarning:
+    """Test the startup warning for large, unbounded context windows."""
+
+    def test_load_warns_on_large_uncapped_context(self):
+        """No ceiling + a large model-reported context window warns at load time."""
+        pytest.importorskip("mlx_embeddings")
+
+        from vllm_mlx.embedding import EmbeddingEngine
+
+        engine = EmbeddingEngine("test-model")
+
+        mock_model = MagicMock()
+        mock_model.config.max_position_embeddings = 40960
+        mock_tokenizer = MagicMock()
+
+        with (
+            patch("mlx_embeddings.load", return_value=(mock_model, mock_tokenizer)),
+            patch("vllm_mlx.embedding.logger") as mock_logger,
+        ):
+            engine.load()
+
+        mock_logger.warning.assert_called_once()
+        assert engine._max_length == 40960
+
+    def test_load_does_not_warn_when_ceiling_set(self):
+        """An explicit ceiling suppresses the large-context startup warning."""
+        pytest.importorskip("mlx_embeddings")
+
+        from vllm_mlx.embedding import EmbeddingEngine
+
+        engine = EmbeddingEngine("test-model", max_length_ceiling=4096)
+
+        mock_model = MagicMock()
+        mock_model.config.max_position_embeddings = 40960
+        mock_tokenizer = MagicMock()
+
+        with (
+            patch("mlx_embeddings.load", return_value=(mock_model, mock_tokenizer)),
+            patch("vllm_mlx.embedding.logger") as mock_logger,
+        ):
+            engine.load()
+
+        mock_logger.warning.assert_not_called()
+        assert engine._max_length == 4096
+
+    def test_load_does_not_warn_for_small_context(self):
+        """No ceiling, but a small (classic BERT-sized) context: no warning."""
+        pytest.importorskip("mlx_embeddings")
+
+        from vllm_mlx.embedding import EmbeddingEngine
+
+        engine = EmbeddingEngine("test-model")
+
+        mock_model = MagicMock()
+        mock_model.config.max_position_embeddings = 512
+        mock_tokenizer = MagicMock()
+
+        with (
+            patch("mlx_embeddings.load", return_value=(mock_model, mock_tokenizer)),
+            patch("vllm_mlx.embedding.logger") as mock_logger,
+        ):
+            engine.load()
+
+        mock_logger.warning.assert_not_called()
+
+
 class TestEmbeddingEngine:
     """Test the EmbeddingEngine wrapper."""
 
@@ -229,6 +295,165 @@ class TestEmbeddingEngine:
         count = engine.count_tokens(["hello", "world"])
         assert count == 10  # 5 tokens * 2 texts
 
+    def test_embed_ceiling_clamps_config_value(self):
+        """Positive: max_length_ceiling clamps the model-derived max_length."""
+        import numpy as np
+
+        from vllm_mlx.embedding import EmbeddingEngine
+
+        engine = EmbeddingEngine("test-model", max_length_ceiling=256)
+
+        mock_output = MagicMock()
+        mock_output.text_embeds.tolist.return_value = [[0.1, 0.2]]
+        mock_model = MagicMock(return_value=mock_output)
+        mock_model.config.max_position_embeddings = 8192
+
+        mock_inner_tokenizer = MagicMock()
+        mock_inner_tokenizer.return_value = {
+            "input_ids": np.array([[1, 2]]),
+            "attention_mask": np.array([[1, 1]]),
+        }
+        mock_tokenizer = MagicMock()
+        mock_tokenizer._tokenizer = mock_inner_tokenizer
+
+        with patch.object(engine, "_ensure_loaded"):
+            engine._model = mock_model
+            engine._tokenizer = mock_tokenizer
+            engine.embed(["hello"])
+
+        assert mock_inner_tokenizer.call_args.kwargs["max_length"] == 256
+
+    def test_embed_error_policy_raises_on_overflow(self):
+        """overflow_policy='error' rejects an over-limit input instead of
+        truncating it, and never reaches the model."""
+        from vllm_mlx.embedding import EmbeddingEngine, EmbeddingLengthExceededError
+
+        engine = EmbeddingEngine(
+            "test-model", max_length_ceiling=10, overflow_policy="error"
+        )
+
+        mock_model = MagicMock()
+        mock_model.config.max_position_embeddings = 8192
+        mock_tokenizer = MagicMock()
+        mock_tokenizer.encode.return_value = list(range(20))  # 20 > ceiling of 10
+
+        with patch.object(engine, "_ensure_loaded"):
+            engine._model = mock_model
+            engine._tokenizer = mock_tokenizer
+            with pytest.raises(EmbeddingLengthExceededError) as exc_info:
+                engine.embed(["a very long text"])
+
+        assert exc_info.value.text_index == 0
+        assert exc_info.value.token_count == 20
+        assert exc_info.value.max_length == 10
+        mock_model.assert_not_called()
+
+    def test_embed_error_policy_does_not_raise_within_limit(self):
+        """overflow_policy='error' embeds normally when inputs are within limit."""
+        import numpy as np
+
+        from vllm_mlx.embedding import EmbeddingEngine
+
+        engine = EmbeddingEngine(
+            "test-model", max_length_ceiling=10, overflow_policy="error"
+        )
+
+        mock_output = MagicMock()
+        mock_output.text_embeds.tolist.return_value = [[0.1, 0.2]]
+        mock_model = MagicMock(return_value=mock_output)
+        mock_model.config.max_position_embeddings = 8192
+
+        mock_inner_tokenizer = MagicMock()
+        mock_inner_tokenizer.return_value = {
+            "input_ids": np.array([[1, 2]]),
+            "attention_mask": np.array([[1, 1]]),
+        }
+        mock_tokenizer = MagicMock()
+        mock_tokenizer._tokenizer = mock_inner_tokenizer
+        mock_tokenizer.encode.return_value = [1, 2, 3]  # within limit
+
+        with patch.object(engine, "_ensure_loaded"):
+            engine._model = mock_model
+            engine._tokenizer = mock_tokenizer
+            result = engine.embed(["short"])
+
+        assert len(result) == 1
+
+    def test_embed_truncate_policy_logs_and_increments_metric(self):
+        """overflow_policy='truncate' (default) still truncates, but now
+        observably: a warning is logged and the metric is incremented."""
+        import numpy as np
+
+        from vllm_mlx.embedding import EmbeddingEngine
+
+        engine = EmbeddingEngine("test-model", max_length_ceiling=10)
+
+        mock_output = MagicMock()
+        mock_output.text_embeds.tolist.return_value = [[0.1, 0.2]]
+        mock_model = MagicMock(return_value=mock_output)
+        mock_model.config.max_position_embeddings = 8192
+
+        mock_inner_tokenizer = MagicMock()
+        mock_inner_tokenizer.return_value = {
+            "input_ids": np.array([[1, 2]]),
+            "attention_mask": np.array([[1, 1]]),
+        }
+        mock_tokenizer = MagicMock()
+        mock_tokenizer._tokenizer = mock_inner_tokenizer
+        mock_tokenizer.encode.return_value = list(range(20))  # 20 > ceiling of 10
+
+        with (
+            patch.object(engine, "_ensure_loaded"),
+            patch("vllm_mlx.embedding.metrics") as mock_metrics,
+        ):
+            engine._model = mock_model
+            engine._tokenizer = mock_tokenizer
+            result = engine.embed(["a very long text"])
+
+        assert len(result) == 1
+        mock_metrics.observe_embedding_truncated.assert_called_once_with(
+            model="test-model"
+        )
+        # Still truncates to the effective max_length, unlike 'error'.
+        assert mock_inner_tokenizer.call_args.kwargs["max_length"] == 10
+
+    def test_embed_truncate_policy_logs_once_per_batch(self):
+        """A batch with multiple over-limit texts logs a single aggregated
+        warning (not one per text), so a large batch can't flood the log.
+        The metric still increments once per over-limit text."""
+        import numpy as np
+
+        from vllm_mlx.embedding import EmbeddingEngine
+
+        engine = EmbeddingEngine("test-model", max_length_ceiling=10)
+
+        mock_output = MagicMock()
+        mock_output.text_embeds.tolist.return_value = [[0.1]] * 3
+        mock_model = MagicMock(return_value=mock_output)
+        mock_model.config.max_position_embeddings = 8192
+
+        mock_inner_tokenizer = MagicMock()
+        mock_inner_tokenizer.return_value = {
+            "input_ids": np.array([[1, 2]] * 3),
+            "attention_mask": np.array([[1, 1]] * 3),
+        }
+        mock_tokenizer = MagicMock()
+        mock_tokenizer._tokenizer = mock_inner_tokenizer
+        # All three texts exceed the ceiling of 10.
+        mock_tokenizer.encode.return_value = list(range(20))
+
+        with (
+            patch.object(engine, "_ensure_loaded"),
+            patch("vllm_mlx.embedding.logger") as mock_logger,
+            patch("vllm_mlx.embedding.metrics") as mock_metrics,
+        ):
+            engine._model = mock_model
+            engine._tokenizer = mock_tokenizer
+            engine.embed(["long one", "long two", "long three"])
+
+        mock_logger.warning.assert_called_once()
+        assert mock_metrics.observe_embedding_truncated.call_count == 3
+
 
 # =============================================================================
 # Integration Tests - FastAPI Endpoint
@@ -328,7 +553,9 @@ class TestEmbeddingsEndpoint:
                 )
                 assert resp.status_code == 200
                 mock_cls.assert_called_once_with(
-                    "mlx-community/multilingual-e5-small-mlx"
+                    "mlx-community/multilingual-e5-small-mlx",
+                    max_length_ceiling=srv._embedding_max_length,
+                    overflow_policy=srv._embedding_overflow_policy,
                 )
                 new_engine.load.assert_called_once()
         finally:
@@ -370,6 +597,90 @@ class TestEmbeddingsEndpoint:
         body = resp.json()
         assert "attacker/unknown-embedding" in body["detail"]
         assert "--embedding-model" in body["detail"]
+
+    def test_overflow_error_policy_returns_structured_400(self, client):
+        """Test overflow_policy='error' surfaces a structured 400 with the
+        observed token count and effective max_length."""
+        import vllm_mlx.server as srv
+        from vllm_mlx.embedding import EmbeddingLengthExceededError
+
+        mock_engine = MagicMock()
+        mock_engine.model_name = "mlx-community/all-MiniLM-L6-v2-4bit"
+        mock_engine.count_tokens.return_value = 1400
+        mock_engine.embed.side_effect = EmbeddingLengthExceededError(0, 1400, 1024)
+
+        original = srv._embedding_engine
+        srv._embedding_engine = mock_engine
+        try:
+            resp = client.post(
+                "/v1/embeddings",
+                json={
+                    "model": "mlx-community/all-MiniLM-L6-v2-4bit",
+                    "input": "a very long text",
+                },
+            )
+        finally:
+            srv._embedding_engine = original
+
+        assert resp.status_code == 400
+        detail = resp.json()["detail"]
+        assert detail["error"] == "embedding_input_too_long"
+        assert detail["input_index"] == 0
+        assert detail["token_count"] == 1400
+        assert detail["max_length"] == 1024
+
+    def test_load_embedding_model_passes_ceiling_and_policy(self):
+        """Test load_embedding_model() wires the configured ceiling/policy
+        globals through to EmbeddingEngine."""
+        import vllm_mlx.server as srv
+
+        original_engine = srv._embedding_engine
+        original_ceiling = srv._embedding_max_length
+        original_policy = srv._embedding_overflow_policy
+        srv._embedding_engine = None
+        srv._embedding_max_length = 999
+        srv._embedding_overflow_policy = "error"
+
+        try:
+            with patch("vllm_mlx.embedding.EmbeddingEngine") as mock_cls:
+                mock_cls.return_value = MagicMock()
+                srv.load_embedding_model("some-model", lock=False)
+                mock_cls.assert_called_once_with(
+                    "some-model", max_length_ceiling=999, overflow_policy="error"
+                )
+        finally:
+            srv._embedding_engine = original_engine
+            srv._embedding_max_length = original_ceiling
+            srv._embedding_overflow_policy = original_policy
+
+    def test_status_reports_embedding_config(self, client):
+        """Test GET /v1/status includes the effective embedding config."""
+        import vllm_mlx.server as srv
+
+        mock_engine = MagicMock()
+        mock_engine.model_name = "mlx-community/all-MiniLM-L6-v2-4bit"
+
+        original_engine = srv._embedding_engine
+        original_ceiling = srv._embedding_max_length
+        original_policy = srv._embedding_overflow_policy
+        srv._embedding_engine = mock_engine
+        srv._embedding_max_length = 1024
+        srv._embedding_overflow_policy = "error"
+
+        try:
+            resp = client.get("/v1/status")
+        finally:
+            srv._embedding_engine = original_engine
+            srv._embedding_max_length = original_ceiling
+            srv._embedding_overflow_policy = original_policy
+
+        assert resp.status_code == 200
+        embedding_status = resp.json()["embedding"]
+        assert embedding_status == {
+            "model": "mlx-community/all-MiniLM-L6-v2-4bit",
+            "max_length": 1024,
+            "overflow_policy": "error",
+        }
 
 
 # =============================================================================

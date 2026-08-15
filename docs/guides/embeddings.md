@@ -89,6 +89,44 @@ vllm-mlx serve my-llm-model --embedding-model mlx-community/all-MiniLM-L6-v2-4bi
 
 Requesting a different model will return a 400 error.
 
+### Input length: ceiling and overflow policy
+
+The truncation length used to tokenize input defaults to each model's own context window (`config.max_position_embeddings`, or a sanitized `tokenizer.model_max_length`, falling back to 512 when neither is usable). Classic 512-token BERT-family models are unaffected by this default.
+
+Operators can additionally cap that value with `--embedding-max-length`, and choose what happens when an input still exceeds the effective limit with `--embedding-overflow-policy`:
+
+```bash
+vllm-mlx serve my-llm-model \
+  --embedding-model mlx-community/embeddinggemma-300m-6bit \
+  --embedding-max-length 1024 \
+  --embedding-overflow-policy error
+```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--embedding-max-length` | `auto` | `auto` (or omitting the flag) uses the model-aware default above. A positive integer imposes a lower deployment-wide ceiling — the effective limit is `min(model-aware default, ceiling)`, so it can only lower the limit, never raise it above what the model supports. |
+| `--embedding-overflow-policy` | `truncate` | `truncate` keeps today's behavior (input is truncated to the effective limit) but logs a warning and increments the `vllm_mlx_embedding_truncated_total` metric with the model, original token count, and effective limit. `error` rejects over-limit inputs instead, with a structured 400 response. |
+
+**Memory implications of large context windows.** `auto` (the default) trusts the model's own declared context window uncapped — this is deliberate, so a large-context model like `Qwen3-Embedding-4B` isn't silently restricted to 512 tokens. But requests are tokenized with `padding=True`, so every text in a batch is padded to the length of the *longest* text in that same batch: one long outlier drags the whole batch up to its length, not just that one input. Combined with attention cost scaling roughly quadratically with sequence length, an unbounded large-context model can use dramatically more memory per batch than the 512-token models this server shipped with historically.
+
+If you pin a large-context embedding model with `--embedding-model`, the server logs a `WARNING` at startup when the resolved context exceeds 4096 tokens and no `--embedding-max-length` is set, as a nudge to set an explicit, memory-appropriate ceiling for your hardware (e.g. `--embedding-max-length 4096`) rather than running fully unbounded in production.
+
+Example `error`-policy response when an input exceeds the effective limit:
+
+```json
+{
+  "detail": {
+    "error": "embedding_input_too_long",
+    "message": "Input 0 has 1400 tokens, exceeding the effective embedding max length of 1024",
+    "input_index": 0,
+    "token_count": 1400,
+    "max_length": 1024
+  }
+}
+```
+
+The effective embedding `max_length` and `overflow_policy` are also reported under the `embedding` key of `GET /v1/status`.
+
 ## API Reference
 
 ### POST /v1/embeddings
@@ -115,6 +153,8 @@ Create embeddings for the given input text(s).
   "usage": {"prompt_tokens": 12, "total_tokens": 12}
 }
 ```
+
+A 400 response with a structured `embedding_input_too_long` detail (see above) is returned when `--embedding-overflow-policy error` is set and an input exceeds the effective max length.
 
 ## Python API
 

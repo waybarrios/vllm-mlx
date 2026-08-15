@@ -60,3 +60,21 @@ def make_positive_int_arg_parser(option_name: str) -> Callable[[str], int]:
         return parse_positive_int_arg(value, option_name)
 
     return _parser
+
+
+def parse_auto_or_positive_int_arg(value: str, option_name: str) -> int | None:
+    """Parse an option that is either the literal 'auto' or a positive integer."""
+    if value.strip().lower() == "auto":
+        return None
+    return parse_positive_int_arg(value, option_name)
+
+
+def make_auto_or_positive_int_arg_parser(
+    option_name: str,
+) -> Callable[[str], int | None]:
+    """Create an argparse type parser for 'auto'-or-positive-integer options."""
+
+    def _parser(value: str) -> int | None:
+        return parse_auto_or_positive_int_arg(value, option_name)
+
+    return _parser

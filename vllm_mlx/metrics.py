@@ -162,6 +162,12 @@ class MetricsCollector:
                 ["endpoint", "stream"],
                 registry=registry,
             ),
+            "embedding_truncated_total": Counter(
+                "vllm_mlx_embedding_truncated_total",
+                "Embedding inputs silently truncated under the truncate overflow policy.",
+                ["model"],
+                registry=registry,
+            ),
             "model_loaded": Gauge(
                 "vllm_mlx_model_loaded",
                 "Whether a generation model is currently loaded.",
@@ -345,6 +351,11 @@ class MetricsCollector:
                 endpoint=endpoint,
                 stream=stream_label,
             ).inc(completion_tokens)
+
+    def observe_embedding_truncated(self, *, model: str) -> None:
+        if not self._enabled or self._prom is None:
+            return
+        self._prom["embedding_truncated_total"].labels(model=model).inc()
 
     def observe_ttft(self, *, endpoint: str, stream: bool, value: float) -> None:
         if not self._enabled or self._prom is None:

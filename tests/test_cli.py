@@ -19,6 +19,8 @@ def _serve_args(**overrides):
         "download_retries": 0,
         "download_timeout": 1,
         "embedding_model": None,
+        "embedding_max_length": None,
+        "embedding_overflow_policy": "truncate",
         "enable_auto_tool_choice": False,
         "enable_metrics": False,
         "enable_mtp": False,
