@@ -22,6 +22,14 @@ logger = logging.getLogger(__name__)
 # unbounded context windows can use disproportionate memory.
 LARGE_CONTEXT_WARNING_THRESHOLD = 4096
 
+# Default cap on total (post-truncation) tokens per forward pass. Mirrors
+# RerankEngine.token_budget (vllm_mlx/rerank.py): a request's texts are
+# still accepted as one unbounded list, but embed() packs them into
+# sub-batches bounded by this budget instead of a single batch padded to
+# the longest member — so one large request can't unilaterally blow up
+# memory/compute.
+DEFAULT_EMBEDDING_TOKEN_BUDGET = 4096
+
 
 class EmbeddingLengthExceededError(Exception):
     """Raised under the "error" overflow policy when an input exceeds the
@@ -51,6 +59,7 @@ class EmbeddingEngine:
         *,
         max_length_ceiling: int | None = None,
         overflow_policy: str = "truncate",
+        token_budget: int = DEFAULT_EMBEDDING_TOKEN_BUDGET,
     ):
         self.model_name = model_name
         self._model = None
@@ -58,10 +67,23 @@ class EmbeddingEngine:
         self._max_length: int | None = None
         self._max_length_ceiling = max_length_ceiling
         self._overflow_policy = overflow_policy
+        self._token_budget = token_budget
 
     @property
     def is_loaded(self) -> bool:
         return self._model is not None
+
+    @property
+    def effective_max_length(self) -> int | None:
+        """The truncation length actually applied by embed(), resolved from
+        the loaded model's config and clamped by the configured ceiling
+        (see resolve_max_length()). Unlike the raw ceiling, this reflects
+        what the engine really uses — e.g. a 512-token model with an 8192
+        ceiling still reports 512 here. None before the model has loaded.
+        """
+        if not self.is_loaded:
+            return None
+        return self._resolve_max_length()
 
     def load(self) -> None:
         """Load the embedding model and tokenizer."""
@@ -102,17 +124,30 @@ class EmbeddingEngine:
             )
         return self._max_length
 
-    def _token_length(self, text: str) -> int:
-        """Raw (untruncated) token count for a single text."""
+    def _exact_token_length(self, text: str) -> int:
+        """Raw (untruncated) token count for a single text, via the real
+        tokenizer. Used to enforce the overflow policy — that decision needs
+        an accurate count, not an estimate that could silently let an
+        over-limit input through (or reject a valid one). Propagates any
+        tokenizer failure instead of masking it with a heuristic; see
+        _estimated_token_length() for the reporting-only fallback.
+        """
+        tokens = self._tokenizer.encode(text)
+        if isinstance(tokens, list):
+            return len(tokens)
+        elif hasattr(tokens, "__len__"):
+            return len(tokens)
+        return tokens.size
+
+    def _estimated_token_length(self, text: str) -> int:
+        """Approximate token count for usage reporting only (count_tokens()).
+        Falls back to a rough ~4-chars-per-token estimate if the tokenizer
+        can't encode the text — acceptable for a reported number, but not for
+        the overflow-policy decision in embed() (see _exact_token_length()).
+        """
         try:
-            tokens = self._tokenizer.encode(text)
-            if isinstance(tokens, list):
-                return len(tokens)
-            elif hasattr(tokens, "__len__"):
-                return len(tokens)
-            return tokens.size
+            return self._exact_token_length(text)
         except Exception:
-            # Fallback: rough estimate of ~4 chars per token
             return max(1, len(text) // 4)
 
     def embed(self, texts: str | list[str]) -> list[list[float]]:
@@ -135,9 +170,11 @@ class EmbeddingEngine:
             texts = [texts]
 
         max_length = self._resolve_max_length()
+        raw_counts: list[int] = []
         overflows: list[tuple[int, int]] = []
         for i, text in enumerate(texts):
-            token_count = self._token_length(text)
+            token_count = self._exact_token_length(text)
+            raw_counts.append(token_count)
             if token_count <= max_length:
                 continue
             if self._overflow_policy == "error":
@@ -168,24 +205,38 @@ class EmbeddingEngine:
         # GemmaTokenizer lacks batch_encode_plus, and the model's __call__
         # expects positional `inputs` not `input_ids` as a kwarg).
         inner_tok = inner_tokenizer(self._tokenizer)
-        encoded = inner_tok(
-            texts,
-            padding=True,
-            truncation=True,
-            max_length=max_length,
-            return_tensors="np",
-        )
 
-        input_ids = mx.array(encoded["input_ids"])
-        attention_mask = mx.array(encoded["attention_mask"])
+        # Pack into sub-batches bounded by self._token_budget instead of one
+        # batch padded to the single longest input: `padding=True` pads
+        # every text in a batch to its longest member, and attention cost
+        # scales roughly quadratically with sequence length, so an unbounded
+        # request (one huge input, or many inputs near max_length) can
+        # otherwise blow up memory/compute for that one request.
+        # Budgeted on the post-truncation length, since that's what's
+        # actually padded/computed — mirrors RerankEngine.score_pairs().
+        effective_counts = [min(c, max_length) for c in raw_counts]
+        result: list[list[float] | None] = [None] * len(texts)
+        for batch_indices in self._token_budget_batches(effective_counts):
+            batch_texts = [texts[i] for i in batch_indices]
+            encoded = inner_tok(
+                batch_texts,
+                padding=True,
+                truncation=True,
+                max_length=max_length,
+                return_tensors="np",
+            )
 
-        output = self._model(input_ids, attention_mask=attention_mask)
+            input_ids = mx.array(encoded["input_ids"])
+            attention_mask = mx.array(encoded["attention_mask"])
 
-        # text_embeds shape: (batch_size, embedding_dim)
-        embeds: mx.array = output.text_embeds
+            output = self._model(input_ids, attention_mask=attention_mask)
 
-        # Convert to Python lists for JSON serialization
-        result = embeds.tolist()
+            # text_embeds shape: (batch_size, embedding_dim)
+            embeds: mx.array = output.text_embeds
+
+            # Convert to Python lists for JSON serialization
+            for idx, embed in zip(batch_indices, embeds.tolist()):
+                result[idx] = embed
 
         # Release the Metal buffers this pass allocated. MLX keeps freed buffers
         # in its allocator pool, keyed by size, and `padding=True` above makes
@@ -195,7 +246,28 @@ class EmbeddingEngine:
         # fresh process from 2.3 GB to 24 GB over 320 texts.
         mx.clear_cache()
 
-        return result
+        return result  # type: ignore[return-value]
+
+    def _token_budget_batches(self, effective_counts: list[int]) -> list[list[int]]:
+        """Group text indices into sub-batches whose summed token count stays
+        at or under self._token_budget, in input order. A single text over
+        budget on its own still forms a batch of one — the budget bounds how
+        many texts get padded together, not any individual sequence length
+        (that bound is max_length itself, applied via truncation).
+        """
+        batches: list[list[int]] = []
+        current: list[int] = []
+        current_tokens = 0
+        for i, count in enumerate(effective_counts):
+            if current and current_tokens + count > self._token_budget:
+                batches.append(current)
+                current = []
+                current_tokens = 0
+            current.append(i)
+            current_tokens += count
+        if current:
+            batches.append(current)
+        return batches
 
     def count_tokens(self, texts: str | list[str]) -> int:
         """Approximate token count for usage reporting."""
@@ -204,4 +276,4 @@ class EmbeddingEngine:
         if isinstance(texts, str):
             texts = [texts]
 
-        return sum(self._token_length(text) for text in texts)
+        return sum(self._estimated_token_length(text) for text in texts)

@@ -107,7 +107,7 @@ vllm-mlx serve my-llm-model \
 | `--embedding-max-length` | `auto` | `auto` (or omitting the flag) uses the model-aware default above. A positive integer imposes a lower deployment-wide ceiling — the effective limit is `min(model-aware default, ceiling)`, so it can only lower the limit, never raise it above what the model supports. |
 | `--embedding-overflow-policy` | `truncate` | `truncate` keeps today's behavior (input is truncated to the effective limit) but logs a warning and increments the `vllm_mlx_embedding_truncated_total` metric with the model, original token count, and effective limit. `error` rejects over-limit inputs instead, with a structured 400 response. |
 
-**Memory implications of large context windows.** `auto` (the default) trusts the model's own declared context window uncapped — this is deliberate, so a large-context model like `Qwen3-Embedding-4B` isn't silently restricted to 512 tokens. But requests are tokenized with `padding=True`, so every text in a batch is padded to the length of the *longest* text in that same batch: one long outlier drags the whole batch up to its length, not just that one input. Combined with attention cost scaling roughly quadratically with sequence length, an unbounded large-context model can use dramatically more memory per batch than the 512-token models this server shipped with historically.
+**Memory implications of large context windows.** `auto` (the default) trusts the model's own declared context window uncapped — this is deliberate, so a large-context model like `Qwen3-Embedding-4B` isn't silently restricted to 512 tokens. Texts are tokenized with `padding=True`, so every text within the same forward pass is padded to the length of the *longest* text in that pass: one long outlier drags that pass up to its length, not just that one input. Combined with attention cost scaling roughly quadratically with sequence length, this can use significantly more memory per pass than a 512-token model. To keep one request from monopolizing memory this way, `/v1/embeddings` internally packs a request's texts into sub-batches bounded by a fixed token budget (4096 tokens by default) instead of a single pass sized to the whole request — a request with many or long inputs runs as several bounded forward passes rather than one unbounded one, transparent to the caller (results still come back in input order).
 
 If you pin a large-context embedding model with `--embedding-model`, the server logs a `WARNING` at startup when the resolved context exceeds 4096 tokens and no `--embedding-max-length` is set, as a nudge to set an explicit, memory-appropriate ceiling for your hardware (e.g. `--embedding-max-length 4096`) rather than running fully unbounded in production.
 
@@ -125,7 +125,7 @@ Example `error`-policy response when an input exceeds the effective limit:
 }
 ```
 
-The effective embedding `max_length` and `overflow_policy` are also reported under the `embedding` key of `GET /v1/status`.
+The effective embedding `max_length` (what the engine actually applies — not the raw `--embedding-max-length` ceiling, which may be higher than what the loaded model itself supports) and `overflow_policy` are also reported under the `embedding` key of `GET /v1/status`, alongside `max_length_ceiling` for the as-configured value (`null` when `--embedding-max-length` was left at its `auto` default, an integer otherwise).
 
 ## API Reference
 

@@ -3509,7 +3509,14 @@ def _embedding_status() -> dict[str, object] | None:
         return None
     return {
         "model": _embedding_engine.model_name,
-        "max_length": _embedding_max_length or "auto",
+        # The truncation length actually applied by embed() — resolved from
+        # the loaded model's config and clamped by max_length_ceiling below.
+        # A 512-token model with an 8192 ceiling still uses 512; reporting
+        # the ceiling itself here would be misleading in that case.
+        "max_length": _embedding_engine.effective_max_length,
+        # None means no operator ceiling is configured. This field is
+        # int | None, a single consistent type API consumers can rely on.
+        "max_length_ceiling": _embedding_max_length,
         "overflow_policy": _embedding_overflow_policy,
     }
 

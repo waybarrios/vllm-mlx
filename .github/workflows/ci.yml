@@ -86,6 +86,7 @@ jobs:
             tests/test_harmony_parsers.py \
             tests/test_endpoint_model_policies.py \
             tests/test_truncation.py \
+            tests/test_cli_arg_types.py \
             tests/test_gemma4_openai_format.py \
             tests/test_gemma4_streaming_edge.py \
             tests/test_gemma4_tool_parser.py \

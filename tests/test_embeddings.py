@@ -295,6 +295,65 @@ class TestEmbeddingEngine:
         count = engine.count_tokens(["hello", "world"])
         assert count == 10  # 5 tokens * 2 texts
 
+    def test_count_tokens_falls_back_to_estimate_on_tokenizer_failure(self):
+        """Usage reporting may use the ~4-chars-per-token estimate when the
+        tokenizer itself can't encode the text — that's the one place the
+        heuristic is still acceptable (see test_embed_error_policy_propagates_
+        tokenizer_failure for why it must NOT apply to policy enforcement)."""
+        from vllm_mlx.embedding import EmbeddingEngine
+
+        engine = EmbeddingEngine("test-model")
+        mock_tokenizer = MagicMock()
+        mock_tokenizer.encode.side_effect = RuntimeError("boom")
+        engine._tokenizer = mock_tokenizer
+        engine._model = MagicMock()
+
+        count = engine.count_tokens("12345678")  # 8 chars -> //4 == 2
+        assert count == 2
+
+    def test_embed_error_policy_propagates_tokenizer_failure(self):
+        """Regression (review blocker): overflow-policy enforcement must use
+        an exact token count. It must NOT silently fall back to the
+        ~4-chars-per-token heuristic on a tokenizer failure — that could
+        let an over-limit input through, or reject a valid one with an
+        inaccurate token_count. A genuine tokenizer failure should surface
+        as an error, not be masked."""
+        from vllm_mlx.embedding import EmbeddingEngine
+
+        engine = EmbeddingEngine(
+            "test-model", max_length_ceiling=10, overflow_policy="error"
+        )
+
+        mock_model = MagicMock()
+        mock_model.config.max_position_embeddings = 8192
+        mock_tokenizer = MagicMock()
+        mock_tokenizer.encode.side_effect = RuntimeError("tokenizer exploded")
+
+        with patch.object(engine, "_ensure_loaded"):
+            engine._model = mock_model
+            engine._tokenizer = mock_tokenizer
+            with pytest.raises(RuntimeError, match="tokenizer exploded"):
+                engine.embed(["some text"])
+
+        mock_model.assert_not_called()
+
+    def test_effective_max_length_reflects_ceiling_clamp(self):
+        """effective_max_length is what embed() actually uses (post-ceiling),
+        not the raw ceiling — this backs /v1/status's `max_length` field."""
+        from vllm_mlx.embedding import EmbeddingEngine
+
+        engine = EmbeddingEngine("test-model", max_length_ceiling=4096)
+        assert engine.effective_max_length is None  # not loaded yet
+
+        mock_model = MagicMock()
+        mock_model.config.max_position_embeddings = 512  # below the ceiling
+        engine._model = mock_model
+        engine._tokenizer = MagicMock()
+
+        # A 512-token model with a 4096 ceiling: the ceiling only clamps
+        # downward, so the effective value stays 512, not the ceiling.
+        assert engine.effective_max_length == 512
+
     def test_embed_ceiling_clamps_config_value(self):
         """Positive: max_length_ceiling clamps the model-derived max_length."""
         import numpy as np
@@ -453,6 +512,148 @@ class TestEmbeddingEngine:
 
         mock_logger.warning.assert_called_once()
         assert mock_metrics.observe_embedding_truncated.call_count == 3
+
+    def test_embed_handles_mixed_length_batch(self):
+        """A batch mixing under- and over-limit texts must only flag the
+        over-limit ones — the short texts in the same call must be neither
+        truncated-and-warned-about nor otherwise affected by their
+        over-limit neighbor."""
+        import numpy as np
+
+        from vllm_mlx.embedding import EmbeddingEngine
+
+        engine = EmbeddingEngine("test-model", max_length_ceiling=10)
+
+        mock_output = MagicMock()
+        mock_output.text_embeds.tolist.return_value = [[0.1]] * 3
+        mock_model = MagicMock(return_value=mock_output)
+        mock_model.config.max_position_embeddings = 8192
+
+        mock_inner_tokenizer = MagicMock()
+        mock_inner_tokenizer.return_value = {
+            "input_ids": np.array([[1, 2]] * 3),
+            "attention_mask": np.array([[1, 1]] * 3),
+        }
+        mock_tokenizer = MagicMock()
+        mock_tokenizer._tokenizer = mock_inner_tokenizer
+        # Only the middle text (20 tokens) exceeds the ceiling of 10; the
+        # other two (5 and 8 tokens) are within limit.
+        mock_tokenizer.encode.side_effect = [
+            list(range(5)),
+            list(range(20)),
+            list(range(8)),
+        ]
+
+        with (
+            patch.object(engine, "_ensure_loaded"),
+            patch("vllm_mlx.embedding.logger") as mock_logger,
+            patch("vllm_mlx.embedding.metrics") as mock_metrics,
+        ):
+            engine._model = mock_model
+            engine._tokenizer = mock_tokenizer
+            result = engine.embed(["short", "way too long", "also short"])
+
+        # Only the one over-limit text (index 1) triggers a warning/metric.
+        mock_logger.warning.assert_called_once()
+        # warning(fmt, overflow_count, total_count, indices, longest, ...)
+        _fmt, overflow_count, total_count, indices, longest = (
+            mock_logger.warning.call_args.args[:5]
+        )
+        assert (overflow_count, total_count) == (1, 3)
+        assert indices == "[1]"
+        assert longest == 20
+        assert mock_metrics.observe_embedding_truncated.call_count == 1
+        # All three still get embedded in one call, in order.
+        assert mock_model.call_count == 1
+        assert len(result) == 3
+
+    def test_embed_stays_a_single_batch_within_budget(self):
+        """A typical request (well under the token budget) still runs as one
+        forward pass — sub-batching must not change behavior for the common
+        case, only bound the uncommon large-request one."""
+        import numpy as np
+
+        from vllm_mlx.embedding import EmbeddingEngine
+
+        engine = EmbeddingEngine("test-model")  # default token_budget
+
+        mock_output = MagicMock()
+        mock_output.text_embeds.tolist.return_value = [[0.1]] * 3
+        mock_model = MagicMock(return_value=mock_output)
+        mock_model.config.max_position_embeddings = 8192
+
+        mock_inner_tokenizer = MagicMock()
+        mock_inner_tokenizer.return_value = {
+            "input_ids": np.array([[1, 2]] * 3),
+            "attention_mask": np.array([[1, 1]] * 3),
+        }
+        mock_tokenizer = MagicMock()
+        mock_tokenizer._tokenizer = mock_inner_tokenizer
+        mock_tokenizer.encode.return_value = [1, 2, 3]
+
+        with patch.object(engine, "_ensure_loaded"):
+            engine._model = mock_model
+            engine._tokenizer = mock_tokenizer
+            result = engine.embed(["a", "b", "c"])
+
+        assert mock_model.call_count == 1
+        assert len(result) == 3
+
+    def test_embed_packs_texts_into_token_budget_bounded_batches(self):
+        """Regression (review blocker): a request's texts must not all be
+        padded together in a single unbounded batch — a large-context model
+        given many/long inputs could otherwise blow up memory/compute for
+        that one request. embed() packs them into sub-batches capped by the
+        token budget instead, calling the model once per sub-batch, and
+        reassembles results in the original input order."""
+        import numpy as np
+
+        from vllm_mlx.embedding import EmbeddingEngine
+
+        engine = EmbeddingEngine("test-model", token_budget=10)
+
+        mock_model = MagicMock()
+        mock_model.config.max_position_embeddings = 8192
+        # Two forward passes expected: first batch holds 2 texts, second 1.
+        output_a = MagicMock()
+        output_a.text_embeds.tolist.return_value = [[0.1, 0.1], [0.2, 0.2]]
+        output_b = MagicMock()
+        output_b.text_embeds.tolist.return_value = [[0.3, 0.3]]
+        mock_model.side_effect = [output_a, output_b]
+
+        mock_inner_tokenizer = MagicMock()
+        mock_inner_tokenizer.side_effect = [
+            {
+                "input_ids": np.array([[1, 2, 3], [1, 2, 3]]),
+                "attention_mask": np.array([[1, 1, 1], [1, 1, 1]]),
+            },
+            {
+                "input_ids": np.array([[1, 2, 3, 4, 5, 6]]),
+                "attention_mask": np.array([[1, 1, 1, 1, 1, 1]]),
+            },
+        ]
+        mock_tokenizer = MagicMock()
+        mock_tokenizer._tokenizer = mock_inner_tokenizer
+        # Raw token counts for the three texts: 3, 3, 6.
+        mock_tokenizer.encode.side_effect = [
+            [0, 1, 2],
+            [0, 1, 2],
+            [0, 1, 2, 3, 4, 5],
+        ]
+
+        with patch.object(engine, "_ensure_loaded"):
+            engine._model = mock_model
+            engine._tokenizer = mock_tokenizer
+            result = engine.embed(["a", "b", "c"])
+
+        assert mock_model.call_count == 2
+        assert mock_inner_tokenizer.call_count == 2
+        # texts 0+1 (3 + 3 = 6 <= budget of 10) share a batch...
+        assert mock_inner_tokenizer.call_args_list[0].args[0] == ["a", "b"]
+        # ...adding text 2 (6 tokens) would exceed the budget, so it's alone.
+        assert mock_inner_tokenizer.call_args_list[1].args[0] == ["c"]
+        # Results land back in original input order regardless of batching.
+        assert result == [[0.1, 0.1], [0.2, 0.2], [0.3, 0.3]]
 
 
 # =============================================================================
@@ -659,6 +860,7 @@ class TestEmbeddingsEndpoint:
 
         mock_engine = MagicMock()
         mock_engine.model_name = "mlx-community/all-MiniLM-L6-v2-4bit"
+        mock_engine.effective_max_length = 1024
 
         original_engine = srv._embedding_engine
         original_ceiling = srv._embedding_max_length
@@ -679,8 +881,66 @@ class TestEmbeddingsEndpoint:
         assert embedding_status == {
             "model": "mlx-community/all-MiniLM-L6-v2-4bit",
             "max_length": 1024,
+            "max_length_ceiling": 1024,
             "overflow_policy": "error",
         }
+
+    def test_status_reports_effective_max_length_not_raw_ceiling(self, client):
+        """Regression: a ceiling higher than what the loaded model actually
+        supports must not be echoed back as `max_length` — /v1/status must
+        report what embed() really applies, distinct from the configured
+        ceiling (which is still reported, under `max_length_ceiling`)."""
+        import vllm_mlx.server as srv
+
+        mock_engine = MagicMock()
+        mock_engine.model_name = "mlx-community/all-MiniLM-L6-v2-4bit"
+        # A 512-token model with a 4096 ceiling: the ceiling only clamps
+        # downward, so the engine still resolves to (and uses) 512.
+        mock_engine.effective_max_length = 512
+
+        original_engine = srv._embedding_engine
+        original_ceiling = srv._embedding_max_length
+        original_policy = srv._embedding_overflow_policy
+        srv._embedding_engine = mock_engine
+        srv._embedding_max_length = 4096
+        srv._embedding_overflow_policy = "truncate"
+
+        try:
+            resp = client.get("/v1/status")
+        finally:
+            srv._embedding_engine = original_engine
+            srv._embedding_max_length = original_ceiling
+            srv._embedding_overflow_policy = original_policy
+
+        embedding_status = resp.json()["embedding"]
+        assert embedding_status["max_length"] == 512
+        assert embedding_status["max_length_ceiling"] == 4096
+
+    def test_status_max_length_ceiling_is_null_not_string_when_unset(self, client):
+        """Regression: with no --embedding-max-length configured,
+        max_length_ceiling must be JSON null (int | None) — a mixed-type
+        field is a broken API contract for anything that types this
+        response."""
+        import vllm_mlx.server as srv
+
+        mock_engine = MagicMock()
+        mock_engine.model_name = "mlx-community/all-MiniLM-L6-v2-4bit"
+        mock_engine.effective_max_length = 8192
+
+        original_engine = srv._embedding_engine
+        original_ceiling = srv._embedding_max_length
+        srv._embedding_engine = mock_engine
+        srv._embedding_max_length = None  # no ceiling configured
+
+        try:
+            resp = client.get("/v1/status")
+        finally:
+            srv._embedding_engine = original_engine
+            srv._embedding_max_length = original_ceiling
+
+        embedding_status = resp.json()["embedding"]
+        assert embedding_status["max_length_ceiling"] is None
+        assert isinstance(embedding_status["max_length"], int)
 
 
 # =============================================================================
