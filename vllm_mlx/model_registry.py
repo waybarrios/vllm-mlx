@@ -880,8 +880,7 @@ class ModelManager:
                 if now - loaded.last_used_at >= idle_seconds
             ]
             unloads = [
-                self._begin_unload_locked(loaded.config.entry.name)
-                for loaded in stale
+                self._begin_unload_locked(loaded.config.entry.name) for loaded in stale
             ]
             self._condition.notify_all()
 

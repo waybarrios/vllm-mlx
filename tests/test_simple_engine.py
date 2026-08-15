@@ -3028,9 +3028,9 @@ class TestSimpleEngineStop:
 
         calls = {"count": 0}
         monkeypatch.setattr(
-            simple_mod.mx, "clear_cache", lambda: calls.__setitem__(
-                "count", calls["count"] + 1
-            )
+            simple_mod.mx,
+            "clear_cache",
+            lambda: calls.__setitem__("count", calls["count"] + 1),
         )
 
         engine = SimpleEngine("test-model")
