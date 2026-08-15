@@ -40,6 +40,7 @@ from .base import (
     GenerationOutput,
     cleanup_startup_cancellation,
     run_blocking_startup_work,
+    shield_task,
 )
 from .chat_template_safety import normalize_messages_for_chat_template
 from ..mlx_streams import (
@@ -1023,8 +1024,8 @@ class SimpleEngine(BaseEngine):
                     self._generation_abort_hooks[request_id] = on_cancel
                 task = asyncio.create_task(_run_on_generation_worker())
                 try:
-                    return await asyncio.shield(task)
-                except asyncio.CancelledError:
+                    return await shield_task(task)
+                except asyncio.CancelledError as cancelled_error:
                     if on_cancel is not None:
                         try:
                             on_cancel()
@@ -1037,7 +1038,7 @@ class SimpleEngine(BaseEngine):
                         await task
                     except BaseException:
                         pass
-                    raise
+                    raise cancelled_error
                 finally:
                     self._generation_abort_hooks.pop(request_id, None)
                     self._active_requests.pop(request_id, None)

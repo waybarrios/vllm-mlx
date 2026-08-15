@@ -11,7 +11,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 
-from .engine.base import BaseEngine, suspend_cancellation
+from .engine.base import BaseEngine, shield_task, suspend_cancellation
 
 
 class ResidentState(str, Enum):
@@ -458,12 +458,12 @@ class ResidencyManager:
             resident._prepare_task = prepare_task
 
         try:
-            await asyncio.shield(prepare_task)
+            await shield_task(prepare_task)
         except asyncio.CancelledError:
             with suspend_cancellation():
                 while not prepare_task.done():
                     try:
-                        await asyncio.shield(prepare_task)
+                        await shield_task(prepare_task)
                     except asyncio.CancelledError:
                         continue
                     except Exception:

@@ -80,6 +80,39 @@ def suspend_cancellation():
             task.cancel()
 
 
+async def shield_task(task: asyncio.Task) -> Any:
+    """Equivalent to ``await asyncio.shield(task)``, minus one asyncio quirk.
+
+    asyncio.shield()'s own implementation unconditionally reassigns `task`'s
+    done-callback to an internal "log on exception" handler the instant its
+    wrapper future is cancelled (CPython asyncio.tasks.shield /
+    _outer_done_callback). That handler calls loop.call_exception_handler()
+    for whatever `task` eventually raises, regardless of whether the caller
+    goes on to retrieve that exception itself afterward -- and pytest-anyio
+    (and similar loop exception hooks) treat that call as an
+    unhandled-exception test failure even when the exception is fully
+    expected and handled. Waiting on our own plain Future sidesteps that
+    reassignment entirely.
+    """
+    loop = asyncio.get_running_loop()
+    waiter = loop.create_future()
+
+    def _propagate(completed_task: asyncio.Task) -> None:
+        if waiter.done():
+            return
+        if completed_task.cancelled():
+            waiter.cancel()
+            return
+        exc = completed_task.exception()
+        if exc is not None:
+            waiter.set_exception(exc)
+        else:
+            waiter.set_result(completed_task.result())
+
+    task.add_done_callback(_propagate)
+    return await waiter
+
+
 async def run_blocking_startup_work(
     work: Callable[[], Any], executor: Any | None = None
 ) -> None:
@@ -93,12 +126,12 @@ async def run_blocking_startup_work(
     loop = asyncio.get_running_loop()
     task = asyncio.ensure_future(loop.run_in_executor(executor, work))
     try:
-        await asyncio.shield(task)
+        await shield_task(task)
     except asyncio.CancelledError:
         with suspend_cancellation():
             while not task.done():
                 try:
-                    await asyncio.shield(task)
+                    await shield_task(task)
                 except asyncio.CancelledError:
                     continue
                 except Exception:
