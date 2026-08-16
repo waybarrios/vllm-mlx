@@ -155,7 +155,11 @@ from .audio_limits import (
     save_upload_with_limit,
     validate_tts_input_length,
 )
-from .cli_arg_types import make_json_object_arg_parser, make_positive_int_arg_parser
+from .cli_arg_types import (
+    make_auto_or_positive_int_arg_parser,
+    make_json_object_arg_parser,
+    make_positive_int_arg_parser,
+)
 from .engine import BaseEngine, BatchedEngine, GenerationOutput, SimpleEngine
 from .endpoint_model_policies import (
     resolve_embedding_model_name,
@@ -6618,6 +6622,7 @@ def main():
     global _default_top_k, _default_min_p
     global _default_presence_penalty, _default_repetition_penalty
     global _max_audio_upload_bytes, _max_tts_input_chars
+    global _embedding_max_length, _embedding_overflow_policy
     _api_key = args.api_key
     _default_timeout = args.timeout
     _metrics_enabled = args.enable_metrics
@@ -6637,6 +6642,8 @@ def main():
         _default_repetition_penalty = args.default_repetition_penalty
     _max_audio_upload_bytes = args.max_audio_upload_mb * 1024 * 1024
     _max_tts_input_chars = args.max_tts_input_chars
+    _embedding_max_length = args.embedding_max_length
+    _embedding_overflow_policy = args.embedding_overflow_policy
 
     # Configure rate limiter
     if args.rate_limit > 0:
@@ -6861,6 +6868,21 @@ Examples:
         type=str,
         default=None,
         help="Pre-load an embedding model at startup (e.g. mlx-community/all-MiniLM-L6-v2-4bit)",
+    )
+    parser.add_argument(
+        "--embedding-max-length",
+        type=make_auto_or_positive_int_arg_parser("--embedding-max-length"),
+        default=None,
+        help=(
+            "Maximum token length for embeddings: positive integer or 'auto' "
+            "(default: auto, use the model context length)"
+        ),
+    )
+    parser.add_argument(
+        "--embedding-overflow-policy",
+        choices=("truncate", "error"),
+        default="truncate",
+        help="How to handle embedding inputs over the effective maximum length",
     )
     parser.add_argument(
         "--default-temperature",

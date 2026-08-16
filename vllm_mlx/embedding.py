@@ -8,6 +8,7 @@ for the OpenAI-compatible /v1/embeddings endpoint.
 
 import logging
 import time
+from typing import Any
 
 import mlx.core as mx
 
@@ -22,12 +23,8 @@ logger = logging.getLogger(__name__)
 # unbounded context windows can use disproportionate memory.
 LARGE_CONTEXT_WARNING_THRESHOLD = 4096
 
-# Default cap on total (post-truncation) tokens per forward pass. Mirrors
-# RerankEngine.token_budget (vllm_mlx/rerank.py): a request's texts are
-# still accepted as one unbounded list, but embed() packs them into
-# sub-batches bounded by this budget instead of a single batch padded to
-# the longest member — so one large request can't unilaterally blow up
-# memory/compute.
+# Default cap on padded token positions for multi-input forward passes. A
+# single longer input still runs alone, up to the effective max length.
 DEFAULT_EMBEDDING_TOKEN_BUDGET = 4096
 
 
@@ -218,53 +215,54 @@ class EmbeddingEngine:
         result: list[list[float] | None] = [None] * len(texts)
         for batch_indices in self._token_budget_batches(effective_counts):
             batch_texts = [texts[i] for i in batch_indices]
-            encoded = inner_tok(
-                batch_texts,
-                padding=True,
-                truncation=True,
-                max_length=max_length,
-                return_tensors="np",
-            )
+            try:
+                batch_embeds = self._embed_batch(inner_tok, batch_texts, max_length)
+            finally:
+                # MLX caches freed buffers by size. Clear after every pass so
+                # varying padded shapes cannot accumulate in the allocator,
+                # including when tokenization or model execution fails.
+                mx.clear_cache()
 
-            input_ids = mx.array(encoded["input_ids"])
-            attention_mask = mx.array(encoded["attention_mask"])
-
-            output = self._model(input_ids, attention_mask=attention_mask)
-
-            # text_embeds shape: (batch_size, embedding_dim)
-            embeds: mx.array = output.text_embeds
-
-            # Convert to Python lists for JSON serialization
-            for idx, embed in zip(batch_indices, embeds.tolist()):
+            for idx, embed in zip(batch_indices, batch_embeds):
                 result[idx] = embed
-
-        # Release the Metal buffers this pass allocated. MLX keeps freed buffers
-        # in its allocator pool, keyed by size, and `padding=True` above makes
-        # the sequence length vary from batch to batch — so nearly every request
-        # asks for sizes the pool has never seen and cannot reuse. Without this
-        # the pool only grows: measured ~70 MB retained per input text, taking a
-        # fresh process from 2.3 GB to 24 GB over 320 texts.
-        mx.clear_cache()
 
         return result  # type: ignore[return-value]
 
+    def _embed_batch(
+        self, tokenizer: Any, texts: list[str], max_length: int
+    ) -> list[list[float]]:
+        """Run one padded embedding pass and return JSON-serializable vectors."""
+        encoded = tokenizer(
+            texts,
+            padding=True,
+            truncation=True,
+            max_length=max_length,
+            return_tensors="np",
+        )
+
+        input_ids = mx.array(encoded["input_ids"])
+        attention_mask = mx.array(encoded["attention_mask"])
+        output = self._model(input_ids, attention_mask=attention_mask)
+        return output.text_embeds.tolist()
+
     def _token_budget_batches(self, effective_counts: list[int]) -> list[list[int]]:
-        """Group text indices into sub-batches whose summed token count stays
-        at or under self._token_budget, in input order. A single text over
-        budget on its own still forms a batch of one — the budget bounds how
-        many texts get padded together, not any individual sequence length
-        (that bound is max_length itself, applied via truncation).
+        """Group text indices into sub-batches whose padded token positions
+        stay at or under self._token_budget, in input order. A single text over
+        budget still forms a batch of one because max_length bounds individual
+        sequence length.
         """
         batches: list[list[int]] = []
         current: list[int] = []
-        current_tokens = 0
+        current_max = 0
         for i, count in enumerate(effective_counts):
-            if current and current_tokens + count > self._token_budget:
+            prospective_max = max(current_max, count)
+            prospective_size = len(current) + 1
+            if current and prospective_size * prospective_max > self._token_budget:
                 batches.append(current)
                 current = []
-                current_tokens = 0
+                current_max = 0
             current.append(i)
-            current_tokens += count
+            current_max = max(current_max, count)
         if current:
             batches.append(current)
         return batches

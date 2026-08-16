@@ -641,12 +641,16 @@ class TestEmbeddingEngine:
             [0, 1, 2, 3, 4, 5],
         ]
 
-        with patch.object(engine, "_ensure_loaded"):
+        with (
+            patch.object(engine, "_ensure_loaded"),
+            patch("vllm_mlx.embedding.mx.clear_cache") as mock_clear_cache,
+        ):
             engine._model = mock_model
             engine._tokenizer = mock_tokenizer
             result = engine.embed(["a", "b", "c"])
 
         assert mock_model.call_count == 2
+        assert mock_clear_cache.call_count == 2
         assert mock_inner_tokenizer.call_count == 2
         # texts 0+1 (3 + 3 = 6 <= budget of 10) share a batch...
         assert mock_inner_tokenizer.call_args_list[0].args[0] == ["a", "b"]
@@ -654,6 +658,56 @@ class TestEmbeddingEngine:
         assert mock_inner_tokenizer.call_args_list[1].args[0] == ["c"]
         # Results land back in original input order regardless of batching.
         assert result == [[0.1, 0.1], [0.2, 0.2], [0.3, 0.3]]
+
+    def test_token_budget_accounts_for_padding(self):
+        """A long input followed by many short inputs must not produce a batch
+        whose padded tensor exceeds the configured budget."""
+        from vllm_mlx.embedding import EmbeddingEngine
+
+        engine = EmbeddingEngine("test-model", token_budget=10)
+        counts = [8, 1, 1]
+
+        batches = engine._token_budget_batches(counts)
+
+        assert batches == [[0], [1, 2]]
+        for batch in batches:
+            if len(batch) > 1:
+                assert len(batch) * max(counts[i] for i in batch) <= 10
+
+    def test_embed_clears_cache_when_a_later_batch_fails(self):
+        """Every attempted forward pass releases its cached MLX buffers,
+        including the pass that raises."""
+        import numpy as np
+
+        from vllm_mlx.embedding import EmbeddingEngine
+
+        engine = EmbeddingEngine("test-model", token_budget=5)
+        output = MagicMock()
+        output.text_embeds.tolist.return_value = [[0.1, 0.1]]
+        mock_model = MagicMock(side_effect=[output, RuntimeError("model failed")])
+        mock_model.config.max_position_embeddings = 8192
+
+        mock_inner_tokenizer = MagicMock(
+            return_value={
+                "input_ids": np.array([[1, 2, 3]]),
+                "attention_mask": np.array([[1, 1, 1]]),
+            }
+        )
+        mock_tokenizer = MagicMock()
+        mock_tokenizer._tokenizer = mock_inner_tokenizer
+        mock_tokenizer.encode.side_effect = [[0, 1, 2], [0, 1, 2]]
+
+        with (
+            patch.object(engine, "_ensure_loaded"),
+            patch("vllm_mlx.embedding.mx.clear_cache") as mock_clear_cache,
+            pytest.raises(RuntimeError, match="model failed"),
+        ):
+            engine._model = mock_model
+            engine._tokenizer = mock_tokenizer
+            engine.embed(["a", "b"])
+
+        assert mock_model.call_count == 2
+        assert mock_clear_cache.call_count == 2
 
 
 # =============================================================================

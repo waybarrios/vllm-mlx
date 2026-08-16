@@ -34,6 +34,8 @@ def restore_server_globals():
         "_mcp_executor",
         "_embedding_engine",
         "_embedding_model_locked",
+        "_embedding_max_length",
+        "_embedding_overflow_policy",
         "_api_key",
         "_auth_warning_logged",
         "_rate_limiter",
@@ -493,6 +495,42 @@ class TestLifecycleCli:
         assert captured["kwargs"]["use_batching"] is True
         assert captured["kwargs"]["auto_unload_idle_seconds"] == 300.0
         assert captured["kwargs"]["lazy_load_model"] is True
+
+    def test_server_main_wires_embedding_length_options(self, monkeypatch):
+        """Standalone server should configure the embedding engine before load."""
+        import vllm_mlx.server as srv
+
+        captured = {}
+
+        def fake_load_embedding_model(*args, **kwargs):
+            captured["args"] = args
+            captured["kwargs"] = kwargs
+            captured["max_length"] = srv._embedding_max_length
+            captured["overflow_policy"] = srv._embedding_overflow_policy
+
+        monkeypatch.setattr(srv, "load_embedding_model", fake_load_embedding_model)
+        monkeypatch.setattr(srv, "load_model", lambda *args, **kwargs: None)
+        monkeypatch.setattr(srv.uvicorn, "run", lambda *args, **kwargs: None)
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            [
+                "vllm_mlx.server",
+                "--embedding-model",
+                "mlx-community/Qwen3-Embedding-4B-4bit",
+                "--embedding-max-length",
+                "1024",
+                "--embedding-overflow-policy",
+                "error",
+            ],
+        )
+
+        srv.main()
+
+        assert captured["args"] == ("mlx-community/Qwen3-Embedding-4B-4bit",)
+        assert captured["kwargs"] == {"lock": True}
+        assert captured["max_length"] == 1024
+        assert captured["overflow_policy"] == "error"
 
     def test_serve_command_describes_lazy_startup_without_claiming_model_is_loaded(
         self, monkeypatch, capsys

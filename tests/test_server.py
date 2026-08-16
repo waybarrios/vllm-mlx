@@ -619,6 +619,28 @@ class TestServeCli:
 class TestStandaloneServerCli:
     """Test standalone server CLI argument parsing."""
 
+    def test_embedding_length_options_parse(self):
+        """Standalone server should expose the embedding length controls."""
+        from vllm_mlx.server import create_parser
+
+        parser = create_parser()
+        args = parser.parse_args(
+            [
+                "--embedding-model",
+                "mlx-community/Qwen3-Embedding-4B-4bit",
+                "--embedding-max-length",
+                "1024",
+                "--embedding-overflow-policy",
+                "error",
+            ]
+        )
+
+        assert args.embedding_max_length == 1024
+        assert args.embedding_overflow_policy == "error"
+
+        auto_args = parser.parse_args(["--embedding-max-length", "auto"])
+        assert auto_args.embedding_max_length is None
+
     def test_trust_remote_code_flag_defaults_false(self):
         """Standalone server should require explicit opt-in for remote code loading."""
         from vllm_mlx.server import create_parser
