@@ -1331,6 +1331,9 @@ class SimpleEngine(BaseEngine):
 
         # For LLM, apply chat template and stream
         tokenizer = self._model.tokenizer
+        # Bound below only on the apply_chat_template path; the system-KV cache
+        # probe reuses it so the probe and the prompt render from the same list.
+        safe_messages: list[dict[str, Any]] | None = None
         if hasattr(tokenizer, "apply_chat_template"):
             # Per-request enable_thinking override; default: True unless coder model.
             enable_thinking = kwargs.pop("enable_thinking", None)
@@ -1508,8 +1511,37 @@ class SimpleEngine(BaseEngine):
                 "content": getattr(m, "content", ""),
             }
 
-        messages_for_cache = [_to_msg_dict(m) for m in messages]
-        has_system = any(m.get("role") == "system" for m in messages_for_cache)
+        # Probe from the SAME normalized list ``prompt`` was rendered from above,
+        # restricted to the SYSTEM messages.
+        #
+        # Two defects here silently disabled the cache for every turn after a
+        # tool call:
+        #
+        # 1. Probing the raw ``messages`` instead of the normalized ones renders
+        #    differently from ``prompt`` for structured content, and on
+        #    tool-calling turns raises inside apply_chat_template (tool-call
+        #    ``arguments`` are JSON strings until normalization converts them to
+        #    mappings). The bare ``except Exception: pass`` below swallowed that.
+        #
+        # 2. Probing the FULL conversation breaks whenever the last message is
+        #    not a user message. A ``tool_result`` converts to a role="tool"
+        #    message, so ``_with_user`` APPENDS a synthetic user turn and the
+        #    probe renders "<|im_start|>user" where the real prompt has
+        #    "<|im_start|>assistant". The computed prefix is then not a prefix of
+        #    the prompt at all, the token-prefix check below fails, and the code
+        #    falls through to the uncached path WITHOUT logging anything.
+        #
+        # The system messages are also the only span stable across the turns of a
+        # conversation, so they are what we actually want keyed and cached.
+        _normalized_for_cache = (
+            safe_messages
+            if safe_messages is not None
+            else [_to_msg_dict(m) for m in messages]
+        )
+        messages_for_cache = [
+            m for m in _normalized_for_cache if m.get("role") == "system"
+        ]
+        has_system = bool(messages_for_cache)
         if (
             has_system
             and not cache_blocking_controls
