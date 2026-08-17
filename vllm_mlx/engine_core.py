@@ -110,6 +110,10 @@ class EngineCore:
         self._task: Optional[asyncio.Task] = None
         self._start_time: Optional[float] = None
         self._steps_executed = 0
+        # MLX streams are thread-local. Keep one executor for the complete
+        # engine lifetime so generation and cache persistence share ownership.
+        self._worker: Optional[ThreadPoolExecutor] = None
+        self._worker_stream_bound = False
 
         logger.debug(f"Engine {self._engine_id} initialized")
 
@@ -120,6 +124,10 @@ class EngineCore:
 
         self._running = True
         self._start_time = time.time()
+        self._worker = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="engine-core"
+        )
+        self._worker_stream_bound = False
         self._task = asyncio.create_task(self._engine_loop())
         logger.info("Engine started")
 
@@ -133,10 +141,24 @@ class EngineCore:
             except asyncio.CancelledError:
                 pass
             self._task = None
-        # Safety net: close batch generator if _engine_loop didn't get a
-        # chance to clean up (e.g. it was never started).  The call is
-        # idempotent — _close_batch_generator checks for None.
-        self.scheduler._close_batch_generator()
+        # Safety net: close the batch generator on the owner thread if the
+        # engine loop did not get a chance to clean it up (e.g. never started).
+        # The call is idempotent — _close_batch_generator checks for None.
+        if self._worker is not None:
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(
+                self._worker,
+                lambda: (
+                    bind_generation_streams(),
+                    self.scheduler._close_batch_generator(),
+                ),
+            )
+        else:
+            self.scheduler._close_batch_generator()
+        if self._worker is not None:
+            self._worker.shutdown(wait=True)
+            self._worker = None
+            self._worker_stream_bound = False
         logger.info("Engine stopped")
 
     def is_running(self) -> bool:
@@ -151,17 +173,14 @@ class EngineCore:
         """
 
         loop = asyncio.get_running_loop()
-        worker = ThreadPoolExecutor(max_workers=1, thread_name_prefix="engine-core")
-        worker_stream_bound = False
         model_thread_stream_bound = False
         use_worker_thread = True
         stream_thread_fallback_used = False
 
         def _bind_worker_streams_once() -> None:
-            nonlocal worker_stream_bound
-            if not worker_stream_bound:
+            if not self._worker_stream_bound:
                 bind_generation_streams()
-                worker_stream_bound = True
+                self._worker_stream_bound = True
 
         def _bind_model_streams_once() -> None:
             nonlocal model_thread_stream_bound
@@ -244,7 +263,7 @@ class EngineCore:
                         if use_worker_thread:
                             try:
                                 output = await loop.run_in_executor(
-                                    worker, _step_on_worker
+                                    self._worker, _step_on_worker
                                 )
                             except Exception as e:
                                 if (
@@ -252,7 +271,7 @@ class EngineCore:
                                     and not stream_thread_fallback_used
                                 ):
                                     await loop.run_in_executor(
-                                        worker, _recover_stream_thread_error_on_worker
+                                        self._worker, _recover_stream_thread_error_on_worker
                                     )
                                     use_worker_thread = False
                                     stream_thread_fallback_used = True
@@ -303,7 +322,7 @@ class EngineCore:
                             if output.finished_request_ids:
                                 if use_worker_thread:
                                     await loop.run_in_executor(
-                                        worker, _clear_cache_on_worker
+                                        self._worker, _clear_cache_on_worker
                                     )
                                 else:
                                     mx.clear_cache()
@@ -325,13 +344,27 @@ class EngineCore:
                     logger.error(f"Engine loop error: {e}\n{traceback.format_exc()}")
                     await asyncio.sleep(0.1)
         finally:
-            try:
-                if use_worker_thread:
-                    await loop.run_in_executor(worker, _close_batch_generator_on_worker)
-                else:
-                    self.scheduler._close_batch_generator()
-            finally:
-                worker.shutdown(wait=True)
+            if use_worker_thread:
+                await loop.run_in_executor(
+                    self._worker, _close_batch_generator_on_worker
+                )
+            else:
+                self.scheduler._close_batch_generator()
+
+    async def _run_on_worker(self, operation):
+        """Run an MLX operation on the engine-owned stream thread."""
+        worker = self._worker
+        if worker is None:
+            raise RuntimeError("engine worker is not running")
+        loop = asyncio.get_running_loop()
+
+        def run():
+            if not self._worker_stream_bound:
+                bind_generation_streams()
+                self._worker_stream_bound = True
+            return operation()
+
+        return await loop.run_in_executor(worker, run)
 
     async def add_request(
         self,
@@ -627,13 +660,17 @@ class EngineCore:
         """Get prefix cache statistics."""
         return self.scheduler.get_cache_stats()
 
-    def save_cache_to_disk(self, cache_dir: str) -> bool:
+    async def save_cache_to_disk(self, cache_dir: str) -> bool:
         """Save prefix cache to disk."""
-        return self.scheduler.save_cache_to_disk(cache_dir)
+        return await self._run_on_worker(
+            lambda: self.scheduler.save_cache_to_disk(cache_dir)
+        )
 
-    def load_cache_from_disk(self, cache_dir: str) -> int:
+    async def load_cache_from_disk(self, cache_dir: str) -> int:
         """Load prefix cache from disk."""
-        return self.scheduler.load_cache_from_disk(cache_dir)
+        return await self._run_on_worker(
+            lambda: self.scheduler.load_cache_from_disk(cache_dir)
+        )
 
     def clear_runtime_caches(self) -> Dict[str, Any] | None:
         """Clear scheduler-managed runtime caches."""
@@ -781,13 +818,13 @@ class AsyncEngineCore:
         """Get prefix cache statistics."""
         return self.engine.get_cache_stats()
 
-    def save_cache_to_disk(self, cache_dir: str) -> bool:
+    async def save_cache_to_disk(self, cache_dir: str) -> bool:
         """Save prefix cache to disk."""
-        return self.engine.save_cache_to_disk(cache_dir)
+        return await self.engine.save_cache_to_disk(cache_dir)
 
-    def load_cache_from_disk(self, cache_dir: str) -> int:
+    async def load_cache_from_disk(self, cache_dir: str) -> int:
         """Load prefix cache from disk."""
-        return self.engine.load_cache_from_disk(cache_dir)
+        return await self.engine.load_cache_from_disk(cache_dir)
 
     def clear_runtime_caches(self) -> Dict[str, Any] | None:
         """Clear scheduler-managed runtime caches."""

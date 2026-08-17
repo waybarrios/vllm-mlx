@@ -3,6 +3,7 @@
 
 import asyncio
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 
 import pytest
@@ -25,6 +26,10 @@ async def test_engine_core_runs_all_scheduler_steps_on_one_worker_thread(monkeyp
     engine._output_collectors = {}
     engine._stream_states = {}
     engine._finished_events = {}
+    engine._worker = ThreadPoolExecutor(
+        max_workers=1, thread_name_prefix="test-engine"
+    )
+    engine._worker_stream_bound = False
 
     main_thread = threading.get_ident()
     bind_threads: list[int] = []
@@ -58,13 +63,54 @@ async def test_engine_core_runs_all_scheduler_steps_on_one_worker_thread(monkeyp
 
     monkeypatch.setattr("vllm_mlx.engine_core.bind_generation_streams", bind_streams)
 
-    await asyncio.wait_for(engine._engine_loop(), timeout=2)
+    try:
+        await asyncio.wait_for(engine._engine_loop(), timeout=2)
+    finally:
+        engine._worker.shutdown(wait=True)
 
     assert scheduler.step_threads
     assert len(set(scheduler.step_threads)) == 1
     assert scheduler.step_threads[0] != main_thread
     assert bind_threads == [scheduler.step_threads[0]]
     assert scheduler.close_threads == [scheduler.step_threads[0]]
+
+
+@pytest.mark.anyio
+async def test_engine_core_cache_io_uses_generation_worker(monkeypatch, tmp_path):
+    """Prefix-cache persistence must share the generation worker thread."""
+    from vllm_mlx.engine_core import EngineCore
+
+    engine = object.__new__(EngineCore)
+    engine._worker = ThreadPoolExecutor(
+        max_workers=1, thread_name_prefix="test-engine"
+    )
+    engine._worker_stream_bound = False
+    bind_threads: list[int] = []
+    operation_threads: list[int] = []
+
+    class FakeScheduler:
+        def save_cache_to_disk(self, cache_dir):
+            operation_threads.append(threading.get_ident())
+            return True
+
+        def load_cache_from_disk(self, cache_dir):
+            operation_threads.append(threading.get_ident())
+            return 1
+
+    engine.scheduler = FakeScheduler()
+    monkeypatch.setattr(
+        "vllm_mlx.engine_core.bind_generation_streams",
+        lambda: bind_threads.append(threading.get_ident()),
+    )
+
+    try:
+        assert await engine.load_cache_from_disk(str(tmp_path)) == 1
+        assert await engine.save_cache_to_disk(str(tmp_path))
+    finally:
+        engine._worker.shutdown(wait=True)
+
+    assert len(set(operation_threads)) == 1
+    assert bind_threads == [operation_threads[0]]
 
 
 @pytest.mark.anyio

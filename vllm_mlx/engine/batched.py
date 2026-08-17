@@ -1198,17 +1198,17 @@ class BatchedEngine(BaseEngine):
             return result
         return False
 
-    def save_cache_to_disk(self, cache_dir: str) -> bool:
+    async def save_cache_to_disk(self, cache_dir: str) -> bool:
         """Save prefix cache to disk for persistence across restarts."""
         if self._mllm_scheduler and self._mllm_scheduler.batch_generator:
             pc = self._mllm_scheduler.batch_generator.prefix_cache
             if pc is not None:
                 return pc.save_to_disk(cache_dir)
         if self._engine:
-            return self._engine.save_cache_to_disk(cache_dir)
+            return await self._engine.save_cache_to_disk(cache_dir)
         return False
 
-    def load_cache_from_disk(self, cache_dir: str) -> int:
+    async def load_cache_from_disk(self, cache_dir: str) -> int:
         """Load prefix cache from disk. Returns number of entries loaded."""
         if self._mllm_scheduler:
             self._mllm_scheduler._ensure_batch_generator()
@@ -1216,7 +1216,7 @@ class BatchedEngine(BaseEngine):
             if pc is not None:
                 return pc.load_from_disk(cache_dir)
         if self._engine:
-            return self._engine.load_cache_from_disk(cache_dir)
+            return await self._engine.load_cache_from_disk(cache_dir)
         return 0
 
     def clear_prefix_cache(self) -> None:
