@@ -301,7 +301,7 @@ Apache 2.0. Voir [LICENSE](LICENSE).
 
 ## Historique des stars
 
-[![Star History Chart](https://api.star-history.com/svg?repos=waybarrios/vllm-mlx&type=Date)](https://star-history.com/#waybarrios/vllm-mlx&Date)
+[![Star History Chart](https://star-history.dera.page/svg?repos=waybarrios/vllm-mlx&type=Date)](https://star-history.dera.page/#waybarrios/vllm-mlx&Date)
 
 ---
 
