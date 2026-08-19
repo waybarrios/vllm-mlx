@@ -13,6 +13,7 @@ Available parsers:
 - gemma4/gemma_4: Google Gemma 4 models (<|tool_call>call:name{} format)
 - hermes/nous: Hermes/NousResearch models
 - deepseek/deepseek_v3/deepseek_r1: DeepSeek models (unicode tokens)
+- deepseek_v4/dsml: DeepSeek-V4 models (<｜DSML｜invoke name="..."> markup)
 - kimi/kimi_k2/moonshot: Kimi/Moonshot models
 - granite/granite3: IBM Granite models
 - nemotron/nemotron3: NVIDIA Nemotron models
@@ -48,6 +49,7 @@ from .abstract_tool_parser import (
 # Import parsers to register them
 from .auto_tool_parser import AutoToolParser
 from .deepseek_tool_parser import DeepSeekToolParser
+from .deepseek_v4_tool_parser import DeepSeekV4ToolParser
 from .functionary_tool_parser import FunctionaryToolParser
 from .gemma4_tool_parser import Gemma4ToolParser
 from .granite_tool_parser import GraniteToolParser
@@ -105,6 +107,7 @@ __all__ = [
     "LlamaToolParser",
     "HermesToolParser",
     "DeepSeekToolParser",
+    "DeepSeekV4ToolParser",
     "KimiToolParser",
     "GraniteToolParser",
     "NemotronToolParser",

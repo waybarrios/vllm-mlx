@@ -16,6 +16,10 @@ from .abstract_tool_parser import (
     ToolParser,
     ToolParserManager,
 )
+from .deepseek_v4_tool_parser import (
+    TOOL_CALLS_START as DSML_TOOL_CALLS_START,
+)
+from .deepseek_v4_tool_parser import DeepSeekV4ToolParser
 from .gemma4_tool_parser import Gemma4ToolParser
 
 
@@ -71,6 +75,14 @@ class AutoToolParser(ToolParser):
         if "<|tool_call>" in model_output:
             gemma_parser = Gemma4ToolParser()
             result = gemma_parser.extract_tool_calls(model_output, request)
+            if result.tools_called:
+                return result
+
+        # 1b. Try DeepSeek-V4 DSML. The marker carries the model's private
+        # ｜DSML｜ token, so a false positive is not realistic.
+        if DSML_TOOL_CALLS_START in model_output:
+            dsml_parser = DeepSeekV4ToolParser()
+            result = dsml_parser.extract_tool_calls(model_output, request)
             if result.tools_called:
                 return result
 
