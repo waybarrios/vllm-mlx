@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 from .api.utils import is_mllm_model
-from .engine.base import BaseEngine
+from .engine.base import BaseEngine, suspend_cancellation
 from .engine.batched import BatchedEngine
 from .engine.simple import SimpleEngine
 from .scheduler import SchedulerConfig
@@ -990,13 +990,22 @@ class ModelManager:
             await asyncio.wait_for(self._condition.wait(), timeout=timeout)
 
     async def _run_unloads(self, unloads: list[LoadedModel]) -> None:
-        for loaded in unloads:
-            try:
-                await loaded.engine.stop()
-            finally:
-                async with self._condition:
-                    self._unloading.pop(loaded.config.entry.name, None)
-                    self._condition.notify_all()
+        async def _stop_engines() -> None:
+            for loaded in unloads:
+                try:
+                    await loaded.engine.stop()
+                finally:
+                    async with self._condition:
+                        self._unloading.pop(loaded.config.entry.name, None)
+                        self._condition.notify_all()
+
+        unload_task = asyncio.create_task(_stop_engines())
+        try:
+            await asyncio.shield(unload_task)
+        except asyncio.CancelledError:
+            with suspend_cancellation():
+                await unload_task
+            raise
 
     def _reserve_load_locked(self, model_name: str, required_bytes: int) -> PendingLoad:
         future: asyncio.Future[LoadedModel] = asyncio.get_running_loop().create_future()

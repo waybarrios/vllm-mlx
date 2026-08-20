@@ -335,6 +335,50 @@ def test_unload_idle_unloads_stale_models_and_skips_busy_ones(tmp_path):
     asyncio.run(_run())
 
 
+def test_unload_idle_completes_engine_stop_when_cancelled(tmp_path):
+    """Cancelling an idle sweep must not orphan a half-stopped engine."""
+
+    async def _run():
+        stop_started = asyncio.Event()
+        stop_gate = asyncio.Event()
+        stop_completed = False
+
+        class BlockingStopEngine(FakeEngine):
+            async def stop(self) -> None:
+                nonlocal stop_completed
+                stop_started.set()
+                await stop_gate.wait()
+                stop_completed = True
+                self.stopped += 1
+
+        registry = _registry(tmp_path, {"alpha": 4})
+        manager = ModelManager(
+            _manager_config(budget_gb=16, idle_unload_seconds=1),
+            registry,
+            _defaults(),
+            engine_factory=lambda config: BlockingStopEngine(config),
+        )
+
+        lease = await manager.acquire("alpha")
+        await lease.release()
+        manager._loaded["alpha"].last_used_at = time.time() - 2
+
+        unload_task = asyncio.create_task(manager.unload_idle())
+        await stop_started.wait()
+        unload_task.cancel()
+        await asyncio.sleep(0)
+
+        stop_gate.set()
+        with pytest.raises(asyncio.CancelledError):
+            await unload_task
+
+        assert stop_completed
+        assert manager.list_models()[0]["status"] == "unloaded"
+        assert manager._unloading == {}
+
+    asyncio.run(_run())
+
+
 # ---------------------------------------------------------------------------
 # Memory budget vs Metal allocation ceiling reconciliation (issue #627)
 # ---------------------------------------------------------------------------

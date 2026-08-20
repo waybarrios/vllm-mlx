@@ -1359,7 +1359,7 @@ Examples:
         "--auto-unload-idle-seconds",
         type=float,
         default=0.0,
-        help="Unload the main model after this many idle seconds (0 = disabled)",
+        help="Unload idle models after this many seconds (0 = disabled)",
     )
     serve_parser.add_argument(
         "--lazy-load-model",

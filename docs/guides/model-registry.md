@@ -53,6 +53,7 @@ Example:
 ```yaml
 manager:
   memory_budget_gb: 100
+  idle_unload_seconds: 300
   contention_policy:
     strategy: wait_then_preempt
     wait_timeout_s: 45
@@ -94,6 +95,16 @@ It does not include, and does not reserve room for:
 - other colocated services
 
 On a 128 GB machine, a practical starting point is often `80-100 GB`.
+
+### `idle_unload_seconds`
+
+Automatically unload a model after it has had no active requests for this many
+seconds. Values less than or equal to `0` disable idle unloading.
+
+If this setting is omitted, registry mode inherits
+`--auto-unload-idle-seconds`; that flag defaults to `0`. A value in the YAML
+file takes precedence over the CLI fallback. Preloaded models are also eligible
+for idle unloading after their preload lease is released.
 
 ### Budget vs. the Metal allocation ceiling
 
@@ -263,6 +274,13 @@ Registry-backed responses include the configured model ids and current state suc
 - `loading`
 - `unloaded`
 - `preempting`
+
+Each model entry also includes `last_used_at` when it is loaded. For the
+effective idle timeout together with all model states, inspect `/v1/status`:
+
+```bash
+curl http://localhost:8000/v1/status
+```
 
 ### Verify a cold-load path
 

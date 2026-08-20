@@ -390,9 +390,10 @@ class TestLifecycleCli:
 
         captured = {}
 
-        def fake_load_model_registry(config_path, *, defaults):
+        def fake_load_model_registry(config_path, *, defaults, memory_budget_gb=None):
             captured["config_path"] = config_path
             captured["defaults"] = defaults
+            captured["memory_budget_gb"] = memory_budget_gb
 
         monkeypatch.setattr(srv, "load_model_registry", fake_load_model_registry)
         monkeypatch.setattr(uvicorn, "run", lambda *args, **kwargs: None)
@@ -467,6 +468,7 @@ class TestLifecycleCli:
 
         assert captured["config_path"] == "/tmp/models.yaml"
         assert captured["defaults"].auto_unload_idle_seconds == 300
+        assert captured["memory_budget_gb"] is None
 
     def test_serve_command_preserves_mtp_scheduler_config_with_residency(
         self, monkeypatch
