@@ -109,9 +109,7 @@ class TestMemoryBudgetGbArg:
             ("1e300", "too large"),
         ],
     )
-    def test_invalid_or_unrepresentable_values_are_rejected(
-        self, bad_value, message
-    ):
+    def test_invalid_or_unrepresentable_values_are_rejected(self, bad_value, message):
         with pytest.raises(argparse.ArgumentTypeError, match=message):
             memory_budget_gb_arg(bad_value)
 
@@ -139,8 +137,6 @@ class TestMemoryBudgetGbCliWiring:
         from vllm_mlx.cli import create_parser
 
         with pytest.raises(SystemExit):
-            create_parser().parse_args(
-                ["serve", "--memory-budget-gb", bad_value]
-            )
+            create_parser().parse_args(["serve", "--memory-budget-gb", bad_value])
 
         assert "--memory-budget-gb" in capsys.readouterr().err

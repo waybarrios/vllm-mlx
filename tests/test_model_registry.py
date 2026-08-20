@@ -181,9 +181,7 @@ def test_cli_memory_budget_takes_precedence_over_invalid_yaml_value(tmp_path):
 
 @pytest.mark.parametrize("raw_value", [".nan", ".inf", "0", "-0.1"])
 def test_registry_rejects_invalid_manager_memory_budget(tmp_path, raw_value):
-    config_path = _write_registry_config(
-        tmp_path, f"  memory_budget_gb: {raw_value}"
-    )
+    config_path = _write_registry_config(tmp_path, f"  memory_budget_gb: {raw_value}")
 
     with pytest.raises(ValueError, match="must be a positive finite number"):
         load_registry_config(config_path, _defaults())
