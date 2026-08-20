@@ -3,6 +3,7 @@
 
 import argparse
 import json
+import math
 from collections.abc import Callable
 from typing import Any
 
@@ -60,6 +61,33 @@ def make_positive_int_arg_parser(option_name: str) -> Callable[[str], int]:
         return parse_positive_int_arg(value, option_name)
 
     return _parser
+
+
+def parse_positive_finite_float(value: Any, value_name: str) -> float:
+    """Parse a numeric value that must be positive and finite."""
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{value_name} must be a number") from exc
+    if not math.isfinite(parsed) or parsed <= 0:
+        raise ValueError(f"{value_name} must be a positive finite number")
+    return parsed
+
+
+def memory_budget_gb_arg(value: str) -> float:
+    """Parse a registry memory budget that can be represented in bytes."""
+    option_name = "--memory-budget-gb"
+    try:
+        parsed = parse_positive_finite_float(value, option_name)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
+
+    bytes_value = parsed * (1024**3)
+    if not math.isfinite(bytes_value):
+        raise argparse.ArgumentTypeError(f"{option_name} is too large")
+    if int(bytes_value) == 0:
+        raise argparse.ArgumentTypeError(f"{option_name} must be at least 1 byte")
+    return parsed
 
 
 def parse_auto_or_positive_int_arg(value: str, option_name: str) -> int | None:

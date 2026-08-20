@@ -3494,11 +3494,16 @@ def load_model_registry(
     config_path: str,
     *,
     defaults: RegistryServeDefaults,
+    memory_budget_gb: float | None = None,
 ) -> None:
     """Load a registry-backed model manager from YAML configuration."""
     global _engine, _model_manager, _model_name, _model_path, _default_max_tokens
 
-    manager_config, registry = load_registry_config(config_path, defaults)
+    manager_config, registry = load_registry_config(
+        config_path,
+        defaults,
+        memory_budget_gb=memory_budget_gb,
+    )
     _engine = None
     _model_path = None
     _model_name = None

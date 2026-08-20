@@ -57,6 +57,7 @@ vllm-mlx serve --models-config <yaml> [options]
 | `--enable-auto-tool-choice` | Enable automatic tool calling | False |
 | `--tool-call-parser` | Tool call parser (`auto`, `mistral`, `qwen`, `llama`, `hermes`, `deepseek`, `kimi`, `granite`, `nemotron`, `xlam`, `functionary`, `glm47`) | None |
 | `--models-config` | YAML registry file for multi-model serving | None |
+| `--memory-budget-gb` | Override the registry manager model-weight residency budget in GB. This is not a total runtime-memory limit and does not guarantee prevention of Metal/MLX OOM. | YAML manager budget |
 
 ### Examples
 
@@ -116,6 +117,9 @@ vllm-mlx serve mlx-community/Llama-3.2-3B-Instruct-4bit --api-key your-secret-ke
 
 # Registry-backed multi-model serving
 vllm-mlx serve --models-config /etc/vllm-mlx/models.yaml --continuous-batching
+
+# Override the registry YAML manager budget at launch time
+vllm-mlx serve --models-config /etc/vllm-mlx/models.yaml --memory-budget-gb 80
 
 # Expose Prometheus metrics
 vllm-mlx serve mlx-community/Llama-3.2-3B-Instruct-4bit --enable-metrics

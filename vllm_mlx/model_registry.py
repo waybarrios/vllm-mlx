@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 from .api.utils import is_mllm_model
+from .cli_arg_types import parse_positive_finite_float
 from .engine.base import BaseEngine
 from .engine.batched import BatchedEngine
 from .engine.simple import SimpleEngine
@@ -249,18 +250,32 @@ def _parse_memory_budget_bytes(value: Any) -> int:
     """Parse a memory budget from bytes, MB, or GB."""
     if value is None:
         raise ValueError("models-config manager.memory_budget_gb is required")
+    multiplier = 1024**3
+    amount: str | int | float
     if isinstance(value, (int, float)):
-        return int(float(value) * (1024**3))
-    if isinstance(value, str):
+        amount = value
+    elif isinstance(value, str):
         raw = value.strip().lower()
         if raw.endswith("gb"):
-            return int(float(raw[:-2]) * (1024**3))
-        if raw.endswith("mb"):
-            return int(float(raw[:-2]) * (1024**2))
-        if raw.endswith("b"):
-            return int(float(raw[:-1]))
-        return int(float(raw) * (1024**3))
-    raise TypeError(f"Unsupported memory budget value: {value!r}")
+            amount = raw[:-2]
+        elif raw.endswith("mb"):
+            amount = raw[:-2]
+            multiplier = 1024**2
+        elif raw.endswith("b"):
+            amount = raw[:-1]
+            multiplier = 1
+        else:
+            amount = raw
+    else:
+        raise TypeError(f"Unsupported memory budget value: {value!r}")
+
+    value_name = "models-config manager memory budget"
+    parsed = parse_positive_finite_float(amount, value_name)
+    bytes_value = parse_positive_finite_float(parsed * multiplier, value_name)
+    memory_budget_bytes = int(bytes_value)
+    if memory_budget_bytes == 0:
+        raise ValueError(f"{value_name} must be at least 1 byte")
+    return memory_budget_bytes
 
 
 def _safe_available_memory_bytes() -> int:
@@ -531,6 +546,8 @@ def _estimate_model_bytes_from_source(source: str) -> int:
 def load_registry_config(
     config_path: str | os.PathLike[str],
     defaults: RegistryServeDefaults,
+    *,
+    memory_budget_gb: float | None = None,
 ) -> tuple[RegistryManagerConfig, dict[str, RegisteredModel]]:
     """Load and validate the models registry YAML file."""
     import yaml  # lazy: only needed when a registry config is provided
@@ -566,7 +583,9 @@ def load_registry_config(
 
     manager = RegistryManagerConfig(
         memory_budget_bytes=_parse_memory_budget_bytes(
-            manager_raw.get("memory_budget_gb", manager_raw.get("memory_budget"))
+            memory_budget_gb
+            if memory_budget_gb is not None
+            else manager_raw.get("memory_budget_gb", manager_raw.get("memory_budget"))
         ),
         policy=policy,
     )

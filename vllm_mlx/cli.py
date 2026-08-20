@@ -20,6 +20,7 @@ from .cli_arg_types import (
     make_auto_or_positive_int_arg_parser,
     make_json_object_arg_parser,
     make_positive_int_arg_parser,
+    memory_budget_gb_arg,
 )
 from .tool_parsers import ToolParserManager
 
@@ -61,6 +62,7 @@ def serve_command(args):
     logger = logging.getLogger(__name__)
     model_arg = getattr(args, "model", None)
     models_config = getattr(args, "models_config", None)
+    memory_budget_gb = getattr(args, "memory_budget_gb", None)
 
     if models_config and model_arg:
         print("Error: use either positional MODEL or --models-config, not both")
@@ -70,6 +72,9 @@ def serve_command(args):
         sys.exit(1)
     if models_config and args.served_model_name:
         print("Error: --served-model-name cannot be used with --models-config")
+        sys.exit(1)
+    if memory_budget_gb is not None and not models_config:
+        print("Error: --memory-budget-gb requires --models-config")
         sys.exit(1)
 
     # Validate tool calling arguments
@@ -400,7 +405,11 @@ def serve_command(args):
             max_tokens=args.max_tokens,
             download_config=download_config,
         )
-        load_model_registry(models_config, defaults=defaults)
+        load_model_registry(
+            models_config,
+            defaults=defaults,
+            memory_budget_gb=memory_budget_gb,
+        )
     else:
         # Load model with unified server
         load_model(
@@ -1055,6 +1064,16 @@ Examples:
         type=str,
         default=None,
         help="YAML file describing a registry of models for lazy multi-model serving",
+    )
+    serve_parser.add_argument(
+        "--memory-budget-gb",
+        type=memory_budget_gb_arg,
+        default=None,
+        help=(
+            "Override the registry manager model-weight residency budget in GB. "
+            "This is not a total runtime-memory limit and does not guarantee "
+            "prevention of Metal/MLX OOM."
+        ),
     )
     serve_parser.add_argument(
         "--served-model-name",
