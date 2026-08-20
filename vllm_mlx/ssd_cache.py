@@ -650,6 +650,8 @@ class SSDCacheTier:
               manifest.json  # per-entry layer metadata
     """
 
+    _WRITER_JOIN_TIMEOUT_S = 5.0
+
     def __init__(self, config: SSDCacheConfig) -> None:
         self._config = config
         self._closed = True
@@ -673,11 +675,17 @@ class SSDCacheTier:
             self._stats = SSDCacheStats()
             self._lock = threading.Lock()
 
+            # Lifecycle state is independent from the stats lock: close() may
+            # wait for a writer that still needs the stats lock to finish its
+            # current entry.
+            self._lifecycle_lock = threading.Lock()
+            self._accepting_spills = True
+            self._writer_shutdown_requested = False
+
             # Spill queue and writer thread
             self._spill_queue: queue.Queue = queue.Queue(
                 maxsize=config.spill_queue_size
             )
-            self._writer_stop = threading.Event()
             self._closed = False
         except Exception:
             index = getattr(self, "_index", None)
@@ -701,23 +709,21 @@ class SSDCacheTier:
 
     def start_writer(self) -> None:
         """Start the background spill writer thread."""
-        if self._writer_thread is not None:
-            return
-        self._writer_stop.clear()
-        self._writer_thread = threading.Thread(
-            target=self._writer_loop, daemon=True, name="ssd-cache-writer"
-        )
-        self._writer_thread.start()
+        with self._lifecycle_lock:
+            if self._closed or self._writer_shutdown_requested:
+                raise RuntimeError("cannot start a closed SSD cache tier")
+            if self._writer_thread is not None:
+                return
+            self._writer_thread = threading.Thread(
+                target=self._writer_loop, daemon=True, name="ssd-cache-writer"
+            )
+            self._writer_thread.start()
         logger.info("[ssd_cache] writer thread started")
 
     def _writer_loop(self) -> None:
         """Drain spill queue and persist entries. Numpy-only — no MLX here."""
-        while not self._writer_stop.is_set():
-            try:
-                item = self._spill_queue.get(timeout=0.5)
-            except queue.Empty:
-                continue
-
+        while True:
+            item = self._spill_queue.get()
             if item is None:  # Poison pill for shutdown
                 break
 
@@ -743,6 +749,10 @@ class SSDCacheTier:
 
         Returns True if enqueued, False if queue is full (entry dropped).
         """
+        with self._lifecycle_lock:
+            if not self._accepting_spills:
+                return False
+
         # Dequantize on the CALLER's thread, which owns the MLX GPU stream.
         # mx.dequantize is a GPU compute op; running it on the writer thread
         # aborts the process ("no Stream(gpu,N) in current thread"). Materialize
@@ -842,15 +852,18 @@ class SSDCacheTier:
             )
             return False
 
-        try:
-            self._spill_queue.put_nowait((tokens, layer_snapshots, memory_bytes))
-            return True
-        except queue.Full:
-            logger.warning(
-                f"[ssd_cache] spill queue full, dropping entry "
-                f"({len(tokens)} tokens, {memory_bytes} bytes)"
-            )
-            return False
+        with self._lifecycle_lock:
+            if not self._accepting_spills:
+                return False
+            try:
+                self._spill_queue.put_nowait((tokens, layer_snapshots, memory_bytes))
+                return True
+            except queue.Full:
+                logger.warning(
+                    f"[ssd_cache] spill queue full, dropping entry "
+                    f"({len(tokens)} tokens, {memory_bytes} bytes)"
+                )
+                return False
 
     def _write_entry(
         self,
@@ -1215,20 +1228,45 @@ class SSDCacheTier:
         return cleaned
 
     def close(self) -> None:
-        """Close the SSD cache tier and release resources."""
-        if self._closed:
-            return
-        self._closed = True
+        """Drain pending spills, stop the writer, and release resources.
 
-        # Stop writer thread
-        self._writer_stop.set()
-        if self._writer_thread is not None:
-            try:
-                self._spill_queue.put_nowait(None)  # Poison pill
-            except queue.Full:
-                pass
-            self._writer_thread.join(timeout=5.0)
-            self._writer_thread = None
+        If the writer does not terminate within the bounded join, retain both
+        the thread reference and the SQLite index so a live writer can finish
+        safely. A later close() call can retry the join.
+        """
+        with self._lifecycle_lock:
+            if self._closed:
+                return
 
-        self._index.close()
+            self._accepting_spills = False
+            if self._writer_thread is not None:
+                shutdown_deadline = time.monotonic() + self._WRITER_JOIN_TIMEOUT_S
+                if not self._writer_shutdown_requested:
+                    # FIFO ordering makes the poison pill a drain barrier: all
+                    # spills accepted before shutdown are written first.
+                    try:
+                        self._spill_queue.put(None, timeout=self._WRITER_JOIN_TIMEOUT_S)
+                    except queue.Full as exc:
+                        raise TimeoutError(
+                            "SSD cache shutdown sentinel could not be queued "
+                            "before timeout"
+                        ) from exc
+                    self._writer_shutdown_requested = True
+
+                join_timeout = max(0.0, shutdown_deadline - time.monotonic())
+                self._writer_thread.join(timeout=join_timeout)
+                if self._writer_thread.is_alive():
+                    raise TimeoutError(
+                        "SSD cache writer thread did not stop before timeout"
+                    )
+                self._writer_thread = None
+
+            self._index.close()
+            self._closed = True
         logger.info("[ssd_cache] SSDCacheTier closed")
+
+    async def aclose(self) -> None:
+        """Close without blocking the caller's asyncio event loop."""
+        import asyncio
+
+        await asyncio.to_thread(self.close)

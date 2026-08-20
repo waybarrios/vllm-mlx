@@ -9,15 +9,25 @@ and Anthropic Messages endpoints.
 """
 
 from .json_schema_processor import (
+    ConstrainedDecodingError,
     JSONSchemaLogitsProcessor,
     LMFormatEnforcerNotAvailableError,
+    UnsupportedJSONSchemaError,
     is_available,
+)
+from .llguidance_schema_processor import (
+    LLGuidanceJSONSchemaLogitsProcessor,
+    is_available as is_strict_json_schema_available,
 )
 from .thinking_processor import ThinkingAwareLogitsProcessor
 
 __all__ = [
+    "ConstrainedDecodingError",
     "JSONSchemaLogitsProcessor",
+    "LLGuidanceJSONSchemaLogitsProcessor",
     "LMFormatEnforcerNotAvailableError",
     "ThinkingAwareLogitsProcessor",
+    "UnsupportedJSONSchemaError",
     "is_available",
+    "is_strict_json_schema_available",
 ]

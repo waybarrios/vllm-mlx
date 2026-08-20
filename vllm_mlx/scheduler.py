@@ -1363,18 +1363,7 @@ class Scheduler:
                 )
 
                 if self.config.ssd_cache_dir is not None:
-                    ssd_config = SSDCacheConfig(
-                        cache_dir=self.config.ssd_cache_dir,
-                        max_size_gb=self.config.ssd_cache_max_gb,
-                    )
-                    self._ssd_tier = SSDCacheTier(ssd_config)
-                    self._ssd_tier.start_writer()
-                    self._ssd_tier.reconcile()
-                    self.memory_aware_cache.set_ssd_tier(self._ssd_tier)
-                    logger.info(
-                        f"SSD cache tier enabled: dir={self.config.ssd_cache_dir}, "
-                        f"max={self.config.ssd_cache_max_gb}GB"
-                    )
+                    self.ensure_ssd_tier()
             else:
                 # Use legacy entry-count based prefix cache
                 self.prefix_cache = PrefixCacheManager(
@@ -3305,12 +3294,50 @@ class Scheduler:
             self.prefix_cache.clear()
             logger.info("[clear_prefix_cache] prefix cache cleared")
 
+    def ensure_ssd_tier(self) -> None:
+        """Create and attach the configured SSD tier when it is absent."""
+        if (
+            self._ssd_tier is not None
+            or self.config.ssd_cache_dir is None
+            or self.memory_aware_cache is None
+        ):
+            return
+
+        ssd_config = SSDCacheConfig(
+            cache_dir=self.config.ssd_cache_dir,
+            max_size_gb=self.config.ssd_cache_max_gb,
+        )
+        tier = SSDCacheTier(ssd_config)
+        try:
+            tier.start_writer()
+            tier.reconcile()
+        except Exception:
+            try:
+                tier.close()
+            except Exception:
+                logger.exception("Failed to close SSD tier after startup error")
+            raise
+
+        self._ssd_tier = tier
+        self.memory_aware_cache.set_ssd_tier(tier)
+        logger.info(
+            f"SSD cache tier enabled: dir={self.config.ssd_cache_dir}, "
+            f"max={self.config.ssd_cache_max_gb}GB"
+        )
+
     def close_ssd_tier(self) -> None:
-        """Shut down the SSD cache tier if present."""
-        if self._ssd_tier is not None:
-            self._ssd_tier.close()
+        """Shut down and detach the SSD cache tier if present."""
+        tier = self._ssd_tier
+        if tier is None:
+            return
+
+        if self.memory_aware_cache is not None:
+            self.memory_aware_cache.set_ssd_tier(None)
+
+        tier.close()
+        if self._ssd_tier is tier:
             self._ssd_tier = None
-            logger.info("SSD cache tier closed")
+        logger.info("SSD cache tier closed")
 
     def _try_promote_ssd_pending(self) -> None:
         """Attempt synchronous SSD promotion for waiting requests tagged ssd_pending.

@@ -762,21 +762,23 @@ class SimpleEngine(BaseEngine):
             # on the slower mlx_vlm multimodal path.
             if self._is_mllm and self._should_route_text_through_text_model():
                 try:
-                    from ..text_model_from_vlm import build_text_model
 
-                    self._text_model = build_text_model(
-                        self._model.model, self._model_name
-                    )
+                    def build_text_route():
+                        from ..text_model_from_vlm import build_text_model
+
+                        text_model = build_text_model(
+                            self._model.model, self._model_name
+                        )
+                        if text_model is None:
+                            return None, None
+                        return text_model, self._model.get_tokenizer()
+
+                    (
+                        self._text_model,
+                        self._text_tokenizer,
+                    ) = await self._run_blocking_serialized(build_text_route)
 
                     if self._text_model is not None:
-                        self._text_tokenizer = self._model.get_tokenizer()
-                        self._supports_system_kv_cache = (
-                            self._probe_system_kv_cache_support(
-                                self._text_model,
-                                "mllm_text",
-                            )
-                        )
-
                         # Apply Qwen3.5 eos_token fix (matches MLXLanguageModel.load)
                         if "qwen3" in self._model_name.lower():
                             self._text_tokenizer.eos_token = "<|im_end|>"

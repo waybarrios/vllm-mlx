@@ -20,10 +20,11 @@ import copy
 import hashlib
 import json
 import logging
-from typing import Any
+from typing import Any, Callable
 
 import mlx.core as mx
 import numpy as np
+from jsonschema.validators import validator_for
 
 from .cache import _get_vocab_size, get_tokenizer_data
 
@@ -32,6 +33,14 @@ logger = logging.getLogger(__name__)
 
 class LMFormatEnforcerNotAvailableError(RuntimeError):
     """Raised when ``lm-format-enforcer`` is required but not installed."""
+
+
+class ConstrainedDecodingError(RuntimeError):
+    """Raised when a declared constrained-output request cannot stay constrained."""
+
+
+class UnsupportedJSONSchemaError(ConstrainedDecodingError):
+    """Raised when schema simplification cannot preserve request semantics."""
 
 
 # Module-level cache of (parser_schema, JsonSchemaParser) keyed by a canonical
@@ -82,16 +91,48 @@ def is_available() -> bool:
     return True
 
 
-# A permissive "any JSON value" schema for ``response_format.type = json_object``.
-# JSON spec allows any of {object, array, string, number, boolean, null} at the
-# top level, but realistic OpenAI ``json_object`` mode expects an object or
-# array at the root.
-_GENERIC_JSON_SCHEMA: dict = {
-    "anyOf": [
-        {"type": "object"},
-        {"type": "array"},
-    ]
-}
+# ``response_format.type = json_object`` requires an object at the root.
+_GENERIC_JSON_SCHEMA: dict = {"type": "object"}
+
+
+def _normalize_prefix_items(
+    node: dict,
+    resolve: Callable[[dict, int], dict],
+    depth: int,
+) -> dict:
+    """Preserve homogeneous bounded prefixItems or reject the schema."""
+    if "prefixItems" not in node:
+        return node
+
+    prefix_items = node["prefixItems"]
+    if not isinstance(prefix_items, list) or not prefix_items:
+        raise UnsupportedJSONSchemaError(
+            "prefixItems must be a non-empty array of schemas"
+        )
+    resolved_prefix = [resolve(item, depth + 1) for item in prefix_items]
+    first = resolved_prefix[0]
+    max_items = node.get("maxItems")
+    if (
+        "items" in node
+        or max_items is None
+        or max_items > len(resolved_prefix)
+        or any(item != first for item in resolved_prefix[1:])
+    ):
+        raise UnsupportedJSONSchemaError(
+            "heterogeneous or open-ended prefixItems is not supported"
+        )
+    node["items"] = first
+    node.pop("prefixItems")
+    return node
+
+
+def _allowed_tokens_or_raise(allowed_result: Any) -> list[int]:
+    allowed = getattr(allowed_result, "allowed_tokens", allowed_result)
+    if allowed is None:
+        raise ConstrainedDecodingError(
+            "JSON schema enforcer returned no allowed-token result"
+        )
+    return list(allowed)
 
 
 def _simplify_schema(schema: dict) -> dict:
@@ -177,6 +218,8 @@ def _simplify_schema(schema: dict) -> dict:
         for key in ("items", "additionalProperties"):
             if key in node and isinstance(node[key], dict):
                 node[key] = _resolve(node[key], depth + 1)
+
+        node = _normalize_prefix_items(node, _resolve, depth)
 
         for key in ("allOf", "anyOf", "oneOf"):
             if key in node and isinstance(node[key], list):
@@ -329,6 +372,10 @@ class JSONSchemaLogitsProcessor:
 
         self._tokenizer = tokenizer
         self._schema = schema
+        validation_schema = schema if schema is not None else _GENERIC_JSON_SCHEMA
+        validator_cls = validator_for(validation_schema)
+        validator_cls.check_schema(validation_schema)
+        self._schema_validator = validator_cls(validation_schema)
         self._tok_data = get_tokenizer_data(tokenizer)
         if self._tok_data is None:
             raise LMFormatEnforcerNotAvailableError(
@@ -343,31 +390,24 @@ class JSONSchemaLogitsProcessor:
         try:
             parser_schema, self._parser = _get_or_build_parser(schema)
             self._enforcer = TokenEnforcer(self._tok_data, self._parser)
+        except UnsupportedJSONSchemaError:
+            raise
         except Exception as exc:
-            logger.warning(
-                "JSONSchemaLogitsProcessor: enforcer init failed (%s); "
-                "falling back to unconstrained generation",
-                exc,
-            )
-            self._disabled = True
-            self._parser = None  # type: ignore[assignment]
-            self._enforcer = None  # type: ignore[assignment]
+            raise ConstrainedDecodingError(
+                f"failed to initialize JSON schema enforcer: {exc}"
+            ) from exc
 
         # Bootstrap the enforcer's ``prefix_states`` with the empty tuple so
         # that subsequent ``get_allowed_tokens([t1, t2, ...])`` calls can find
         # their ``prev_step_tuple`` and apply characters incrementally rather
         # than treating the whole sequence as a prompt and resetting to the
         # root parser.
-        if not self._disabled:
-            try:
-                self._enforcer.get_allowed_tokens([])
-            except Exception as exc:
-                logger.warning(
-                    "TokenEnforcer bootstrap failed (%s); "
-                    "falling back to unconstrained generation",
-                    exc,
-                )
-                self._disabled = True
+        try:
+            self._enforcer.get_allowed_tokens([])
+        except Exception as exc:
+            raise ConstrainedDecodingError(
+                f"failed to bootstrap JSON schema enforcer: {exc}"
+            ) from exc
 
         self._prompt_len: int | None = None
         self._vocab_size: int = _get_vocab_size(tokenizer)
@@ -514,10 +554,10 @@ class JSONSchemaLogitsProcessor:
         if not text:
             return False
         try:
-            json.loads(text)
+            value = json.loads(text)
         except (ValueError, json.JSONDecodeError):
             return False
-        return True
+        return self._schema_validator.is_valid(value)
 
     def _get_json_context(self, suffix: list[int]) -> str:
         """Determine the JSON structural context of the current suffix.
@@ -845,11 +885,7 @@ class JSONSchemaLogitsProcessor:
             # Use prompt_len directly instead of O(n) list comparison.
             pass_to_enforcer = suffix if self._prompt_len else tokens_list
             allowed_result = self._enforcer.get_allowed_tokens(pass_to_enforcer)
-            allowed = getattr(allowed_result, "allowed_tokens", allowed_result)
-            if allowed is None:
-                return logits
-
-            allowed_list = list(allowed)
+            allowed_list = _allowed_tokens_or_raise(allowed_result)
 
             # --- Schema-aware key filter (before EOS guard so that the
             # incremental JSON context state and bracket depth counters
@@ -872,11 +908,8 @@ class JSONSchemaLogitsProcessor:
             ):
                 allowed_list = [t for t in allowed_list if t not in self._eos_set]
 
-            # --- Recovery: if enforcer returns empty set AND output is not
-            # complete JSON, the schema is likely unsupported — disable the
-            # processor and let the model generate freely (system prompt +
-            # post-validation still apply).  Only force EOS if the output
-            # already parses as valid JSON (generation is done).
+            # Empty allowed sets cannot fall back to unconstrained generation:
+            # that would turn a strict response_format request into best effort.
             if not allowed_list:
                 if self._suffix_is_complete_json(suffix) and self._eos_set:
                     allowed_list = sorted(self._eos_set)
@@ -885,16 +918,11 @@ class JSONSchemaLogitsProcessor:
                         decoded = self._tokenizer.decode(suffix)
                     except Exception:
                         decoded = "<decode-error>"
-                    logger.warning(
-                        "JSONLP: enforcer stuck (empty allowed-set at "
-                        "suffix_len=%d, suffix_tokens=%s, decoded=%r); "
-                        "disabling constrained decoding for this request",
-                        len(suffix),
-                        suffix[:10],
-                        decoded[:80],
+                    raise ConstrainedDecodingError(
+                        "JSON schema enforcer reached an empty allowed-token set "
+                        f"at suffix_len={len(suffix)}, suffix_tokens={suffix[:10]}, "
+                        f"decoded={decoded[:80]!r}"
                     )
-                    self._disabled = True
-                    return logits
 
             actual_vocab = logits.shape[-1]
             mask = self._build_allow_mask(allowed_list, actual_vocab)
@@ -902,12 +930,9 @@ class JSONSchemaLogitsProcessor:
                 mask = mask[None, :]
             return logits + mask
         except Exception as exc:  # pragma: no cover - defensive
-            logger.error(
-                "JSONSchemaLogitsProcessor crashed; disabling for this request: %s",
-                exc,
-            )
-            self._disabled = True
-            return logits
+            raise ConstrainedDecodingError(
+                f"JSON schema logits processor failed: {exc}"
+            ) from exc
 
     # Diagnostic helpers -------------------------------------------------
 

@@ -55,6 +55,9 @@ class _FakeScheduler:
     def _close_batch_generator(self):
         pass
 
+    def close_ssd_tier(self):
+        pass
+
 
 def _bare_engine_core(monkeypatch, worker=None):
     from vllm_mlx.engine_core import EngineConfig, EngineCore

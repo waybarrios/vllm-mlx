@@ -126,6 +126,70 @@ def _registry(tmp_path: Path, sizes_gb: dict[str, float]) -> dict[str, Registere
     return registry
 
 
+def _write_registry_config(tmp_path: Path, manager_yaml: str) -> Path:
+    config_path = tmp_path / "models.yaml"
+    config_path.write_text(f"""
+manager:
+{manager_yaml}
+models:
+  - name: test
+    path: /tmp/test-model
+""".strip())
+    return config_path
+
+
+def test_cli_memory_budget_overrides_yaml_value(tmp_path):
+    config_path = _write_registry_config(tmp_path, "  memory_budget_gb: 4")
+
+    manager, _ = load_registry_config(
+        config_path,
+        _defaults(),
+        memory_budget_gb=7.5,
+    )
+
+    assert manager.memory_budget_bytes == int(7.5 * (1024**3))
+
+
+def test_omitting_cli_memory_budget_preserves_yaml_value(tmp_path):
+    config_path = _write_registry_config(tmp_path, "  memory_budget: 2048mb")
+
+    manager, _ = load_registry_config(config_path, _defaults())
+
+    assert manager.memory_budget_bytes == 2048 * (1024**2)
+
+
+def test_cli_memory_budget_works_without_yaml_manager_budget(tmp_path):
+    config_path = _write_registry_config(tmp_path, "  contention_policy: {}")
+
+    manager, _ = load_registry_config(
+        config_path,
+        _defaults(),
+        memory_budget_gb=3.25,
+    )
+
+    assert manager.memory_budget_bytes == int(3.25 * (1024**3))
+
+
+def test_cli_memory_budget_takes_precedence_over_invalid_yaml_value(tmp_path):
+    config_path = _write_registry_config(tmp_path, "  memory_budget_gb: invalid")
+
+    manager, _ = load_registry_config(
+        config_path,
+        _defaults(),
+        memory_budget_gb=2.5,
+    )
+
+    assert manager.memory_budget_bytes == int(2.5 * (1024**3))
+
+
+@pytest.mark.parametrize("raw_value", [".nan", ".inf", "0", "-0.1"])
+def test_registry_rejects_invalid_manager_memory_budget(tmp_path, raw_value):
+    config_path = _write_registry_config(tmp_path, f"  memory_budget_gb: {raw_value}")
+
+    with pytest.raises(ValueError, match="must be a positive finite number"):
+        load_registry_config(config_path, _defaults())
+
+
 @pytest.mark.parametrize("raw_value", [".nan", ".inf", "0", "-0.1", "1.1"])
 def test_registry_rejects_invalid_per_entry_gpu_memory_utilization(tmp_path, raw_value):
     config_path = tmp_path / "models.yaml"

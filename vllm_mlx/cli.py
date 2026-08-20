@@ -20,7 +20,30 @@ from .cli_arg_types import (
     make_auto_or_positive_int_arg_parser,
     make_json_object_arg_parser,
     make_positive_int_arg_parser,
+    memory_budget_gb_arg,
 )
+from .tool_parsers import ToolParserManager
+
+_TOOL_PARSER_CHOICES = ToolParserManager.list_registered()
+_TOOL_PARSER_HELP = (
+    "Select the tool call parser for the model. Options: "
+    f"{', '.join(_TOOL_PARSER_CHOICES)}. Required for --enable-auto-tool-choice."
+)
+
+
+def _add_tool_calling_args(serve_parser: argparse.ArgumentParser) -> None:
+    serve_parser.add_argument(
+        "--enable-auto-tool-choice",
+        action="store_true",
+        help="Enable auto tool choice for supported models. Use --tool-call-parser to specify which parser to use.",
+    )
+    serve_parser.add_argument(
+        "--tool-call-parser",
+        type=str,
+        default=None,
+        choices=_TOOL_PARSER_CHOICES,
+        help=_TOOL_PARSER_HELP,
+    )
 
 
 def serve_command(args):
@@ -39,6 +62,7 @@ def serve_command(args):
     logger = logging.getLogger(__name__)
     model_arg = getattr(args, "model", None)
     models_config = getattr(args, "models_config", None)
+    memory_budget_gb = getattr(args, "memory_budget_gb", None)
 
     if models_config and model_arg:
         print("Error: use either positional MODEL or --models-config, not both")
@@ -48,6 +72,9 @@ def serve_command(args):
         sys.exit(1)
     if models_config and args.served_model_name:
         print("Error: --served-model-name cannot be used with --models-config")
+        sys.exit(1)
+    if memory_budget_gb is not None and not models_config:
+        print("Error: --memory-budget-gb requires --models-config")
         sys.exit(1)
 
     # Validate tool calling arguments
@@ -379,7 +406,11 @@ def serve_command(args):
             download_config=download_config,
             auto_unload_idle_seconds=args.auto_unload_idle_seconds,
         )
-        load_model_registry(models_config, defaults=defaults)
+        load_model_registry(
+            models_config,
+            defaults=defaults,
+            memory_budget_gb=memory_budget_gb,
+        )
     else:
         # Load model with unified server
         load_model(
@@ -1036,6 +1067,16 @@ Examples:
         help="YAML file describing a registry of models for lazy multi-model serving",
     )
     serve_parser.add_argument(
+        "--memory-budget-gb",
+        type=memory_budget_gb_arg,
+        default=None,
+        help=(
+            "Override the registry manager model-weight residency budget in GB. "
+            "This is not a total runtime-memory limit and does not guarantee "
+            "prevention of Metal/MLX OOM."
+        ),
+    )
+    serve_parser.add_argument(
         "--served-model-name",
         type=str,
         default=None,
@@ -1379,42 +1420,7 @@ Examples:
         help="Maximum number of characters accepted by /v1/audio/speech (default: 4096)",
     )
     # Tool calling options
-    serve_parser.add_argument(
-        "--enable-auto-tool-choice",
-        action="store_true",
-        help="Enable auto tool choice for supported models. Use --tool-call-parser to specify which parser to use.",
-    )
-    serve_parser.add_argument(
-        "--tool-call-parser",
-        type=str,
-        default=None,
-        choices=[
-            "auto",
-            "mistral",
-            "qwen",
-            "qwen3_coder",
-            "llama",
-            "hermes",
-            "harmony",
-            "gpt-oss",
-            "deepseek",
-            "kimi",
-            "granite",
-            "nemotron",
-            "xlam",
-            "functionary",
-            "gemma4",
-            "glm47",
-            "minimax",
-        ],
-        help=(
-            "Select the tool call parser for the model. Options: "
-            "auto (auto-detect), mistral, qwen, qwen3_coder, llama, hermes, "
-            "harmony, gpt-oss, deepseek, gemma4, kimi, granite, nemotron, "
-            "xlam, functionary, glm47, minimax. "
-            "Required for --enable-auto-tool-choice."
-        ),
-    )
+    _add_tool_calling_args(serve_parser)
     # Reasoning parser options - choices loaded dynamically from registry
     from .reasoning import list_parsers
 

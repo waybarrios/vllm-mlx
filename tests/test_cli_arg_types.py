@@ -12,6 +12,7 @@ import pytest
 
 from vllm_mlx.cli_arg_types import (
     make_auto_or_positive_int_arg_parser,
+    memory_budget_gb_arg,
     parse_auto_or_positive_int_arg,
 )
 
@@ -89,3 +90,53 @@ class TestEmbeddingMaxLengthCliWiring:
             ).embedding_max_length
             == 2048
         )
+
+
+class TestMemoryBudgetGbArg:
+    def test_positive_finite_value_is_accepted(self):
+        assert memory_budget_gb_arg("12.5") == 12.5
+
+    @pytest.mark.parametrize(
+        ("bad_value", "message"),
+        [
+            ("0", "positive finite number"),
+            ("-1", "positive finite number"),
+            ("nan", "positive finite number"),
+            ("inf", "positive finite number"),
+            ("-inf", "positive finite number"),
+            ("not-a-number", "must be a number"),
+            ("1e-12", "at least 1 byte"),
+            ("1e300", "too large"),
+        ],
+    )
+    def test_invalid_or_unrepresentable_values_are_rejected(self, bad_value, message):
+        with pytest.raises(argparse.ArgumentTypeError, match=message):
+            memory_budget_gb_arg(bad_value)
+
+
+class TestMemoryBudgetGbCliWiring:
+    def test_registry_override_parses_successfully(self):
+        from vllm_mlx.cli import create_parser
+
+        args = create_parser().parse_args(
+            [
+                "serve",
+                "--models-config",
+                "/tmp/models.yaml",
+                "--memory-budget-gb",
+                "12.5",
+            ]
+        )
+
+        assert args.memory_budget_gb == 12.5
+
+    @pytest.mark.parametrize("bad_value", ["1e-12", "1e300"])
+    def test_unrepresentable_values_fail_during_argument_parsing(
+        self, bad_value, capsys
+    ):
+        from vllm_mlx.cli import create_parser
+
+        with pytest.raises(SystemExit):
+            create_parser().parse_args(["serve", "--memory-budget-gb", bad_value])
+
+        assert "--memory-budget-gb" in capsys.readouterr().err

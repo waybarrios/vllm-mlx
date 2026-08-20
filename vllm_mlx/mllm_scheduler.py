@@ -213,6 +213,10 @@ class MLLMScheduler:
 
         # Batch generator (created lazily)
         self.batch_generator: Optional[MLLMBatchGenerator] = None
+        # SSD cold tier, wired onto the batch generator's prefix cache lazily
+        # in _ensure_batch_generator() — initialized here so stop() can
+        # safely check it even if no request ever ran.
+        self._ssd_tier: Optional[Any] = None
 
         # Request management - following vLLM's design
         self.waiting: deque[MLLMRequest] = deque()  # Waiting queue (FCFS)
@@ -846,6 +850,17 @@ class MLLMScheduler:
         if self.batch_generator is not None:
             self.batch_generator.close()
             self.batch_generator = None
+
+        if self._ssd_tier is not None:
+            tier = self._ssd_tier
+            aclose = getattr(tier, "aclose", None)
+            if aclose is not None:
+                await aclose()
+            else:
+                await asyncio.to_thread(tier.close)
+            if self._ssd_tier is tier:
+                self._ssd_tier = None
+            logger.info("SSD cache tier closed")
 
         logger.info("MLLM Scheduler stopped")
 
