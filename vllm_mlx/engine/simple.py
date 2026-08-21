@@ -552,9 +552,13 @@ class SimpleEngine(BaseEngine):
         return self._prefix_trie_cache
 
     def _fetch_prefix_trie_cache(
-        self, model: Any, tokens: list[int]
+        self,
+        model: Any,
+        tokens: list[int],
+        *,
+        minimum_tokens_saved: int = 0,
     ) -> tuple[Any | None, list[int] | None, int]:
-        """Fetch a nearest prompt-cache trie entry for a full prompt token list."""
+        """Fetch a trie entry only when it beats the existing cached prefix."""
         prefix_trie = self._ensure_prefix_trie_cache()
         if prefix_trie is None:
             return None, None, 0
@@ -576,6 +580,9 @@ class SimpleEngine(BaseEngine):
                 trie_rest = [tokens[-1]]
 
             tokens_saved = len(tokens) - len(trie_rest)
+            if tokens_saved <= minimum_tokens_saved:
+                self._prefix_trie_cache_stats["skips"] += 1
+                return None, None, 0
             self._prefix_trie_cache_stats["hits"] += 1
             self._prefix_trie_cache_stats["tokens_saved"] += tokens_saved
             return trie_cache, list(trie_rest), tokens_saved
@@ -2098,13 +2105,25 @@ class SimpleEngine(BaseEngine):
                 prefix_trie_rest_tokens: list[int] | None = None
                 local_hit_snapshot = hit_snapshot
 
+                # A system snapshot can coexist with a longer conversation-prefix
+                # entry. Preserve the empty-trie fast path, otherwise let them
+                # compete by tokens saved.
+                with self._prefix_trie_cache_lock:
+                    prefix_trie_has_entries = bool(self._prefix_trie_cache)
+
                 # The model, prompt caches, and MLX streams belong to the pinned
                 # generation worker. LRUPromptCache.fetch_nearest_cache deep-copies
                 # cache arrays, so looking up on the event-loop thread would cross
                 # the same ownership boundary that worker pinning protects.
-                if prefix_trie_eligible and not cache_hit:
+                if prefix_trie_eligible and (not cache_hit or prefix_trie_has_entries):
                     trie_cache, trie_rest, trie_tokens_saved = (
-                        self._fetch_prefix_trie_cache(model, cache_key)
+                        self._fetch_prefix_trie_cache(
+                            model,
+                            cache_key,
+                            minimum_tokens_saved=(
+                                system_token_count if cache_hit else 0
+                            ),
+                        )
                     )
                     if trie_cache is not None and trie_rest is not None:
                         prefix_trie_hit = True
