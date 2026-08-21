@@ -4614,11 +4614,9 @@ class TestServerIntegration:
         """Test /v1/chat/completions endpoint."""
         import requests
 
-        payload = {
-            "model": "default",
-            "messages": [{"role": "user", "content": "Say hello"}],
-            "max_tokens": 10,
-        }
+        from tests.server_integration_helpers import get_chat_completion_payload
+
+        payload = get_chat_completion_payload(requests, server_url)
 
         response = requests.post(
             f"{server_url}/v1/chat/completions",

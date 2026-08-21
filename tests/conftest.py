@@ -9,7 +9,7 @@ def pytest_addoption(parser):
     parser.addoption(
         "--server-url",
         action="store",
-        default="http://localhost:8000",
+        default=None,
         help="URL of the vllm-mlx server for integration tests",
     )
     parser.addoption(
@@ -33,17 +33,25 @@ def pytest_configure(config):
 
 def pytest_collection_modifyitems(config, items):
     """Skip slow tests unless --run-slow is passed."""
+    server_url = config.getoption("--server-url")
     if not config.getoption("--run-slow"):
         skip_slow = pytest.mark.skip(reason="Need --run-slow option to run")
         for item in items:
-            if "slow" in item.keywords:
+            # Supplying an integration server is an explicit opt-in to the
+            # integration suite, including tests that are also marked slow.
+            if item.get_closest_marker("slow") is not None and not (
+                server_url and item.get_closest_marker("integration") is not None
+            ):
                 item.add_marker(skip_slow)
 
     # Skip integration tests unless server URL is explicitly provided
-    skip_integration = pytest.mark.skip(reason="Integration tests require --server-url")
-    for item in items:
-        if "integration" in item.keywords:
-            item.add_marker(skip_integration)
+    if not server_url:
+        skip_integration = pytest.mark.skip(
+            reason="Integration tests require --server-url"
+        )
+        for item in items:
+            if item.get_closest_marker("integration") is not None:
+                item.add_marker(skip_integration)
 
 
 @pytest.fixture(scope="session")
