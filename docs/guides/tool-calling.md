@@ -54,7 +54,7 @@ Use `--tool-call-parser` to select a parser for your model family:
 | `auto` | | Any model | Auto-detects format (tries all parsers) |
 | `mistral` | | Mistral, Devstral | `[TOOL_CALLS]` JSON array |
 | `qwen` | `qwen3` | Qwen, Qwen3 | `<tool_call>` XML or `[Calling tool:]` |
-| `llama` | `llama3`, `llama4` | Llama 3.x, 4.x | `<function=name>` tags |
+| `llama` | `llama3`, `llama4` | Llama 3.x, 4.x | `<\|python_tag\|>` JSON, bare JSON, or `<function=name>` tags |
 | `hermes` | `nous` | Hermes, NousResearch | `<tool_call>` JSON in XML |
 | `deepseek` | `deepseek_v3`, `deepseek_r1` | DeepSeek V3, R1 | Unicode delimiters |
 | `kimi` | `kimi_k2`, `moonshot` | Kimi K2, Moonshot | `<\|tool_call_begin\|>` tokens |

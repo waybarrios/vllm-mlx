@@ -54,7 +54,7 @@ Usa `--tool-call-parser` para seleccionar un tool parser según tu familia de mo
 | `auto` | | Cualquier modelo | Detecta el formato automáticamente (prueba todos los parsers) |
 | `mistral` | | Mistral, Devstral | Arreglo JSON con `[TOOL_CALLS]` |
 | `qwen` | `qwen3` | Qwen, Qwen3 | XML `<tool_call>` o `[Calling tool:]` |
-| `llama` | `llama3`, `llama4` | Llama 3.x, 4.x | Etiquetas `<function=name>` |
+| `llama` | `llama3`, `llama4` | Llama 3.x, 4.x | JSON con `<\|python_tag\|>`, JSON sin marcador o etiquetas `<function=name>` |
 | `hermes` | `nous` | Hermes, NousResearch | JSON `<tool_call>` dentro de XML |
 | `deepseek` | `deepseek_v3`, `deepseek_r1` | DeepSeek V3, R1 | Delimitadores Unicode |
 | `kimi` | `kimi_k2`, `moonshot` | Kimi K2, Moonshot | Tokens `<\|tool_call_begin\|>` |

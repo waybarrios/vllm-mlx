@@ -17,7 +17,10 @@ import logging
 import os
 import time
 from collections.abc import AsyncIterator
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
+
+import mlx.core as mx
 
 from ..api.tool_calling import convert_tools_for_template
 from ..api.utils import clean_output_text, extract_multimodal_content, is_mllm_model
@@ -194,6 +197,9 @@ class BatchedEngine(BaseEngine):
         stream_interval: int = 1,
         force_mllm: bool = False,
         gpu_memory_utilization: float = 0.90,
+        mllm_draft_model: str | None = None,
+        mllm_draft_kind: str | None = None,
+        mllm_draft_block_size: int | None = None,
     ):
         """
         Initialize the batched engine.
@@ -213,6 +219,9 @@ class BatchedEngine(BaseEngine):
         self._scheduler_config = scheduler_config
         self._stream_interval = stream_interval
         self._gpu_memory_utilization = gpu_memory_utilization
+        self._mllm_draft_model = mllm_draft_model
+        self._mllm_draft_kind = mllm_draft_kind
+        self._mllm_draft_block_size = mllm_draft_block_size
         self._is_mllm = force_mllm or is_mllm_model(model_name)
 
         self._model = None
@@ -222,6 +231,8 @@ class BatchedEngine(BaseEngine):
         self._mllm_scheduler = None  # MLLMScheduler for MLLM
         self._mllm_instance = None  # MLXMultimodalLM instance
         self._loaded = False
+        # Single thread that owns the model; see _generation_worker.
+        self._generation_executor: ThreadPoolExecutor | None = None
 
     @property
     def model_name(self) -> str:
@@ -257,16 +268,26 @@ class BatchedEngine(BaseEngine):
 
         try:
             if self._model is None:
-                if self._uses_default_prepare_for_start():
-                    # Load inline on the event-loop thread so mlx-lm's
-                    # generation_stream (created at module import on this
-                    # thread) and model weights are owned by the same thread
-                    # that drives scheduler.step (issue #407).
-                    self.prepare_for_start()
+                # Load on the thread that drives scheduler.step. MLX buffers
+                # carry the stream of the thread that built them, and
+                # BatchGenerator captures generation_stream into self._stream
+                # when it is created, so the two must be the same thread.
+                # Which thread that is depends on the path — see
+                # _model_load_executor.
+                executor = self._model_load_executor()
+                if executor is None:
+                    # MLLM: MLLMScheduler steps here, on the event loop.
+                    # Keep the pre-existing split for an overridden
+                    # prepare_for_start — test doubles may block and do not own
+                    # MLX state.
+                    if self._uses_default_prepare_for_start():
+                        self.prepare_for_start()
+                    else:
+                        await run_blocking_startup_work(self.prepare_for_start)
                 else:
-                    # Test doubles and custom overrides may block; run them via
-                    # the shared cancellation-safe thread helper.
-                    await run_blocking_startup_work(self.prepare_for_start)
+                    await run_blocking_startup_work(
+                        self.prepare_for_start, executor=executor
+                    )
 
             if self._is_mllm:
                 await self._start_mllm()
@@ -286,6 +307,41 @@ class BatchedEngine(BaseEngine):
         method = getattr(self.prepare_for_start, "__func__", None)
         return method is BatchedEngine.prepare_for_start
 
+    def _model_load_executor(self) -> ThreadPoolExecutor | None:
+        """Thread the model must be built on, or None for the event loop.
+
+        The two batched paths step on different threads, so they have to load
+        on different threads:
+
+        - MLLM never touches the generation worker. ``_start_mllm`` drives
+          MLLMScheduler, whose ``_process_loop`` calls ``step()`` on the event
+          loop with no executor hop, so an MLLM model has to be built there —
+          exactly as it was before generation was pinned.
+        - Everything else runs through AsyncEngineCore, which steps on the
+          worker, so it has to load there. Loading inline on the event loop
+          (issue #407) is what left BatchGenerator carrying a stream the
+          stepping thread did not have.
+
+        ResidencyManager reads this too, so it must answer for an engine that
+        has not started yet.
+        """
+        if self._is_mllm:
+            return None
+        return self._generation_worker()
+
+    def _generation_worker(self) -> ThreadPoolExecutor:
+        """Return the single thread that owns the model and drives stepping.
+
+        The residency manager also looks this up by name to load models here,
+        so it must exist before ``prepare_for_start`` runs and must outlive the
+        engine loop.
+        """
+        if self._generation_executor is None:
+            self._generation_executor = ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="engine-core"
+            )
+        return self._generation_executor
+
     def _prepare_mllm_model(self) -> None:
         """Load the MLLM model before scheduler startup."""
         from ..models.mllm import MLXMultimodalLM
@@ -295,6 +351,9 @@ class BatchedEngine(BaseEngine):
             self._model_name,
             trust_remote_code=self._trust_remote_code,
             max_kv_size=max_kv_size,
+            draft_model=self._mllm_draft_model,
+            draft_kind=self._mllm_draft_kind,
+            draft_block_size=self._mllm_draft_block_size,
         )
         self._mllm_instance.load()
         self._model = self._mllm_instance.model
@@ -330,7 +389,11 @@ class BatchedEngine(BaseEngine):
             logger.warning(f"Failed to set Metal memory limits: {e}")
 
         # Inject MTP support if enabled
-        if self._scheduler_config and self._scheduler_config.enable_mtp:
+        if (
+            self._scheduler_config
+            and self._scheduler_config.enable_mtp
+            and self._mllm_draft_model is None
+        ):
             self._inject_mtp_mllm()
 
     async def _start_mllm(self) -> None:
@@ -414,10 +477,18 @@ class BatchedEngine(BaseEngine):
         )
 
         # Create and start MLLM scheduler
+        scheduler_kwargs = {}
+        if self._mllm_draft_model is not None:
+            scheduler_kwargs = {
+                "draft_model": getattr(self._mllm_instance, "_draft_model", None),
+                "draft_kind": self._mllm_draft_kind,
+                "draft_block_size": self._mllm_draft_block_size,
+            }
         self._mllm_scheduler = MLLMScheduler(
             model=self._model,
             processor=self._processor,
             config=mllm_config,
+            **scheduler_kwargs,
         )
         await self._mllm_scheduler.start()
 
@@ -569,11 +640,12 @@ class BatchedEngine(BaseEngine):
             gpu_memory_utilization=self._gpu_memory_utilization,
         )
 
-        # Create async engine
+        # Create async engine, stepping on the thread that loaded the model.
         self._engine = AsyncEngineCore(
             model=self._model,
             tokenizer=self._tokenizer,
             config=engine_config,
+            generation_worker=self._generation_worker(),
         )
 
         await self._engine.engine.start()
@@ -594,6 +666,11 @@ class BatchedEngine(BaseEngine):
         self._processor = None
         self._mllm_instance = None
         self._loaded = False
+        if self._generation_executor is not None:
+            # The model and its streams lived on this thread; both go with it.
+            self._generation_executor.shutdown(wait=True)
+            self._generation_executor = None
+        mx.clear_cache()
         logger.info("BatchedEngine stopped")
 
     def _apply_chat_template(
@@ -774,6 +851,7 @@ class BatchedEngine(BaseEngine):
                 presence_penalty=kwargs.pop("presence_penalty", 0.0),
                 repetition_penalty=kwargs.pop("repetition_penalty", 1.0),
                 logits_processors=kwargs.pop("logits_processors", None),
+                mllm_draft=bool(kwargs.pop("mllm_draft", False)),
             )
 
             return GenerationOutput(
@@ -863,6 +941,7 @@ class BatchedEngine(BaseEngine):
                 presence_penalty=kwargs.pop("presence_penalty", 0.0),
                 repetition_penalty=kwargs.pop("repetition_penalty", 1.0),
                 logits_processors=kwargs.pop("logits_processors", None),
+                mllm_draft=bool(kwargs.pop("mllm_draft", False)),
             )
 
             async for output in self._mllm_scheduler.stream_outputs(request_id):

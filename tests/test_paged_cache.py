@@ -163,6 +163,18 @@ class TestPagedCacheManager:
         # Block should be back in free queue
         assert manager.free_blocks == initial_free
 
+    def test_free_block_batch_is_callable_and_updates_free_count(self):
+        """Bulk release must not be shadowed by the free-block count property."""
+        from vllm_mlx.paged_cache import PagedCacheManager
+
+        manager = PagedCacheManager(block_size=64, max_blocks=10)
+        blocks = [manager.allocate_block(), manager.allocate_block()]
+        assert manager.free_blocks == 7
+
+        manager.free_block_batch(blocks)
+
+        assert manager.free_blocks == 9
+
     def test_reference_counting(self):
         """Test reference counting."""
         from vllm_mlx.paged_cache import PagedCacheManager

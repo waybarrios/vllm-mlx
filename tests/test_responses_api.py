@@ -755,6 +755,41 @@ class TestResponsesEndpoint:
         assert len(function_call_deltas) == 1
         assert function_call_deltas[0]["delta"] == '{"a": 1, "b": 2}'
 
+    def test_streaming_response_without_tools_keeps_llama_shaped_json(
+        self, client, monkeypatch
+    ):
+        """Configured parsing must not suppress JSON when no tools are declared."""
+        import vllm_mlx.server as srv
+
+        text = '{"name":"Alice","parameters":{"age":42}}'
+        engine = _mock_engine(_output("unused"))
+        engine._stream_outputs = [_stream_output(text, finish_reason="stop")]
+        srv._engine = engine
+        monkeypatch.setattr(srv, "_enable_auto_tool_choice", True)
+        monkeypatch.setattr(srv, "_tool_call_parser", "llama")
+        monkeypatch.setattr(srv, "_tool_parser_instance", None)
+        monkeypatch.setattr(srv, "_reasoning_parser", None)
+
+        with client.stream(
+            "POST",
+            "/v1/responses",
+            json={"model": "test-model", "input": "Describe Alice", "stream": True},
+        ) as resp:
+            body = "".join(resp.iter_text())
+
+        events = _parse_sse_events(body)
+        text_deltas = [
+            payload["delta"]
+            for event_type, payload in events
+            if event_type == "response.output_text.delta"
+        ]
+
+        assert resp.status_code == 200
+        assert text_deltas == [text]
+        assert not any(
+            event_type.startswith("response.function_call") for event_type, _ in events
+        )
+
     def test_json_object_response_format_is_rejected(self, client):
         import vllm_mlx.server as srv
 

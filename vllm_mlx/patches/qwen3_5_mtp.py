@@ -19,6 +19,7 @@ The actual MTP scheduling logic lives in:
   - vllm_mlx/scheduler.py  (_install_mtp, _mtp_step, _mtp_next)
 """
 
+import json
 import logging
 from pathlib import Path
 from typing import Any
@@ -88,6 +89,101 @@ def _apply_qwen_mtp_rmsnorm_offset_fixups(mtp_weights: dict) -> int:
             mtp_weights[key] = weight + 1.0
             norm_fixup_count += 1
     return norm_fixup_count
+
+
+def _mtp_artifact_uses_mlx_norm_weights(mtp_weights_path: Path) -> bool:
+    """Return whether a converter manifest proves norms already use MLX gamma.
+
+    Missing or malformed manifests deliberately fall back to legacy detection
+    for existing artifacts.  Only the explicit schema version and declared
+    format suppress the offset conversion.
+    """
+    manifest_path = mtp_weights_path.with_name("manifest.json")
+    try:
+        with open(manifest_path) as f:
+            manifest = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return False
+    if not isinstance(manifest, dict):
+        return False
+    return (
+        manifest.get("artifact_schema_version") == 1
+        and manifest.get("rmsnorm_weight_format") == "mlx_gamma"
+    )
+
+
+def _mtp_quantization_companion_key(key: str, suffix: str) -> str:
+    """Return the scale/bias key for both standard and fused Qwen tensors."""
+    if key.endswith(".weight"):
+        return f"{key[:-len('.weight')]}.{suffix}"
+    return f"{key}.{suffix}"
+
+
+def _validate_qwen_moe_mtp_tensor_shapes(mtp_weights: dict, args) -> None:
+    """Reject MTP expert tensors that cannot feed the target Qwen decoder.
+
+    Qwen 3.6 publishes fused MTP expert tensors without a ``.weight`` suffix.
+    A malformed quantized artifact previously overwrote those tensors with its
+    bias values, which let injection continue until the first live decode.
+    Validate the pre-split tensor contract before attaching the MTP module.
+    """
+    if getattr(args, "num_experts", 0) <= 0:
+        return
+
+    num_experts = args.num_experts
+    hidden_size = args.hidden_size
+    intermediate_size = args.moe_intermediate_size
+    fused_keys = (
+        "layers.0.mlp.experts.gate_up_proj",
+        "layers.0.mlp.experts.gate_up_proj.weight",
+    )
+    down_keys = (
+        "layers.0.mlp.experts.down_proj",
+        "layers.0.mlp.experts.down_proj.weight",
+    )
+    fused_key = next((key for key in fused_keys if key in mtp_weights), None)
+    down_key = next((key for key in down_keys if key in mtp_weights), None)
+
+    if fused_key is not None or down_key is not None:
+        if fused_key is None or down_key is None:
+            raise ValueError(
+                "Qwen MoE MTP artifact has an incomplete fused expert pair"
+            )
+        expected_fused = (num_experts, 2 * intermediate_size, hidden_size)
+        expected_down = (num_experts, hidden_size, intermediate_size)
+        actual_fused = tuple(mtp_weights[fused_key].shape)
+        actual_down = tuple(mtp_weights[down_key].shape)
+        if actual_fused != expected_fused or actual_down != expected_down:
+            raise ValueError(
+                "Qwen MoE MTP expert shape mismatch: "
+                f"{fused_key}={actual_fused}, expected={expected_fused}; "
+                f"{down_key}={actual_down}, expected={expected_down}"
+            )
+        return
+
+    split_keys = {
+        "gate": "layers.0.mlp.switch_mlp.gate_proj.weight",
+        "up": "layers.0.mlp.switch_mlp.up_proj.weight",
+        "down": "layers.0.mlp.switch_mlp.down_proj.weight",
+    }
+    if not any(key in mtp_weights for key in split_keys.values()):
+        raise ValueError("Qwen MoE MTP artifact has no expert tensors")
+    if not all(key in mtp_weights for key in split_keys.values()):
+        raise ValueError("Qwen MoE MTP artifact has an incomplete split expert set")
+
+    expected_project = (num_experts, intermediate_size, hidden_size)
+    expected_down = (num_experts, hidden_size, intermediate_size)
+    actual = {name: tuple(mtp_weights[key].shape) for name, key in split_keys.items()}
+    if (
+        actual["gate"] != expected_project
+        or actual["up"] != expected_project
+        or actual["down"] != expected_down
+    ):
+        raise ValueError(
+            "Qwen MoE MTP split expert shape mismatch: "
+            f"gate={actual['gate']}, up={actual['up']}, down={actual['down']}; "
+            f"expected gate/up={expected_project}, down={expected_down}"
+        )
 
 
 def _fixup_moe_mtp(mtp, inner_model, loaded_keys: set, mx) -> None:
@@ -281,8 +377,8 @@ def inject_mtp_support(model: Any, model_path, config: dict) -> bool:
         if key.endswith(".scales") or key.endswith(".biases"):
             continue
 
-        scales_key = key.replace(".weight", ".scales")
-        biases_key = key.replace(".weight", ".biases")
+        scales_key = _mtp_quantization_companion_key(key, "scales")
+        biases_key = _mtp_quantization_companion_key(key, "biases")
 
         if scales_key != key and scales_key in raw_mtp and biases_key in raw_mtp:
             # Quantized triplet → dequantize to BF16
@@ -300,6 +396,12 @@ def inject_mtp_support(model: Any, model_path, config: dict) -> bool:
             mtp_weights[key] = raw_mtp[key]
             processed.add(key)
     del raw_mtp
+
+    try:
+        _validate_qwen_moe_mtp_tensor_shapes(mtp_weights, args)
+    except ValueError as exc:
+        logger.error("[MTP inject] Refusing invalid Qwen MTP artifact: %s", exc)
+        return False
 
     # --- Convert fused expert format to split format ---
     # Qwen3.6 MTP uses fused expert keys:
@@ -332,16 +434,18 @@ def inject_mtp_support(model: Any, model_path, config: dict) -> bool:
             )
 
     # --- Fixup RMSNorm weights: HuggingFace offset convention ---
-    # Qwen3.5/3.6 models store RMSNorm weights as offsets (actual = 1 + stored).
-    # The main model's sanitize() handles this, but MTP weights bypass sanitize.
-    # Detect raw-offset weights (mean < 0.5) and apply +1.0; skip if already
-    # in actual-gamma space (as produced by add_mtp_weights_qwen35.py).
-    norm_fixup_count = _apply_qwen_mtp_rmsnorm_offset_fixups(mtp_weights)
-    if norm_fixup_count > 0:
-        logger.info(
-            f"[MTP inject] Applied +1.0 RMSNorm offset to {norm_fixup_count} "
-            f"norm weights (raw HF offset detected)"
-        )
+    # Qwen3.5/3.6 source weights use offsets (actual = 1 + stored), but the
+    # converter writes MLX gamma weights.  Its manifest is authoritative.
+    # Legacy artifacts retain the conservative mean-based compatibility path.
+    if _mtp_artifact_uses_mlx_norm_weights(mtp_file):
+        logger.info("[MTP inject] Converter manifest declares MLX RMSNorm gamma")
+    else:
+        norm_fixup_count = _apply_qwen_mtp_rmsnorm_offset_fixups(mtp_weights)
+        if norm_fixup_count > 0:
+            logger.info(
+                f"[MTP inject] Applied +1.0 RMSNorm offset to {norm_fixup_count} "
+                f"norm weights (legacy raw HF offset detected)"
+            )
 
     mtp.load_weights(list(mtp_weights.items()), strict=False)
     mx.eval(mtp.parameters())
