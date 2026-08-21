@@ -104,16 +104,15 @@ async def shield_task(task: asyncio.Task) -> Any:
     exception hooks) treat that call as an unhandled-exception test failure
     even when the exception is fully expected and handled.
 
-    This does not reproduce on the currently supported CPython 3.10-3.13:
-    there, shield() uses two callbacks instead of one -- an outer-cancel
-    callback that removes the inner task's done-callback once the caller
-    cancels (so a later `await task` by the caller is the only thing that
-    retrieves the exception), and, for the race where the inner task
-    finishes before that removal lands, the inner done-callback itself
-    still fires but explicitly calls `inner.exception()` to mark it
-    retrieved before discarding it -- so nothing is ever logged. This
-    helper is therefore a forward-compatibility fix for 3.14+, not a fix
-    for the currently declared/CI-tested versions.
+    This does not reproduce on CPython 3.10-3.13: there, shield() uses two
+    callbacks instead of one -- an outer-cancel callback that removes the
+    inner task's done-callback once the caller cancels (so a later `await
+    task` by the caller is the only thing that retrieves the exception),
+    and, for the race where the inner task finishes before that removal
+    lands, the inner done-callback itself still fires but explicitly calls
+    `inner.exception()` to mark it retrieved before discarding it -- so
+    nothing is ever logged. This helper's value is therefore specific to
+    CPython 3.14+ (see the dedicated ``test-python-3-14`` CI job).
 
     Two more invariants, both required by callers that re-shield the same
     still-running `task` in a retry loop (see run_blocking_startup_work):

@@ -64,14 +64,20 @@ class TestShieldTask:
 
     @pytest.mark.anyio
     async def test_cancellation_does_not_trigger_loop_exception_handler(self):
-        """Regression test: asyncio.shield() unconditionally reassigns the
-        shielded task's done-callback to an internal handler that logs any
-        later exception via loop.call_exception_handler() once the shield's
-        own wrapper future is cancelled -- even if the caller retrieves that
-        exception itself afterward. Test runners that fail tests on any
-        logged loop exception (e.g. pytest-anyio) then report a spurious
-        failure despite the exception being fully handled. shield_task()
-        must never trigger the loop's exception handler in this scenario.
+        """Regression test for CPython 3.14+ specifically: on 3.14+,
+        asyncio.shield() unconditionally reassigns the shielded task's
+        done-callback to an internal handler that logs any later exception
+        via loop.call_exception_handler() once the shield's own wrapper
+        future is cancelled -- even if the caller retrieves that exception
+        itself afterward. Test runners that fail tests on any logged loop
+        exception (e.g. pytest-anyio) then report a spurious failure despite
+        the exception being fully handled. On 3.10-3.13 this does not
+        reproduce (see shield_task()'s docstring), so this test only
+        exercises the 3.14+ code path meaningfully -- it still runs on
+        3.10-3.13 (asserting the always-true absence of the bug there), but
+        the ``test-python-3-14`` CI job is what actually covers the
+        behavior it targets. shield_task() must never trigger the loop's
+        exception handler in this scenario, on any supported version.
         """
         loop = asyncio.get_running_loop()
         logged_contexts = []
