@@ -360,6 +360,61 @@ class TestAnthropicToOpenai:
         assert result.messages[1].role == "assistant"
         assert result.messages[2].role == "user"
 
+    def test_mid_stream_system_role_merges_to_single_leading_system(self):
+        msgs = [
+            AnthropicMessage(role="user", content="hello"),
+            AnthropicMessage(role="system", content="Be terse."),
+        ]
+        req = self._make_request(system="You are Claude Code.", messages=msgs)
+
+        result = anthropic_to_openai(req)
+
+        system_messages = [
+            message for message in result.messages if message.role == "system"
+        ]
+        assert len(system_messages) == 1
+        assert result.messages[0].role == "system"
+        assert result.messages[0].content == "You are Claude Code.\n\nBe terse."
+        assert result.messages[1].role == "user"
+        assert result.messages[1].content == "hello"
+
+    def test_mid_stream_system_role_without_top_level_system(self):
+        msgs = [
+            AnthropicMessage(role="user", content="hi"),
+            AnthropicMessage(role="system", content="Answer in one word."),
+        ]
+        req = self._make_request(messages=msgs)
+
+        result = anthropic_to_openai(req)
+
+        assert len(result.messages) == 2
+        assert result.messages[0].role == "system"
+        assert result.messages[0].content == "Answer in one word."
+        assert result.messages[1].role == "user"
+        assert result.messages[1].content == "hi"
+
+    def test_multiple_system_messages_preserve_system_and_turn_order(self):
+        msgs = [
+            AnthropicMessage(role="user", content="first question"),
+            AnthropicMessage(role="system", content="First instruction."),
+            AnthropicMessage(role="assistant", content="first answer"),
+            AnthropicMessage(role="system", content="Second instruction."),
+            AnthropicMessage(role="user", content="second question"),
+        ]
+        req = self._make_request(system="Top-level instruction.", messages=msgs)
+
+        result = anthropic_to_openai(req)
+
+        assert [(message.role, message.content) for message in result.messages] == [
+            (
+                "system",
+                "Top-level instruction.\n\nFirst instruction.\n\nSecond instruction.",
+            ),
+            ("user", "first question"),
+            ("assistant", "first answer"),
+            ("user", "second question"),
+        ]
+
 
 class TestOpenaiToAnthropic:
     """Tests for openai_to_anthropic conversion."""
