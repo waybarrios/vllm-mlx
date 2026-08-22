@@ -18,6 +18,8 @@ It is a pure HTTP client that talks to a running OpenAI-compatible server.
 import asyncio
 import csv as csv_mod
 import dataclasses as _dataclasses
+import hashlib
+import importlib.metadata
 import io
 import itertools
 import json
@@ -70,6 +72,333 @@ class Workload:
     description: str
     defaults: dict
     cases: list[WorkloadCase]
+
+
+# ---------------------------------------------------------------------------
+# Versioned capacity-envelope contract
+# ---------------------------------------------------------------------------
+
+# This is intentionally separate from ``BenchServeResult``.  The existing
+# prompt-sweep output is a useful compatibility surface; capacity envelopes
+# need a richer, versioned artifact with explicit provenance and failure
+# classification.
+CAPACITY_ENVELOPE_KIND = "vllm-mlx-capacity-envelope"
+CAPACITY_ENVELOPE_SCHEMA_VERSION = 1
+CAPACITY_CACHE_MODES = ("cold", "warm", "prefix-hit", "prefix-miss")
+DEFAULT_CAPACITY_CONCURRENCIES = (1, 2, 4, 8, 16, 32)
+DEFAULT_CAPACITY_PROMPT_TOKENS = (256, 2048, 8192, 32768)
+DEFAULT_CAPACITY_OUTPUT_TOKENS = (128, 512)
+
+
+@dataclass(frozen=True)
+class CapacityThresholds:
+    """Tail-latency and failure limits for sustainable capacity."""
+
+    max_p95_ttft_ms: Optional[float] = None
+    max_p95_chunk_gap_ms: Optional[float] = None
+    max_p95_e2e_ms: Optional[float] = None
+    max_failure_rate: float = 0.0
+    max_ooms: int = 0
+    max_timeouts: int = 0
+
+
+@dataclass(frozen=True)
+class CapacityConfig:
+    """Declarative, JSON-serializable capacity sweep configuration."""
+
+    concurrencies: tuple[int, ...] = DEFAULT_CAPACITY_CONCURRENCIES
+    prompt_tokens: tuple[int, ...] = DEFAULT_CAPACITY_PROMPT_TOKENS
+    output_tokens: tuple[int, ...] = DEFAULT_CAPACITY_OUTPUT_TOKENS
+    cache_modes: tuple[str, ...] = CAPACITY_CACHE_MODES
+    repetitions: int = 3
+    warmup: int = 1
+    request_timeout_s: Optional[float] = 300.0
+    thresholds: CapacityThresholds = CapacityThresholds()
+    extra_body: Optional[dict] = None
+
+    def __post_init__(self) -> None:
+        for name in ("concurrencies", "prompt_tokens", "output_tokens"):
+            values = getattr(self, name)
+            if not values or any(int(value) < 1 for value in values):
+                raise ValueError(f"{name} must contain positive integers")
+        if not self.cache_modes or any(
+            mode not in CAPACITY_CACHE_MODES for mode in self.cache_modes
+        ):
+            raise ValueError(
+                f"cache_modes must contain only: {', '.join(CAPACITY_CACHE_MODES)}"
+            )
+        if self.repetitions < 1:
+            raise ValueError("repetitions must be at least 1")
+        if self.warmup < 0:
+            raise ValueError("warmup must be non-negative")
+        if self.request_timeout_s is not None and self.request_timeout_s <= 0:
+            raise ValueError("request_timeout_s must be positive or None")
+        if not isinstance(self.thresholds, CapacityThresholds):
+            raise ValueError("thresholds must be a CapacityThresholds instance")
+        if self.extra_body is not None and not isinstance(self.extra_body, dict):
+            raise ValueError("extra_body must be an object")
+
+    def to_dict(self) -> dict:
+        """Return a stable JSON-compatible representation of the config."""
+        thresholds = _dataclasses.asdict(self.thresholds)
+        return {
+            "concurrencies": list(self.concurrencies),
+            "prompt_tokens": list(self.prompt_tokens),
+            "output_tokens": list(self.output_tokens),
+            "cache_modes": list(self.cache_modes),
+            "repetitions": self.repetitions,
+            "warmup": self.warmup,
+            "request_timeout_s": self.request_timeout_s,
+            "thresholds": thresholds,
+            "extra_body": self.extra_body or {},
+        }
+
+
+def _canonical_json(value: Any) -> str:
+    """Serialize JSON deterministically for reproducible artifact hashes."""
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def sha256_json(value: Any) -> str:
+    """Return the SHA-256 of a canonical JSON value."""
+    return hashlib.sha256(_canonical_json(value).encode("utf-8")).hexdigest()
+
+
+def build_capacity_messages(
+    target_prompt_tokens: int, *, variant: str = "base"
+) -> list[dict]:
+    """Build a deterministic approximate-length HTTP prompt.
+
+    Tokenizers differ across model families, so ``target_prompt_tokens`` is a
+    requested workload size, not a claim about the resulting token count. The
+    server-reported ``usage.prompt_tokens`` is authoritative in each sample.
+    ``variant`` lets the prefix-miss case use a distinct prompt while keeping
+    the requested size constant.
+    """
+    marker = variant
+    prefix = f"capacity envelope {marker}: "
+    content = prefix + ("x " * max(1, target_prompt_tokens - 4)).strip()
+    return [{"role": "user", "content": content}]
+
+
+def classify_capacity_error(error: str) -> str:
+    """Classify transport/server failures without guessing at other errors."""
+    normalized = (error or "").lower()
+    if "timeout" in normalized or "timed out" in normalized:
+        return "timeout"
+    if any(
+        marker in normalized
+        for marker in (
+            "out of memory",
+            "out-of-memory",
+            "oom",
+            "memoryerror",
+            "metal resource",
+        )
+    ):
+        return "oom"
+    return "error"
+
+
+def _metric_stats(records: list[dict], key: str) -> Optional[dict]:
+    values = [
+        float(record[key])
+        for record in records
+        if record.get(key) is not None and isinstance(record.get(key), (int, float))
+    ]
+    return compute_summary_stats(values) if values else None
+
+
+def classify_sustainable_capacity(
+    summary: dict, thresholds: CapacityThresholds
+) -> tuple[bool, list[str]]:
+    """Apply explicit SLOs to one capacity cell summary.
+
+    Missing latency telemetry cannot pass a configured latency SLO.  When no
+    SLO is configured for a metric, unavailable telemetry remains unavailable
+    and does not get replaced with a fabricated zero.
+    """
+    reasons: list[str] = []
+    if summary.get("sample_count", 0) == 0:
+        reasons.append("no samples")
+    if summary.get("failure_rate", 0.0) > thresholds.max_failure_rate:
+        reasons.append(
+            f"failure_rate {summary['failure_rate']:.4f} > {thresholds.max_failure_rate:.4f}"
+        )
+    if summary.get("oom_count", 0) > thresholds.max_ooms:
+        reasons.append(f"oom_count {summary['oom_count']} > {thresholds.max_ooms}")
+    if summary.get("timeout_count", 0) > thresholds.max_timeouts:
+        reasons.append(
+            f"timeout_count {summary['timeout_count']} > {thresholds.max_timeouts}"
+        )
+    if summary.get("correctness_failure_count", 0):
+        reasons.append("correctness failure")
+    if summary.get("correctness_unavailable_count", 0):
+        reasons.append("correctness unavailable")
+    cache_status = summary.get("cache_verification", {}).get("status")
+    if cache_status != "verified":
+        reasons.append(f"cache state {cache_status or 'unavailable'}")
+
+    for field_name, limit, label in (
+        ("ttft_ms", thresholds.max_p95_ttft_ms, "p95 TTFT"),
+        ("chunk_gap_ms", thresholds.max_p95_chunk_gap_ms, "p95 chunk gap"),
+        ("e2e_latency_ms", thresholds.max_p95_e2e_ms, "p95 end-to-end latency"),
+    ):
+        if limit is None:
+            continue
+        stats = summary.get(field_name)
+        if not stats:
+            reasons.append(f"{label} unavailable")
+        elif stats.get("p95", 0.0) > limit:
+            reasons.append(f"{label} {stats['p95']:.3f} > {limit:.3f} ms")
+    return (not reasons, reasons)
+
+
+def summarize_capacity_cell(
+    *,
+    prompt_tokens: int,
+    output_tokens: int,
+    cache_mode: str,
+    concurrency: int,
+    samples: list[dict],
+    batch_durations_ms: list[float],
+    thresholds: CapacityThresholds,
+    telemetry_delta: Optional[dict] = None,
+    cache_actions: Optional[list[dict]] = None,
+    cache_verification: Optional[dict] = None,
+) -> dict:
+    """Aggregate request samples into one classified capacity cell."""
+    errors = [sample for sample in samples if sample.get("error")]
+    valid = [sample for sample in samples if not sample.get("error")]
+    completion_tokens = sum(
+        int(sample.get("completion_tokens", 0) or 0) for sample in valid
+    )
+    duration_s = sum(batch_durations_ms) / 1000.0
+    summary = {
+        "prompt_tokens_target": prompt_tokens,
+        "output_tokens_target": output_tokens,
+        "cache_mode": cache_mode,
+        "concurrency": concurrency,
+        "sample_count": len(samples),
+        "failure_count": len(errors),
+        "failure_rate": len(errors) / len(samples) if samples else 0.0,
+        "timeout_count": sum(
+            sample.get("error_kind") == "timeout" for sample in samples
+        ),
+        "oom_count": sum(sample.get("error_kind") == "oom" for sample in samples),
+        "correctness_failure_count": sum(
+            sample.get("correctness", {}).get("status") == "mismatch"
+            for sample in samples
+        ),
+        "correctness_unavailable_count": sum(
+            sample.get("correctness", {}).get("status") == "unavailable"
+            for sample in samples
+        ),
+        "ttft_ms": _metric_stats(valid, "ttft_ms"),
+        "chunk_gap_ms": _metric_stats(valid, "chunk_gap_ms"),
+        "e2e_latency_ms": _metric_stats(valid, "e2e_latency_ms"),
+        "queue_time_ms": _metric_stats(valid, "queue_time_ms"),
+        "prompt_tokens": _metric_stats(valid, "prompt_tokens"),
+        "completion_tokens": _metric_stats(valid, "completion_tokens"),
+        "output_throughput_tps": completion_tokens / duration_s if duration_s else None,
+        # Throughput is based on successful requests only.  A failed request
+        # must not inflate the apparent capacity of a cell.
+        "requests_per_s": len(valid) / duration_s if duration_s else None,
+        "batch_duration_ms": (
+            compute_summary_stats(batch_durations_ms) if batch_durations_ms else None
+        ),
+        "telemetry_delta": telemetry_delta or {},
+        "cache_actions": cache_actions or [],
+        "cache_verification": cache_verification
+        or {"status": "unavailable", "source": None},
+        "memory": {
+            "active_gb": _metric_stats(
+                [
+                    sample["memory"]
+                    for sample in valid
+                    if sample.get("memory", {}).get("active_gb") is not None
+                ],
+                "active_gb",
+            ),
+            "peak_gb": _metric_stats(
+                [
+                    sample["memory"]
+                    for sample in valid
+                    if sample.get("memory", {}).get("peak_gb") is not None
+                ],
+                "peak_gb",
+            ),
+            "cache_gb": _metric_stats(
+                [
+                    sample["memory"]
+                    for sample in valid
+                    if sample.get("memory", {}).get("cache_gb") is not None
+                ],
+                "cache_gb",
+            ),
+            "source": next(
+                (
+                    sample.get("memory", {}).get("source")
+                    for sample in valid
+                    if sample.get("memory", {}).get("source")
+                ),
+                "unavailable",
+            ),
+        },
+        "mtp_status": next(
+            (
+                sample.get("mtp_status")
+                for sample in reversed(valid)
+                if sample.get("mtp_status") is not None
+            ),
+            None,
+        ),
+    }
+    sustainable, reasons = classify_sustainable_capacity(summary, thresholds)
+    summary["sustainable"] = sustainable
+    summary["sustainability_reasons"] = reasons
+    return summary
+
+
+def summarize_capacity_envelope(
+    cells: list[dict], *, config: CapacityConfig, memory_gb: Optional[float]
+) -> dict:
+    """Return global and per-concurrency sustainable-capacity classifications."""
+    by_concurrency: dict[int, list[dict]] = {}
+    for cell in cells:
+        by_concurrency.setdefault(int(cell["concurrency"]), []).append(cell)
+    sustainable_concurrencies = sorted(
+        concurrency
+        for concurrency, rows in by_concurrency.items()
+        if rows and all(row.get("sustainable", False) for row in rows)
+    )
+    highest = max(sustainable_concurrencies, default=None)
+    sustainable_throughputs = [
+        float(row["output_throughput_tps"])
+        for row in cells
+        if row.get("sustainable") and row.get("output_throughput_tps") is not None
+    ]
+    peak_throughput = max(sustainable_throughputs, default=None)
+    return {
+        "sustainable_concurrencies": sustainable_concurrencies,
+        "highest_concurrency": highest,
+        "peak_sustainable_output_throughput_tps": peak_throughput,
+        "throughput_per_gib": (
+            peak_throughput / memory_gb
+            if peak_throughput is not None and memory_gb is not None and memory_gb > 0
+            else None
+        ),
+        "sustainable_concurrency_per_gib": (
+            highest / memory_gb
+            if highest is not None and memory_gb is not None and memory_gb > 0
+            else None
+        ),
+        "evaluated_concurrencies": sorted(by_concurrency),
+        "note": (
+            "A concurrency is sustainable only when every prompt-length, output-length, "
+            "and cache-mode cell at that concurrency passes the configured SLOs."
+        ),
+    }
 
 
 def load_prompt_set(name_or_path: str) -> list[list[dict]]:
@@ -514,10 +843,38 @@ def parse_metrics_text(text: str) -> dict:
         m = re.search(pattern, text, re.MULTILINE)
         return int(m.group(1)) if m else 0
 
+    # Keep the historical counters above stable, while also retaining
+    # optional telemetry relevant to a capacity envelope.  Labels are part
+    # of the key so reason-specific MTP/speculative counters are not merged.
+    telemetry: dict[str, float] = {}
+    metric_pattern = re.compile(
+        r"^([a-zA-Z_:][a-zA-Z0-9_:]*)(\{[^}]*\})?\s+([-+]?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?)"
+    )
+    for line in text.splitlines():
+        if not line or line.startswith("#"):
+            continue
+        match = metric_pattern.match(line)
+        if not match:
+            continue
+        name, labels, value = match.groups()
+        lower_name = name.lower()
+        if (
+            "mtp" in lower_name
+            or "spec" in lower_name
+            or "prefix_cache" in lower_name
+            or lower_name.startswith("vllm_mlx_cache_")
+            or "queue" in lower_name
+        ):
+            try:
+                telemetry[f"{name}{labels or ''}"] = float(value)
+            except ValueError:
+                continue
+
     return {
         "cache_hits": _extract("vllm_prefix_cache_hits_total"),
         "cache_misses": _extract("vllm_prefix_cache_misses_total"),
         "tokens_saved": _extract("vllm_prefix_cache_tokens_saved_total"),
+        "telemetry": telemetry,
     }
 
 
@@ -684,6 +1041,52 @@ async def clear_runtime_cache(client: httpx.AsyncClient, base_url: str) -> dict:
     return event
 
 
+async def _fetch_capacity_cache_stats(
+    client: httpx.AsyncClient, base_url: str
+) -> Optional[dict]:
+    try:
+        response = await client.get(f"{base_url}/v1/cache/stats")
+        response.raise_for_status()
+        data = response.json()
+        return data if isinstance(data, dict) else None
+    except (httpx.HTTPError, ValueError):
+        return None
+
+
+def _capacity_cache_stats_are_empty(stats: Optional[dict]) -> Optional[bool]:
+    if stats is None:
+        return None
+    if "engine_cache" not in stats:
+        return None
+    engine = stats.get("engine_cache")
+    if engine is None:
+        return True
+    if not isinstance(engine, dict) or "error" in engine:
+        return None
+    activity_keys = {
+        "hits",
+        "misses",
+        "tokens_saved",
+        "entry_count",
+        "current_memory_bytes",
+        "current_memory_mb",
+        "dropped_entries",
+    }
+    observed: list[float] = []
+
+    def _walk(value: Any) -> None:
+        if not isinstance(value, dict):
+            return
+        for key, nested in value.items():
+            if key in activity_keys and isinstance(nested, (int, float)):
+                observed.append(float(nested))
+            elif isinstance(nested, dict):
+                _walk(nested)
+
+    _walk(engine)
+    return all(value == 0 for value in observed) if observed else None
+
+
 def _normalize_cache_policy(value: Optional[str]) -> str:
     """Normalize cache-policy spelling from CLI or workload JSON.
 
@@ -739,11 +1142,33 @@ def parse_sse_line(line: str) -> Optional[dict]:
         return None
 
     choices = chunk.get("choices") or []
-    delta = choices[0].get("delta", {}) if choices else {}
+    choice = choices[0] if choices else {}
+    delta = choice.get("delta", {}) if choices else {}
     content = delta.get("content", "") or ""
-    finish_reason = choices[0].get("finish_reason") if choices else None
+    finish_reason = choice.get("finish_reason") if choices else None
     usage = chunk.get("usage")
     tool_calls_delta = delta.get("tool_calls")
+
+    # Different OpenAI-compatible servers expose optional queue timing and
+    # token IDs in slightly different locations.  Preserve only values that
+    # are actually emitted; the capacity report uses null when unavailable.
+    queue_time_ms = chunk.get("queue_time_ms")
+    if queue_time_ms is None:
+        queue_time_ms = choice.get("queue_time_ms")
+    if queue_time_ms is None:
+        queue_time_ms = (chunk.get("metrics") or {}).get("queue_time_ms")
+    token_ids = choice.get("token_ids") or delta.get("token_ids") or []
+    if not token_ids:
+        logprobs = choice.get("logprobs") or {}
+        token_ids = logprobs.get("token_ids") or []
+        if not token_ids:
+            token_ids = [
+                item.get("token_id")
+                for item in (logprobs.get("content") or [])
+                if item.get("token_id") is not None
+            ]
+    if not isinstance(token_ids, list):
+        token_ids = [token_ids]
 
     return {
         "id": chunk.get("id"),
@@ -751,6 +1176,8 @@ def parse_sse_line(line: str) -> Optional[dict]:
         "finish_reason": finish_reason,
         "usage": usage,
         "tool_calls_delta": tool_calls_delta,
+        "queue_time_ms": float(queue_time_ms) if queue_time_ms is not None else None,
+        "token_ids": token_ids,
     }
 
 
@@ -942,12 +1369,16 @@ async def stream_chat_completion(
     usage: Optional[dict] = None
     request_id: Optional[str] = None
     tool_calls_acc: dict[int, dict] = {}
+    queue_time_ms: Optional[float] = None
+    token_ids: list[int] = []
 
     async def _consume_stream() -> None:
-        nonlocal finish_reason, request_id, t_first_token, usage
+        nonlocal finish_reason, request_id, t_first_token, usage, queue_time_ms
         async with client.stream(
             "POST", f"{base_url}/v1/chat/completions", json=body
         ) as response:
+            if getattr(response, "status_code", 200) >= 400:
+                await response.aread()
             response.raise_for_status()
             async for raw_line in response.aiter_lines():
                 parsed = parse_sse_line(raw_line)
@@ -957,6 +1388,10 @@ async def stream_chat_completion(
                     request_id = parsed["id"]
                 if parsed.get("usage"):
                     usage = parsed["usage"]
+                if parsed.get("queue_time_ms") is not None:
+                    queue_time_ms = parsed["queue_time_ms"]
+                if parsed.get("token_ids"):
+                    token_ids.extend(parsed["token_ids"])
                 if parsed.get("finish_reason"):
                     finish_reason = parsed["finish_reason"]
                 tc_delta = parsed.get("tool_calls_delta")
@@ -1004,11 +1439,18 @@ async def stream_chat_completion(
 
     return {
         **metrics,
+        "usage_available": bool(
+            isinstance(usage, dict)
+            and "prompt_tokens" in usage
+            and "completion_tokens" in usage
+        ),
         "completion_tokens": completion_tokens,
         "prompt_tokens": prompt_tokens,
         "finish_reason": finish_reason,
         "content": "".join(content_parts),
         "tool_calls": finalize_tool_calls(tool_calls_acc),
+        "queue_time_ms": queue_time_ms,
+        "token_ids": token_ids,
     }
 
 
@@ -2618,3 +3060,673 @@ async def run_bench_serve(
             print(output)
 
         return results
+
+
+# ---------------------------------------------------------------------------
+# Versioned capacity-envelope runner
+# ---------------------------------------------------------------------------
+
+
+def _capacity_package_version(package: str) -> Optional[str]:
+    try:
+        return importlib.metadata.version(package)
+    except importlib.metadata.PackageNotFoundError:
+        return None
+
+
+def _capacity_memory_from_status(status: dict) -> dict:
+    """Extract memory only when the status endpoint actually reports it."""
+    metal = status.get("metal") or {}
+    aliases = {
+        "active_gb": ("active_memory_gb", "active_gb"),
+        "peak_gb": ("peak_memory_gb", "peak_gb"),
+        "cache_gb": ("cache_memory_gb", "cache_gb"),
+    }
+    memory: dict[str, Any] = {"source": "unavailable"}
+    for output_name, keys in aliases.items():
+        value = next((metal[key] for key in keys if key in metal), None)
+        if value is not None:
+            try:
+                memory[output_name] = float(value)
+            except (TypeError, ValueError):
+                memory[output_name] = None
+    if any(memory.get(name) is not None for name in aliases):
+        memory["source"] = "/v1/status"
+    else:
+        for output_name, keys in aliases.items():
+            value = next((status[key] for key in keys if key in status), None)
+            if value is not None:
+                try:
+                    memory[output_name] = float(value)
+                except (TypeError, ValueError):
+                    memory[output_name] = None
+        if any(memory.get(name) is not None for name in aliases):
+            memory["source"] = "/v1/status"
+    return memory
+
+
+def _capacity_telemetry_delta(before: dict, after: dict) -> dict:
+    if not before or not after:
+        return {"available": False, "source": "/metrics", "values": None}
+    before_values = before.get("telemetry") or {}
+    after_values = after.get("telemetry") or {}
+    if not before_values or not after_values:
+        return {"available": False, "source": "/metrics", "values": None}
+    shared_keys = sorted(set(before_values) & set(after_values))
+    if not shared_keys:
+        return {"available": False, "source": "/metrics", "values": None}
+    delta: dict[str, float] = {}
+    for key in shared_keys:
+        value = float(after_values[key]) - float(before_values[key])
+        if value:
+            delta[key] = value
+    return {
+        "available": True,
+        "source": "/metrics",
+        "values": delta,
+        "missing_before": sorted(set(after_values) - set(before_values)),
+        "missing_after": sorted(set(before_values) - set(after_values)),
+    }
+
+
+def _verified_capacity_cache_reset(
+    event: dict, *, require_engine_cache: bool = False
+) -> bool:
+    """Require the vllm-mlx cache endpoint's explicit engine acknowledgement."""
+    response = event.get("response") or {}
+    if "engine_cache" not in response:
+        return False
+    engine_cache = response.get("engine_cache")
+    acknowledged = bool(event.get("ok") and response.get("status") == "cleared")
+    if not acknowledged or (isinstance(engine_cache, dict) and "error" in engine_cache):
+        return False
+    if require_engine_cache:
+        return isinstance(engine_cache, dict) and bool(engine_cache)
+    return True
+
+
+def _capacity_reset_state_verified(
+    event: dict, post_reset_empty: Optional[bool]
+) -> bool:
+    if not _verified_capacity_cache_reset(event):
+        return False
+    engine_cache = (event.get("response") or {}).get("engine_cache")
+    if post_reset_empty is False:
+        return False
+    if engine_cache is not None and post_reset_empty is not True:
+        return False
+    return True
+
+
+def _verify_capacity_cache_mode(cache_mode: str, telemetry: dict) -> dict:
+    if cache_mode not in {"prefix-hit", "prefix-miss"}:
+        return {"status": "verified", "source": "controlled reset/warmup"}
+    if not telemetry.get("available"):
+        return {"status": "unavailable", "source": "/metrics"}
+    values = telemetry.get("values") or {}
+    hits = sum(value for key, value in values.items() if "cache_hits" in key)
+    misses = sum(value for key, value in values.items() if "cache_misses" in key)
+    if cache_mode == "prefix-hit":
+        verified = hits > 0
+    else:
+        verified = misses > 0 and hits == 0
+    return {
+        "status": "verified" if verified else "mismatch",
+        "source": "/metrics",
+        "cache_hits": hits,
+        "cache_misses": misses,
+    }
+
+
+def _capacity_hardware_fingerprint() -> dict:
+    """Collect host facts without exposing estimated profile values."""
+    import subprocess
+
+    def _sysctl(name: str) -> Optional[str]:
+        try:
+            result = subprocess.run(
+                ["sysctl", "-n", name],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            return result.stdout.strip() or None
+        except (OSError, subprocess.SubprocessError):
+            return None
+
+    chip = _sysctl("machdep.cpu.brand_string")
+    memory_bytes = _sysctl("hw.memsize")
+    memory_gb = float(memory_bytes) / (1024**3) if memory_bytes else None
+    return {
+        "chip": chip,
+        "memory_gb": memory_gb,
+        "os_version": platform.platform(),
+        "gpu_cores": None,
+        "bandwidth_gbs": None,
+        "source": {
+            "chip": "sysctl" if chip else "unavailable",
+            "memory_gb": "sysctl" if memory_gb is not None else "unavailable",
+            "gpu_cores": "unavailable",
+            "bandwidth_gbs": "unavailable",
+        },
+    }
+
+
+def _capacity_provenance(
+    *,
+    url: str,
+    model_id: Optional[str],
+    runtime: dict,
+    status: dict,
+    hardware: dict,
+) -> dict:
+    """Collect explicit provenance, leaving unknown values as null."""
+    mtp = status.get("mtp") if isinstance(status.get("mtp"), dict) else None
+    return {
+        "client": {
+            "package": "vllm-mlx",
+            "package_version": _capacity_package_version("vllm-mlx"),
+            "python_version": platform.python_version(),
+            "platform": platform.platform(),
+            "source_commit": _capacity_source_commit(),
+        },
+        "server": {
+            "url": url,
+            "version": status.get("version") or status.get("server_version"),
+            "commit": status.get("commit") or status.get("server_commit"),
+        },
+        "hardware": hardware,
+        "runtime": {
+            "model_id": model_id,
+            "model_type": runtime.get("model_type") or None,
+            "engine_type": runtime.get("engine_type") or None,
+            "mtp": mtp,
+            "mtp_enabled": mtp.get("enabled") if mtp else None,
+            "specprefill": runtime.get("specprefill"),
+            "kv_quant": runtime.get("kv_quant") or None,
+            "cache_type": runtime.get("cache_type") or None,
+        },
+        "model": {
+            "revision": status.get("model_revision") or status.get("revision"),
+            "quantization": status.get("quantization") or status.get("quant"),
+            "context_limit": status.get("context_limit") or status.get("max_model_len"),
+        },
+        "feature_flags": status.get("feature_flags") or status.get("features") or None,
+        "library_versions": {
+            name: _capacity_package_version(name)
+            for name in ("mlx", "mlx-lm", "mlx-vlm")
+        },
+    }
+
+
+def _capacity_source_commit() -> Optional[str]:
+    import subprocess
+
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=Path(__file__).resolve().parent.parent,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        return result.stdout.strip() or None
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def compare_capacity_outputs(candidate: dict, baseline: dict) -> dict:
+    """Compare deterministic A/B outputs using IDs, then decoded text hash."""
+    candidate_ids = candidate.get("token_ids") or []
+    baseline_ids = baseline.get("token_ids") or []
+    if candidate_ids and baseline_ids:
+        candidate_hash = sha256_json(candidate_ids)
+        baseline_hash = sha256_json(baseline_ids)
+        return {
+            "status": "match" if candidate_hash == baseline_hash else "mismatch",
+            "method": "token_ids",
+            "candidate_hash": candidate_hash,
+            "baseline_hash": baseline_hash,
+        }
+    candidate_hash = hashlib.sha256(
+        str(candidate.get("content") or "").encode("utf-8")
+    ).hexdigest()
+    baseline_hash = hashlib.sha256(
+        str(baseline.get("content") or "").encode("utf-8")
+    ).hexdigest()
+    return {
+        "status": "match" if candidate_hash == baseline_hash else "mismatch",
+        "method": "decoded_output_sha256",
+        "candidate_hash": candidate_hash,
+        "baseline_hash": baseline_hash,
+    }
+
+
+def _capacity_baseline_identity(candidate: dict, baseline: dict) -> dict:
+    fields = ("model_id", "revision", "quantization")
+    candidate_values = {
+        "model_id": candidate.get("runtime", {}).get("model_id"),
+        "revision": candidate.get("model", {}).get("revision"),
+        "quantization": candidate.get("model", {}).get("quantization"),
+    }
+    baseline_values = {
+        "model_id": baseline.get("runtime", {}).get("model_id"),
+        "revision": baseline.get("model", {}).get("revision"),
+        "quantization": baseline.get("model", {}).get("quantization"),
+    }
+    missing = [
+        field
+        for field in fields
+        if candidate_values[field] is None or baseline_values[field] is None
+    ]
+    mismatched = [
+        field
+        for field in fields
+        if field not in missing and candidate_values[field] != baseline_values[field]
+    ]
+    return {
+        "verified": not missing and not mismatched,
+        "missing_fields": missing,
+        "mismatched_fields": mismatched,
+        "candidate": candidate_values,
+        "baseline": baseline_values,
+    }
+
+
+async def _run_capacity_request(
+    client: httpx.AsyncClient,
+    base_url: str,
+    *,
+    messages: list[dict],
+    model: str,
+    max_tokens: int,
+    extra_body: Optional[dict],
+    request_timeout_s: Optional[float],
+) -> dict:
+    try:
+        result = await stream_chat_completion(
+            client=client,
+            base_url=base_url,
+            messages=messages,
+            model=model,
+            max_tokens=max_tokens,
+            extra_body=extra_body,
+            timeout_s=request_timeout_s,
+        )
+        error = ""
+    except Exception as exc:
+        response = getattr(exc, "response", None)
+        try:
+            response_text = response.text if response is not None else ""
+        except httpx.ResponseNotRead:
+            response_text = ""
+        result = {
+            "ttft_ms": None,
+            "tpot_ms": None,
+            "e2e_latency_ms": None,
+            "queue_time_ms": None,
+            "prompt_tokens": None,
+            "completion_tokens": None,
+            "usage_available": False,
+            "content": "",
+            "token_ids": [],
+        }
+        error = " — ".join(part for part in (str(exc), response_text) if part)
+    sample = {
+        **result,
+        "error": error,
+        "error_kind": classify_capacity_error(error) if error else None,
+    }
+    sample["chunk_gap_ms"] = sample.pop("tpot_ms", None)
+    if error:
+        sample["validated"] = False
+    else:
+        finish_reason = result.get("finish_reason")
+        has_output = bool(result.get("content") or result.get("tool_calls"))
+        valid = finish_reason in {"stop", "length", "tool_calls"} and has_output
+        reason = "" if valid else "invalid or empty capacity response"
+        if not result.get("usage_available"):
+            valid = False
+            reason = "token usage unavailable"
+        sample["validated"] = valid
+        if not valid:
+            sample["error"] = reason
+            sample["error_kind"] = "error"
+    return sample
+
+
+async def run_capacity_envelope(
+    *,
+    url: str = "http://127.0.0.1:8080",
+    model: Optional[str] = None,
+    config: Optional[CapacityConfig] = None,
+    output_path: Optional[str] = None,
+    baseline_url: Optional[str] = None,
+) -> dict:
+    """Run a versioned capacity sweep against one or two HTTP servers.
+
+    This function only uses OpenAI-compatible HTTP endpoints.  It never
+    imports MLX model internals and does not change server behavior beyond the
+    existing optional ``DELETE /v1/cache`` endpoint used for explicit cold
+    cells.
+    """
+    config = config or CapacityConfig()
+    run_id = str(uuid.uuid4())[:8]
+    started_at = datetime.now(timezone.utc).isoformat()
+    timeout = (
+        httpx.Timeout(config.request_timeout_s) if config.request_timeout_s else None
+    )
+    samples: list[dict] = []
+    cells: list[dict] = []
+    cache_events: list[dict] = []
+
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        runtime = await auto_detect_runtime(client, url)
+        hardware = _capacity_hardware_fingerprint()
+        is_local_server = any(
+            marker in url for marker in ("127.0.0.1", "localhost", "[::1]")
+        )
+        hardware["scope"] = "client_host"
+        if not is_local_server:
+            hardware["memory_gb"] = None
+            hardware["source"]["memory_gb"] = "unavailable for remote server"
+        model_id = model or runtime.get("model_id", "")
+        if not model_id:
+            raise ValueError("could not determine model ID; pass --model")
+        status = await _fetch_post_run_status(client, url)
+        provenance = _capacity_provenance(
+            url=url,
+            model_id=model_id,
+            runtime=runtime,
+            status=status,
+            hardware=hardware,
+        )
+        baseline_provenance = None
+        baseline_identity = None
+        if baseline_url:
+            baseline_runtime = await auto_detect_runtime(client, baseline_url)
+            baseline_status = await _fetch_post_run_status(client, baseline_url)
+            baseline_provenance = _capacity_provenance(
+                url=baseline_url,
+                model_id=baseline_runtime.get("model_id"),
+                runtime=baseline_runtime,
+                status=baseline_status,
+                hardware={"scope": "not_collected"},
+            )
+            baseline_identity = _capacity_baseline_identity(
+                provenance, baseline_provenance
+            )
+        request_extra = dict(config.extra_body or {})
+        if baseline_url and "temperature" not in request_extra:
+            # A/B comparisons must be deterministic unless the caller
+            # explicitly chooses another sampling policy.
+            request_extra["temperature"] = 0.0
+        if baseline_url and float(request_extra.get("temperature", 0.0)) != 0.0:
+            raise ValueError("baseline parity requires deterministic temperature=0")
+        workload_descriptor = {
+            "schema_version": CAPACITY_ENVELOPE_SCHEMA_VERSION,
+            "config": config.to_dict(),
+            "request_template": {
+                "role": "user",
+                "generator": "capacity-envelope-token-bucket-v2",
+                "extra_body": request_extra,
+                "baseline_enabled": baseline_url is not None,
+            },
+            "prompt_material_sha256": {
+                f"{tokens}:{variant}": sha256_json(
+                    build_capacity_messages(tokens, variant=variant)
+                )
+                for tokens in config.prompt_tokens
+                for variant in ("base", "warm", "miss")
+            },
+        }
+        workload_hash = sha256_json(workload_descriptor)
+
+        for prompt_tokens in config.prompt_tokens:
+            for output_tokens in config.output_tokens:
+                for cache_mode in config.cache_modes:
+                    for concurrency in config.concurrencies:
+                        cell_samples: list[dict] = []
+                        batch_durations_ms: list[float] = []
+                        telemetry_values: dict[str, float] = {}
+                        telemetry_available = True
+                        cache_actions: list[dict] = []
+                        cache_mode_available = True
+                        for repetition in range(config.repetitions):
+                            measured_variant = (
+                                "miss" if cache_mode == "prefix-miss" else "base"
+                            )
+                            measured_messages = build_capacity_messages(
+                                prompt_tokens, variant=measured_variant
+                            )
+                            warmup_variant = "warm" if cache_mode == "warm" else "base"
+                            warmup_messages = build_capacity_messages(
+                                prompt_tokens, variant=warmup_variant
+                            )
+                            actions: dict[str, Any] = {
+                                "mode": cache_mode,
+                                "repetition": repetition,
+                                "reset_before_measured": False,
+                                "warmup_requests": 0,
+                            }
+                            reset = await clear_runtime_cache(client, url)
+                            post_reset_stats = await _fetch_capacity_cache_stats(
+                                client, url
+                            )
+                            post_reset_empty = _capacity_cache_stats_are_empty(
+                                post_reset_stats
+                            )
+                            actions["reset_before_measured"] = True
+                            actions["reset_event"] = reset
+                            actions["post_reset_stats"] = post_reset_stats
+                            actions["post_reset_empty"] = post_reset_empty
+                            cache_events.append(
+                                {
+                                    "prompt_tokens": prompt_tokens,
+                                    "output_tokens": output_tokens,
+                                    "cache_mode": cache_mode,
+                                    "concurrency": concurrency,
+                                    "repetition": repetition,
+                                    "event": reset,
+                                }
+                            )
+                            if not _capacity_reset_state_verified(
+                                reset, post_reset_empty
+                            ):
+                                raise RuntimeError(
+                                    f"{cache_mode} cache state could not be verified: "
+                                    f"{reset.get('error') or reset.get('status_code')}"
+                                )
+                            if cache_mode in {
+                                "prefix-hit",
+                                "prefix-miss",
+                            } and not _verified_capacity_cache_reset(
+                                reset, require_engine_cache=True
+                            ):
+                                actions["availability"] = "unsupported"
+                                cache_actions.append(actions)
+                                cache_mode_available = False
+                                continue
+                            warmup_count = 0 if cache_mode == "cold" else config.warmup
+                            if cache_mode in {"warm", "prefix-hit", "prefix-miss"}:
+                                warmup_count = max(1, warmup_count)
+                            for _ in range(warmup_count):
+                                warmup_sample = await _run_capacity_request(
+                                    client,
+                                    url,
+                                    messages=warmup_messages,
+                                    model=model_id,
+                                    max_tokens=output_tokens,
+                                    extra_body=request_extra,
+                                    request_timeout_s=config.request_timeout_s,
+                                )
+                                if warmup_sample.get("error"):
+                                    raise RuntimeError(
+                                        f"{cache_mode} warmup failed: "
+                                        f"{warmup_sample['error']}"
+                                    )
+                            actions["warmup_requests"] = warmup_count
+                            cache_actions.append(actions)
+
+                            metrics_before = await scrape_metrics(client, url)
+                            started = time.perf_counter()
+                            batch = await asyncio.gather(
+                                *[
+                                    _run_capacity_request(
+                                        client,
+                                        url,
+                                        messages=measured_messages,
+                                        model=model_id,
+                                        max_tokens=output_tokens,
+                                        extra_body=request_extra,
+                                        request_timeout_s=config.request_timeout_s,
+                                    )
+                                    for _ in range(concurrency)
+                                ]
+                            )
+                            batch_duration_ms = (time.perf_counter() - started) * 1000.0
+                            metrics_after = await scrape_metrics(client, url)
+                            status_after = await _fetch_post_run_status(client, url)
+                            batch_telemetry = _capacity_telemetry_delta(
+                                metrics_before, metrics_after
+                            )
+                            batch_memory = _capacity_memory_from_status(status_after)
+                            batch_durations_ms.append(batch_duration_ms)
+                            for sample in batch:
+                                sample.update(
+                                    {
+                                        "prompt_tokens_target": prompt_tokens,
+                                        "output_tokens_target": output_tokens,
+                                        "cache_mode": cache_mode,
+                                        "concurrency": concurrency,
+                                        "repetition": repetition,
+                                        "batch_duration_ms": batch_duration_ms,
+                                        "cache_state": actions,
+                                        "timing_semantics": "content_chunk_gap",
+                                        "memory": batch_memory,
+                                        "telemetry_delta": batch_telemetry,
+                                        "mtp_status": (
+                                            status_after.get("mtp")
+                                            if isinstance(status_after.get("mtp"), dict)
+                                            else None
+                                        ),
+                                    }
+                                )
+                            if baseline_url and batch:
+                                baseline_batch = await asyncio.gather(
+                                    *[
+                                        _run_capacity_request(
+                                            client,
+                                            baseline_url,
+                                            messages=measured_messages,
+                                            model=model_id,
+                                            max_tokens=output_tokens,
+                                            extra_body=request_extra,
+                                            request_timeout_s=config.request_timeout_s,
+                                        )
+                                        for _ in batch
+                                    ]
+                                )
+                                for sample, baseline_sample in zip(
+                                    batch, baseline_batch
+                                ):
+                                    if (
+                                        not baseline_identity["verified"]
+                                        or sample.get("error")
+                                        or baseline_sample.get("error")
+                                    ):
+                                        sample["correctness"] = {
+                                            "status": "unavailable",
+                                            "reason": "baseline identity unverified",
+                                        }
+                                    else:
+                                        sample["correctness"] = (
+                                            compare_capacity_outputs(
+                                                sample, baseline_sample
+                                            )
+                                        )
+                            else:
+                                for sample in batch:
+                                    sample["correctness"] = {"status": "not_run"}
+                            cell_samples.extend(batch)
+                            samples.extend(batch)
+                            if not batch_telemetry.get("available"):
+                                telemetry_available = False
+                            else:
+                                for key, value in (
+                                    batch_telemetry.get("values") or {}
+                                ).items():
+                                    telemetry_values[key] = (
+                                        telemetry_values.get(key, 0.0) + value
+                                    )
+
+                        cell_telemetry = {
+                            "available": telemetry_available,
+                            "source": "/metrics",
+                            "values": telemetry_values if telemetry_available else None,
+                        }
+                        cache_verification = (
+                            _verify_capacity_cache_mode(cache_mode, cell_telemetry)
+                            if cache_mode_available
+                            else {
+                                "status": "unavailable",
+                                "source": "DELETE /v1/cache",
+                                "reason": "engine cache unsupported",
+                            }
+                        )
+                        cell = summarize_capacity_cell(
+                            prompt_tokens=prompt_tokens,
+                            output_tokens=output_tokens,
+                            cache_mode=cache_mode,
+                            concurrency=concurrency,
+                            samples=cell_samples,
+                            batch_durations_ms=batch_durations_ms,
+                            thresholds=config.thresholds,
+                            telemetry_delta=cell_telemetry,
+                            cache_actions=cache_actions,
+                            cache_verification=cache_verification,
+                        )
+                        cells.append(cell)
+                        print(
+                            f"  prompt={prompt_tokens} output={output_tokens} "
+                            f"cache={cache_mode} concurrency={concurrency}: "
+                            f"{'PASS' if cell['sustainable'] else 'FAIL'}"
+                        )
+
+    finished_at = datetime.now(timezone.utc).isoformat()
+    payload = {
+        "kind": CAPACITY_ENVELOPE_KIND,
+        "schema_version": CAPACITY_ENVELOPE_SCHEMA_VERSION,
+        "run_id": run_id,
+        "started_at": started_at,
+        "finished_at": finished_at,
+        "workload_hash": workload_hash,
+        "provenance_hash": sha256_json(provenance),
+        "workload": workload_descriptor,
+        "provenance": provenance,
+        "baseline_provenance": baseline_provenance,
+        "baseline_identity": baseline_identity,
+        "summary": summarize_capacity_envelope(
+            cells,
+            config=config,
+            memory_gb=hardware.get("memory_gb"),
+        ),
+        "measurement": {
+            "ttft_ms": "first content chunk from request start",
+            "chunk_gap_ms": "mean gap between content chunks; not token TPOT",
+            "queue_time_ms": "server-reported only; null when absent",
+            "output_throughput_tps": "successful completion tokens / batch wall time",
+            "memory": "null when /v1/status does not report the field",
+            "memory_scope": "post-batch /v1/status snapshot; not a per-cell peak",
+        },
+        "cache_events": cache_events,
+        "cells": cells,
+        "samples": samples,
+    }
+    rendered = json.dumps(payload, indent=2, sort_keys=True)
+    if output_path:
+        Path(output_path).expanduser().write_text(rendered + "\n")
+        print(f"Capacity envelope written to {output_path}")
+    else:
+        print(rendered)
+    return payload

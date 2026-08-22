@@ -206,6 +206,8 @@ TTFT, TPOT, throughput, cache deltas, and Metal memory. Workload mode adds
 per-case quality checks, repeated samples for variance, and comparison-only
 product policy timeouts. Workload cases can embed `messages` directly or point
 `request_path` at an existing OpenAI-compatible request JSON.
+Capacity-envelope mode produces a versioned concurrency/SLO evidence artifact;
+see [Capacity-envelope benchmarking](../guides/capacity-envelope.md).
 
 ### Usage
 
@@ -221,6 +223,7 @@ vllm-mlx bench-serve --url http://localhost:8000 [options]
 | `--model` | API model id | Auto-detect |
 | `--prompts` | Comma-separated prompt sets or files for sweep mode | `short,medium,long` |
 | `--workload` | Declarative workload JSON for contract mode | None |
+| `--capacity-envelope` | Run the versioned capacity-envelope JSON benchmark | False |
 | `--concurrency` | Comma-separated concurrency levels for sweep mode | `1,4` |
 | `--max-tokens` | Max tokens for sweep mode | `256` |
 | `--repetitions` | Repetitions per sweep configuration or workload case | `3` |

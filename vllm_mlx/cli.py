@@ -945,7 +945,68 @@ def bench_serve_command(args):
     """Run serving benchmark."""
     import asyncio
 
-    from .bench_serve import run_bench_serve, run_bench_serve_workload
+    from .bench_serve import (
+        CapacityConfig,
+        CapacityThresholds,
+        run_bench_serve,
+        run_bench_serve_workload,
+        run_capacity_envelope,
+    )
+
+    if args.capacity_envelope:
+
+        def _positive_csv(value: str, option: str) -> tuple[int, ...]:
+            try:
+                parsed = tuple(
+                    int(item.strip()) for item in value.split(",") if item.strip()
+                )
+            except ValueError as exc:
+                raise ValueError(f"{option} must be comma-separated integers") from exc
+            if not parsed or any(item < 1 for item in parsed):
+                raise ValueError(f"{option} must contain positive integers")
+            return parsed
+
+        cache_modes = tuple(
+            item.strip().lower()
+            for item in args.capacity_cache_modes.split(",")
+            if item.strip()
+        )
+        config = CapacityConfig(
+            concurrencies=_positive_csv(
+                args.capacity_concurrency, "--capacity-concurrency"
+            ),
+            prompt_tokens=_positive_csv(
+                args.capacity_prompt_tokens, "--capacity-prompt-tokens"
+            ),
+            output_tokens=_positive_csv(
+                args.capacity_output_tokens, "--capacity-output-tokens"
+            ),
+            cache_modes=cache_modes,
+            repetitions=args.capacity_repetitions,
+            warmup=args.capacity_warmup,
+            request_timeout_s=(
+                None if args.request_timeout_s <= 0 else args.request_timeout_s
+            ),
+            thresholds=CapacityThresholds(
+                max_p95_ttft_ms=args.capacity_max_p95_ttft_ms,
+                max_p95_chunk_gap_ms=args.capacity_max_p95_chunk_gap_ms,
+                max_p95_e2e_ms=args.capacity_max_p95_e2e_ms,
+                max_failure_rate=args.capacity_max_failure_rate,
+                max_ooms=args.capacity_max_ooms,
+                max_timeouts=args.capacity_max_timeouts,
+            ),
+            extra_body={"temperature": 0.0},
+        )
+        asyncio.run(
+            run_capacity_envelope(
+                url=args.url,
+                model=args.model,
+                config=config,
+                output_path=args.output,
+                baseline_url=args.capacity_baseline_url,
+            )
+        )
+        return
 
     if args.workload:
         sweep_only_warnings = []
@@ -2035,6 +2096,93 @@ Examples:
             "runs contract-style cases with per-case quality checks and "
             "comparison-only policy timeouts instead of the prompt sweep."
         ),
+    )
+    bench_serve_parser.add_argument(
+        "--capacity-envelope",
+        action="store_true",
+        help=(
+            "Run the versioned capacity-envelope sweep. This is an HTTP-only "
+            "mode and writes a JSON artifact; legacy prompt/workload modes "
+            "remain unchanged."
+        ),
+    )
+    bench_serve_parser.add_argument(
+        "--capacity-concurrency",
+        type=str,
+        default="1,2,4,8,16,32",
+        help="Capacity concurrency levels (default: 1,2,4,8,16,32)",
+    )
+    bench_serve_parser.add_argument(
+        "--capacity-prompt-tokens",
+        type=str,
+        default="256,2048,8192,32768",
+        help="Requested prompt sizes (default: 256,2048,8192,32768)",
+    )
+    bench_serve_parser.add_argument(
+        "--capacity-output-tokens",
+        type=str,
+        default="128,512",
+        help="Requested output limits (default: 128,512)",
+    )
+    bench_serve_parser.add_argument(
+        "--capacity-cache-modes",
+        type=str,
+        default="cold,warm,prefix-hit,prefix-miss",
+        help="Cache-state cases (default: cold,warm,prefix-hit,prefix-miss)",
+    )
+    bench_serve_parser.add_argument(
+        "--capacity-repetitions",
+        type=int,
+        default=3,
+        help="Measured repetitions per capacity cell (default: 3)",
+    )
+    bench_serve_parser.add_argument(
+        "--capacity-warmup",
+        type=int,
+        default=1,
+        help="Warmup requests before measured capacity batches (default: 1)",
+    )
+    bench_serve_parser.add_argument(
+        "--capacity-baseline-url",
+        type=str,
+        default=None,
+        help="Optional HTTP baseline URL for greedy output parity checks",
+    )
+    bench_serve_parser.add_argument(
+        "--capacity-max-p95-ttft-ms",
+        type=float,
+        default=None,
+        help="Optional p95 TTFT SLO for sustainable capacity",
+    )
+    bench_serve_parser.add_argument(
+        "--capacity-max-p95-chunk-gap-ms",
+        type=float,
+        default=None,
+        help="Optional p95 content-chunk-gap SLO for sustainable capacity",
+    )
+    bench_serve_parser.add_argument(
+        "--capacity-max-p95-e2e-ms",
+        type=float,
+        default=None,
+        help="Optional p95 end-to-end latency SLO for sustainable capacity",
+    )
+    bench_serve_parser.add_argument(
+        "--capacity-max-failure-rate",
+        type=float,
+        default=0.0,
+        help="Maximum allowed request failure rate (default: 0)",
+    )
+    bench_serve_parser.add_argument(
+        "--capacity-max-ooms",
+        type=int,
+        default=0,
+        help="Maximum allowed OOM-classified failures (default: 0)",
+    )
+    bench_serve_parser.add_argument(
+        "--capacity-max-timeouts",
+        type=int,
+        default=0,
+        help="Maximum allowed timeout failures (default: 0)",
     )
     bench_serve_parser.add_argument(
         "--prompts",
