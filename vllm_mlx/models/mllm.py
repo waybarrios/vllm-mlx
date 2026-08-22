@@ -414,46 +414,51 @@ def _stream_mllm_generated_outputs(
     )
 
 
-def load_gemma4_assistant_drafter(model_path: str):
-    """Load a Gemma 4 assistant drafter for mlx-vlm speculative decoding."""
+def load_assistant_drafter(model_path: str):
+    """Load an mlx-vlm assistant/MTP drafter for speculative decoding.
+
+    Dispatches by the drafter checkpoint's own ``config.json`` ``model_type``
+    (via ``mlx_vlm.utils.load_model``, the same generic loader mlx-vlm uses
+    for its own regular models) instead of assuming a single fixed
+    architecture. This covers every drafter family mlx-vlm ships under
+    ``mlx_vlm.speculative.drafters`` (``gemma4_assistant``, ``qwen3_5_mtp``,
+    ``eagle3``, ``deepseek_v4_mtp``, ...) with one code path, and any new
+    family mlx-vlm adds later needs no change here.
+
+    Deliberately uses ``load_model`` rather than ``mlx_vlm.utils.load``:
+    standalone assistant/MTP drafters are small predictor heads, not
+    full checkpoints, and typically don't ship their own tokenizer/processor
+    files (they reuse the target model's) — ``load`` would additionally try
+    to load a processor and fail or misbehave for such a checkpoint.
+    """
     try:
-        import mlx.core as mx
-        from mlx_vlm.speculative.drafters import gemma4_assistant as arch
+        from mlx_vlm.utils import load_model
     except ImportError as exc:
         raise ImportError(
-            "Gemma 4 assistant drafter support requires an mlx-vlm build that "
-            "provides mlx_vlm.speculative.drafters.gemma4_assistant."
+            "Assistant/MTP drafter support requires mlx-vlm to be installed."
         ) from exc
 
     try:
         mlx_vlm_version = version("mlx-vlm")
     except PackageNotFoundError:
         mlx_vlm_version = "unknown"
+
+    path = Path(model_path)
+    config_path = path / "config.json"
+    if not config_path.exists():
+        raise FileNotFoundError(f"Assistant drafter config not found: {config_path}")
+    if not sorted(path.glob("*.safetensors")):
+        raise FileNotFoundError(f"Assistant drafter weights not found: {path}")
+
+    model_type = json.loads(config_path.read_text(encoding="utf-8")).get("model_type")
     logger.info(
-        "Loading Gemma 4 assistant drafter from %s using mlx-vlm %s",
+        "Loading %s assistant drafter from %s using mlx-vlm %s",
+        model_type or "unknown-architecture",
         model_path,
         mlx_vlm_version,
     )
 
-    path = Path(model_path)
-    config_path = path / "config.json"
-    weight_paths = sorted(path.glob("*.safetensors"))
-    if not config_path.exists():
-        raise FileNotFoundError(f"Gemma 4 assistant config not found: {config_path}")
-    if not weight_paths:
-        raise FileNotFoundError(f"Gemma 4 assistant weights not found: {path}")
-
-    config = arch.ModelConfig.from_dict(
-        json.loads(config_path.read_text(encoding="utf-8"))
-    )
-    model = arch.Model(config)
-    weights = {}
-    for weight_path in weight_paths:
-        weights.update(mx.load(str(weight_path)))
-    if hasattr(model, "sanitize"):
-        weights = model.sanitize(weights)
-    model.load_weights(list(weights.items()))
-    mx.eval(model.parameters())
+    model = load_model(path)
     model.eval()
     return model
 
@@ -1401,7 +1406,7 @@ class MLXMultimodalLM:
 
     def _load_draft_model(self):
         if self.draft_kind == "mtp":
-            return load_gemma4_assistant_drafter(self.draft_model_path)
+            return load_assistant_drafter(self.draft_model_path)
 
         from mlx_vlm.utils import load
 
