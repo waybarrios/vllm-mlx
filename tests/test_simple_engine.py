@@ -3092,6 +3092,129 @@ class TestSimpleEngineNaturalStop:
         assert outputs[0].finish_reason == "stop"
 
 
+class TestSimpleEngineStreamClose:
+    @staticmethod
+    def _engine(generate):
+        from vllm_mlx.engine.simple import SimpleEngine
+
+        with patch("vllm_mlx.engine.simple.is_mllm_model", return_value=False):
+            engine = SimpleEngine("test-model")
+        engine._loaded = True
+        engine._model = MagicMock()
+        engine._model.stream_generate.side_effect = generate
+        engine._model.tokenizer.apply_chat_template.return_value = "prompt"
+        return engine
+
+    @staticmethod
+    async def _close_and_assert_clean(engine, stream, backend_closed, loop_errors):
+        from vllm_mlx.engine.simple import _in_tracker
+
+        first = await anext(stream)
+        await stream.aclose()
+        await asyncio.sleep(0)
+
+        assert not first.finished
+        assert backend_closed()
+        assert not engine._active_requests
+        assert engine._num_running == 0
+        assert not engine._generation_lock.locked()
+        assert not _in_tracker.get()
+        assert not loop_errors
+
+    @pytest.mark.anyio
+    async def test_public_stream_generate_close_cleans_inner_state(self):
+        backend_closed = False
+
+        def generate(**kwargs):
+            nonlocal backend_closed
+            try:
+                yield SimpleNamespace(
+                    text="partial", prompt_tokens=3, finish_reason=None
+                )
+                yield SimpleNamespace(text="ignored", prompt_tokens=3)
+            finally:
+                backend_closed = True
+
+        engine = self._engine(generate)
+
+        loop_errors = []
+        loop = asyncio.get_running_loop()
+        previous_handler = loop.get_exception_handler()
+        loop.set_exception_handler(lambda _loop, context: loop_errors.append(context))
+        try:
+            stream = engine.stream_generate(prompt="hi", max_tokens=50)
+            await self._close_and_assert_clean(
+                engine, stream, lambda: backend_closed, loop_errors
+            )
+        finally:
+            loop.set_exception_handler(previous_handler)
+
+    @pytest.mark.anyio
+    async def test_public_stream_chat_close_cleans_nested_generate(self):
+        backend_closed = False
+
+        def generate(**kwargs):
+            nonlocal backend_closed
+            try:
+                yield SimpleNamespace(
+                    text="partial", prompt_tokens=3, finish_reason=None
+                )
+                yield SimpleNamespace(text="ignored", prompt_tokens=3)
+            finally:
+                backend_closed = True
+
+        engine = self._engine(generate)
+        loop_errors = []
+        loop = asyncio.get_running_loop()
+        previous_handler = loop.get_exception_handler()
+        loop.set_exception_handler(lambda _loop, context: loop_errors.append(context))
+        try:
+            stream = engine.stream_chat(
+                messages=[{"role": "user", "content": "hi"}], max_tokens=50
+            )
+            await self._close_and_assert_clean(
+                engine, stream, lambda: backend_closed, loop_errors
+            )
+        finally:
+            loop.set_exception_handler(previous_handler)
+
+    @pytest.mark.anyio
+    async def test_mllm_text_route_close_reaches_inner_cleanup(self):
+        from vllm_mlx.engine.base import GenerationOutput
+
+        inner_closed = False
+
+        async def text_stream(*args, **kwargs):
+            nonlocal inner_closed
+            try:
+                yield GenerationOutput(
+                    text="partial",
+                    new_text="partial",
+                    prompt_tokens=3,
+                    completion_tokens=1,
+                    finished=False,
+                )
+                yield GenerationOutput(text="ignored")
+            finally:
+                inner_closed = True
+
+        engine = self._engine(lambda **kwargs: iter(()))
+        engine._is_mllm = True
+        engine._text_model = MagicMock()
+        engine._stream_generate_text = text_stream
+
+        stream = engine.stream_chat(
+            messages=[{"role": "user", "content": "hi"}], max_tokens=50
+        )
+        first = await anext(stream)
+        await stream.aclose()
+
+        assert not first.finished
+        assert inner_closed
+        assert not engine._active_requests
+        assert engine._num_running == 0
+
+
 class TestSimpleEngineClearRuntimeCaches:
     """Operational reset (DELETE /v1/cache) must actually release the
     multi-slot system-prompt KV cache state introduced in the LRU patch —
