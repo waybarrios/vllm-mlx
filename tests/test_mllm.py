@@ -121,6 +121,56 @@ class TestMLLMHelperFunctions:
         assert not is_base64_image("https://example.com/image.jpg")
         assert not is_base64_image("/path/to/image.jpg")
 
+    def test_remote_media_log_does_not_expose_signed_url(self, monkeypatch, caplog):
+        import logging
+        import requests
+
+        from vllm_mlx.models import mllm
+
+        signed_url = "https://example.com/media.png?token=super-secret"
+
+        def fail_request(*args, **kwargs):
+            raise requests.Timeout("offline")
+
+        monkeypatch.setattr(mllm, "_request_with_safe_redirects", fail_request)
+        with caplog.at_level(logging.INFO), pytest.raises(requests.Timeout):
+            mllm._download_media(signed_url, "image", {"png": ".png"}, ".png", 1, 1024)
+
+        assert "super-secret" not in caplog.text
+        assert signed_url not in caplog.text
+
+
+class TestMLLMMediaAndHelperFunctions:
+    def test_invalid_image_fails_request_instead_of_becoming_text_only(
+        self, monkeypatch
+    ):
+        from vllm_mlx.models import mllm
+
+        model = mllm.MLXMultimodalLM.__new__(mllm.MLXMultimodalLM)
+        monkeypatch.setattr(
+            mllm,
+            "process_image_input",
+            lambda image: (_ for _ in ()).throw(ValueError("invalid image")),
+        )
+
+        with pytest.raises(ValueError, match="invalid image"):
+            model._prepare_images(["bad-image"])
+
+    def test_invalid_audio_fails_request_instead_of_becoming_text_only(
+        self, monkeypatch
+    ):
+        from vllm_mlx.models import mllm
+
+        model = mllm.MLXMultimodalLM.__new__(mllm.MLXMultimodalLM)
+        monkeypatch.setattr(
+            mllm,
+            "process_audio_input",
+            lambda audio: (_ for _ in ()).throw(ValueError("invalid audio")),
+        )
+
+        with pytest.raises(ValueError, match="invalid audio"):
+            model._prepare_audio(["bad-audio"])
+
     def test_is_base64_video(self):
         """Test base64 video detection."""
         from vllm_mlx.models.mllm import is_base64_video
