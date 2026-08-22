@@ -539,6 +539,7 @@ def test_cache_limit_ignored_for_simple_mode_entries(tmp_path):
 
     assert report.continuous_batching_entries == 0
     assert report.total_entries == 1
+    assert report.memory_aware_prefix_cache_entries == 0
     assert report.per_engine_cache_limit_bytes is None
     assert report.per_engine_cache_percent is None
 
@@ -560,6 +561,87 @@ def test_cache_limit_ignored_when_paged_cache_supersedes_it(tmp_path):
     )
 
     assert report.continuous_batching_entries == 1
+    assert report.memory_aware_prefix_cache_entries == 0
+    assert report.per_engine_cache_limit_bytes is None
+
+
+def test_cache_limit_applies_to_auto_detected_mllm_with_paged_cache(tmp_path, caplog):
+    """MLLM still constructs MemoryAwarePrefixCache under --use-paged-cache."""
+    from vllm_mlx.scheduler import SchedulerConfig
+
+    registry = _registry(tmp_path, {"text": 8, "vision": 8})
+    vision_path = Path(registry["vision"].source)
+    (vision_path / "config.json").write_text('{"vision_config": {}}')
+
+    report = build_memory_budget_report(
+        _manager_config(budget_gb=10),
+        registry,
+        _defaults_with(
+            continuous_batching=True,
+            scheduler_config=SchedulerConfig(
+                cache_memory_mb=20480, use_paged_cache=True
+            ),
+        ),
+        device_working_set_bytes=128 * GB,
+    )
+
+    assert report.continuous_batching_entries == 2
+    assert report.memory_aware_prefix_cache_entries == 1
+    assert report.per_engine_cache_limit_bytes == 20 * GB
+
+    with caplog.at_level(logging.INFO, logger="vllm_mlx.model_registry"):
+        log_memory_budget_report(report)
+
+    assert "20.0 GB per memory-aware prefix-cache engine" in caplog.text
+    assert "1 of 2 entries" in caplog.text
+
+
+@pytest.mark.parametrize("force_source", ["entry", "serve_default"])
+def test_cache_limit_applies_to_forced_mllm_with_paged_cache(tmp_path, force_source):
+    """Both MLLM override sources select the same cache path as BatchedEngine."""
+    from vllm_mlx.scheduler import SchedulerConfig
+
+    registry = _registry(tmp_path, {"alpha": 8})
+    defaults = _defaults_with(
+        continuous_batching=True,
+        force_mllm=force_source == "serve_default",
+        scheduler_config=SchedulerConfig(cache_memory_mb=20480, use_paged_cache=True),
+    )
+    if force_source == "entry":
+        registry["alpha"] = dataclasses.replace(registry["alpha"], force_mllm=True)
+
+    report = build_memory_budget_report(
+        _manager_config(budget_gb=10),
+        registry,
+        defaults,
+        device_working_set_bytes=128 * GB,
+    )
+
+    assert report.memory_aware_prefix_cache_entries == 1
+    assert report.per_engine_cache_limit_bytes == 20 * GB
+
+
+def test_entry_mllm_false_overrides_serve_default_for_cache_report(tmp_path):
+    """The report must use the same per-entry override precedence as loading."""
+    from vllm_mlx.scheduler import SchedulerConfig
+
+    registry = _registry(tmp_path, {"alpha": 8})
+    registry["alpha"] = dataclasses.replace(registry["alpha"], force_mllm=False)
+
+    report = build_memory_budget_report(
+        _manager_config(budget_gb=10),
+        registry,
+        _defaults_with(
+            continuous_batching=True,
+            force_mllm=True,
+            scheduler_config=SchedulerConfig(
+                cache_memory_mb=20480, use_paged_cache=True
+            ),
+        ),
+        device_working_set_bytes=128 * GB,
+    )
+
+    assert report.memory_aware_prefix_cache_entries == 0
     assert report.per_engine_cache_limit_bytes is None
 
 
@@ -788,7 +870,7 @@ def test_log_memory_budget_report_reports_ceiling_and_cache(tmp_path, caplog):
 
     assert "Registry memory budget: 40.0 GB" in caplog.text
     assert "Metal allocation ceiling 64.0 GB" in caplog.text
-    assert "20.0 GB per continuous-batching engine" in caplog.text
+    assert "20.0 GB per memory-aware prefix-cache engine" in caplog.text
     assert "2 of 2 entries" in caplog.text
 
 

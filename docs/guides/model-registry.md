@@ -145,8 +145,13 @@ together with the prefix-cache setting:
 ```
 Registry memory budget: 68.0 GB of model weights; Metal allocation ceiling
 64.0 GB (50% of 128.0 GB, from serve default); prefix-cache maximum
-20.0 GB per continuous-batching engine (--cache-memory-mb, 2 of 3 entries)
+20.0 GB per memory-aware prefix-cache engine (--cache-memory-mb, 2 of 3 entries)
 ```
+
+The entry count follows the cache path each model will use. With
+`--use-paged-cache`, text engines use the paged cache and are excluded from this
+count. MLLM engines still construct a memory-aware prefix cache, so their
+per-engine `--cache-memory-mb` maximum remains included.
 
 When the weights budget alone does not fit below the ceiling, startup warns:
 
