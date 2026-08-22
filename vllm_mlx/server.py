@@ -159,6 +159,12 @@ from .cli_arg_types import (
     make_json_object_arg_parser,
     make_positive_int_arg_parser,
 )
+from .attention_backend import (
+    ATTENTION_BACKEND_CHOICES,
+    AttentionBackendCapabilityError,
+    BackendSelection,
+    resolve_attention_backend,
+)
 from .engine import BaseEngine, BatchedEngine, GenerationOutput, SimpleEngine
 from .endpoint_model_policies import (
     resolve_embedding_model_name,
@@ -209,6 +215,10 @@ _default_min_p: float | None = None  # Set via --default-min-p
 _default_presence_penalty: float | None = None  # Set via --default-presence-penalty
 _default_repetition_penalty: float | None = None  # Set via --default-repetition-penalty
 _metrics_enabled = False
+# Backend selection is configured during CLI startup.  Keeping this separate
+# from the scheduler preserves the existing MLX route until a qualified native
+# executor is introduced.
+_attention_backend_selection: BackendSelection | None = None
 _max_audio_upload_bytes: int = DEFAULT_MAX_AUDIO_UPLOAD_BYTES
 _max_tts_input_chars: int = DEFAULT_MAX_TTS_INPUT_CHARS
 _force_mllm_model: bool = False
@@ -228,6 +238,34 @@ _FALLBACK_TOP_K = 0
 _FALLBACK_MIN_P = 0.0
 _FALLBACK_PRESENCE_PENALTY = 0.0
 _FALLBACK_REPETITION_PENALTY = 1.0
+
+
+def configure_attention_backend(selection: BackendSelection) -> None:
+    """Record the startup backend decision for status and future executors."""
+
+    if selection.selected.value == "metal-context" and (
+        not selection.capabilities.available or not selection.capabilities.serving_ready
+    ):
+        raise AttentionBackendCapabilityError(
+            selection.selected, selection.capabilities
+        )
+    global _attention_backend_selection
+    _attention_backend_selection = selection
+
+
+def _attention_backend_status() -> dict[str, object]:
+    """Return backend selection without probing or changing runtime state."""
+
+    selection = _attention_backend_selection
+    if selection is None:
+        return {
+            "requested": "mlx",
+            "selected": "mlx",
+            "fallback": False,
+            "fallback_reason": None,
+            "capabilities": None,
+        }
+    return selection.as_dict()
 
 
 def _resolve_temperature(request_value: float | None) -> float:
@@ -3613,6 +3651,7 @@ async def health():
             else "llm"
         ),
         "engine_type": engine_stats.get("engine_type", "unknown"),
+        "attention_backend": _attention_backend_status(),
         "mcp": mcp_info,
     }
     if lifecycle is not None:
@@ -3663,6 +3702,7 @@ async def status():
                 "models": _model_manager.list_models(),
             },
             "embedding": _embedding_status(),
+            "attention_backend": _attention_backend_status(),
         }
     lifecycle = _public_lifecycle_status(_get_lifecycle_status())
     if _engine is None:
@@ -3672,6 +3712,7 @@ async def status():
             "residency": lifecycle,
             "requests": [],
             "embedding": _embedding_status(),
+            "attention_backend": _attention_backend_status(),
         }
 
     stats = _engine.get_stats()
@@ -3684,6 +3725,7 @@ async def status():
         "model": _model_name,
         "residency": lifecycle,
         "embedding": _embedding_status(),
+        "attention_backend": _attention_backend_status(),
         "uptime_s": round(stats.get("uptime_seconds", 0), 1),
         "steps_executed": stats.get("steps_executed", 0),
         "num_running": stats.get("num_running", 0),
@@ -6848,6 +6890,27 @@ def main():
     parser = create_parser()
     args = parser.parse_args()
 
+    try:
+        attention_backend = resolve_attention_backend(
+            getattr(args, "attention_backend", "mlx")
+        )
+    except AttentionBackendCapabilityError as exc:
+        parser.error(str(exc))
+    configure_attention_backend(attention_backend)
+    if attention_backend.fallback_reason:
+        logger.info(
+            "Attention backend: requested=%s selected=%s (%s)",
+            attention_backend.requested.value,
+            attention_backend.selected.value,
+            attention_backend.fallback_reason,
+        )
+    else:
+        logger.info(
+            "Attention backend: requested=%s selected=%s",
+            attention_backend.requested.value,
+            attention_backend.selected.value,
+        )
+
     # Set global configuration
     global _api_key, _default_timeout, _rate_limiter, _metrics_enabled
     global _default_temperature, _default_top_p, _default_chat_template_kwargs
@@ -6997,6 +7060,17 @@ Examples:
         type=int,
         default=8000,
         help="Port to bind to",
+    )
+    parser.add_argument(
+        "--attention-backend",
+        type=str,
+        choices=ATTENTION_BACKEND_CHOICES,
+        default="mlx",
+        help=(
+            "Attention execution backend: mlx (default), metal-context "
+            "(explicit opt-in; requires the compiled native extension), or "
+            "auto (currently remains on mlx until qualification passes)."
+        ),
     )
     parser.add_argument(
         "--mllm",

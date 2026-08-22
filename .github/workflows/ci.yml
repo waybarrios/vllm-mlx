@@ -28,6 +28,33 @@ jobs:
       - name: Run black
         run: black --check vllm_mlx/ tests/
 
+      - name: Verify native source distribution manifest
+        run: |
+          pip install build
+          rm -rf /tmp/vllm-mlx-sdist
+          python -m build --sdist --outdir /tmp/vllm-mlx-sdist
+          python - <<'PY'
+          import glob
+          import tarfile
+
+          archive = glob.glob("/tmp/vllm-mlx-sdist/*.tar.gz")
+          assert len(archive) == 1, archive
+          with tarfile.open(archive[0], "r:gz") as source:
+              names = source.getnames()
+          required = {
+              "native/metal_context/kernels/paged_decode.metal",
+              "native/metal_context/src/python_module.mm",
+              "native/metal_context/README.md",
+              "scripts/build_metal_context.py",
+              "tests/test_attention_backend.py",
+              "tests/test_metal_context_native.py",
+          }
+          missing = {
+              path for path in required if not any(name.endswith(path) for name in names)
+          }
+          assert not missing, f"sdist is missing: {sorted(missing)}"
+          PY
+
   type-check:
     runs-on: ubuntu-latest
     steps:
@@ -63,7 +90,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install pytest anyio pytest-cov pydantic fastapi jsonschema httpx psutil transformers requests
+          pip install pytest anyio pytest-cov pydantic fastapi jsonschema httpx psutil transformers requests numpy
 
       - name: Run unit tests (no MLX required)
         run: |
@@ -91,6 +118,7 @@ jobs:
             tests/test_endpoint_model_policies.py \
             tests/test_truncation.py \
             tests/test_cli_arg_types.py \
+            tests/test_attention_backend.py \
             tests/test_gemma4_openai_format.py \
             tests/test_gemma4_streaming_edge.py \
             tests/test_gemma4_tool_parser.py \
@@ -152,6 +180,8 @@ jobs:
           python-version: ${{ matrix.python-version }}
 
       - name: Install project and dependencies
+        env:
+          VLLM_MLX_BUILD_METAL_CONTEXT: "1"
         run: |
           python -m pip install --upgrade pip
           pip install -e ".[dev,vision,harmony]"
@@ -161,10 +191,31 @@ jobs:
           python -c "import platform; assert platform.machine() == 'arm64', 'Not ARM64'"
           python -c "import mlx.core as mx; print(f'MLX OK: {mx.default_device()}')"
 
+      - name: Verify strict native Metal build
+        run: |
+          python - <<'PY'
+          import platform
+          from vllm_mlx import _metal_context
+
+          assert platform.machine() == "arm64"
+          capabilities = _metal_context.capabilities()
+          assert capabilities.get("compiled") is True, capabilities
+          # GitHub's arm64 macOS hosts expose the Apple toolchain but may not
+          # expose a Metal device to jobs.  Compilation is mandatory here;
+          # dispatch tests run when a device is actually present and otherwise
+          # must report the precise fail-closed reason.
+          if not capabilities.get("available"):
+              assert capabilities.get("metal_device") is False, capabilities
+              assert "no GPU" in capabilities.get("reason", ""), capabilities
+          print("Metal Context native capability:", capabilities)
+          PY
+
       - name: Run MLX-dependent tests
         run: |
           pytest \
             tests/test_platform.py \
+            tests/test_attention_backend.py \
+            tests/test_metal_context_native.py \
             tests/test_llm.py \
             tests/test_mllm.py \
             tests/test_server.py \
