@@ -177,7 +177,7 @@ from .model_registry import (
 )
 from .metrics import metrics as _metrics
 from .models.mllm import UnsafeRemoteURLError, _validate_url_safety, is_url
-from .reasoning import get_parser as get_reasoning_parser
+from .reasoning import DeltaMessage, get_parser as get_reasoning_parser
 from .tool_parsers import ToolParserManager, get_parser_stop_tokens
 
 logging.basicConfig(level=logging.INFO)
@@ -1207,6 +1207,35 @@ def _streaming_json_fence_stripper(
     if response_format_type in ("json_object", "json_schema"):
         return StreamingJsonFenceStripper()
     return None
+
+
+def _extract_streaming_reasoning_delta(
+    parser,
+    previous_text: str,
+    current_text: str,
+    delta_text: str,
+    *,
+    finished: bool,
+) -> DeltaMessage | None:
+    """Parse one reasoning delta and flush buffered text on the final output."""
+    delta = parser.extract_reasoning_streaming(previous_text, current_text, delta_text)
+    if not finished:
+        return delta
+
+    finalize_stream = getattr(parser, "finalize_stream", None)
+    if finalize_stream is None:
+        return delta
+
+    final = finalize_stream()
+    if final is None:
+        return delta
+    if delta is None:
+        return final
+    return DeltaMessage(
+        role=delta.role or final.role,
+        reasoning=((delta.reasoning or "") + (final.reasoning or "")) or None,
+        content=((delta.content or "") + (final.content or "")) or None,
+    )
 
 
 # Lifecycle startup coordination — an Event lets the lifecycle loop block
@@ -2647,15 +2676,23 @@ async def _stream_responses_request(request: ResponsesRequest) -> AsyncIterator[
             completion_tokens = output.completion_tokens
 
         delta_text = output.new_text or ""
-        if not delta_text and not output.finished:
+        output_finished = bool(getattr(output, "finished", False))
+        use_reasoning = reasoning_parser and not _thinking_disabled(
+            request, chat_kwargs
+        )
+        if not delta_text and not (use_reasoning and output_finished):
             continue
 
         previous_text = raw_accumulated_text
         raw_accumulated_text += delta_text
 
-        if reasoning_parser:
-            delta_msg = reasoning_parser.extract_reasoning_streaming(
-                previous_text, raw_accumulated_text, delta_text
+        if use_reasoning:
+            delta_msg = _extract_streaming_reasoning_delta(
+                reasoning_parser,
+                previous_text,
+                raw_accumulated_text,
+                delta_text,
+                finished=output_finished,
             )
             if delta_msg is None:
                 continue
@@ -5978,7 +6015,8 @@ async def _stream_anthropic_messages(
         async for output in engine.stream_chat(messages=messages, **chat_kwargs):
             if metrics_tracker is not None:
                 metrics_tracker.observe_ttft()
-            delta_text = output.new_text
+            delta_text = output.new_text or ""
+            output_finished = bool(getattr(output, "finished", False))
 
             if hasattr(output, "prompt_tokens") and output.prompt_tokens:
                 prompt_tokens = output.prompt_tokens
@@ -5987,12 +6025,12 @@ async def _stream_anthropic_messages(
             if hasattr(output, "completion_tokens") and output.completion_tokens:
                 completion_tokens = output.completion_tokens
 
-            if not delta_text and not output.finished:
+            if not delta_text and not (use_reasoning and output_finished):
                 continue
 
             # Filter special tokens
             filtered = SPECIAL_TOKENS_PATTERN.sub("", delta_text)
-            if not filtered and not output.finished:
+            if not filtered and not (use_reasoning and output_finished):
                 continue
 
             if not use_reasoning:
@@ -6047,8 +6085,12 @@ async def _stream_anthropic_messages(
             previous_text = accumulated_text
             accumulated_text += filtered
             assert reasoning_parser is not None
-            delta_msg = reasoning_parser.extract_reasoning_streaming(
-                previous_text, accumulated_text, filtered
+            delta_msg = _extract_streaming_reasoning_delta(
+                reasoning_parser,
+                previous_text,
+                accumulated_text,
+                filtered,
+                finished=output_finished,
             )
 
             if delta_msg is None:
@@ -6344,7 +6386,8 @@ async def stream_chat_completion(
         async for output in engine.stream_chat(messages=messages, **kwargs):
             if metrics_tracker is not None:
                 metrics_tracker.observe_ttft()
-            delta_text = output.new_text
+            delta_text = output.new_text or ""
+            output_finished = bool(getattr(output, "finished", False))
             last_output = output
 
             # Track token counts from output (updated each chunk)
@@ -6356,11 +6399,19 @@ async def stream_chat_completion(
             # Use reasoning parser if enabled (skip when enable_thinking=False
             # is set either on the request or via the resolved chat template
             # kwargs / server default).
-            if reasoning_parser and delta_text:
+            if (
+                reasoning_parser
+                and (delta_text or output_finished)
+                and not _thinking_disabled(request, kwargs)
+            ):
                 previous_text = accumulated_text
                 accumulated_text += delta_text
-                delta_msg = reasoning_parser.extract_reasoning_streaming(
-                    previous_text, accumulated_text, delta_text
+                delta_msg = _extract_streaming_reasoning_delta(
+                    reasoning_parser,
+                    previous_text,
+                    accumulated_text,
+                    delta_text,
+                    finished=output_finished,
                 )
 
                 if delta_msg is None:

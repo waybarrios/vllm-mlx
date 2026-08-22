@@ -3490,6 +3490,73 @@ class TestStreamChatCompletion:
         assert not errors, f"Unexpected streaming wrapper errors: {errors}"
         assert any("data: [DONE]" in chunk for chunk in chunks)
 
+    @pytest.mark.anyio
+    async def test_reasoning_stream_flushes_partial_marker_before_finish(
+        self, monkeypatch
+    ):
+        """A final partial reasoning marker must not be dropped."""
+        from vllm_mlx.engine.base import GenerationOutput
+        from vllm_mlx.server import (
+            ChatCompletionRequest,
+            Message,
+            stream_chat_completion,
+        )
+        import vllm_mlx.server as server
+
+        class FakeEngine:
+            model_name = "fake-engine"
+            tokenizer = None
+
+            async def stream_chat(self, messages, **kwargs):
+                yield GenerationOutput(
+                    text="thinking</thi",
+                    new_text="thinking</thi",
+                    finished=True,
+                    finish_reason="stop",
+                    prompt_tokens=3,
+                    completion_tokens=2,
+                )
+
+        monkeypatch.setattr(server, "_model_name", "served-model")
+        monkeypatch.setattr(server, "_reasoning_parser_name", "qwen3")
+        monkeypatch.setattr(server, "_reasoning_parser", None)
+        monkeypatch.setattr(server, "_enable_auto_tool_choice", False)
+        monkeypatch.setattr(server, "_tool_call_parser", None)
+        monkeypatch.setattr(server, "_tool_parser_instance", None)
+
+        request = ChatCompletionRequest(
+            model="served-model",
+            messages=[Message(role="user", content="hi")],
+            stream=True,
+        )
+        chunks = [
+            chunk
+            async for chunk in stream_chat_completion(
+                FakeEngine(), request.messages, request
+            )
+        ]
+        payloads = [
+            json.loads(chunk.removeprefix("data: ").strip())
+            for chunk in chunks
+            if chunk != "data: [DONE]\n\n"
+        ]
+
+        reasoning = "".join(
+            choice["delta"].get("reasoning_content", "")
+            for payload in payloads
+            for choice in payload["choices"]
+        )
+        finish_reasons = [
+            choice["finish_reason"]
+            for payload in payloads
+            for choice in payload["choices"]
+            if choice["finish_reason"] is not None
+        ]
+
+        assert reasoning == "thinking</thi"
+        assert finish_reasons == ["stop"]
+        assert chunks[-1] == "data: [DONE]\n\n"
+
 
 class TestReasoningAndToolCallsNonStreaming:
     """Non-streaming coexistence of reasoning extraction and tool parsing."""

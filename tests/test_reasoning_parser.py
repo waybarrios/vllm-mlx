@@ -1533,3 +1533,113 @@ class TestGemma4DegenerateCycling:
         # Channel tokens must not leak
         assert "<channel|>" not in full_content
         assert "<|channel>" not in full_content
+
+
+class TestSplitTagStreaming:
+    """Tags that arrive split across deltas must not leak or be lost.
+
+    A model whose tokenizer has ``</think>`` as a single token never produces
+    this, which is why it went unnoticed; one that spells the tag out in
+    ordinary tokens produces it on every reasoning turn.
+    """
+
+    @staticmethod
+    def _stream(parser, text, chunk):
+        parser.reset_state()
+        accumulated, reasoning, content = "", [], []
+        for i in range(0, len(text), chunk):
+            delta = text[i : i + chunk]
+            previous, accumulated = accumulated, accumulated + delta
+            message = parser.extract_reasoning_streaming(previous, accumulated, delta)
+            if message is not None:
+                if message.reasoning:
+                    reasoning.append(message.reasoning)
+                if message.content:
+                    content.append(message.content)
+        message = parser.finalize_stream()
+        if message is not None:
+            if message.reasoning:
+                reasoning.append(message.reasoning)
+            if message.content:
+                content.append(message.content)
+        return "".join(reasoning), "".join(content)
+
+    @pytest.fixture(params=["qwen3", "deepseek_r1"])
+    def parser(self, request):
+        return get_parser(request.param)()
+
+    @pytest.mark.parametrize("chunk", [1, 2, 3, 4, 5, 6, 7, 16])
+    def test_split_end_tag_does_not_leak(self, parser, chunk):
+        """No fragment of </think> may surface as reasoning."""
+        reasoning, content = self._stream(parser, "weighing it</think>Answer.", chunk)
+        assert reasoning.strip() == "weighing it"
+        assert content.strip() == "Answer."
+        for fragment in ("<", "/", "think", ">"):
+            assert fragment not in reasoning
+
+    @pytest.mark.parametrize("chunk", [1, 2, 3, 5])
+    def test_split_start_tag_does_not_leak(self, parser, chunk):
+        reasoning, content = self._stream(
+            parser, "<think>weighing it</think>Answer.", chunk
+        )
+        assert reasoning.strip() == "weighing it"
+        assert content.strip() == "Answer."
+        assert "<think>" not in reasoning
+        assert "<think>" not in content
+
+    @pytest.mark.parametrize(
+        "text", ["thinking<", "thinking</", "thinking</thi", "thinking</think"]
+    )
+    def test_truncated_tag_prefix_is_still_delivered(self, parser, text):
+        """Withheld text must be flushed when the stream ends without the tag."""
+        reasoning, content = self._stream(parser, text, 3)
+        assert len(reasoning) + len(content) == len(text)
+
+    @pytest.mark.parametrize("chunk", [1, 3, 7])
+    def test_nothing_is_lost(self, parser, chunk):
+        text = "weighing it</think>Answer."
+        reasoning, content = self._stream(parser, text, chunk)
+        # The tag itself is a delimiter, not content of either channel.
+        assert len(reasoning) + len(content) == len(text) - len("</think>")
+
+
+class TestStreamingCostIsFlat:
+    """Per-token cost must not grow with output length.
+
+    The parser used to search the whole accumulated text on every delta, which
+    is O(N²) over a generation — invisible on short replies, dominant on long
+    ones.
+    """
+
+    @staticmethod
+    def _elapsed_ms(parser, n_tokens):
+        import time
+
+        parser.reset_state()
+        tokens = (
+            [f"step{i} " for i in range(n_tokens)]
+            + ["</think>"]
+            + [f"word{i} " for i in range(10)]
+        )
+        accumulated = ""
+        start = time.perf_counter()
+        for delta in tokens:
+            previous, accumulated = accumulated, accumulated + delta
+            parser.extract_reasoning_streaming(previous, accumulated, delta)
+        return (time.perf_counter() - start) * 1000
+
+    @pytest.fixture(params=["qwen3", "deepseek_r1"])
+    def parser(self, request):
+        return get_parser(request.param)()
+
+    def test_scales_linearly(self, parser):
+        """20x the tokens must cost well under 20x^2 the time."""
+        small = self._elapsed_ms(parser, 250)
+        large = self._elapsed_ms(parser, 5000)
+        # Linear would be 20x. Allow generous headroom for timer noise on a
+        # loaded CI machine while still failing loudly on quadratic growth,
+        # which measured over 1000x before the fix.
+        assert large < small * 200, (
+            f"{small:.2f}ms at 250 tokens, {large:.2f}ms at 5000 — "
+            "per-token cost is growing with output length"
+        )
