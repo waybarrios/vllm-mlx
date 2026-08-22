@@ -2,7 +2,9 @@
 """Tests for SimpleEngine's optional mlx-lm prompt trie cache."""
 
 import hashlib
+import sys
 import threading
+import types
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -75,6 +77,63 @@ class ThreadRecordingTrie:
 
     def insert_cache(self, *_args, **_kwargs):
         self.insert_threads.append(threading.get_ident())
+
+
+class NonWinningTrie:
+    """Expose a shorter match without materializing its prompt cache."""
+
+    nbytes = 0
+
+    def __init__(self, tokens_saved):
+        self.tokens_saved = tokens_saved
+        self.fetches = 0
+        self._trie = self
+
+    def __len__(self):
+        return 1
+
+    def search(self, model, tokens):
+        return SimpleNamespace(
+            model=model,
+            exact=None,
+            shorter=tokens[: self.tokens_saved],
+            longer=None,
+            common_prefix=self.tokens_saved,
+        )
+
+    def fetch_nearest_cache(self, _model, tokens):
+        self.fetches += 1
+        return [object()], tokens[self.tokens_saved :]
+
+
+class ExactUntrimmableTrie:
+    """Expose an exact match whose cache cannot drop the final token."""
+
+    nbytes = 0
+
+    def __init__(self):
+        self.fetches = 0
+        self._trie = self
+        self.prompt_cache = [SimpleNamespace(is_trimmable=lambda: False)]
+
+    def __len__(self):
+        return 1
+
+    def search(self, model, tokens):
+        return SimpleNamespace(
+            model=model,
+            exact=tokens,
+            shorter=None,
+            longer=None,
+            common_prefix=0,
+        )
+
+    def get(self, _model, _tokens):
+        return SimpleNamespace(prompt_cache=self.prompt_cache)
+
+    def fetch_nearest_cache(self, _model, _tokens):
+        self.fetches += 1
+        return self.prompt_cache, []
 
 
 def _engine(**kwargs):
@@ -221,6 +280,45 @@ async def test_existing_exact_snapshot_hit_wins_before_prefix_trie_lookup():
         await _collect(engine, messages)
 
     assert engine.get_stats()["prefix_trie_cache"]["lookups"] == 0
+
+
+async def test_system_snapshot_rejects_shorter_trie_before_materializing_cache():
+    engine = _engine(prefix_trie_cache=True)
+    trie = NonWinningTrie(tokens_saved=4)
+    engine._prefix_trie_cache = trie
+
+    cache, rest, tokens_saved = engine._fetch_prefix_trie_cache(
+        engine._model.model,
+        list(range(8)),
+        minimum_tokens_saved=4,
+    )
+
+    assert (cache, rest, tokens_saved) == (None, None, 0)
+    assert trie.fetches == 0
+
+
+async def test_system_snapshot_rejects_untrimmable_exact_trie_before_fetch(
+    monkeypatch,
+):
+    cache_module = types.ModuleType("mlx_lm.models.cache")
+    cache_module.can_trim_prompt_cache = lambda cache: all(
+        entry.is_trimmable() for entry in cache
+    )
+    cache_module.trim_prompt_cache = lambda cache, count: count
+    monkeypatch.setitem(sys.modules, "mlx_lm.models.cache", cache_module)
+
+    engine = _engine(prefix_trie_cache=True)
+    trie = ExactUntrimmableTrie()
+    engine._prefix_trie_cache = trie
+
+    cache, rest, tokens_saved = engine._fetch_prefix_trie_cache(
+        engine._model.model,
+        list(range(8)),
+        minimum_tokens_saved=4,
+    )
+
+    assert (cache, rest, tokens_saved) == (None, None, 0)
+    assert trie.fetches == 0
 
 
 async def test_prefix_trie_cache_is_disabled_by_default():

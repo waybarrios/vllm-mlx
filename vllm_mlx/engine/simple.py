@@ -566,6 +566,18 @@ class SimpleEngine(BaseEngine):
         self._prefix_trie_cache_stats["lookups"] += 1
         try:
             with self._prefix_trie_cache_lock:
+                if minimum_tokens_saved > 0:
+                    candidate_tokens_saved = self._peek_prefix_trie_tokens_saved(
+                        prefix_trie,
+                        model,
+                        tokens,
+                    )
+                    if (
+                        candidate_tokens_saved is None
+                        or candidate_tokens_saved <= minimum_tokens_saved
+                    ):
+                        self._prefix_trie_cache_stats["skips"] += 1
+                        return None, None, 0
                 trie_cache, trie_rest = prefix_trie.fetch_nearest_cache(model, tokens)
             if trie_cache is None or trie_rest is None or len(trie_rest) >= len(tokens):
                 self._prefix_trie_cache_stats["misses"] += 1
@@ -590,6 +602,58 @@ class SimpleEngine(BaseEngine):
             self._prefix_trie_cache_stats["skips"] += 1
             logger.debug("Prefix trie cache lookup skipped after failure (%s)", e)
             return None, None, 0
+
+    @staticmethod
+    def _peek_prefix_trie_tokens_saved(
+        prefix_trie: Any,
+        model: Any,
+        tokens: list[int],
+    ) -> int | None:
+        """Return reusable tokens without copying the matched prompt cache.
+
+        mlx-lm 0.31.3+ exposes no public non-copying lookup. Its LRUPromptCache
+        keeps the search metadata on ``_trie``; feature-detect that stable shape
+        and safely prefer the existing system snapshot if it changes upstream.
+        """
+        trie = getattr(prefix_trie, "_trie", None)
+        search = getattr(trie, "search", None)
+        if not callable(search):
+            return None
+
+        result = search(model, tokens)
+
+        def _entry_is_trimmable(cache_key: list[int]) -> bool | None:
+            get_entry = getattr(trie, "get", None)
+            if not callable(get_entry):
+                return None
+
+            from mlx_lm.models.cache import can_trim_prompt_cache
+
+            entry = get_entry(result.model, cache_key)
+            prompt_cache = getattr(entry, "prompt_cache", None)
+            if prompt_cache is None:
+                return None
+            return can_trim_prompt_cache(prompt_cache)
+
+        exact = getattr(result, "exact", None)
+        if exact is not None:
+            exact_is_trimmable = _entry_is_trimmable(exact)
+            if exact_is_trimmable is None:
+                return None
+            return max(0, len(tokens) - 1) if exact_is_trimmable else 0
+
+        shorter = getattr(result, "shorter", None)
+        shorter_length = len(shorter) if shorter is not None else 0
+        longer = getattr(result, "longer", None)
+        common_prefix = getattr(result, "common_prefix", 0)
+        if longer is not None and common_prefix > shorter_length:
+            longer_is_trimmable = _entry_is_trimmable(longer)
+            if longer_is_trimmable is None:
+                return None
+            if longer_is_trimmable:
+                return min(len(tokens) - 1, common_prefix)
+
+        return shorter_length
 
     def _insert_prefix_trie_cache(
         self, model: Any, cache_key: list[int], prompt_cache: Any
