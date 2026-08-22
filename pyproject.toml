@@ -94,6 +94,9 @@ vision = [
     "torch>=2.8.0",
     "torchvision>=0.23.0",
 ]
+postgres = [
+    "psycopg[binary]>=3.1",
+]
 # Harmony prompt rendering for GPT-OSS models (see #568). With this installed
 # and ``--tool-call-parser harmony``/``gpt-oss`` set, the engine routes prompt
 # building through OpenAI's canonical renderer instead of the Jinja chat

@@ -200,6 +200,10 @@ vllm-mlx bench-serve --url http://localhost:8000 --workload workload.json --repe
 
 # Append workload rows into SQLite for longitudinal comparisons
 vllm-mlx bench-serve --url http://localhost:8000 --workload workload.json --repetitions 5 --format sqlite --output bench.db
+
+# Append workload rows into PostgreSQL (requires: pip install "vllm-mlx[postgres]")
+export BENCH_SERVE_PG_URL='postgresql://user:password@localhost/benchmarks'
+vllm-mlx bench-serve --url http://localhost:8000 --workload workload.json --repetitions 5 --format postgres
 ```
 
 ### Model acquisition and conversion

@@ -229,8 +229,9 @@ vllm-mlx bench-serve --url http://localhost:8000 [options]
 | `--include-content` | Include full generated content in workload JSON | False |
 | `--request-timeout-s` | Workload HTTP transport timeout, `0` disables | `300` |
 | `--cache-policy` | Workload cache handling: `preserve`, `before-run`, `before-case` | Workload default or `preserve` |
-| `--output` | Output file | stdout |
-| `--format` | Output format: `auto`, `table`, `json`, `csv`, `sql`, `sqlite` | `auto` = `table` for prompt sweeps, `json` for workloads |
+| `--output` | Output file, or PostgreSQL connection URL with `--format postgres` | stdout or `BENCH_SERVE_PG_URL` |
+| `--format` | Output format: `auto`, `table`, `json`, `csv`, `sql`, `sqlite`, `postgres` | `auto` = `table` for prompt sweeps, `json` for workloads |
+| `--pg-table` | Custom PostgreSQL table using lowercase letters, digits, and underscores | Mode-specific default |
 
 In workload mode, `--request-timeout-s` is the HTTP transport ceiling for each
 request. Product policy timeouts should live in the workload as
@@ -238,6 +239,12 @@ request. Product policy timeouts should live in the workload as
 Python regex patterns, so literal strings are valid. Workload JSON may spell
 cache policy values with underscores, such as `before_case`; they normalize to
 the hyphenated CLI values.
+
+PostgreSQL output requires `pip install "vllm-mlx[postgres]"`. A connection URL
+passed through `--output` takes precedence over `BENCH_SERVE_PG_URL`. The
+default tables are `bench_serve_results` for prompt sweeps and
+`bench_serve_workload_results` for workloads. Each row includes the regular
+searchable columns plus its full source record in `raw_result` JSONB.
 
 ### Examples
 
@@ -253,6 +260,11 @@ vllm-mlx bench-serve --url http://localhost:8000 \
 # Append contract rows directly into SQLite for longitudinal comparisons
 vllm-mlx bench-serve --url http://localhost:8000 \
   --workload workload.json --repetitions 5 --format sqlite --output bench.db
+
+# Append contract rows without passing the connection URL to bench-serve
+export BENCH_SERVE_PG_URL='postgresql://user:password@localhost/benchmarks'
+vllm-mlx bench-serve --url http://localhost:8000 \
+  --workload workload.json --repetitions 5 --format postgres
 ```
 
 ## `vllm-mlx-bench`

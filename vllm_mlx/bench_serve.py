@@ -23,6 +23,7 @@ import itertools
 import json
 import logging
 import math
+import os
 import platform
 import re
 import sqlite3
@@ -45,6 +46,8 @@ from tabulate import tabulate as _tabulate
 _BUILTIN_DIR = Path(__file__).parent / "bench_serve_prompts"
 _BUILTIN_NAMES = {"short", "medium", "long", "thinking"}
 _SQL_IDENTIFIER_RE = re.compile(r"^[a-z_][a-z0-9_]*$")
+_POSTGRES_PROMPT_TABLE = "bench_serve_results"
+_POSTGRES_WORKLOAD_TABLE = "bench_serve_workload_results"
 
 
 @dataclass
@@ -1701,6 +1704,7 @@ async def run_bench_serve_workload(
     request_timeout_s: Optional[float] = 300.0,
     repetitions: int = 1,
     cache_policy: Optional[str] = None,
+    pg_table: Optional[str] = None,
 ) -> dict:
     """Run a declarative workload against a running server.
 
@@ -1710,6 +1714,13 @@ async def run_bench_serve_workload(
     """
     if repetitions < 1:
         raise ValueError("repetitions must be at least 1")
+
+    postgres_target = None
+    if output_format == "postgres":
+        table = pg_table or _POSTGRES_WORKLOAD_TABLE
+        connection_url = _resolve_postgres_url(output_path)
+        write_workload_postgres({"results": []}, connection_url, table)
+        postgres_target = (connection_url, table)
 
     workload = load_workload(workload_path)
     resolved_cache_policy = _normalize_cache_policy(
@@ -1807,6 +1818,12 @@ async def run_bench_serve_workload(
             raise ValueError("--output is required when --format sqlite")
         write_workload_sqlite(payload, output_path)
         print(f"Workload SQLite results written to {output_path}")
+        return payload
+    if output_format == "postgres":
+        assert postgres_target is not None
+        connection_url, table = postgres_target
+        write_workload_postgres(payload, connection_url, table)
+        print(f"Workload PostgreSQL results written to table {table}")
         return payload
 
     rendered = format_workload_payload(payload, output_format)
@@ -1993,7 +2010,83 @@ def _write_sqlite_rows(
 def _validate_sql_identifier(identifier: str, *, kind: str) -> None:
     """Reject unsafe SQL identifiers before string interpolation."""
     if not _SQL_IDENTIFIER_RE.fullmatch(identifier):
-        raise ValueError(f"invalid SQLite {kind} identifier: {identifier!r}")
+        raise ValueError(f"invalid SQL {kind} identifier: {identifier!r}")
+
+
+def _resolve_postgres_url(output_path: Optional[str]) -> str:
+    """Resolve a PostgreSQL connection URL without logging its contents."""
+    connection_url = output_path or os.environ.get("BENCH_SERVE_PG_URL")
+    if not connection_url:
+        raise ValueError(
+            "--output or BENCH_SERVE_PG_URL is required when --format postgres"
+        )
+    return connection_url
+
+
+def _load_psycopg():
+    """Load the optional PostgreSQL driver only when requested."""
+    try:
+        import psycopg
+        from psycopg.types.json import Jsonb
+    except ImportError as exc:
+        raise RuntimeError(
+            'PostgreSQL output requires psycopg; install "vllm-mlx[postgres]"'
+        ) from exc
+    return psycopg, Jsonb
+
+
+def _postgres_safe(value):
+    """Normalize non-finite values before binding SQL and JSONB parameters."""
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    if isinstance(value, dict):
+        return {key: _postgres_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_postgres_safe(item) for item in value]
+    return value
+
+
+def _write_postgres_rows(
+    connection_url: str,
+    *,
+    table: str,
+    schema: str,
+    columns: list[str],
+    rows: list[dict],
+    raw_rows: list[dict],
+) -> None:
+    """Append benchmark rows to PostgreSQL using parameterized values."""
+    _validate_sql_identifier(table, kind="table")
+    for column in [*columns, "raw_result"]:
+        _validate_sql_identifier(column, kind="column")
+    if len(rows) != len(raw_rows):
+        raise ValueError("PostgreSQL normalized and raw row counts must match")
+
+    psycopg, Jsonb = _load_psycopg()
+    quoted_table = f'"{table}"'
+    insert_columns = [*columns, "raw_result"]
+    placeholders = ", ".join("%s" for _ in insert_columns)
+    column_list = ", ".join(insert_columns)
+    values = [
+        [*(_postgres_safe(row.get(col)) for col in columns), Jsonb(_postgres_safe(raw))]
+        for row, raw in zip(rows, raw_rows)
+    ]
+    table_schema = (
+        "id BIGSERIAL PRIMARY KEY, "
+        "created_at TIMESTAMPTZ NOT NULL DEFAULT now(), "
+        f"{schema}, raw_result JSONB NOT NULL"
+    )
+
+    with psycopg.connect(connection_url) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                f"CREATE TABLE IF NOT EXISTS {quoted_table} ({table_schema})"
+            )
+            if values:
+                cursor.executemany(
+                    f"INSERT INTO {quoted_table} ({column_list}) VALUES ({placeholders})",
+                    values,
+                )
 
 
 def write_sqlite(results: list[BenchServeResult], output_path: str) -> None:
@@ -2004,6 +2097,22 @@ def write_sqlite(results: list[BenchServeResult], output_path: str) -> None:
         schema=_SQL_SCHEMA,
         columns=RESULT_COLUMNS,
         rows=rows,
+    )
+
+
+def write_postgres(
+    results: list[BenchServeResult],
+    connection_url: str,
+    table: str = _POSTGRES_PROMPT_TABLE,
+) -> None:
+    rows = [_result_to_dict(result) for result in results]
+    _write_postgres_rows(
+        connection_url,
+        table=table,
+        schema=_SQL_SCHEMA,
+        columns=RESULT_COLUMNS,
+        rows=rows,
+        raw_rows=rows,
     )
 
 
@@ -2181,6 +2290,23 @@ def write_workload_sqlite(payload: dict, output_path: str) -> None:
     )
 
 
+def write_workload_postgres(
+    payload: dict,
+    connection_url: str,
+    table: str = _POSTGRES_WORKLOAD_TABLE,
+) -> None:
+    raw_rows = payload.get("results") or []
+    rows = [_workload_record_to_row(record) for record in raw_rows]
+    _write_postgres_rows(
+        connection_url,
+        table=table,
+        schema=_WORKLOAD_SQL_SCHEMA,
+        columns=WORKLOAD_RESULT_COLUMNS,
+        rows=rows,
+        raw_rows=raw_rows,
+    )
+
+
 def format_workload_payload(payload: dict, fmt: str = "json") -> str:
     if fmt == "json":
         return format_workload_json(payload)
@@ -2219,6 +2345,7 @@ async def run_bench_serve(
     override_fields: Optional[dict] = None,
     system_prompt_file: Optional[str] = None,
     skip_preflight_token_count: bool = False,
+    pg_table: Optional[str] = None,
 ) -> list[BenchServeResult]:
     """Run the full bench-serve sweep against a running vllm-mlx server.
 
@@ -2239,7 +2366,7 @@ async def run_bench_serve(
         output_path: File path to write results to. If ``None``, prints to
             stdout.
         fmt: Output format — one of ``"table"``, ``"json"``, ``"csv"``,
-            ``"sql"``, or ``"sqlite"``.
+            ``"sql"``, ``"sqlite"``, or ``"postgres"``.
         do_validate: Whether to validate each response.
         scrape: Whether to scrape ``/metrics`` before and after each run.
         tag: Optional tag string stored in every result row.
@@ -2248,6 +2375,13 @@ async def run_bench_serve(
     Returns:
         List of :class:`BenchServeResult` instances.
     """
+    postgres_target = None
+    if fmt == "postgres":
+        table = pg_table or _POSTGRES_PROMPT_TABLE
+        connection_url = _resolve_postgres_url(output_path)
+        write_postgres([], connection_url, table)
+        postgres_target = (connection_url, table)
+
     # 1. Set defaults
     if prompt_sets is None:
         prompt_sets = ["short", "medium", "long"]
@@ -2598,6 +2732,12 @@ async def run_bench_serve(
                 raise ValueError("--output is required when --format sqlite")
             write_sqlite(results, output_path)
             print(f"\nSQLite results written to {output_path}")
+            return results
+        if fmt == "postgres":
+            assert postgres_target is not None
+            connection_url, table = postgres_target
+            write_postgres(results, connection_url, table)
+            print(f"\nPostgreSQL results written to table {table}")
             return results
 
         formatters = {
