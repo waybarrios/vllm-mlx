@@ -9,6 +9,22 @@ import pytest
 import numpy as np
 
 
+def _install_fake_stt_loader(monkeypatch, model=None, load_model=None):
+    """Install a minimal mlx-audio module tree around a fake STT model."""
+    import sys
+    from types import ModuleType
+
+    utils_module = ModuleType("mlx_audio.stt.utils")
+    utils_module.load_model = load_model or (lambda _model_name: model)
+    stt_module = ModuleType("mlx_audio.stt")
+    stt_module.utils = utils_module
+    mlx_audio_module = ModuleType("mlx_audio")
+    mlx_audio_module.stt = stt_module
+    monkeypatch.setitem(sys.modules, "mlx_audio", mlx_audio_module)
+    monkeypatch.setitem(sys.modules, "mlx_audio.stt", stt_module)
+    monkeypatch.setitem(sys.modules, "mlx_audio.stt.utils", utils_module)
+
+
 class TestSTTEngine:
     """Tests for Speech-to-Text engine."""
 
@@ -47,6 +63,147 @@ class TestSTTEngine:
         assert result.text == "Hello world"
         assert result.language == "en"
         assert result.duration == 2.5
+
+    @pytest.mark.parametrize(
+        ("model_name", "processor_repo"),
+        [
+            ("mlx-community/whisper-tiny-mlx", "openai/whisper-tiny"),
+            ("mlx-community/whisper-small-mlx", "openai/whisper-small"),
+            ("mlx-community/whisper-medium-mlx", "openai/whisper-medium"),
+            ("mlx-community/whisper-large-v3-mlx", "openai/whisper-large-v3"),
+            (
+                "mlx-community/whisper-large-v3-turbo",
+                "openai/whisper-large-v3-turbo",
+            ),
+        ],
+    )
+    def test_load_recovers_missing_whisper_processor(
+        self, monkeypatch, model_name, processor_repo
+    ):
+        """Documented MLX checkpoints should use their canonical processor."""
+        from types import SimpleNamespace
+
+        from vllm_mlx.audio.stt import STTEngine
+
+        model = SimpleNamespace(_processor=None)
+        _install_fake_stt_loader(monkeypatch, model)
+
+        processor = object()
+        calls = []
+
+        def fake_from_pretrained(requested_repo):
+            calls.append(requested_repo)
+            return processor
+
+        monkeypatch.setattr(
+            "transformers.WhisperProcessor.from_pretrained",
+            fake_from_pretrained,
+        )
+
+        engine = STTEngine(model_name)
+        engine.load()
+
+        assert model._processor is processor
+        assert calls == [processor_repo]
+        assert engine._loaded is True
+
+    def test_load_preserves_existing_whisper_processor(self, monkeypatch):
+        """A processor bundled with the MLX checkpoint remains authoritative."""
+        from types import SimpleNamespace
+
+        from vllm_mlx.audio.stt import STTEngine
+
+        processor = object()
+        model = SimpleNamespace(_processor=processor)
+        _install_fake_stt_loader(monkeypatch, model)
+
+        def unexpected_processor_load(_model_name):
+            raise AssertionError("processor should not be replaced")
+
+        monkeypatch.setattr(
+            "transformers.WhisperProcessor.from_pretrained",
+            unexpected_processor_load,
+        )
+
+        engine = STTEngine("mlx-community/whisper-small-mlx")
+        engine.load()
+
+        assert model._processor is processor
+
+    def test_processor_load_failure_does_not_retain_model(self, monkeypatch):
+        """A failed processor download should leave the engine retry-safe."""
+        from types import SimpleNamespace
+
+        from vllm_mlx.audio.stt import STTEngine
+
+        model = SimpleNamespace(_processor=None)
+        load_observations = []
+        engine = STTEngine("mlx-community/whisper-small-mlx")
+
+        def fake_load_model(_model_name):
+            load_observations.append(engine.model)
+            return model
+
+        _install_fake_stt_loader(monkeypatch, load_model=fake_load_model)
+
+        def fail_processor_load(_model_name):
+            raise OSError("offline")
+
+        monkeypatch.setattr(
+            "transformers.WhisperProcessor.from_pretrained",
+            fail_processor_load,
+        )
+
+        with pytest.raises(OSError, match="offline"):
+            engine.load()
+        with pytest.raises(OSError, match="offline"):
+            engine.load()
+
+        assert load_observations == [None, None]
+        assert engine.model is None
+        assert engine._loaded is False
+
+    def test_load_does_not_attach_processor_to_parakeet(self, monkeypatch):
+        """Parakeet keeps its native mlx-audio loading path."""
+        from types import SimpleNamespace
+
+        from vllm_mlx.audio.stt import STTEngine
+
+        model = SimpleNamespace(_processor=None)
+        _install_fake_stt_loader(monkeypatch, model)
+
+        def unexpected_processor_load(_model_name):
+            raise AssertionError("Whisper processor should not load for Parakeet")
+
+        monkeypatch.setattr(
+            "transformers.WhisperProcessor.from_pretrained",
+            unexpected_processor_load,
+        )
+
+        engine = STTEngine("mlx-community/parakeet-tdt-0.6b-v2")
+        engine.load()
+
+        assert model._processor is None
+
+    def test_transcription_duration_supports_dictionary_segments(self):
+        """mlx-audio Whisper returns segment dictionaries."""
+        from types import SimpleNamespace
+
+        from vllm_mlx.audio.stt import STTEngine
+
+        engine = STTEngine("mlx-community/whisper-small-mlx")
+        engine._loaded = True
+        engine.model = SimpleNamespace(
+            generate=lambda *_args, **_kwargs: SimpleNamespace(
+                text="hello",
+                language="en",
+                segments=[{"start": 0.0, "end": 1.25, "text": "hello"}],
+            )
+        )
+
+        result = engine.transcribe("speech.wav")
+
+        assert result.duration == 1.25
 
 
 class TestTTSEngine:
