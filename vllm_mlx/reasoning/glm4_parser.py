@@ -3,15 +3,11 @@
 Reasoning parser for GLM-4 models (GLM-4.5-Air, GLM-4.6V, GLM-4.7, etc.).
 
 GLM-4 uses <think>...</think> tags for reasoning content, same as Qwen3.
-However, unlike Qwen3, GLM-4 does NOT inject <think> in the prompt —
-the model decides autonomously whether to reason.
-
-This means:
-- Output without tags = normal response (no reasoning)
-- Output with tags = reasoning + content
-
-This is the opposite of Qwen3 where no tags = pure reasoning (because
-<think> was injected in the prompt and the model hit max_tokens).
+GLM-4.7's chat template injects <think> in the prompt when thinking is
+enabled (and a pre-closed </think> when disabled), so model output with
+thinking on carries only the closing tag — implicit reasoning mode, like
+Qwen3. Thinking-disabled requests bypass reasoning parsing server-side
+(``_thinking_disabled``), so no-tag output is not misclassified.
 
 GLM-4.6V also wraps responses in <|begin_of_box|>...<|end_of_box|> container
 tags which must be stripped before returning content.
@@ -70,38 +66,24 @@ class Glm4ReasoningParser(BaseThinkingReasoningParser):
         """
         Extract reasoning from streaming delta.
 
-        Overrides base class pre_think behavior: when no tags have been seen,
-        emit delta as content (not reasoning). GLM-4 doesn't inject <think>
-        in the prompt, so early tokens without tags are normal content.
+        GLM-4.7's chat template injects ``<think>`` at the end of the
+        generation prompt when thinking is enabled (and a pre-closed
+        ``</think>`` when disabled), so with thinking on the model output
+        contains only the CLOSING tag — the base class's implicit-reasoning
+        mode (default to reasoning until ``</think>``) is exactly right.
+        Thinking-disabled requests never reach this parser: the server
+        bypasses reasoning parsing via ``_thinking_disabled``, so plain
+        content is not at risk of being swallowed into reasoning.
 
-        Once <think> is seen, delegates to base class state machine.
+        (An earlier version assumed GLM-4 never injects ``<think>`` and
+        emitted pre-tag deltas as content; on GLM-4.7 that streamed the
+        entire thinking block into ``content``.)
         """
         # Strip GLM-4.6V box container tags (special tokens, always whole)
         delta_text = delta_text.replace(_BOX_START, "").replace(_BOX_END, "")
         if not delta_text:
             return None
 
-        start_tok = self.start_token
-        end_tok = self.end_token
-
-        # In pre_think phase: check if we should treat as content
-        if self._phase == "pre_think":
-            # If start tag appeared, transition to thinking via base class
-            if start_tok in current_text:
-                return super().extract_reasoning_streaming(
-                    previous_text, current_text, delta_text
-                )
-
-            # If end tag appeared without start (implicit mode from agent)
-            if end_tok in current_text:
-                return super().extract_reasoning_streaming(
-                    previous_text, current_text, delta_text
-                )
-
-            # No tags yet — GLM-4 doesn't inject <think>, so this is content
-            return DeltaMessage(content=delta_text)
-
-        # In thinking or content phase, delegate to base class
         return super().extract_reasoning_streaming(
             previous_text, current_text, delta_text
         )

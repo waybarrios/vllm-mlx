@@ -1291,13 +1291,34 @@ class TestGlm4Parser:
 
     # Streaming tests
 
-    def test_streaming_no_tags_emits_content(self, parser):
-        """GLM-4 streaming without tags should emit content (not reasoning)."""
+    def test_streaming_no_tags_emits_reasoning(self, parser):
+        """GLM-4.7 injects <think> in the prompt, so tag-less streaming
+        output is implicit reasoning (thinking-disabled requests bypass
+        the parser server-side and are not affected)."""
         parser.reset_state()
         result = parser.extract_reasoning_streaming("", "Hello", "Hello")
         assert result is not None
-        assert result.content == "Hello"
-        assert result.reasoning is None
+        assert result.reasoning == "Hello"
+        assert result.content is None
+
+    def test_streaming_implicit_close_splits_reasoning_and_content(self, parser):
+        """Only </think> in output (GLM-4.7 shape): reasoning before the
+        tag, content after — nothing leaks across."""
+        parser.reset_state()
+        tokens = ["thinking a", "bout it", "</think>", "the answer"]
+        accumulated = ""
+        reasoning_parts, content_parts = [], []
+        for token in tokens:
+            prev = accumulated
+            accumulated += token
+            result = parser.extract_reasoning_streaming(prev, accumulated, token)
+            if result:
+                if result.reasoning:
+                    reasoning_parts.append(result.reasoning)
+                if result.content:
+                    content_parts.append(result.content)
+        assert "".join(reasoning_parts) == "thinking about it"
+        assert "".join(content_parts) == "the answer"
 
     def test_streaming_with_thinking(self, parser):
         """Test streaming with think tags."""
@@ -1327,16 +1348,16 @@ class TestGlm4Parser:
 
         tokens = ["<|begin_of_box|>", "Paris", "<|end_of_box|>"]
         accumulated = ""
-        content_parts = []
+        parts = []
 
         for token in tokens:
             prev = accumulated
             accumulated += token
             result = parser.extract_reasoning_streaming(prev, accumulated, token)
-            if result and result.content:
-                content_parts.append(result.content)
+            if result:
+                parts.append((result.reasoning or "") + (result.content or ""))
 
-        full = "".join(content_parts)
+        full = "".join(parts)
         assert "Paris" in full
         assert "<|begin_of_box|>" not in full
         assert "<|end_of_box|>" not in full
