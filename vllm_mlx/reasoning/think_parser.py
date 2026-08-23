@@ -151,7 +151,13 @@ class BaseThinkingReasoningParser(ReasoningParser):
             if start_tok in current_text:
                 self._phase = "thinking"
                 idx = delta_text.find(start_tok)
-                after = delta_text[idx + len(start_tok) :] if idx >= 0 else delta_text
+                if idx >= 0:
+                    after = delta_text[idx + len(start_tok) :]
+                else:
+                    # Tag straddles the previous|delta boundary: drop the
+                    # tag remnant at the head of this delta.
+                    tag_end = current_text.find(start_tok) + len(start_tok)
+                    after = delta_text[max(0, tag_end - len(previous_text)) :]
 
                 if end_tok in after:
                     self._phase = "content"
@@ -178,8 +184,11 @@ class BaseThinkingReasoningParser(ReasoningParser):
                     reasoning = delta_text[:idx]
                     content = delta_text[idx + len(end_tok) :]
                 else:
+                    # Tag straddles the previous|delta boundary: drop the
+                    # tag remnant at the head of this delta.
+                    tag_end = current_text.find(end_tok) + len(end_tok)
                     reasoning = None
-                    content = delta_text
+                    content = delta_text[max(0, tag_end - len(previous_text)) :]
                 return self._transition_to_content(reasoning, content)
 
             # No tags — default to reasoning (implicit mode assumption).
@@ -214,8 +223,11 @@ class BaseThinkingReasoningParser(ReasoningParser):
                     reasoning = delta_text[:idx]
                     content = delta_text[idx + len(end_tok) :]
                 else:
-                    reasoning = delta_text
-                    content = None
+                    # Tag straddles the previous|delta boundary: drop the
+                    # tag remnant at the head of this delta.
+                    tag_end = current_text.find(end_tok) + len(end_tok)
+                    reasoning = None
+                    content = delta_text[max(0, tag_end - len(previous_text)) :]
                 return self._transition_to_content(reasoning, content)
             return DeltaMessage(reasoning=delta_text)
 
