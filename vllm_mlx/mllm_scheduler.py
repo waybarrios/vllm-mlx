@@ -348,7 +348,7 @@ class MLLMScheduler:
                 prefill_step_size=self.config.prefill_step_size,
                 prefix_cache_config=prefix_cache_config,
                 max_kv_size=self.config.max_kv_size,
-                specprefill_draft_model=self.specprefill_draft_model,
+                specprefill_draft_model=getattr(self, "specprefill_draft_model", None),
                 specprefill_enabled=self.config.specprefill_enabled,
                 specprefill_threshold=self.config.specprefill_threshold,
                 specprefill_keep_pct=self.config.specprefill_keep_pct,
