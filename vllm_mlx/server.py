@@ -591,7 +591,12 @@ def _generation_metadata(
     mtp_drafts = getattr(output, "mtp_drafts", 0) or 0
     mtp_accepted = getattr(output, "mtp_accepted", 0) or 0
     has_mtp_activity = bool(mtp_drafts or mtp_accepted)
-    if thinking_processor is None and not has_mtp_activity:
+    specprefill_outcome = getattr(output, "specprefill_outcome", None)
+    if (
+        thinking_processor is None
+        and not has_mtp_activity
+        and specprefill_outcome is None
+    ):
         return None
     return GenerationMetadata(
         no_final_content_watchdog_tokens=getattr(
@@ -602,6 +607,25 @@ def _generation_metadata(
         ),
         mtp_drafts=mtp_drafts if has_mtp_activity else None,
         mtp_accepted=mtp_accepted if has_mtp_activity else None,
+        specprefill_requested=getattr(specprefill_outcome, "requested", None),
+        specprefill_engaged=(
+            getattr(specprefill_outcome, "engaged", None)
+            if specprefill_outcome is not None
+            else None
+        ),
+        specprefill_reason=getattr(specprefill_outcome, "reason", None),
+        specprefill_route=getattr(specprefill_outcome, "route", None),
+        specprefill_model_module=getattr(specprefill_outcome, "model_module", None),
+        specprefill_language_module=getattr(
+            specprefill_outcome, "language_module", None
+        ),
+        specprefill_model_type=getattr(specprefill_outcome, "model_type", None),
+        specprefill_original_tokens=getattr(
+            specprefill_outcome, "original_tokens", None
+        ),
+        specprefill_selected_tokens=getattr(
+            specprefill_outcome, "selected_tokens", None
+        ),
     )
 
 
@@ -1357,6 +1381,11 @@ def _build_engine(spec: ModelSpec) -> BaseEngine:
             scheduler_config=spec.scheduler_config,
             stream_interval=spec.stream_interval,
             force_mllm=spec.force_mllm,
+            specprefill_enabled=spec.specprefill_enabled,
+            specprefill_threshold=spec.specprefill_threshold,
+            specprefill_keep_pct=spec.specprefill_keep_pct,
+            specprefill_backbone_pct=spec.specprefill_backbone_pct,
+            specprefill_draft_model=spec.specprefill_draft_model,
         )
 
     from .engine.simple import SimpleEngine
@@ -3401,7 +3430,7 @@ def load_model(
         trust_remote_code: Allow HuggingFace remote code execution during model/tokenizer loading
         mtp: Enable native MTP speculative decoding (SimpleEngine only)
         prefill_step_size: Chunk size for prompt prefill processing (default: 2048)
-        specprefill_enabled: Enable SpecPrefill (SimpleEngine only)
+        specprefill_enabled: Enable SpecPrefill
         specprefill_threshold: Minimum suffix tokens to trigger SpecPrefill (default: 8192)
         specprefill_keep_pct: Fraction of tokens to keep (default: 0.3)
         specprefill_backbone_pct: Fraction of chunks reserved for evenly spaced coverage
@@ -3547,6 +3576,11 @@ def load_model(
             mllm_draft_kind=mllm_draft_kind,
             mllm_draft_block_size=mllm_draft_block_size,
             default_mllm_draft=default_mllm_draft,
+            specprefill_enabled=specprefill_enabled,
+            specprefill_threshold=specprefill_threshold,
+            specprefill_keep_pct=specprefill_keep_pct,
+            specprefill_backbone_pct=specprefill_backbone_pct,
+            specprefill_draft_model=specprefill_draft_model,
         )
         # BatchedEngine will be started in lifespan (uvicorn's event loop)
         # Just log for now
@@ -6880,6 +6914,10 @@ async def stream_chat_completion(
             f"Chat completion (stream): {completion_tokens} tokens in {elapsed:.2f}s ({tokens_per_sec:.1f} tok/s)"
         )
 
+        terminal_metadata = (
+            _generation_metadata(None, last_output) if last_output is not None else None
+        )
+
         # Send final chunk with usage if requested
         if include_usage:
             usage_chunk = ChatCompletionChunk(
@@ -6891,8 +6929,17 @@ async def stream_chat_completion(
                     completion_tokens=completion_tokens,
                     total_tokens=prompt_tokens + completion_tokens,
                 ),
+                generation_metadata=terminal_metadata,
             )
             yield f"data: {usage_chunk.model_dump_json()}\n\n"
+        elif terminal_metadata is not None:
+            metadata_chunk = ChatCompletionChunk(
+                id=response_id,
+                model=_response_model_name(request.model),
+                choices=[],
+                generation_metadata=terminal_metadata,
+            )
+            yield f"data: {metadata_chunk.model_dump_json()}\n\n"
 
         yield "data: [DONE]\n\n"
     except HTTPException as exc:
