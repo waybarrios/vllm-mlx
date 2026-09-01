@@ -4568,6 +4568,8 @@ async def _build_chat_streaming_response(
     chat_kwargs,
     total_timeout,
     deadline,
+    *,
+    thinking_processor=None,
 ) -> tuple[StreamingResponse | Response, bool]:
     """Build a chat stream and report whether caller cleanup remains required."""
     stream_generator = stream_chat_completion(
@@ -4575,6 +4577,7 @@ async def _build_chat_streaming_response(
         messages,
         request,
         metrics_tracker=metrics_tracker,
+        thinking_processor=thinking_processor,
         **chat_kwargs,
     )
     if _response_format_type(request.response_format) in (
@@ -5344,6 +5347,7 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
                 prepared.chat_kwargs,
                 total_timeout,
                 deadline,
+                thinking_processor=prepared.thinking_processor,
             )
             return response
 
@@ -6445,6 +6449,8 @@ async def stream_chat_completion(
     messages: list,
     request: ChatCompletionRequest,
     metrics_tracker=None,
+    *,
+    thinking_processor: object | None = None,
     **kwargs,
 ) -> AsyncIterator[str]:
     """Stream chat completion response."""
@@ -6456,6 +6462,16 @@ async def stream_chat_completion(
     # compute once instead of model_dump()-ing the whole request on every
     # tool-call delta during streaming.
     tool_request_context, tools_dict, include_usage = _stream_request_metadata(request)
+
+    def attach_terminal_metadata(
+        chunk: ChatCompletionChunk, output: object | None
+    ) -> None:
+        if (
+            not include_usage
+            and chunk.choices
+            and chunk.choices[0].finish_reason is not None
+        ):
+            chunk.generation_metadata = _generation_metadata(thinking_processor, output)
 
     # First chunk with role
     first_chunk = ChatCompletionChunk(
@@ -6641,6 +6657,7 @@ async def stream_chat_completion(
                                 ],
                                 usage=get_usage(output) if output.finished else None,
                             )
+                            attach_terminal_metadata(chunk, output)
                             yield f"data: {chunk.model_dump_json()}\n\n"
                             finish_reason_emitted = finish_reason_emitted or bool(
                                 chunk.choices[0].finish_reason
@@ -6691,6 +6708,7 @@ async def stream_chat_completion(
                         else None
                     ),
                 )
+                attach_terminal_metadata(chunk, output)
                 yield f"data: {chunk.model_dump_json()}\n\n"
                 finish_reason_emitted = finish_reason_emitted or bool(
                     chunk.choices[0].finish_reason
@@ -6775,6 +6793,7 @@ async def stream_chat_completion(
                                 ],
                                 usage=get_usage(output) if output.finished else None,
                             )
+                            attach_terminal_metadata(chunk, output)
                             yield f"data: {chunk.model_dump_json()}\n\n"
                             finish_reason_emitted = finish_reason_emitted or bool(
                                 chunk.choices[0].finish_reason
@@ -6824,6 +6843,7 @@ async def stream_chat_completion(
                         else None
                     ),
                 )
+                attach_terminal_metadata(chunk, output)
                 yield f"data: {chunk.model_dump_json()}\n\n"
                 finish_reason_emitted = finish_reason_emitted or bool(
                     chunk.choices[0].finish_reason
@@ -6870,6 +6890,7 @@ async def stream_chat_completion(
                         )
                     ],
                 )
+                attach_terminal_metadata(tool_chunk, last_output)
                 yield f"data: {tool_chunk.model_dump_json()}\n\n"
                 finish_reason_emitted = True
 
@@ -6898,6 +6919,7 @@ async def stream_chat_completion(
                 ],
                 usage=get_usage(last_output),
             )
+            attach_terminal_metadata(terminal_chunk, last_output)
             yield f"data: {terminal_chunk.model_dump_json()}\n\n"
 
         # Structured streams are buffered by the endpoint until this independent
@@ -6914,12 +6936,13 @@ async def stream_chat_completion(
             f"Chat completion (stream): {completion_tokens} tokens in {elapsed:.2f}s ({tokens_per_sec:.1f} tok/s)"
         )
 
-        terminal_metadata = (
-            _generation_metadata(None, last_output) if last_output is not None else None
-        )
-
         # Send final chunk with usage if requested
         if include_usage:
+            terminal_metadata = (
+                _generation_metadata(thinking_processor, last_output)
+                if last_output is not None
+                else None
+            )
             usage_chunk = ChatCompletionChunk(
                 id=response_id,
                 model=_response_model_name(request.model),
@@ -6932,14 +6955,6 @@ async def stream_chat_completion(
                 generation_metadata=terminal_metadata,
             )
             yield f"data: {usage_chunk.model_dump_json()}\n\n"
-        elif terminal_metadata is not None:
-            metadata_chunk = ChatCompletionChunk(
-                id=response_id,
-                model=_response_model_name(request.model),
-                choices=[],
-                generation_metadata=terminal_metadata,
-            )
-            yield f"data: {metadata_chunk.model_dump_json()}\n\n"
 
         yield "data: [DONE]\n\n"
     except HTTPException as exc:
