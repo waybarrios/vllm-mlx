@@ -43,3 +43,56 @@ def test_installed_mlx_lm_batch_generator_lacks_step_hook():
     # fails, mlx-lm regained a _step hook and the MTP patch (and this
     # guard) should be revisited.
     assert not hasattr(BatchGenerator, "_step")
+
+
+def test_scheduler_enable_mtp_survives_modern_batch_generator(caplog):
+    """Integration: the real construction path with enable_mtp=True.
+
+    Builds a real Scheduler and calls _create_batch_generator, so the guard is
+    exercised through the actual call path with the installed mlx-lm
+    BatchGenerator (which lacks the _step hook).  Construction and request
+    scheduling must continue, MTP must be absent from the generator, and the
+    operator-visible warning must be emitted.
+    """
+    from types import SimpleNamespace
+
+    from vllm_mlx.scheduler import (
+        Request,
+        SamplingParams,
+        Scheduler,
+        SchedulerConfig,
+    )
+
+    model = SimpleNamespace(mtp=object())  # has an MTP head: only the guard disables
+    tokenizer = SimpleNamespace(
+        encode=lambda text: list(range(len(text.split()))),
+        decode=lambda ids: " ".join(str(i) for i in ids),
+        eos_token_id=0,
+        eos_token_ids={0},
+    )
+    scheduler = Scheduler(
+        model=model,
+        tokenizer=tokenizer,
+        config=SchedulerConfig(enable_prefix_cache=False, enable_mtp=True),
+    )
+
+    with caplog.at_level(logging.WARNING, logger="vllm_mlx.scheduler"):
+        bg = scheduler._create_batch_generator(SamplingParams())
+
+    # Construction survived on the real, modern BatchGenerator.
+    assert bg is not None
+    assert not hasattr(bg, "_step")
+    # MTP is absent: the install no-oped, so no MTP surface was attached.
+    assert not hasattr(bg, "get_mtp_stats")
+    assert any("[MTP] disabled" in rec.message for rec in caplog.records)
+
+    # Request scheduling continues.
+    scheduler.add_request(
+        Request(
+            request_id="mtp-guard-1",
+            prompt="hello there",
+            sampling_params=SamplingParams(max_tokens=4),
+        )
+    )
+    assert scheduler.has_requests()
+    assert scheduler.get_num_waiting() == 1
