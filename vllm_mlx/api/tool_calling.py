@@ -789,7 +789,7 @@ class StreamingJsonFenceStripper:
 
 def parse_json_output(
     text: str, response_format: Optional[Union[ResponseFormat, Dict[str, Any]]] = None
-) -> Tuple[str, Optional[Dict[str, Any]], bool, Optional[str]]:
+) -> Tuple[str, Optional[Any], bool, Optional[str]]:
     """
     Parse JSON from model output when response_format is set.
 
@@ -835,8 +835,10 @@ def parse_json_output(
     if parsed is None:
         return text, None, False, "Failed to extract valid JSON from output"
 
-    # json_object - just verify it's valid JSON (already done by extraction)
+    # json_object requires an object root, not merely any valid JSON value.
     if format_type == "json_object":
+        if not isinstance(parsed, dict):
+            return text, parsed, False, "JSON object root must be an object"
         return text, parsed, True, None
 
     # json_schema - validate against schema
@@ -1009,27 +1011,22 @@ def build_json_logits_processor(
     try:
         from ..constrained import (
             JSONSchemaLogitsProcessor,
-            LMFormatEnforcerNotAvailableError,
+            LLGuidanceJSONSchemaLogitsProcessor,
             is_available,
+            is_strict_json_schema_available,
         )
     except ImportError:
-        # Constrained decoding module could not be imported; fall back.
-        return None
-
-    if not is_available():
-        # ``lm-format-enforcer`` optional dependency missing; fall back.
-        return None
+        raise RuntimeError("constrained decoding module could not be imported")
 
     # ``json_schema`` without an actual schema degrades to ``json_object``
     # (both paths pass ``schema=None`` to the processor).
     if format_type == "json_object" or (format_type == "json_schema" and not schema):
         schema = None
 
-    try:
-        return JSONSchemaLogitsProcessor(schema=schema, tokenizer=tokenizer)
-    except LMFormatEnforcerNotAvailableError:
-        return None
-    except Exception:
-        # Malformed schema or tokenizer issue — fall back to prompt-only
-        # mode.  Callers still run post-hoc validation as a safety net.
-        return None
+    if schema is not None:
+        if not is_strict_json_schema_available():
+            raise RuntimeError("llguidance is required for strict json_schema")
+        return LLGuidanceJSONSchemaLogitsProcessor(schema=schema, tokenizer=tokenizer)
+    if not is_available():
+        raise RuntimeError("lm-format-enforcer is required for json_object")
+    return JSONSchemaLogitsProcessor(schema=schema, tokenizer=tokenizer)

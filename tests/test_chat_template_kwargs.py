@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for chat template kwargs forwarding."""
 
+import json
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -435,3 +436,150 @@ async def test_stream_anthropic_skips_reasoning_parser_when_thinking_disabled():
     assert '"type": "thinking"' not in body
     assert "HEL" in body and "LO" in body
     assert '"type": "text_delta"' in body
+
+
+@pytest.mark.anyio
+async def test_stream_anthropic_flushes_partial_reasoning_marker(monkeypatch):
+    async def fake_stream_chat(messages, **kwargs):
+        yield SimpleNamespace(
+            new_text="thinking</thi",
+            prompt_tokens=3,
+            completion_tokens=2,
+            finished=True,
+            finish_reason="stop",
+        )
+
+    engine = MagicMock(stream_chat=fake_stream_chat, tokenizer=None)
+    messages = [{"role": "user", "content": "Think"}]
+    openai_request = srv.ChatCompletionRequest(
+        model="test-model",
+        messages=[srv.Message(**messages[0])],
+        max_tokens=8,
+    )
+    anthropic_request = srv.AnthropicRequest(
+        model="test-model",
+        max_tokens=8,
+        messages=messages,
+    )
+    prepared = srv.PreparedChatInvocation(
+        messages=messages,
+        chat_kwargs={},
+        response_format=None,
+        json_logits_processor=None,
+    )
+    monkeypatch.setattr(srv, "_reasoning_parser_name", "qwen3")
+    monkeypatch.setattr(srv, "_reasoning_parser", None)
+    monkeypatch.setattr(srv, "_model_name", "test-model")
+
+    body = "".join(
+        [
+            chunk
+            async for chunk in srv._stream_anthropic_messages(
+                engine, openai_request, anthropic_request, prepared
+            )
+        ]
+    )
+    events = [
+        json.loads(line.removeprefix("data: "))
+        for line in body.splitlines()
+        if line.startswith("data: ")
+    ]
+    thinking = "".join(
+        event["delta"]["thinking"]
+        for event in events
+        if event["type"] == "content_block_delta"
+        and event["delta"]["type"] == "thinking_delta"
+    )
+
+    assert thinking == "thinking</thi"
+    assert body.index("thinking</thi") < body.index("message_stop")
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("use_reasoning", [False, True])
+async def test_stream_anthropic_flushes_truncated_deepseek_v4_dsml(
+    monkeypatch, use_reasoning
+):
+    d = "｜DSML｜"
+    truncated = f'Before <{d}tool_calls>\n<{d}invoke name="f'
+
+    async def fake_stream_chat(messages, **kwargs):
+        yield GenerationOutput(
+            text="",
+            new_text=("thinking</think>" if use_reasoning else "") + truncated,
+            finished=False,
+        )
+        yield GenerationOutput(
+            text="",
+            new_text="",
+            finished=True,
+            finish_reason="length",
+            prompt_tokens=3,
+            completion_tokens=2,
+        )
+
+    engine = MagicMock(stream_chat=fake_stream_chat, tokenizer=None)
+    messages = [{"role": "user", "content": "Think"}]
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "f",
+                "parameters": {"type": "object"},
+            },
+        }
+    ]
+    openai_request = srv.ChatCompletionRequest(
+        model="test-model",
+        messages=[srv.Message(**messages[0])],
+        max_tokens=8,
+        tools=tools,
+    )
+    anthropic_request = srv.AnthropicRequest(
+        model="test-model",
+        max_tokens=8,
+        messages=messages,
+        tools=[
+            {
+                "name": "f",
+                "input_schema": {"type": "object"},
+            }
+        ],
+    )
+    prepared = srv.PreparedChatInvocation(
+        messages=messages,
+        chat_kwargs={},
+        response_format=None,
+        json_logits_processor=None,
+    )
+    monkeypatch.setattr(
+        srv, "_reasoning_parser_name", "deepseek_v4" if use_reasoning else None
+    )
+    monkeypatch.setattr(srv, "_reasoning_parser", None)
+    monkeypatch.setattr(srv, "_enable_auto_tool_choice", True)
+    monkeypatch.setattr(srv, "_tool_call_parser", "deepseek_v4")
+    monkeypatch.setattr(srv, "_tool_parser_instance", None)
+    monkeypatch.setattr(srv, "_model_name", "test-model")
+
+    body = "".join(
+        [
+            chunk
+            async for chunk in srv._stream_anthropic_messages(
+                engine, openai_request, anthropic_request, prepared
+            )
+        ]
+    )
+    events = [
+        json.loads(line.removeprefix("data: "))
+        for line in body.splitlines()
+        if line.startswith("data: ")
+    ]
+    text = "".join(
+        event["delta"]["text"]
+        for event in events
+        if event["type"] == "content_block_delta"
+        and event["delta"]["type"] == "text_delta"
+    )
+
+    assert text == truncated
+    assert events[-1]["type"] == "message_stop"

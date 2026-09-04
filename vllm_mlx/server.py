@@ -40,6 +40,7 @@ The server provides:
 import argparse
 import asyncio
 import copy
+import hashlib
 from dataclasses import dataclass
 import json
 import logging
@@ -139,7 +140,6 @@ from .api.tool_calling import (
     build_json_logits_processor,
     build_json_system_prompt,
     convert_tools_for_template,
-    parse_json_output,
     parse_tool_calls,
 )
 from .api.utils import (
@@ -155,7 +155,11 @@ from .audio_limits import (
     save_upload_with_limit,
     validate_tts_input_length,
 )
-from .cli_arg_types import make_json_object_arg_parser, make_positive_int_arg_parser
+from .cli_arg_types import (
+    make_auto_or_positive_int_arg_parser,
+    make_json_object_arg_parser,
+    make_positive_int_arg_parser,
+)
 from .engine import BaseEngine, BatchedEngine, GenerationOutput, SimpleEngine
 from .endpoint_model_policies import (
     resolve_embedding_model_name,
@@ -174,7 +178,7 @@ from .model_registry import (
 )
 from .metrics import metrics as _metrics
 from .models.mllm import UnsafeRemoteURLError, _validate_url_safety, is_url
-from .reasoning import get_parser as get_reasoning_parser
+from .reasoning import DeltaMessage, get_parser as get_reasoning_parser
 from .tool_parsers import ToolParserManager, get_parser_stop_tokens
 
 logging.basicConfig(level=logging.INFO)
@@ -193,6 +197,10 @@ _warm_prompts_path: str | None = None  # Path to JSON of prompts to pre-warm at 
 _default_model_key: str | None = None
 _default_max_tokens: int = 32768
 _max_request_tokens: int = 32768
+_embedding_max_length: int | None = (
+    None  # Set via --embedding-max-length ('auto' = None)
+)
+_embedding_overflow_policy: str = "truncate"  # Set via --embedding-overflow-policy
 _default_timeout: float = 300.0  # Default request timeout in seconds (5 minutes)
 _default_temperature: float | None = None  # Set via --default-temperature
 _default_top_p: float | None = None  # Set via --default-top-p
@@ -212,6 +220,7 @@ _auto_unload_idle_seconds: float = 0.0
 _lazy_load_model: bool = False
 _residency_manager: ResidencyManager | None = None
 _lifecycle_task: asyncio.Task | None = None
+_registry_idle_reaper_task: asyncio.Task | None = None
 _lifespan_active: bool = False
 
 _FALLBACK_TEMPERATURE = 0.7
@@ -465,22 +474,30 @@ def _prepare_json_logits_processor(
     if json_instruction:
         messages = _inject_json_instruction(messages, json_instruction)
 
-    # ``tools`` + ``response_format`` is undefined in OpenAI; skip constraints
-    # when tools are active so tool-call markup can still be emitted.
+    # ``tools`` + ``response_format`` is undefined in OpenAI. Do not silently
+    # downgrade a declared constrained-output request to prompt-only behavior.
     if tools and tool_choice != "none":
-        return messages, json_logits_processor
+        raise HTTPException(
+            status_code=400,
+            detail="tools and response_format cannot be combined",
+        )
 
     tokenizer_obj = _get_engine_tokenizer(engine)
     if tokenizer_obj is None:
-        return messages, json_logits_processor
+        raise HTTPException(
+            status_code=422,
+            detail="response_format is unavailable: serving tokenizer not found",
+        )
 
     try:
         json_logits_processor = build_json_logits_processor(
             response_format, tokenizer_obj
         )
     except Exception as exc:
-        logger.warning("Failed to build JSON logits processor: %s", exc)
-        json_logits_processor = None
+        raise HTTPException(
+            status_code=422,
+            detail=f"response_format is unavailable: {exc}",
+        ) from exc
 
     if json_logits_processor is not None:
         log_label = f" for {log_context}" if log_context else ""
@@ -570,8 +587,12 @@ def _resolve_no_final_content_token_limit() -> int | None:
 
 def _generation_metadata(
     thinking_processor: object | None,
+    output: object | None = None,
 ) -> GenerationMetadata | None:
-    if thinking_processor is None:
+    mtp_drafts = getattr(output, "mtp_drafts", 0) or 0
+    mtp_accepted = getattr(output, "mtp_accepted", 0) or 0
+    has_mtp_activity = bool(mtp_drafts or mtp_accepted)
+    if thinking_processor is None and not has_mtp_activity:
         return None
     return GenerationMetadata(
         no_final_content_watchdog_tokens=getattr(
@@ -580,6 +601,8 @@ def _generation_metadata(
         no_final_content_watchdog_enforced=bool(
             getattr(thinking_processor, "watchdog_was_enforced", False)
         ),
+        mtp_drafts=mtp_drafts if has_mtp_activity else None,
+        mtp_accepted=mtp_accepted if has_mtp_activity else None,
     )
 
 
@@ -974,9 +997,16 @@ _STREAMING_TOOL_MARKERS = (
     # streaming gates scan, so the harmony tokens remain present.
     "<|channel|>commentary",
     "<|call|>",
+    # DeepSeek-V4 DSML. Listed as the bare token rather than the full
+    # <｜DSML｜tool_calls> marker so a partial chunk still trips the gate.
+    "｜DSML｜",
 )
 _STREAMING_BARE_BRACKET_MARKER = re.compile(r"\[\w+\(\{")
 _STREAMING_BARE_BRACKET_PARTIAL = re.compile(r"\[\w+\($")
+_STREAMING_BARE_JSON_MARKER = re.compile(r'^\s*\{\s*"(?:name|type)"\s*:')
+_STREAMING_BARE_JSON_PARTIAL = re.compile(
+    r'^\s*\{\s*"?(?:n(?:a(?:m(?:e)?)?)?|t(?:y(?:p(?:e)?)?)?)?"?\s*:?\s*$'
+)
 _STREAMING_TOOL_MARKUP_SCAN_CHARS = 512
 
 
@@ -1138,6 +1168,137 @@ def _build_reasoning_parser(engine: BaseEngine | None = None):
         return type(_reasoning_parser)()
 
 
+# Keyed partly on request-supplied chat_template_kwargs, so an adversarial or
+# merely varied client can mint unbounded entries. Bound it FIFO, same shape as
+# _responses_store above. Templates-per-model is tiny in practice; this is a
+# safety net, not a working-set limit.
+_IMPLICIT_THINKING_CACHE_MAX_SIZE: int = 256
+_implicit_thinking_cache: dict[tuple, bool] = {}
+
+
+def _template_signature(engine: BaseEngine) -> str | None:
+    """Stable identity for the chat template the engine will render with.
+
+    ``model_name`` is only a proxy for the template: a local override, a
+    re-pull, or a swapped tokenizer changes what ``<think>`` behaviour the
+    template has while the name stays put, and a verdict cached under the name
+    would outlive the template that produced it.
+
+    Both the processor's and the tokenizer's templates are hashed, rather than
+    re-deriving which one ``_apply_chat_template`` will actually pick. That
+    selection is engine-private (``_is_mllm`` and processor capability), and a
+    copy of it here is a second place to drift. Hashing both can only cost a
+    spurious re-probe if the unused one changes; missing a change would cost a
+    stale verdict, which is the bug this guards.
+
+    Returns ``None`` when no template is reachable -- the caller must then skip
+    the cache entirely, since there is nothing to invalidate against.
+    """
+    sources = []
+    for attr in ("_processor", "tokenizer"):
+        template = getattr(getattr(engine, attr, None), "chat_template", None)
+        if template is not None:
+            sources.append(f"{attr}={template!r}")
+    if not sources:
+        return None
+    joined = "\x00".join(sources).encode("utf-8", "surrogatepass")
+    return hashlib.sha256(joined).hexdigest()
+
+
+def _tool_signature(tools: list | None) -> tuple[str, ...] | None:
+    """Stable, low-cardinality identity for a request's tool set.
+
+    Used in the implicit-thinking cache key. Tool *names* are what a chat
+    template can plausibly branch on; ordering is normalized so two requests
+    offering the same tools in a different order share one entry.
+    """
+    if not tools:
+        return None
+    names = []
+    for tool in tools:
+        name = _tool_name(tool) if isinstance(tool, dict) else None
+        names.append(name or repr(tool))
+    return tuple(sorted(names))
+
+
+def _detect_implicit_thinking(engine: BaseEngine, chat_kwargs: dict | None) -> bool:
+    """Return True iff the chat template injects an open ``<think>``.
+
+    GLM-5.2/5.3 templates end the rendered prompt with ``<think>``, so
+    generation starts INSIDE the reasoning block and the model only ever
+    emits the closing tag. A streaming parser that defaults untagged output
+    to content would put the whole chain-of-thought in ``content``.
+
+    This is a property of the template, not of the conversation, so it is
+    probed once per (model, chat_template_kwargs) with a throwaway message
+    and cached -- rendering the real prompt on every request would put a
+    second template application in the hot path.
+
+    ``tools`` are forwarded and keyed on: a template may gate the ``<think>``
+    injection on tool presence, and ``chat_kwargs["tools"]`` is per-request.
+    The key carries the sorted tool *names*, not the full schemas -- enough to
+    separate "tools" from "no tools" and one tool set from another, without
+    minting a fresh entry (and a fresh template render) for every argument
+    schema a client happens to send. A template that opened ``<think>`` based
+    on a tool's *parameters* rather than its name would still be misread.
+
+    The key carries a hash of the chat template itself, not just the model
+    name: two engines can share a name and render differently, and the same
+    engine's template can be swapped underneath it. See ``_template_signature``.
+    A template that cannot be identified is probed every time rather than
+    cached under an identity that could go stale.
+
+    ``enable_thinking`` is forwarded and keyed on because it is resolved
+    per-request: ``_apply_forced_tool_choice`` sets it to ``False`` on
+    ``chat_kwargs`` directly, not inside ``chat_template_kwargs``. Probing
+    without it would let the engine default (``"coder" not in model_name``)
+    disagree with the flag the real prompt render is about to use.
+    """
+    apply_template = getattr(engine, "_apply_chat_template", None)
+    if apply_template is None:
+        return False
+
+    ctk = (chat_kwargs or {}).get("chat_template_kwargs") or {}
+    # Absent means "let the engine pick its default", which is not the same as
+    # False -- forward only what the request actually resolved.
+    enable_thinking = (chat_kwargs or {}).get("enable_thinking")
+    tools = (chat_kwargs or {}).get("tools") or None
+    template_sig = _template_signature(engine)
+    key = (
+        getattr(engine, "model_name", None),
+        template_sig,
+        repr(sorted(ctk.items())),
+        enable_thinking,
+        _tool_signature(tools),
+    )
+    if template_sig is not None:
+        cached = _implicit_thinking_cache.get(key)
+        if cached is not None:
+            return cached
+
+    probe_kwargs: dict[str, object] = {"chat_template_kwargs": dict(ctk) or None}
+    if enable_thinking is not None:
+        probe_kwargs["enable_thinking"] = enable_thinking
+    if tools:
+        probe_kwargs["tools"] = tools
+
+    try:
+        prompt = apply_template([{"role": "user", "content": "hi"}], **probe_kwargs)
+    except Exception:
+        # A template that won't render for the probe is not evidence either
+        # way -- don't cache, and leave the existing default in place.
+        logger.debug("implicit-thinking probe failed", exc_info=True)
+        return False
+
+    result = bool(prompt) and prompt.rstrip().endswith("<think>")
+    if template_sig is None:
+        return result
+    _implicit_thinking_cache[key] = result
+    while len(_implicit_thinking_cache) > _IMPLICIT_THINKING_CACHE_MAX_SIZE:
+        _implicit_thinking_cache.pop(next(iter(_implicit_thinking_cache)))
+    return result
+
+
 def _prepare_streaming_reasoning_parser(
     engine: BaseEngine,
     request: ChatCompletionRequest | ResponsesRequest | None,
@@ -1150,7 +1311,7 @@ def _prepare_streaming_reasoning_parser(
         return None
     parser = _build_reasoning_parser(engine)
     if parser is not None:
-        parser.reset_state()
+        parser.reset_state(implicit_mode=_detect_implicit_thinking(engine, chat_kwargs))
     return parser
 
 
@@ -1187,6 +1348,35 @@ def _streaming_json_fence_stripper(
     if response_format_type in ("json_object", "json_schema"):
         return StreamingJsonFenceStripper()
     return None
+
+
+def _extract_streaming_reasoning_delta(
+    parser,
+    previous_text: str,
+    current_text: str,
+    delta_text: str,
+    *,
+    finished: bool,
+) -> DeltaMessage | None:
+    """Parse one reasoning delta and flush buffered text on the final output."""
+    delta = parser.extract_reasoning_streaming(previous_text, current_text, delta_text)
+    if not finished:
+        return delta
+
+    finalize_stream = getattr(parser, "finalize_stream", None)
+    if finalize_stream is None:
+        return delta
+
+    final = finalize_stream()
+    if final is None:
+        return delta
+    if delta is None:
+        return final
+    return DeltaMessage(
+        role=delta.role or final.role,
+        reasoning=((delta.reasoning or "") + (final.reasoning or "")) or None,
+        content=((delta.content or "") + (final.content or "")) or None,
+    )
 
 
 # Lifecycle startup coordination — an Event lets the lifecycle loop block
@@ -1318,6 +1508,9 @@ def _build_engine(spec: ModelSpec) -> BaseEngine:
         specprefill_backbone_pct=spec.specprefill_backbone_pct,
         specprefill_draft_model=spec.specprefill_draft_model,
         max_kv_size=max_kv_size,
+        prefix_trie_cache=spec.prefix_trie_cache,
+        prefix_trie_cache_size=spec.prefix_trie_cache_size,
+        prefix_trie_cache_memory_mb=spec.prefix_trie_cache_memory_mb,
     )
 
 
@@ -1464,6 +1657,7 @@ async def _release_default_engine(*, count_activity: bool = True) -> None:
 async def lifespan(app: FastAPI):
     """FastAPI lifespan for startup/shutdown events."""
     global _engine, _mcp_manager, _model_manager, _lifecycle_task, _lifespan_active
+    global _registry_idle_reaper_task
     primary_exc: BaseException | None = None
     try:
         _get_idle_unload_event().clear()
@@ -1480,6 +1674,10 @@ async def lifespan(app: FastAPI):
             await _engine.start()
         if _model_manager is not None:
             await _model_manager.preload()
+            if _model_manager.idle_unload_seconds > 0:
+                _registry_idle_reaper_task = asyncio.create_task(
+                    _model_manager.run_idle_reaper()
+                )
 
         # Load persisted cache from disk (AFTER engine start — AsyncEngineCore must exist)
         if (
@@ -1562,6 +1760,11 @@ async def lifespan(app: FastAPI):
             await _engine.stop()
             _engine = None
             logger.info("Engine stopped")
+        if _registry_idle_reaper_task is not None:
+            _registry_idle_reaper_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await _registry_idle_reaper_task
+            _registry_idle_reaper_task = None
         if _model_manager is not None:
             await _model_manager.shutdown()
             logger.info("Model manager stopped")
@@ -1862,7 +2065,11 @@ def _parse_tool_calls_with_parser(
 
     request_dict = request.model_dump() if request else None
 
-    # tool_choice="none" means never return tool calls — skip all parsing
+    # Tool parsing is valid only when the request declares available tools.
+    if request is not None and not getattr(request, "tools", None):
+        return output_text, None
+
+    # tool_choice="none" means never return tool calls, so skip all parsing.
     if request is not None:
         tool_choice = getattr(request, "tool_choice", None)
         if tool_choice is None and request_dict:
@@ -2599,7 +2806,7 @@ async def _stream_responses_request(request: ResponsesRequest) -> AsyncIterator[
 
     tool_parser = _get_streaming_tool_parser(chat_request, engine)
     tool_accumulated_text = ""
-    tool_markup_possible = False
+    tool_markup_possible = _requires_eager_tool_streaming(tool_parser)
 
     async for output in engine.stream_chat(messages=messages, **chat_kwargs):
         last_output = output
@@ -2610,18 +2817,32 @@ async def _stream_responses_request(request: ResponsesRequest) -> AsyncIterator[
             completion_tokens = output.completion_tokens
 
         delta_text = output.new_text or ""
-        if not delta_text:
+        output_finished = bool(getattr(output, "finished", False))
+        use_reasoning = reasoning_parser and not _thinking_disabled(
+            request, chat_kwargs
+        )
+        if not delta_text and not (
+            (use_reasoning and output_finished)
+            or (tool_parser and tool_markup_possible and output_finished)
+        ):
             continue
 
         previous_text = raw_accumulated_text
         raw_accumulated_text += delta_text
 
-        if reasoning_parser:
-            delta_msg = reasoning_parser.extract_reasoning_streaming(
-                previous_text, raw_accumulated_text, delta_text
+        if use_reasoning:
+            delta_msg = _extract_streaming_reasoning_delta(
+                reasoning_parser,
+                previous_text,
+                raw_accumulated_text,
+                delta_text,
+                finished=output_finished,
             )
             if delta_msg is None:
-                continue
+                if output_finished and tool_parser and tool_markup_possible:
+                    delta_msg = DeltaMessage()
+                else:
+                    continue
 
             if delta_msg.reasoning:
                 for event in _start_reasoning_item():
@@ -2639,10 +2860,29 @@ async def _stream_responses_request(request: ResponsesRequest) -> AsyncIterator[
                 )
                 sequence += 1
 
-            if delta_msg.content:
+            content = delta_msg.content or ""
+            if tool_parser and (content or (output_finished and tool_markup_possible)):
+                tool_accumulated_text, tool_result = _extract_streaming_tool_delta(
+                    tool_parser,
+                    tool_accumulated_text,
+                    content,
+                    tool_request_context,
+                )
+                if output_finished and (
+                    tool_result is None or _requires_eager_tool_streaming(tool_parser)
+                ):
+                    tool_result = _finalize_streaming_tool_result(
+                        tool_parser, tool_accumulated_text, tool_result
+                    )
+                if tool_result is None or "tool_calls" in tool_result:
+                    content = ""
+                else:
+                    content = tool_result.get("content", "")
+
+            if content:
                 for event in _start_text_item():
                     yield event
-                accumulated_text += delta_msg.content
+                accumulated_text += content
                 yield _responses_sse_event(
                     "response.output_text.delta",
                     ResponseOutputTextDeltaEvent(
@@ -2650,14 +2890,14 @@ async def _stream_responses_request(request: ResponsesRequest) -> AsyncIterator[
                         item_id=text_item_id,
                         output_index=text_output_index,
                         content_index=0,
-                        delta=delta_msg.content,
+                        delta=content,
                     ),
                 )
                 sequence += 1
             continue
 
         content = SPECIAL_TOKENS_PATTERN.sub("", delta_text)
-        if tool_parser and delta_text:
+        if tool_parser and (delta_text or (output.finished and tool_markup_possible)):
             # Fast path: skip parsing until a tool-markup marker appears.
             # Use _streaming_tool_markup_possible to catch all supported
             # shapes (<tool_call>, <function=, [Calling tool:, [TOOL_CALLS],
@@ -2666,7 +2906,7 @@ async def _stream_responses_request(request: ResponsesRequest) -> AsyncIterator[
             if (
                 not tool_markup_possible
                 and not _streaming_tool_markup_possible_after_delta(
-                    tool_accumulated_text, delta_text
+                    tool_accumulated_text, delta_text, tool_parser
                 )
             ):
                 tool_accumulated_text += delta_text
@@ -2679,11 +2919,20 @@ async def _stream_responses_request(request: ResponsesRequest) -> AsyncIterator[
                     delta_text,
                     tool_request_context,
                 )
+                if output.finished and (
+                    tool_result is None or _requires_eager_tool_streaming(tool_parser)
+                ):
+                    tool_result = _finalize_streaming_tool_result(
+                        tool_parser, tool_accumulated_text, tool_result
+                    )
                 if tool_result is None:
                     continue
                 if "tool_calls" in tool_result:
-                    continue
-                content = tool_result.get("content", "")
+                    content = tool_result.get("content", "")
+                    if not content:
+                        continue
+                else:
+                    content = tool_result.get("content", "")
 
         if not content:
             continue
@@ -3041,6 +3290,8 @@ def _get_streaming_tool_parser(
     """
     if request is None:
         return None
+    if not getattr(request, "tools", None):
+        return None
     if _tool_choice_disabled(request):
         return None
 
@@ -3055,9 +3306,6 @@ def _get_streaming_tool_parser(
                 _sanitize_log_text(e, limit=500),
             )
             return None
-
-    if not getattr(request, "tools", None):
-        return None
 
     try:
         parser_cls = ToolParserManager.get_tool_parser("auto")
@@ -3114,17 +3362,34 @@ def _parse_streaming_tool_content(
     return accumulated_text, result, suppress
 
 
-def _streaming_tool_markup_possible(text: str) -> bool:
+def _streaming_tool_markup_possible(text: str, tool_parser=None) -> bool:
     """Heuristic marker check to avoid parser work on ordinary text chunks."""
+    parser_markers = getattr(tool_parser, "STREAMING_MARKERS", ())
+    supports_bare_json = bool(
+        getattr(tool_parser, "SUPPORTS_BARE_JSON_STREAMING", False)
+    )
     return (
         any(marker in text for marker in _STREAMING_TOOL_MARKERS)
+        or any(marker in text for marker in parser_markers)
         or _STREAMING_BARE_BRACKET_MARKER.search(text) is not None
         or _STREAMING_BARE_BRACKET_PARTIAL.search(text) is not None
+        or (
+            supports_bare_json
+            and (
+                _STREAMING_BARE_JSON_MARKER.search(text) is not None
+                or _STREAMING_BARE_JSON_PARTIAL.search(text) is not None
+            )
+        )
     )
 
 
+def _requires_eager_tool_streaming(tool_parser) -> bool:
+    """Return whether a parser must receive every delta from response start."""
+    return bool(getattr(tool_parser, "REQUIRES_EAGER_STREAMING", False))
+
+
 def _streaming_tool_markup_possible_after_delta(
-    accumulated_text: str, delta_text: str
+    accumulated_text: str, delta_text: str, tool_parser=None
 ) -> bool:
     """
     Check only the boundary window needed to detect newly appearing tool markup.
@@ -3138,7 +3403,31 @@ def _streaming_tool_markup_possible_after_delta(
     if not delta_text:
         return False
     check_text = accumulated_text[-_STREAMING_TOOL_MARKUP_SCAN_CHARS:] + delta_text
-    return _streaming_tool_markup_possible(check_text)
+    return _streaming_tool_markup_possible(check_text, tool_parser)
+
+
+def _finalize_streaming_tool_result(
+    tool_parser, current_text: str, result: dict | None = None
+):
+    """Let parsers resolve an ambiguous prefix at end of generation."""
+    finalize = getattr(tool_parser, "finalize_streaming", None)
+    if finalize is None:
+        return result
+    final = finalize(current_text)
+    if final is None:
+        return result
+    if result is None:
+        return final
+
+    merged = dict(result)
+    if final.get("content"):
+        merged["content"] = (merged.get("content") or "") + final["content"]
+    if final.get("tool_calls"):
+        merged["tool_calls"] = [
+            *(merged.get("tool_calls") or []),
+            *final["tool_calls"],
+        ]
+    return merged
 
 
 def load_embedding_model(
@@ -3165,7 +3454,11 @@ def load_embedding_model(
 
     from .embedding import EmbeddingEngine
 
-    _embedding_engine = EmbeddingEngine(model_name)
+    _embedding_engine = EmbeddingEngine(
+        model_name,
+        max_length_ceiling=_embedding_max_length,
+        overflow_policy=_embedding_overflow_policy,
+    )
     _embedding_engine.load()
 
 
@@ -3215,12 +3508,16 @@ def load_model(
     specprefill_keep_pct: float = 0.3,
     specprefill_backbone_pct: float = 0.0,
     specprefill_draft_model: str = None,
+    prefix_trie_cache: bool = False,
+    prefix_trie_cache_size: int = 32,
+    prefix_trie_cache_memory_mb: int | None = None,
     mllm_draft_model: str | None = None,
     mllm_draft_kind: str | None = None,
     mllm_draft_block_size: int | None = None,
     warm_prompts_path: str | None = None,
     auto_unload_idle_seconds: float = 0.0,
     lazy_load_model: bool = False,
+    default_mllm_draft: bool = False,
 ):
     """
     Load a model (auto-detects MLLM vs LLM).
@@ -3241,6 +3538,9 @@ def load_model(
         specprefill_keep_pct: Fraction of tokens to keep (default: 0.3)
         specprefill_backbone_pct: Fraction of chunks reserved for evenly spaced coverage
         specprefill_draft_model: Path to small draft model for SpecPrefill scoring
+        prefix_trie_cache: Enable mlx-lm LRUPromptCache for pure-LLM SimpleEngine chat
+        prefix_trie_cache_size: Maximum prompt-cache trie entries
+        prefix_trie_cache_memory_mb: Optional prompt-cache trie memory cap in MB
         mllm_draft_model: Optional MLLM speculative draft/assistant model path.
         mllm_draft_kind: Optional mlx-vlm draft kind, for example "mtp".
         mllm_draft_block_size: Optional speculative block size passed to mlx-vlm.
@@ -3250,6 +3550,8 @@ def load_model(
         lazy_load_model: When lifecycle residency is enabled, defer the first
             resident load until the first request instead of FastAPI lifespan
             startup.
+        default_mllm_draft: Enable a configured assistant drafter unless a
+            request explicitly opts out.
     """
     global _engine, _model_manager, _model_name, _model_path, _default_max_tokens
     global _max_request_tokens, _tool_parser_instance, _warm_prompts_path
@@ -3266,10 +3568,14 @@ def load_model(
         raise ValueError("Default max tokens cannot exceed max request tokens")
     if mllm_draft_model and not force_mllm:
         raise ValueError("MLLM draft models require force_mllm/--mllm")
+    if default_mllm_draft and not mllm_draft_model:
+        raise ValueError("default_mllm_draft requires an MLLM draft model")
+    if mllm_draft_model and use_batching and mllm_draft_kind != "mtp":
+        raise ValueError(
+            "Continuous-batching MLLM draft models require mllm_draft_kind='mtp'"
+        )
     if mllm_draft_block_size is not None and mllm_draft_block_size <= 0:
         raise ValueError("MLLM draft block size must be a positive integer")
-    if mllm_draft_model and use_batching:
-        raise ValueError("MLLM draft models are supported only by SimpleEngine")
     if mllm_draft_model and (auto_unload_idle_seconds > 0 or lazy_load_model):
         raise ValueError(
             "MLLM draft models are not supported with lifecycle residency yet"
@@ -3338,6 +3644,9 @@ def load_model(
             specprefill_keep_pct=specprefill_keep_pct,
             specprefill_backbone_pct=specprefill_backbone_pct,
             specprefill_draft_model=specprefill_draft_model,
+            prefix_trie_cache=prefix_trie_cache,
+            prefix_trie_cache_size=prefix_trie_cache_size,
+            prefix_trie_cache_memory_mb=prefix_trie_cache_memory_mb,
         )
         _residency_manager = ResidencyManager(
             _engine_factory,
@@ -3366,6 +3675,10 @@ def load_model(
             stream_interval=stream_interval,
             force_mllm=force_mllm,
             gpu_memory_utilization=gpu_memory_utilization,
+            mllm_draft_model=mllm_draft_model,
+            mllm_draft_kind=mllm_draft_kind,
+            mllm_draft_block_size=mllm_draft_block_size,
+            default_mllm_draft=default_mllm_draft,
         )
         # BatchedEngine will be started in lifespan (uvicorn's event loop)
         # Just log for now
@@ -3394,6 +3707,10 @@ def load_model(
             mllm_draft_model=mllm_draft_model,
             mllm_draft_kind=mllm_draft_kind,
             mllm_draft_block_size=mllm_draft_block_size,
+            prefix_trie_cache=prefix_trie_cache,
+            prefix_trie_cache_size=prefix_trie_cache_size,
+            prefix_trie_cache_memory_mb=prefix_trie_cache_memory_mb,
+            default_mllm_draft=default_mllm_draft,
         )
         # Start SimpleEngine synchronously (no background loop)
         # Use new_event_loop() for Python 3.10+ compatibility (get_event_loop() is deprecated)
@@ -3433,11 +3750,16 @@ def load_model_registry(
     config_path: str,
     *,
     defaults: RegistryServeDefaults,
+    memory_budget_gb: float | None = None,
 ) -> None:
     """Load a registry-backed model manager from YAML configuration."""
     global _engine, _model_manager, _model_name, _model_path, _default_max_tokens
 
-    manager_config, registry = load_registry_config(config_path, defaults)
+    manager_config, registry = load_registry_config(
+        config_path,
+        defaults,
+        memory_budget_gb=memory_budget_gb,
+    )
     _engine = None
     _model_path = None
     _model_name = None
@@ -3542,6 +3864,24 @@ async def health():
     return payload
 
 
+def _embedding_status() -> dict[str, object] | None:
+    """Effective embedding config, for status/config reporting."""
+    if _embedding_engine is None:
+        return None
+    return {
+        "model": _embedding_engine.model_name,
+        # The truncation length actually applied by embed() — resolved from
+        # the loaded model's config and clamped by max_length_ceiling below.
+        # A 512-token model with an 8192 ceiling still uses 512; reporting
+        # the ceiling itself here would be misleading in that case.
+        "max_length": _embedding_engine.effective_max_length,
+        # None means no operator ceiling is configured. This field is
+        # int | None, a single consistent type API consumers can rely on.
+        "max_length_ceiling": _embedding_max_length,
+        "overflow_policy": _embedding_overflow_policy,
+    }
+
+
 @app.get("/v1/status", dependencies=[Depends(verify_api_key)])
 async def status():
     """Real-time status with per-request details for debugging and monitoring."""
@@ -3552,8 +3892,10 @@ async def status():
                 "memory_budget_gb": round(
                     _model_manager.memory_budget_bytes / (1024**3), 2
                 ),
+                "idle_unload_seconds": _model_manager.idle_unload_seconds,
                 "models": _model_manager.list_models(),
             },
+            "embedding": _embedding_status(),
         }
     lifecycle = _public_lifecycle_status(_get_lifecycle_status())
     if _engine is None:
@@ -3562,6 +3904,7 @@ async def status():
             "model": _model_name,
             "residency": lifecycle,
             "requests": [],
+            "embedding": _embedding_status(),
         }
 
     stats = _engine.get_stats()
@@ -3573,6 +3916,7 @@ async def status():
         "status": "running" if stats.get("running") else "stopped",
         "model": _model_name,
         "residency": lifecycle,
+        "embedding": _embedding_status(),
         "uptime_s": round(stats.get("uptime_seconds", 0), 1),
         "steps_executed": stats.get("steps_executed", 0),
         "num_running": stats.get("num_running", 0),
@@ -3835,6 +4179,8 @@ async def create_embeddings(request: EmbeddingRequest) -> EmbeddingResponse:
     server startup.
     """
     global _embedding_engine
+    from .embedding import EmbeddingLengthExceededError
+
     tracker = _metrics.track_inference("embeddings", stream=False)
 
     try:
@@ -3886,6 +4232,18 @@ async def create_embeddings(request: EmbeddingRequest) -> EmbeddingResponse:
         )
         return response
 
+    except EmbeddingLengthExceededError as exc:
+        tracker.finish(result="error")
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "embedding_input_too_long",
+                "message": str(exc),
+                "input_index": exc.text_index,
+                "token_count": exc.token_count,
+                "max_length": exc.max_length,
+            },
+        ) from exc
     except ImportError:
         tracker.finish(result="error")
         raise HTTPException(
@@ -4292,6 +4650,71 @@ async def _ensure_sse_terminal(
     finally:
         if not emitted:
             yield terminal_frame
+
+
+async def _collect_stream_chunks(generator: AsyncIterator[str]) -> list[str]:
+    """Collect a structured-output stream before exposing a success response."""
+    return [chunk async for chunk in generator]
+
+
+async def _build_chat_streaming_response(
+    engine,
+    messages,
+    request,
+    raw_request,
+    metrics_tracker,
+    chat_kwargs,
+    total_timeout,
+    deadline,
+) -> tuple[StreamingResponse | Response, bool]:
+    """Build a chat stream and report whether caller cleanup remains required."""
+    stream_generator = stream_chat_completion(
+        engine,
+        messages,
+        request,
+        metrics_tracker=metrics_tracker,
+        **chat_kwargs,
+    )
+    if _response_format_type(request.response_format) in (
+        "json_object",
+        "json_schema",
+    ):
+        chunks = await _wait_with_disconnect(
+            _collect_stream_chunks(stream_generator),
+            raw_request,
+            timeout=_remaining_request_timeout(total_timeout, deadline),
+            timeout_detail_seconds=total_timeout,
+        )
+        if chunks is None:
+            return Response(status_code=499), True
+        return StreamingResponse(iter(chunks), media_type="text/event-stream"), True
+
+    response = StreamingResponse(
+        _disconnect_guard(
+            _ensure_sse_terminal(stream_generator, "data: [DONE]\n\n"),
+            raw_request,
+            cleanup=_make_release_cleanup(raw_request),
+            timeout=total_timeout,
+        ),
+        media_type="text/event-stream",
+    )
+    return response, False
+
+
+def _record_structured_stream_content(
+    parts: list[str], content: str, enabled: bool, tool_calls_detected: bool
+) -> None:
+    if content and enabled and not tool_calls_detected:
+        parts.append(content)
+
+
+def _validate_structured_stream(
+    request: ChatCompletionRequest,
+    content_parts: list[str],
+    tool_calls_detected: bool,
+) -> None:
+    if request.response_format is not None and not tool_calls_detected:
+        _apply_response_format_or_raise("".join(content_parts), request.response_format)
 
 
 def _find_uvicorn_cycle(obj, depth=0, visited=None):
@@ -4846,6 +5269,9 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
             )
             if specprefill_backbone_pct is not None:
                 generate_kwargs["specprefill_backbone_pct"] = specprefill_backbone_pct
+            mllm_draft = getattr(request, "mllm_draft", None)
+            if mllm_draft is not None:
+                generate_kwargs["mllm_draft"] = mllm_draft
             try:
                 if raw_request is None:
                     output = await engine.generate(**generate_kwargs)
@@ -5007,25 +5433,16 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
             _raise_remote_media_http_error(exc)
 
         if request.stream:
-            response = StreamingResponse(
-                _disconnect_guard(
-                    _ensure_sse_terminal(
-                        stream_chat_completion(
-                            engine,
-                            prepared.messages,
-                            request,
-                            metrics_tracker=tracker,
-                            **prepared.chat_kwargs,
-                        ),
-                        "data: [DONE]\n\n",
-                    ),
-                    raw_request,
-                    cleanup=_make_release_cleanup(raw_request),
-                    timeout=total_timeout,
-                ),
-                media_type="text/event-stream",
+            response, release_on_exit = await _build_chat_streaming_response(
+                engine,
+                prepared.messages,
+                request,
+                raw_request,
+                tracker,
+                prepared.chat_kwargs,
+                total_timeout,
+                deadline,
             )
-            release_on_exit = False
             return response
 
         start_time = time.perf_counter()
@@ -5105,7 +5522,9 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
                 completion_tokens=output.completion_tokens,
                 total_tokens=output.prompt_tokens + output.completion_tokens,
             ),
-            generation_metadata=_generation_metadata(prepared.thinking_processor),
+            generation_metadata=_generation_metadata(
+                prepared.thinking_processor, output
+            ),
         )
     finally:
         if release_on_exit:
@@ -5789,15 +6208,16 @@ async def _stream_anthropic_messages(
     # Tool call streaming suppression — prevents raw tool markup from leaking
     # as text_delta events. Mirrors the OpenAI streaming path logic.
     tool_accumulated_text = ""
-    tool_markup_possible = False
     tool_parser = _get_streaming_tool_parser(openai_request, engine)
+    tool_markup_possible = _requires_eager_tool_streaming(tool_parser)
     tool_request_context = openai_request.model_dump()
 
     try:
         async for output in engine.stream_chat(messages=messages, **chat_kwargs):
             if metrics_tracker is not None:
                 metrics_tracker.observe_ttft()
-            delta_text = output.new_text
+            delta_text = output.new_text or ""
+            output_finished = bool(getattr(output, "finished", False))
 
             if hasattr(output, "prompt_tokens") and output.prompt_tokens:
                 prompt_tokens = output.prompt_tokens
@@ -5806,12 +6226,18 @@ async def _stream_anthropic_messages(
             if hasattr(output, "completion_tokens") and output.completion_tokens:
                 completion_tokens = output.completion_tokens
 
-            if not delta_text:
+            if not delta_text and not (
+                (use_reasoning and output_finished)
+                or (tool_parser and tool_markup_possible and output_finished)
+            ):
                 continue
 
             # Filter special tokens
             filtered = SPECIAL_TOKENS_PATTERN.sub("", delta_text)
-            if not filtered:
+            if not filtered and not (
+                (use_reasoning and output_finished)
+                or (tool_parser and tool_markup_possible and output_finished)
+            ):
                 continue
 
             if not use_reasoning:
@@ -5823,18 +6249,20 @@ async def _stream_anthropic_messages(
                 # must see the raw delta (harmony control tokens intact) so a
                 # gpt-oss commentary block can activate the gate; only the
                 # emitted text stays SPECIAL_TOKENS-stripped.
-                if tool_parser and delta_text:
+                if tool_parser and (
+                    delta_text or (output.finished and tool_markup_possible)
+                ):
                     if (
                         not tool_markup_possible
                         and not _streaming_tool_markup_possible_after_delta(
-                            tool_accumulated_text, delta_text
+                            tool_accumulated_text, delta_text, tool_parser
                         )
                     ):
                         tool_accumulated_text += delta_text
                     else:
                         if not tool_markup_possible:
                             tool_markup_possible = True
-                        tool_accumulated_text, tool_result, suppress_tool_text = (
+                        tool_accumulated_text, tool_result, _ = (
                             _parse_streaming_tool_content(
                                 tool_parser,
                                 tool_accumulated_text,
@@ -5842,8 +6270,15 @@ async def _stream_anthropic_messages(
                                 tool_request_context,
                             )
                         )
-                        if suppress_tool_text:
-                            # Inside tool markup or tool calls detected — suppress
+                        if output.finished and (
+                            tool_result is None
+                            or _requires_eager_tool_streaming(tool_parser)
+                        ):
+                            tool_result = _finalize_streaming_tool_result(
+                                tool_parser, tool_accumulated_text, tool_result
+                            )
+                        if tool_result is None:
+                            # Inside tool markup, so suppress this delta.
                             continue
                         content_to_emit = tool_result.get("content", "")
                         if content_to_emit:
@@ -5860,12 +6295,19 @@ async def _stream_anthropic_messages(
             previous_text = accumulated_text
             accumulated_text += filtered
             assert reasoning_parser is not None
-            delta_msg = reasoning_parser.extract_reasoning_streaming(
-                previous_text, accumulated_text, filtered
+            delta_msg = _extract_streaming_reasoning_delta(
+                reasoning_parser,
+                previous_text,
+                accumulated_text,
+                filtered,
+                finished=output_finished,
             )
 
             if delta_msg is None:
-                continue
+                if output_finished and tool_parser and tool_markup_possible:
+                    delta_msg = DeltaMessage()
+                else:
+                    continue
 
             if delta_msg.reasoning:
                 if not thinking_block_started:
@@ -5873,22 +6315,26 @@ async def _stream_anthropic_messages(
                     thinking_block_started = True
                 yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': thinking_index, 'delta': {'type': 'thinking_delta', 'thinking': delta_msg.reasoning}})}\n\n"
 
-            if delta_msg.content:
-                content_to_emit = delta_msg.content
+            content_to_emit = delta_msg.content or ""
+            if content_to_emit or (
+                tool_parser and output_finished and tool_markup_possible
+            ):
 
                 # Filter tool call markup during streaming
-                if tool_parser and content_to_emit:
+                if tool_parser and (
+                    content_to_emit or (output.finished and tool_markup_possible)
+                ):
                     if (
                         not tool_markup_possible
                         and not _streaming_tool_markup_possible_after_delta(
-                            tool_accumulated_text, content_to_emit
+                            tool_accumulated_text, content_to_emit, tool_parser
                         )
                     ):
                         tool_accumulated_text += content_to_emit
                     else:
                         if not tool_markup_possible:
                             tool_markup_possible = True
-                        tool_accumulated_text, tool_result, suppress_tool_text = (
+                        tool_accumulated_text, tool_result, _ = (
                             _parse_streaming_tool_content(
                                 tool_parser,
                                 tool_accumulated_text,
@@ -5896,8 +6342,15 @@ async def _stream_anthropic_messages(
                                 tool_request_context,
                             )
                         )
-                        if suppress_tool_text:
-                            # Inside tool markup or tool calls detected — suppress
+                        if output.finished and (
+                            tool_result is None
+                            or _requires_eager_tool_streaming(tool_parser)
+                        ):
+                            tool_result = _finalize_streaming_tool_result(
+                                tool_parser, tool_accumulated_text, tool_result
+                            )
+                        if tool_result is None:
+                            # Inside tool markup, so suppress this delta.
                             continue
                         content_to_emit = tool_result.get("content", "")
                         if content_to_emit:
@@ -6030,6 +6483,9 @@ async def stream_completion(
     specprefill_backbone_pct = getattr(request, "specprefill_backbone_pct", None)
     if specprefill_backbone_pct is not None:
         generate_kwargs["specprefill_backbone_pct"] = specprefill_backbone_pct
+    mllm_draft = getattr(request, "mllm_draft", None)
+    if mllm_draft is not None:
+        generate_kwargs["mllm_draft"] = mllm_draft
 
     try:
         async for output in engine.stream_generate(**generate_kwargs):
@@ -6132,13 +6588,14 @@ async def stream_chat_completion(
     # ``"```json{...}```"`` instead of ``"{...}"`` for models that wrap
     # their structured output in markdown (e.g. Gemma 4).
     fence_stripper = _streaming_json_fence_stripper(request)
+    response_format_content: list[str] = []
 
     # Tool call streaming state
     tool_parser = None
     tool_accumulated_text = ""
     tool_calls_detected = False
-    tool_markup_possible = False  # Fast path: skip parsing until markers appear
     tool_parser = _get_streaming_tool_parser(request, engine)
+    tool_markup_possible = _requires_eager_tool_streaming(tool_parser)
     # Whether any emitted chunk carried a terminal finish_reason. The engine's
     # finished=True output can be swallowed by a parser `continue` below (e.g.
     # a bare end-of-turn token arriving after a completed tool call); without
@@ -6150,7 +6607,8 @@ async def stream_chat_completion(
         async for output in engine.stream_chat(messages=messages, **kwargs):
             if metrics_tracker is not None:
                 metrics_tracker.observe_ttft()
-            delta_text = output.new_text
+            delta_text = output.new_text or ""
+            output_finished = bool(getattr(output, "finished", False))
             last_output = output
 
             # Track token counts from output (updated each chunk)
@@ -6162,22 +6620,34 @@ async def stream_chat_completion(
             # Use reasoning parser if enabled (skip when enable_thinking=False
             # is set either on the request or via the resolved chat template
             # kwargs / server default).
-            if reasoning_parser and delta_text:
+            if (
+                reasoning_parser
+                and (delta_text or output_finished)
+                and not _thinking_disabled(request, kwargs)
+            ):
                 previous_text = accumulated_text
                 accumulated_text += delta_text
-                delta_msg = reasoning_parser.extract_reasoning_streaming(
-                    previous_text, accumulated_text, delta_text
+                delta_msg = _extract_streaming_reasoning_delta(
+                    reasoning_parser,
+                    previous_text,
+                    accumulated_text,
+                    delta_text,
+                    finished=output_finished,
                 )
 
                 if delta_msg is None:
-                    # Skip this chunk (e.g., <think> token itself)
-                    continue
+                    if output_finished and tool_parser and tool_markup_possible:
+                        delta_msg = DeltaMessage()
+                    else:
+                        # Skip this chunk (e.g., <think> token itself)
+                        continue
 
                 content = delta_msg.content
                 reasoning = delta_msg.reasoning
                 content, reasoning = _promote_streaming_response_format_delta(
                     content, reasoning, request
                 )
+                content = content or ""
 
                 # Some models (e.g. MiniMax) wrap tool calls in <think>
                 # blocks, so reasoning parser captures tool call XML as
@@ -6185,16 +6655,18 @@ async def stream_chat_completion(
                 # to the content stream so the tool parser can handle it.
                 if tool_parser and reasoning and not content:
                     _check = tool_accumulated_text + reasoning
-                    if _streaming_tool_markup_possible(_check):
+                    if _streaming_tool_markup_possible(_check, tool_parser):
                         content = reasoning
                         reasoning = None
 
                 # Tool call parsing on content portion
-                if tool_parser and content:
+                if tool_parser and (
+                    content or (output_finished and tool_markup_possible)
+                ):
                     if (
                         not tool_markup_possible
                         and not _streaming_tool_markup_possible_after_delta(
-                            tool_accumulated_text, content
+                            tool_accumulated_text, content, tool_parser
                         )
                     ):
                         tool_accumulated_text += content
@@ -6210,6 +6682,14 @@ async def stream_chat_completion(
                                 tool_request_context,
                             )
                         )
+
+                        if output.finished and (
+                            tool_result is None
+                            or _requires_eager_tool_streaming(tool_parser)
+                        ):
+                            tool_result = _finalize_streaming_tool_result(
+                                tool_parser, tool_accumulated_text, tool_result
+                            )
 
                         if tool_result is None:
                             # Inside tool markup - suppress content output
@@ -6249,6 +6729,7 @@ async def stream_chat_completion(
                                     ChatCompletionChunkChoice(
                                         delta=ChatCompletionChunkDelta(
                                             tool_calls=tool_result["tool_calls"],
+                                            content=tool_result.get("content") or None,
                                             reasoning=reasoning,
                                         ),
                                         finish_reason=(
@@ -6277,6 +6758,13 @@ async def stream_chat_completion(
                         flush = fence_stripper.finalize()
                         if flush:
                             content = content + flush
+
+                _record_structured_stream_content(
+                    response_format_content,
+                    content,
+                    fence_stripper is not None,
+                    tool_calls_detected,
+                )
 
                 chunk = ChatCompletionChunk(
                     id=response_id,
@@ -6319,7 +6807,9 @@ async def stream_chat_completion(
                     think_prefix_sent = True
 
                 # Tool call streaming parsing
-                if tool_parser and delta_text:
+                if tool_parser and (
+                    delta_text or (output.finished and tool_markup_possible)
+                ):
                     # Fast path: skip full parsing until likely tool markup appears.
                     # This preserves the cheap path for ordinary text while still
                     # allowing generic streaming tool parsing when no explicit
@@ -6327,7 +6817,7 @@ async def stream_chat_completion(
                     if (
                         not tool_markup_possible
                         and not _streaming_tool_markup_possible_after_delta(
-                            tool_accumulated_text, delta_text
+                            tool_accumulated_text, delta_text, tool_parser
                         )
                     ):
                         tool_accumulated_text += delta_text
@@ -6343,6 +6833,14 @@ async def stream_chat_completion(
                                 tool_request_context,
                             )
                         )
+
+                        if output.finished and (
+                            tool_result is None
+                            or _requires_eager_tool_streaming(tool_parser)
+                        ):
+                            tool_result = _finalize_streaming_tool_result(
+                                tool_parser, tool_accumulated_text, tool_result
+                            )
 
                         if tool_result is None:
                             # Inside tool markup - suppress output
@@ -6365,7 +6863,8 @@ async def stream_chat_completion(
                                 choices=[
                                     ChatCompletionChunkChoice(
                                         delta=ChatCompletionChunkDelta(
-                                            tool_calls=tool_result["tool_calls"]
+                                            tool_calls=tool_result["tool_calls"],
+                                            content=tool_result.get("content") or None,
                                         ),
                                         finish_reason=(
                                             "tool_calls" if output.finished else None
@@ -6393,6 +6892,13 @@ async def stream_chat_completion(
                         flush = fence_stripper.finalize()
                         if flush:
                             content = content + flush
+
+                _record_structured_stream_content(
+                    response_format_content,
+                    content,
+                    fence_stripper is not None,
+                    tool_calls_detected,
+                )
 
                 chunk = ChatCompletionChunk(
                     id=response_id,
@@ -6429,7 +6935,7 @@ async def stream_chat_completion(
             tool_parser
             and tool_accumulated_text
             and not tool_calls_detected
-            and _streaming_tool_markup_possible(tool_accumulated_text)
+            and _streaming_tool_markup_possible(tool_accumulated_text, tool_parser)
         ):
             final_parse_result = tool_parser.extract_tool_calls(
                 tool_accumulated_text, tool_request_context
@@ -6492,38 +6998,12 @@ async def stream_chat_completion(
             )
             yield f"data: {terminal_chunk.model_dump_json()}\n\n"
 
-        # Safety-net validation: if response_format was requested, verify the
-        # accumulated output still parses.  When constrained decoding is active
-        # this should always succeed; if it fails we log loudly (error) so we
-        # notice grammar-integration regressions.  When constrained decoding was
-        # *not* active (optional dep missing, incompatible tokenizer, combined
-        # with tools), we log at warning level only — the prompt-only path is
-        # best-effort.
-        if (
-            getattr(request, "response_format", None) is not None
-            and not tool_calls_detected
-        ):
-            try:
-                _, _parsed, _is_valid, _err = parse_json_output(
-                    accumulated_text, request.response_format
-                )
-                if not _is_valid:
-                    # Determine whether constrained decoding was wired up.  We
-                    # passed the processor through ``kwargs`` so its presence is
-                    # the signal.
-                    has_constrained = any(
-                        p.__class__.__name__ == "JSONSchemaLogitsProcessor"
-                        for p in (kwargs.get("logits_processors") or [])
-                    )
-                    if has_constrained:
-                        logger.error(
-                            "Streaming constrained decoding produced invalid JSON: %s",
-                            _err,
-                        )
-                    else:
-                        logger.warning("Streaming JSON validation failed: %s", _err)
-            except Exception as exc:  # pragma: no cover - defensive
-                logger.warning("Streaming JSON validation raised: %s", exc)
+        # Structured streams are buffered by the endpoint until this independent
+        # validation succeeds, so invalid content cannot be returned as a
+        # successful stream.
+        _validate_structured_stream(
+            request, response_format_content, tool_calls_detected
+        )
 
         # Log throughput
         elapsed = time.perf_counter() - start_time
@@ -6658,6 +7138,7 @@ def main():
     global _default_top_k, _default_min_p
     global _default_presence_penalty, _default_repetition_penalty
     global _max_audio_upload_bytes, _max_tts_input_chars
+    global _embedding_max_length, _embedding_overflow_policy
     _api_key = args.api_key
     _default_timeout = args.timeout
     _metrics_enabled = args.enable_metrics
@@ -6677,6 +7158,8 @@ def main():
         _default_repetition_penalty = args.default_repetition_penalty
     _max_audio_upload_bytes = args.max_audio_upload_mb * 1024 * 1024
     _max_tts_input_chars = args.max_tts_input_chars
+    _embedding_max_length = args.embedding_max_length
+    _embedding_overflow_policy = args.embedding_overflow_policy
 
     # Configure rate limiter
     if args.rate_limit > 0:
@@ -6746,6 +7229,10 @@ def main():
         mllm_draft_model=args.mllm_draft_model,
         mllm_draft_kind=args.mllm_draft_kind,
         mllm_draft_block_size=args.mllm_draft_block_size,
+        prefix_trie_cache=args.prefix_trie_cache,
+        prefix_trie_cache_size=args.prefix_trie_cache_size,
+        prefix_trie_cache_memory_mb=args.prefix_trie_cache_memory_mb,
+        default_mllm_draft=args.default_mllm_draft,
         auto_unload_idle_seconds=args.auto_unload_idle_seconds,
         lazy_load_model=args.lazy_load_model,
     )
@@ -6831,6 +7318,35 @@ Examples:
         help="Draft block size passed to mlx-vlm for --mllm-draft-model.",
     )
     parser.add_argument(
+        "--prefix-trie-cache",
+        action="store_true",
+        default=False,
+        help=(
+            "Enable mlx-lm LRUPromptCache for pure-LLM SimpleEngine chat. "
+            "Default off; exact system-prefix snapshots still take precedence."
+        ),
+    )
+    parser.add_argument(
+        "--prefix-trie-cache-size",
+        type=make_positive_int_arg_parser("--prefix-trie-cache-size"),
+        default=32,
+        help="Maximum prompt-cache trie entries for --prefix-trie-cache.",
+    )
+    parser.add_argument(
+        "--prefix-trie-cache-memory-mb",
+        type=make_positive_int_arg_parser("--prefix-trie-cache-memory-mb"),
+        default=None,
+        help="Optional prompt-cache trie memory cap in MB.",
+    )
+    parser.add_argument(
+        "--default-mllm-draft",
+        action="store_true",
+        help=(
+            "Enable a configured MLLM assistant drafter by default. "
+            "Requests may opt out with mllm_draft=false."
+        ),
+    )
+    parser.add_argument(
         "--mcp-config",
         type=str,
         default=None,
@@ -6869,7 +7385,7 @@ Examples:
         "--auto-unload-idle-seconds",
         type=float,
         default=0.0,
-        help="Unload the main model after this many idle seconds (0 = disabled)",
+        help="Unload idle models after this many seconds (0 = disabled)",
     )
     parser.add_argument(
         "--lazy-load-model",
@@ -6901,6 +7417,21 @@ Examples:
         type=str,
         default=None,
         help="Pre-load an embedding model at startup (e.g. mlx-community/all-MiniLM-L6-v2-4bit)",
+    )
+    parser.add_argument(
+        "--embedding-max-length",
+        type=make_auto_or_positive_int_arg_parser("--embedding-max-length"),
+        default=None,
+        help=(
+            "Maximum token length for embeddings: positive integer or 'auto' "
+            "(default: auto, use the model context length)"
+        ),
+    )
+    parser.add_argument(
+        "--embedding-overflow-policy",
+        choices=("truncate", "error"),
+        default="truncate",
+        help="How to handle embedding inputs over the effective maximum length",
     )
     parser.add_argument(
         "--default-temperature",

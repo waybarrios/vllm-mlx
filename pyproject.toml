@@ -69,6 +69,7 @@ dependencies = [
     "jsonschema>=4.0.0",
     # Constrained decoding (grammar-guided generation for response_format)
     "lm-format-enforcer>=0.10.9",
+    "llguidance>=1.7.6",
     # pytz is required by gradio but not declared as a dependency
     # See: https://github.com/waybarrios/vllm-mlx/issues/23
     "pytz>=2024.1",
@@ -122,8 +123,8 @@ audio = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/waybarrios/vllm-mlx"
-Documentation = "https://github.com/waybarrios/vllm-mlx/tree/main/docs"
+Homepage = "https://vllm-mlx.is-a.dev/"
+Documentation = "https://vllm-mlx.is-a.dev/"
 Repository = "https://github.com/waybarrios/vllm-mlx"
 Issues = "https://github.com/waybarrios/vllm-mlx/issues"
 "Release Notes" = "https://github.com/waybarrios/vllm-mlx/releases"

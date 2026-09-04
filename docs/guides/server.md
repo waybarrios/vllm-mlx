@@ -63,6 +63,9 @@ vllm-mlx serve mlx-community/Qwen3-8B-4bit \
 | `--enable-metrics` | Expose Prometheus metrics on `/metrics` | False |
 | `--continuous-batching` | Enable batching for multi-user | False |
 | `--use-paged-cache` | Enable paged KV cache | False |
+| `--prefix-trie-cache` | Enable conversation-prefix reuse in pure-LLM SimpleEngine mode | False |
+| `--prefix-trie-cache-size` | Maximum SimpleEngine prompt-trie entries | 32 |
+| `--prefix-trie-cache-memory-mb` | Optional SimpleEngine prompt-trie memory cap in MB | None |
 | `--cache-memory-mb` | Cache memory limit in MB | Auto |
 | `--cache-memory-percent` | Fraction of RAM for cache | 0.20 |
 | `--max-tokens` | Default max tokens | 32768 |

@@ -131,6 +131,24 @@ For DeepSeek-R1 models that may omit the opening `<think>` tag.
 vllm-mlx serve mlx-community/DeepSeek-R1-Distill-Qwen-7B-4bit --reasoning-parser deepseek_r1
 ```
 
+### DeepSeek-V4 Parser (`deepseek_v4`)
+
+DeepSeek V4 Flash can end an implicit reasoning block by opening a DSML tool
+call, even when `</think>` is absent. Use the V4 reasoning parser together with
+the V4 tool parser so the DSML tail is routed to structured tool-call output:
+
+```bash
+vllm-mlx serve deepseek-ai/DeepSeek-V4-Flash-0731 \
+  --reasoning-parser deepseek_v4 \
+  --enable-auto-tool-choice \
+  --tool-call-parser deepseek_v4
+```
+
+The encoder detects the published preview and 0731 reasoning-effort profiles.
+For OpenAI requests, unspecified effort selects `high`; `minimal`, `low`, and
+`medium` select `low`; `high` and `xhigh` select `high`; and `max` selects
+`max`. The preview profile normalizes `low` to its `high` behavior.
+
 ## How It Works
 
 The reasoning parser uses text-based detection to identify thinking tags in the model output. During streaming, it tracks the current position in the output to correctly route each token to either `reasoning` or `content`.

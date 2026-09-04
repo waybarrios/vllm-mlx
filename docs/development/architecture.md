@@ -135,7 +135,7 @@ vllm_mlx/
 ├── models/
 │   ├── llm.py            # MLXLanguageModel
 │   └── mllm.py           # MLXMultimodalLM
-├── tool_parsers/         # Tool call parsers (12 formats)
+├── tool_parsers/         # Tool call parsers (19 formats)
 ├── reasoning_parsers/    # Reasoning parsers (qwen3, deepseek_r1)
 ├── server.py             # FastAPI server
 ├── engine_core.py        # AsyncEngineCore

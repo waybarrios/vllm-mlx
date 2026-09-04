@@ -76,6 +76,7 @@ def list_parsers() -> list[str]:
 def _register_builtin_parsers():
     """Register built-in parsers."""
     from .deepseek_r1_parser import DeepSeekR1ReasoningParser
+    from .deepseek_v4_parser import DeepSeekV4ReasoningParser
     from .gemma4_parser import Gemma4ReasoningParser
     from .glm4_parser import Glm4ReasoningParser
     from .gpt_oss_parser import GptOssReasoningParser
@@ -83,15 +84,18 @@ def _register_builtin_parsers():
     from .mistral_parser import MistralReasoningParser
     from .poolside_v1_parser import PoolsideV1ReasoningParser
     from .qwen3_parser import Qwen3ReasoningParser
+    from .step3p5_parser import Step3p5ReasoningParser
 
     register_parser("qwen3", Qwen3ReasoningParser)
     register_parser("deepseek_r1", DeepSeekR1ReasoningParser)
+    register_parser("deepseek_v4", DeepSeekV4ReasoningParser)
     register_parser("gpt_oss", GptOssReasoningParser)
     register_parser("harmony", HarmonyReasoningParser)
     register_parser("gemma4", Gemma4ReasoningParser)
     register_parser("glm4", Glm4ReasoningParser)
     register_parser("mistral", MistralReasoningParser)
     register_parser("poolside_v1", PoolsideV1ReasoningParser)
+    register_parser("step3p5", Step3p5ReasoningParser)
 
 
 # Register built-in parsers on module load

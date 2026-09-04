@@ -46,7 +46,7 @@ claude
 ### APIs
 - **OpenAI-compatible**: `/v1/chat/completions`, `/v1/completions`, `/v1/embeddings`, `/v1/rerank`, `/v1/responses`
 - **Anthropic-compatible**: `/v1/messages` (streaming, tool use, system prompts)
-- **MCP Tool Calling**: 12 parsers (OpenAI, Anthropic, Gemini, Qwen, DeepSeek, Gemma, and more)
+- **MCP Tool Calling**: 19 parsers (OpenAI, Anthropic, Gemini, Qwen, DeepSeek, Gemma, and more)
 - **Structured output**: JSON Schema via `response_format` (lm-format-enforcer)
 
 ### Throughput & memory
@@ -64,7 +64,7 @@ claude
 - **STT**: Whisper family with RTF up to 197x on M4 Max
 
 ### Reasoning & advanced
-- **Reasoning extraction**: Qwen3, DeepSeek-R1 (`--reasoning-parser`)
+- **Reasoning extraction**: Qwen3, DeepSeek-R1, DeepSeek-V4 (`--reasoning-parser`)
 - **MoE expert reduction**: `--moe-top-k` for +7-16% on Qwen3-30B-A3B
 - **Speculative decoding**: `--mtp` for Qwen3-Next
 - **Sparse prefill**: attention-based `--spec-prefill` for TTFT reduction
@@ -255,6 +255,8 @@ See [Installation Guide](docs/getting-started/installation.md) for full options.
 
 ## Documentation
 
+Browse the complete documentation at [vllm-mlx.is-a.dev](https://vllm-mlx.is-a.dev/).
+
 - **Getting started**: [Installation](docs/getting-started/installation.md) · [Quick Start](docs/getting-started/quickstart.md)
 - **Servers & APIs**: [OpenAI server](docs/guides/server.md) · [Anthropic Messages API](docs/guides/server.md#anthropic-messages-api) · [Python API](docs/guides/python-api.md)
 - **Features**: [Multimodal](docs/guides/multimodal.md) · [Audio](docs/guides/audio.md) · [Embeddings](docs/guides/embeddings.md) · [Reasoning](docs/guides/reasoning.md) · [MCP & Tool Calling](docs/guides/mcp-tools.md) · [Tool Parsers](docs/guides/tool-calling.md)
@@ -320,7 +322,7 @@ Apache 2.0. See [LICENSE](LICENSE).
 
 ## Star history
 
-[![Star History Chart](https://api.star-history.com/svg?repos=waybarrios/vllm-mlx&type=Date)](https://star-history.com/#waybarrios/vllm-mlx&Date)
+[![Star History Chart](https://star-history.dera.page/svg?repos=waybarrios/vllm-mlx&type=Date)](https://star-history.dera.page/#waybarrios/vllm-mlx&Date)
 
 ---
 

@@ -52,7 +52,7 @@ class RequestOutputCollector:
         self.aggregate = aggregate
         self._is_waiting = False
 
-    def put(self, output: RequestOutput) -> None:
+    def put(self, output: RequestOutput, notify: bool = True) -> None:
         """
         Put an output into the collector (non-blocking).
 
@@ -61,6 +61,12 @@ class RequestOutputCollector:
 
         Args:
             output: The RequestOutput to store
+            notify: If True, release the accumulated output to the consumer.
+                If False, the output is *accumulated* (its ``new_text`` is
+                merged) but withheld until a later ``notify=True`` put. This
+                implements ``--stream-interval`` batching without dropping any
+                tokens: callers put every step but only release on the interval
+                boundary (or on finish). Requires ``aggregate=True``.
         """
         if self.output is None:
             self.output = output
@@ -70,7 +76,8 @@ class RequestOutputCollector:
         else:
             # Replace: just use the new output
             self.output = output
-        self.ready.set()
+        if notify:
+            self.ready.set()
 
     def get_nowait(self) -> Optional[RequestOutput]:
         """
@@ -80,8 +87,12 @@ class RequestOutputCollector:
         reducing latency under load.
 
         Returns:
-            The output if available, None otherwise
+            The output if available *and released* (notified), None otherwise.
+            Output accumulated via ``put(..., notify=False)`` is withheld until
+            a subsequent ``notify=True`` put sets the ready event.
         """
+        if not self.ready.is_set():
+            return None
         output = self.output
         if output is not None:
             self.output = None
@@ -105,7 +116,7 @@ class RequestOutputCollector:
             with RequestOutputCollector._waiting_lock:
                 RequestOutputCollector._waiting_consumers += 1
         try:
-            while self.output is None:
+            while not self.ready.is_set():
                 await self.ready.wait()
             output = self.get_nowait()
             # This should never be None after wait, but satisfy type checker

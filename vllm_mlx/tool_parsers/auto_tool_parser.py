@@ -16,6 +16,10 @@ from .abstract_tool_parser import (
     ToolParser,
     ToolParserManager,
 )
+from .deepseek_v4_tool_parser import (
+    TOOL_CALLS_START as DSML_TOOL_CALLS_START,
+)
+from .deepseek_v4_tool_parser import DeepSeekV4ToolParser
 from .gemma4_tool_parser import Gemma4ToolParser
 
 
@@ -57,6 +61,19 @@ class AutoToolParser(ToolParser):
     )
     BARE_BRACKET_PATTERN = re.compile(r"\[(\w+)\((\{.*?\})\)\]", re.DOTALL)
     BARE_BRACKET_PARTIAL_PATTERN = re.compile(r"\[\w+\($")
+    # Auto includes DSML, whose opening marker must be buffered from its first
+    # ``<`` rather than after the complete marker becomes visible.
+    REQUIRES_EAGER_STREAMING = True
+
+    def __init__(self, tokenizer=None):
+        super().__init__(tokenizer)
+        self._dsml_parser = DeepSeekV4ToolParser(tokenizer)
+        self._legacy_stream_text = ""
+
+    def reset(self) -> None:
+        super().reset()
+        self._dsml_parser.reset()
+        self._legacy_stream_text = ""
 
     def extract_tool_calls(
         self, model_output: str, request: dict[str, Any] | None = None
@@ -71,6 +88,14 @@ class AutoToolParser(ToolParser):
         if "<|tool_call>" in model_output:
             gemma_parser = Gemma4ToolParser()
             result = gemma_parser.extract_tool_calls(model_output, request)
+            if result.tools_called:
+                return result
+
+        # 1b. Try DeepSeek-V4 DSML. The marker carries the model's private
+        # ｜DSML｜ token, so a false positive is not realistic.
+        if DSML_TOOL_CALLS_START in model_output:
+            dsml_parser = DeepSeekV4ToolParser()
+            result = dsml_parser.extract_tool_calls(model_output, request)
             if result.tools_called:
                 return result
 
@@ -349,7 +374,7 @@ class AutoToolParser(ToolParser):
 
         return tool_calls
 
-    def extract_tool_calls_streaming(
+    def _extract_legacy_tool_calls_streaming(
         self,
         previous_text: str,
         current_text: str,
@@ -412,3 +437,53 @@ class AutoToolParser(ToolParser):
                 }
 
         return None
+
+    def extract_tool_calls_streaming(
+        self,
+        previous_text: str,
+        current_text: str,
+        delta_text: str,
+        previous_token_ids: Sequence[int] | None = None,
+        current_token_ids: Sequence[int] | None = None,
+        delta_token_ids: Sequence[int] | None = None,
+        request: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
+        """Run DSML buffering before the legacy auto-detection formats."""
+        dsml_result = self._dsml_parser.extract_tool_calls_streaming(
+            previous_text,
+            current_text,
+            delta_text,
+            previous_token_ids,
+            current_token_ids,
+            delta_token_ids,
+            request,
+        )
+        if dsml_result is None or "tool_calls" in dsml_result:
+            return dsml_result
+
+        safe_delta = dsml_result.get("content", "")
+        safe_previous = self._legacy_stream_text
+        self._legacy_stream_text += safe_delta
+        return self._extract_legacy_tool_calls_streaming(
+            safe_previous,
+            self._legacy_stream_text,
+            safe_delta,
+            previous_token_ids,
+            current_token_ids,
+            delta_token_ids,
+            request,
+        )
+
+    def finalize_streaming(self, current_text: str) -> dict[str, Any] | None:
+        """Flush DSML prefixes or truncated blocks at end of generation."""
+        result = self._dsml_parser.finalize_streaming(current_text)
+        if result is None or "tool_calls" in result:
+            return result
+
+        safe_delta = result.get("content", "")
+        safe_previous = self._legacy_stream_text
+        self._legacy_stream_text += safe_delta
+        legacy = self._extract_legacy_tool_calls_streaming(
+            safe_previous, self._legacy_stream_text, safe_delta
+        )
+        return legacy if legacy is not None else {"content": safe_delta}
