@@ -796,6 +796,9 @@ class SimpleEngine(BaseEngine):
             )
 
         self._model.load()
+        if self._is_mllm and self._mllm_draft_model_path is not None:
+            assert self._model is not None
+            self._mllm_draft_kind = self._model.draft_kind
 
     def _uses_default_prepare_for_start(self) -> bool:
         """Return True when prepare_for_start is the class implementation."""
@@ -3427,15 +3430,26 @@ class SimpleEngine(BaseEngine):
             }
 
         if self._mllm_draft_model_path is not None:
-            stats["mtp"] = {
-                "enabled": True,
-                "implementation": "mlx_vlm_assistant",
-                "draft_model": self._mllm_draft_model_path,
-                "draft_kind": self._mllm_draft_kind,
-                "draft_block_size": self._mllm_draft_block_size,
-                "default_enabled": self._default_mllm_draft,
-                "continuous_batching_supported": True,
-            }
+            if self._mllm_draft_kind == "eagle3":
+                stats["speculative"] = {
+                    "enabled": True,
+                    "implementation": "mlx_vlm_eagle3",
+                    "draft_model": self._mllm_draft_model_path,
+                    "draft_kind": self._mllm_draft_kind,
+                    "draft_block_size": self._mllm_draft_block_size,
+                    "default_enabled": self._default_mllm_draft,
+                    "continuous_batching_supported": False,
+                }
+            else:
+                stats["mtp"] = {
+                    "enabled": True,
+                    "implementation": "mlx_vlm_assistant",
+                    "draft_model": self._mllm_draft_model_path,
+                    "draft_kind": self._mllm_draft_kind,
+                    "draft_block_size": self._mllm_draft_block_size,
+                    "default_enabled": self._default_mllm_draft,
+                    "continuous_batching_supported": True,
+                }
 
         # System KV cache stats (LRU over multiple system prefixes)
         if self._system_kv_cache:

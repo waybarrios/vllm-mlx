@@ -1,3 +1,5 @@
+import sys
+import types
 from types import SimpleNamespace
 
 import pytest
@@ -136,6 +138,103 @@ def test_serve_parser_accepts_registered_step3p5_tool_parser():
     )
 
     assert args.tool_call_parser == "step3p5"
+
+
+def test_serve_parser_accepts_eagle3_mllm_draft_kind():
+    """Eagle3 must be selectable as a distinct mlx-vlm draft algorithm."""
+    from vllm_mlx import cli
+
+    args = cli.create_parser().parse_args(
+        [
+            "serve",
+            "--model",
+            "local-test-model",
+            "--mllm-draft-kind",
+            "eagle3",
+        ]
+    )
+
+    assert args.mllm_draft_kind == "eagle3"
+
+
+def test_serve_command_rejects_eagle3_batching_before_download(monkeypatch, capsys):
+    """Eagle3 cannot reach model download when continuous batching is requested."""
+    import vllm_mlx
+    from vllm_mlx import cli
+    from vllm_mlx.utils import download
+
+    fake_server = types.ModuleType("vllm_mlx.server")
+    fake_server.RateLimiter = object
+    fake_server.app = object()
+    fake_server._metrics = SimpleNamespace(configure=lambda **kwargs: None)
+    fake_server.load_model = lambda *args, **kwargs: None
+    fake_server.load_model_registry = lambda *args, **kwargs: None
+    fake_registry = types.ModuleType("vllm_mlx.model_registry")
+    fake_registry.RegistryServeDefaults = object
+    monkeypatch.setitem(sys.modules, "vllm_mlx.server", fake_server)
+    monkeypatch.setitem(sys.modules, "vllm_mlx.model_registry", fake_registry)
+    monkeypatch.setattr(vllm_mlx, "server", fake_server, raising=False)
+    monkeypatch.setattr("uvicorn.run", lambda *args, **kwargs: None)
+
+    monkeypatch.setattr(
+        download,
+        "ensure_model_downloaded",
+        lambda *args, **kwargs: pytest.fail("model download must not start"),
+    )
+
+    with pytest.raises(SystemExit):
+        cli.serve_command(
+            _serve_args(
+                mllm=True,
+                mllm_draft_model="eagle3-drafter",
+                mllm_draft_kind="eagle3",
+                continuous_batching=True,
+            )
+        )
+
+    assert (
+        "Eagle3 uses SimpleEngine and cannot use continuous batching"
+        in capsys.readouterr().out
+    )
+
+
+def test_serve_command_rejects_eagle3_block_size_below_two_before_download(
+    monkeypatch, capsys
+):
+    """Eagle3 block size one must fail before a model download begins."""
+    import vllm_mlx
+    from vllm_mlx import cli
+    from vllm_mlx.utils import download
+
+    fake_server = types.ModuleType("vllm_mlx.server")
+    fake_server.RateLimiter = object
+    fake_server.app = object()
+    fake_server._metrics = SimpleNamespace(configure=lambda **kwargs: None)
+    fake_server.load_model = lambda *args, **kwargs: None
+    fake_server.load_model_registry = lambda *args, **kwargs: None
+    fake_registry = types.ModuleType("vllm_mlx.model_registry")
+    fake_registry.RegistryServeDefaults = object
+    monkeypatch.setitem(sys.modules, "vllm_mlx.server", fake_server)
+    monkeypatch.setitem(sys.modules, "vllm_mlx.model_registry", fake_registry)
+    monkeypatch.setattr(vllm_mlx, "server", fake_server, raising=False)
+    monkeypatch.setattr("uvicorn.run", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        download,
+        "ensure_model_downloaded",
+        lambda *args, **kwargs: pytest.fail("model download must not start"),
+    )
+
+    with pytest.raises(SystemExit):
+        cli.serve_command(
+            _serve_args(
+                mllm=True,
+                mllm_draft_model="eagle3-drafter",
+                mllm_draft_kind="eagle3",
+                mllm_draft_block_size=1,
+            )
+        )
+
+    assert "Eagle3 draft block size must be at least 2" in capsys.readouterr().out
 
 
 def test_memory_budget_help_describes_scope_and_limitations(capsys):

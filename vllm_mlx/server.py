@@ -3570,10 +3570,19 @@ def load_model(
         raise ValueError("MLLM draft models require force_mllm/--mllm")
     if default_mllm_draft and not mllm_draft_model:
         raise ValueError("default_mllm_draft requires an MLLM draft model")
+    if mllm_draft_model and use_batching and mllm_draft_kind == "eagle3":
+        raise ValueError("Eagle3 uses SimpleEngine and cannot use continuous batching")
     if mllm_draft_model and use_batching and mllm_draft_kind != "mtp":
         raise ValueError(
             "Continuous-batching MLLM draft models require mllm_draft_kind='mtp'"
         )
+    if (
+        mllm_draft_model
+        and mllm_draft_kind == "eagle3"
+        and mllm_draft_block_size is not None
+        and mllm_draft_block_size < 2
+    ):
+        raise ValueError("Eagle3 draft block size must be at least 2")
     if mllm_draft_block_size is not None and mllm_draft_block_size <= 0:
         raise ValueError("MLLM draft block size must be a positive integer")
     if mllm_draft_model and (auto_unload_idle_seconds > 0 or lazy_load_model):
@@ -3912,7 +3921,7 @@ async def status():
     # Extract batch_generator throughput when available (MLLM scheduler).
     bg = stats.get("batch_generator", {})
 
-    return {
+    payload = {
         "status": "running" if stats.get("running") else "stopped",
         "model": _model_name,
         "residency": lifecycle,
@@ -3937,6 +3946,9 @@ async def status():
         "mtp": stats.get("mtp") or {"enabled": False},
         "requests": stats.get("requests", []),
     }
+    if "speculative" in stats:
+        payload["speculative"] = stats["speculative"]
+    return payload
 
 
 @app.get("/v1/cache/stats", dependencies=[Depends(verify_api_key)])
@@ -7308,8 +7320,11 @@ Examples:
         "--mllm-draft-kind",
         type=str,
         default=None,
-        choices=["mtp"],
-        help="mlx-vlm draft kind for --mllm-draft-model.",
+        choices=["mtp", "eagle3"],
+        help=(
+            "mlx-vlm draft kind for --mllm-draft-model. Eagle3 uses "
+            "SimpleEngine and cannot use continuous batching."
+        ),
     )
     parser.add_argument(
         "--mllm-draft-block-size",

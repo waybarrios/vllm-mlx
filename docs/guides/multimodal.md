@@ -22,6 +22,65 @@ vllm-mlx serve mlx-community/Qwen3-VL-4B-Instruct-3bit --port 8000
 
 Models with "VL", "Vision", or "mllm" in the name are auto-detected as multimodal.
 
+## Eagle3 Draft Decoding
+
+Eagle3 uses `SimpleEngine` for multimodal speculative decoding. Configure the
+target and Eagle3 checkpoint together, with an optional draft block size:
+
+```bash
+vllm-mlx serve TARGET_MODEL \
+  --mllm \
+  --mllm-draft-model EAGLE3_CHECKPOINT \
+  --mllm-draft-kind eagle3 \
+  --mllm-draft-block-size 4
+```
+
+When `--mllm-draft-block-size` is omitted, mlx-vlm applies its default
+behavior. When set, Eagle3 requires a value of at least `2`. Eagle3 does not
+support continuous batching, paged batching caches,
+model registry mode, or lifecycle residency. Do not add
+`--continuous-batching`; the CLI rejects it with
+`Error: Eagle3 uses SimpleEngine and cannot use continuous batching`.
+
+At startup, vllm-mlx checks that the requested checkpoint resolves to Eagle3
+and that the target exposes the required rollback and capture-layer
+capabilities. It also checks capture-layer bounds and compatible target hidden
+and vocabulary sizes. Successful model construction by itself is not proof
+that the target is supported at runtime.
+
+The engine status and public `/v1/status` endpoint identify this configuration
+under `speculative` with
+`implementation: "mlx_vlm_eagle3"`, `draft_kind: "eagle3"`, and
+`continuous_batching_supported: false`; `/v1/status` keeps its existing `mtp`
+field. The endpoint also reports Metal memory under `metal`, including
+`peak_memory_gb`.
+
+### Apple Silicon Validation Protocol
+
+Hardware results for Eagle3 are pending. Do not assume a speedup until this
+protocol has been completed on the target Apple Silicon machine:
+
+1. Use the same fixed prompts, media inputs, generation limits, and random
+   seed for target-only and Eagle3 runs. Record exact model and checkpoint
+   revisions.
+2. Run greedy target-only generation and greedy Eagle3 generation. Compare the
+   complete generated token-ID sequences exactly, not only decoded text.
+3. Read the checkpoint default block size from its config. If it differs from
+   mlx-vlm's no-override behavior, pass that value explicitly with
+   `--mllm-draft-block-size`. Warm up each mode, then collect at least 20
+   measured runs per mode for block sizes `2`, `4`, and that checkpoint value.
+4. Record median and p95 latency, output throughput, drafted tokens, accepted
+   tokens, acceptance rate, mean accepted length, process RSS, and peak Metal
+   allocation. Read the latter from `/v1/status` as `metal.peak_memory_gb` and
+   keep raw status samples with the benchmark output.
+5. If the deployment intends to set `max_kv_size`, test its boundary with a
+   bounded sweep. Include the largest prompt and generation combination that
+   fits, the first one that exceeds the bound, and the resulting error or
+   fallback behavior.
+
+Report parity, resource use, and performance separately. Mark every hardware
+result pending until the measurements and exact token-ID comparison pass.
+
 ## Image Analysis
 
 ### Via OpenAI SDK

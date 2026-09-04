@@ -57,6 +57,20 @@ assistant drafters currently require `--mllm-draft-kind mtp`. `/v1/status`
 shows the configured model and default after startup. In continuous-batching
 mode, it also adds runtime acceptance counters as requests run.
 
+Eagle3 is a SimpleEngine-only draft implementation. It cannot be combined
+with `--continuous-batching` or its paged batching caches. It is also not
+supported in model registry mode or with lifecycle residency. If these options
+are combined, startup fails with:
+
+```
+Error: Eagle3 uses SimpleEngine and cannot use continuous batching
+```
+
+Use the SimpleEngine command in the multimodal guide instead. Do not infer
+runtime support from successful model construction alone. Startup checks the
+Eagle3 checkpoint identity and target capabilities, including the rollback
+API, capture layers, layer bounds, and compatible hidden and vocabulary sizes.
+
 Injected Qwen3.5 and Qwen3.6 MTP checkpoints use the established post-norm
 backbone state by default. A checkpoint qualified for pre-norm input can opt in
 by setting `mtp_hidden_state_mode` to `pre_norm` in its `text_config`. Leave the

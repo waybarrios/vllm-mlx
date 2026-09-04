@@ -114,11 +114,22 @@ def serve_command(args):
     if default_mllm_draft and not mllm_draft_model:
         print("Error: --default-mllm-draft requires --mllm-draft-model")
         sys.exit(1)
+    if mllm_draft_model and args.continuous_batching and mllm_draft_kind == "eagle3":
+        print("Error: Eagle3 uses SimpleEngine and cannot use continuous batching")
+        sys.exit(1)
     if mllm_draft_model and args.continuous_batching and mllm_draft_kind != "mtp":
         print(
             "Error: --mllm-draft-model with --continuous-batching "
             "requires --mllm-draft-kind mtp"
         )
+        sys.exit(1)
+    if (
+        mllm_draft_model
+        and mllm_draft_kind == "eagle3"
+        and mllm_draft_block_size is not None
+        and mllm_draft_block_size < 2
+    ):
+        print("Error: Eagle3 draft block size must be at least 2")
         sys.exit(1)
     if mllm_draft_block_size is not None and mllm_draft_block_size <= 0:
         print("Error: --mllm-draft-block-size must be a positive integer")
@@ -1363,8 +1374,11 @@ Examples:
         "--mllm-draft-kind",
         type=str,
         default=None,
-        choices=["mtp"],
-        help="mlx-vlm draft kind for --mllm-draft-model.",
+        choices=["mtp", "eagle3"],
+        help=(
+            "mlx-vlm draft kind for --mllm-draft-model. Eagle3 uses "
+            "SimpleEngine and cannot use continuous batching."
+        ),
     )
     serve_parser.add_argument(
         "--mllm-draft-block-size",

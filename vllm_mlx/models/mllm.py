@@ -458,6 +458,109 @@ def load_gemma4_assistant_drafter(model_path: str):
     return model
 
 
+def _eagle3_metadata_value(model, name: str):
+    """Return comparable model metadata when the model exposes it."""
+    config = getattr(model, "config", None)
+    candidates = (model, config, getattr(config, "text_config", None))
+    for candidate in candidates:
+        if candidate is None:
+            continue
+        value = (
+            candidate.get(name)
+            if isinstance(candidate, dict)
+            else getattr(candidate, name, None)
+        )
+        if value is not None:
+            return value
+    return None
+
+
+def _eagle3_config_value(config, name: str):
+    if isinstance(config, dict):
+        return config.get(name)
+    return getattr(config, name, None)
+
+
+def _eagle3_drafter_target_metadata_value(drafter, name: str):
+    """Return Eagle3 metadata that describes the target, not the drafter."""
+    target_name = f"target_{name}"
+    config = getattr(drafter, "config", None)
+    for candidate in (drafter, config):
+        value = _eagle3_config_value(candidate, target_name)
+        if value is not None:
+            return value
+    transformer_config = _eagle3_config_value(config, "transformer_layer_config")
+    return _eagle3_config_value(transformer_config, name)
+
+
+def _validate_eagle3_target(target, drafter) -> None:
+    """Validate the target capabilities required by mlx-vlm Eagle3."""
+    language_model = getattr(target, "language_model", target)
+    rollback = getattr(language_model, "rollback_speculative_cache", None)
+    if not callable(rollback):
+        raise ValueError(
+            "Eagle3 target is incompatible: language model must provide "
+            "callable rollback_speculative_cache"
+        )
+
+    drafter_config = getattr(drafter, "config", None)
+    capture_layer_ids = _eagle3_config_value(drafter_config, "capture_layer_ids")
+    if capture_layer_ids is None:
+        capture_layer_ids = _eagle3_config_value(drafter_config, "target_layer_ids")
+    if not capture_layer_ids or not all(
+        isinstance(layer_id, int) and not isinstance(layer_id, bool)
+        for layer_id in capture_layer_ids
+    ):
+        raise ValueError(
+            "Eagle3 target is incompatible: capture_layer_ids must be a non-empty "
+            "sequence of integers"
+        )
+    if len(capture_layer_ids) != 3:
+        raise ValueError(
+            "Eagle3 target is incompatible: capture_layer_ids must contain exactly "
+            "three layer IDs"
+        )
+    if len(set(capture_layer_ids)) != len(capture_layer_ids):
+        raise ValueError(
+            "Eagle3 target is incompatible: capture_layer_ids must not contain duplicates"
+        )
+    if any(layer_id < 0 for layer_id in capture_layer_ids):
+        raise ValueError(
+            "Eagle3 target is incompatible: capture_layer_ids must not contain "
+            "negative values"
+        )
+
+    layers = getattr(language_model, "layers", None)
+    layer_count = None
+    if layers is not None:
+        try:
+            layer_count = len(layers)
+        except TypeError:
+            pass
+    if layer_count is None:
+        layer_count = _eagle3_metadata_value(language_model, "num_hidden_layers")
+    if layer_count is not None and any(
+        layer_id >= layer_count for layer_id in capture_layer_ids
+    ):
+        raise ValueError(
+            "Eagle3 target is incompatible: capture_layer_ids contains a layer "
+            "outside the target layer count"
+        )
+
+    for property_name in ("hidden_size", "vocab_size"):
+        target_value = _eagle3_metadata_value(language_model, property_name)
+        drafter_value = _eagle3_drafter_target_metadata_value(drafter, property_name)
+        if (
+            target_value is not None
+            and drafter_value is not None
+            and target_value != drafter_value
+        ):
+            raise ValueError(
+                f"Eagle3 target is incompatible: {property_name} differs "
+                f"(target={target_value}, drafter={drafter_value})"
+            )
+
+
 _DRAFT_KWARG_NAMES = ("draft_model", "draft_kind", "draft_block_size")
 
 
@@ -1404,6 +1507,25 @@ class MLXMultimodalLM:
     def _load_draft_model(self):
         if self.draft_kind == "mtp":
             return load_gemma4_assistant_drafter(self.draft_model_path)
+
+        if self.draft_kind == "eagle3":
+            from mlx_vlm.speculative import load_drafter
+            from mlx_vlm.speculative.drafters import validate_drafter_compatibility
+
+            requested_kind = self.draft_kind
+            draft_model, resolved_kind = load_drafter(
+                self.draft_model_path, kind="eagle3"
+            )
+            if requested_kind != resolved_kind:
+                raise ValueError(
+                    "MLLM draft kind mismatch: requested "
+                    f"'{requested_kind}', resolved '{resolved_kind}' for checkpoint "
+                    f"'{self.draft_model_path}'"
+                )
+            _validate_eagle3_target(self.model, draft_model)
+            validate_drafter_compatibility(self.model, draft_model, resolved_kind)
+            self.draft_kind = resolved_kind
+            return draft_model
 
         from mlx_vlm.utils import load
 
