@@ -28,6 +28,7 @@ from .paged_cache import PagedCacheManager
 from .ssd_cache import SSDCacheConfig, SSDCacheTier
 from .prefix_cache import BlockAwarePrefixCache, PrefixCacheManager
 from .request import Request, RequestOutput, RequestStatus, SamplingParams
+from .spec_utils import longest_accepted_prefix
 from .utils.mamba_cache import ensure_mamba_support
 
 logger = logging.getLogger(__name__)
@@ -135,7 +136,22 @@ class SchedulerConfig:
     mtp_num_draft_tokens: int = 1  # Number of draft tokens from MTP head
     mtp_optimistic: bool = False  # Skip acceptance check for max speed
 
+    # Block-draft speculative decoding (--spec-draft). Only "dspark" exists:
+    # the NVIDIA DSpark drafter for NemotronH targets, greedy single-sequence
+    # requests only. Mutually exclusive with enable_mtp (the CLI enforces it).
+    spec_draft: Optional[str] = None
+    spec_num_draft_tokens: int = 7  # draft tokens per round (<= block_size - 1)
+    spec_draft_margin_tau: Optional[float] = None  # adaptive block cut-off
+
     def __post_init__(self) -> None:
+        if self.spec_draft not in (None, "dspark"):
+            raise ValueError(
+                f"spec_draft must be None or 'dspark', got {self.spec_draft!r}"
+            )
+        if self.spec_num_draft_tokens < 1:
+            raise ValueError("spec_num_draft_tokens must be >= 1")
+        if self.spec_draft and self.enable_mtp:
+            raise ValueError("spec_draft and enable_mtp are mutually exclusive")
         if self.mllm_prefill_step_size is not None and self.mllm_prefill_step_size <= 0:
             raise ValueError("mllm_prefill_step_size must be > 0 when provided")
 
@@ -1289,6 +1305,458 @@ def _install_mtp(
     )
 
 
+@dataclass
+class _SpecDecodeStatsState:
+    """Cumulative block-spec-decode counters shared across generator instances."""
+
+    counters: Dict[str, int] = field(
+        default_factory=lambda: {
+            "rounds": 0,  # draft/verify rounds attempted
+            "drafted": 0,  # draft tokens proposed
+            "accepted": 0,  # draft tokens accepted
+            "rounds_full": 0,  # rounds where the whole block was accepted
+            "context_disables": 0,  # requests that turned spec off (context gap)
+            "bounded_kv_disables": 0,  # KV cache past --max-kv-size (untrimmable)
+            "despeculations": 0,  # cache rewound to the emitted prefix (batch change)
+            "errors": 0,
+        }
+    )
+    lock: Any = field(default_factory=Lock)
+
+
+def _sampling_is_greedy(sampling_params: Any) -> bool:
+    """True when the request samples by argmax.
+
+    ``mlx_lm.sample_utils.make_sampler(temp=0)`` returns a pure argmax
+    sampler regardless of top_p/top_k/min_p, so temperature alone decides.
+    """
+    temp = getattr(sampling_params, "temperature", None)
+    try:
+        return temp is not None and float(temp) == 0.0
+    except (TypeError, ValueError):
+        return False
+
+
+def _install_dspark(
+    batch_gen: "BatchGenerator",
+    model: Any,
+    num_draft_tokens: int = 7,
+    stats_state: Optional["_SpecDecodeStatsState"] = None,
+) -> bool:
+    """
+    Install DSpark block speculative decoding on an mlx-lm >= 0.31
+    BatchGenerator. Returns True when installed.
+
+    mlx-lm 0.31 moved decode into ``GenerationBatch._step``, which is
+    pipelined: each call RETURNS the token sampled by the PREVIOUS call
+    while advancing the cache by it. The hook keeps that contract and
+    spreads one speculative round over several calls:
+
+      cycle call    forward(t) -> P = argmax; DSpark drafts d1..dk (one
+                    parallel query-block forward + sequential Markov bias);
+                    verify [P, d1..dk] in ONE (k+1)-wide target forward.
+                    m = longest agreeing prefix (see longest_accepted_prefix).
+                    m == k: queue d1..dk; keep the post-dk logits for the
+                            next cycle (the bonus token needs no forward).
+                    m <  k: trim the KV caches by k+1, restore the recurrent
+                            snapshots, re-advance [P, d1..dm, c] in one
+                            forward where c is the verify pass's own
+                            corrected token — a "failed" round still nets
+                            m+1 new tokens; queue d1..dm, c.
+      pending calls emit one queued token each, NO forward.
+      skip call     sample the next P from the stored logits, no forward,
+                    and start the next cycle from there.
+
+    Correctness: every emitted token is an argmax of the target's logits
+    over the emitted prefix. The draft only changes speed. Divergence from
+    a plain 1-wide greedy run can only occur where the target's own top-1 /
+    top-2 logits tie within bf16 reduction-order noise at a different verify
+    width (measured: 1 flip in 199 positions, at a gap of exactly 0.0).
+
+    Hybrid caches: KV layers are trimmed; Mamba/recurrent layers cannot be
+    rewound, so their state arrays are snapshotted before the verify (mlx
+    caches reassign state arrays rather than mutating them, so holding the
+    references is a faithful snapshot) and restored on a partial accept.
+
+    Cache invariant. Between two steps of a round the cache is AHEAD of
+    what has been emitted (it holds the verified-but-not-yet-emitted
+    tokens), which the stock step must never see. The hook therefore
+    tracks how far ahead it is and, before anything that hands the cache to
+    stock code — a batch merge (``extend``), a cache extraction, an
+    exception — rewinds to the pre-verify snapshot and re-advances exactly
+    the tokens emitted since (``_despeculate``). Speculation then stays off
+    for that request, because its drafter context can no longer be
+    reconciled with the cache.
+
+    Gates: single-sequence batches only (any other composition runs the
+    stock step for that call), no logits processors, greedy sampling (the
+    install site only calls this for temperature 0), and trimmable KV
+    caches (a RotatingKVCache past ``--max-kv-size`` cannot be rolled
+    back). If the drafter's context does not line up with the target cache
+    at any cycle — a prefix-cache hit skipped the prompt forward, another
+    request's prefill landed in the aux stash, or the request was
+    de-speculated — spec decode disables itself for that request rather
+    than drafting against a wrong context.
+    """
+    gb0 = getattr(batch_gen, "_generation_batch", None)
+    if gb0 is None or not hasattr(type(gb0), "_step"):
+        logger.warning(
+            "[DSpark] disabled: mlx-lm BatchGenerator has no GenerationBatch._step "
+            "hook (expected mlx-lm >= 0.31). Generation continues without it."
+        )
+        return False
+    draft = getattr(model, "dspark", None)
+    if draft is None:
+        logger.warning("[DSpark] disabled: model has no drafter (model.dspark is None)")
+        return False
+    if stats_state is None:
+        stats_state = _SpecDecodeStatsState()
+    counters = stats_state.counters
+    lock = stats_state.lock
+
+    gb_cls = type(gb0)
+    _gb_cls_step = gb_cls._step  # unbound originals
+    _gb_cls_extend = gb_cls.extend
+    _gb_cls_extract = gb_cls.extract_cache
+    block_size = int(getattr(draft, "block_size", 8))
+    k = max(1, min(int(num_draft_tokens), block_size - 1))
+
+    st: Dict[str, Any] = {
+        "skip": None,  # logits to sample the next P from without a forward
+        "pending": deque(),  # (token, logprobs) already in the cache
+        "uids": None,
+        "installed_on": None,
+        "disabled": False,
+        # how far the cache is ahead of the emitted prefix, and what it
+        # takes to get back there
+        "snaps": {},  # recurrent-state snapshot taken before the verify
+        "advanced": 0,  # tokens fed since that snapshot
+        "emitted_since": [],  # of those, the ones already emitted, in order
+    }
+
+    def _bump(key: str, n: int = 1) -> None:
+        with lock:
+            counters[key] += n
+
+    def _reset() -> None:
+        st["skip"] = None
+        st["pending"].clear()
+        st["uids"] = None
+        st["snaps"] = {}
+        st["advanced"] = 0
+        st["emitted_since"] = []
+
+    def _disable(reason_key: str, msg: str, *args) -> None:
+        logger.warning("[DSpark] " + msg + " — spec decode off for this request", *args)
+        st["disabled"] = True
+        _bump(reason_key)
+
+    def _rnn_snapshot(prompt_cache):
+        """Snapshot every non-trimmable (recurrent) cache before a verify.
+
+        mlx-lm cache updates reassign the state arrays rather than mutating
+        them, so holding the references is a faithful snapshot. ArraysCache
+        also keeps per-sequence ``lengths`` / ``left_padding`` counters that
+        ``advance()`` decrements per processed token; they are captured too
+        so a rollback leaves them consistent.
+        """
+        snaps = {}
+        for ci, c in enumerate(prompt_cache):
+            if not (hasattr(c, "is_trimmable") and c.is_trimmable()):
+                if hasattr(c, "state"):
+                    snaps[ci] = (
+                        list(c.state),
+                        getattr(c, "lengths", None),
+                        getattr(c, "left_padding", None),
+                    )
+        return snaps
+
+    def _rollback(prompt_cache, snaps, n_trim: int) -> None:
+        for c in prompt_cache:
+            if hasattr(c, "is_trimmable") and c.is_trimmable() and hasattr(c, "trim"):
+                c.trim(n_trim)
+        for ci, (state, lengths, left_padding) in snaps.items():
+            c = prompt_cache[ci]
+            c.state = state
+            if hasattr(c, "lengths"):
+                c.lengths = lengths
+            if hasattr(c, "left_padding"):
+                c.left_padding = left_padding
+
+    def _kv_trimmable(prompt_cache) -> bool:
+        for c in prompt_cache:
+            if hasattr(c, "keys") and hasattr(c, "is_trimmable"):
+                if not c.is_trimmable():
+                    return False
+        return True
+
+    def _cache_offset(prompt_cache) -> int:
+        for c in prompt_cache:
+            if hasattr(c, "offset") and hasattr(c, "keys"):
+                return int(c.offset)
+        return -1
+
+    def _drain_aux() -> None:
+        """Move every stashed aux chunk into the drafter's context KV."""
+        pending = model._dspark_pending
+        while pending:
+            draft.append_context(pending.pop(0))
+
+    def _despeculate(gb) -> None:
+        """Rewind the cache to exactly the emitted prefix and drop spec state.
+
+        After this the stock invariant holds: every token in the cache has
+        been emitted and ``gb._next_tokens`` is the next token to feed.
+        """
+        if st["advanced"]:
+            _rollback(gb.prompt_cache, st["snaps"], st["advanced"])
+            emitted = st["emitted_since"]
+            if emitted:
+                model(mx.array([emitted], dtype=mx.uint32), cache=gb.prompt_cache)
+            model._dspark_pending.clear()
+            draft.reset_context()
+            _bump("despeculations")
+        _reset()
+
+    def _finish_step(gb, inputs, primary, logprobs):
+        gb._next_tokens = primary
+        gb._next_logprobs = list(logprobs)
+        mx.async_eval(gb._next_tokens, gb._next_logprobs)
+        mx.eval(inputs, gb._current_logprobs)
+        inputs_l = inputs.tolist()
+        for sti, ti in zip(gb.tokens, inputs_l):
+            sti.append(ti)
+        return inputs_l, gb._current_logprobs
+
+    def _make_step(gb):
+        def _dspark_gb_step():
+            uids = tuple(gb.uids)
+            if len(uids) != 1 or any(gb.logits_processors):
+                if st["advanced"]:
+                    # A merge must have gone through _despeculate first; if
+                    # not, the cache is unreconcilable from here.
+                    logger.error(
+                        "[DSpark] batch changed with speculative state held; "
+                        "disabling for this request"
+                    )
+                    _bump("errors")
+                    st["disabled"] = True
+                _reset()
+                draft.reset_context()
+                return _gb_cls_step(gb)
+            if st["uids"] is not None and st["uids"] != uids:
+                # New request. Reset the draft context and re-enable, but do
+                # NOT clear model._dspark_pending: it already holds the new
+                # request's prompt aux states (the old request's were drained
+                # during its cycles). Clearing it here starves the context
+                # check and disables spec for every request after the first.
+                _reset()
+                draft.reset_context()
+                st["disabled"] = False
+            st["uids"] = uids
+            if st["disabled"]:
+                return _gb_cls_step(gb)
+
+            # ---- pending call: token already in the cache, just emit ----
+            if st["pending"]:
+                tok, lp = st["pending"].popleft()
+                gb._current_tokens = gb._next_tokens
+                gb._current_logprobs = gb._next_logprobs
+                inputs = gb._current_tokens
+                gb._next_tokens = mx.array([tok], dtype=mx.uint32)
+                gb._next_logprobs = [lp]
+                mx.eval(inputs, gb._current_logprobs)
+                inputs_l = inputs.tolist()
+                st["emitted_since"].append(int(inputs_l[0]))
+                for sti, ti in zip(gb.tokens, inputs_l):
+                    sti.append(ti)
+                return inputs_l, gb._current_logprobs
+
+            # ---- cycle call ----
+            gb._current_tokens = gb._next_tokens
+            gb._current_logprobs = gb._next_logprobs
+            inputs = gb._current_tokens
+            # Emitting `inputs` completes the previous round: after this call
+            # the cache holds exactly the emitted prefix again.
+            st["snaps"] = {}
+            st["advanced"] = 0
+            st["emitted_since"] = []
+
+            skip = st["skip"]
+            if skip is not None:
+                st["skip"] = None
+                logits = skip
+            else:
+                out = model(inputs[:, None], cache=gb.prompt_cache)
+                logits = out[:, -1, :]
+
+            # The drafter's context must cover exactly the target cache,
+            # checked every cycle: a prefix-cache hit skips the prompt aux
+            # states, and another request's prefill between two steps adds
+            # foreign ones (the taps cannot tell sequences apart).
+            _drain_aux()
+            if not st["disabled"]:
+                off = _cache_offset(gb.prompt_cache)
+                if off >= 0 and draft.context_length != off:
+                    _disable(
+                        "context_disables",
+                        "drafter context (%d) does not match the target cache (%d): "
+                        "a prefix-cache hit, another request's prefill or a batch "
+                        "change disturbed the aux states",
+                        draft.context_length,
+                        off,
+                    )
+            if not st["disabled"] and not _kv_trimmable(gb.prompt_cache):
+                _disable(
+                    "bounded_kv_disables",
+                    "KV cache is not trimmable (past --max-kv-size); a partial "
+                    "accept could not be rolled back",
+                )
+
+            logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+            primary = mx.argmax(logprobs, axis=-1)  # greedy by install gate
+
+            if st["disabled"]:
+                return _finish_step(gb, inputs, primary, logprobs)
+
+            _bump("rounds")
+            try:
+                mx.eval(primary)
+                p_tok = int(primary.item())
+                drafts = draft.draft(p_tok, model.lm_head, k)
+                nd = len(drafts)  # adaptive: may be < k
+                _bump("drafted", nd)
+
+                st["snaps"] = _rnn_snapshot(gb.prompt_cache)
+                verify_in = mx.array([[p_tok] + drafts], dtype=mx.uint32)
+                vlogits = model(verify_in, cache=gb.prompt_cache)
+                st["advanced"] = nd + 1
+                # position i's logits predict the token after input i
+                vpred = mx.argmax(vlogits[0, :, :], axis=-1)
+                mx.eval(vpred)
+                m, correction = longest_accepted_prefix(vpred.tolist(), drafts)
+                _bump("accepted", m)
+
+                vlp = vlogits[0] - mx.logsumexp(vlogits[0], axis=-1, keepdims=True)
+                if m == nd:
+                    _bump("rounds_full")
+                    for i, d in enumerate(drafts):
+                        st["pending"].append((d, vlp[i]))
+                    st["skip"] = vlogits[:, -1, :]
+                    _drain_aux()  # verify aux == accepted tokens
+                else:
+                    # Partial accept: rewind everything the verify advanced,
+                    # then re-advance the accepted prefix plus the target's
+                    # own corrected token in one forward.
+                    model._dspark_pending.clear()  # verify aux is invalid
+                    _rollback(gb.prompt_cache, st["snaps"], nd + 1)
+                    st["advanced"] = 0
+                    readv = mx.array(
+                        [[p_tok] + drafts[:m] + [correction]], dtype=mx.uint32
+                    )
+                    rlogits = model(readv, cache=gb.prompt_cache)
+                    st["advanced"] = m + 2
+                    for i in range(m):
+                        st["pending"].append((drafts[i], vlp[i]))
+                    st["pending"].append((correction, vlp[m]))
+                    st["skip"] = rlogits[:, -1, :]
+                    _drain_aux()  # re-advance aux == kept tokens
+                mx.async_eval(st["skip"])
+            except Exception:
+                logger.exception(
+                    "[DSpark] draft/verify failed — disabling for this request"
+                )
+                _bump("errors")
+                st["disabled"] = True
+                try:
+                    if st["advanced"]:
+                        # nothing past the snapshot has been emitted yet
+                        _rollback(gb.prompt_cache, st["snaps"], st["advanced"])
+                except Exception:
+                    logger.exception("[DSpark] rollback after failure also failed")
+                st["skip"] = None
+                st["pending"].clear()
+                st["snaps"] = {}
+                st["advanced"] = 0
+                st["emitted_since"] = []
+                model._dspark_pending.clear()
+
+            return _finish_step(gb, inputs, primary, logprobs)
+
+        return _dspark_gb_step
+
+    def _make_extend(gb):
+        def _dspark_extend(batch):
+            # Another sequence is joining: hand over a cache that holds
+            # exactly the emitted prefix.
+            _despeculate(gb)
+            return _gb_cls_extend(gb, batch)
+
+        return _dspark_extend
+
+    def _make_extract(gb):
+        def _dspark_extract_cache(idx):
+            # A finished or aborted request must not carry verified-but-
+            # unemitted tokens into a stored prompt cache.
+            _despeculate(gb)
+            return _gb_cls_extract(gb, idx)
+
+        return _dspark_extract_cache
+
+    batch_gen._inner_next = batch_gen._next
+
+    def _dspark_next():
+        gb = batch_gen._generation_batch
+        if st["installed_on"] is not gb:
+            gb._step = _make_step(gb)
+            gb.extend = _make_extend(gb)
+            gb.extract_cache = _make_extract(gb)
+            st["installed_on"] = gb
+            _reset()
+        return batch_gen._inner_next()
+
+    batch_gen._next = _dspark_next
+
+    def _get_spec_decode_stats() -> Dict[str, Any]:
+        with lock:
+            c = dict(counters)
+        rounds, drafted, accepted = c["rounds"], c["drafted"], c["accepted"]
+        return {
+            "enabled": True,
+            "active": not st["disabled"],
+            "mode": "dspark_block",
+            "num_draft_tokens": k,
+            "rounds": rounds,
+            "drafted": drafted,
+            "accepted": accepted,
+            "rounds_full": c["rounds_full"],
+            "context_disables": c["context_disables"],
+            "bounded_kv_disables": c["bounded_kv_disables"],
+            "despeculations": c["despeculations"],
+            "errors": c["errors"],
+            # per drafted token
+            "acceptance_rate": (accepted / drafted) if drafted else 0.0,
+            # accepted drafts per round; a round also emits the target's own
+            # token after the accepted prefix (tokens/round = this + 1 after a
+            # full block, + 2 after a partial one: correction + next sample)
+            "mean_accept_len": (accepted / rounds) if rounds else 0.0,
+        }
+
+    batch_gen.get_spec_decode_stats = _get_spec_decode_stats
+    logger.info(
+        "[DSpark] installed on GenerationBatch: block spec decode, "
+        f"num_draft_tokens={k} (block_size={block_size})"
+    )
+    return True
+
+
+def _spec_decode_status_snapshot(batch_generator) -> Dict[str, Any]:
+    get_stats = getattr(batch_generator, "get_spec_decode_stats", None)
+    if callable(get_stats):
+        return {"spec_decode": get_stats()}
+    return {}
+
+
 def _mtp_status_snapshot(batch_generator) -> Dict[str, Any]:
     get_mtp_stats = getattr(batch_generator, "get_mtp_stats", None)
     if callable(get_mtp_stats):
@@ -1410,6 +1878,7 @@ class Scheduler:
         self.total_prompt_tokens = 0
         self.total_completion_tokens = 0
         self._mtp_stats_state = _MTPStatsState()
+        self._spec_stats_state = _SpecDecodeStatsState()
 
         # Memory management: periodic mx.clear_cache() to free Metal command buffers
         # Lower interval = less VRAM spike during generation but slight throughput cost
@@ -1541,6 +2010,28 @@ class Scheduler:
         if not need_chunked and prompt_cache_cb is not None:
             if hasattr(bg, "_process_prompts"):
                 _install_prompt_cache_save(bg, prompt_cache_cb)
+
+        # DSpark block-draft speculative decoding: greedy, single-sequence
+        # NemotronH only. Installed per generator so the greedy gate follows
+        # the sampling params that created it.
+        if self.config.spec_draft == "dspark":
+            if getattr(self.model, "dspark", None) is None:
+                logger.warning(
+                    "[DSpark] --spec-draft dspark is set but no drafter is loaded "
+                    "(model.dspark is None); continuing without it"
+                )
+            elif not _sampling_is_greedy(sampling_params):
+                logger.info(
+                    "[DSpark] skipped: sampling is not greedy (temperature=%s)",
+                    sampling_params.temperature,
+                )
+            else:
+                _install_dspark(
+                    bg,
+                    model=self.model,
+                    num_draft_tokens=self.config.spec_num_draft_tokens,
+                    stats_state=self._spec_stats_state,
+                )
 
         # Install MTP if the model supports it
         if self.config.enable_mtp:
@@ -3350,6 +3841,7 @@ class Scheduler:
             "total_completion_tokens": self.total_completion_tokens,
         }
         stats.update(_mtp_status_snapshot(self.batch_generator))
+        stats.update(_spec_decode_status_snapshot(self.batch_generator))
         # Include Metal memory stats
         try:
             if mx.metal.is_available():

@@ -37,6 +37,9 @@ vllm-mlx serve --models-config <yaml> [options]
 | `--mllm-draft-kind` | Assistant drafter kind. Use `mtp` for continuous batching. | None |
 | `--mllm-draft-block-size` | Speculative block size passed to mlx-vlm. | None |
 | `--default-mllm-draft` | Enable the configured assistant by default. Requests can override with `mllm_draft`. | False |
+| `--spec-draft` | Block-draft speculative decoding (`dspark`, NemotronH targets). Requires `--continuous-batching`; greedy single-stream requests only. See [Speculative Decoding](../guides/speculative-decoding.md). | None |
+| `--spec-num-draft-tokens` | Draft tokens per speculative round (max 7 for DSpark). | 7 |
+| `--spec-draft-margin-tau` | Adaptive block length: stop drafting where the draft margin falls below this value. | None |
 | `--cache-memory-mb` | Cache memory limit in MB | Auto |
 | `--cache-memory-percent` | Fraction of RAM for cache | 0.20 |
 | `--no-memory-aware-cache` | Use legacy entry-count cache | False |

@@ -496,6 +496,11 @@ class BatchedEngine(BaseEngine):
             tokenizer_config=tokenizer_config,
         )
 
+        # DSpark block-draft speculative decoding (--spec-draft dspark):
+        # attach the drafter and the aux-hidden-state taps it feeds on.
+        if getattr(self._scheduler_config, "spec_draft", None) == "dspark":
+            self._inject_dspark_drafter()
+
         # Validate MTP support if enabled
         if self._scheduler_config and self._scheduler_config.enable_mtp:
             from ..patches.qwen3_5_mtp import validate_mtp_support as validate_35
@@ -510,6 +515,44 @@ class BatchedEngine(BaseEngine):
                 )
 
         self._configure_metal_memory_limits()
+
+    def _inject_dspark_drafter(self) -> None:
+        """Load the DSpark drafter for a NemotronH text model (--spec-draft dspark).
+
+        Failure is logged and leaves generation unaffected: the scheduler
+        warns and runs plain decode when ``model.dspark`` is absent.
+        """
+        import json
+        from pathlib import Path
+
+        from mlx_lm.utils import _download
+
+        try:
+            model_path = Path(_download(self._model_name))
+            config_path = model_path / "config.json"
+            if not config_path.exists():
+                logger.warning(
+                    "[DSpark] no config.json at %s; not installing", model_path
+                )
+                return
+            with open(config_path) as f:
+                config = json.load(f)
+            if config.get("model_type") != "nemotron_h":
+                logger.warning(
+                    "[DSpark] --spec-draft dspark needs a nemotron_h target, got %r; "
+                    "not installing",
+                    config.get("model_type"),
+                )
+                return
+            from ..patches.nemotron_dspark import inject_dspark_support
+
+            margin_tau = getattr(self._scheduler_config, "spec_draft_margin_tau", None)
+            if inject_dspark_support(
+                self._model, model_path, config, margin_tau=margin_tau
+            ):
+                logger.info("[DSpark] drafter injected")
+        except Exception:
+            logger.exception("[DSpark] drafter injection failed; continuing without it")
 
     def _configure_metal_memory_limits(self) -> None:
         """Make MLX allocation failures graceful during startup."""
