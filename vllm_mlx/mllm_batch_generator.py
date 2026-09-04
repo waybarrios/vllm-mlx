@@ -723,11 +723,14 @@ class MLLMBatchGenerator:
         thinking mode and the template's generation-prompt shape, and costs
         only the few tokens of the ``<|im_start|>assistant`` header.
         """
-        if self._im_end_id is not None:
+        # getattr: tests build the generator with __new__ and set only the
+        # attributes they need, so neither field is guaranteed to exist.
+        im_end_id = getattr(self, "_im_end_id", None)
+        if im_end_id is not None:
             for i in range(len(ids) - 1, -1, -1):
-                if ids[i] == self._im_end_id:
+                if ids[i] == im_end_id:
                     return i + 1
-        S = self._think_suffix_len
+        S = getattr(self, "_think_suffix_len", 0)
         return len(ids) - S if S > 0 else len(ids)
 
     def _compute_think_suffix_len(self) -> int:
