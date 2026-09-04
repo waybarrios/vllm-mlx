@@ -126,6 +126,20 @@ def serve_command(args):
     if mllm_draft_model and (args.auto_unload_idle_seconds > 0 or args.lazy_load_model):
         print("Error: --mllm-draft-model is not supported with lifecycle residency yet")
         sys.exit(1)
+    spec_draft = getattr(args, "spec_draft", None)
+    if spec_draft:
+        if not args.continuous_batching:
+            print("Error: --spec-draft requires --continuous-batching")
+            sys.exit(1)
+        if getattr(args, "mllm", False):
+            print("Error: --spec-draft is not supported with --mllm")
+            sys.exit(1)
+        if args.enable_mtp:
+            print("Error: --spec-draft and --enable-mtp are mutually exclusive")
+            sys.exit(1)
+        if args.spec_num_draft_tokens < 1:
+            print("Error: --spec-num-draft-tokens must be at least 1")
+            sys.exit(1)
 
     # Configure server security settings
     server._api_key = args.api_key
@@ -316,6 +330,10 @@ def serve_command(args):
             enable_mtp=args.enable_mtp,
             mtp_num_draft_tokens=args.mtp_num_draft_tokens,
             mtp_optimistic=args.mtp_optimistic,
+            # Block-draft speculative decoding (DSpark)
+            spec_draft=args.spec_draft,
+            spec_num_draft_tokens=args.spec_num_draft_tokens,
+            spec_draft_margin_tau=args.spec_draft_margin_tau,
             # KV cache quantization
             kv_cache_quantization=args.kv_cache_quantization,
             kv_cache_quantization_bits=args.kv_cache_quantization_bits,
@@ -341,6 +359,13 @@ def serve_command(args):
                     "MTP: MLLM path currently uses effective_draft_tokens=1 "
                     "per verify step; inspect /v1/status for attempts and acceptance"
                 )
+        if args.spec_draft:
+            print(
+                f"Speculative decoding: {args.spec_draft} block draft, "
+                f"draft_tokens={args.spec_num_draft_tokens}, "
+                f"margin_tau={args.spec_draft_margin_tau} "
+                "(greedy single-stream requests only; see /v1/status spec_decode)"
+            )
         print(f"Stream interval: {args.stream_interval} tokens")
         if args.use_paged_cache:
             print(
@@ -1284,6 +1309,31 @@ Examples:
         default=False,
         help="Skip MTP acceptance check for maximum speed. "
         "~5-10%% wrong tokens. Best for chat, not for code.",
+    )
+    # Block-draft speculative decoding (DSpark)
+    serve_parser.add_argument(
+        "--spec-draft",
+        choices=["dspark"],
+        default=None,
+        help="Block-draft speculative decoding. 'dspark' uses the NVIDIA DSpark "
+        "drafter: NemotronH targets, requires --continuous-batching and the "
+        "drafter weights in the model dir (see docs/guides/speculative-decoding.md). "
+        "Engages for greedy (temperature 0) single-stream requests only.",
+    )
+    serve_parser.add_argument(
+        "--spec-num-draft-tokens",
+        type=int,
+        default=7,
+        help="Draft tokens per speculative round (max block_size-1 = 7 for DSpark). "
+        "Default: 7",
+    )
+    serve_parser.add_argument(
+        "--spec-draft-margin-tau",
+        type=float,
+        default=None,
+        help="Adaptive block length: stop drafting at the first position whose "
+        "top1-top2 draft margin falls below this value (e.g. 1.5). Default: off "
+        "(always draft the full block).",
     )
     # Prefill step size
     serve_parser.add_argument(

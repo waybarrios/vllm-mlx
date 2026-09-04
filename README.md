@@ -66,7 +66,7 @@ claude
 ### Reasoning & advanced
 - **Reasoning extraction**: Qwen3, DeepSeek-R1, DeepSeek-V4 (`--reasoning-parser`)
 - **MoE expert reduction**: `--moe-top-k` for +7-16% on Qwen3-30B-A3B
-- **Speculative decoding**: `--mtp` for Qwen3-Next
+- **Speculative decoding**: `--mtp` for Qwen3-Next; `--spec-draft dspark` block drafting for Nemotron 3.5 Lightning ([design + measurements](docs/guides/speculative-decoding.md))
 - **Sparse prefill**: attention-based `--spec-prefill` for TTFT reduction
 
 ### Observability
