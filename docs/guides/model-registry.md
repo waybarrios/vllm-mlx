@@ -155,6 +155,10 @@ per-engine `--cache-memory-mb` maximum remains included. For an unresolved
 remote model ID, set `mllm: true` on the registry entry so the startup report
 can include its cache without relying on a model-name heuristic.
 
+If an entry enables continuous batching while the global serve default leaves
+it disabled, the report uses the same scheduler defaults as the engine,
+including the default 20% memory-aware cache limit.
+
 When the weights budget alone does not fit below the ceiling, startup warns:
 
 ```

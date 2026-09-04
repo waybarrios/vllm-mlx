@@ -414,6 +414,11 @@ def build_memory_budget_report(
     candidates: list[tuple[float, int, str]] = []
     memory_aware_prefix_cache_entries = 0
     scheduler_config = defaults.scheduler_config
+    if scheduler_config is None:
+        # A registry entry can enable continuous batching while the global CLI
+        # flag is off. BatchedEngine supplies SchedulerConfig defaults in that
+        # case, so the startup report must account for the same default cache.
+        scheduler_config = SchedulerConfig()
     for name in sorted(registry):
         entry = registry[name]
         entry_continuous_batching = (

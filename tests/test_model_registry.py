@@ -689,6 +689,28 @@ def test_cache_percent_applies_to_mllm_with_paged_cache(tmp_path):
     assert report.per_engine_cache_percent == pytest.approx(0.35)
 
 
+def test_entry_batching_override_reports_default_scheduler_cache(tmp_path):
+    """Entry-level batching uses SchedulerConfig defaults when CLI batching is off."""
+    registry = _registry(tmp_path, {"vision": 8})
+    registry["vision"] = dataclasses.replace(
+        registry["vision"], continuous_batching=True
+    )
+    vision_path = Path(registry["vision"].source)
+    (vision_path / "config.json").write_text('{"vision_config": {}}')
+
+    report = build_memory_budget_report(
+        _manager_config(budget_gb=10),
+        registry,
+        _defaults(),
+        device_working_set_bytes=128 * GB,
+    )
+
+    assert report.continuous_batching_entries == 1
+    assert report.memory_aware_prefix_cache_entries == 1
+    assert report.per_engine_cache_limit_bytes is None
+    assert report.per_engine_cache_percent == pytest.approx(0.20)
+
+
 @pytest.mark.parametrize("force_source", ["entry", "serve_default"])
 def test_cache_limit_applies_to_forced_mllm_with_paged_cache(tmp_path, force_source):
     """Both MLLM override sources select the same cache path as BatchedEngine."""
