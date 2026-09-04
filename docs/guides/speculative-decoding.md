@@ -48,6 +48,30 @@ prefix. Against a 1-wide greedy run of the same prompt, 199 positions were compa
 divergence, at a position where the 1-wide run's top-1/top-2 logit gap was exactly 0.0000
 (a bf16 tie that a different verify width legitimately breaks the other way).
 
+## Clean run on the rebased tree (2026-09-04, host otherwise idle)
+
+Same build for every row; served with `--continuous-batching --disable-prefix-cache --max-num-seqs 1`, native NVFP4 drafter, greedy, thinking off, one warm-up then three 512-token completions per prompt; medians. M5 Max 128 GB, mlx-lm 0.31.3.
+
+| config | code tok/s | vs plain | accepted / round (per token) | prose tok/s | vs plain | accepted / round (per token) |
+|---|---|---|---|---|---|---|
+| plain greedy | 125.6 | — | — | 118.8 | — | — |
+| DSpark k=4 | 104.1 | 0.83× | 2.98 of 4 (74.6 %) | 65.2 | 0.55× | 1.51 of 4 (37.7 %) |
+| DSpark k=7 | 76.8 | 0.61× | 3.59 of 7 (51.3 %) | 53.6 | 0.45× | 1.88 of 7 (26.9 %) |
+| DSpark k=4, `--spec-draft-margin-tau 1.5` | 109.6 | 0.87× | 2.59 of 2.96 drafted (87.5 %) | 71.1 | 0.60× | 1.17 of 2.22 drafted (52.6 %) |
+
+Counters over the whole run: `errors` 0, `context_disables` 0, `bounded_kv_disables` 0, `despeculations` = one per finished request (the rewind at `extract_cache`). Every config's three runs were byte-identical to each other.
+
+Reading: the ratios match the August measurements (0.7–0.8× then, 0.83–0.87× now on code). Wider blocks lose: k=7 accepts more tokens per round (3.59) but the 8-wide verify costs more than they save. The adaptive cut-off is now the best configuration, because on this tree the cost per drafted position is what it trims. Prose is worse than code at every setting, as the acceptance column predicts.
+
+**Fidelity.** Against the plain run, every DSpark config produced the same two divergences, one per prompt, and all three DSpark configs agree with each other:
+
+| prompt | first divergence | plain chose | DSpark chose | plain-forward logits at that position | gap |
+|---|---|---|---|---|---|
+| code | token 50 of 512 | `\n\n` | `,` | 28.25 vs 28.25 | **0.000** (exact tie) |
+| prose | token 2 of 512 | ` difference` | ` distinction` | 24.125 vs 24.25 | **0.125 = one bf16 ULP** at that magnitude |
+
+The gaps were measured offline with the same weights (the server has no logprobs endpoint): a forward over the prompt plus the common prefix, top-3 logits at the divergence position. In the prose case the wide forward's own argmax is the DSpark token, i.e. the 1-wide run is the one that broke the tie the other way. Both divergences therefore satisfy the acceptance bar proposed in *Greedy versus non-greedy correctness*: every emitted token is an argmax of the target over the emitted prefix, and any difference from a 1-wide run sits at a position whose top-1/top-2 gap is within bf16 resolution.
+
 ## Why it does not win yet: the verify-width curve
 
 Speculative decoding pays for a `(k+1)`-wide verify forward instead of `k+1` single-token
@@ -267,7 +291,7 @@ is a follow-up; the verify forward already produces the full distributions it ne
 | `rounds` | draft/verify rounds attempted |
 | `drafted` / `accepted` | draft tokens proposed / accepted |
 | `acceptance_rate` | `accepted / drafted` (per-token) |
-| `mean_accept_len` | `accepted / rounds`; tokens per round is this + 1 (bonus or corrected token) |
+| `mean_accept_len` | `accepted / rounds`; a round also emits the target's own token after the accepted prefix, so tokens per round is this + 1 after a full block and this + 2 after a partial one (the correction plus the next sample) |
 | `rounds_full` | rounds where the entire block was accepted |
 | `context_disables` | requests where spec turned itself off at the context check |
 | `bounded_kv_disables` | requests where spec turned itself off because the KV cache was no longer trimmable |

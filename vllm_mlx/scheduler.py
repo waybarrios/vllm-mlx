@@ -1736,8 +1736,9 @@ def _install_dspark(
             "errors": c["errors"],
             # per drafted token
             "acceptance_rate": (accepted / drafted) if drafted else 0.0,
-            # accepted drafts per round; each round also emits one target
-            # token (bonus or correction), so tokens/round = this + 1
+            # accepted drafts per round; a round also emits the target's own
+            # token after the accepted prefix (tokens/round = this + 1 after a
+            # full block, + 2 after a partial one: correction + next sample)
             "mean_accept_len": (accepted / rounds) if rounds else 0.0,
         }
 
