@@ -137,7 +137,7 @@ def serve_command(args):
         if args.enable_mtp:
             print("Error: --spec-draft and --enable-mtp are mutually exclusive")
             sys.exit(1)
-        if args.spec_num_draft_tokens < 1:
+        if getattr(args, "spec_num_draft_tokens", 7) < 1:
             print("Error: --spec-num-draft-tokens must be at least 1")
             sys.exit(1)
 
@@ -331,9 +331,9 @@ def serve_command(args):
             mtp_num_draft_tokens=args.mtp_num_draft_tokens,
             mtp_optimistic=args.mtp_optimistic,
             # Block-draft speculative decoding (DSpark)
-            spec_draft=args.spec_draft,
-            spec_num_draft_tokens=args.spec_num_draft_tokens,
-            spec_draft_margin_tau=args.spec_draft_margin_tau,
+            spec_draft=getattr(args, "spec_draft", None),
+            spec_num_draft_tokens=getattr(args, "spec_num_draft_tokens", 7),
+            spec_draft_margin_tau=getattr(args, "spec_draft_margin_tau", None),
             # KV cache quantization
             kv_cache_quantization=args.kv_cache_quantization,
             kv_cache_quantization_bits=args.kv_cache_quantization_bits,
@@ -359,11 +359,11 @@ def serve_command(args):
                     "MTP: MLLM path currently uses effective_draft_tokens=1 "
                     "per verify step; inspect /v1/status for attempts and acceptance"
                 )
-        if args.spec_draft:
+        if getattr(args, "spec_draft", None):
             print(
                 f"Speculative decoding: {args.spec_draft} block draft, "
-                f"draft_tokens={args.spec_num_draft_tokens}, "
-                f"margin_tau={args.spec_draft_margin_tau} "
+                f"draft_tokens={getattr(args, 'spec_num_draft_tokens', 7)}, "
+                f"margin_tau={getattr(args, 'spec_draft_margin_tau', None)} "
                 "(greedy single-stream requests only; see /v1/status spec_decode)"
             )
         print(f"Stream interval: {args.stream_interval} tokens")
