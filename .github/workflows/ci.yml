@@ -99,6 +99,7 @@ jobs:
             tests/test_qwen3_xml_registration.py \
             tests/test_qwen3_xml_streaming_chunks.py \
             tests/test_qwen35_mtp_hidden_state_mode.py \
+            tests/test_mllm_assistant_drafter_loader.py \
             tests/test_streaming_fence_stripper.py \
             tests/test_streaming_think_router.py \
             tests/test_streaming_tool_filter.py \

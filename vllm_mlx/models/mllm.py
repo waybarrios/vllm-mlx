@@ -420,10 +420,10 @@ def load_assistant_drafter(model_path: str):
     Dispatches by the drafter checkpoint's own ``config.json`` ``model_type``
     (via ``mlx_vlm.utils.load_model``, the same generic loader mlx-vlm uses
     for its own regular models) instead of assuming a single fixed
-    architecture. This covers every drafter family mlx-vlm ships under
+    architecture. This covers the MTP drafter families mlx-vlm ships under
     ``mlx_vlm.speculative.drafters`` (``gemma4_assistant``, ``qwen3_5_mtp``,
-    ``eagle3``, ``deepseek_v4_mtp``, ...) with one code path, and any new
-    family mlx-vlm adds later needs no change here.
+    ``deepseek_v4_mtp``, ...) with one code path. Other speculative modes such
+    as Eagle3 and DFlash require generation paths vllm-mlx does not expose yet.
 
     Deliberately uses ``load_model`` rather than ``mlx_vlm.utils.load``:
     standalone assistant/MTP drafters are small predictor heads, not
@@ -431,7 +431,15 @@ def load_assistant_drafter(model_path: str):
     files (they reuse the target model's) — ``load`` would additionally try
     to load a processor and fail or misbehave for such a checkpoint.
     """
+    path = Path(model_path)
+    config_path = path / "config.json"
+    if not config_path.exists():
+        raise FileNotFoundError(f"Assistant drafter config not found: {config_path}")
+    if not sorted(path.glob("*.safetensors")):
+        raise FileNotFoundError(f"Assistant drafter weights not found: {path}")
+
     try:
+        from mlx_vlm.speculative.drafters import resolve_drafter_kind
         from mlx_vlm.utils import load_model
     except ImportError as exc:
         raise ImportError(
@@ -443,14 +451,13 @@ def load_assistant_drafter(model_path: str):
     except PackageNotFoundError:
         mlx_vlm_version = "unknown"
 
-    path = Path(model_path)
-    config_path = path / "config.json"
-    if not config_path.exists():
-        raise FileNotFoundError(f"Assistant drafter config not found: {config_path}")
-    if not sorted(path.glob("*.safetensors")):
-        raise FileNotFoundError(f"Assistant drafter weights not found: {path}")
-
     model_type = json.loads(config_path.read_text(encoding="utf-8")).get("model_type")
+    resolved_kind = resolve_drafter_kind(path)
+    if resolved_kind != "mtp":
+        raise ValueError(
+            f"Assistant drafter model_type={model_type!r} requires draft kind "
+            f"{resolved_kind!r}; vllm-mlx currently supports only 'mtp'."
+        )
     logger.info(
         "Loading %s assistant drafter from %s using mlx-vlm %s",
         model_type or "unknown-architecture",
