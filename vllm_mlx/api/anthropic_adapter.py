@@ -230,8 +230,8 @@ def _convert_message(msg: AnthropicMessage) -> list[Message]:
     tool_results = []
 
     for block in msg.content:
-        if block.type == "text":
-            text_parts.append(block.text or "")
+        if block.type == "text" and block.text:
+            text_parts.append(block.text)
 
         elif block.type == "tool_use":
             # Assistant message with tool calls

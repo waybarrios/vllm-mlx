@@ -109,3 +109,20 @@ def test_missing_config_is_not_reported_as_a_build_failure(tmp_path, caplog):
     with caplog.at_level(logging.ERROR, logger="vllm_mlx.text_model_from_vlm"):
         assert build_text_model(_Vlm(), tmp_path) is None
     assert not caplog.records
+
+
+@pytest.mark.parametrize("model_type", ["qwen4_exp", "qwen4_exp_text"])
+def test_qwen4_exp_stays_on_mlx_vlm_text_path(tmp_path, caplog, model_type):
+    """Qwen4-Exp is not compatible with the generic Qwen3.5 TextModel."""
+    (tmp_path / "config.json").write_text(
+        '{"text_config": {"model_type": "' + model_type + '"}}'
+    )
+
+    class _Vlm:
+        language_model = object()
+
+    with caplog.at_level(logging.INFO, logger="vllm_mlx.text_model_from_vlm"):
+        assert build_text_model(_Vlm(), tmp_path) is None
+
+    assert "mlx-vlm text path" in caplog.records[-1].getMessage()
+    assert not [record for record in caplog.records if record.levelno >= logging.ERROR]

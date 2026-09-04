@@ -46,7 +46,7 @@ claude
 ### API
 - **兼容 OpenAI**：`/v1/chat/completions`、`/v1/completions`、`/v1/embeddings`、`/v1/rerank`、`/v1/responses`
 - **兼容 Anthropic**：`/v1/messages`（流式、工具调用、system prompts）
-- **MCP 工具调用**：12 种解析器（OpenAI、Anthropic、Gemini、Qwen、DeepSeek、Gemma 等）
+- **MCP 工具调用**：19 种解析器（OpenAI、Anthropic、Gemini、Qwen、DeepSeek、Gemma 等）
 - **结构化输出**：通过 `response_format` 的 JSON Schema（基于 lm-format-enforcer）
 
 ### 吞吐与内存
@@ -64,7 +64,7 @@ claude
 - **STT**：Whisper 系列，M4 Max 上 RTF 最高可达 197 倍
 
 ### 推理与高级功能
-- **思维链提取**：Qwen3、DeepSeek-R1（`--reasoning-parser`）
+- **思维链提取**：Qwen3、DeepSeek-R1、DeepSeek-V4（`--reasoning-parser`）
 - **MoE 专家裁剪**：`--moe-top-k`，Qwen3-30B-A3B 上 +7-16%
 - **投机解码**：`--mtp`，用于 Qwen3-Next
 - **稀疏 prefill**：基于注意力的 `--spec-prefill`，降低 TTFT
@@ -295,7 +295,7 @@ Apache 2.0。详见 [LICENSE](LICENSE)。
 
 ## Star 历史
 
-[![Star History Chart](https://api.star-history.com/svg?repos=waybarrios/vllm-mlx&type=Date)](https://star-history.com/#waybarrios/vllm-mlx&Date)
+[![Star History Chart](https://star-history.dera.page/svg?repos=waybarrios/vllm-mlx&type=Date)](https://star-history.dera.page/#waybarrios/vllm-mlx&Date)
 
 ---
 

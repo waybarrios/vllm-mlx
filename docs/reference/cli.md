@@ -33,10 +33,17 @@ vllm-mlx serve --models-config <yaml> [options]
 | `--timeout` | Request timeout in seconds | 300 |
 | `--enable-metrics` | Expose Prometheus metrics on `/metrics` | False |
 | `--continuous-batching` | Enable batching for multi-user | False |
+| `--mllm-draft-model` | Configured mlx-vlm assistant/draft model path. Requires `--mllm`. | None |
+| `--mllm-draft-kind` | Assistant drafter kind. Use `mtp` for continuous batching. | None |
+| `--mllm-draft-block-size` | Speculative block size passed to mlx-vlm. | None |
+| `--default-mllm-draft` | Enable the configured assistant by default. Requests can override with `mllm_draft`. | False |
 | `--cache-memory-mb` | Cache memory limit in MB | Auto |
 | `--cache-memory-percent` | Fraction of RAM for cache | 0.20 |
 | `--no-memory-aware-cache` | Use legacy entry-count cache | False |
 | `--use-paged-cache` | Enable paged KV cache | False |
+| `--prefix-trie-cache` | Enable conversation-prefix reuse in pure-LLM SimpleEngine mode | False |
+| `--prefix-trie-cache-size` | Maximum SimpleEngine prompt-trie entries | 32 |
+| `--prefix-trie-cache-memory-mb` | Optional SimpleEngine prompt-trie memory cap in MB | None |
 | `--max-tokens` | Default max tokens | 32768 |
 | `--max-request-tokens` | Maximum `max_tokens` accepted from API clients | 32768 |
 | `--stream-interval` | Tokens per stream chunk | 1 |
@@ -54,6 +61,7 @@ vllm-mlx serve --models-config <yaml> [options]
 | `--enable-auto-tool-choice` | Enable automatic tool calling | False |
 | `--tool-call-parser` | Tool call parser (`auto`, `mistral`, `qwen`, `llama`, `hermes`, `deepseek`, `kimi`, `granite`, `nemotron`, `xlam`, `functionary`, `glm47`) | None |
 | `--models-config` | YAML registry file for multi-model serving | None |
+| `--memory-budget-gb` | Override the registry manager model-weight residency budget in GB. This is not a total runtime-memory limit and does not guarantee prevention of Metal/MLX OOM. | YAML manager budget |
 
 ### Examples
 
@@ -113,6 +121,9 @@ vllm-mlx serve mlx-community/Llama-3.2-3B-Instruct-4bit --api-key your-secret-ke
 
 # Registry-backed multi-model serving
 vllm-mlx serve --models-config /etc/vllm-mlx/models.yaml --continuous-batching
+
+# Override the registry YAML manager budget at launch time
+vllm-mlx serve --models-config /etc/vllm-mlx/models.yaml --memory-budget-gb 80
 
 # Expose Prometheus metrics
 vllm-mlx serve mlx-community/Llama-3.2-3B-Instruct-4bit --enable-metrics

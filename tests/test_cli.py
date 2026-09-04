@@ -1,5 +1,7 @@
 from types import SimpleNamespace
 
+import pytest
+
 
 def _serve_args(**overrides):
     args = {
@@ -19,6 +21,8 @@ def _serve_args(**overrides):
         "download_retries": 0,
         "download_timeout": 1,
         "embedding_model": None,
+        "embedding_max_length": None,
+        "embedding_overflow_policy": "truncate",
         "enable_auto_tool_choice": False,
         "enable_metrics": False,
         "enable_mtp": False,
@@ -32,10 +36,12 @@ def _serve_args(**overrides):
         "max_cache_blocks": 1000,
         "max_num_seqs": 32,
         "max_tokens": 16,
+        "memory_budget_gb": None,
         "mcp_config": None,
         "mllm_prefill_step_size": None,
         "mllm": False,
         "model": "local-test-model",
+        "models_config": None,
         "mtp_num_draft_tokens": 1,
         "mtp_optimistic": False,
         "no_memory_aware_cache": False,
@@ -45,6 +51,9 @@ def _serve_args(**overrides):
         "prefill_batch_size": 8,
         "prefill_step_size": 512,
         "prefix_cache_size": 100,
+        "prefix_trie_cache": False,
+        "prefix_trie_cache_size": 32,
+        "prefix_trie_cache_memory_mb": None,
         "rate_limit": 0,
         "reasoning_parser": None,
         "served_model_name": None,
@@ -108,3 +117,73 @@ def test_serve_command_propagates_all_sampling_defaults(monkeypatch):
     assert server._default_presence_penalty == 0.0
     assert server._default_repetition_penalty == 1.0
     assert loaded["kwargs"]["specprefill_backbone_pct"] == 0.25
+
+
+def test_serve_parser_accepts_registered_step3p5_tool_parser():
+    from vllm_mlx import cli
+
+    parser = cli.create_parser()
+
+    args = parser.parse_args(
+        [
+            "serve",
+            "--model",
+            "local-test-model",
+            "--enable-auto-tool-choice",
+            "--tool-call-parser",
+            "step3p5",
+        ]
+    )
+
+    assert args.tool_call_parser == "step3p5"
+
+
+def test_memory_budget_help_describes_scope_and_limitations(capsys):
+    from vllm_mlx.cli import create_parser
+
+    with pytest.raises(SystemExit):
+        create_parser().parse_args(["serve", "--help"])
+
+    help_text = " ".join(capsys.readouterr().out.split())
+    assert "registry manager model-weight residency budget" in help_text
+    assert "not a total runtime-memory limit" in help_text
+    assert "does not guarantee prevention of Metal/MLX OOM" in help_text
+
+
+def test_serve_command_rejects_memory_budget_outside_registry_mode(capsys):
+    from vllm_mlx import cli
+
+    with pytest.raises(SystemExit):
+        cli.serve_command(_serve_args(memory_budget_gb=8.0))
+
+    assert "--memory-budget-gb requires --models-config" in capsys.readouterr().out
+
+
+def test_serve_command_applies_memory_budget_override_end_to_end(tmp_path, monkeypatch):
+    from vllm_mlx import cli, server
+
+    config_path = tmp_path / "models.yaml"
+    config_path.write_text("""
+manager:
+  memory_budget_gb: 4
+models:
+  - name: test
+    path: /tmp/test-model
+""".strip())
+    args = cli.create_parser().parse_args(
+        [
+            "serve",
+            "--models-config",
+            str(config_path),
+            "--memory-budget-gb",
+            "6.5",
+            "--offline",
+        ]
+    )
+    monkeypatch.setattr(server, "_model_manager", None)
+    monkeypatch.setattr("uvicorn.run", lambda *args, **kwargs: None)
+
+    cli.serve_command(args)
+
+    assert server._model_manager is not None
+    assert server._model_manager.memory_budget_bytes == int(6.5 * (1024**3))

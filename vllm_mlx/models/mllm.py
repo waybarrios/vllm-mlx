@@ -337,6 +337,83 @@ class MLLMOutput:
     mtp_accepted: int = 0
 
 
+def _chunk_text(chunk) -> str:
+    return chunk.text if hasattr(chunk, "text") else str(chunk)
+
+
+def _generation_kwargs_with_stop(
+    kwargs: dict,
+    stop: list[str] | None,
+) -> dict:
+    if not stop:
+        return kwargs
+    generation_kwargs = dict(kwargs)
+    generation_kwargs["stop"] = stop
+    return generation_kwargs
+
+
+def _until_stop_sequence(chunks, stop: list[str] | None):
+    if not stop:
+        yield from chunks
+        return
+
+    accumulated_text = ""
+    for chunk in chunks:
+        accumulated_text += _chunk_text(chunk)
+        yield chunk
+        if any(stop_seq in accumulated_text for stop_seq in stop):
+            break
+
+
+def _stream_mllm_generated_outputs(
+    *,
+    stream_generate_fn,
+    model,
+    processor,
+    formatted_prompt: str,
+    images,
+    audio,
+    max_tokens: int,
+    temperature: float,
+    prompt_cache,
+    draft_kwargs: dict,
+    generation_kwargs: dict,
+    stop: list[str] | None,
+    draft_metrics,
+):
+    token_count = 0
+    last_chunk = None
+    chunks = stream_generate_fn(
+        model,
+        processor,
+        formatted_prompt,
+        images,
+        audio=audio,
+        max_tokens=max_tokens,
+        temp=temperature,
+        prompt_cache=prompt_cache,
+        **draft_kwargs,
+        **generation_kwargs,
+    )
+    for chunk in _until_stop_sequence(chunks, stop):
+        last_chunk = chunk
+        token_count += 1
+        yield MLLMOutput(
+            text=_chunk_text(chunk),
+            finish_reason=None,
+            prompt_tokens=getattr(chunk, "prompt_tokens", 0),
+            completion_tokens=token_count,
+        )
+
+    yield MLLMOutput(
+        text="",
+        finish_reason="stop",
+        prompt_tokens=getattr(last_chunk, "prompt_tokens", 0) if last_chunk else 0,
+        completion_tokens=token_count,
+        **draft_metrics(),
+    )
+
+
 def load_gemma4_assistant_drafter(model_path: str):
     """Load a Gemma 4 assistant drafter for mlx-vlm speculative decoding."""
     try:
@@ -1242,6 +1319,7 @@ class MLXMultimodalLM:
         draft_model: str | None = None,
         draft_kind: str | None = None,
         draft_block_size: int | None = None,
+        default_draft_enabled: bool = False,
     ):
         """
         Initialize the MLX multimodal language model.
@@ -1263,6 +1341,7 @@ class MLXMultimodalLM:
         self.draft_model_path = draft_model
         self.draft_kind = draft_kind
         self.draft_block_size = draft_block_size
+        self.default_draft_enabled = default_draft_enabled
 
         self.model = None
         self.processor = None
@@ -1332,15 +1411,15 @@ class MLXMultimodalLM:
         return draft_model
 
     def _draft_generation_kwargs(self, call_kwargs: dict | None = None) -> dict:
-        """Return mlx-vlm drafter kwargs when the request explicitly opts in.
+        """Return mlx-vlm drafter kwargs when the request enables the drafter.
 
         ``call_kwargs`` is the outbound mlx-vlm kwargs dict. This method removes
         vllm-mlx drafter control keys before the dict is forwarded so caller
         passthrough values cannot conflict with the configured server drafter.
         """
-        draft_requested = False
+        draft_requested = self.default_draft_enabled
         if call_kwargs is not None:
-            draft_requested = bool(call_kwargs.pop("mllm_draft", False))
+            draft_requested = bool(call_kwargs.pop("mllm_draft", draft_requested))
             for key in _DRAFT_KWARG_NAMES:
                 call_kwargs.pop(key, None)
         if not draft_requested or self._draft_model is None:
@@ -2536,6 +2615,7 @@ class MLXMultimodalLM:
         video_fps = kwargs.pop("video_fps", DEFAULT_FPS)
         video_max_frames = kwargs.pop("video_max_frames", MAX_FRAMES)
         tools = kwargs.pop("tools", None)
+        stop = kwargs.pop("stop", None)
         use_cache = kwargs.pop("use_cache", True)
         enable_thinking = kwargs.pop("enable_thinking", True)
         # Honor chat_template_kwargs on the MLLM path (parity with the text path in
@@ -2699,41 +2779,22 @@ class MLXMultimodalLM:
                 prompt_cache = None
 
         # Stream generate tokens with cache
-        accumulated_text = ""
-        token_count = 0
         draft_accept_start = self._reset_draft_metrics()
-
-        for chunk in stream_generate(
-            self.model,
-            self.processor,
-            formatted_prompt,
-            all_images if all_images else None,
+        generation_kwargs = _generation_kwargs_with_stop(kwargs, stop)
+        yield from _stream_mllm_generated_outputs(
+            stream_generate_fn=stream_generate,
+            model=self.model,
+            processor=self.processor,
+            formatted_prompt=formatted_prompt,
+            images=all_images if all_images else None,
             audio=all_audio if all_audio else None,
             max_tokens=max_tokens,
-            temp=temperature,
+            temperature=temperature,
             prompt_cache=prompt_cache,
-            **self._draft_generation_kwargs(kwargs),
-            **kwargs,
-        ):
-            token_count += 1
-            # chunk is a GenerationResult with .text attribute containing the new token
-            new_text = chunk.text if hasattr(chunk, "text") else str(chunk)
-            accumulated_text += new_text
-
-            yield MLLMOutput(
-                text=new_text,  # Just the new token for streaming
-                finish_reason=None,
-                prompt_tokens=getattr(chunk, "prompt_tokens", 0),
-                completion_tokens=token_count,
-            )
-
-        # Final yield with finish_reason
-        yield MLLMOutput(
-            text="",
-            finish_reason="stop",
-            prompt_tokens=getattr(chunk, "prompt_tokens", 0) if "chunk" in dir() else 0,
-            completion_tokens=token_count,
-            **self._draft_metrics_since(draft_accept_start),
+            draft_kwargs=self._draft_generation_kwargs(generation_kwargs),
+            generation_kwargs=generation_kwargs,
+            stop=stop,
+            draft_metrics=lambda: self._draft_metrics_since(draft_accept_start),
         )
 
     def describe_image(

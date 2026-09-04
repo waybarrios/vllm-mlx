@@ -415,6 +415,62 @@ class TestAnthropicToOpenai:
             ("user", "second question"),
         ]
 
+    def test_typed_system_blocks_ignore_empty_unknown_and_preserve_tool_order(self):
+        msgs = [
+            AnthropicMessage(role="user", content="Find the weather."),
+            AnthropicMessage(
+                role="assistant",
+                content=[
+                    AnthropicContentBlock(
+                        type="tool_use",
+                        id="call_weather",
+                        name="get_weather",
+                        input={"city": "Bogota"},
+                    )
+                ],
+            ),
+            AnthropicMessage(
+                role="system",
+                content=[
+                    AnthropicContentBlock(type="text", text="Be concise."),
+                    AnthropicContentBlock(type="text", text=""),
+                    AnthropicContentBlock(type="cache_control"),
+                    AnthropicContentBlock(type="text", text="Use Celsius."),
+                ],
+            ),
+            AnthropicMessage(
+                role="user",
+                content=[
+                    AnthropicContentBlock(
+                        type="tool_result",
+                        tool_use_id="call_weather",
+                        content="18 C",
+                    )
+                ],
+            ),
+        ]
+        req = self._make_request(
+            system=(
+                "x-anthropic-billing-header: account=test; cch=rotating\n"
+                "You are Claude Code."
+            ),
+            messages=msgs,
+        )
+
+        result = anthropic_to_openai(req)
+
+        assert [message.role for message in result.messages] == [
+            "system",
+            "user",
+            "assistant",
+            "tool",
+        ]
+        assert result.messages[0].content == (
+            "You are Claude Code.\n\nBe concise.\nUse Celsius."
+        )
+        assert result.messages[2].tool_calls[0]["id"] == "call_weather"
+        assert result.messages[3].tool_call_id == "call_weather"
+
 
 class TestOpenaiToAnthropic:
     """Tests for openai_to_anthropic conversion."""

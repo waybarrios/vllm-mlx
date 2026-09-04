@@ -22,12 +22,12 @@ import os
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 
 import mlx.core as mx
 import mlx.nn as nn
 
-from .memory_cache import MemoryAwarePrefixCache, MemoryCacheConfig, _trim_cache_offset
+from .memory_cache import MemoryAwarePrefixCache, MemoryCacheConfig
 from .multimodal_processor import MultimodalProcessor
 from .vision_embedding_cache import VisionEmbeddingCache
 
@@ -77,19 +77,12 @@ def _drop_retired_processors(
 def _request_uses_stochastic_sampling(request: Any) -> bool:
     """Return whether a request needs sampler-aware speculative verification.
 
-    Greedy (temperature 0) requests are excluded regardless of top_p/top_k/
-    min_p: _sampling_logprobs() collapses to an argmax delta distribution for
-    temperature 0 and never applies those filters, so a greedy request left at
-    a non-default top_p/top_k/min_p is not actually stochastic.
+    Any positive temperature samples even when top-p, top-k, and min-p are at
+    their unrestricted defaults. Temperature zero remains greedy regardless of
+    the filter settings.
     """
     temperature = getattr(request, "temperature", 0.0)
-    if temperature in (0, 0.0):
-        return False
-    return (
-        getattr(request, "top_p", 1.0) < 1.0
-        or getattr(request, "top_k", 0) != 0
-        or getattr(request, "min_p", 0.0) != 0.0
-    )
+    return temperature not in (0, 0.0)
 
 
 def _sampling_logprobs(logits: mx.array, request: Any) -> mx.array:
@@ -212,6 +205,7 @@ class MLLMBatchRequest:
     min_p: float = 0.0
     presence_penalty: float = 0.0
     repetition_penalty: float = 1.0
+    mllm_draft: bool = False
     # Extra logits processors (e.g. JSON schema constrained decoding).
     # Merged with built-in repetition/presence penalty processors in
     # ``_prefill_batch``.
@@ -549,6 +543,8 @@ class MLLMBatchGenerator:
         self.unprocessed_requests: List[MLLMBatchRequest] = []
         self.active_batch: Optional[MLLMBatch] = None
         self.uid_counter = 0
+        self._require_uniform_mllm_draft = False
+        self._allow_mid_batch_extend = True
 
         # Statistics
         self._stats = MLLMBatchStats()
@@ -863,6 +859,24 @@ class MLLMBatchGenerator:
             r for r in self.unprocessed_requests if r.uid not in uid_set
         ]
 
+    def _compatible_pending_requests(
+        self,
+        requests: List[MLLMBatchRequest],
+        limit: int,
+        reference: Optional[MLLMBatchRequest] = None,
+    ) -> List[MLLMBatchRequest]:
+        """Select requests that can safely share an assistant-drafter batch."""
+        if not requests or not getattr(self, "_require_uniform_mllm_draft", False):
+            return requests[:limit]
+
+        if reference is None and self.active_batch is not None:
+            reference = self.active_batch.requests[0]
+        if reference is None:
+            reference = requests[0]
+
+        draft_requested = reference.mllm_draft
+        return [r for r in requests if r.mllm_draft == draft_requested][:limit]
+
     def _preprocess_request(self, request: MLLMBatchRequest) -> None:
         """
         Preprocess a single MLLM request (vision encoding).
@@ -1017,87 +1031,173 @@ class MLLMBatchGenerator:
         )
 
     @staticmethod
-    def _copy_prefix_cache(cache_list):
-        """Create shallow copies of cache objects to prevent mutation of stored prefix cache.
-
-        MLX arrays are immutable and safe to share, but cache objects have mutable
-        Python attributes (offset, _idx) that get modified by update_and_fetch().
-        Without copying, the stored prefix cache entry is corrupted after each use.
-        """
-        from mlx_lm.models.cache import KVCache, RotatingKVCache
-
-        copies = []
-        for c in cache_list:
-            if isinstance(c, RotatingKVCache):
-                new_c = RotatingKVCache(c.max_size, c.keep)
-                new_c.step = c.step
-                new_c.keys = c.keys
-                new_c.values = c.values
-                new_c.offset = c.offset
-                new_c._idx = c._idx
-                copies.append(new_c)
-            elif isinstance(c, KVCache):
-                new_c = KVCache()
-                new_c.step = c.step
-                new_c.keys = c.keys
-                new_c.values = c.values
-                new_c.offset = c.offset
-                copies.append(new_c)
-            else:
-                copies.append(c)
-        return copies
+    def _copy_cache_state(value):
+        """Copy mutable state containers while sharing immutable MLX arrays."""
+        if isinstance(value, list):
+            return [MLLMBatchGenerator._copy_cache_state(v) for v in value]
+        if isinstance(value, tuple):
+            return tuple(MLLMBatchGenerator._copy_cache_state(v) for v in value)
+        if isinstance(value, dict):
+            return {
+                k: MLLMBatchGenerator._copy_cache_state(v) for k, v in value.items()
+            }
+        return value
 
     @staticmethod
-    def _has_empty_rotating_cache(cache_list):
+    def _cache_class_families():
+        """Return cache classes shared by the mlx-lm and mlx-vlm families."""
+        from mlx_lm.models import cache as mlx_lm_cache
+        from mlx_vlm.models import cache as mlx_vlm_cache
+
+        return (
+            (mlx_lm_cache.CacheList, mlx_vlm_cache.CacheList),
+            (mlx_lm_cache.KVCache, mlx_vlm_cache.KVCache),
+            (mlx_lm_cache.RotatingKVCache, mlx_vlm_cache.RotatingKVCache),
+        )
+
+    @classmethod
+    def _copy_cache_layer(cls, cache):
+        """Clone one cache wrapper without copying its immutable MLX arrays."""
+        cache_lists, kv_caches, rotating_caches = cls._cache_class_families()
+
+        if isinstance(cache, cache_lists):
+            return type(cache)(*(cls._copy_cache_layer(c) for c in cache.caches))
+        if type(cache) in rotating_caches:
+            copied = type(cache)(cache.max_size, cache.keep)
+            copied.step = cache.step
+            copied.keys = cache.keys
+            copied.values = cache.values
+            copied.offset = cache.offset
+            copied._idx = cache._idx
+            return copied
+        if type(cache) in kv_caches:
+            copied = type(cache)()
+            copied.step = cache.step
+            copied.keys = cache.keys
+            copied.values = cache.values
+            copied.offset = cache.offset
+            return copied
+
+        from_state = getattr(type(cache), "from_state", None)
+        if not callable(from_state):
+            raise TypeError(f"Unsupported prefix cache layer: {type(cache).__name__}")
+        state = cls._copy_cache_state(cache.state)
+        meta_state = cls._copy_cache_state(cache.meta_state)
+        copied = from_state(state, meta_state)
+        if "step" in getattr(cache, "__dict__", {}):
+            copied.step = cache.step
+        return copied
+
+    @classmethod
+    def _copy_prefix_cache(cls, cache_list):
+        """Clone cache wrappers recursively so reuse cannot mutate storage."""
+        try:
+            return [cls._copy_cache_layer(c) for c in cache_list]
+        except (AttributeError, TypeError, ValueError) as exc:
+            logger.warning("Prefix cache copy rejected: %s", exc)
+            return None
+
+    @classmethod
+    def _cache_leaves(cls, cache_list) -> Iterator[Any]:
+        """Yield cache leaves from a possibly nested CacheList topology."""
+        cache_lists, _, _ = cls._cache_class_families()
+
+        for cache in cache_list:
+            if isinstance(cache, cache_lists):
+                yield from cls._cache_leaves(cache.caches)
+            else:
+                yield cache
+
+    @classmethod
+    def _has_empty_rotating_cache(cls, cache_list):
         """Check if any RotatingKVCache layer has no data (keys=None).
 
         This happens when prefix cache stores a long response where all
         sliding-window entries were trimmed (entries_to_keep=0).
         Using such a cache produces garbage — fall through to full prefill.
         """
-        from mlx_lm.models.cache import RotatingKVCache
+        _, _, rotating_caches = cls._cache_class_families()
 
-        for c in cache_list:
-            if isinstance(c, RotatingKVCache) and c.keys is None:
+        for c in cls._cache_leaves(cache_list):
+            if isinstance(c, rotating_caches) and c.keys is None:
                 return True
         return False
 
-    @staticmethod
-    def _trim_rotating_caches(cache_list):
-        """Trim RotatingKVCache buffers restored from prefix cache.
+    @classmethod
+    def _prepare_rotating_caches(cls, cache_list) -> bool:
+        """Normalize oversized rotating buffers without changing positions.
 
-        Prefix cache stores the full KV state (offset may exceed max_size for
-        sliding-window layers).  RotatingKVCache._update_in_place computes
-        ``new_size = min(step, max_size - prev)`` which goes negative when
-        ``prev > max_size``, crashing with "Negative dimensions not allowed".
-
-        Trimming the buffer to max_size and clamping offset/idx prevents this.
+        A saturated cache legitimately has ``offset > max_size``: offset is the
+        absolute sequence position and must not be clamped to the window size.
+        Oversized prefill buffers are reduced to the configured window while
+        preserving that offset. Inconsistent undersized buffers fail closed.
         """
-        from mlx_lm.models.cache import RotatingKVCache
+        _, _, rotating_caches = cls._cache_class_families()
 
-        for layer_cache in cache_list:
-            if not isinstance(layer_cache, RotatingKVCache):
+        for layer_cache in cls._cache_leaves(cache_list):
+            # Buffered subclasses deliberately retain rollback slack beyond the
+            # attention window; only normalize the two plain implementations.
+            if type(layer_cache) not in rotating_caches:
                 continue
             if layer_cache.keys is None:
-                layer_cache.offset = 0
-                continue
+                if layer_cache.offset == 0:
+                    continue
+                return False
             buf_len = layer_cache.keys.shape[2]
             if buf_len > layer_cache.max_size:
                 trim_size = buf_len - layer_cache.max_size
                 layer_cache.keys = layer_cache._trim(trim_size, layer_cache.keys)
                 layer_cache.values = layer_cache._trim(trim_size, layer_cache.values)
                 layer_cache._idx = layer_cache.max_size
-            layer_cache.offset = min(layer_cache.offset, layer_cache.max_size)
-            # Defensive: ensure size() <= keys.shape[2] to prevent merge crash.
-            # Prefix cache trimming can create offset > keys.shape[2] when
-            # a supersequence/LCP trim crosses the max_size boundary.
             buf_len = layer_cache.keys.shape[2]
-            if min(layer_cache.offset, layer_cache.max_size) > buf_len:
+            required = min(layer_cache.offset, layer_cache.max_size)
+            if required > buf_len:
                 logger.warning(
-                    f"RotatingKVCache offset ({layer_cache.offset}) > "
-                    f"buffer ({buf_len}), capping to buffer size"
+                    "Prefix cache has inconsistent RotatingKVCache state: "
+                    "offset=%s max_size=%s buffer=%s",
+                    layer_cache.offset,
+                    layer_cache.max_size,
+                    buf_len,
                 )
-                layer_cache.offset = buf_len
+                return False
+        return True
+
+    @classmethod
+    def _can_rewind_prefix_cache(cls, cache_list, trim_by: int) -> bool:
+        """Return whether every cache leaf retains the positions to rewind."""
+        if trim_by <= 0:
+            return True
+        for cache in cls._cache_leaves(cache_list):
+            keys = getattr(cache, "keys", None)
+            offset = getattr(cache, "offset", None)
+            if keys is None or offset is None or offset < trim_by:
+                return False
+            if isinstance(keys, (list, tuple)):
+                return False
+            is_trimmable = getattr(cache, "is_trimmable", None)
+            if not callable(is_trimmable) or not is_trimmable():
+                return False
+        return True
+
+    @classmethod
+    def _rewind_prefix_cache(cls, cache_list, trim_by: int):
+        """Clone and safely rewind every leaf, or return None to fail closed."""
+        if not cls._can_rewind_prefix_cache(cache_list, trim_by):
+            return None
+        copied = cls._copy_prefix_cache(cache_list)
+        if copied is None or trim_by <= 0:
+            return copied
+
+        # Use each cache implementation's own trim contract after cloning.
+        # This preserves type-specific metadata such as ChunkedKVCache's
+        # chunk_size/start_position instead of reconstructing a generic KV
+        # wrapper. Verify the full rewind so a partially retained window cannot
+        # be stored under a longer token key.
+        for cache in cls._cache_leaves(copied):
+            trim = getattr(cache, "trim", None)
+            if not callable(trim) or trim(trim_by) != trim_by:
+                return None
+        return copied
 
     def _run_chunked_text_prefill(
         self, request: MLLMBatchRequest, cache: List[Any]
@@ -1434,11 +1534,34 @@ class MLLMBatchGenerator:
                     cached_kv = None
                     remaining_ids = None
 
+                prepared_cache = None
+                if cached_kv is not None and remaining_ids:
+                    prepared_cache = self._copy_prefix_cache(cached_kv)
+                    if prepared_cache is None or not self._prepare_rotating_caches(
+                        prepared_cache
+                    ):
+                        logger.warning(
+                            "Prefix cache hit for %s has unsupported or inconsistent "
+                            "cache state — falling through to full prefill",
+                            req.request_id,
+                        )
+                        cached_kv = None
+                        remaining_ids = None
+                        prepared_cache = None
+                elif cached_kv is not None and not remaining_ids:
+                    prepared_cache = self._rewind_prefix_cache(cached_kv, 1)
+                    if prepared_cache is None:
+                        logger.debug(
+                            "Prefix cache exact hit for %s cannot be rewound "
+                            "safely — falling through to full prefill",
+                            req.request_id,
+                        )
+                        cached_kv = None
+
                 if cached_kv is not None and remaining_ids:
                     # Prefix/LCP match — run language model on remaining tokens.
-                    # Copy cache to prevent mutation of stored prefix cache entry.
-                    request_cache = self._copy_prefix_cache(cached_kv)
-                    self._trim_rotating_caches(request_cache)
+                    # The prepared cache is an isolated recursive copy.
+                    request_cache = prepared_cache
                     remaining = mx.array(remaining_ids)[None, :]
                     cached_count = len(input_ids_list) - len(remaining_ids)
                     total_tokens = len(input_ids_list)
@@ -1514,9 +1637,8 @@ class MLLMBatchGenerator:
                     # but we still need logits for the last position.
                     # Trim by 1 so re-running the last token produces correct
                     # logits for the next-token prediction.
-                    # _trim_cache_offset creates new cache objects (safe for
-                    # stored entry).
-                    request_cache = _trim_cache_offset(cached_kv, 1)
+                    # The prepared cache is a safe recursive one-token rewind.
+                    request_cache = prepared_cache
                     last_token = req.input_ids[:, -1:]
                     total_tokens = len(input_ids_list)
                     self._prefill_progress[req.request_id] = (
@@ -1604,7 +1726,8 @@ class MLLMBatchGenerator:
         from mlx_lm.models.cache import RotatingKVCache
 
         for rc in per_request_caches:
-            self._trim_rotating_caches(rc)
+            if not self._prepare_rotating_caches(rc):
+                raise RuntimeError("Cannot merge inconsistent rotating cache state")
             for layer_cache in rc:
                 if isinstance(layer_cache, RotatingKVCache):
                     if layer_cache.keys is not None:
@@ -1760,7 +1883,9 @@ class MLLMBatchGenerator:
         # Exception: text-only requests can be extended into an active batch
         # via the elif branch below (they skip vision encoding entirely).
         if num_active == 0:
-            requests = self.unprocessed_requests[: self.completion_batch_size]
+            requests = self._compatible_pending_requests(
+                self.unprocessed_requests, self.completion_batch_size
+            )
 
             if len(requests) == 0:
                 self.active_batch = None
@@ -1769,9 +1894,11 @@ class MLLMBatchGenerator:
             try:
                 # Save count before _process_prompts which modifies
                 # `requests` in-place via .remove() for failed items.
-                num_to_consume = len(requests)
+                requested_uids = {r.uid for r in requests}
                 new_batch = self._process_prompts(requests)
-                self.unprocessed_requests = self.unprocessed_requests[num_to_consume:]
+                self.unprocessed_requests = [
+                    r for r in self.unprocessed_requests if r.uid not in requested_uids
+                ]
                 self.active_batch = new_batch
                 prompt_processing = True
             except Exception as e:
@@ -1781,7 +1908,9 @@ class MLLMBatchGenerator:
                     exc_info=True,
                 )
                 # Remove failed requests to avoid infinite retry loop
-                self.unprocessed_requests = self.unprocessed_requests[len(requests) :]
+                self.unprocessed_requests = [
+                    r for r in self.unprocessed_requests if r.uid not in requested_uids
+                ]
                 for req in requests:
                     self._pending_error_responses.append(
                         MLLMBatchResponse(
@@ -1795,10 +1924,13 @@ class MLLMBatchGenerator:
 
         # Mid-batch extend: text-only requests can join an active batch
         # without vision encoding (no shape mismatch risk).
-        elif self.unprocessed_requests:
-            text_only = [
-                r for r in self.unprocessed_requests if not r.images and not r.videos
-            ][: self.completion_batch_size]
+        elif self.unprocessed_requests and getattr(
+            self, "_allow_mid_batch_extend", True
+        ):
+            text_only = self._compatible_pending_requests(
+                [r for r in self.unprocessed_requests if not r.images and not r.videos],
+                self.completion_batch_size,
+            )
 
             if text_only:
                 try:
@@ -1977,6 +2109,30 @@ class MLLMBatchGenerator:
         self._stats.peak_memory = mx.get_peak_memory() / 1e9
         return self._stats
 
+    def _store_prefix_snapshot(
+        self,
+        cache_key: List[int],
+        cache: List[Any],
+        trim_by: int,
+        request_id: str,
+        source: str,
+    ) -> bool:
+        """Store an isolated, key-aligned cache snapshot when rewind is safe."""
+        if self.prefix_cache is None:
+            return False
+        snapshot = self._rewind_prefix_cache(cache, trim_by)
+        if snapshot is None:
+            logger.debug(
+                "Skipping %s prefix cache store for %s: cache cannot be "
+                "rewound safely by %s token(s)",
+                source,
+                request_id,
+                trim_by,
+            )
+            return False
+        self.prefix_cache.store(cache_key, snapshot)
+        return True
+
     def _maybe_store_prefix_cache(
         self, batch: MLLMBatch, end_indices: List[int]
     ) -> None:
@@ -1999,9 +2155,14 @@ class MLLMBatchGenerator:
                     output_count = batch.num_tokens[i]
                     S = self._think_suffix_len
                     total_trim = output_count + S
-                    prompt_cache = _trim_cache_offset(extracted, total_trim)
                     cache_key = input_ids_list[:-S] if S > 0 else input_ids_list
-                    self.prefix_cache.store(cache_key, prompt_cache)
+                    self._store_prefix_snapshot(
+                        cache_key,
+                        extracted,
+                        total_trim,
+                        req.request_id,
+                        "completion",
+                    )
                 except Exception as e:
                     logger.warning(
                         f"Failed to store prefix cache for {req.request_id}: {type(e).__name__}: {e}"
@@ -2036,10 +2197,34 @@ class MLLMBatchGenerator:
         return bool(self.unprocessed_requests or self.active_batch)
 
 
+def _draft_external_mtp_active_batch(
+    draft_model: Any,
+    primary_tokens: mx.array,
+    hidden_states: mx.array,
+    positions: List[int],
+    sampler: Callable,
+) -> mx.array:
+    """Draft one token per row without conflating mixed KV positions."""
+    from mlx_vlm.speculative.mtp import _mtp_draft_block_active
+
+    return _mtp_draft_block_active(
+        draft_model,
+        primary_tokens.tolist(),
+        hidden_states[:, -1:, :],
+        2,
+        sampler,
+        primary_tokens.dtype,
+        positions,
+        greedy_sampling=True,
+    )[:, 0]
+
+
 def install_mtp_mllm(
     batch_gen: "MLLMBatchGenerator",
     language_model: Any,
     num_draft_tokens: int = 1,
+    draft_model: Any = None,
+    draft_block_size: Optional[int] = None,
 ) -> None:
     """Install MTP (Multi-Token Prediction) on an MLLMBatchGenerator.
 
@@ -2059,6 +2244,30 @@ def install_mtp_mllm(
 
     _orig_step = batch_gen._step
     _draft_sampler = make_sampler(temp=0.0)
+    external_drafter = draft_model is not None
+    if external_drafter:
+        batch_gen._require_uniform_mllm_draft = True
+        batch_gen._allow_mid_batch_extend = False
+        draft_model.reset(batch_gen.model)
+
+    def _model_parts(output: Any) -> Tuple[mx.array, Optional[mx.array]]:
+        if isinstance(output, tuple):
+            return output[0], output[1]
+        logits = getattr(output, "logits", output)
+        hidden = getattr(output, "hidden_states", None)
+        if isinstance(hidden, list):
+            hidden = hidden[-1] if hidden else None
+        return logits, hidden
+
+    def _shared_kv(cache: List[Any]) -> Dict[str, Any]:
+        from mlx_vlm.speculative.mtp import _mtp_shared_kv_from_prompt_cache
+
+        return _mtp_shared_kv_from_prompt_cache(language_model, cache)
+
+    def _cache_positions(cache: List[Any], batch_size: int) -> Tuple[int, List[int]]:
+        from mlx_vlm.speculative.mtp import _mtp_cache_positions
+
+        return _mtp_cache_positions(cache, batch_size)
 
     # Skip state belongs to a request, not a batch position. Text-only work
     # may join/leave a continuous batch between decode steps; positional state
@@ -2078,6 +2287,7 @@ def install_mtp_mllm(
         "no_active_batch": 0,
         "concurrent_batch": 0,
         "logits_processors": 0,
+        "assistant_not_requested": 0,
     }
 
     def _get_mtp_stats() -> Dict[str, Any]:
@@ -2093,6 +2303,9 @@ def install_mtp_mllm(
             "enabled": True,
             "requested_draft_tokens": num_draft_tokens,
             "effective_draft_tokens": 1,
+            "implementation": (
+                "external_assistant" if external_drafter else "native_target_head"
+            ),
             "mode": "request_local_sampler_aware_verified",
             "attempted": attempted,
             "accepted": accepted,
@@ -2127,12 +2340,22 @@ def install_mtp_mllm(
         logits_processors_bypass = logits_processors is not None and any(
             logits_processors
         )
-        if prefill_bypass or no_active_batch_bypass or logits_processors_bypass:
+        assistant_not_requested_bypass = external_drafter and (
+            not active_requests
+            or not all(request.mllm_draft for request in active_requests)
+        )
+        if (
+            prefill_bypass
+            or no_active_batch_bypass
+            or logits_processors_bypass
+            or assistant_not_requested_bypass
+        ):
             # Keep the descriptions near the guards so operator-facing
             # telemetry stays dynamic instead of duplicating code predicates:
             # prefill=input_tokens.shape[1] > 1
             # no_active_batch=active_batch is None
             # logits_processors=request-local processors are active
+            # assistant_not_requested=not every active request opted in
             with _mtp_stats_lock:
                 if prefill_bypass:
                     _bypass_counts["prefill"] += 1
@@ -2140,6 +2363,8 @@ def install_mtp_mllm(
                     _bypass_counts["no_active_batch"] += 1
                 if logits_processors_bypass:
                     _bypass_counts["logits_processors"] += 1
+                if assistant_not_requested_bypass:
+                    _bypass_counts["assistant_not_requested"] += 1
             _skip_state_by_uid.clear()
             return _orig_step(
                 input_tokens, cache, logits_processors, output_tokens, samplers
@@ -2169,9 +2394,8 @@ def install_mtp_mllm(
         else:
             # Normal forward with return_hidden
             model_output = language_model(input_tokens, cache=cache, return_hidden=True)
-            if isinstance(model_output, tuple):
-                logits, hidden_states = model_output
-            else:
+            logits, hidden_states = _model_parts(model_output)
+            if hidden_states is None:
                 return _orig_step(
                     input_tokens, cache, logits_processors, output_tokens, samplers
                 )
@@ -2205,18 +2429,53 @@ def install_mtp_mllm(
         try:
             with _mtp_stats_lock:
                 _mtp_stats["attempted"] += 1
-            draft_logits = language_model.mtp_forward(
-                hidden_states[:, -1:, :],
-                primary_tokens[:, None],
-                mtp_cache=None,
-            )
-            draft_logits = draft_logits[:, -1, :]
             sampled_rows = [
                 _request_uses_stochastic_sampling(request)
                 for request in active_requests
             ]
             uses_stochastic_sampling = any(sampled_rows)
-            if uses_stochastic_sampling:
+            if external_drafter:
+                from mlx_vlm.speculative.common import _batch_cache_left_padding
+                from mlx_vlm.speculative.mtp import _mtp_draft_position
+
+                shared_kv = _shared_kv(cache)
+                if not shared_kv:
+                    raise RuntimeError(
+                        "Assistant MTP requires target shared-KV state from the batch cache"
+                    )
+                max_position, positions = _cache_positions(cache, batch_size)
+                draft_model.set_shared_kv(
+                    shared_kv,
+                    kv_offset=max_position,
+                    position=_mtp_draft_position(mx.array(positions)),
+                    kv_valid_len=mx.array(positions),
+                    left_padding=_batch_cache_left_padding(cache),
+                )
+                # Sample-and-compare preserves the target distribution here only
+                # because the external draft is a point mass. Changing greedy=True
+                # requires a rejection-sampling verifier that accounts for q(x).
+                # Mixed-position batches cannot share one assistant-drafter
+                # decode position. A request that joins an active batch has a
+                # shorter valid KV length than the rows already decoding; the
+                # mlx-vlm helper drafts those rows independently and restores
+                # the batched shared-KV view afterwards.
+                draft_tokens = _draft_external_mtp_active_batch(
+                    draft_model,
+                    primary_tokens,
+                    hidden_states,
+                    positions,
+                    _draft_sampler,
+                )
+                draft_distribution = None
+            else:
+                draft_logits = language_model.mtp_forward(
+                    hidden_states[:, -1:, :],
+                    primary_tokens[:, None],
+                    mtp_cache=None,
+                )
+                draft_logits = draft_logits[:, -1, :]
+
+            if uses_stochastic_sampling and not external_drafter:
                 draft_distribution = mx.concatenate(
                     [
                         _sampling_logprobs(draft_logits[row : row + 1], request)
@@ -2225,7 +2484,7 @@ def install_mtp_mllm(
                     axis=0,
                 )
                 draft_tokens = mx.random.categorical(draft_distribution)
-            else:
+            elif not external_drafter:
                 draft_logprobs = draft_logits - mx.logsumexp(
                     draft_logits, axis=-1, keepdims=True
                 )
@@ -2251,11 +2510,7 @@ def install_mtp_mllm(
             verify_output = language_model(
                 verify_input, cache=cache, return_hidden=True
             )
-            if isinstance(verify_output, tuple):
-                verify_logits, verify_hidden = verify_output
-            else:
-                verify_logits = verify_output
-                verify_hidden = None
+            verify_logits, verify_hidden = _model_parts(verify_output)
 
             # Verify in each request's sampler space. The old argmax equality
             # check was valid only for greedy decoding and silently bypassed
@@ -2263,7 +2518,26 @@ def install_mtp_mllm(
             draft_list = draft_tokens.tolist()
             residual_tokens_by_uid: Dict[int, int] = {}
             residual_logprobs_by_uid: Dict[int, mx.array] = {}
-            if uses_stochastic_sampling:
+            if uses_stochastic_sampling and external_drafter:
+                verify_distribution = mx.concatenate(
+                    [
+                        _sampling_logprobs(verify_logits[row : row + 1, 0, :], request)
+                        for row, request in enumerate(active_requests)
+                    ],
+                    axis=0,
+                )
+                # _sampling_logprobs already applies each request's sampler
+                # transforms. Draw directly from that distribution so
+                # temperature and top-k/top-p/min-p are not applied twice.
+                sampled_target = mx.random.categorical(verify_distribution)
+                mx.eval(sampled_target, draft_tokens)
+                all_accepted = sampled_target.tolist() == draft_list
+                if not all_accepted:
+                    sampled_target_list = sampled_target.tolist()
+                    for row, uid in enumerate(current_uids):
+                        residual_tokens_by_uid[uid] = int(sampled_target_list[row])
+                        residual_logprobs_by_uid[uid] = verify_distribution[row]
+            elif uses_stochastic_sampling:
                 verify_distribution = mx.concatenate(
                     [
                         _sampling_logprobs(verify_logits[row : row + 1, 0, :], request)
@@ -2302,6 +2576,9 @@ def install_mtp_mllm(
                 verify_lp = verify_logits[:, 0, :] - mx.logsumexp(
                     verify_logits[:, 0, :], axis=-1, keepdims=True
                 )
+                accepted_logprobs = (
+                    verify_distribution if uses_stochastic_sampling else verify_lp
+                )
                 for e in range(batch_size):
                     uid = current_uids[e]
                     _skip_state_by_uid[uid] = {
@@ -2310,27 +2587,31 @@ def install_mtp_mllm(
                     }
                     _deferred_drafts[uid] = {
                         "token": draft_list[e],
-                        "logprobs": verify_lp[e],
+                        "logprobs": accepted_logprobs[e],
+                        "from_draft": True,
                     }
                 with _mtp_stats_lock:
                     _mtp_stats["accepted"] += 1
+                if external_drafter:
+                    draft_model.accept_lens.append(1)
+                    draft_model.draft_lens.append(1)
 
             else:
                 # A batch cache cannot roll back an individual row. On a mixed
-                # concurrent rejection, replay only the primary token for every
-                # row; this preserves each target distribution and trades that
-                # step's acceleration for exact cache state. A single sampled
-                # rejection can retain its residual token and still advance.
-                sampled_single_reject = (
-                    uses_stochastic_sampling
-                    and batch_size == 1
-                    and bool(residual_tokens_by_uid)
+                # concurrent rejection, replay the same suffix for every row.
+                # External assistant verification retains the already sampled
+                # target token instead of sampling it twice. Native sampled MTP
+                # only retains a residual for a single-row rejection.
+                sampled_reject = uses_stochastic_sampling and bool(
+                    residual_tokens_by_uid
                 )
                 replay_tokens = primary_tokens
-                if sampled_single_reject:
-                    residual_token = residual_tokens_by_uid[current_uids[0]]
+                if sampled_reject:
+                    residual_tokens = mx.array(
+                        [residual_tokens_by_uid[uid] for uid in current_uids]
+                    )
                     replay_tokens = mx.concatenate(
-                        [primary_tokens[:, None], mx.array([[residual_token]])],
+                        [primary_tokens[:, None], residual_tokens[:, None]],
                         axis=1,
                     )
 
@@ -2347,19 +2628,11 @@ def install_mtp_mllm(
                     for _ci, _snap in _rnn_snapshots.items():
                         cache[_ci].state = _snap
                     rerun_out = language_model(
-                        (
-                            replay_tokens
-                            if sampled_single_reject
-                            else primary_tokens[:, None]
-                        ),
+                        (replay_tokens if sampled_reject else primary_tokens[:, None]),
                         cache=cache,
                         return_hidden=True,
                     )
-                    if isinstance(rerun_out, tuple):
-                        rerun_logits, rerun_hidden = rerun_out
-                    else:
-                        rerun_logits = rerun_out
-                        rerun_hidden = None
+                    rerun_logits, rerun_hidden = _model_parts(rerun_out)
                     if rerun_hidden is not None:
                         mx.async_eval(rerun_logits[:, -1, :], rerun_hidden[:, -1:, :])
                         for row, uid in enumerate(current_uids):
@@ -2381,15 +2654,17 @@ def install_mtp_mllm(
                             and hasattr(c, "trim")
                         ):
                             c.trim(1)
-                    if sampled_single_reject:
-                        residual_token = residual_tokens_by_uid[current_uids[0]]
+                    if sampled_reject:
+                        residual_tokens = mx.array(
+                            [residual_tokens_by_uid[uid] for uid in current_uids]
+                        )
                         rerun_out = language_model(
-                            mx.array([[residual_token]]),
+                            residual_tokens[:, None],
                             cache=cache,
                             return_hidden=True,
                         )
-                        if isinstance(rerun_out, tuple):
-                            rerun_logits, rerun_hidden = rerun_out
+                        if isinstance(rerun_out, tuple) or hasattr(rerun_out, "logits"):
+                            rerun_logits, rerun_hidden = _model_parts(rerun_out)
                             # language_model(...) returns (batch, seq, vocab)/
                             # (batch, seq, hidden); reduce logits to the same
                             # 2-D (batch, vocab) convention every other
@@ -2416,16 +2691,20 @@ def install_mtp_mllm(
                         _skip_state_by_uid.clear()
                 for row, uid in enumerate(current_uids):
                     _deferred_drafts.pop(uid, None)
-                    if sampled_single_reject:
+                    if sampled_reject:
                         # Report the logprob from the residual distribution the
                         # token was actually drawn from, not the raw unfiltered
                         # target distribution at this position.
                         _deferred_drafts[uid] = {
                             "token": residual_tokens_by_uid[uid],
                             "logprobs": residual_logprobs_by_uid[uid],
+                            "from_draft": False,
                         }
                 with _mtp_stats_lock:
                     _mtp_stats["rejected"] += 1
+                if external_drafter:
+                    draft_model.accept_lens.append(0)
+                    draft_model.draft_lens.append(1)
 
         except Exception as e:
             logger.warning(f"[MTP-MLLM] draft/verify failed: {e}")
@@ -2502,6 +2781,7 @@ def install_mtp_mllm(
                     draft_info = prev_deferred.pop(uid)
                     draft_t = draft_info["token"]
                     draft_lp = draft_info["logprobs"]
+                    from_draft = draft_info.get("from_draft", True)
 
                     if draft_t in batch_gen.stop_tokens:
                         augmented.append(
@@ -2511,7 +2791,7 @@ def install_mtp_mllm(
                                 token=draft_t,
                                 logprobs=draft_lp,
                                 finish_reason="stop",
-                                from_draft=True,
+                                from_draft=from_draft,
                             )
                         )
                         draft_end_uids.add(uid)
@@ -2535,7 +2815,7 @@ def install_mtp_mllm(
                                 token=draft_t,
                                 logprobs=draft_lp,
                                 finish_reason=draft_finish,
-                                from_draft=True,
+                                from_draft=from_draft,
                             )
                         )
 
@@ -2758,11 +3038,22 @@ def install_chunked_prefill_mllm(
                 # IMPORTANT: Only inline requests whose prompt fits
                 # within the chunk budget — longer requests must wait
                 # for their own interleaved prefill (Phase 2).
-                if batch_gen.unprocessed_requests:
+                if batch_gen.unprocessed_requests and getattr(
+                    batch_gen, "_allow_mid_batch_extend", True
+                ):
                     _budget = batch_gen._chunked_prefill_budget
                     short_reqs = []
+                    reference = (
+                        batch_gen.active_batch.requests[0]
+                        if batch_gen.active_batch is not None
+                        else req
+                    )
                     for r in batch_gen.unprocessed_requests:
                         if r.images or r.videos:
+                            continue
+                        if not batch_gen._compatible_pending_requests(
+                            [r], 1, reference=reference
+                        ):
                             continue
                         if r.input_ids is None:
                             try:
@@ -2861,7 +3152,10 @@ def install_chunked_prefill_mllm(
                     from mlx_lm.models.cache import RotatingKVCache
 
                     request_cache = partial["cache"]
-                    batch_gen._trim_rotating_caches(request_cache)
+                    if not batch_gen._prepare_rotating_caches(request_cache):
+                        raise RuntimeError(
+                            "Cannot merge inconsistent rotating cache state"
+                        )
                     for layer_cache in request_cache:
                         if isinstance(layer_cache, RotatingKVCache):
                             if layer_cache.keys is not None:
@@ -2904,8 +3198,13 @@ def install_chunked_prefill_mllm(
                         # trim by S only (matching canonical path's
                         # output_count + S invariant).
                         trim_amount = S
-                        store_cache = _trim_cache_offset(partial["cache"], trim_amount)
-                        batch_gen.prefix_cache.store(cache_key, store_cache)
+                        batch_gen._store_prefix_snapshot(
+                            cache_key,
+                            partial["cache"],
+                            trim_amount,
+                            req.request_id,
+                            "interleaved prefill",
+                        )
                     except Exception as e:
                         logger.warning(
                             f"Failed to store prefix cache after chunked "
@@ -2925,10 +3224,16 @@ def install_chunked_prefill_mllm(
         batch = batch_gen.active_batch
         num_active = len(batch) if batch else 0
 
-        if batch_gen.unprocessed_requests:
+        if batch_gen.unprocessed_requests and (
+            num_active == 0 or getattr(batch_gen, "_allow_mid_batch_extend", True)
+        ):
             # Find first text-only request eligible for interleaving
             text_only_req = None
-            for r in batch_gen.unprocessed_requests:
+            compatible_pending = batch_gen._compatible_pending_requests(
+                batch_gen.unprocessed_requests,
+                len(batch_gen.unprocessed_requests),
+            )
+            for r in compatible_pending:
                 if not r.images and not r.videos:
                     text_only_req = r
                     break
@@ -2979,17 +3284,31 @@ def install_chunked_prefill_mllm(
                         cached_kv = None
                         remaining_ids = None
 
+                prepared_cache = None
+                if cached_kv is not None and remaining_ids:
+                    prepared_cache = batch_gen._copy_prefix_cache(cached_kv)
+                    if (
+                        prepared_cache is None
+                        or not batch_gen._prepare_rotating_caches(prepared_cache)
+                    ):
+                        cached_kv = None
+                        remaining_ids = None
+                        prepared_cache = None
+                elif cached_kv is not None and not remaining_ids:
+                    prepared_cache = batch_gen._rewind_prefix_cache(cached_kv, 1)
+                    if prepared_cache is None:
+                        cached_kv = None
+
                 if cached_kv is not None and remaining_ids:
                     # Prefix cache hit
-                    request_cache = batch_gen._copy_prefix_cache(cached_kv)
-                    batch_gen._trim_rotating_caches(request_cache)
+                    request_cache = prepared_cache
                     remaining = mx.array(remaining_ids)[None, :]
                     cached_count = total_tokens - len(remaining_ids)
                     remaining_count = len(remaining_ids)
                 elif cached_kv is not None and not remaining_ids:
                     # Exact hit — trim cache by 1 so replaying the last token
                     # produces correct logits (same as _process_prompts path).
-                    request_cache = _trim_cache_offset(cached_kv, 1)
+                    request_cache = prepared_cache
                     remaining = input_ids[:, -1:]
                     cached_count = total_tokens - 1
                     remaining_count = 1

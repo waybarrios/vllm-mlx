@@ -298,15 +298,10 @@ class TestSchedulerIntegration:
 
 
 class TestTrimRotatingCaches:
-    """Regression tests for _trim_rotating_caches offset clamp."""
+    """Regression tests for restored rotating-cache validation."""
 
-    def test_offset_clamped_to_max_size(self):
-        """Restored cache with offset > max_size must be clamped.
-
-        Without clamping, RotatingKVCache._update_in_place computes
-        ``new_size = min(step, max_size - prev)`` which goes negative
-        when ``prev = offset % max_size`` exceeds max_size after trim.
-        """
+    def test_saturated_offset_is_preserved_while_buffer_is_trimmed(self):
+        """The absolute position must survive window normalization."""
         mx = pytest.importorskip("mlx.core")
         mlx_lm_cache = pytest.importorskip("mlx_lm.models.cache")
         KVCache = mlx_lm_cache.KVCache
@@ -314,13 +309,13 @@ class TestTrimRotatingCaches:
 
         from vllm_mlx.mllm_batch_generator import MLLMBatchGenerator
 
-        # Simulate a RotatingKVCache with offset far beyond max_size
-        # (happens when prefix cache stores long-generation state)
+        # A large first prefill can leave an oversized buffer. The next
+        # single-token update normally reduces it to the rotating window.
         rc = RotatingKVCache(max_size=128, keep=0)
-        rc.offset = 500  # Way beyond max_size
-        rc.keys = mx.zeros((1, 4, 128, 64))  # Full buffer at max_size
-        rc.values = mx.zeros((1, 4, 128, 64))
-        rc._idx = 128
+        rc.offset = 500
+        rc.keys = mx.zeros((1, 4, 500, 64))
+        rc.values = mx.zeros((1, 4, 500, 64))
+        rc._idx = 500
 
         # Also include a regular KVCache (should be unaffected)
         kv = KVCache()
@@ -329,17 +324,18 @@ class TestTrimRotatingCaches:
         kv.values = mx.zeros((1, 4, 200, 64))
 
         cache_list = [rc, kv]
-        MLLMBatchGenerator._trim_rotating_caches(cache_list)
+        assert MLLMBatchGenerator._prepare_rotating_caches(cache_list) is True
 
-        # RotatingKVCache offset must be clamped to max_size
-        assert rc.offset <= rc.max_size
-        assert rc.offset == 128
+        assert rc.offset == 500
+        assert rc.keys.shape[2] == 128
+        assert rc.values.shape[2] == 128
+        assert rc._idx == 128
 
         # KVCache should be untouched
         assert kv.offset == 200
 
-    def test_empty_rotating_cache_offset_reset(self):
-        """RotatingKVCache with keys=None should get offset reset to 0."""
+    def test_inconsistent_undersized_buffer_is_rejected(self):
+        mx = pytest.importorskip("mlx.core")
         mlx_lm_cache = pytest.importorskip("mlx_lm.models.cache")
         RotatingKVCache = mlx_lm_cache.RotatingKVCache
 
@@ -347,11 +343,12 @@ class TestTrimRotatingCaches:
 
         rc = RotatingKVCache(max_size=128, keep=0)
         rc.offset = 500
-        rc.keys = None
-        rc.values = None
+        rc.keys = mx.zeros((1, 1, 64, 4))
+        rc.values = mx.zeros((1, 1, 64, 4))
+        rc._idx = 64
 
-        MLLMBatchGenerator._trim_rotating_caches([rc])
-        assert rc.offset == 0
+        assert MLLMBatchGenerator._prepare_rotating_caches([rc]) is False
+        assert rc.offset == 500
 
 
 class TestCopyPrefixCache:
@@ -393,6 +390,130 @@ class TestCopyPrefixCache:
         assert original.offset == 50
         assert original._idx == 50
 
+    def test_copy_recurses_through_cache_list(self):
+        mx = pytest.importorskip("mlx.core")
+        mlx_lm_cache = pytest.importorskip("mlx_lm.models.cache")
+        CacheList = mlx_lm_cache.CacheList
+        KVCache = mlx_lm_cache.KVCache
+        RotatingKVCache = mlx_lm_cache.RotatingKVCache
+
+        from vllm_mlx.mllm_batch_generator import MLLMBatchGenerator
+
+        kv = KVCache()
+        kv.update_and_fetch(mx.zeros((1, 1, 3, 4)), mx.zeros((1, 1, 3, 4)))
+        rotating = RotatingKVCache(max_size=4)
+        rotating.update_and_fetch(mx.zeros((1, 1, 3, 4)), mx.zeros((1, 1, 3, 4)))
+        original = CacheList(kv, rotating)
+
+        copied = MLLMBatchGenerator._copy_prefix_cache([original])[0]
+
+        assert copied is not original
+        assert all(a is not b for a, b in zip(copied.caches, original.caches))
+        assert copied.caches[0].keys is original.caches[0].keys
+        copied.caches[0].offset = 1
+        copied.caches[1]._idx = 1
+        assert original.caches[0].offset == 3
+        assert original.caches[1]._idx == 3
+
+    def test_copy_recurses_through_mlx_vlm_cache_list(self):
+        mx = pytest.importorskip("mlx.core")
+        mlx_vlm_cache = pytest.importorskip("mlx_vlm.models.cache")
+
+        from vllm_mlx.mllm_batch_generator import MLLMBatchGenerator
+
+        child = mlx_vlm_cache.KVCache()
+        child.update_and_fetch(mx.zeros((1, 1, 3, 2)), mx.zeros((1, 1, 3, 2)))
+        original = mlx_vlm_cache.CacheList(child)
+
+        copied = MLLMBatchGenerator._copy_prefix_cache([original])[0]
+
+        assert type(copied) is mlx_vlm_cache.CacheList
+        assert copied is not original
+        assert copied.caches[0] is not child
+        copied.caches[0].offset = 1
+        assert child.offset == 3
+
+
+class TestRewindPrefixCache:
+    def test_nested_plain_cache_rewinds_without_mutating_storage(self):
+        mx = pytest.importorskip("mlx.core")
+        mlx_lm_cache = pytest.importorskip("mlx_lm.models.cache")
+        CacheList = mlx_lm_cache.CacheList
+        KVCache = mlx_lm_cache.KVCache
+
+        from vllm_mlx.mllm_batch_generator import MLLMBatchGenerator
+
+        children = []
+        for _ in range(2):
+            cache = KVCache()
+            cache.update_and_fetch(mx.zeros((1, 1, 4, 2)), mx.zeros((1, 1, 4, 2)))
+            children.append(cache)
+        stored = CacheList(*children)
+
+        rewound = MLLMBatchGenerator._rewind_prefix_cache([stored], 1)[0]
+
+        assert [c.offset for c in rewound.caches] == [3, 3]
+        assert [c.offset for c in stored.caches] == [4, 4]
+        assert rewound is not stored
+
+    def test_saturated_rotating_child_fails_closed(self):
+        mx = pytest.importorskip("mlx.core")
+        mlx_lm_cache = pytest.importorskip("mlx_lm.models.cache")
+        CacheList = mlx_lm_cache.CacheList
+        KVCache = mlx_lm_cache.KVCache
+        RotatingKVCache = mlx_lm_cache.RotatingKVCache
+
+        from vllm_mlx.mllm_batch_generator import MLLMBatchGenerator
+
+        kv = KVCache()
+        kv.update_and_fetch(mx.zeros((1, 1, 6, 2)), mx.zeros((1, 1, 6, 2)))
+        rotating = RotatingKVCache(max_size=4)
+        rotating.keys = mx.zeros((1, 1, 4, 2))
+        rotating.values = mx.zeros((1, 1, 4, 2))
+        rotating.offset = 6
+        rotating._idx = 4
+
+        assert (
+            MLLMBatchGenerator._rewind_prefix_cache([CacheList(kv, rotating)], 1)
+            is None
+        )
+
+    @pytest.mark.parametrize(
+        "cache_module", ["mlx_lm.models.cache", "mlx_vlm.models.cache"]
+    )
+    def test_chunked_cache_rewind_preserves_type_metadata(self, cache_module):
+        mx = pytest.importorskip("mlx.core")
+        cache_types = pytest.importorskip(cache_module)
+        ChunkedKVCache = cache_types.ChunkedKVCache
+
+        from vllm_mlx.mllm_batch_generator import MLLMBatchGenerator
+
+        stored = ChunkedKVCache(chunk_size=8)
+        stored.update_and_fetch(mx.zeros((1, 1, 4, 2)), mx.zeros((1, 1, 4, 2)))
+
+        rewound = MLLMBatchGenerator._rewind_prefix_cache([stored], 1)[0]
+
+        assert type(rewound) is ChunkedKVCache
+        assert rewound.chunk_size == 8
+        assert rewound.start_position == 0
+        assert rewound.offset == 3
+        assert stored.offset == 4
+        rewound.update_and_fetch(mx.zeros((1, 1, 1, 2)), mx.zeros((1, 1, 1, 2)))
+        assert rewound.offset == 4
+
+    def test_chunked_cache_rewind_fails_when_front_was_discarded(self):
+        mx = pytest.importorskip("mlx.core")
+        mlx_vlm_cache = pytest.importorskip("mlx_vlm.models.cache")
+
+        from vllm_mlx.mllm_batch_generator import MLLMBatchGenerator
+
+        stored = mlx_vlm_cache.ChunkedKVCache(chunk_size=4)
+        stored.update_and_fetch(mx.zeros((1, 1, 4, 2)), mx.zeros((1, 1, 4, 2)))
+        stored.start_position = 3
+        stored.offset = 4
+
+        assert MLLMBatchGenerator._rewind_prefix_cache([stored], 2) is None
+
 
 class TestHasEmptyRotatingCache:
     """Tests for _has_empty_rotating_cache detection."""
@@ -425,6 +546,147 @@ class TestHasEmptyRotatingCache:
         rc.keys = mx.zeros((1, 4, 50, 64))
 
         assert MLLMBatchGenerator._has_empty_rotating_cache([kv, rc]) is False
+
+    def test_detects_empty_rotating_child_in_nested_cache_list(self):
+        mlx_lm_cache = pytest.importorskip("mlx_lm.models.cache")
+        CacheList = mlx_lm_cache.CacheList
+        KVCache = mlx_lm_cache.KVCache
+        RotatingKVCache = mlx_lm_cache.RotatingKVCache
+
+        from vllm_mlx.mllm_batch_generator import MLLMBatchGenerator
+
+        nested = CacheList(KVCache(), CacheList(RotatingKVCache(max_size=4)))
+        assert MLLMBatchGenerator._has_empty_rotating_cache([nested]) is True
+
+    def test_detects_empty_mlx_vlm_rotating_child(self):
+        mlx_vlm_cache = pytest.importorskip("mlx_vlm.models.cache")
+
+        from vllm_mlx.mllm_batch_generator import MLLMBatchGenerator
+
+        nested = mlx_vlm_cache.CacheList(
+            mlx_vlm_cache.KVCache(), mlx_vlm_cache.RotatingKVCache(max_size=4)
+        )
+        assert MLLMBatchGenerator._has_empty_rotating_cache([nested]) is True
+
+
+class TestMLLMCompletionCacheStore:
+    @staticmethod
+    def _filled(cache, length, mx):
+        cache.update_and_fetch(mx.zeros((1, 1, length, 2)), mx.zeros((1, 1, length, 2)))
+        return cache
+
+    def test_saturated_nested_rotating_cache_is_not_stored(self):
+        from types import SimpleNamespace
+
+        mx = pytest.importorskip("mlx.core")
+        mlx_lm_cache = pytest.importorskip("mlx_lm.models.cache")
+        CacheList = mlx_lm_cache.CacheList
+        KVCache = mlx_lm_cache.KVCache
+        RotatingKVCache = mlx_lm_cache.RotatingKVCache
+
+        from vllm_mlx.mllm_batch_generator import MLLMBatchGenerator
+
+        full = self._filled(KVCache(), 8, mx)
+        rotating = RotatingKVCache(max_size=4)
+        rotating.keys = mx.zeros((1, 1, 4, 2))
+        rotating.values = mx.zeros((1, 1, 4, 2))
+        rotating.offset = 8
+        rotating._idx = 4
+
+        generator = MLLMBatchGenerator.__new__(MLLMBatchGenerator)
+        generator.prefix_cache = MagicMock()
+        generator._think_suffix_len = 0
+        request = SimpleNamespace(
+            request_id="saturated", input_ids=mx.array([[1, 2, 3, 4]])
+        )
+        batch = SimpleNamespace(
+            requests=[request],
+            num_tokens=[4],
+            extract_cache=lambda _: [CacheList(full, rotating)],
+        )
+
+        generator._maybe_store_prefix_cache(batch, [0])
+
+        generator.prefix_cache.store.assert_not_called()
+
+    def test_saturated_flat_rotating_cache_is_not_stored(self):
+        """Exercise #689's completion rewind without the container guard."""
+        from types import SimpleNamespace
+
+        mx = pytest.importorskip("mlx.core")
+        mlx_vlm_cache = pytest.importorskip("mlx_vlm.models.cache")
+
+        from vllm_mlx.mllm_batch_generator import MLLMBatchGenerator
+
+        full = self._filled(mlx_vlm_cache.KVCache(), 8, mx)
+        rotating = mlx_vlm_cache.RotatingKVCache(max_size=4)
+        rotating.keys = mx.zeros((1, 1, 4, 2))
+        rotating.values = mx.zeros((1, 1, 4, 2))
+        rotating.offset = 8
+        rotating._idx = 4
+        generator = MLLMBatchGenerator.__new__(MLLMBatchGenerator)
+        generator.prefix_cache = MagicMock()
+        generator._think_suffix_len = 0
+        request = SimpleNamespace(request_id="flat", input_ids=mx.array([[1, 2, 3, 4]]))
+        batch = SimpleNamespace(
+            requests=[request],
+            num_tokens=[4],
+            extract_cache=lambda _: [full, rotating],
+        )
+
+        generator._maybe_store_prefix_cache(batch, [0])
+
+        generator.prefix_cache.store.assert_not_called()
+
+    def test_plain_nested_cache_is_stored_with_recursive_accounting(self):
+        from types import SimpleNamespace
+
+        mx = pytest.importorskip("mlx.core")
+        mlx_lm_cache = pytest.importorskip("mlx_lm.models.cache")
+        CacheList = mlx_lm_cache.CacheList
+        KVCache = mlx_lm_cache.KVCache
+
+        from vllm_mlx.mllm_batch_generator import MLLMBatchGenerator
+        from vllm_mlx.memory_cache import estimate_kv_cache_memory
+
+        children = [self._filled(KVCache(), 4, mx) for _ in range(2)]
+        extracted = CacheList(*children)
+        generator = MLLMBatchGenerator.__new__(MLLMBatchGenerator)
+        generator.prefix_cache = MagicMock()
+        generator._think_suffix_len = 0
+        request = SimpleNamespace(request_id="plain", input_ids=mx.array([[1, 2, 3]]))
+        batch = SimpleNamespace(
+            requests=[request],
+            num_tokens=[1],
+            extract_cache=lambda _: [extracted],
+        )
+
+        generator._maybe_store_prefix_cache(batch, [0])
+
+        generator.prefix_cache.store.assert_called_once()
+        _, stored = generator.prefix_cache.store.call_args.args
+        assert estimate_kv_cache_memory(stored) > 0
+        assert [child.offset for child in stored[0].caches] == [3, 3]
+
+    def test_zero_trim_flat_snapshot_does_not_alias_live_cache(self):
+        mx = pytest.importorskip("mlx.core")
+        mlx_lm_cache = pytest.importorskip("mlx_lm.models.cache")
+        KVCache = mlx_lm_cache.KVCache
+
+        from vllm_mlx.mllm_batch_generator import MLLMBatchGenerator
+
+        live = self._filled(KVCache(), 3, mx)
+        generator = MLLMBatchGenerator.__new__(MLLMBatchGenerator)
+        generator.prefix_cache = MagicMock()
+
+        assert generator._store_prefix_snapshot(
+            [1, 2, 3], [live], 0, "interleaved", "interleaved prefill"
+        )
+
+        _, stored = generator.prefix_cache.store.call_args.args
+        assert stored[0] is not live
+        live.offset = 99
+        assert stored[0].offset == 3
 
 
 if __name__ == "__main__":

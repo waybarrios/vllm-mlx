@@ -164,9 +164,10 @@ class TestSSDIndex:
 
         os.makedirs(db_dir, exist_ok=True)
         conn = sqlite3.connect(os.path.join(db_dir, "index.db"))
-        conn.executescript("""
+        conn.executescript(f"""
             CREATE TABLE schema_version (version INTEGER NOT NULL);
-            INSERT INTO schema_version (version) VALUES (1);
+            INSERT INTO schema_version (version)
+                VALUES ({SSDIndex._SCHEMA_VERSION});
             CREATE TABLE entries (
                 token_hash   TEXT PRIMARY KEY,
                 tokens_blob  BLOB NOT NULL,
@@ -393,6 +394,25 @@ class TestLayerSerializer:
             == "supported_via_dequant_on_spill"
         )
 
+    def test_mx_to_numpy_safe_upcasts_a_real_bfloat16_array(self):
+        """Real bf16 mx.array, not a simulated exception.
+
+        The other bf16 tests raise the buffer-protocol error by hand, so they
+        pass regardless of which exception class mlx actually uses. That hid a
+        live bug: the handler caught only RuntimeError while mlx 0.31.x raises
+        ValueError ("'bfloat16' is not a valid PEP 3118 buffer format string"),
+        so every bf16 KV spill failed on current mlx. Drive the real array.
+        """
+        mx = pytest.importorskip("mlx.core")
+        from vllm_mlx.ssd_cache import _mx_to_numpy_safe
+
+        arr = mx.zeros((2, 3), dtype=mx.bfloat16)
+        np_arr, original_dtype = _mx_to_numpy_safe(arr)
+
+        assert original_dtype == "bfloat16"
+        assert np_arr.dtype == np.float32
+        assert np_arr.shape == (2, 3)
+
     def test_snapshot_layer_honors_original_dtype_sentinel(self):
         """When enqueue_spill's dequant path stashed a pre-cast dtype on the
         layer, snapshot_layer must surface it in the snapshot — without this,
@@ -511,6 +531,23 @@ class TestSSDCacheTierCore:
             stats = tier.get_stats()
             assert stats["spill_count"] == 0
             assert stats["ssd_hits"] == 0
+        finally:
+            tier.close()
+
+    def test_remove_deletes_the_index_and_entry_directory(self, tmp_path):
+        tokens = (1, 2, 3)
+        config = SSDCacheConfig(cache_dir=str(tmp_path / "remove_test"))
+        tier = SSDCacheTier(config)
+        entry_hash = tier._entry_hash(tokens)
+        entry_dir = os.path.join(tier._data_dir, entry_hash)
+        os.makedirs(entry_dir)
+        tier._index.insert_entry(tokens, entry_hash, memory_bytes=128, num_tokens=3)
+
+        try:
+            assert tier.remove(tokens) is True
+            assert tier._index.lookup_exact(tokens) is None
+            assert not os.path.exists(entry_dir)
+            assert tier.remove(tokens) is False
         finally:
             tier.close()
 
@@ -1229,3 +1266,341 @@ class TestIntegrationSpillAndFetch:
             assert stats["ssd_hits"] >= 1
             assert stats["reload_bytes"] > 0
             assert stats["avg_reload_latency_ms"] > 0
+
+
+class TestCacheListSpillRoundTrip:
+    """SSD spill must round-trip GLM-5.2 / DeepSeek-V3.2 DSA caches.
+
+    A DSA layer is ``CacheList(KVCache latent, KVCache indexer)`` (full layers)
+    or ``CacheList(KVCache latent)`` (shared layers). The indexer sub-cache is
+    empty below the sparse ``index_topk`` threshold. ``CacheList`` exposes a
+    list ``.state``, so the duck-typed dispatcher used to mis-route it to
+    ``ArraysCacheSerializer``; iterating ``.state`` then yields per-sub
+    ``(keys, values)`` tuples and ``_mx_to_numpy_safe`` choked
+    (``'tuple' object has no attribute 'dtype'``), dropping every entry. A
+    dedicated ``CacheListSerializer`` round-trips them.
+    """
+
+    def _make_dsa_cache(self):
+        import mlx.core as mx
+        from mlx_lm.models.cache import KVCache, CacheList
+
+        # Full layer: populated bf16 latent + empty (dense-mode) indexer.
+        lat = KVCache()
+        lat.update_and_fetch(
+            mx.random.normal((1, 4, 6, 16)).astype(mx.bfloat16),
+            mx.random.normal((1, 4, 6, 16)).astype(mx.bfloat16),
+        )
+        idx = KVCache()
+        idx.keys = mx.zeros((1, 4, 0, 16), dtype=mx.float32)
+        idx.values = mx.zeros((1, 4, 0, 16), dtype=mx.float32)
+        idx.offset = 0
+        full = CacheList(lat, idx)
+
+        # Shared layer: single latent sub-cache.
+        lat2 = KVCache()
+        lat2.update_and_fetch(
+            mx.random.normal((1, 4, 6, 16)).astype(mx.bfloat16),
+            mx.random.normal((1, 4, 6, 16)).astype(mx.bfloat16),
+        )
+        shared = CacheList(lat2)
+        return [full, shared], lat, lat2
+
+    def test_dispatch_picks_cachelist_serializer(self):
+        from vllm_mlx.ssd_cache import (
+            get_serializer_for_layer,
+            CacheListSerializer,
+            ArraysCacheSerializer,
+        )
+
+        cache, _, _ = self._make_dsa_cache()
+        s = get_serializer_for_layer(cache[0])
+        assert isinstance(s, CacheListSerializer)
+        assert not isinstance(s, ArraysCacheSerializer)
+
+    def test_cachelist_in_support_matrix(self):
+        from vllm_mlx.ssd_cache import SERIALIZER_SUPPORT_MATRIX
+
+        assert "CacheList" in SERIALIZER_SUPPORT_MATRIX
+
+    def test_snapshot_serialize_deserialize_round_trip(self, tmp_path):
+        from vllm_mlx.ssd_cache import get_serializer_for_layer
+
+        cache, lat, lat2 = self._make_dsa_cache()
+        ser = get_serializer_for_layer(cache[0])
+        path = str(tmp_path / "layer_0.safetensors")
+
+        snap = ser.snapshot_layer(cache[0])
+        meta = ser.serialize_layer(snap, 0, path)
+        assert meta["layer_type"] == "CacheList"
+        assert meta["sub_count"] == 2
+        assert os.path.exists(path)
+
+        ld = ser.deserialize_layer(path, meta)
+        assert "cachelist_subs" in ld
+        subs = ld["cachelist_subs"]
+        assert len(subs) == 2
+        # Latent: offset + data preserved.
+        assert subs[0]["offset"] == 6
+        # Empty indexer preserved.
+        assert subs[1]["offset"] == 0
+        assert np.array(subs[1]["keys"]).size == 0
+
+    def test_full_roundtrip_reconstructs_cachelist(self, tmp_path):
+        import types
+        import mlx.core as mx
+        from vllm_mlx.ssd_cache import get_serializer_for_layer
+        from vllm_mlx.scheduler import Scheduler
+
+        cache, lat, lat2 = self._make_dsa_cache()
+
+        # snapshot -> serialize -> deserialize each layer (what _read_entry does)
+        dicts = []
+        for i, layer in enumerate(cache):
+            ser = get_serializer_for_layer(layer)
+            path = str(tmp_path / f"layer_{i}.safetensors")
+            snap = ser.snapshot_layer(layer)
+            meta = ser.serialize_layer(snap, i, path)
+            dicts.append(ser.deserialize_layer(path, meta))
+
+        # reconstruct (scheduler) — method only touches module globals, so a
+        # dummy self is sufficient.
+        result = Scheduler._reconstruct_ssd_layers(types.SimpleNamespace(), dicts)
+        assert result is not None
+        assert [type(c).__name__ for c in result] == ["CacheList", "CacheList"]
+        assert [len(c.caches) for c in result] == [2, 1]
+
+        # Latent: dtype, offset, and data round-trip (bf16 -> fp32 -> bf16).
+        r_lat = result[0].caches[0]
+        assert str(r_lat.keys.dtype).endswith("bfloat16")
+        assert r_lat.offset == 6
+        assert bool(
+            mx.allclose(
+                r_lat.keys[..., :6, :].astype(mx.float32),
+                lat.keys[..., :6, :].astype(mx.float32),
+            )
+        )
+        # Empty indexer preserved.
+        assert result[0].caches[1].offset == 0
+        assert result[0].caches[1].keys.size == 0
+        # Shared-layer latent round-trips too.
+        assert result[1].caches[0].offset == 6
+        assert bool(
+            mx.allclose(
+                result[1].caches[0].keys[..., :6, :].astype(mx.float32),
+                lat2.keys[..., :6, :].astype(mx.float32),
+            )
+        )
+
+    def test_plain_kvcache_still_dispatches_to_kvcache(self):
+        """Regression: non-DSA plain KVCache must NOT hit the CacheList path."""
+        import mlx.core as mx
+        from mlx_lm.models.cache import KVCache
+        from vllm_mlx.ssd_cache import get_serializer_for_layer, KVCacheSerializer
+
+        layer = KVCache()
+        layer.update_and_fetch(
+            mx.random.normal((1, 4, 5, 16)), mx.random.normal((1, 4, 5, 16))
+        )
+        assert isinstance(get_serializer_for_layer(layer), KVCacheSerializer)
+
+
+class TestSchemaVersionInvalidation:
+    """A schema bump must drop entries written by an incompatible build.
+
+    Motivating case: before CacheList got a dedicated serializer, a GLM-5.2/5.3
+    DSA layer was mis-dispatched to ArraysCacheSerializer. With bf16 that raised
+    and the entry was dropped, but with fp16 ``np.array((keys, values))`` stacks
+    cleanly, so the spill was *written* -- tagged ``layer_type: "ArraysCache"``
+    and missing the per-sub offsets. ``_entry_hash`` is the token hash alone and
+    the cache dir is not build-namespaced, so such an entry still matches after
+    the upgrade and reconstructs into an ArraysCache the DSA model cannot use.
+    """
+
+    @staticmethod
+    def _seed(cache_dir, version):
+        import sqlite3
+        import time
+
+        from vllm_mlx import ssd_cache as ssd_cache_module
+
+        data_dir = os.path.join(cache_dir, "data")
+        os.makedirs(data_dir, exist_ok=True)
+        tokens = (1, 2, 3)
+        entry_dir = os.path.join(data_dir, ssd_cache_module._tokens_hash(tokens))
+        os.makedirs(entry_dir, exist_ok=True)
+        with open(os.path.join(entry_dir, "manifest.json"), "w") as fh:
+            fh.write('{"layers": [{"layer_type": "ArraysCache"}]}')
+
+        conn = sqlite3.connect(os.path.join(cache_dir, "index.db"))
+        conn.executescript("""
+            CREATE TABLE schema_version (version INTEGER NOT NULL);
+            CREATE TABLE entries (
+                token_hash   TEXT PRIMARY KEY,
+                tokens_blob  BLOB NOT NULL,
+                prefix_hash  TEXT,
+                num_tokens   INTEGER NOT NULL,
+                file_path    TEXT NOT NULL,
+                memory_bytes INTEGER NOT NULL,
+                created_at   REAL NOT NULL,
+                accessed_at  REAL NOT NULL
+            );
+            """)
+        conn.execute("INSERT INTO schema_version (version) VALUES (?)", (version,))
+        now = time.time()
+        conn.execute(
+            "INSERT INTO entries VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                ssd_cache_module._tokens_hash(tokens),
+                ssd_cache_module._tokens_to_blob(tokens),
+                ssd_cache_module._prefix_hash(tokens),
+                len(tokens),
+                ssd_cache_module._tokens_hash(tokens),
+                1000,
+                now,
+                now,
+            ),
+        )
+        conn.commit()
+        conn.close()
+        return tokens, entry_dir
+
+    def test_older_schema_version_drops_every_entry(self, tmp_path):
+        cache_dir = str(tmp_path / "cache")
+        tokens, _ = self._seed(cache_dir, SSDIndex._SCHEMA_VERSION - 1)
+
+        idx = SSDIndex(cache_dir)
+        try:
+            assert idx.migrated_from == SSDIndex._SCHEMA_VERSION - 1
+            assert idx.get_entry_count() == 0
+            assert idx.lookup_exact(tokens) is None
+            with idx._db_lock:
+                cur = idx._conn.execute("SELECT version FROM schema_version")
+                assert cur.fetchone()[0] == SSDIndex._SCHEMA_VERSION
+        finally:
+            idx.close()
+
+    def test_current_schema_version_keeps_entries(self, tmp_path):
+        cache_dir = str(tmp_path / "cache")
+        tokens, _ = self._seed(cache_dir, SSDIndex._SCHEMA_VERSION)
+
+        idx = SSDIndex(cache_dir)
+        try:
+            assert idx.migrated_from is None
+            assert idx.lookup_exact(tokens) is not None
+        finally:
+            idx.close()
+
+    def test_tier_removes_stale_data_dirs_on_migration(self, tmp_path):
+        from vllm_mlx.ssd_cache import SSDCacheTier
+
+        cache_dir = str(tmp_path / "cache")
+        _, entry_dir = self._seed(cache_dir, SSDIndex._SCHEMA_VERSION - 1)
+        assert os.path.isdir(entry_dir)
+
+        tier = SSDCacheTier(SSDCacheConfig(cache_dir=cache_dir))
+        try:
+            assert not os.path.exists(
+                entry_dir
+            ), "stale spill files must not survive a schema bump"
+            assert os.path.isdir(os.path.join(cache_dir, "data"))
+        finally:
+            tier.close()
+
+    def test_fresh_cache_dir_is_not_treated_as_a_migration(self, tmp_path):
+        cache_dir = str(tmp_path / "cache")
+        os.makedirs(cache_dir, exist_ok=True)
+        idx = SSDIndex(cache_dir)
+        try:
+            assert idx.migrated_from is None
+        finally:
+            idx.close()
+
+
+class TestUnsupportedSubCaches:
+    """A layer that cannot be spilled must fail loudly, not write junk.
+
+    ``snapshot_layer`` runs on the *writer* thread, where ``_writer_loop``
+    catches and logs. A guard that raises there costs one dropped entry and a
+    log line. Getting past the guard is worse: ``np.array(None)`` is a 0-d
+    object array whose ``.size`` is 1, so it slips past the ``keys_empty``
+    branch and only fails later in ``save_file`` ("dtype object is not
+    covered") -- same dropped entry, but with an orphaned .tmp directory and a
+    much less obvious message.
+    """
+
+    def _cache_list(self, *subs):
+        from mlx_lm.models.cache import CacheList
+
+        return CacheList(*subs)
+
+    def _populated_kv(self):
+        import mlx.core as mx
+        from mlx_lm.models.cache import KVCache
+
+        kv = KVCache()
+        kv.update_and_fetch(
+            mx.random.normal((1, 2, 4, 8)), mx.random.normal((1, 2, 4, 8))
+        )
+        return kv
+
+    def test_unpopulated_sub_cache_raises(self):
+        """KVCache leaves keys/values None until the first update_and_fetch."""
+        from mlx_lm.models.cache import KVCache
+        from vllm_mlx.ssd_cache import CacheListSerializer
+
+        layer = self._cache_list(self._populated_kv(), KVCache())
+        with pytest.raises(ValueError, match="not materialized"):
+            CacheListSerializer().snapshot_layer(layer)
+
+    def test_unpopulated_plain_kvcache_raises(self):
+        """Same guard protects a non-CacheList layer -- one invariant, one place."""
+        from mlx_lm.models.cache import KVCache
+        from vllm_mlx.ssd_cache import KVCacheSerializer
+
+        with pytest.raises(ValueError, match="not materialized"):
+            KVCacheSerializer().snapshot_layer(KVCache())
+
+    def test_empty_but_materialized_sub_cache_is_still_supported(self):
+        """Regression guard: the DSA indexer is size-0, NOT None.
+
+        The None check must not start rejecting the empty dense-mode indexer,
+        which is a normal, spillable state.
+        """
+        import mlx.core as mx
+        from mlx_lm.models.cache import KVCache
+        from vllm_mlx.ssd_cache import CacheListSerializer
+
+        idx = KVCache()
+        idx.keys = mx.zeros((1, 2, 0, 8), dtype=mx.float32)
+        idx.values = mx.zeros((1, 2, 0, 8), dtype=mx.float32)
+        idx.offset = 0
+
+        snap = CacheListSerializer().snapshot_layer(
+            self._cache_list(self._populated_kv(), idx)
+        )
+        assert len(snap["sub_snapshots"]) == 2
+        assert snap["sub_snapshots"][1]["keys_np"].size == 0
+
+    def test_non_kvcache_sub_is_rejected_by_type(self):
+        """A sub-cache without the KVCache shape has no serializer at all."""
+        from vllm_mlx.ssd_cache import CacheListSerializer
+
+        class Alien:
+            pass
+
+        layer = self._cache_list(self._populated_kv(), Alien())
+        with pytest.raises(ValueError, match="not.*KVCache-like|unsupported"):
+            CacheListSerializer().snapshot_layer(layer)
+
+    def test_rejected_layer_writes_no_file(self, tmp_path):
+        """The guard fires before serialize_layer, so nothing lands on disk."""
+        from mlx_lm.models.cache import KVCache
+        from vllm_mlx.ssd_cache import CacheListSerializer
+
+        ser = CacheListSerializer()
+        path = str(tmp_path / "layer_0.safetensors")
+        with pytest.raises(ValueError):
+            snap = ser.snapshot_layer(self._cache_list(KVCache()))
+            ser.serialize_layer(snap, 0, path)
+        assert not os.path.exists(path)

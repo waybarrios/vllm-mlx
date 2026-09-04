@@ -158,11 +158,19 @@ class SSDIndex:
     The SQLite connection uses WAL mode for concurrent read/write safety.
     """
 
-    _SCHEMA_VERSION = 1
+    # 2: CacheList (GLM-5.2/5.3 DSA) layers gained a dedicated serializer.
+    #    Before it, they were mis-dispatched to ArraysCacheSerializer; with
+    #    fp16 that silently succeeded, writing an entry tagged
+    #    layer_type="ArraysCache" with the per-sub offsets lost. Those entries
+    #    still match on token hash after an upgrade, so they must be dropped.
+    _SCHEMA_VERSION = 2
 
     def __init__(self, cache_dir: str) -> None:
         self._cache_dir = cache_dir
         self._db_lock = threading.Lock()
+        # Set to the previous version when an incompatible index was purged,
+        # so the tier knows to clear the matching data directories.
+        self.migrated_from: int | None = None
         db_path = os.path.join(cache_dir, "index.db")
         self._conn = sqlite3.connect(db_path, check_same_thread=False)
         self._conn.execute("PRAGMA journal_mode=WAL")
@@ -200,12 +208,27 @@ class SSDIndex:
             CREATE INDEX IF NOT EXISTS idx_entries_prefix_hash_num_tokens
                 ON entries(prefix_hash, num_tokens);
             """)
-        # Insert schema version if not present
-        cur = self._conn.execute("SELECT COUNT(*) FROM schema_version")
-        if cur.fetchone()[0] == 0:
+        # Insert schema version if not present, or drop an index written by an
+        # older, incompatible build. Entries are keyed on the token hash alone
+        # and the cache dir is not build-namespaced, so a stale entry would
+        # otherwise be served to a reader that cannot interpret it.
+        cur = self._conn.execute("SELECT version FROM schema_version")
+        row = cur.fetchone()
+        if row is None:
             self._conn.execute(
                 "INSERT INTO schema_version (version) VALUES (?)",
                 (self._SCHEMA_VERSION,),
+            )
+        elif row[0] != self._SCHEMA_VERSION:
+            self.migrated_from = row[0]
+            self._conn.execute("DELETE FROM entries")
+            self._conn.execute(
+                "UPDATE schema_version SET version = ?", (self._SCHEMA_VERSION,)
+            )
+            logger.info(
+                "[ssd_cache] index schema %s -> %s: dropped all entries",
+                row[0],
+                self._SCHEMA_VERSION,
             )
         self._backfill_prefix_hashes()
         self._conn.commit()
@@ -409,6 +432,7 @@ SERIALIZER_SUPPORT_MATRIX = {
     "RotatingKVCache": "supported",  # Serialized as KVCache (keys/values/offset)
     "ArraysCache": "supported",
     "MambaCache": "supported",  # Legacy name for ArraysCache
+    "CacheList": "supported",  # DSA (GLM-5.2/DeepSeek-V3.2): list of KVCache subs
     "_QuantizedCacheWrapper": "supported_via_dequant_on_spill",
     "QuantizedKVCache": "supported_via_dequant_on_spill",
 }
@@ -452,8 +476,11 @@ def _mx_to_numpy_safe(arr: Any) -> tuple[np.ndarray, str | None]:
     """
     try:
         return np.array(arr), None
-    except RuntimeError as exc:
-        # numpy ↔ mlx bf16 buffer-protocol mismatch on mlx ≥ 0.31. Re-raise
+    except (RuntimeError, ValueError) as exc:
+        # numpy ↔ mlx bf16 buffer-protocol mismatch. The exception type is not
+        # stable across mlx versions — older builds raise RuntimeError, mlx
+        # 0.31.x raises ValueError ("'bfloat16' is not a valid PEP 3118 buffer
+        # format string") — so match on the message, not the class. Re-raise
         # anything else — don't swallow unrelated errors.
         if "buffer format string" not in str(exc):
             raise
@@ -477,6 +504,22 @@ class KVCacheSerializer(LayerSerializer):
     _ROTATING_ATTRS = ("max_size", "keep", "step", "_idx")
 
     def snapshot_layer(self, layer: Any) -> dict[str, Any]:
+        # A KVCache leaves keys/values None until its first update_and_fetch.
+        # np.array(None) is a 0-d *object* array whose .size is 1, so it slips
+        # past serialize_layer's empty-array branch and only fails inside
+        # save_file ("dtype object is not covered") -- on the writer thread,
+        # where _writer_loop swallows the error and orphans the .tmp dir. Fail
+        # here instead: the same entry is dropped, but loudly and locally.
+        # NOTE: a size-0 array is NOT None -- the dense-mode DSA indexer is
+        # empty but materialized, and must still round-trip.
+        if (
+            getattr(layer, "keys", None) is None
+            or getattr(layer, "values", None) is None
+        ):
+            raise ValueError(
+                f"{type(layer).__name__} keys/values are not materialized "
+                "(None); layer cannot be spilled to SSD"
+            )
         keys_np, keys_orig_dtype = _mx_to_numpy_safe(layer.keys)
         values_np, values_orig_dtype = _mx_to_numpy_safe(layer.values)
 
@@ -613,15 +656,136 @@ class ArraysCacheSerializer(LayerSerializer):
         return result
 
 
+class CacheListSerializer(LayerSerializer):
+    """Serializer for DSA ``CacheList`` layers (GLM-5.2 / DeepSeek-V3.2).
+
+    A ``CacheList`` wraps N sub-caches — for DSA each is a ``KVCache``:
+    ``(latent, indexer)`` for full layers, ``(latent,)`` for shared layers.
+    Below the sparse ``index_topk`` threshold the indexer sub-cache is empty
+    (size-0 arrays).
+
+    ``CacheList`` also exposes a list ``.state``, so the duck-typed dispatcher
+    used to mis-route it to ``ArraysCacheSerializer``. Depending on the mlx_lm
+    build that either crashed (``.state`` yields per-sub ``(keys, values)``
+    tuples that ``_mx_to_numpy_safe`` cannot handle) or silently flattened the
+    sub-caches and lost the CacheList structure. This serializer instead walks
+    ``layer.caches`` directly — independent of ``.state`` semantics — snapshots
+    each sub ``KVCache`` (reusing ``KVCacheSerializer``), flattens their arrays
+    into one safetensors file under ``sub_{j}_*`` keys, and records the per-sub
+    layout (offset, dtype hints, empty-array shapes) in metadata.
+    """
+
+    def snapshot_layer(self, layer: Any) -> dict[str, Any]:
+        sub_ser = KVCacheSerializer()
+        sub_snapshots = []
+        for sub in layer.caches:
+            if not (
+                hasattr(sub, "keys")
+                and hasattr(sub, "values")
+                and hasattr(sub, "offset")
+            ):
+                raise ValueError(
+                    f"CacheList sub-cache {type(sub).__name__} is not "
+                    "KVCache-like; unsupported for SSD spill"
+                )
+            sub_snapshots.append(sub_ser.snapshot_layer(sub))
+        return {"sub_snapshots": sub_snapshots}
+
+    def serialize_layer(
+        self, snapshot: dict[str, Any], layer_idx: int, file_path: str
+    ) -> dict[str, Any]:
+        from safetensors.numpy import save_file
+
+        sub_snapshots = snapshot["sub_snapshots"]
+        tensors: dict[str, np.ndarray] = {}
+        sub_meta: list[dict[str, Any]] = []
+        for j, sub in enumerate(sub_snapshots):
+            keys_np = sub["keys_np"]
+            values_np = sub["values_np"]
+            m: dict[str, Any] = {"offset": sub["offset"]}
+            # Size-0 arrays (empty DSA indexer) can't go through safetensors;
+            # record shape+dtype and recreate on load, like the disk-persist path.
+            if getattr(keys_np, "size", 1) == 0:
+                m["keys_empty"] = [list(keys_np.shape), str(keys_np.dtype)]
+            else:
+                tensors[f"sub_{j}_keys"] = keys_np
+            if getattr(values_np, "size", 1) == 0:
+                m["values_empty"] = [list(values_np.shape), str(values_np.dtype)]
+            else:
+                tensors[f"sub_{j}_values"] = values_np
+            for k in ("keys_original_dtype", "values_original_dtype"):
+                if k in sub:
+                    m[k] = sub[k]
+            for attr in KVCacheSerializer._ROTATING_ATTRS:
+                if attr in sub:
+                    m[attr] = sub[attr]
+            sub_meta.append(m)
+
+        if not tensors:
+            # safetensors rejects an empty tensor dict; write a sentinel. (The
+            # latent sub-cache is always populated, so this is a guard only.)
+            tensors["__placeholder__"] = np.zeros((1,), dtype=np.uint8)
+        save_file(tensors, file_path)
+
+        return {
+            "layer_type": "CacheList",
+            "layer_idx": layer_idx,
+            "sub_count": len(sub_snapshots),
+            "sub_meta": sub_meta,
+        }
+
+    def deserialize_layer(self, file_path: str, metadata: dict[str, Any]) -> dict:
+        from safetensors.numpy import load_file
+
+        sub_count = metadata["sub_count"]
+        sub_meta = metadata["sub_meta"]
+        tensors = load_file(file_path)
+
+        subs = []
+        for j in range(sub_count):
+            m = sub_meta[j]
+            kkey, vkey = f"sub_{j}_keys", f"sub_{j}_values"
+            if kkey in tensors:
+                keys = tensors[kkey]
+            else:
+                shape, dt = m["keys_empty"]
+                keys = np.zeros(shape, dtype=np.dtype(dt))
+            if vkey in tensors:
+                values = tensors[vkey]
+            else:
+                shape, dt = m["values_empty"]
+                values = np.zeros(shape, dtype=np.dtype(dt))
+
+            sub_ld: dict[str, Any] = {
+                "keys": keys,
+                "values": values,
+                "offset": m["offset"],
+            }
+            for k in ("keys_original_dtype", "values_original_dtype"):
+                if k in m:
+                    sub_ld[k] = m[k]
+            for attr in KVCacheSerializer._ROTATING_ATTRS:
+                if attr in m:
+                    sub_ld[attr] = m[attr]
+            subs.append(sub_ld)
+        return {"cachelist_subs": subs}
+
+
 def get_serializer_for_layer(layer: Any) -> LayerSerializer:
     """Return the appropriate serializer for a cache layer.
 
     Dispatches based on duck-typing:
+    - If layer has .caches (DSA CacheList) -> CacheListSerializer
     - If layer has .keys and .values and .offset -> KVCacheSerializer
     - If layer has .state and it's a list -> ArraysCacheSerializer
 
+    The CacheList check comes first because a CacheList ALSO has a list
+    ``.state`` and would otherwise be mis-routed to ArraysCacheSerializer.
+
     Raises ValueError for unsupported layer types.
     """
+    if isinstance(getattr(layer, "caches", None), (list, tuple)):
+        return CacheListSerializer()
     if hasattr(layer, "keys") and hasattr(layer, "values") and hasattr(layer, "offset"):
         return KVCacheSerializer()
     if hasattr(layer, "state") and isinstance(getattr(layer, "state", None), list):
@@ -650,6 +814,8 @@ class SSDCacheTier:
               manifest.json  # per-entry layer metadata
     """
 
+    _WRITER_JOIN_TIMEOUT_S = 5.0
+
     def __init__(self, config: SSDCacheConfig) -> None:
         self._config = config
         self._closed = True
@@ -668,16 +834,24 @@ class SSDCacheTier:
         try:
             # Open SQLite index
             self._index = SSDIndex(self._cache_dir)
+            if getattr(self._index, "migrated_from", None) is not None:
+                self._purge_data_dir()
 
             # Stats
             self._stats = SSDCacheStats()
             self._lock = threading.Lock()
 
+            # Lifecycle state is independent from the stats lock: close() may
+            # wait for a writer that still needs the stats lock to finish its
+            # current entry.
+            self._lifecycle_lock = threading.Lock()
+            self._accepting_spills = True
+            self._writer_shutdown_requested = False
+
             # Spill queue and writer thread
             self._spill_queue: queue.Queue = queue.Queue(
                 maxsize=config.spill_queue_size
             )
-            self._writer_stop = threading.Event()
             self._closed = False
         except Exception:
             index = getattr(self, "_index", None)
@@ -690,6 +864,31 @@ class SSDCacheTier:
                     )
             raise
 
+    def _purge_data_dir(self) -> None:
+        """Delete every spilled entry after an incompatible schema bump.
+
+        The index rows are already gone, so reconcile() would eventually sweep
+        these as orphans -- but reconcile is not guaranteed to run before the
+        first spill, and leaving gigabytes of unreadable files on disk counting
+        against the size budget is worse than a short startup cost.
+        """
+        import shutil
+
+        if not os.path.isdir(self._data_dir):
+            return
+        for entry_name in os.listdir(self._data_dir):
+            entry_path = os.path.join(self._data_dir, entry_name)
+            if not os.path.isdir(entry_path):
+                continue
+            try:
+                shutil.rmtree(entry_path)
+            except OSError:
+                logger.warning(
+                    "[ssd_cache] failed to remove stale entry directory %s",
+                    entry_name,
+                    exc_info=True,
+                )
+
     @staticmethod
     def _entry_hash(tokens: tuple[int, ...]) -> str:
         """Compute deterministic hash for a token sequence."""
@@ -701,23 +900,21 @@ class SSDCacheTier:
 
     def start_writer(self) -> None:
         """Start the background spill writer thread."""
-        if self._writer_thread is not None:
-            return
-        self._writer_stop.clear()
-        self._writer_thread = threading.Thread(
-            target=self._writer_loop, daemon=True, name="ssd-cache-writer"
-        )
-        self._writer_thread.start()
+        with self._lifecycle_lock:
+            if self._closed or self._writer_shutdown_requested:
+                raise RuntimeError("cannot start a closed SSD cache tier")
+            if self._writer_thread is not None:
+                return
+            self._writer_thread = threading.Thread(
+                target=self._writer_loop, daemon=True, name="ssd-cache-writer"
+            )
+            self._writer_thread.start()
         logger.info("[ssd_cache] writer thread started")
 
     def _writer_loop(self) -> None:
         """Drain spill queue and persist entries. Numpy-only — no MLX here."""
-        while not self._writer_stop.is_set():
-            try:
-                item = self._spill_queue.get(timeout=0.5)
-            except queue.Empty:
-                continue
-
+        while True:
+            item = self._spill_queue.get()
             if item is None:  # Poison pill for shutdown
                 break
 
@@ -743,6 +940,10 @@ class SSDCacheTier:
 
         Returns True if enqueued, False if queue is full (entry dropped).
         """
+        with self._lifecycle_lock:
+            if not self._accepting_spills:
+                return False
+
         # Dequantize on the CALLER's thread, which owns the MLX GPU stream.
         # mx.dequantize is a GPU compute op; running it on the writer thread
         # aborts the process ("no Stream(gpu,N) in current thread"). Materialize
@@ -842,15 +1043,18 @@ class SSDCacheTier:
             )
             return False
 
-        try:
-            self._spill_queue.put_nowait((tokens, layer_snapshots, memory_bytes))
-            return True
-        except queue.Full:
-            logger.warning(
-                f"[ssd_cache] spill queue full, dropping entry "
-                f"({len(tokens)} tokens, {memory_bytes} bytes)"
-            )
-            return False
+        with self._lifecycle_lock:
+            if not self._accepting_spills:
+                return False
+            try:
+                self._spill_queue.put_nowait((tokens, layer_snapshots, memory_bytes))
+                return True
+            except queue.Full:
+                logger.warning(
+                    f"[ssd_cache] spill queue full, dropping entry "
+                    f"({len(tokens)} tokens, {memory_bytes} bytes)"
+                )
+                return False
 
     def _write_entry(
         self,
@@ -952,6 +1156,30 @@ class SSDCacheTier:
         if results:
             return results[0]  # Already sorted by num_tokens DESC
         return None
+
+    def remove(self, tokens: tuple[int, ...]) -> bool:
+        """Remove an entry from both the SSD index and its data directory."""
+        import shutil
+
+        meta = self._index.lookup_exact(tokens)
+        if meta is None:
+            return False
+
+        # Remove the index first so a data-file cleanup failure cannot expose
+        # the rejected entry to another promotion. Reconciliation removes any
+        # orphaned directory left behind.
+        self._index.delete_entry(tokens)
+        entry_dir = os.path.join(self._data_dir, meta["file_path"])
+        try:
+            if os.path.exists(entry_dir):
+                shutil.rmtree(entry_dir)
+        except OSError:
+            logger.warning(
+                "[ssd_cache] failed to remove entry directory %s",
+                meta["file_path"],
+                exc_info=True,
+            )
+        return True
 
     async def async_promote(
         self,
@@ -1088,6 +1316,8 @@ class SSDCacheTier:
                     serializer = KVCacheSerializer()
                 elif layer_type in ("ArraysCache", "MambaCache"):
                     serializer = ArraysCacheSerializer()
+                elif layer_type == "CacheList":
+                    serializer = CacheListSerializer()
                 else:
                     logger.warning(
                         f"[ssd_cache] unknown layer type {layer_type}, skipping"
@@ -1215,20 +1445,45 @@ class SSDCacheTier:
         return cleaned
 
     def close(self) -> None:
-        """Close the SSD cache tier and release resources."""
-        if self._closed:
-            return
-        self._closed = True
+        """Drain pending spills, stop the writer, and release resources.
 
-        # Stop writer thread
-        self._writer_stop.set()
-        if self._writer_thread is not None:
-            try:
-                self._spill_queue.put_nowait(None)  # Poison pill
-            except queue.Full:
-                pass
-            self._writer_thread.join(timeout=5.0)
-            self._writer_thread = None
+        If the writer does not terminate within the bounded join, retain both
+        the thread reference and the SQLite index so a live writer can finish
+        safely. A later close() call can retry the join.
+        """
+        with self._lifecycle_lock:
+            if self._closed:
+                return
 
-        self._index.close()
+            self._accepting_spills = False
+            if self._writer_thread is not None:
+                shutdown_deadline = time.monotonic() + self._WRITER_JOIN_TIMEOUT_S
+                if not self._writer_shutdown_requested:
+                    # FIFO ordering makes the poison pill a drain barrier: all
+                    # spills accepted before shutdown are written first.
+                    try:
+                        self._spill_queue.put(None, timeout=self._WRITER_JOIN_TIMEOUT_S)
+                    except queue.Full as exc:
+                        raise TimeoutError(
+                            "SSD cache shutdown sentinel could not be queued "
+                            "before timeout"
+                        ) from exc
+                    self._writer_shutdown_requested = True
+
+                join_timeout = max(0.0, shutdown_deadline - time.monotonic())
+                self._writer_thread.join(timeout=join_timeout)
+                if self._writer_thread.is_alive():
+                    raise TimeoutError(
+                        "SSD cache writer thread did not stop before timeout"
+                    )
+                self._writer_thread = None
+
+            self._index.close()
+            self._closed = True
         logger.info("[ssd_cache] SSDCacheTier closed")
+
+    async def aclose(self) -> None:
+        """Close without blocking the caller's asyncio event loop."""
+        import asyncio
+
+        await asyncio.to_thread(self.close)

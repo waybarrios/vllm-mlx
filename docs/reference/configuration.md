@@ -43,6 +43,9 @@
 | `--use-paged-cache` | Enable paged KV cache | `false` |
 | `--paged-cache-block-size` | Tokens per block | `64` |
 | `--max-cache-blocks` | Maximum blocks | `1000` |
+| `--prefix-trie-cache` | Enable conversation-prefix reuse in pure-LLM SimpleEngine mode | `false` |
+| `--prefix-trie-cache-size` | Maximum SimpleEngine prompt-trie entries | `32` |
+| `--prefix-trie-cache-memory-mb` | Optional SimpleEngine prompt-trie memory cap in MB | None |
 
 ### Tool Calling Options
 

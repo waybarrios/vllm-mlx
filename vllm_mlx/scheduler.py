@@ -139,6 +139,17 @@ class SchedulerConfig:
         if self.mllm_prefill_step_size is not None and self.mllm_prefill_step_size <= 0:
             raise ValueError("mllm_prefill_step_size must be > 0 when provided")
 
+        # Normalize once, here, rather than on every scheduling pass. A
+        # negative value is a startup mistake: warning about it per request
+        # turns one bad flag into a log flood, and it would say nothing new
+        # the second time.
+        if not isinstance(self.max_kv_size, int) or self.max_kv_size < 0:
+            logger.warning(
+                "Ignoring invalid max_kv_size=%r; treating as unbounded",
+                self.max_kv_size,
+            )
+            self.max_kv_size = 0
+
 
 @dataclass
 class SchedulerOutput:
@@ -213,7 +224,6 @@ def _install_chunked_prefill(
 
     from mlx_lm.generate import (
         _left_pad_prompts,
-        _make_cache,
         _merge_caches,
         _right_pad_prompts,
     )
@@ -562,9 +572,13 @@ def _install_chunked_prefill(
 
                     if not is_cached:
                         padded = _left_pad_prompts(inputs_raw, max_length=max_length)
-                        prompt_cache = _make_cache(
-                            self.model, padding, self.max_kv_size
-                        )
+                        # Batch the per-request caches supplied by the scheduler,
+                        # even when they are empty. Rebuilding through
+                        # mlx-lm's _make_cache loses max_kv_size for models whose
+                        # make_cache() returns plain KVCache layers.
+                        prompt_cache = _merge_caches(caches)
+                        for c in prompt_cache:
+                            c.prepare(left_padding=padding)
                     else:
                         last_inputs = mx.array(
                             [p[-prompt_checkpoint:] for p in inputs_raw]
@@ -796,6 +810,19 @@ def _install_mtp(
        Reject: trim KVCache by 1, skip_state from pos 0 (no cold start)
     5. Draft is emitted in the NEXT generation step after primary
     """
+    # The MTP monkey-patch relies on BatchGenerator._step, which was
+    # refactored away in mlx-lm 0.31.x (decode now lives on
+    # GenerationBatch._step).  Skip gracefully when the required API is
+    # absent instead of crashing at generator creation — mirrors the
+    # chunked prefill compatibility guard.
+    if not hasattr(batch_gen, "_step"):
+        logger.warning(
+            "[MTP] disabled: mlx-lm BatchGenerator lacks the _step hook "
+            "required by the MTP monkey-patch (refactored in mlx-lm 0.31.x). "
+            "Generation continues without multi-token prediction."
+        )
+        return
+
     _orig_step = batch_gen._step
 
     # Greedy sampler for MTP draft tokens
@@ -1363,18 +1390,7 @@ class Scheduler:
                 )
 
                 if self.config.ssd_cache_dir is not None:
-                    ssd_config = SSDCacheConfig(
-                        cache_dir=self.config.ssd_cache_dir,
-                        max_size_gb=self.config.ssd_cache_max_gb,
-                    )
-                    self._ssd_tier = SSDCacheTier(ssd_config)
-                    self._ssd_tier.start_writer()
-                    self._ssd_tier.reconcile()
-                    self.memory_aware_cache.set_ssd_tier(self._ssd_tier)
-                    logger.info(
-                        f"SSD cache tier enabled: dir={self.config.ssd_cache_dir}, "
-                        f"max={self.config.ssd_cache_max_gb}GB"
-                    )
+                    self.ensure_ssd_tier()
             else:
                 # Use legacy entry-count based prefix cache
                 self.prefix_cache = PrefixCacheManager(
@@ -1486,6 +1502,12 @@ class Scheduler:
             prefill_batch_size=self.config.prefill_batch_size,
             completion_batch_size=self.config.completion_batch_size,
             prefill_step_size=self.config.prefill_step_size,
+            # BatchGenerator builds caches for any sequence inserted without
+            # one, and its rule is the correct one: it post-processes the
+            # model's own cache, converting KVCache layers to RotatingKVCache.
+            # make_prompt_cache(model, max_kv_size=...) cannot do that — it
+            # ignores max_kv_size entirely for models that define make_cache.
+            max_kv_size=self._bounded_kv_size(),
         )
         # Set callback as attribute — used by _install_chunked_prefill
         # monkey-patch. Not a BatchGenerator constructor parameter.
@@ -1707,6 +1729,140 @@ class Scheduler:
             self._close_batch_generator()
             self.batch_generator = self._create_batch_generator(sampling_params)
             self._current_sampler_params = sampler_params
+
+    def _bounded_kv_size(self) -> int | None:
+        """Configured KV bound, or None when there is none to apply.
+
+        Only a positive value is a bound; ``0`` means unbounded. Negatives are
+        normalized away in ``SchedulerConfig.__post_init__``, so this stays a
+        pure accessor and never logs — it runs on every scheduling pass.
+        """
+        size = self.config.max_kv_size
+        return size if isinstance(size, int) and size > 0 else None
+
+    def _restored_cache_matches_kv_bound(self, cache: Any) -> bool:
+        """Would this restored entry be built the same way for a request now?
+
+        Prefix caches are persisted to disk, so an entry outlives both an
+        upgrade and any change to ``--max-kv-size``. Reusing one built under a
+        different bound gets it wrong in both directions: an unbounded
+        ``KVCache`` restored under ``--max-kv-size 64`` stays unbounded, and a
+        ``RotatingKVCache(max_size=64)`` restored after the flag changed keeps
+        the stale window.
+
+        The comparison is against the topology this scheduler would construct
+        for the request, not against ``max_kv_size`` alone. Models with
+        sliding-window attention (Gemma, Llama) create rotating layers with
+        *their own* window and no operator bound involved; measuring those
+        against the flag rejects a perfectly good entry on every reuse.
+
+        Re-bounding a populated cache in place is not an option — its contents
+        would have to be re-laid-out into a ring, which is the rewrite that
+        desynchronizes layers — so a mismatch is rejected and the request falls
+        back to a full prefill.
+        """
+        reference = self._reference_cache_topology()
+        if reference is None:
+            # No reference to compare against; do not reject blindly.
+            return True
+        if len(reference) != len(cache):
+            # A different layer count is incompatibility in itself.
+            return False
+
+        def _matches(restored: Any, expected: Any) -> bool:
+            restored_children = getattr(restored, "caches", None)
+            expected_children = getattr(expected, "caches", None)
+            if restored_children or expected_children:
+                if not (restored_children and expected_children):
+                    return False
+                if len(restored_children) != len(expected_children):
+                    return False
+                return all(
+                    _matches(r, e) for r, e in zip(restored_children, expected_children)
+                )
+            if type(restored) is not type(expected):
+                return False
+            missing = object()
+            topology_attributes = (
+                "max_size",
+                "keep",
+                "chunk_size",
+                "group_size",
+                "bits",
+            )
+            return all(
+                getattr(restored, attribute, missing)
+                == getattr(expected, attribute, missing)
+                for attribute in topology_attributes
+            )
+
+        return all(_matches(r, e) for r, e in zip(cache, reference))
+
+    def _evict_incompatible_entry(self, request: Any) -> None:
+        """Drop a rejected entry from the shared prefix cache."""
+        cache = self.memory_aware_cache
+        if cache is None:
+            return
+        key = getattr(request, "prompt_cache_key", None) or getattr(
+            request, "cached_prefix_tokens", None
+        )
+        if key is None:
+            key = list(request.prompt_token_ids)[: getattr(request, "cached_tokens", 0)]
+        try:
+            if key and cache.remove(list(key), include_ssd=True):
+                logger.debug(
+                    "[cache] evicted %d-token entry incompatible with the "
+                    "configured KV bound",
+                    len(key),
+                )
+        except Exception:
+            logger.debug("Evicting an incompatible cache entry failed", exc_info=True)
+
+    def _reference_cache_topology(self) -> Any:
+        """The cache this scheduler would build for a fresh request.
+
+        Cached after the first call: it depends only on the model and the
+        configured bound, and building it allocates cache objects.
+        """
+        cached = getattr(self, "_reference_topology", None)
+        if cached is not None:
+            return cached
+        try:
+            from mlx_lm.models.cache import make_prompt_cache
+
+            reference = make_prompt_cache(self.model)
+            bound = self._bounded_kv_size()
+            if bound is not None:
+                reference = self._bound_cache_layers(reference, bound)
+        except Exception:
+            logger.debug("Could not build a reference cache topology", exc_info=True)
+            return None
+        self._reference_topology = reference
+        return reference
+
+    @staticmethod
+    def _bound_cache_layers(cache: Any, max_kv_size: int) -> Any:
+        """Bound plain KV layers, descending into cache containers.
+
+        mlx-lm's own rule (``BatchGenerator._make_new_cache``) only converts
+        flat ``KVCache`` layers, so a ``KVCache`` nested inside a ``CacheList``
+        stays unbounded — and the architectures that nest are exactly the ones
+        running out of memory. Layers that are already something else keep
+        their own type: a rotating, pooling or Mamba cache carries its own
+        bounding and replacing it would break the model.
+        """
+        from mlx_lm.models.cache import KVCache, RotatingKVCache
+
+        def _bound(layer: Any) -> Any:
+            children = getattr(layer, "caches", None)
+            if children:
+                layer.caches = type(children)([_bound(c) for c in children])
+                return layer
+            if type(layer) is KVCache:
+                return RotatingKVCache(max_size=max_kv_size)
+            return layer
+
+        return [_bound(layer) for layer in cache]
 
     def _validate_cache(self, cache: Any) -> bool:
         """
@@ -1945,6 +2101,12 @@ class Scheduler:
             request.cache_hit_type = self.memory_aware_cache._last_match_type
             if cache:
                 request.prompt_cache = cache
+                matched_key = getattr(
+                    self.memory_aware_cache, "_last_matched_key", None
+                )
+                request.prompt_cache_key = (
+                    list(matched_key) if matched_key is not None else None
+                )
                 request.cached_tokens = len(request.prompt_token_ids) - len(remaining)
                 request.remaining_tokens = remaining
                 logger.info(
@@ -2139,10 +2301,14 @@ class Scheduler:
                 # corrupted context (measured: same prompt, different output).
                 # Entries stored post-prefill cover the full key, so drop the
                 # cache and prefill instead of guessing which kind this is.
-                if getattr(request, "cache_hit_type", None) == "exact":
+                if getattr(request, "cache_hit_type", None) in {
+                    "exact",
+                    "supersequence",
+                }:
                     logger.debug(
-                        "[cache] exact match on a full-coverage entry; "
-                        "prefilling to avoid duplicating the last token"
+                        "[cache] %s match on a full-coverage entry; "
+                        "prefilling to avoid duplicating the last token",
+                        request.cache_hit_type,
                     )
                     cache_to_use = None
                     request.prompt_cache = None
@@ -2157,25 +2323,60 @@ class Scheduler:
                 tokens_to_process = request.prompt_token_ids
             cache_to_use = request.prompt_cache  # May be None
 
-            # Create bounded cache when max_kv_size is configured and no cache exists
-            if cache_to_use is None and self.config.max_kv_size > 0:
-                from mlx_lm.models.cache import make_prompt_cache
-
-                cache_to_use = make_prompt_cache(
-                    self.model, max_kv_size=self.config.max_kv_size
+            # Validate cache before using it (restored entries only).
+            # This has to run before the bounded cache is built below, not
+            # after: it rejects any layer whose ``keys`` are still None, which
+            # is true of every freshly created cache. Running it afterwards
+            # discarded the bounded cache on every request and left
+            # --max-kv-size a no-op.
+            if cache_to_use is not None and not self._restored_cache_matches_kv_bound(
+                cache_to_use
+            ):
+                logger.debug(
+                    "Request %s: restored cache does not match the configured "
+                    "KV bound (%s); discarding it",
+                    request.request_id,
+                    self._bounded_kv_size(),
                 )
+                cache_to_use = None
+                # Evict it from the shared cache too. Clearing only the request
+                # leaves the stale entry in place, so every later request with
+                # the same prefix repeats the false hit and the full prefill,
+                # and nothing ever removes it.
+                self._evict_incompatible_entry(request)
+                request.prompt_cache = None
+                request.cached_tokens = 0
+                request.remaining_tokens = request.prompt_token_ids
+                tokens_to_process = request.prompt_token_ids
 
-            # Validate cache before using it
             if cache_to_use is not None and not self._validate_cache(cache_to_use):
                 logger.debug(
                     f"Request {request.request_id}: invalid cache detected, "
                     f"proceeding without cache"
                 )
                 cache_to_use = None
+                # The request has to fall back to a full prefill whatever
+                # happens next. Leaving this to the bounded-cache branch below
+                # meant a rejected cache with max_kv_size=0 kept stale
+                # cached_tokens/remaining_tokens, and the scheduler inserted
+                # only the prompt's suffix.
                 request.prompt_cache = None
                 request.cached_tokens = 0
                 request.remaining_tokens = request.prompt_token_ids
                 tokens_to_process = request.prompt_token_ids
+
+            # Build the bounded cache ourselves rather than leaving it to
+            # BatchGenerator. Its rule only converts flat KVCache layers, so a
+            # KVCache nested inside a CacheList stays unbounded and the flag is
+            # a no-op on those architectures (DeepSeek-V4 groups three caches
+            # per layer). BatchGenerator still gets max_kv_size as a backstop
+            # for any sequence inserted without a cache.
+            if cache_to_use is None and self._bounded_kv_size() is not None:
+                from mlx_lm.models.cache import make_prompt_cache
+
+                cache_to_use = self._bound_cache_layers(
+                    make_prompt_cache(self.model), self._bounded_kv_size()
+                )
 
             # Build per-request logits_processors from repetition_penalty and
             # any caller-supplied extras (e.g. JSON schema constrained
@@ -2270,25 +2471,6 @@ class Scheduler:
                 )
 
         return scheduled
-
-    @staticmethod
-    def _copy_cache_state(value: Any) -> Any:
-        """Deep-copy a cache ``state`` payload.
-
-        Sharing the arrays is not safe: RotatingKVCache writes into its ring
-        buffer and PoolingCache writes into its remainder buffer, both in
-        place, so a snapshot that aliases them would be rewritten by the very
-        generation it is supposed to predate. ``x + 0`` forces a fresh array
-        while staying on the GPU.
-        """
-        import mlx.core as mx
-
-        if isinstance(value, mx.array):
-            return value + 0
-        if isinstance(value, (list, tuple)):
-            copied = [Scheduler._copy_cache_state(v) for v in value]
-            return type(value)(copied) if isinstance(value, tuple) else copied
-        return value
 
     # How much a prompt must have grown before its cache snapshot is worth
     # re-taking. Copying the KV cache is O(context), so refreshing every turn
@@ -2520,8 +2702,6 @@ class Scheduler:
             if cache_key is None:
                 return
 
-            import mlx.core as mx
-
             import time as _t
 
             _t0 = _t.monotonic()
@@ -2529,22 +2709,22 @@ class Scheduler:
             _t1 = _t.monotonic()
             if snapshot is None:
                 return
-            states = []
+            # The destination mirrors structure only; its state aliases the
+            # live caches on purpose.  store() is the single owner of
+            # copying and evaluation: its detach pass replaces every array
+            # with a freshly allocated, evaluated copy before the entry is
+            # kept (and rejects the entry instead of storing an alias if it
+            # cannot).
             for dst, src in zip(snapshot, raw_cache):
-                state = self._copy_cache_state(src.state)
                 meta = getattr(src, "meta_state", None)
                 if meta is not None:
                     dst.meta_state = meta
-                dst.state = state
-                states.append(state)
+                dst.state = src.state
             _t2 = _t.monotonic()
-            mx.eval(states)
-            _t3 = _t.monotonic()
             logger.debug(
-                "[snapshot_timing] make=%.2fs copy=%.2fs eval=%.2fs layers=%d",
+                "[snapshot_timing] make=%.2fs mirror=%.2fs layers=%d",
                 _t1 - _t0,
                 _t2 - _t1,
-                _t3 - _t2,
                 len(snapshot),
             )
 
@@ -3301,12 +3481,50 @@ class Scheduler:
             self.prefix_cache.clear()
             logger.info("[clear_prefix_cache] prefix cache cleared")
 
+    def ensure_ssd_tier(self) -> None:
+        """Create and attach the configured SSD tier when it is absent."""
+        if (
+            self._ssd_tier is not None
+            or self.config.ssd_cache_dir is None
+            or self.memory_aware_cache is None
+        ):
+            return
+
+        ssd_config = SSDCacheConfig(
+            cache_dir=self.config.ssd_cache_dir,
+            max_size_gb=self.config.ssd_cache_max_gb,
+        )
+        tier = SSDCacheTier(ssd_config)
+        try:
+            tier.start_writer()
+            tier.reconcile()
+        except Exception:
+            try:
+                tier.close()
+            except Exception:
+                logger.exception("Failed to close SSD tier after startup error")
+            raise
+
+        self._ssd_tier = tier
+        self.memory_aware_cache.set_ssd_tier(tier)
+        logger.info(
+            f"SSD cache tier enabled: dir={self.config.ssd_cache_dir}, "
+            f"max={self.config.ssd_cache_max_gb}GB"
+        )
+
     def close_ssd_tier(self) -> None:
-        """Shut down the SSD cache tier if present."""
-        if self._ssd_tier is not None:
-            self._ssd_tier.close()
+        """Shut down and detach the SSD cache tier if present."""
+        tier = self._ssd_tier
+        if tier is None:
+            return
+
+        if self.memory_aware_cache is not None:
+            self.memory_aware_cache.set_ssd_tier(None)
+
+        tier.close()
+        if self._ssd_tier is tier:
             self._ssd_tier = None
-            logger.info("SSD cache tier closed")
+        logger.info("SSD cache tier closed")
 
     def _try_promote_ssd_pending(self) -> None:
         """Attempt synchronous SSD promotion for waiting requests tagged ssd_pending.
@@ -3340,8 +3558,13 @@ class Scheduler:
 
             # Use the SSD entry's actual token count for read and store,
             # NOT the full prompt tokens. For prefix hits these differ.
-            matched_count = candidate["matched_tokens"]
-            matched_tokens = tuple(request.prompt_token_ids[:matched_count])
+            matched_tokens = tuple(
+                candidate.get(
+                    "matched_key",
+                    request.prompt_token_ids[: candidate["matched_tokens"]],
+                )
+            )
+            matched_count = len(matched_tokens)
 
             try:
                 cache_layers = self._ssd_tier._read_entry(
@@ -3377,6 +3600,7 @@ class Scheduler:
             )
 
             request.prompt_cache = reconstructed
+            request.prompt_cache_key = list(matched_tokens)
             request.cached_tokens = matched_count
             request.remaining_tokens = request.prompt_token_ids[matched_count:]
             request.cache_hit_type = "ssd_hit"
@@ -3417,8 +3641,15 @@ class Scheduler:
                 self.memory_aware_cache.release_reserved_memory(nbytes)
 
         # Use matched token count, not full prompt, for prefix hits
-        matched_count = candidate.get("matched_tokens", len(request.prompt_token_ids))
-        matched_tokens = tuple(request.prompt_token_ids[:matched_count])
+        matched_tokens = tuple(
+            candidate.get(
+                "matched_key",
+                request.prompt_token_ids[
+                    : candidate.get("matched_tokens", len(request.prompt_token_ids))
+                ],
+            )
+        )
+        matched_count = len(matched_tokens)
 
         cache_layers = await self._ssd_tier.async_promote(
             matched_tokens, reserve_budget, release_budget
@@ -3443,6 +3674,7 @@ class Scheduler:
         )
 
         request.prompt_cache = reconstructed
+        request.prompt_cache_key = list(matched_tokens)
         request.cached_tokens = matched_count
         request.remaining_tokens = request.prompt_token_ids[matched_count:]
         request.cache_hit_type = "ssd_hit"
@@ -3461,7 +3693,7 @@ class Scheduler:
         Converts numpy arrays back to MLX arrays and creates KVCache objects.
         """
         try:
-            from mlx_lm.models.cache import ArraysCache, KVCache
+            from mlx_lm.models.cache import ArraysCache, CacheList, KVCache
 
             # Cast restored arrays back to their original dtype if the spill
             # path upcast for numpy (bf16 → fp32). None = mlx lacks the named
@@ -3469,27 +3701,34 @@ class Scheduler:
             def _mx_dtype_from_name(name: str):
                 return getattr(mx, name, None)
 
+            def _mk_kv(d: dict):
+                """Rebuild a KVCache from a deserialized layer/sub dict."""
+                kv = KVCache()
+                kv.keys = mx.array(d["keys"])
+                kv.values = mx.array(d["values"])
+                keys_orig = d.get("keys_original_dtype")
+                if keys_orig is not None:
+                    dt = _mx_dtype_from_name(keys_orig)
+                    if dt is not None:
+                        kv.keys = kv.keys.astype(dt)
+                values_orig = d.get("values_original_dtype")
+                if values_orig is not None:
+                    dt = _mx_dtype_from_name(values_orig)
+                    if dt is not None:
+                        kv.values = kv.values.astype(dt)
+                kv.offset = d["offset"]
+                for attr in ("max_size", "keep", "step", "_idx"):
+                    if attr in d:
+                        setattr(kv, attr, d[attr])
+                return kv
+
             result = []
             for ld in layer_dicts:
                 if "keys" in ld and "values" in ld:
-                    kv = KVCache()
-                    kv.keys = mx.array(ld["keys"])
-                    kv.values = mx.array(ld["values"])
-                    keys_orig = ld.get("keys_original_dtype")
-                    if keys_orig is not None:
-                        dt = _mx_dtype_from_name(keys_orig)
-                        if dt is not None:
-                            kv.keys = kv.keys.astype(dt)
-                    values_orig = ld.get("values_original_dtype")
-                    if values_orig is not None:
-                        dt = _mx_dtype_from_name(values_orig)
-                        if dt is not None:
-                            kv.values = kv.values.astype(dt)
-                    kv.offset = ld["offset"]
-                    for attr in ("max_size", "keep", "step", "_idx"):
-                        if attr in ld:
-                            setattr(kv, attr, ld[attr])
-                    result.append(kv)
+                    result.append(_mk_kv(ld))
+                elif "cachelist_subs" in ld:
+                    # DSA CacheList: rebuild each KVCache sub and re-wrap.
+                    result.append(CacheList(*[_mk_kv(s) for s in ld["cachelist_subs"]]))
                 elif "state" in ld:
                     state_arrays = [mx.array(a) for a in ld["state"]]
                     state_dtypes = ld.get("state_original_dtypes")

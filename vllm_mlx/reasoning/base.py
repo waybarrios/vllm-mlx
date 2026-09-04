@@ -99,13 +99,19 @@ class ReasoningParser(ABC):
         """
         pass
 
-    def reset_state(self):  # noqa: B027
+    def reset_state(self, implicit_mode: bool = False):  # noqa: B027
         """
         Reset any internal state for a new request.
 
         Called before starting to process a new streaming request.
         Override in subclasses if stateful parsing is needed.
         This is intentionally a default no-op implementation.
+
+        ``implicit_mode`` says the chat template injected an open ``<think>``,
+        so generation begins INSIDE the reasoning block and the model will
+        only ever emit the closing tag. Parsers that default untagged output
+        to content must invert that default when it is set. Parsers with no
+        such ambiguity may ignore it.
         """
         pass
 

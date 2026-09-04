@@ -16,7 +16,34 @@ import argparse
 import json
 import sys
 
-from .cli_arg_types import make_json_object_arg_parser, make_positive_int_arg_parser
+from .cli_arg_types import (
+    make_auto_or_positive_int_arg_parser,
+    make_json_object_arg_parser,
+    make_positive_int_arg_parser,
+    memory_budget_gb_arg,
+)
+from .tool_parsers import ToolParserManager
+
+_TOOL_PARSER_CHOICES = ToolParserManager.list_registered()
+_TOOL_PARSER_HELP = (
+    "Select the tool call parser for the model. Options: "
+    f"{', '.join(_TOOL_PARSER_CHOICES)}. Required for --enable-auto-tool-choice."
+)
+
+
+def _add_tool_calling_args(serve_parser: argparse.ArgumentParser) -> None:
+    serve_parser.add_argument(
+        "--enable-auto-tool-choice",
+        action="store_true",
+        help="Enable auto tool choice for supported models. Use --tool-call-parser to specify which parser to use.",
+    )
+    serve_parser.add_argument(
+        "--tool-call-parser",
+        type=str,
+        default=None,
+        choices=_TOOL_PARSER_CHOICES,
+        help=_TOOL_PARSER_HELP,
+    )
 
 
 def serve_command(args):
@@ -35,6 +62,7 @@ def serve_command(args):
     logger = logging.getLogger(__name__)
     model_arg = getattr(args, "model", None)
     models_config = getattr(args, "models_config", None)
+    memory_budget_gb = getattr(args, "memory_budget_gb", None)
 
     if models_config and model_arg:
         print("Error: use either positional MODEL or --models-config, not both")
@@ -44,6 +72,9 @@ def serve_command(args):
         sys.exit(1)
     if models_config and args.served_model_name:
         print("Error: --served-model-name cannot be used with --models-config")
+        sys.exit(1)
+    if memory_budget_gb is not None and not models_config:
+        print("Error: --memory-budget-gb requires --models-config")
         sys.exit(1)
 
     # Validate tool calling arguments
@@ -73,19 +104,24 @@ def serve_command(args):
     mllm_draft_model = getattr(args, "mllm_draft_model", None)
     mllm_draft_kind = getattr(args, "mllm_draft_kind", None)
     mllm_draft_block_size = getattr(args, "mllm_draft_block_size", None)
+    default_mllm_draft = getattr(args, "default_mllm_draft", False)
     if mllm_draft_model and models_config:
         print("Error: --mllm-draft-model cannot be used with --models-config")
         sys.exit(1)
     if mllm_draft_model and not getattr(args, "mllm", False):
         print("Error: --mllm-draft-model requires --mllm")
         sys.exit(1)
+    if default_mllm_draft and not mllm_draft_model:
+        print("Error: --default-mllm-draft requires --mllm-draft-model")
+        sys.exit(1)
+    if mllm_draft_model and args.continuous_batching and mllm_draft_kind != "mtp":
+        print(
+            "Error: --mllm-draft-model with --continuous-batching "
+            "requires --mllm-draft-kind mtp"
+        )
+        sys.exit(1)
     if mllm_draft_block_size is not None and mllm_draft_block_size <= 0:
         print("Error: --mllm-draft-block-size must be a positive integer")
-        sys.exit(1)
-    if mllm_draft_model and args.continuous_batching:
-        print(
-            "Error: --mllm-draft-model is supported only without --continuous-batching"
-        )
         sys.exit(1)
     if mllm_draft_model and (args.auto_unload_idle_seconds > 0 or args.lazy_load_model):
         print("Error: --mllm-draft-model is not supported with lifecycle residency yet")
@@ -97,6 +133,8 @@ def serve_command(args):
     server._metrics_enabled = args.enable_metrics
     server._metrics.configure(enabled=args.enable_metrics)
     server._max_request_tokens = max_request_tokens
+    server._embedding_max_length = args.embedding_max_length
+    server._embedding_overflow_policy = args.embedding_overflow_policy
     if args.rate_limit > 0:
         server._rate_limiter = RateLimiter(
             requests_per_minute=args.rate_limit, enabled=True
@@ -335,11 +373,22 @@ def serve_command(args):
                 f"keep={args.specprefill_keep_pct*100:.0f}%, "
                 f"backbone={specprefill_backbone_pct*100:.0f}%)"
             )
+        if args.prefix_trie_cache:
+            memory = (
+                f", memory={args.prefix_trie_cache_memory_mb}MB"
+                if args.prefix_trie_cache_memory_mb is not None
+                else ""
+            )
+            print(
+                "Prefix trie cache: enabled "
+                f"(max_entries={args.prefix_trie_cache_size}{memory})"
+            )
         if mllm_draft_model:
             print(
                 "MLLM draft model: enabled "
                 f"(draft={mllm_draft_model}, kind={mllm_draft_kind}, "
-                f"block_size={mllm_draft_block_size})"
+                f"block_size={mllm_draft_block_size}, "
+                f"default_enabled={default_mllm_draft})"
             )
 
     if models_config:
@@ -353,13 +402,21 @@ def serve_command(args):
             specprefill_keep_pct=args.specprefill_keep_pct,
             specprefill_backbone_pct=specprefill_backbone_pct,
             specprefill_draft_model=args.specprefill_draft_model,
+            prefix_trie_cache=args.prefix_trie_cache,
+            prefix_trie_cache_size=args.prefix_trie_cache_size,
+            prefix_trie_cache_memory_mb=args.prefix_trie_cache_memory_mb,
             stream_interval=args.stream_interval if args.continuous_batching else 1,
             gpu_memory_utilization=args.gpu_memory_utilization,
             scheduler_config=scheduler_config,
             max_tokens=args.max_tokens,
             download_config=download_config,
+            auto_unload_idle_seconds=args.auto_unload_idle_seconds,
         )
-        load_model_registry(models_config, defaults=defaults)
+        load_model_registry(
+            models_config,
+            defaults=defaults,
+            memory_budget_gb=memory_budget_gb,
+        )
     else:
         # Load model with unified server
         load_model(
@@ -380,9 +437,13 @@ def serve_command(args):
             specprefill_keep_pct=args.specprefill_keep_pct,
             specprefill_backbone_pct=specprefill_backbone_pct,
             specprefill_draft_model=args.specprefill_draft_model,
+            prefix_trie_cache=args.prefix_trie_cache,
+            prefix_trie_cache_size=args.prefix_trie_cache_size,
+            prefix_trie_cache_memory_mb=args.prefix_trie_cache_memory_mb,
             mllm_draft_model=mllm_draft_model,
             mllm_draft_kind=mllm_draft_kind,
             mllm_draft_block_size=mllm_draft_block_size,
+            default_mllm_draft=default_mllm_draft,
             warm_prompts_path=getattr(args, "warm_prompts", None),
             auto_unload_idle_seconds=args.auto_unload_idle_seconds,
             lazy_load_model=args.lazy_load_model,
@@ -1013,6 +1074,16 @@ Examples:
         help="YAML file describing a registry of models for lazy multi-model serving",
     )
     serve_parser.add_argument(
+        "--memory-budget-gb",
+        type=memory_budget_gb_arg,
+        default=None,
+        help=(
+            "Override the registry manager model-weight residency budget in GB. "
+            "This is not a total runtime-memory limit and does not guarantee "
+            "prevention of Metal/MLX OOM."
+        ),
+    )
+    serve_parser.add_argument(
         "--served-model-name",
         type=str,
         default=None,
@@ -1259,6 +1330,27 @@ Examples:
         help="Path to small draft model for SpecPrefill importance scoring. "
         "Must share the same tokenizer as the target model.",
     )
+    serve_parser.add_argument(
+        "--prefix-trie-cache",
+        action="store_true",
+        default=False,
+        help=(
+            "Enable mlx-lm LRUPromptCache for pure-LLM SimpleEngine chat. "
+            "Default off; exact system-prefix snapshots still take precedence."
+        ),
+    )
+    serve_parser.add_argument(
+        "--prefix-trie-cache-size",
+        type=make_positive_int_arg_parser("--prefix-trie-cache-size"),
+        default=32,
+        help="Maximum prompt-cache trie entries for --prefix-trie-cache.",
+    )
+    serve_parser.add_argument(
+        "--prefix-trie-cache-memory-mb",
+        type=make_positive_int_arg_parser("--prefix-trie-cache-memory-mb"),
+        default=None,
+        help="Optional prompt-cache trie memory cap in MB.",
+    )
     # MLLM speculative draft/assistant model
     serve_parser.add_argument(
         "--mllm-draft-model",
@@ -1279,6 +1371,14 @@ Examples:
         type=make_positive_int_arg_parser("--mllm-draft-block-size"),
         default=None,
         help="Draft block size passed to mlx-vlm for --mllm-draft-model.",
+    )
+    serve_parser.add_argument(
+        "--default-mllm-draft",
+        action="store_true",
+        help=(
+            "Enable a configured MLLM assistant drafter by default. "
+            "Requests may opt out with mllm_draft=false."
+        ),
     )
     # MCP options
     serve_parser.add_argument(
@@ -1315,7 +1415,7 @@ Examples:
         "--auto-unload-idle-seconds",
         type=float,
         default=0.0,
-        help="Unload the main model after this many idle seconds (0 = disabled)",
+        help="Unload idle models after this many seconds (0 = disabled)",
     )
     serve_parser.add_argument(
         "--lazy-load-model",
@@ -1335,42 +1435,7 @@ Examples:
         help="Maximum number of characters accepted by /v1/audio/speech (default: 4096)",
     )
     # Tool calling options
-    serve_parser.add_argument(
-        "--enable-auto-tool-choice",
-        action="store_true",
-        help="Enable auto tool choice for supported models. Use --tool-call-parser to specify which parser to use.",
-    )
-    serve_parser.add_argument(
-        "--tool-call-parser",
-        type=str,
-        default=None,
-        choices=[
-            "auto",
-            "mistral",
-            "qwen",
-            "qwen3_coder",
-            "llama",
-            "hermes",
-            "harmony",
-            "gpt-oss",
-            "deepseek",
-            "kimi",
-            "granite",
-            "nemotron",
-            "xlam",
-            "functionary",
-            "gemma4",
-            "glm47",
-            "minimax",
-        ],
-        help=(
-            "Select the tool call parser for the model. Options: "
-            "auto (auto-detect), mistral, qwen, qwen3_coder, llama, hermes, "
-            "harmony, gpt-oss, deepseek, gemma4, kimi, granite, nemotron, "
-            "xlam, functionary, glm47, minimax. "
-            "Required for --enable-auto-tool-choice."
-        ),
-    )
+    _add_tool_calling_args(serve_parser)
     # Reasoning parser options - choices loaded dynamically from registry
     from .reasoning import list_parsers
 
@@ -1466,6 +1531,28 @@ Examples:
         type=str,
         default=None,
         help="Pre-load an embedding model at startup (e.g. mlx-community/embeddinggemma-300m-6bit)",
+    )
+    serve_parser.add_argument(
+        "--embedding-max-length",
+        type=make_auto_or_positive_int_arg_parser("--embedding-max-length"),
+        default=None,
+        help=(
+            "Ceiling on embedding input tokens: 'auto' (default) uses the "
+            "model-aware default (from the model's own context window), or "
+            "a positive integer to cap it lower for memory-constrained "
+            "deployments"
+        ),
+    )
+    serve_parser.add_argument(
+        "--embedding-overflow-policy",
+        type=str,
+        default="truncate",
+        choices=["truncate", "error"],
+        help=(
+            "What to do when an embedding input exceeds the effective max "
+            "length: 'truncate' (default, observable via a warning + metric) "
+            "or 'error' (reject with a structured 400 response)"
+        ),
     )
     # Reranker model option
     serve_parser.add_argument(

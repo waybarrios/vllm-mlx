@@ -49,6 +49,32 @@ def _needs_strict_false(model_name: str) -> bool:
     return False
 
 
+def _model_type(model_name: str) -> str:
+    """Read model_type from config.json, empty string if unavailable."""
+    from mlx_lm.utils import _download, load_config
+
+    try:
+        config = load_config(_download(model_name))
+    except Exception:
+        return ""
+    return config.get("text_config", config).get("model_type", "") or ""
+
+
+def _install_custom_chat_template(model_name: str, tokenizer):
+    """Give models without a Jinja chat template a programmatic encoder.
+
+    DeepSeek-V4 ships no ``chat_template``, so the stock path would either raise
+    or fall back to naive ``"role: content"`` concatenation. Patching the
+    tokenizer covers every caller at once.
+    """
+    if tokenizer is None or _model_type(model_name) != "deepseek_v4":
+        return tokenizer
+
+    from .deepseek_v4_encoding import install as install_deepseek_v4
+
+    return install_deepseek_v4(tokenizer, model_name=model_name)
+
+
 def load_model_with_fallback(model_name: str, tokenizer_config: dict = None):
     """
     Load model and tokenizer with fallback for non-standard tokenizers.
@@ -60,6 +86,11 @@ def load_model_with_fallback(model_name: str, tokenizer_config: dict = None):
     Returns:
         Tuple of (model, tokenizer)
     """
+    model, tokenizer = _load_model_with_fallback(model_name, tokenizer_config)
+    return model, _install_custom_chat_template(model_name, tokenizer)
+
+
+def _load_model_with_fallback(model_name: str, tokenizer_config: dict = None):
     from mlx_lm import load
 
     tokenizer_config = tokenizer_config or {}
