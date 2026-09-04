@@ -609,6 +609,9 @@ class MLLMBatchGenerator:
         # but next request has actual response at that position).
         # Stripping the suffix from cache keys enables clean PREFIX match.
         self._think_suffix_len = self._compute_think_suffix_len()
+        # Fallback anchor for _prompt_boundary_len().  See that method for why
+        # the think-suffix length alone is not a safe cut point.
+        self._im_end_id = self._resolve_im_end_id()
 
         # Generation stream
         if MLLMBatchGenerator._stream is None:
@@ -685,6 +688,47 @@ class MLLMBatchGenerator:
                 "[prefix_cache] Chat template has last_query_index but "
                 "regex did not match — template may use a different pattern"
             )
+
+    def _resolve_im_end_id(self) -> Optional[int]:
+        """Token id of ``<|im_end|>``, or None for non-ChatML templates."""
+        try:
+            tokenizer = getattr(self.processor, "tokenizer", self.processor)
+            ids = tokenizer.encode("<|im_end|>")
+            if len(ids) == 1:
+                return ids[0]
+        except Exception:
+            pass
+        return None
+
+    def _prompt_boundary_len(self, ids: List[int]) -> int:
+        """Length of the reusable prefix of ``ids`` — the end of the last
+        COMPLETE message.
+
+        Prefix-cache keys must not include the generation prompt.  The next
+        turn of the same conversation replaces it with the assistant's actual
+        reply, so a key that contains it is never a strict prefix of the next
+        turn: it matches only as an LCP with a small ``excess``, which is
+        rejected outright for hybrid (linear-attention) caches because
+        recurrent state cannot be rewound.  The result is a silent loss of
+        prefix reuse — every turn re-prefills the whole conversation.
+
+        ``_think_suffix_len`` is measured ONCE at startup against
+        ``enable_thinking=True``.  That is the wrong length whenever a request
+        renders with ``enable_thinking=False``, which callers select per
+        request via ``chat_template_kwargs``.  For Qwen3.5/3.6 the two suffixes
+        are ``<think>\n`` (2 tokens) and ``<think>\n\n</think>\n\n``
+        (4 tokens), so a fixed strip of 2 leaves ``<think>\n\n`` on the key.
+
+        Anchoring on the last ``<|im_end|>`` is independent of both the
+        thinking mode and the template's generation-prompt shape, and costs
+        only the few tokens of the ``<|im_start|>assistant`` header.
+        """
+        if self._im_end_id is not None:
+            for i in range(len(ids) - 1, -1, -1):
+                if ids[i] == self._im_end_id:
+                    return i + 1
+        S = self._think_suffix_len
+        return len(ids) - S if S > 0 else len(ids)
 
     def _compute_think_suffix_len(self) -> int:
         """Compute how many extra tokens enable_thinking=True adds at the END.
@@ -1502,13 +1546,13 @@ class MLLMBatchGenerator:
                     input_ids_list = req.input_ids.reshape(-1).tolist()
                     # Strip think suffix from lookup key so stored entries
                     # (also stripped) match as clean PREFIX.
-                    S = self._think_suffix_len
-                    lookup_ids = input_ids_list[:-S] if S > 0 else input_ids_list
+                    boundary = self._prompt_boundary_len(input_ids_list)
+                    lookup_ids = input_ids_list[:boundary]
                     cached_kv, remaining_ids = self.prefix_cache.fetch(lookup_ids)
-                    # Append think suffix back to remaining so the model
-                    # sees the full generation prompt (<think>\n).
-                    if cached_kv is not None and S > 0:
-                        remaining_ids = list(remaining_ids) + input_ids_list[-S:]
+                    # Put the generation prompt back on the remaining tokens
+                    # so the model still sees the full prompt.
+                    if cached_kv is not None and boundary < len(input_ids_list):
+                        remaining_ids = list(remaining_ids) + input_ids_list[boundary:]
 
                     # If remaining tokens contain image placeholders, the
                     # language-model-only path cannot handle them — clear the
@@ -2153,9 +2197,9 @@ class MLLMBatchGenerator:
                     # The exact-match path trims by 1 at fetch time to
                     # re-derive logits for the last prompt token.
                     output_count = batch.num_tokens[i]
-                    S = self._think_suffix_len
-                    total_trim = output_count + S
-                    cache_key = input_ids_list[:-S] if S > 0 else input_ids_list
+                    boundary = self._prompt_boundary_len(input_ids_list)
+                    total_trim = output_count + (len(input_ids_list) - boundary)
+                    cache_key = input_ids_list[:boundary]
                     self._store_prefix_snapshot(
                         cache_key,
                         extracted,
@@ -3192,12 +3236,12 @@ def install_chunked_prefill_mllm(
                 if batch_gen.prefix_cache is not None and req.input_ids is not None:
                     try:
                         input_ids_list = req.input_ids.reshape(-1).tolist()
-                        S = batch_gen._think_suffix_len
-                        cache_key = input_ids_list[:-S] if S > 0 else input_ids_list
-                        # Trim output: at store time output_count=0, so
-                        # trim by S only (matching canonical path's
-                        # output_count + S invariant).
-                        trim_amount = S
+                        boundary = batch_gen._prompt_boundary_len(input_ids_list)
+                        cache_key = input_ids_list[:boundary]
+                        # output_count is 0 here (nothing generated yet), so the
+                        # trim is just the generation prompt — the same boundary
+                        # the canonical path uses.
+                        trim_amount = len(input_ids_list) - boundary
                         batch_gen._store_prefix_snapshot(
                             cache_key,
                             partial["cache"],
@@ -3271,11 +3315,11 @@ def install_chunked_prefill_mllm(
 
                 if batch_gen.prefix_cache is not None:
                     input_ids_list = input_ids.reshape(-1).tolist()
-                    S = batch_gen._think_suffix_len
-                    lookup_ids = input_ids_list[:-S] if S > 0 else input_ids_list
+                    boundary = batch_gen._prompt_boundary_len(input_ids_list)
+                    lookup_ids = input_ids_list[:boundary]
                     cached_kv, remaining_ids = batch_gen.prefix_cache.fetch(lookup_ids)
-                    if cached_kv is not None and S > 0:
-                        remaining_ids = list(remaining_ids) + input_ids_list[-S:]
+                    if cached_kv is not None and boundary < len(input_ids_list):
+                        remaining_ids = list(remaining_ids) + input_ids_list[boundary:]
 
                     # Check for empty rotating cache
                     if cached_kv is not None and batch_gen._has_empty_rotating_cache(
