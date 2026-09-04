@@ -341,11 +341,21 @@ class MemoryBudgetReport:
 def _registry_entry_uses_mllm_path(
     entry: RegisteredModel, defaults: RegistryServeDefaults
 ) -> bool:
-    """Match the MLLM selection performed when BatchedEngine is constructed."""
+    """Classify explicit or locally verifiable MLLM registry entries."""
     force_mllm = (
         entry.force_mllm if entry.force_mllm is not None else defaults.force_mllm
     )
-    return bool(force_mllm) or is_mllm_model(entry.source)
+    if force_mllm:
+        return True
+
+    # Remote IDs are unresolved when this startup report is built. Their names
+    # are only a heuristic and can disagree with the downloaded config that the
+    # engine later treats as authoritative. Require an explicit declaration for
+    # remote entries so capacity warnings cannot be false positives.
+    if not Path(entry.source).exists():
+        return False
+
+    return is_mllm_model(entry.source)
 
 
 def build_memory_budget_report(

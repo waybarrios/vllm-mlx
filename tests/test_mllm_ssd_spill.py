@@ -22,9 +22,11 @@ def _install_fakes(monkeypatch, prefix_cache_obj):
 
     set_calls = []
     tier_instances = []
+    generator_kwargs = []
 
     class FakeGenerator:
         def __init__(self, *a, **kw):
+            generator_kwargs.append(kw)
             self.prefix_cache = prefix_cache_obj
             self.language_model = SimpleNamespace(mtp=None)
 
@@ -66,7 +68,7 @@ def _install_fakes(monkeypatch, prefix_cache_obj):
     fake_ssd.SSDCacheConfig = FakeTierConfig
     monkeypatch.setitem(sys.modules, "vllm_mlx.ssd_cache", fake_ssd)
 
-    return set_calls, tier_instances
+    return set_calls, tier_instances, generator_kwargs
 
 
 def _bare_scheduler(config):
@@ -83,7 +85,7 @@ def _bare_scheduler(config):
 
 def test_ssd_tier_attached_when_dir_set(monkeypatch, tmp_path):
     prefix_cache = SimpleNamespace()
-    set_calls, tiers = _install_fakes(monkeypatch, prefix_cache)
+    set_calls, tiers, _ = _install_fakes(monkeypatch, prefix_cache)
 
     cfg = MLLMSchedulerConfig(ssd_cache_dir=str(tmp_path), ssd_cache_max_gb=7.0)
     sched = _bare_scheduler(cfg)
@@ -100,7 +102,7 @@ def test_ssd_tier_attached_when_dir_set(monkeypatch, tmp_path):
 
 def test_no_tier_when_dir_unset(monkeypatch):
     prefix_cache = SimpleNamespace()
-    set_calls, tiers = _install_fakes(monkeypatch, prefix_cache)
+    set_calls, tiers, _ = _install_fakes(monkeypatch, prefix_cache)
 
     cfg = MLLMSchedulerConfig(ssd_cache_dir=None)
     sched = _bare_scheduler(cfg)
@@ -113,7 +115,7 @@ def test_no_tier_when_dir_unset(monkeypatch):
 
 def test_no_tier_when_prefix_cache_absent(monkeypatch, tmp_path):
     # Prefix caching disabled → generator.prefix_cache is None → no SSD tier.
-    set_calls, tiers = _install_fakes(monkeypatch, None)
+    set_calls, tiers, _ = _install_fakes(monkeypatch, None)
 
     cfg = MLLMSchedulerConfig(ssd_cache_dir=str(tmp_path))
     sched = _bare_scheduler(cfg)
@@ -121,3 +123,14 @@ def test_no_tier_when_prefix_cache_absent(monkeypatch, tmp_path):
 
     assert tiers == []
     assert sched._ssd_tier is None
+
+
+def test_prefix_cache_uses_configured_memory_percent(monkeypatch):
+    _, _, generator_kwargs = _install_fakes(monkeypatch, SimpleNamespace())
+    cfg = MLLMSchedulerConfig(prefix_cache_memory_percent=0.35)
+    sched = _bare_scheduler(cfg)
+
+    sched._ensure_batch_generator()
+
+    prefix_cache_config = generator_kwargs[0]["prefix_cache_config"]
+    assert prefix_cache_config.max_memory_percent == 0.35

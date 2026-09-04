@@ -159,3 +159,13 @@ def test_start_mllm_forwards_ssd_cache_fields(monkeypatch):
     )
     assert captured["config_kwargs"]["ssd_cache_dir"] == "/tmp/ssd-kv"
     assert captured["config_kwargs"]["ssd_cache_max_gb"] == 42.0
+
+
+def test_start_mllm_forwards_prefix_cache_memory_percent(monkeypatch):
+    """The MLLM prefix cache must receive the configured percentage limit."""
+    captured = _run_start_mllm(
+        monkeypatch,
+        _base_scheduler_config(cache_memory_percent=0.35),
+    )
+
+    assert captured["config_kwargs"]["prefix_cache_memory_percent"] == 0.35

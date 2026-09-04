@@ -77,6 +77,8 @@ class MLLMSchedulerConfig:
     use_memory_aware_cache: bool = True
     # Memory limit for prefix cache (None = auto-detect)
     prefix_cache_memory_mb: Optional[int] = None
+    # Fraction of available memory used when no explicit MB limit is configured
+    prefix_cache_memory_percent: float = 0.20
     # KV cache quantization for prefix cache store/fetch
     kv_cache_quantization: bool = False
     kv_cache_quantization_bits: int = 8
@@ -307,6 +309,7 @@ class MLLMScheduler:
             if self.config.enable_prefix_cache and self.config.use_memory_aware_cache:
                 prefix_cache_config = MemoryCacheConfig(
                     max_memory_mb=self.config.prefix_cache_memory_mb,
+                    max_memory_percent=self.config.prefix_cache_memory_percent,
                     kv_quantize=self.config.kv_cache_quantization,
                     kv_bits=self.config.kv_cache_quantization_bits,
                     kv_group_size=self.config.kv_cache_quantization_group_size,
