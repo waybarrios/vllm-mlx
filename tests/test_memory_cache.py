@@ -428,6 +428,47 @@ class TestMemoryAwarePrefixCache:
         stats = cache.get_stats()
         assert stats["evictions"] > 0
 
+    def test_eviction_prefers_superseded_prefix_over_lru(self, model, mock_kv_cache):
+        """Under pressure, give up a turn another entry subsumes -- not a live one.
+
+        Multi-turn conversations store one entry per turn, each a strict prefix of
+        the next, so the cache fills with superseded turns. Walking strictly
+        oldest-first then evicts conversation A's NEWEST entry -- the one A is
+        about to reuse -- before touching conversation B's already-superseded
+        turns. Preferring superseded entries keeps every live conversation warm.
+        """
+        # ~200KB entries, 1MB budget => 5 resident; 8 stores forces 3 evictions.
+        config = MemoryCacheConfig(
+            max_memory_mb=1.0,
+            max_entries=100,
+            min_prefix_tokens=1,
+        )
+        cache = MemoryAwarePrefixCache(model, config)
+
+        def turns(tag):
+            # three turns, each a strict prefix of the next
+            return [[tag] * (3 * n) for n in (1, 2, 3)]
+
+        a_turns, b_turns = turns(1), turns(2)
+        # evict_prefixes=False mirrors the hybrid-model path, where proactive
+        # prefix eviction is disabled and superseded turns therefore accumulate.
+        for seq in a_turns + b_turns:
+            cache.store(seq, mock_kv_cache(200 * 1024), evict_prefixes=False)
+        # conversation C applies the pressure that forces the discriminating choice
+        for seq in turns(3)[:2]:
+            cache.store(seq, mock_kv_cache(200 * 1024), evict_prefixes=False)
+
+        assert cache.get_stats()["evictions"] >= 3
+
+        # A's live (newest) entry must have survived: strict LRU would have taken
+        # it as the third victim, since A1 and A2 are the two oldest entries.
+        result, _ = cache.fetch(a_turns[-1])
+        assert result is not None, "live entry of the older conversation was evicted"
+
+        # ...and B's live entry too.
+        result_b, _ = cache.fetch(b_turns[-1])
+        assert result_b is not None, "live entry of the newer conversation was evicted"
+
     def test_lru_order_updated_on_fetch(self, small_cache, mock_kv_cache):
         # Store two entries
         tokens1 = [1, 2, 3]
