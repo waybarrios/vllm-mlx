@@ -130,6 +130,36 @@ def test_generation_metadata_preserves_zero_mllm_mtp_acceptance():
     assert metadata.mtp_accepted == 0
 
 
+def test_generation_metadata_reports_media_specprefill_fallback():
+    from vllm_mlx import server
+
+    outcome = SimpleNamespace(
+        requested=True,
+        engaged=False,
+        reason="unsupported_model_module",
+        route="mllm_media",
+        model_module="custom.model",
+        language_module="custom.language",
+        model_type="custom_vlm",
+        original_tokens=9000,
+        selected_tokens=0,
+    )
+    output = SimpleNamespace(
+        mtp_drafts=0,
+        mtp_accepted=0,
+        specprefill_outcome=outcome,
+    )
+
+    metadata = server._generation_metadata(None, output)
+
+    assert metadata is not None
+    assert metadata.specprefill_requested is True
+    assert metadata.specprefill_engaged is False
+    assert metadata.specprefill_reason == "unsupported_model_module"
+    assert metadata.specprefill_route == "mllm_media"
+    assert metadata.specprefill_original_tokens == 9000
+
+
 def test_build_thinking_processor_warns_when_watchdog_cannot_fire(monkeypatch, caplog):
     from vllm_mlx import server
 

@@ -357,6 +357,7 @@ class TestMLLMBatch:
             num_tokens=[0, 0, 0, 0],
             cache=[],
             requests=requests,
+            decode_rope_deltas=mx.array([[10], [20], [30], [40]]),
         )
 
         # Keep only indices 1 and 3
@@ -365,6 +366,7 @@ class TestMLLMBatch:
         assert len(batch) == 2
         assert batch.uids == [1, 3]
         assert batch.request_ids == ["req-1", "req-3"]
+        assert batch.decode_rope_deltas.tolist() == [[20], [40]]
 
     def test_batch_extend_handles_empty_protocol_caches_without_keys(self):
         """Caches with empty()/extend() but no .keys still need batch extension."""
@@ -393,6 +395,7 @@ class TestMLLMBatch:
             num_tokens=[0],
             cache=[primary_cache],
             requests=[MLLMBatchRequest(uid=1, request_id="req-1", prompt="one")],
+            decode_rope_deltas=mx.array([[7]]),
         )
         other = MLLMBatch(
             uids=[2],
@@ -408,8 +411,50 @@ class TestMLLMBatch:
         primary.extend(other)
 
         assert primary.y.shape == (2,)
+        assert primary.decode_rope_deltas.tolist() == [[7], [0]]
         assert primary_cache.extend_calls == 1
         assert primary_cache.extended_with is other_cache
+
+    def test_specprefill_gating_uses_installed_mtp_state(self, monkeypatch):
+        from vllm_mlx import mllm_batch_generator as batch_module
+        from vllm_mlx.mllm_batch_generator import (
+            MLLMBatchGenerator,
+            MLLMBatchRequest,
+        )
+        from vllm_mlx.mllm_specprefill import SpecPrefillRequestConfig
+
+        generator = MLLMBatchGenerator.__new__(MLLMBatchGenerator)
+        generator.model = object()
+        generator.specprefill_draft_model = object()
+        generator.specprefill_threshold = 10
+        generator.specprefill_runtime_reason = None
+        generator._mtp_runtime_implementation = None
+        request = MLLMBatchRequest(
+            uid=1,
+            request_id="media",
+            prompt="prompt",
+            mllm_draft=False,
+        )
+        config = SpecPrefillRequestConfig(enabled=True, keep_pct=0.3)
+        monkeypatch.setattr(
+            batch_module, "request_eligibility_reason", lambda *a, **k: None
+        )
+
+        assert generator._specprefill_eligibility_reason(request, config, True) is None
+
+        generator._mtp_runtime_implementation = "native_target_head"
+        assert (
+            generator._specprefill_eligibility_reason(request, config, True)
+            == "mtp_incompatible"
+        )
+
+        generator._mtp_runtime_implementation = "external_assistant"
+        assert generator._specprefill_eligibility_reason(request, config, True) is None
+        request.mllm_draft = True
+        assert (
+            generator._specprefill_eligibility_reason(request, config, True)
+            == "mtp_incompatible"
+        )
 
 
 class TestMLLMBatchStats:
@@ -1074,6 +1119,7 @@ class TestMLLMBatchGeneratorMTPGuards:
 
         install_mtp_mllm(batch_gen, language_model, num_draft_tokens=4)
 
+        assert batch_gen._mtp_runtime_implementation == "native_target_head"
         stats = batch_gen.get_mtp_stats()
         assert stats["enabled"] is True
         assert stats["requested_draft_tokens"] == 4
@@ -1136,6 +1182,7 @@ class TestMLLMBatchGeneratorMTPGuards:
         language_model = MagicMock()
         install_mtp_mllm(batch_gen, language_model, draft_model=draft_model)
 
+        assert batch_gen._mtp_runtime_implementation == "external_assistant"
         assert batch_gen._allow_mid_batch_extend is False
 
         tokens, logprobs = batch_gen._step(
@@ -1916,8 +1963,9 @@ class TestBatchedMLLMConfigWiring:
                 self.__dict__.update(kwargs)
 
         class FakeMLLMScheduler:
-            def __init__(self, model, processor, config):
+            def __init__(self, model, processor, config, **kwargs):
                 captured["scheduler_config"] = config
+                captured["scheduler_kwargs"] = kwargs
 
             async def start(self):
                 return None
@@ -1957,6 +2005,7 @@ class TestBatchedMLLMConfigWiring:
         assert captured["config_kwargs"]["use_memory_aware_cache"] is False
         assert captured["config_kwargs"]["cache_memory_mb"] == 123
         assert captured["config_kwargs"]["prefix_cache_memory_mb"] == 123
+        assert captured["scheduler_kwargs"]["specprefill_draft_model"] is None
 
 
 class TestPreprocessIdempotent:
@@ -1991,6 +2040,7 @@ class TestPreprocessIdempotent:
         # Must return immediately without touching prepare_inputs
         gen._preprocess_request(req)
         assert req.input_ids.shape == (1, 3)
+        assert req.is_text_only is True
 
     def test_vision_request_not_skipped(self):
         """Vision requests should NOT be skipped even with input_ids set."""
@@ -2015,6 +2065,7 @@ class TestPreprocessIdempotent:
         # Should NOT return early — will try to import prepare_inputs
         with pytest.raises(Exception):
             gen._preprocess_request(req)
+        assert req.is_text_only is False
 
 
 class TestChunkedPrefillCacheHandling:
@@ -2265,6 +2316,37 @@ class TestChunkedPrefillCacheHandling:
         assert orig_next_called == [
             1
         ], f"Short prompt should fall through to _orig_next, got {orig_next_called}"
+
+    def test_audio_request_bypasses_interleaved_text_prefill(self):
+        """Audio requests must remain on the multimodal prefill path."""
+        from vllm_mlx.mllm_batch_generator import (
+            MLLMBatchRequest,
+            install_chunked_prefill_mllm,
+        )
+
+        gen = self._make_fake_batch_gen()
+        gen.prefix_cache = MagicMock()
+        gen.language_model = MagicMock()
+        original_next = MagicMock(return_value=[])
+        gen._next = original_next
+
+        install_chunked_prefill_mllm(gen, budget=1)
+
+        request = MLLMBatchRequest(
+            uid=5,
+            request_id="req-audio",
+            prompt="transcribe",
+            audio=["fake.wav"],
+        )
+        request.input_ids = mx.array([[10, 20, 30]])
+        gen.unprocessed_requests.append(request)
+        gen._preprocess_request = MagicMock()
+
+        gen._next()
+
+        gen._preprocess_request.assert_not_called()
+        gen.prefix_cache.fetch.assert_not_called()
+        original_next.assert_called_once()
 
 
 def test_external_mtp_drafts_mixed_position_rows_independently():

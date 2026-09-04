@@ -27,8 +27,20 @@ from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 import mlx.core as mx
 import mlx.nn as nn
 
-from .memory_cache import MemoryAwarePrefixCache, MemoryCacheConfig
+from .memory_cache import (
+    MemoryAwarePrefixCache,
+    MemoryCacheConfig,
+    is_text_only_prefix_cache_request,
+)
 from .multimodal_processor import MultimodalProcessor
+from .mllm_specprefill import (
+    SpecPrefillOutcome,
+    SpecPrefillRequestConfig,
+    capability_reason,
+    model_identity,
+    request_eligibility_reason,
+    run_media_specprefill,
+)
 from .vision_embedding_cache import VisionEmbeddingCache
 
 logger = logging.getLogger(__name__)
@@ -210,6 +222,9 @@ class MLLMBatchRequest:
     # Merged with built-in repetition/presence penalty processors in
     # ``_prefill_batch``.
     logits_processors: Optional[List[Callable]] = None
+    specprefill_config: Optional[SpecPrefillRequestConfig] = None
+    specprefill_outcome: Optional[SpecPrefillOutcome] = None
+    decode_rope_delta: Optional[mx.array] = None
 
     # Processed inputs (set after vision preprocessing)
     input_ids: Optional[mx.array] = None
@@ -248,6 +263,7 @@ class MLLMBatchResponse:
     from_draft: bool = False  # True when this response is an accepted MTP draft
     mtp_attempted: bool = False  # True when the primary step attempted MTP
     mtp_attempted_count: int = 0  # Number of draft tokens attempted
+    specprefill_outcome: Optional[SpecPrefillOutcome] = None
 
 
 @dataclass
@@ -269,6 +285,7 @@ class MLLMBatch:
     requests: List[MLLMBatchRequest]  # Full request data
     logits_processors: Optional[List[Optional[List[Callable]]]] = None
     samplers: Optional[List[Optional[Callable]]] = None
+    decode_rope_deltas: Optional[mx.array] = None
 
     def __len__(self) -> int:
         return len(self.uids)
@@ -292,6 +309,8 @@ class MLLMBatch:
             self.samplers = [self.samplers[k] for k in keep_idx]
 
         keep_idx_array = mx.array(keep_idx, mx.int32)
+        if self.decode_rope_deltas is not None:
+            self.decode_rope_deltas = self.decode_rope_deltas[keep_idx_array]
         self.y = self.y[keep_idx_array]
 
         # Filter cache entries
@@ -328,6 +347,21 @@ class MLLMBatch:
             self_s = self.samplers or [None] * self_len
             other_s = other.samplers or [None] * len(other.uids)
             self.samplers = list(self_s) + list(other_s)
+
+        if self.decode_rope_deltas is not None or other.decode_rope_deltas is not None:
+            template = (
+                self.decode_rope_deltas
+                if self.decode_rope_deltas is not None
+                else other.decode_rope_deltas
+            )
+            self_len = len(self.uids) - len(other.uids)
+            left = self.decode_rope_deltas
+            right = other.decode_rope_deltas
+            if left is None:
+                left = mx.zeros((self_len, 1), dtype=template.dtype)
+            if right is None:
+                right = mx.zeros((len(other.uids), 1), dtype=template.dtype)
+            self.decode_rope_deltas = mx.concatenate([left, right], axis=0)
 
         # Extend cache - handle both BatchKVCache (.keys/.values) and
         # ArraysCache (.cache list) from hybrid models like Qwen3.5. Some
@@ -484,6 +518,12 @@ class MLLMBatchGenerator:
         vision_cache_size: int = 100,
         prefix_cache_config: Optional[MemoryCacheConfig] = None,
         max_kv_size: int = 0,
+        specprefill_draft_model: Optional[Any] = None,
+        specprefill_enabled: bool = False,
+        specprefill_threshold: int = 8192,
+        specprefill_keep_pct: float = 0.3,
+        specprefill_backbone_pct: float = 0.0,
+        specprefill_runtime_reason: Optional[str] = None,
     ):
         """
         Initialize MLLM batch generator.
@@ -507,6 +547,21 @@ class MLLMBatchGenerator:
         self.processor = processor
         self.mm_processor = mm_processor
         self.max_kv_size = max_kv_size
+        self.specprefill_draft_model = specprefill_draft_model
+        self.specprefill_enabled = specprefill_enabled
+        self.specprefill_threshold = specprefill_threshold
+        self.specprefill_keep_pct = specprefill_keep_pct
+        self.specprefill_backbone_pct = specprefill_backbone_pct
+        self.specprefill_runtime_reason = specprefill_runtime_reason
+        self._mtp_runtime_implementation: Optional[str] = None
+        self._specprefill_stats = {
+            "decisions": 0,
+            "engaged": 0,
+            "fallbacks": 0,
+            "original_tokens": 0,
+            "selected_tokens": 0,
+            "bypass_counts": {},
+        }
 
         # Get language model for text generation
         self.language_model = getattr(model, "language_model", model)
@@ -892,6 +947,13 @@ class MLLMBatchGenerator:
         Args:
             request: Request to preprocess
         """
+        # Classify from the original payload, not successfully processed media.
+        # A failed image/audio conversion must never make the request eligible
+        # for the token-only prefix cache.
+        request.is_text_only = not bool(
+            request.images or request.videos or request.audio
+        )
+
         # Already preprocessed (e.g. by early executor offloading in
         # _process_loop or chunked prefill interleaving).  Only skip for
         # text-only requests; media requests need pixel/audio cache lookup
@@ -1019,9 +1081,6 @@ class MLLMBatchGenerator:
 
         self._stats.num_images_processed += len(all_images)
         self._stats.vision_encoding_time += processing_time
-
-        # Mark text-only requests (eligible for prefix cache)
-        request.is_text_only = not bool(all_images or all_audio)
 
         logger.debug(
             f"Preprocessed request {request.request_id}: "
@@ -1225,10 +1284,7 @@ class MLLMBatchGenerator:
             output = self.language_model(input_ids, cache=cache)
             request.vision_encoded = True
             # Release preprocessed inputs after encoding (issue #442)
-            request.pixel_values = None
-            request.attention_mask = None
-            request.image_grid_thw = None
-            request.extra_kwargs.clear()
+            self._release_preprocessed_inputs(request)
             if hasattr(output, "logits"):
                 return output.logits
             return output
@@ -1283,10 +1339,7 @@ class MLLMBatchGenerator:
         output = self.language_model(last_chunk, cache=cache)
         request.vision_encoded = True
         # Release preprocessed inputs after encoding (issue #442)
-        request.pixel_values = None
-        request.attention_mask = None
-        request.image_grid_thw = None
-        request.extra_kwargs.clear()
+        self._release_preprocessed_inputs(request)
         self._prefill_progress[request.request_id] = (total, total)
 
         if chunk_count > 0:
@@ -1341,15 +1394,204 @@ class MLLMBatchGenerator:
         # into the KV cache.  pixel_values can be hundreds of MB for multi-
         # image requests; holding them pins Metal buffers for the entire
         # generation duration (issue #442).
-        request.pixel_values = None
-        request.attention_mask = None
-        request.image_grid_thw = None
-        request.extra_kwargs.clear()
+        self._release_preprocessed_inputs(request)
 
         # Handle LanguageModelOutput or plain tensor
         if hasattr(output, "logits"):
             return output.logits
         return output
+
+    @staticmethod
+    def _release_preprocessed_inputs(request: MLLMBatchRequest) -> None:
+        """Release request-local media tensors after prefill has consumed them."""
+        request.pixel_values = None
+        request.attention_mask = None
+        request.image_grid_thw = None
+        request.extra_kwargs.clear()
+
+    def _record_specprefill_outcome(
+        self,
+        request: MLLMBatchRequest,
+        *,
+        requested: bool,
+        engaged: bool,
+        reason: str,
+        original_tokens: int,
+        selected_tokens: int = 0,
+    ) -> None:
+        """Attach stable diagnostics and update aggregate SpecPrefill counters."""
+        identity = model_identity(self.model)
+        request.specprefill_outcome = SpecPrefillOutcome(
+            requested=requested,
+            engaged=engaged,
+            reason=reason,
+            model_module=identity.model_module,
+            language_module=identity.language_module,
+            model_type=identity.model_type,
+            original_tokens=original_tokens,
+            selected_tokens=selected_tokens,
+        )
+        self._specprefill_stats["decisions"] += 1
+        if engaged:
+            self._specprefill_stats["engaged"] += 1
+            self._specprefill_stats["original_tokens"] += original_tokens
+            self._specprefill_stats["selected_tokens"] += selected_tokens
+        else:
+            self._specprefill_stats["fallbacks"] += 1
+            bypass_counts = self._specprefill_stats["bypass_counts"]
+            bypass_counts[reason] = bypass_counts.get(reason, 0) + 1
+
+    def _resolved_specprefill_config(
+        self, request: MLLMBatchRequest
+    ) -> tuple[SpecPrefillRequestConfig, bool]:
+        """Resolve request overrides without losing threshold semantics."""
+        overrides = request.specprefill_config or SpecPrefillRequestConfig()
+        requested = (
+            overrides.enabled
+            if overrides.enabled is not None
+            else self.specprefill_enabled
+        )
+        return (
+            SpecPrefillRequestConfig(
+                enabled=overrides.enabled,
+                keep_pct=(
+                    overrides.keep_pct
+                    if overrides.keep_pct is not None
+                    else self.specprefill_keep_pct
+                ),
+                backbone_pct=(
+                    overrides.backbone_pct
+                    if overrides.backbone_pct is not None
+                    else self.specprefill_backbone_pct
+                ),
+            ),
+            requested,
+        )
+
+    def _specprefill_eligibility_reason(
+        self,
+        request: MLLMBatchRequest,
+        config: SpecPrefillRequestConfig,
+        requested: bool,
+    ) -> Optional[str]:
+        if not requested:
+            return (
+                "disabled_by_request"
+                if config.enabled is False
+                else "disabled_by_server"
+            )
+        if self.specprefill_runtime_reason is not None:
+            return self.specprefill_runtime_reason
+        if self._mtp_runtime_implementation == "native_target_head":
+            return "mtp_incompatible"
+        if (
+            self._mtp_runtime_implementation == "external_assistant"
+            and request.mllm_draft
+        ):
+            return "mtp_incompatible"
+        return request_eligibility_reason(
+            self.model,
+            self.specprefill_draft_model,
+            request,
+            config,
+            threshold=self.specprefill_threshold,
+        )
+
+    def _try_media_specprefill(
+        self,
+        request: MLLMBatchRequest,
+        cache: List[Any],
+    ) -> Tuple[Optional[mx.array], bool]:
+        """Return sparse logits and whether dense fallback needs a fresh cache."""
+        config, requested = self._resolved_specprefill_config(request)
+        original_tokens = (
+            int(request.input_ids.size) if request.input_ids is not None else 0
+        )
+        reason = self._specprefill_eligibility_reason(request, config, requested)
+        if reason is not None:
+            self._record_specprefill_outcome(
+                request,
+                requested=requested,
+                engaged=False,
+                reason=reason,
+                original_tokens=original_tokens,
+            )
+            return None, False
+
+        def _cancel_check() -> None:
+            if request.request_id in self._aborted_request_ids:
+                self._aborted_request_ids.discard(request.request_id)
+                raise PrefillAbortedError(request.request_id)
+
+        try:
+            logits, decode_rope_delta, selected_tokens = run_media_specprefill(
+                self.model,
+                self.language_model,
+                self.specprefill_draft_model,
+                request,
+                cache,
+                keep_pct=config.keep_pct,
+                backbone_pct=config.backbone_pct,
+                step_size=self.prefill_step_size,
+                cancel_check=_cancel_check,
+            )
+            if selected_tokens >= original_tokens:
+                self._record_specprefill_outcome(
+                    request,
+                    requested=requested,
+                    engaged=False,
+                    reason="selection_not_sparse",
+                    original_tokens=original_tokens,
+                    selected_tokens=selected_tokens,
+                )
+                return None, False
+        except PrefillAbortedError:
+            raise
+        except Exception as exc:
+            logger.warning(
+                "Media SpecPrefill failed for %s; using dense VLM prefill: %s: %s",
+                request.request_id,
+                type(exc).__name__,
+                exc,
+            )
+            self._record_specprefill_outcome(
+                request,
+                requested=requested,
+                engaged=False,
+                reason="sparse_prefill_failed",
+                original_tokens=original_tokens,
+            )
+            return None, True
+
+        request.decode_rope_delta = decode_rope_delta
+        request.vision_encoded = True
+        self._release_preprocessed_inputs(request)
+        self._prefill_progress[request.request_id] = (
+            original_tokens,
+            original_tokens,
+        )
+        self._record_specprefill_outcome(
+            request,
+            requested=requested,
+            engaged=True,
+            reason="engaged",
+            original_tokens=original_tokens,
+            selected_tokens=selected_tokens,
+        )
+        logger.info(
+            "Media SpecPrefill engaged for %s: selected=%d/%d",
+            request.request_id,
+            selected_tokens,
+            original_tokens,
+        )
+        return logits, False
+
+    def _capture_dense_rope_delta(self, request: MLLMBatchRequest) -> None:
+        """Capture request-local Qwen MRoPE state before another prefill mutates it."""
+        if capability_reason(self.model) is None:
+            request.decode_rope_delta = getattr(
+                self.language_model, "_rope_deltas", None
+            )
 
     def _process_prompts(self, requests: List[MLLMBatchRequest]) -> MLLMBatch:
         """
@@ -1394,6 +1636,7 @@ class MLLMBatchGenerator:
                         token=0,
                         logprobs=mx.zeros(1),
                         finish_reason="error",
+                        specprefill_outcome=req.specprefill_outcome,
                     )
                 )
 
@@ -1490,15 +1733,14 @@ class MLLMBatchGenerator:
                     self._aborted_request_ids.discard(req.request_id)
                     raise PrefillAbortedError(req.request_id)
 
-                # Try prefix cache for all requests (text-only and multimodal).
-                # VLM forward writes the same KV state as language model forward
-                # for text tokens, so cached KV from a previous VLM run is valid.
-                # However, if the remaining (uncached) tokens contain image
-                # placeholders, we must fall back to VLM forward instead of
-                # running them through the language model alone.
+                # Media state is not represented in the token-only cache key,
+                # and supported Qwen routes also need request-local MRoPE
+                # deltas. Restrict shared prefix state to text-only requests.
                 cached_kv = None
                 remaining_ids = None
-                if self.prefix_cache is not None and req.input_ids is not None:
+                if self.prefix_cache is not None and is_text_only_prefix_cache_request(
+                    req
+                ):
                     input_ids_list = req.input_ids.reshape(-1).tolist()
                     # Strip think suffix from lookup key so stored entries
                     # (also stripped) match as clean PREFIX.
@@ -1509,19 +1751,6 @@ class MLLMBatchGenerator:
                     # sees the full generation prompt (<think>\n).
                     if cached_kv is not None and S > 0:
                         remaining_ids = list(remaining_ids) + input_ids_list[-S:]
-
-                    # If remaining tokens contain image placeholders, the
-                    # language-model-only path cannot handle them — clear the
-                    # cache hit so we fall through to full VLM forward.
-                    if cached_kv is not None and remaining_ids:
-                        img_tok = getattr(
-                            getattr(self.model, "config", None),
-                            "image_token_index",
-                            None,
-                        )
-                        if img_tok is not None and img_tok in remaining_ids:
-                            cached_kv = None
-                            remaining_ids = None
 
                 # Detect empty RotatingKVCache in cached entry — if any sliding-window
                 # layer has keys=None (all entries trimmed), the cache is unusable.
@@ -1680,7 +1909,28 @@ class MLLMBatchGenerator:
                                 req, cache=request_cache
                             )
                         else:
-                            logits = self._run_vision_encoding(req, cache=request_cache)
+                            _, specprefill_requested = (
+                                self._resolved_specprefill_config(req)
+                            )
+                            logits = None
+                            needs_fresh_cache = False
+                            if specprefill_requested:
+                                logits, needs_fresh_cache = self._try_media_specprefill(
+                                    req, request_cache
+                                )
+                            if logits is None:
+                                # Only a failed sparse target execution may
+                                # have advanced this cache. Ineligible and
+                                # non-sparse decisions reuse the untouched one.
+                                if needs_fresh_cache:
+                                    request_cache = make_prompt_cache(
+                                        self.language_model,
+                                        max_kv_size=self.max_kv_size or None,
+                                    )
+                                logits = self._run_vision_encoding(
+                                    req, cache=request_cache
+                                )
+                                self._capture_dense_rope_delta(req)
 
                         # Extract last token logits
                         last_logits = logits[:, -1, :]
@@ -1702,6 +1952,7 @@ class MLLMBatchGenerator:
                         token=0,
                         logprobs=mx.zeros(1),
                         finish_reason="abort",
+                        specprefill_outcome=req.specprefill_outcome,
                     )
                 )
 
@@ -1772,6 +2023,24 @@ class MLLMBatchGenerator:
         has_any_lp = any(batch_logits_processors)
         batch_samplers = [samplers_by_request.get(req.request_id) for req in requests]
         has_any_sampler = any(batch_samplers)
+        decode_rope_deltas = None
+        if any(req.decode_rope_delta is not None for req in requests):
+            template = next(
+                req.decode_rope_delta
+                for req in requests
+                if req.decode_rope_delta is not None
+            )
+            decode_rope_deltas = mx.concatenate(
+                [
+                    (
+                        req.decode_rope_delta
+                        if req.decode_rope_delta is not None
+                        else mx.zeros((1, 1), dtype=template.dtype)
+                    )
+                    for req in requests
+                ],
+                axis=0,
+            )
 
         self._stats.prompt_time += time.perf_counter() - tic
 
@@ -1780,10 +2049,7 @@ class MLLMBatchGenerator:
         # input_ids, etc. can be hundreds of MB per request; holding them
         # for the entire generation duration pins Metal buffers (issue #442).
         for req in requests:
-            req.pixel_values = None
-            req.attention_mask = None
-            req.image_grid_thw = None
-            req.extra_kwargs.clear()
+            self._release_preprocessed_inputs(req)
 
         return MLLMBatch(
             uids=[req.uid for req in requests],
@@ -1796,6 +2062,7 @@ class MLLMBatchGenerator:
             requests=requests,
             logits_processors=batch_logits_processors if has_any_lp else None,
             samplers=batch_samplers if has_any_sampler else None,
+            decode_rope_deltas=decode_rope_deltas,
         )
 
     def _step(
@@ -1823,8 +2090,16 @@ class MLLMBatchGenerator:
         if input_tokens.ndim == 1:
             input_tokens = input_tokens[:, None]
 
-        # Run language model only (not full VLM)
-        output = self.language_model(input_tokens, cache=cache)
+        # Run language model only (not full VLM). Supported Qwen media models
+        # require request-local MRoPE deltas during every decode step.
+        model_kwargs = {}
+        if (
+            self.active_batch is not None
+            and self.active_batch.decode_rope_deltas is not None
+            and len(self.active_batch) == int(input_tokens.shape[0])
+        ):
+            model_kwargs["rope_deltas"] = self.active_batch.decode_rope_deltas
+        output = self.language_model(input_tokens, cache=cache, **model_kwargs)
 
         # Handle LanguageModelOutput or plain tensor
         if hasattr(output, "logits"):
@@ -1919,6 +2194,7 @@ class MLLMBatchGenerator:
                             token=0,
                             logprobs=mx.zeros(1),
                             finish_reason="error",
+                            specprefill_outcome=req.specprefill_outcome,
                         )
                     )
 
@@ -1965,6 +2241,7 @@ class MLLMBatchGenerator:
                                 token=0,
                                 logprobs=mx.zeros(1),
                                 finish_reason="error",
+                                specprefill_outcome=req.specprefill_outcome,
                             )
                         )
 
@@ -2073,6 +2350,7 @@ class MLLMBatchGenerator:
                     logprobs=logprobs[i],
                     finish_reason=finish_reason,
                     prompt_cache=cache_fn,
+                    specprefill_outcome=req.specprefill_outcome,
                 )
             )
 
@@ -2144,7 +2422,7 @@ class MLLMBatchGenerator:
             return
         for i in end_indices:
             req = batch.requests[i]
-            if req.input_ids is not None:
+            if is_text_only_prefix_cache_request(req):
                 try:
                     extracted = batch.extract_cache(i)
                     input_ids_list = req.input_ids.reshape(-1).tolist()
@@ -2191,6 +2469,26 @@ class MLLMBatchGenerator:
             "memory_utilization": 0.0,
             "entry_count": 0,
         }
+
+    def get_specprefill_stats(self) -> Dict[str, Any]:
+        """Return aggregate media SpecPrefill decisions and compression."""
+        stats = dict(self._specprefill_stats)
+        stats["bypass_counts"] = dict(stats["bypass_counts"])
+        stats.update(
+            {
+                "enabled": self.specprefill_enabled,
+                "threshold": self.specprefill_threshold,
+                "keep_pct": self.specprefill_keep_pct,
+                "backbone_pct": self.specprefill_backbone_pct,
+                "draft_loaded": self.specprefill_draft_model is not None,
+                "runtime_reason": self.specprefill_runtime_reason,
+                "mtp_implementation": self._mtp_runtime_implementation,
+            }
+        )
+        original = stats["original_tokens"]
+        selected = stats["selected_tokens"]
+        stats["selection_rate"] = selected / original if original else 0.0
+        return stats
 
     def has_pending(self) -> bool:
         """Check if there are pending or active requests."""
@@ -2792,6 +3090,7 @@ def install_mtp_mllm(
                                 logprobs=draft_lp,
                                 finish_reason="stop",
                                 from_draft=from_draft,
+                                specprefill_outcome=r.specprefill_outcome,
                             )
                         )
                         draft_end_uids.add(uid)
@@ -2816,6 +3115,7 @@ def install_mtp_mllm(
                                 logprobs=draft_lp,
                                 finish_reason=draft_finish,
                                 from_draft=from_draft,
+                                specprefill_outcome=r.specprefill_outcome,
                             )
                         )
 
@@ -2851,6 +3151,9 @@ def install_mtp_mllm(
 
     batch_gen._step = _mtp_step
     batch_gen._next = _mtp_next
+    batch_gen._mtp_runtime_implementation = (
+        "external_assistant" if external_drafter else "native_target_head"
+    )
 
     if num_draft_tokens != 1:
         logger.warning(
@@ -2970,6 +3273,7 @@ def install_chunked_prefill_mllm(
                         if finish_reason is not None
                         else None
                     ),
+                    specprefill_outcome=req.specprefill_outcome,
                 )
             )
 
@@ -3007,6 +3311,7 @@ def install_chunked_prefill_mllm(
                         token=0,
                         logprobs=mx.zeros(1),
                         finish_reason="abort",
+                        specprefill_outcome=req.specprefill_outcome,
                     )
                 )
                 return _generation_step()
@@ -3189,7 +3494,10 @@ def install_chunked_prefill_mllm(
                     batch_gen.active_batch = new_batch
 
                 # Store in prefix cache (prompt-only)
-                if batch_gen.prefix_cache is not None and req.input_ids is not None:
+                if (
+                    batch_gen.prefix_cache is not None
+                    and is_text_only_prefix_cache_request(req)
+                ):
                     try:
                         input_ids_list = req.input_ids.reshape(-1).tolist()
                         S = batch_gen._think_suffix_len
@@ -3234,7 +3542,7 @@ def install_chunked_prefill_mllm(
                 len(batch_gen.unprocessed_requests),
             )
             for r in compatible_pending:
-                if not r.images and not r.videos:
+                if not r.images and not r.videos and not r.audio:
                     text_only_req = r
                     break
 
@@ -3255,6 +3563,7 @@ def install_chunked_prefill_mllm(
                             token=0,
                             logprobs=mx.zeros(1),
                             finish_reason="error",
+                            specprefill_outcome=text_only_req.specprefill_outcome,
                         )
                     )
                     return _generation_step()
@@ -3269,7 +3578,9 @@ def install_chunked_prefill_mllm(
                 cached_count = 0
                 total_tokens = input_ids.shape[1]
 
-                if batch_gen.prefix_cache is not None:
+                if batch_gen.prefix_cache is not None and (
+                    is_text_only_prefix_cache_request(text_only_req)
+                ):
                     input_ids_list = input_ids.reshape(-1).tolist()
                     S = batch_gen._think_suffix_len
                     lookup_ids = input_ids_list[:-S] if S > 0 else input_ids_list

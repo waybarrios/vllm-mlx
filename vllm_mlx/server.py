@@ -592,7 +592,12 @@ def _generation_metadata(
     mtp_drafts = getattr(output, "mtp_drafts", 0) or 0
     mtp_accepted = getattr(output, "mtp_accepted", 0) or 0
     has_mtp_activity = bool(mtp_drafts or mtp_accepted)
-    if thinking_processor is None and not has_mtp_activity:
+    specprefill_outcome = getattr(output, "specprefill_outcome", None)
+    if (
+        thinking_processor is None
+        and not has_mtp_activity
+        and specprefill_outcome is None
+    ):
         return None
     return GenerationMetadata(
         no_final_content_watchdog_tokens=getattr(
@@ -603,6 +608,25 @@ def _generation_metadata(
         ),
         mtp_drafts=mtp_drafts if has_mtp_activity else None,
         mtp_accepted=mtp_accepted if has_mtp_activity else None,
+        specprefill_requested=getattr(specprefill_outcome, "requested", None),
+        specprefill_engaged=(
+            getattr(specprefill_outcome, "engaged", None)
+            if specprefill_outcome is not None
+            else None
+        ),
+        specprefill_reason=getattr(specprefill_outcome, "reason", None),
+        specprefill_route=getattr(specprefill_outcome, "route", None),
+        specprefill_model_module=getattr(specprefill_outcome, "model_module", None),
+        specprefill_language_module=getattr(
+            specprefill_outcome, "language_module", None
+        ),
+        specprefill_model_type=getattr(specprefill_outcome, "model_type", None),
+        specprefill_original_tokens=getattr(
+            specprefill_outcome, "original_tokens", None
+        ),
+        specprefill_selected_tokens=getattr(
+            specprefill_outcome, "selected_tokens", None
+        ),
     )
 
 
@@ -1489,6 +1513,11 @@ def _build_engine(spec: ModelSpec) -> BaseEngine:
             scheduler_config=spec.scheduler_config,
             stream_interval=spec.stream_interval,
             force_mllm=spec.force_mllm,
+            specprefill_enabled=spec.specprefill_enabled,
+            specprefill_threshold=spec.specprefill_threshold,
+            specprefill_keep_pct=spec.specprefill_keep_pct,
+            specprefill_backbone_pct=spec.specprefill_backbone_pct,
+            specprefill_draft_model=spec.specprefill_draft_model,
         )
 
     from .engine.simple import SimpleEngine
@@ -3533,7 +3562,7 @@ def load_model(
         trust_remote_code: Allow HuggingFace remote code execution during model/tokenizer loading
         mtp: Enable native MTP speculative decoding (SimpleEngine only)
         prefill_step_size: Chunk size for prompt prefill processing (default: 2048)
-        specprefill_enabled: Enable SpecPrefill (SimpleEngine only)
+        specprefill_enabled: Enable SpecPrefill
         specprefill_threshold: Minimum suffix tokens to trigger SpecPrefill (default: 8192)
         specprefill_keep_pct: Fraction of tokens to keep (default: 0.3)
         specprefill_backbone_pct: Fraction of chunks reserved for evenly spaced coverage
@@ -3679,6 +3708,11 @@ def load_model(
             mllm_draft_kind=mllm_draft_kind,
             mllm_draft_block_size=mllm_draft_block_size,
             default_mllm_draft=default_mllm_draft,
+            specprefill_enabled=specprefill_enabled,
+            specprefill_threshold=specprefill_threshold,
+            specprefill_keep_pct=specprefill_keep_pct,
+            specprefill_backbone_pct=specprefill_backbone_pct,
+            specprefill_draft_model=specprefill_draft_model,
         )
         # BatchedEngine will be started in lifespan (uvicorn's event loop)
         # Just log for now
@@ -4666,6 +4700,8 @@ async def _build_chat_streaming_response(
     chat_kwargs,
     total_timeout,
     deadline,
+    *,
+    thinking_processor=None,
 ) -> tuple[StreamingResponse | Response, bool]:
     """Build a chat stream and report whether caller cleanup remains required."""
     stream_generator = stream_chat_completion(
@@ -4673,6 +4709,7 @@ async def _build_chat_streaming_response(
         messages,
         request,
         metrics_tracker=metrics_tracker,
+        thinking_processor=thinking_processor,
         **chat_kwargs,
     )
     if _response_format_type(request.response_format) in (
@@ -5442,6 +5479,7 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
                 prepared.chat_kwargs,
                 total_timeout,
                 deadline,
+                thinking_processor=prepared.thinking_processor,
             )
             return response
 
@@ -6543,6 +6581,8 @@ async def stream_chat_completion(
     messages: list,
     request: ChatCompletionRequest,
     metrics_tracker=None,
+    *,
+    thinking_processor: object | None = None,
     **kwargs,
 ) -> AsyncIterator[str]:
     """Stream chat completion response."""
@@ -6554,6 +6594,16 @@ async def stream_chat_completion(
     # compute once instead of model_dump()-ing the whole request on every
     # tool-call delta during streaming.
     tool_request_context, tools_dict, include_usage = _stream_request_metadata(request)
+
+    def attach_terminal_metadata(
+        chunk: ChatCompletionChunk, output: object | None
+    ) -> None:
+        if (
+            not include_usage
+            and chunk.choices
+            and chunk.choices[0].finish_reason is not None
+        ):
+            chunk.generation_metadata = _generation_metadata(thinking_processor, output)
 
     # First chunk with role
     first_chunk = ChatCompletionChunk(
@@ -6739,6 +6789,7 @@ async def stream_chat_completion(
                                 ],
                                 usage=get_usage(output) if output.finished else None,
                             )
+                            attach_terminal_metadata(chunk, output)
                             yield f"data: {chunk.model_dump_json()}\n\n"
                             finish_reason_emitted = finish_reason_emitted or bool(
                                 chunk.choices[0].finish_reason
@@ -6789,6 +6840,7 @@ async def stream_chat_completion(
                         else None
                     ),
                 )
+                attach_terminal_metadata(chunk, output)
                 yield f"data: {chunk.model_dump_json()}\n\n"
                 finish_reason_emitted = finish_reason_emitted or bool(
                     chunk.choices[0].finish_reason
@@ -6873,6 +6925,7 @@ async def stream_chat_completion(
                                 ],
                                 usage=get_usage(output) if output.finished else None,
                             )
+                            attach_terminal_metadata(chunk, output)
                             yield f"data: {chunk.model_dump_json()}\n\n"
                             finish_reason_emitted = finish_reason_emitted or bool(
                                 chunk.choices[0].finish_reason
@@ -6922,6 +6975,7 @@ async def stream_chat_completion(
                         else None
                     ),
                 )
+                attach_terminal_metadata(chunk, output)
                 yield f"data: {chunk.model_dump_json()}\n\n"
                 finish_reason_emitted = finish_reason_emitted or bool(
                     chunk.choices[0].finish_reason
@@ -6968,6 +7022,7 @@ async def stream_chat_completion(
                         )
                     ],
                 )
+                attach_terminal_metadata(tool_chunk, last_output)
                 yield f"data: {tool_chunk.model_dump_json()}\n\n"
                 finish_reason_emitted = True
 
@@ -6996,6 +7051,7 @@ async def stream_chat_completion(
                 ],
                 usage=get_usage(last_output),
             )
+            attach_terminal_metadata(terminal_chunk, last_output)
             yield f"data: {terminal_chunk.model_dump_json()}\n\n"
 
         # Structured streams are buffered by the endpoint until this independent
@@ -7014,6 +7070,11 @@ async def stream_chat_completion(
 
         # Send final chunk with usage if requested
         if include_usage:
+            terminal_metadata = (
+                _generation_metadata(thinking_processor, last_output)
+                if last_output is not None
+                else None
+            )
             usage_chunk = ChatCompletionChunk(
                 id=response_id,
                 model=_response_model_name(request.model),
@@ -7023,6 +7084,7 @@ async def stream_chat_completion(
                     completion_tokens=completion_tokens,
                     total_tokens=prompt_tokens + completion_tokens,
                 ),
+                generation_metadata=terminal_metadata,
             )
             yield f"data: {usage_chunk.model_dump_json()}\n\n"
 

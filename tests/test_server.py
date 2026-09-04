@@ -2029,6 +2029,185 @@ class TestStreamChatCompletion:
     """Tests for streaming chat completion behavior."""
 
     @pytest.mark.anyio
+    @pytest.mark.parametrize("suppress_final", [False, True])
+    async def test_final_delta_attaches_metadata_to_terminal_choice(
+        self, monkeypatch, suppress_final
+    ):
+        """Direct and parser-suppressed finals keep a compatible shape."""
+        from vllm_mlx.engine.base import GenerationOutput
+        from vllm_mlx.server import (
+            ChatCompletionRequest,
+            Message,
+            stream_chat_completion,
+        )
+        import vllm_mlx.server as server
+
+        class SuppressingReasoningParser:
+            def __init__(self, tokenizer=None):
+                pass
+
+            def reset_state(self):
+                pass
+
+            def extract_reasoning_streaming(
+                self, previous_text, current_text, delta_text
+            ):
+                return None
+
+        class FakeEngine:
+            model_name = "fake-engine"
+
+            async def stream_chat(self, messages, **kwargs):
+                yield GenerationOutput(
+                    text="" if suppress_final else "ok",
+                    new_text="</think>" if suppress_final else "ok",
+                    finished=True,
+                    finish_reason="stop",
+                    specprefill_outcome=SimpleNamespace(
+                        requested=True,
+                        engaged=False,
+                        reason="unsupported_media_type",
+                        route="mllm_media",
+                        model_module="mlx_vlm.models.qwen3_vl.qwen3_vl",
+                        language_module="mlx_vlm.models.qwen3_vl.language",
+                        model_type="qwen3_vl",
+                        original_tokens=9000,
+                        selected_tokens=0,
+                    ),
+                )
+
+        monkeypatch.setattr(server, "_model_name", "served-model")
+        monkeypatch.setattr(
+            server,
+            "_reasoning_parser_name",
+            "suppressing" if suppress_final else None,
+        )
+        monkeypatch.setattr(server, "_reasoning_parser", None)
+        monkeypatch.setattr(
+            server, "get_reasoning_parser", lambda name: SuppressingReasoningParser
+        )
+        monkeypatch.setattr(server, "_enable_auto_tool_choice", False)
+        monkeypatch.setattr(server, "_tool_call_parser", None)
+        monkeypatch.setattr(server, "_tool_parser_instance", None)
+
+        request = ChatCompletionRequest(
+            model="served-model",
+            messages=[Message(role="user", content="hi")],
+            stream=True,
+        )
+        chunks = [
+            chunk
+            async for chunk in stream_chat_completion(
+                FakeEngine(), request.messages, request
+            )
+        ]
+        payloads = [
+            json.loads(chunk.removeprefix("data: ").strip())
+            for chunk in chunks
+            if chunk != "data: [DONE]\n\n"
+        ]
+
+        assert request.stream_options is None
+        assert all(payload["choices"] for payload in payloads)
+        metadata_payloads = [
+            payload
+            for payload in payloads
+            if payload.get("generation_metadata") is not None
+        ]
+        assert len(metadata_payloads) == 1
+
+        metadata_payload = metadata_payloads[0]
+        assert metadata_payload["choices"][0]["finish_reason"] == "stop"
+        assert metadata_payload["generation_metadata"]["specprefill_requested"] is True
+        assert metadata_payload["generation_metadata"]["specprefill_engaged"] is False
+        assert (
+            metadata_payload["generation_metadata"]["specprefill_reason"]
+            == "unsupported_media_type"
+        )
+
+    @pytest.mark.anyio
+    async def test_usage_chunk_preserves_thinking_processor_through_builder(
+        self, monkeypatch
+    ):
+        """Opted-in usage metadata preserves the live thinking processor state."""
+        from vllm_mlx.engine.base import GenerationOutput
+        from vllm_mlx.server import (
+            _build_chat_streaming_response,
+            ChatCompletionRequest,
+            Message,
+        )
+        import vllm_mlx.server as server
+
+        thinking_processor = SimpleNamespace(
+            _no_final_content_token_limit=7,
+            watchdog_was_enforced=True,
+        )
+
+        class FakeEngine:
+            model_name = "fake-engine"
+
+            async def stream_chat(self, messages, **kwargs):
+                assert "thinking_processor" not in kwargs
+                assert kwargs["logits_processors"] == [thinking_processor]
+                yield GenerationOutput(
+                    text="ok",
+                    new_text="ok",
+                    finished=True,
+                    finish_reason="stop",
+                    prompt_tokens=5,
+                    completion_tokens=2,
+                )
+
+        async def passthrough_disconnect_guard(generator, *_args, **_kwargs):
+            async for chunk in generator:
+                yield chunk
+
+        monkeypatch.setattr(server, "_model_name", "served-model")
+        monkeypatch.setattr(server, "_reasoning_parser_name", None)
+        monkeypatch.setattr(server, "_reasoning_parser", None)
+        monkeypatch.setattr(server, "_enable_auto_tool_choice", False)
+        monkeypatch.setattr(server, "_tool_call_parser", None)
+        monkeypatch.setattr(server, "_tool_parser_instance", None)
+        monkeypatch.setattr(server, "_disconnect_guard", passthrough_disconnect_guard)
+
+        request = ChatCompletionRequest(
+            model="served-model",
+            messages=[Message(role="user", content="hi")],
+            stream=True,
+            stream_options={"include_usage": True},
+        )
+        response, release_on_exit = await _build_chat_streaming_response(
+            FakeEngine(),
+            request.messages,
+            request,
+            SimpleNamespace(),
+            None,
+            {"logits_processors": [thinking_processor]},
+            None,
+            None,
+            thinking_processor=thinking_processor,
+        )
+        chunks = [chunk async for chunk in response.body_iterator]
+        payloads = [
+            json.loads(chunk.removeprefix("data: ").strip())
+            for chunk in chunks
+            if chunk != "data: [DONE]\n\n"
+        ]
+
+        assert release_on_exit is False
+        usage_payloads = [payload for payload in payloads if payload["choices"] == []]
+        assert len(usage_payloads) == 1
+        usage_payload = usage_payloads[0]
+        assert usage_payload["usage"] == {
+            "prompt_tokens": 5,
+            "completion_tokens": 2,
+            "total_tokens": 7,
+        }
+        metadata = usage_payload["generation_metadata"]
+        assert metadata["no_final_content_watchdog_tokens"] == 7
+        assert metadata["no_final_content_watchdog_enforced"] is True
+
+    @pytest.mark.anyio
     async def test_interleaved_streams_keep_reasoning_parser_state_isolated(
         self, monkeypatch
     ):

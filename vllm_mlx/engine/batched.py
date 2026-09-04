@@ -127,6 +127,11 @@ class BatchedEngine(BaseEngine):
         mllm_draft_kind: str | None = None,
         mllm_draft_block_size: int | None = None,
         default_mllm_draft: bool = False,
+        specprefill_enabled: bool = False,
+        specprefill_threshold: int = 8192,
+        specprefill_keep_pct: float = 0.3,
+        specprefill_backbone_pct: float = 0.0,
+        specprefill_draft_model: str | None = None,
     ):
         """
         Initialize the batched engine.
@@ -141,6 +146,11 @@ class BatchedEngine(BaseEngine):
                 limit and emergency threshold (0.0-1.0, default 0.90)
             default_mllm_draft: Enable the configured assistant drafter unless a
                 request explicitly sets ``mllm_draft`` to false.
+            specprefill_enabled: Enable media-aware SpecPrefill for supported VLMs
+            specprefill_threshold: Minimum media prompt tokens before engagement
+            specprefill_keep_pct: Fraction of prompt chunks to retain
+            specprefill_backbone_pct: Fraction reserved for uniform coverage
+            specprefill_draft_model: Small text model used to score prompt tokens
         """
         self._model_name = model_name
         self._created_at = time.time()
@@ -152,6 +162,12 @@ class BatchedEngine(BaseEngine):
         self._mllm_draft_kind = mllm_draft_kind
         self._mllm_draft_block_size = mllm_draft_block_size
         self._default_mllm_draft = default_mllm_draft
+        self._specprefill_enabled = specprefill_enabled
+        self._specprefill_threshold = specprefill_threshold
+        self._specprefill_keep_pct = specprefill_keep_pct
+        self._specprefill_backbone_pct = specprefill_backbone_pct
+        self._specprefill_draft_model_path = specprefill_draft_model
+        self._specprefill_draft_model = None
         self._is_mllm = force_mllm or is_mllm_model(model_name)
 
         self._model = None
@@ -276,18 +292,43 @@ class BatchedEngine(BaseEngine):
         """Load the MLLM model before scheduler startup."""
         from ..models.mllm import MLXMultimodalLM
 
-        max_kv_size = getattr(self._scheduler_config, "max_kv_size", 0)
-        self._mllm_instance = MLXMultimodalLM(
-            self._model_name,
-            trust_remote_code=self._trust_remote_code,
-            max_kv_size=max_kv_size,
-            draft_model=self._mllm_draft_model,
-            draft_kind=self._mllm_draft_kind,
-            draft_block_size=self._mllm_draft_block_size,
-        )
-        self._mllm_instance.load()
-        self._model = self._mllm_instance.model
-        self._processor = self._mllm_instance.processor
+        if self._model is None or self._processor is None:
+            max_kv_size = getattr(self._scheduler_config, "max_kv_size", 0)
+            self._mllm_instance = MLXMultimodalLM(
+                self._model_name,
+                trust_remote_code=self._trust_remote_code,
+                max_kv_size=max_kv_size,
+                draft_model=self._mllm_draft_model,
+                draft_kind=self._mllm_draft_kind,
+                draft_block_size=self._mllm_draft_block_size,
+            )
+            self._mllm_instance.load()
+            self._model = self._mllm_instance.model
+            self._processor = self._mllm_instance.processor
+
+        if (
+            self._specprefill_enabled
+            and self._specprefill_draft_model_path
+            and self._specprefill_draft_model is None
+        ):
+            try:
+                from mlx_lm import load as mlx_lm_load
+
+                self._specprefill_draft_model, _ = mlx_lm_load(
+                    self._specprefill_draft_model_path
+                )
+                logger.info(
+                    "Media SpecPrefill draft loaded: model=%s threshold=%d keep=%.0f%%",
+                    self._specprefill_draft_model_path,
+                    self._specprefill_threshold,
+                    self._specprefill_keep_pct * 100,
+                )
+            except Exception:
+                self._specprefill_draft_model = None
+                logger.exception(
+                    "Media SpecPrefill draft load failed; media requests will "
+                    "use dense prefill"
+                )
 
         # Set Metal memory limits (same as LLM path)
         try:
@@ -403,17 +444,25 @@ class BatchedEngine(BaseEngine):
             max_kv_size=max_kv_size,
             ssd_cache_dir=ssd_cache_dir,
             ssd_cache_max_gb=ssd_cache_max_gb,
+            specprefill_enabled=self._specprefill_enabled,
+            specprefill_threshold=self._specprefill_threshold,
+            specprefill_keep_pct=self._specprefill_keep_pct,
+            specprefill_backbone_pct=self._specprefill_backbone_pct,
             **mllm_extra,
         )
 
         # Create and start MLLM scheduler
-        scheduler_kwargs = {}
+        scheduler_kwargs = {
+            "specprefill_draft_model": self._specprefill_draft_model,
+        }
         if self._mllm_draft_model is not None:
-            scheduler_kwargs = {
-                "draft_model": getattr(self._mllm_instance, "_draft_model", None),
-                "draft_kind": self._mllm_draft_kind,
-                "draft_block_size": self._mllm_draft_block_size,
-            }
+            scheduler_kwargs.update(
+                {
+                    "draft_model": getattr(self._mllm_instance, "_draft_model", None),
+                    "draft_kind": self._mllm_draft_kind,
+                    "draft_block_size": self._mllm_draft_block_size,
+                }
+            )
         self._mllm_scheduler = MLLMScheduler(
             model=self._model,
             processor=self._processor,
@@ -595,6 +644,7 @@ class BatchedEngine(BaseEngine):
         self._tokenizer = None
         self._processor = None
         self._mllm_instance = None
+        self._specprefill_draft_model = None
         self._loaded = False
         if self._generation_executor is not None:
             # The model and its streams lived on this thread; both go with it.
@@ -782,6 +832,9 @@ class BatchedEngine(BaseEngine):
                 repetition_penalty=kwargs.pop("repetition_penalty", 1.0),
                 logits_processors=kwargs.pop("logits_processors", None),
                 mllm_draft=bool(kwargs.pop("mllm_draft", self._default_mllm_draft)),
+                specprefill=kwargs.pop("specprefill", None),
+                specprefill_keep_pct=kwargs.pop("specprefill_keep_pct", None),
+                specprefill_backbone_pct=kwargs.pop("specprefill_backbone_pct", None),
             )
 
             return GenerationOutput(
@@ -792,6 +845,7 @@ class BatchedEngine(BaseEngine):
                 finish_reason=output.finish_reason,
                 mtp_drafts=output.mtp_drafts,
                 mtp_accepted=output.mtp_accepted,
+                specprefill_outcome=getattr(output, "specprefill_outcome", None),
             )
 
         # Use LLM engine for text-only (non-MLLM models)
@@ -872,6 +926,9 @@ class BatchedEngine(BaseEngine):
                 repetition_penalty=kwargs.pop("repetition_penalty", 1.0),
                 logits_processors=kwargs.pop("logits_processors", None),
                 mllm_draft=bool(kwargs.pop("mllm_draft", self._default_mllm_draft)),
+                specprefill=kwargs.pop("specprefill", None),
+                specprefill_keep_pct=kwargs.pop("specprefill_keep_pct", None),
+                specprefill_backbone_pct=kwargs.pop("specprefill_backbone_pct", None),
             )
 
             async for output in self._mllm_scheduler.stream_outputs(request_id):
@@ -884,6 +941,7 @@ class BatchedEngine(BaseEngine):
                     finish_reason=output.finish_reason,
                     mtp_drafts=output.mtp_drafts,
                     mtp_accepted=output.mtp_accepted,
+                    specprefill_outcome=getattr(output, "specprefill_outcome", None),
                 )
             return
 
@@ -1165,6 +1223,7 @@ class BatchedEngine(BaseEngine):
                 "prefix_cache",
                 "batch_generator",
                 "mtp",
+                "specprefill",
                 "requests",
             ):
                 if key in mllm_stats:
