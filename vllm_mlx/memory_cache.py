@@ -30,8 +30,9 @@ import logging
 import math
 import threading
 from collections import OrderedDict
+from contextlib import nullcontext
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable
 
 logger = logging.getLogger(__name__)
 
@@ -303,15 +304,24 @@ class _CacheEntry:
     tokens: tuple[int, ...]
     cache: list[Any]
     memory_bytes: int
+    auxiliary: dict[str, Any] | None = None
 
     @classmethod
-    def create(cls, tokens: list[int], cache: list[Any]) -> _CacheEntry:
+    def create(
+        cls,
+        tokens: list[int],
+        cache: list[Any],
+        auxiliary: dict[str, Any] | None = None,
+    ) -> _CacheEntry:
         """Create a cache entry with memory estimation."""
         memory = estimate_kv_cache_memory(cache)
+        if auxiliary:
+            memory += sum(getattr(value, "nbytes", 0) for value in auxiliary.values())
         return cls(
             tokens=tuple(tokens),
             cache=cache,
             memory_bytes=memory,
+            auxiliary=auxiliary,
         )
 
 
@@ -1059,8 +1069,10 @@ class MemoryAwarePrefixCache:
         matches, and longest-common-prefix (LCP) matches.  Uses a sorted key
         index for O(log N) lookup instead of scanning all entries.
 
-        Returns the cached KV state directly (no copy) since MLX arrays
-        are immutable and safe to share.
+        Returns the independently owned stored state directly. Callers must
+        clone its cache wrappers before replay because some MLX cache buffers
+        support in-place updates even though the stored backing is detached
+        from the request that created it.
 
         Args:
             tokens: Input token sequence.
@@ -1288,68 +1300,38 @@ class MemoryAwarePrefixCache:
 
         return None, tokens
 
-    def store(
-        self, tokens: list[int], cache: list[Any], evict_prefixes: bool = True
-    ) -> bool:
-        """
-        Store KV cache for future reuse.
+    def prepare_store(
+        self,
+        tokens: list[int],
+        cache: list[Any],
+        auxiliary: dict[str, Any] | None = None,
+    ) -> _CacheEntry | None:
+        """Detach and account an entry without publishing it.
 
-        The entry is snapshotted before storage: every MLX array is
-        detached into a freshly allocated, evaluated copy (with optional
-        quantization applied first), so the stored entry never aliases the
-        caller's cache objects or retains their lazy graphs.  Entries whose
-        projected size exceeds the memory limit are rejected before
-        anything is materialized.  If the memory limit is exceeded by the
-        new entry, LRU entries are evicted until there's room.
-
-        This method does not raise: any failure while building or storing
-        the snapshot rejects the entry (returns False) with a warning.
-
-        Args:
-            tokens: Token sequence that was processed.
-            cache: The computed KV cache to store.
-            evict_prefixes: If True, evict existing entries whose token
-                sequence is a strict prefix of ``tokens``.  Set to False
-                when storing prompt+output entries to preserve prompt-only
-                entries created by prompt_cache_save (those are the entries
-                that future requests will actually match).
-
-        Returns:
-            True if stored successfully, False if rejected.
+        Hybrid recurrent caches cannot be rewound after generation starts,
+        while ordinary ``KVCache`` buffers are updated in place.  Callers can
+        therefore prepare an immutable entry at the exact prefill boundary,
+        continue the request, and publish that already-detached entry only
+        after the remaining prefill succeeds.
         """
         if not tokens or not cache:
-            return False
+            return None
         if len(tokens) < self._config.min_prefix_tokens:
             logger.debug(
                 "[cache_store] skipped short prefix: tokens=%s min_prefix_tokens=%s",
                 len(tokens),
                 self._config.min_prefix_tokens,
             )
-            return False
+            return None
 
         tokens_key = tuple(tokens)
-
-        # Fast path: already cached — just refresh LRU order.
         with self._memory_lock:
-            if tokens_key in self._entries:
-                self._entries.move_to_end(tokens_key)
-                return True
+            existing = self._entries.get(tokens_key)
+            if existing is not None:
+                return existing
 
-        # Build the snapshot outside _memory_lock: trim (lazy) -> quantize
-        # (lazy) -> preflight (shape-based, no eval) -> detach (the one
-        # entry-sized GPU copy+eval).  Holding _memory_lock across the eval
-        # would serialize try_reserve_memory / remove / clear for the full
-        # copy duration; fetch() is lock-free either way.  store() never
-        # raises: any failure in the pipeline rejects the entry instead.
         try:
-            # Trim oversized KV arrays to actual used size (lazy slices).
             cache = _trim_to_offset(cache)
-
-            # Quantize BEFORE detaching so the detached, evaluated arrays
-            # are the final stored representation.  Quantizing after
-            # detachment would build new lazy quantized arrays on top of
-            # the evaluated full-precision snapshot and retain it as graph
-            # inputs, so resident memory would exceed the accounting.
             if (
                 self._config.kv_quantize
                 and len(tokens) >= self._config.kv_min_quantize_tokens
@@ -1357,12 +1339,6 @@ class MemoryAwarePrefixCache:
                 cache = _quantize_cache(
                     cache, self._config.kv_bits, self._config.kv_group_size
                 )
-
-            # Preflight: reject oversized entries BEFORE materializing
-            # anything.  shape×dtype pricing needs no evaluation, and both
-            # trim and quantize above are lazy, so an over-limit entry is
-            # refused without incurring an entry-sized allocation (which
-            # could itself hit Metal resource/memory limits).
             projected_bytes = estimate_kv_cache_memory(cache)
             if projected_bytes > self._max_memory:
                 self._stats.store_rejections += 1
@@ -1371,36 +1347,80 @@ class MemoryAwarePrefixCache:
                     f"{projected_bytes / _BYTES_PER_MB:.1f}MB "
                     f"exceeds limit {self._max_memory / _BYTES_PER_MB:.1f}MB"
                 )
-                return False
+                return None
 
-            # Detach from live batch buffers and lazy graphs so the stored
-            # entry owns its data (prevents aliasing + Metal handle leak).
-            # Fail-closed: an entry that cannot be detached is rejected —
-            # storing it by reference would reintroduce the leak.  The
-            # copy lock keeps concurrent stores from materializing
-            # entry-sized copies simultaneously (N-fold peak), without
-            # blocking _memory_lock users.
             with self._copy_lock:
                 cache = _detach_cache_for_storage(cache)
-            # Create entry and account the final (detached) representation
-            entry = _CacheEntry.create(tokens, cache)
+                detached_auxiliary = None
+                if auxiliary:
+                    import mlx.core as mx
 
-            with self._memory_lock:
-                # Re-check under the lock: a concurrent store() may have won
-                # the race while we were detaching.  Keep theirs (drop our
-                # copy) and refresh LRU order.
+                    detached_auxiliary = {
+                        key: value + 0 if isinstance(value, mx.array) else value
+                        for key, value in auxiliary.items()
+                    }
+                    mx.eval(
+                        *(
+                            value
+                            for value in detached_auxiliary.values()
+                            if isinstance(value, mx.array)
+                        )
+                    )
+            entry = _CacheEntry.create(tokens, cache, detached_auxiliary)
+            if entry.memory_bytes > self._max_memory:
+                self._stats.store_rejections += 1
+                logger.warning(
+                    "Cache entry too large after auxiliary accounting: "
+                    "%.1fMB exceeds limit %.1fMB",
+                    entry.memory_bytes / _BYTES_PER_MB,
+                    self._max_memory / _BYTES_PER_MB,
+                )
+                return None
+            return entry
+        except UndetachableCacheError as e:
+            self._stats.store_rejections += 1
+            logger.warning("[cache_store] rejecting entry: %s", e)
+            return None
+        except Exception as e:
+            self._stats.store_rejections += 1
+            logger.warning("[cache_store] rejecting entry: %s: %s", type(e).__name__, e)
+            return None
+
+    def commit_prepared(
+        self,
+        entry: _CacheEntry,
+        evict_prefixes: bool = True,
+        *,
+        commit_lock: Any = None,
+        commit_guard: Callable[[], bool] | None = None,
+    ) -> bool:
+        """Atomically publish an entry returned by :meth:`prepare_store`.
+
+        ``commit_lock`` is acquired inside ``_memory_lock``. Callers must not
+        call cache methods while holding the caller-supplied ``commit_lock``.
+        """
+        tokens_key = entry.tokens
+        commit_context = commit_lock if commit_lock is not None else nullcontext()
+        try:
+            with self._memory_lock, commit_context:
+                if commit_guard is not None and not commit_guard():
+                    return False
+                if entry.memory_bytes > self._max_memory:
+                    self._stats.store_rejections += 1
+                    logger.warning(
+                        "[cache_store] rejecting oversized prepared entry: "
+                        "%.1fMB exceeds limit %.1fMB",
+                        entry.memory_bytes / _BYTES_PER_MB,
+                        self._max_memory / _BYTES_PER_MB,
+                    )
+                    return False
                 if tokens_key in self._entries:
                     self._entries.move_to_end(tokens_key)
                     return True
 
-                # Prefix-subset eviction: remove entries whose token sequence
-                # is a strict prefix of the new entry.  Uses sorted index for
-                # O(log N + K) lookup instead of O(N) scan.
                 if evict_prefixes and self._sorted_keys:
                     to_remove = []
                     idx = bisect.bisect_left(self._sorted_keys, tokens_key)
-                    # Scan backwards — prefixes of tokens_key are immediately
-                    # before idx
                     for i in range(idx - 1, -1, -1):
                         key = self._sorted_keys[i]
                         klen = len(key)
@@ -1416,49 +1436,70 @@ class MemoryAwarePrefixCache:
                         self._stats.evictions += 1
                         self._remove_from_sorted(key)
                         logger.debug(
-                            f"[prefix_evict] removed {len(key)} tokens, "
-                            f"freed {old.memory_bytes / _BYTES_PER_MB:.2f}MB, "
-                            f"new_entry={len(tokens_key)} tokens"
+                            "[prefix_evict] removed %s tokens, freed %.2fMB, "
+                            "new_entry=%s tokens",
+                            len(key),
+                            old.memory_bytes / _BYTES_PER_MB,
+                            len(tokens_key),
                         )
-                    if to_remove:
-                        self._stats.entry_count = len(self._entries)
-                        self._stats.current_memory_bytes = self._current_memory
 
-                # Evict until we have room
                 while (
                     self._current_memory + entry.memory_bytes > self._max_memory
                     or len(self._entries) >= self._config.max_entries
                 ) and self._entries:
                     self._evict_lru()
 
-                # Store entry
                 self._entries[tokens_key] = entry
                 self._current_memory += entry.memory_bytes
                 bisect.insort(self._sorted_keys, tokens_key)
                 self._stats.entry_count = len(self._entries)
                 self._stats.current_memory_bytes = self._current_memory
-        except UndetachableCacheError as e:
-            self._stats.store_rejections += 1
-            logger.warning("[cache_store] rejecting entry: %s", e)
-            return False
         except Exception as e:
-            # Anything else — malformed input to trim/quantize (e.g.
-            # head_dim not divisible by the quantization group size), or an
-            # eviction-path failure such as an SSD spill hook raising a
-            # stream-affinity RuntimeError — must not crash the caller.
-            # Several call sites have no enclosing try; a rejected store
-            # only costs a cache miss.
             self._stats.store_rejections += 1
-            logger.warning("[cache_store] rejecting entry: %s: %s", type(e).__name__, e)
+            logger.warning(
+                "[cache_store] rejecting commit: %s: %s", type(e).__name__, e
+            )
             return False
 
         logger.debug(
-            f"Stored cache: {len(tokens)} tokens, "
+            f"Stored cache: {len(tokens_key)} tokens, "
             f"{entry.memory_bytes / _BYTES_PER_MB:.2f}MB, "
             f"total={self._current_memory / _BYTES_PER_MB:.1f}MB"
         )
-
         return True
+
+    def clone_for_replay(self, cache: list[Any]) -> list[Any] | None:
+        """Return independently owned backing for a mutating model replay."""
+        try:
+            with self._copy_lock:
+                return _detach_cache_for_storage(cache)
+        except Exception as exc:
+            logger.warning(
+                "[cache_fetch] replay clone rejected: %s: %s",
+                type(exc).__name__,
+                exc,
+            )
+            return None
+
+    def fetch_exact_auxiliary(self, tokens: list[int]) -> dict[str, Any] | None:
+        """Return auxiliary data only when an exact resident entry owns it."""
+        with self._memory_lock:
+            entry = self._entries.get(tuple(tokens))
+            if entry is None or entry.auxiliary is None:
+                return None
+            return dict(entry.auxiliary)
+
+    def store(
+        self,
+        tokens: list[int],
+        cache: list[Any],
+        evict_prefixes: bool = True,
+    ) -> bool:
+        """Detach, account, and atomically publish a reusable cache entry."""
+        entry = self.prepare_store(tokens, cache)
+        if entry is None:
+            return False
+        return self.commit_prepared(entry, evict_prefixes=evict_prefixes)
 
     def _remove_from_sorted(self, key: tuple[int, ...]) -> None:
         """Remove a key from the sorted index using bisect for O(log N)."""
