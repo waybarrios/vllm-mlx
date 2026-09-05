@@ -78,6 +78,25 @@ def _bare_engine_core(monkeypatch, worker=None):
     return engine
 
 
+def _run_executors_deterministically(monkeypatch):
+    """Drive executor callbacks synchronously while retaining worker identity."""
+    loop = asyncio.get_running_loop()
+
+    def run_in_executor(executor, operation, *args):
+        future = loop.create_future()
+        try:
+            if executor is None:
+                result = operation(*args)
+            else:
+                result = executor.submit(operation, *args).result(timeout=5)
+            future.set_result(result)
+        except BaseException as exc:
+            future.set_exception(exc)
+        return future
+
+    monkeypatch.setattr(loop, "run_in_executor", run_in_executor)
+
+
 def test_generation_worker_is_one_reused_thread():
     """The worker has to be stable: it owns the loaded model for the process."""
     from vllm_mlx.engine.batched import BatchedEngine
@@ -281,6 +300,42 @@ async def test_supplied_worker_outlives_the_engine_loop(monkeypatch):
 
 
 @pytest.mark.anyio
+async def test_engine_core_stop_cleanup_stays_on_supplied_worker(monkeypatch):
+    """Cancellation, its safety net, and repeated stop keep one owner."""
+    worker = ThreadPoolExecutor(max_workers=1, thread_name_prefix="engine-core")
+    core = _bare_engine_core(monkeypatch, worker=worker)
+    core._running = False
+    core._task = None
+    core._request_event = None
+    close_threads: list[int] = []
+
+    class StopScheduler(_FakeScheduler):
+        def has_requests(self):
+            return False
+
+        def _close_batch_generator(self):
+            close_threads.append(threading.get_ident())
+
+    core.scheduler = StopScheduler(core)
+    _run_executors_deterministically(monkeypatch)
+
+    try:
+        await core.start()
+        await asyncio.sleep(0)
+        loop_task = core._task
+
+        await core.stop()
+        await core.stop()
+
+        owner_thread = worker.submit(threading.get_ident).result()
+    finally:
+        worker.shutdown(wait=True)
+
+    assert loop_task is not None and loop_task.cancelled()
+    assert close_threads == [owner_thread, owner_thread, owner_thread]
+
+
+@pytest.mark.anyio
 async def test_loop_still_cleans_up_a_worker_it_created(monkeypatch):
     """Without a supplied worker the loop owns its pool and must retire it."""
     core = _bare_engine_core(monkeypatch, worker=None)
@@ -295,6 +350,129 @@ async def test_loop_still_cleans_up_a_worker_it_created(monkeypatch):
     assert stepped_on not in {
         t.ident for t in threading.enumerate()
     }, "the loop created its own worker and left it running"
+
+
+@pytest.mark.anyio
+async def test_supplied_model_worker_is_not_replaced_by_stream_fallback(monkeypatch):
+    """A caller-supplied worker owns the model and cannot be abandoned."""
+    worker = ThreadPoolExecutor(max_workers=1, thread_name_prefix="engine-core")
+    core = _bare_engine_core(monkeypatch, worker=worker)
+
+    class StreamErrorScheduler(_FakeScheduler):
+        def step(self):
+            self.step_threads.append(threading.get_ident())
+            self.calls += 1
+            if self.calls == 1:
+                raise RuntimeError("There is no Stream(gpu, 0) in current thread")
+            core._running = False
+            return _SchedulerOutput()
+
+        def _recover_from_cache_error(self):
+            pass
+
+        def _reschedule_running_requests(self):
+            pass
+
+    core.scheduler = StreamErrorScheduler(core)
+    loop = asyncio.get_running_loop()
+    executor_calls: list[str] = []
+
+    def run_in_executor(executor, operation, *args):
+        future = loop.create_future()
+        executor_calls.append(getattr(operation, "__name__", type(operation).__name__))
+        try:
+            future.set_result(operation(*args))
+        except BaseException as exc:
+            future.set_exception(exc)
+        return future
+
+    monkeypatch.setattr(loop, "run_in_executor", run_in_executor)
+    try:
+        await asyncio.wait_for(core._engine_loop(), timeout=2)
+    finally:
+        worker.shutdown(wait=True)
+
+    assert executor_calls.count("_step_on_worker") == 2
+    assert "_recover_stream_thread_error_on_worker" not in executor_calls
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("operation", "expected"),
+    [("load_cache_from_disk", 1), ("save_cache_to_disk", True)],
+)
+async def test_cache_io_uses_the_model_generation_worker(operation, expected):
+    """Persisted MLX cache state must stay on the model owner thread."""
+    from vllm_mlx.engine.batched import BatchedEngine
+    from vllm_mlx.engine_core import AsyncEngineCore, EngineCore
+
+    engine = object.__new__(BatchedEngine)
+    engine._generation_executor = None
+    engine._mllm_scheduler = None
+    operation_threads: list[int] = []
+
+    class FakeScheduler:
+        def load_cache_from_disk(self, cache_dir):
+            operation_threads.append(threading.get_ident())
+            return 1
+
+        def save_cache_to_disk(self, cache_dir):
+            operation_threads.append(threading.get_ident())
+            return True
+
+    worker = engine._generation_worker()
+    core = object.__new__(EngineCore)
+    core.scheduler = FakeScheduler()
+    core._external_generation_worker = worker
+    async_engine = object.__new__(AsyncEngineCore)
+    async_engine.engine = core
+    engine._engine = async_engine
+
+    try:
+        result = await getattr(engine, operation)("cache")
+        owner_threads = {thread.ident for thread in worker._threads}
+    finally:
+        worker.shutdown(wait=True)
+        engine._generation_executor = None
+
+    assert result == expected
+    assert operation_threads == list(owner_threads)
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("operation", "expected"),
+    [("load_cache_from_disk", 1), ("save_cache_to_disk", True)],
+)
+async def test_mllm_cache_io_stays_on_the_model_event_loop(operation, expected):
+    """MLLM cache state follows MLLMScheduler instead of the text worker."""
+    from vllm_mlx.engine.batched import BatchedEngine
+
+    engine = object.__new__(BatchedEngine)
+    engine._generation_executor = None
+    engine._engine = None
+    operation_threads: list[int] = []
+
+    class FakePrefixCache:
+        def load_from_disk(self, cache_dir):
+            operation_threads.append(threading.get_ident())
+            return 1
+
+        def save_to_disk(self, cache_dir):
+            operation_threads.append(threading.get_ident())
+            return True
+
+    prefix_cache = FakePrefixCache()
+    engine._mllm_scheduler = SimpleNamespace(
+        batch_generator=SimpleNamespace(prefix_cache=prefix_cache),
+        _ensure_batch_generator=lambda: None,
+    )
+
+    result = await getattr(engine, operation)("cache")
+
+    assert result == expected
+    assert operation_threads == [threading.get_ident()]
+    assert engine._generation_executor is None
 
 
 @pytest.mark.anyio
@@ -316,6 +494,82 @@ async def test_stop_retires_the_generation_worker():
     worker = engine._generation_worker()
     await engine.stop()
 
+    assert engine._generation_executor is None
+    with pytest.raises(RuntimeError, match="cannot schedule new futures"):
+        worker.submit(lambda: None)
+
+
+@pytest.mark.anyio
+async def test_stop_closes_core_on_generation_worker_and_is_repeatable(monkeypatch):
+    """Deep reset runs on the model owner before that worker is retired."""
+    from vllm_mlx.engine.batched import BatchedEngine
+
+    close_threads: list[int] = []
+
+    class FakeCore:
+        def close(self):
+            close_threads.append(threading.get_ident())
+
+    class FakeAsyncEngine:
+        engine = FakeCore()
+
+        async def stop(self):
+            pass
+
+    engine = object.__new__(BatchedEngine)
+    engine._generation_executor = None
+    engine._engine = FakeAsyncEngine()
+    engine._mllm_scheduler = None
+    engine._model = object()
+    engine._tokenizer = object()
+    engine._processor = None
+    engine._mllm_instance = None
+    engine._loaded = True
+    worker = engine._generation_worker()
+    owner_thread = worker.submit(threading.get_ident).result()
+    _run_executors_deterministically(monkeypatch)
+
+    await engine.stop()
+    await engine.stop()
+
+    assert close_threads == [owner_thread]
+    assert engine._generation_executor is None
+
+
+@pytest.mark.anyio
+async def test_stop_retires_generation_worker_when_engine_cleanup_fails(monkeypatch):
+    """A cleanup error must not leave the model-owning executor alive."""
+    from vllm_mlx.engine.batched import BatchedEngine
+
+    close_threads: list[int] = []
+
+    class FakeCore:
+        def close(self):
+            close_threads.append(threading.get_ident())
+
+    class FailingAsyncEngine:
+        engine = FakeCore()
+
+        async def stop(self):
+            raise RuntimeError("engine cleanup failed")
+
+    engine = object.__new__(BatchedEngine)
+    engine._generation_executor = None
+    engine._engine = FailingAsyncEngine()
+    engine._mllm_scheduler = None
+    engine._model = object()
+    engine._tokenizer = object()
+    engine._processor = None
+    engine._mllm_instance = None
+    engine._loaded = True
+    worker = engine._generation_worker()
+    owner_thread = worker.submit(threading.get_ident).result()
+    _run_executors_deterministically(monkeypatch)
+
+    with pytest.raises(RuntimeError, match="engine cleanup failed"):
+        await engine.stop()
+
+    assert close_threads == [owner_thread]
     assert engine._generation_executor is None
     with pytest.raises(RuntimeError, match="cannot schedule new futures"):
         worker.submit(lambda: None)

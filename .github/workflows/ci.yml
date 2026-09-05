@@ -163,6 +163,7 @@ jobs:
         run: |
           python -c "import platform; assert platform.machine() == 'arm64', 'Not ARM64'"
           python -c "import mlx.core as mx; print(f'MLX OK: {mx.default_device()}')"
+          python -m pip show mlx mlx-lm
 
       - name: Run MLX-dependent tests
         run: |
@@ -179,6 +180,7 @@ jobs:
             tests/test_mllm_continuous_batching.py \
             tests/test_mllm_cache.py \
             tests/test_optimizations.py \
+            tests/test_batched_engine.py \
             tests/test_simple_engine.py \
             tests/test_simple_engine_prefix_trie_cache.py \
             tests/test_text_model_dispatch.py \

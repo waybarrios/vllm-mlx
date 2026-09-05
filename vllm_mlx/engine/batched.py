@@ -29,6 +29,7 @@ from .base import (
     GenerationOutput,
     cleanup_startup_cancellation,
     run_blocking_startup_work,
+    suspend_cancellation,
 )
 from .chat_template_safety import normalize_messages_for_chat_template
 
@@ -271,6 +272,11 @@ class BatchedEngine(BaseEngine):
                 max_workers=1, thread_name_prefix="engine-core"
             )
         return self._generation_executor
+
+    async def _run_on_generation_worker(self, operation):
+        """Run an MLX operation on the thread that owns the text model."""
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(self._generation_worker(), operation)
 
     def _prepare_mllm_model(self) -> None:
         """Load the MLLM model before scheduler startup."""
@@ -586,25 +592,49 @@ class BatchedEngine(BaseEngine):
 
     async def stop(self) -> None:
         """Stop the engine and cleanup resources."""
-        if self._mllm_scheduler:
-            await self._mllm_scheduler.stop()
+        try:
+            if self._mllm_scheduler:
+                await self._mllm_scheduler.stop()
+
+            if self._engine:
+                engine = self._engine
+                try:
+                    await engine.stop()
+                except BaseException:
+                    # Preserve cancellation or the primary stop error while
+                    # still releasing registry and cache state on its owner.
+                    with suspend_cancellation():
+                        try:
+                            await self._run_on_generation_worker(engine.engine.close)
+                        except BaseException as cleanup_error:
+                            if isinstance(
+                                cleanup_error, (KeyboardInterrupt, SystemExit)
+                            ):
+                                raise
+                            logger.error(
+                                "BatchedEngine core cleanup failed after stop error",
+                                exc_info=(
+                                    type(cleanup_error),
+                                    cleanup_error,
+                                    cleanup_error.__traceback__,
+                                ),
+                            )
+                    raise
+                else:
+                    await self._run_on_generation_worker(engine.engine.close)
+        finally:
             self._mllm_scheduler = None
-
-        if self._engine:
-            await self._engine.stop()
-            self._engine.engine.close()
             self._engine = None
-
-        self._model = None
-        self._tokenizer = None
-        self._processor = None
-        self._mllm_instance = None
-        self._loaded = False
-        if self._generation_executor is not None:
-            # The model and its streams lived on this thread; both go with it.
-            self._generation_executor.shutdown(wait=True)
-            self._generation_executor = None
-        mx.clear_cache()
+            self._model = None
+            self._tokenizer = None
+            self._processor = None
+            self._mllm_instance = None
+            self._loaded = False
+            if self._generation_executor is not None:
+                # The model and its streams lived on this thread; both go with it.
+                self._generation_executor.shutdown(wait=True)
+                self._generation_executor = None
+            mx.clear_cache()
         logger.info("BatchedEngine stopped")
 
     def _apply_chat_template(
@@ -1224,17 +1254,20 @@ class BatchedEngine(BaseEngine):
             return result
         return False
 
-    def save_cache_to_disk(self, cache_dir: str) -> bool:
+    async def save_cache_to_disk(self, cache_dir: str) -> bool:
         """Save prefix cache to disk for persistence across restarts."""
         if self._mllm_scheduler and self._mllm_scheduler.batch_generator:
             pc = self._mllm_scheduler.batch_generator.prefix_cache
             if pc is not None:
                 return pc.save_to_disk(cache_dir)
         if self._engine:
-            return self._engine.save_cache_to_disk(cache_dir)
+            engine = self._engine
+            return await self._run_on_generation_worker(
+                lambda: engine.save_cache_to_disk(cache_dir)
+            )
         return False
 
-    def load_cache_from_disk(self, cache_dir: str) -> int:
+    async def load_cache_from_disk(self, cache_dir: str) -> int:
         """Load prefix cache from disk. Returns number of entries loaded."""
         if self._mllm_scheduler:
             self._mllm_scheduler._ensure_batch_generator()
@@ -1242,7 +1275,10 @@ class BatchedEngine(BaseEngine):
             if pc is not None:
                 return pc.load_from_disk(cache_dir)
         if self._engine:
-            return self._engine.load_cache_from_disk(cache_dir)
+            engine = self._engine
+            return await self._run_on_generation_worker(
+                lambda: engine.load_cache_from_disk(cache_dir)
+            )
         return 0
 
     def clear_prefix_cache(self) -> None:

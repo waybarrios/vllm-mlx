@@ -42,6 +42,7 @@ import asyncio
 import copy
 import hashlib
 from dataclasses import dataclass
+import inspect
 import json
 import logging
 import os
@@ -1417,7 +1418,7 @@ def _invalidate_tool_parser_cache(reason: str | None = None) -> None:
     _tool_parser_instance = None
 
 
-def _load_prefix_cache_from_disk(engine: BaseEngine | None = None) -> None:
+async def _load_prefix_cache_from_disk(engine: BaseEngine | None = None) -> None:
     """Load prefix cache from disk during startup."""
     target_engine = engine or _engine
     if target_engine is None:
@@ -1426,7 +1427,11 @@ def _load_prefix_cache_from_disk(engine: BaseEngine | None = None) -> None:
     try:
         d = _get_cache_dir()
         logger.info(f"[lifespan] Loading prefix cache from {d}")
-        loaded = target_engine.load_cache_from_disk(d)
+        load_cache = target_engine.load_cache_from_disk
+        if inspect.iscoroutinefunction(load_cache):
+            loaded = await load_cache(d)
+        else:
+            loaded = await asyncio.to_thread(load_cache, d)
         if loaded > 0:
             logger.info(f"[lifespan] Loaded {loaded} prefix cache entries")
         else:
@@ -1438,7 +1443,7 @@ def _load_prefix_cache_from_disk(engine: BaseEngine | None = None) -> None:
         )
 
 
-def _save_prefix_cache_to_disk(engine: BaseEngine | None = None) -> None:
+async def _save_prefix_cache_to_disk(engine: BaseEngine | None = None) -> None:
     """Save prefix cache to disk during shutdown."""
     target_engine = engine or _engine
     if target_engine is None:
@@ -1447,7 +1452,11 @@ def _save_prefix_cache_to_disk(engine: BaseEngine | None = None) -> None:
     try:
         d = _get_cache_dir()
         logger.info(f"[lifespan] Saving prefix cache to {d}")
-        saved = target_engine.save_cache_to_disk(d)
+        save_cache = target_engine.save_cache_to_disk
+        if inspect.iscoroutinefunction(save_cache):
+            saved = await save_cache(d)
+        else:
+            saved = await asyncio.to_thread(save_cache, d)
         if saved:
             logger.info(f"[lifespan] Saved prefix cache to {d}")
         else:
@@ -1520,13 +1529,16 @@ async def _engine_factory(spec: ModelSpec) -> BaseEngine:
 
 
 async def _run_blocking_engine_cache_io(io_fn, engine: BaseEngine) -> None:
-    """Run blocking cache persistence off the event loop.
+    """Run cache persistence through the engine's owned execution context.
 
     If the caller is canceled while waiting, finish the in-flight thread before
     propagating cancellation so engine state cannot keep mutating in the
     background after lifecycle cleanup has started.
     """
-    task = asyncio.create_task(asyncio.to_thread(io_fn, engine))
+    if inspect.iscoroutinefunction(io_fn):
+        task = asyncio.create_task(io_fn(engine))
+    else:
+        task = asyncio.create_task(asyncio.to_thread(io_fn, engine))
     try:
         await asyncio.shield(task)
     except asyncio.CancelledError:
@@ -1685,7 +1697,7 @@ async def lifespan(app: FastAPI):
             and _engine is not None
             and hasattr(_engine, "load_cache_from_disk")
         ):
-            _load_prefix_cache_from_disk()
+            await _load_prefix_cache_from_disk()
 
         # Warm up prefix cache with user-provided prompts (AFTER disk cache load,
         # so any already-persisted entries are preserved and warm-up only fills
@@ -1741,7 +1753,7 @@ async def lifespan(app: FastAPI):
             and _engine is not None
             and hasattr(_engine, "save_cache_to_disk")
         ):
-            _save_prefix_cache_to_disk()
+            await _save_prefix_cache_to_disk()
 
         # Shutdown: Close MCP connections and stop engine
         if _lifecycle_task is not None:
