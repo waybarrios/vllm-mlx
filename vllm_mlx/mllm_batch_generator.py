@@ -1164,10 +1164,27 @@ class MLLMBatchGenerator:
 
     @classmethod
     def _can_rewind_prefix_cache(cls, cache_list, trim_by: int) -> bool:
-        """Return whether every cache leaf retains the positions to rewind."""
+        """Return whether every position-indexed cache leaf retains the
+        positions to rewind.
+
+        Hybrid architectures (e.g. Qwen3.5-family) mix real KV-cache layers
+        with non-KV state leaves (mlx_lm/mlx_vlm ``ArraysCache``, used for
+        SSM/linear-attention layers). Those leaves have no ``.keys``
+        attribute at all -- they're not a position-indexed buffer, so
+        "rewinding by N positions" isn't a meaningful operation on them and
+        replaying the trimmed tokens through the model doesn't re-enter them
+        the way it re-enters a KV cache. Only leaves that expose ``.keys``
+        (i.e. claim to be KV-shaped) are held to the strict rewind contract
+        below; anything else is left alone here and simply carried through
+        as an isolated copy by ``_rewind_prefix_cache``. A leaf that *does*
+        expose ``.keys`` but is empty/invalid (e.g. a fully-evicted
+        RotatingKVCache with ``keys=None``) still correctly fails closed.
+        """
         if trim_by <= 0:
             return True
         for cache in cls._cache_leaves(cache_list):
+            if not hasattr(cache, "keys"):
+                continue
             keys = getattr(cache, "keys", None)
             offset = getattr(cache, "offset", None)
             if keys is None or offset is None or offset < trim_by:
@@ -1181,7 +1198,9 @@ class MLLMBatchGenerator:
 
     @classmethod
     def _rewind_prefix_cache(cls, cache_list, trim_by: int):
-        """Clone and safely rewind every leaf, or return None to fail closed."""
+        """Clone and safely rewind every KV leaf; pass non-KV leaves through
+        as an isolated copy (see ``_can_rewind_prefix_cache``), or return
+        None to fail closed."""
         if not cls._can_rewind_prefix_cache(cache_list, trim_by):
             return None
         copied = cls._copy_prefix_cache(cache_list)
@@ -1192,8 +1211,13 @@ class MLLMBatchGenerator:
         # This preserves type-specific metadata such as ChunkedKVCache's
         # chunk_size/start_position instead of reconstructing a generic KV
         # wrapper. Verify the full rewind so a partially retained window cannot
-        # be stored under a longer token key.
+        # be stored under a longer token key. Non-KV leaves (no ``.keys``)
+        # have nothing position-indexed to trim -- _copy_prefix_cache already
+        # gave them an isolated copy via from_state/meta_state, so skip them
+        # here rather than rejecting the whole cache for lacking .trim().
         for cache in cls._cache_leaves(copied):
+            if not hasattr(cache, "keys"):
+                continue
             trim = getattr(cache, "trim", None)
             if not callable(trim) or trim(trim_by) != trim_by:
                 return None

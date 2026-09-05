@@ -2053,6 +2053,230 @@ class TestChunkedPrefillCacheHandling:
             mx.eval(cache.keys, cache.values)
         return cache
 
+    def _make_fake_arrays_cache(self):
+        """Create a real ArraysCache (SSM/hybrid state leaf, no .keys)."""
+        from mlx_lm.models.cache import ArraysCache
+
+        cache = ArraysCache(2)
+        cache[0] = mx.ones((1, 4, 8))
+        cache[1] = mx.full((1, 4, 8), 2.0)
+        mx.eval(*[c for c in cache.state if c is not None])
+        return cache
+
+    def _make_hybrid_cache(self, kv_offset=50):
+        """A cache list mixing a real KVCache leaf with a real ArraysCache
+        leaf, mirroring a hybrid (e.g. Qwen3.5-family) architecture where
+        only some layers carry a real KV cache."""
+        return [
+            self._make_fake_kv_cache(offset=kv_offset),
+            self._make_fake_arrays_cache(),
+        ]
+
+    def test_can_rewind_hybrid_cache_ignores_non_kv_leaf(self):
+        """A non-KV leaf (no .keys) must not block rewind of the KV leaf."""
+        from vllm_mlx.mllm_batch_generator import MLLMBatchGenerator
+
+        hybrid = self._make_hybrid_cache(kv_offset=50)
+        assert MLLMBatchGenerator._can_rewind_prefix_cache(hybrid, 1) is True
+
+    def test_can_rewind_hybrid_cache_still_rejects_bad_kv_leaf(self):
+        """The strict contract must still apply to the KV leaf itself --
+        offset < trim_by must still fail closed even with a non-KV leaf
+        present."""
+        from vllm_mlx.mllm_batch_generator import MLLMBatchGenerator
+
+        hybrid = self._make_hybrid_cache(kv_offset=0)  # offset 0 < trim_by
+        assert MLLMBatchGenerator._can_rewind_prefix_cache(hybrid, 1) is False
+
+    def test_rewind_hybrid_cache_trims_kv_leaf_and_copies_non_kv_leaf(self):
+        """Rewinding a hybrid cache must trim the KV leaf's offset and
+        return an isolated copy of the non-KV leaf (not the same object,
+        not blocked by lacking .trim())."""
+        from vllm_mlx.mllm_batch_generator import MLLMBatchGenerator
+
+        kv, arrays = self._make_hybrid_cache(kv_offset=50)
+        result = MLLMBatchGenerator._rewind_prefix_cache([kv, arrays], 1)
+
+        assert result is not None
+        new_kv, new_arrays = result
+        assert new_kv.offset == 49
+        assert new_arrays is not arrays  # isolated copy, per bf5ccb4's ownership goal
+        assert len(new_arrays.state) == len(arrays.state)
+
+    def test_hybrid_store_prefix_snapshot_succeeds(self):
+        """The completion-store path must not silently skip a hybrid cache
+        the way it did before this fix (only a DEBUG log, no error)."""
+        from vllm_mlx.mllm_batch_generator import MLLMBatchGenerator, MLLMBatchStats
+        from vllm_mlx.memory_cache import MemoryAwarePrefixCache, MemoryCacheConfig
+
+        gen = MLLMBatchGenerator.__new__(MLLMBatchGenerator)
+        gen._stats = MLLMBatchStats()
+        gen.prefix_cache = MemoryAwarePrefixCache(
+            model=object(), config=MemoryCacheConfig(min_prefix_tokens=1)
+        )
+
+        hybrid = self._make_hybrid_cache(kv_offset=50)
+        ok = gen._store_prefix_snapshot(
+            list(range(50)),
+            hybrid,
+            trim_by=1,
+            request_id="hybrid-store",
+            source="completion",
+        )
+
+        assert ok is True
+        assert len(gen.prefix_cache._entries) == 1
+
+    def test_copy_prefix_cache_handles_hybrid_leaves(self):
+        """_copy_prefix_cache (the prefix/LCP-match path's cache prep) was
+        never part of this bug -- it already produces an isolated copy for
+        both KV and non-KV leaves via _copy_cache_layer's from_state
+        fallback. This locks that in as regression coverage."""
+        from vllm_mlx.mllm_batch_generator import MLLMBatchGenerator
+
+        kv, arrays = self._make_hybrid_cache(kv_offset=50)
+        result = MLLMBatchGenerator._copy_prefix_cache([kv, arrays])
+
+        assert result is not None
+        new_kv, new_arrays = result
+        assert new_kv is not kv
+        assert new_arrays is not arrays
+        assert new_kv.offset == kv.offset
+
+    def test_process_prompts_exact_hit_with_hybrid_cache(self, monkeypatch):
+        """End-to-end on the primary _process_prompts fetch site (not the
+        interleaved path, which only commits to its own fetch when a prompt
+        is long enough to need interleaving): an exact hit on a hybrid
+        (KV + ArraysCache) cache must take the rewind-and-replay-last-token
+        path, not silently fall through to a full miss the way it did
+        before this fix."""
+        from vllm_mlx.mllm_batch_generator import (
+            MLLMBatchGenerator,
+            MLLMBatchRequest,
+            MLLMBatchStats,
+        )
+
+        class FreshCache:
+            def merge(self, caches):
+                return self
+
+        kv, arrays = self._make_hybrid_cache(kv_offset=6)
+        stored = [kv, arrays]
+
+        class PrefixCache:
+            def fetch(self, _):
+                return stored, []  # exact hit
+
+        monkeypatch.setattr(mx, "stream", lambda stream: nullcontext())
+        monkeypatch.setattr(
+            "mlx_lm.models.cache.make_prompt_cache", lambda *_, **__: [FreshCache()]
+        )
+        monkeypatch.setattr(
+            "mlx_lm.sample_utils.make_sampler",
+            lambda **_: MagicMock(return_value=mx.array([1], dtype=mx.uint32)),
+        )
+        monkeypatch.setattr(
+            "mlx_lm.sample_utils.make_logits_processors", lambda **_: []
+        )
+
+        generator = MLLMBatchGenerator.__new__(MLLMBatchGenerator)
+        generator.max_kv_size = 0
+        generator._stats = MLLMBatchStats()
+        generator._pending_error_responses = []
+        generator._aborted_request_ids = set()
+        generator._prefill_progress = {}
+        generator.prefix_cache = PrefixCache()
+        generator._think_suffix_len = 0
+        generator.prefill_step_size = 512
+        generator.language_model = MagicMock(
+            return_value=mx.array([[[0.0, 1.0]]], dtype=mx.float32)
+        )
+        generator.model = MagicMock()
+        generator.sampler = MagicMock()
+        generator._preprocess_request = lambda req: None
+        full_prefill = MagicMock(
+            return_value=mx.array([[[0.0, 1.0]]], dtype=mx.float32)
+        )
+        generator._run_chunked_text_prefill = full_prefill
+
+        request = MLLMBatchRequest(uid=1, request_id="hybrid-exact", prompt="x")
+        request.input_ids = mx.array([[1, 2, 3, 4, 5, 6]])
+        request.is_text_only = True
+
+        MLLMBatchGenerator._process_prompts(generator, [request])
+
+        # Before this fix, the hybrid cache's ArraysCache leaf made
+        # _rewind_prefix_cache return None, forcing a fall-through to a full
+        # miss (_run_chunked_text_prefill). It must not be called here.
+        full_prefill.assert_not_called()
+        generator.language_model.assert_called_once()
+        (called_with_tokens,), call_kwargs = generator.language_model.call_args
+        assert called_with_tokens.shape == (1, 1)  # replays only the last token
+        # The rewound cache is an isolated copy -- the stored original must
+        # be untouched (bf5ccb4's ownership-hardening goal, preserved).
+        assert kv.offset == 6
+        assert call_kwargs["cache"][0].offset == 5
+
+    def test_process_prompts_prefix_extension_hit_with_hybrid_cache(self, monkeypatch):
+        """A genuine prefix/LCP-match (remaining_ids non-empty) against a
+        hybrid cache. This path (_copy_prefix_cache + _prepare_rotating_caches)
+        was never part of the regression, but is covered here as an explicit
+        prefix-extension regression test alongside the exact-hit and store
+        cases, per the fix's test plan."""
+        from vllm_mlx.mllm_batch_generator import (
+            MLLMBatchGenerator,
+            MLLMBatchRequest,
+            MLLMBatchStats,
+        )
+
+        kv, arrays = self._make_hybrid_cache(kv_offset=4)
+        stored = [kv, arrays]
+
+        class PrefixCache:
+            def fetch(self, ids):
+                return stored, ids[4:]  # first 4 tokens cached, 2 remaining
+
+        monkeypatch.setattr(mx, "stream", lambda stream: nullcontext())
+        monkeypatch.setattr(
+            "mlx_lm.sample_utils.make_sampler",
+            lambda **_: MagicMock(return_value=mx.array([1], dtype=mx.uint32)),
+        )
+        monkeypatch.setattr(
+            "mlx_lm.sample_utils.make_logits_processors", lambda **_: []
+        )
+
+        generator = MLLMBatchGenerator.__new__(MLLMBatchGenerator)
+        generator.max_kv_size = 0
+        generator._stats = MLLMBatchStats()
+        generator._pending_error_responses = []
+        generator._aborted_request_ids = set()
+        generator._prefill_progress = {}
+        generator.prefix_cache = PrefixCache()
+        generator._think_suffix_len = 0
+        generator.prefill_step_size = 512
+        generator.model = MagicMock()
+        generator.sampler = MagicMock()
+        generator._preprocess_request = lambda req: None
+        remaining_call = MagicMock(
+            return_value=mx.array([[[0.0, 1.0]]], dtype=mx.float32)
+        )
+        generator.language_model = remaining_call
+        full_prefill = MagicMock(
+            return_value=mx.array([[[0.0, 1.0]]], dtype=mx.float32)
+        )
+        generator._run_chunked_text_prefill = full_prefill
+
+        request = MLLMBatchRequest(uid=2, request_id="hybrid-prefix", prompt="x")
+        request.input_ids = mx.array([[1, 2, 3, 4, 5, 6]])
+        request.is_text_only = True
+
+        MLLMBatchGenerator._process_prompts(generator, [request])
+
+        full_prefill.assert_not_called()
+        remaining_call.assert_called_once()
+        (called_with_tokens,), _ = remaining_call.call_args
+        assert called_with_tokens.shape == (1, 2)  # only the 2 remaining tokens
+
     def test_exact_hit_uses_safe_rewind(self):
         """An exact hit must use the type-preserving safe rewind path."""
         from vllm_mlx.mllm_batch_generator import (
