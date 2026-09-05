@@ -205,6 +205,17 @@ jobs:
             -m "not slow" \
             -k "not Integration"
 
+      - name: Run streaming text-with-tool-calls regression tests
+        run: |
+          # Kept out of the list above because that invocation filters with
+          # -k "not Integration", which would deselect the endpoint file by
+          # name and silently skip every regression in it.
+          pytest \
+            tests/test_streaming_content_with_tool_calls.py \
+            tests/test_streaming_content_with_tool_calls_integration.py \
+            -v --tb=short \
+            -m "not slow"
+
       - name: Run EngineCore stream-affinity regression tests
         run: |
           # Fresh process so globals like mlx_lm.generate.generation_stream
