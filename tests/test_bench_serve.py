@@ -18,6 +18,8 @@ from vllm_mlx.bench_serve import (
     SweepConfig,
     Workload,
     WorkloadCase,
+    _load_psycopg,
+    _resolve_postgres_url,
     _validate_sql_identifier,
     accumulate_tool_calls,
     compute_request_metrics,
@@ -38,13 +40,16 @@ from vllm_mlx.bench_serve import (
     parse_metrics_text,
     parse_sse_line,
     parse_status_response,
+    run_bench_serve,
     run_bench_serve_workload,
     run_workload_case,
     stream_chat_completion,
     summarize_workload_results,
     validate_quality_checks,
     validate_response,
+    write_postgres,
     write_sqlite,
+    write_workload_postgres,
     write_workload_sqlite,
 )
 
@@ -1629,6 +1634,54 @@ def _make_sample_workload_payload() -> dict:
 class TestFormatters:
     """Unit tests for output formatter functions."""
 
+    @staticmethod
+    def _fake_postgres():
+        class FakeJsonb:
+            def __init__(self, value):
+                self.value = value
+
+        class FakeCursor:
+            def __init__(self):
+                self.executed = []
+                self.batches = []
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return None
+
+            def execute(self, query):
+                self.executed.append(query)
+
+            def executemany(self, query, values):
+                self.batches.append((query, values))
+
+        class FakeConnection:
+            def __init__(self, cursor):
+                self._cursor = cursor
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return None
+
+            def cursor(self):
+                return self._cursor
+
+        cursor = FakeCursor()
+
+        class FakePsycopg:
+            def __init__(self):
+                self.connection_urls = []
+
+            def connect(self, connection_url):
+                self.connection_urls.append(connection_url)
+                return FakeConnection(cursor)
+
+        return FakePsycopg(), FakeJsonb, cursor
+
     def test_format_table_not_empty(self):
         r = _make_sample_result()
         output = format_table([r])
@@ -1683,6 +1736,26 @@ class TestFormatters:
             ).fetchone()
         assert row == ("sqlite-run", "mlx-community/gemma-3-4b-it-4bit", 0)
 
+    def test_write_postgres_creates_and_inserts_prompt_rows(self, monkeypatch):
+        psycopg, Jsonb, cursor = self._fake_postgres()
+        monkeypatch.setattr(
+            "vllm_mlx.bench_serve._load_psycopg", lambda: (psycopg, Jsonb)
+        )
+        result = _make_sample_result(ttft_ms=float("nan"), tag="it's bound")
+
+        write_postgres([result], "postgresql://user:secret@db/bench")
+
+        assert psycopg.connection_urls == ["postgresql://user:secret@db/bench"]
+        assert 'CREATE TABLE IF NOT EXISTS "bench_serve_results"' in cursor.executed[0]
+        assert "id BIGSERIAL PRIMARY KEY" in cursor.executed[0]
+        assert "raw_result JSONB NOT NULL" in cursor.executed[0]
+        insert_query, values = cursor.batches[0]
+        assert "%s" in insert_query
+        assert "it's bound" not in insert_query
+        assert values[0][RESULT_COLUMNS.index("ttft_ms")] is None
+        assert values[0][-1].value["ttft_ms"] is None
+        assert values[0][-1].value["tag"] == "it's bound"
+
     def test_result_columns_match_dataclass(self):
         import dataclasses
 
@@ -1714,12 +1787,116 @@ class TestFormatters:
             ).fetchone()
         assert row == ("resume-smoke", 0, 1)
 
+    def test_write_workload_postgres_preserves_raw_record(self, monkeypatch):
+        psycopg, Jsonb, cursor = self._fake_postgres()
+        monkeypatch.setattr(
+            "vllm_mlx.bench_serve._load_psycopg", lambda: (psycopg, Jsonb)
+        )
+        payload = _make_sample_workload_payload()
+
+        write_workload_postgres(
+            payload,
+            "postgresql://db/bench",
+            table="custom_bench_results",
+        )
+
+        assert 'CREATE TABLE IF NOT EXISTS "custom_bench_results"' in cursor.executed[0]
+        insert_query, values = cursor.batches[0]
+        assert 'INSERT INTO "custom_bench_results"' in insert_query
+        raw_record = values[0][-1].value
+        assert raw_record["case_id"] == "resume-smoke"
+        assert raw_record["request"]["extra_body"] == {"temperature": 0.6}
+        assert raw_record["quality"]["ok"] is True
+
+    def test_resolve_postgres_url_prefers_output_then_environment(self, monkeypatch):
+        monkeypatch.setenv("BENCH_SERVE_PG_URL", "postgresql://environment")
+
+        assert _resolve_postgres_url("postgresql://output") == "postgresql://output"
+        assert _resolve_postgres_url(None) == "postgresql://environment"
+
+    def test_resolve_postgres_url_requires_configuration(self, monkeypatch):
+        monkeypatch.delenv("BENCH_SERVE_PG_URL", raising=False)
+
+        with pytest.raises(ValueError, match="BENCH_SERVE_PG_URL"):
+            _resolve_postgres_url(None)
+
+    def test_workload_postgres_configuration_fails_before_loading(self, monkeypatch):
+        monkeypatch.delenv("BENCH_SERVE_PG_URL", raising=False)
+        monkeypatch.setattr(
+            "vllm_mlx.bench_serve.load_workload",
+            lambda *_args: (_ for _ in ()).throw(AssertionError("must not load")),
+        )
+
+        with pytest.raises(ValueError, match="BENCH_SERVE_PG_URL"):
+            asyncio.run(
+                run_bench_serve_workload(
+                    url="http://server",
+                    workload_path="unused.json",
+                    output_format="postgres",
+                )
+            )
+
+    def test_prompt_postgres_configuration_fails_before_connecting(self, monkeypatch):
+        monkeypatch.delenv("BENCH_SERVE_PG_URL", raising=False)
+        monkeypatch.setattr(
+            "vllm_mlx.bench_serve.auto_detect_runtime",
+            lambda *_args: (_ for _ in ()).throw(AssertionError("must not connect")),
+        )
+
+        with pytest.raises(ValueError, match="BENCH_SERVE_PG_URL"):
+            asyncio.run(run_bench_serve(fmt="postgres"))
+
+    def test_missing_postgres_dependency_has_install_guidance(self, monkeypatch):
+        import builtins
+
+        real_import = builtins.__import__
+
+        def import_without_psycopg(name, *args, **kwargs):
+            if name == "psycopg" or name.startswith("psycopg."):
+                raise ImportError("psycopg unavailable")
+            return real_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "__import__", import_without_psycopg)
+
+        with pytest.raises(RuntimeError, match=r"vllm-mlx\[postgres\]"):
+            _load_psycopg()
+
     def test_sqlite_identifier_validation_rejects_unsafe_names(self):
-        with pytest.raises(ValueError, match="invalid SQLite table identifier"):
+        with pytest.raises(ValueError, match="invalid SQL table identifier"):
             _validate_sql_identifier("bench; DROP TABLE bench_serve", kind="table")
 
-        with pytest.raises(ValueError, match="invalid SQLite column identifier"):
+        with pytest.raises(ValueError, match="invalid SQL column identifier"):
             _validate_sql_identifier("case-id", kind="column")
+
+    def test_postgres_rejects_unsafe_table_before_connecting(self, monkeypatch):
+        monkeypatch.setattr(
+            "vllm_mlx.bench_serve._load_psycopg",
+            lambda: (_ for _ in ()).throw(AssertionError("must not connect")),
+        )
+
+        with pytest.raises(ValueError, match="invalid SQL table identifier"):
+            write_postgres([], "postgresql://db/bench", "bench; DROP TABLE users")
+
+    def test_postgres_quotes_keyword_table_names(self, monkeypatch):
+        psycopg, Jsonb, cursor = self._fake_postgres()
+        monkeypatch.setattr(
+            "vllm_mlx.bench_serve._load_psycopg", lambda: (psycopg, Jsonb)
+        )
+
+        write_postgres([_make_sample_result()], "postgresql://db/bench", "user")
+
+        assert 'CREATE TABLE IF NOT EXISTS "user"' in cursor.executed[0]
+        assert 'INSERT INTO "user"' in cursor.batches[0][0]
+
+    def test_cli_accepts_postgres_output_options(self):
+        from vllm_mlx.cli import create_parser
+
+        args = create_parser().parse_args(
+            ["bench-serve", "--format", "postgres", "--pg-table", "benchmark_runs"]
+        )
+
+        assert args.format == "postgres"
+        assert args.pg_table == "benchmark_runs"
 
     def test_format_workload_payload_rejects_unknown_format(self):
         with pytest.raises(ValueError, match="Unsupported workload output format"):

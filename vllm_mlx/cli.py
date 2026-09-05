@@ -986,6 +986,7 @@ def bench_serve_command(args):
                 request_timeout_s=request_timeout_s,
                 repetitions=args.repetitions,
                 cache_policy=args.cache_policy,
+                pg_table=args.pg_table,
             )
         )
         return
@@ -1048,6 +1049,7 @@ def bench_serve_command(args):
             skip_preflight_token_count=(
                 args.skip_preflight_token_count or bool(args.system_prompt_file)
             ),
+            pg_table=args.pg_table,
         )
     )
 
@@ -2126,17 +2128,27 @@ Examples:
         "--output",
         type=str,
         default=None,
-        help="File path to write results to (default: stdout)",
+        help=(
+            "File path to write results to, or PostgreSQL connection URL when "
+            "--format postgres (default: stdout or BENCH_SERVE_PG_URL)"
+        ),
     )
     bench_serve_parser.add_argument(
         "--format",
         type=str,
         default="auto",
-        choices=["auto", "table", "json", "csv", "sql", "sqlite"],
+        choices=["auto", "table", "json", "csv", "sql", "sqlite", "postgres"],
         help=(
             "Output format (auto = table for prompt sweeps, json for workloads; "
-            "sqlite requires --output)"
+            "sqlite requires --output; postgres accepts --output or "
+            "BENCH_SERVE_PG_URL)"
         ),
+    )
+    bench_serve_parser.add_argument(
+        "--pg-table",
+        type=str,
+        default=None,
+        help="Custom PostgreSQL table name (lowercase letters, digits, underscores)",
     )
     bench_serve_parser.add_argument(
         "--validate",

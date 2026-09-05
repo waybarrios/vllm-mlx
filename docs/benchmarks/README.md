@@ -100,7 +100,12 @@ policy?" after first measuring what the model and serving stack can actually do.
 Workload output defaults to JSON for full provenance. Use `--format csv` for
 flat per-case rows, `--format sql` to emit importable SQL, or
 `--format sqlite --output bench.db` to append rows directly into a local
-benchmark database.
+benchmark database. PostgreSQL output is available after installing
+`vllm-mlx[postgres]`. Pass its connection URL with `--output`, or set
+`BENCH_SERVE_PG_URL` to avoid passing credentials as a `bench-serve` argument.
+PostgreSQL uses `bench_serve_results` for prompt sweeps and
+`bench_serve_workload_results` for workloads. Override either safe, unqualified
+table name with `--pg-table`.
 
 `--request-timeout-s` is the HTTP transport ceiling for each request in
 workload mode. Product policy timeouts belong in the workload as
@@ -112,6 +117,10 @@ vllm-mlx bench-serve --url http://localhost:8000 \
 
 vllm-mlx bench-serve --url http://localhost:8000 \
   --workload ./workload.json --repetitions 5 --format sqlite --output bench.db
+
+export BENCH_SERVE_PG_URL='postgresql://user:password@localhost/benchmarks'
+vllm-mlx bench-serve --url http://localhost:8000 \
+  --workload ./workload.json --repetitions 5 --format postgres
 ```
 
 ## Standalone Test Defaults
