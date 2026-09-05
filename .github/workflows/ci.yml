@@ -23,10 +23,10 @@ jobs:
           pip install ruff black
 
       - name: Run ruff
-        run: ruff check vllm_mlx/ tests/ --select E,F,W --ignore E402,E501,E731,F811,F841
+        run: ruff check vllm_mlx/ tests/ scripts/client_acceptance/ --select E,F,W --ignore E402,E501,E731,F811,F841
 
       - name: Run black
-        run: black --check vllm_mlx/ tests/
+        run: black --check vllm_mlx/ tests/ scripts/client_acceptance/
 
   type-check:
     runs-on: ubuntu-latest
@@ -68,6 +68,9 @@ jobs:
       - name: Run unit tests (no MLX required)
         run: |
           pytest \
+            tests/test_client_acceptance_runner.py \
+            tests/test_client_acceptance_clients.py \
+            tests/test_client_acceptance_observe.py \
             tests/test_mcp_security.py \
             tests/test_structured_output.py \
             tests/test_reasoning_parser.py \
