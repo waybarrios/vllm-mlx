@@ -99,6 +99,7 @@ from .api.models import (
     Message,  # noqa: F401
     ModelInfo,  # noqa: F401
     ModelsResponse,
+    PromptTokensDetails,
     RerankRequest,
     RerankResponse,
     RerankResult,
@@ -129,6 +130,7 @@ from .api.responses_models import (
     ResponseReasoningTextDeltaEvent,
     ResponseReasoningTextDoneEvent,
     ResponseReasoningTextPart,
+    ResponsesInputTokenDetails,
     ResponseTextContentPart,
     ResponsesRequest,
     ResponsesUsage,
@@ -2539,6 +2541,7 @@ def _build_response_object(
     completion_tokens: int,
     finish_reason: str | None,
     response_id: str | None = None,
+    cached_tokens: int = 0,
 ) -> ResponseObject:
     """Build a full Responses API object."""
     response = ResponseObject(
@@ -2562,6 +2565,10 @@ def _build_response_object(
             input_tokens=prompt_tokens,
             output_tokens=completion_tokens,
             total_tokens=prompt_tokens + completion_tokens,
+            # Responses API surfaces prefix-cache reuse under input_tokens_details.
+            input_tokens_details=ResponsesInputTokenDetails(
+                cached_tokens=cached_tokens
+            ),
         ),
     )
     if finish_reason == "length":
@@ -2667,6 +2674,7 @@ async def _run_responses_request(
         prompt_tokens=output.prompt_tokens,
         completion_tokens=output.completion_tokens,
         finish_reason=output.finish_reason,
+        cached_tokens=getattr(output, "cached_tokens", 0) or 0,
     )
 
     persisted_messages = _responses_request_to_persisted_messages(request)
@@ -3097,6 +3105,7 @@ async def _stream_responses_request(request: ResponsesRequest) -> AsyncIterator[
         completion_tokens=completion_tokens,
         finish_reason=finish_reason,
         response_id=response_id,
+        cached_tokens=getattr(last_output, "cached_tokens", 0) or 0,
     )
 
     if request.store and last_output is not None:
@@ -3789,6 +3798,9 @@ def get_usage(output: GenerationOutput) -> Usage:
         prompt_tokens=total_prompt_tokens,
         completion_tokens=total_completion_tokens,
         total_tokens=total_prompt_tokens + total_completion_tokens,
+        prompt_tokens_details=PromptTokensDetails(
+            cached_tokens=getattr(output, "cached_tokens", 0) or 0
+        ),
     )
 
 
@@ -5246,6 +5258,7 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
         choices = []
         total_completion_tokens = 0
         total_prompt_tokens = 0
+        total_cached_tokens = 0
         for i, prompt in enumerate(prompts):
             generate_kwargs = {
                 "prompt": prompt,
@@ -5307,6 +5320,7 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
             total_prompt_tokens += (
                 output.prompt_tokens if hasattr(output, "prompt_tokens") else 0
             )
+            total_cached_tokens += getattr(output, "cached_tokens", 0) or 0
 
         elapsed = time.perf_counter() - start_time
         tokens_per_sec = total_completion_tokens / elapsed if elapsed > 0 else 0
@@ -5326,6 +5340,9 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
                 prompt_tokens=total_prompt_tokens,
                 completion_tokens=total_completion_tokens,
                 total_tokens=total_prompt_tokens + total_completion_tokens,
+                prompt_tokens_details=PromptTokensDetails(
+                    cached_tokens=total_cached_tokens
+                ),
             ),
         )
     finally:
@@ -5521,6 +5538,9 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
                 prompt_tokens=output.prompt_tokens,
                 completion_tokens=output.completion_tokens,
                 total_tokens=output.prompt_tokens + output.completion_tokens,
+                prompt_tokens_details=PromptTokensDetails(
+                    cached_tokens=getattr(output, "cached_tokens", 0) or 0
+                ),
             ),
             generation_metadata=_generation_metadata(
                 prepared.thinking_processor, output
@@ -5979,6 +5999,9 @@ async def create_anthropic_message(
             usage=AnthropicUsage(
                 input_tokens=output.prompt_tokens,
                 output_tokens=output.completion_tokens,
+                # Anthropic surfaces prefix-cache reuse as cache_read_input_tokens.
+                cache_read_input_tokens=(getattr(output, "cached_tokens", 0) or 0)
+                or None,
             ),
         )
         tracker.finish(
@@ -7022,6 +7045,9 @@ async def stream_chat_completion(
                     prompt_tokens=prompt_tokens,
                     completion_tokens=completion_tokens,
                     total_tokens=prompt_tokens + completion_tokens,
+                    prompt_tokens_details=PromptTokensDetails(
+                        cached_tokens=getattr(last_output, "cached_tokens", 0) or 0
+                    ),
                 ),
             )
             yield f"data: {usage_chunk.model_dump_json()}\n\n"

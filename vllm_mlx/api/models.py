@@ -252,12 +252,26 @@ class ChatCompletionChoice(BaseModel):
     finish_reason: str | None = "stop"
 
 
+class PromptTokensDetails(BaseModel):
+    """Breakdown of prompt tokens (OpenAI-compatible).
+
+    ``cached_tokens`` is the number of prompt tokens served from the prefix/KV
+    cache. This mirrors OpenAI's ``usage.prompt_tokens_details.cached_tokens``
+    so observability tools (Phoenix, Langfuse, ...) pick it up automatically.
+    """
+
+    cached_tokens: int = 0
+
+
 class Usage(BaseModel):
     """Token usage statistics."""
 
     prompt_tokens: int = 0
     completion_tokens: int = 0
     total_tokens: int = 0
+    # Present whenever the serving path reports cache reuse; matches OpenAI,
+    # which always includes prompt_tokens_details when applicable.
+    prompt_tokens_details: PromptTokensDetails | None = None
 
 
 class GenerationMetadata(BaseModel):

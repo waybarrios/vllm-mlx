@@ -77,6 +77,7 @@ jobs:
             tests/test_memory_cache.py \
             tests/test_prefix_cache.py \
             tests/test_mllm_cache.py \
+            tests/test_cache_token_usage.py \
             tests/test_api_models.py \
             tests/test_api_utils.py \
             tests/test_request.py \
@@ -107,7 +108,7 @@ jobs:
             tests/test_streaming_tool_filter.py \
             tests/test_tool_call_promotion.py \
             -v --tb=short \
-            -k "not Integration and not InjectJson and not TestMLXMultimodalLMCache" \
+            -k "not Integration and not InjectJson and not TestMLXMultimodalLMCache and not GetUsage and not ChatCompletionCachedTokens" \
             --cov=vllm_mlx \
             --cov-report=term-missing \
             --cov-report=xml
@@ -178,6 +179,7 @@ jobs:
             tests/test_batched_engine_mllm_config.py \
             tests/test_mllm_continuous_batching.py \
             tests/test_mllm_cache.py \
+            tests/test_cache_token_usage.py \
             tests/test_optimizations.py \
             tests/test_simple_engine.py \
             tests/test_simple_engine_prefix_trie_cache.py \

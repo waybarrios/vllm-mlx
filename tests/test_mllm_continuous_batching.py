@@ -223,6 +223,7 @@ class TestMLLMBatchRequest:
         assert req.top_p == 0.9
         assert req.mllm_draft is False
         assert req.output_tokens == []
+        assert req.cached_tokens == 0
 
 
 class TestMLLMBatchResponse:
@@ -246,6 +247,7 @@ class TestMLLMBatchResponse:
         assert resp.request_id == "test-1"
         assert resp.token == 42
         assert resp.finish_reason is None
+        assert resp.cached_tokens == 0
 
     def test_finished_response(self):
         """Test response with finish reason."""
@@ -307,6 +309,160 @@ class TestMLLMBatchResponse:
         assert "req-err" not in scheduler._detokenizer_pool
         assert len(outputs) == 1
         assert outputs[0].new_text == ""
+
+    def test_process_batch_responses_surfaces_cached_tokens(self):
+        """response.cached_tokens must land on both the persistent request
+        and the emitted RequestOutput, unaccumulated (set, not +=)."""
+        from unittest.mock import MagicMock
+
+        from vllm_mlx.mllm_batch_generator import MLLMBatchResponse
+        from vllm_mlx.mllm_scheduler import MLLMScheduler
+        from vllm_mlx.request import RequestStatus
+
+        scheduler = MLLMScheduler.__new__(MLLMScheduler)
+        scheduler._detokenizer_pool = {}
+        scheduler.uid_to_request_id = {0: "req-cached"}
+        scheduler.total_completion_tokens = 0
+        scheduler.num_requests_processed = 0
+
+        mock_tokenizer = MagicMock()
+        mock_processor = MagicMock()
+        mock_processor.tokenizer = mock_tokenizer
+        scheduler.processor = mock_processor
+
+        mock_request = MagicMock()
+        mock_request.request_id = "req-cached"
+        mock_request.output_tokens = []
+        mock_request.num_output_tokens = 0
+        mock_request.num_prompt_tokens = 500
+        mock_request.status = RequestStatus.RUNNING
+        mock_request.mtp_drafts = 0
+        mock_request.mtp_accepted = 0
+        mock_request.first_token_time = None
+        mock_request.cached_tokens = 0
+        mock_request.peak_cached_tokens = 0
+        scheduler.running = {"req-cached": mock_request}
+
+        resp = MLLMBatchResponse(
+            uid=0,
+            request_id="req-cached",
+            token=42,
+            logprobs=mx.array([0.0]),
+            finish_reason=None,
+            cached_tokens=384,
+        )
+
+        outputs, _finished = scheduler._process_batch_responses([resp])
+
+        assert mock_request.cached_tokens == 384
+        assert mock_request.peak_cached_tokens == 384
+        assert outputs[0].cached_tokens == 384
+
+    def test_mtp_deferred_draft_does_not_clobber_cached_tokens(self):
+        """Regression for the MTP-wrapper prefix-cache-hit defect (PR #732
+        review): the ``_mtp_next`` wrapper in mllm_batch_generator.py appends
+        deferred draft responses (see the augmentation sites around
+        ``MLLMBatchResponse(uid=uid, request_id=r.request_id, token=draft_t,
+        ...)``) without a ``cached_tokens`` argument, so they default to 0.
+        Ordinary decode-step primary responses also report cached_tokens=0
+        (the cache is only consulted at prefill). Before the fix, either of
+        these zero-carrying responses unconditionally overwrote
+        ``request.cached_tokens``, so a prefix-cache hit established on the
+        prefill step read back as a miss on every later output -- including
+        the finished one the client actually sees usage for.
+        """
+        from unittest.mock import MagicMock
+
+        from vllm_mlx.mllm_batch_generator import MLLMBatchResponse
+        from vllm_mlx.mllm_scheduler import MLLMScheduler
+        from vllm_mlx.request import RequestStatus
+
+        scheduler = MLLMScheduler.__new__(MLLMScheduler)
+        scheduler._detokenizer_pool = {}
+        scheduler.uid_to_request_id = {0: "req-mtp"}
+        scheduler.total_completion_tokens = 0
+        scheduler.num_requests_processed = 0
+
+        mock_tokenizer = MagicMock()
+        mock_processor = MagicMock()
+        mock_processor.tokenizer = mock_tokenizer
+        scheduler.processor = mock_processor
+
+        mock_request = MagicMock()
+        mock_request.request_id = "req-mtp"
+        mock_request.output_tokens = []
+        mock_request.num_output_tokens = 0
+        mock_request.num_prompt_tokens = 500
+        mock_request.status = RequestStatus.RUNNING
+        mock_request.mtp_drafts = 0
+        mock_request.mtp_accepted = 0
+        mock_request.first_token_time = None
+        mock_request.cached_tokens = 0
+        mock_request.peak_cached_tokens = 0
+        scheduler.running = {"req-mtp": mock_request}
+
+        HIT = 512
+
+        # Step 1: prefill resolves the prefix-cache lookup on the primary
+        # response.
+        primary_prefill = MLLMBatchResponse(
+            uid=0,
+            request_id="req-mtp",
+            token=1,
+            logprobs=mx.array([0.0]),
+            finish_reason=None,
+            cached_tokens=HIT,
+        )
+        outputs_1, _ = scheduler._process_batch_responses([primary_prefill])
+        assert outputs_1[0].cached_tokens == HIT
+        assert outputs_1[0].usage["cached_tokens"] == HIT
+
+        # Step 2: shape mirrors what `_mtp_next` returns -- the batch's
+        # primary decode-step response (cached_tokens defaults to 0; no new
+        # cache lookup happens on decode) followed by the deferred MTP draft
+        # response, also with no cached_tokens argument, which finishes the
+        # request (the "final deferred draft" the review calls out).
+        primary_decode = MLLMBatchResponse(
+            uid=0,
+            request_id="req-mtp",
+            token=2,
+            logprobs=mx.array([0.0]),
+            finish_reason=None,
+        )
+        deferred_draft = MLLMBatchResponse(
+            uid=0,
+            request_id="req-mtp",
+            token=3,
+            logprobs=mx.array([0.0]),
+            finish_reason="stop",
+            from_draft=True,
+        )
+        assert primary_decode.cached_tokens == 0
+        assert deferred_draft.cached_tokens == 0
+
+        outputs_2, finished = scheduler._process_batch_responses(
+            [primary_decode, deferred_draft]
+        )
+
+        assert "req-mtp" in finished
+        # Every output in this batch -- the decode-step primary and the
+        # finishing deferred draft alike -- must still report the cache hit.
+        for output in outputs_2:
+            assert output.cached_tokens == HIT
+            assert output.usage["cached_tokens"] == HIT
+
+        # The final deferred draft is what the client's usage object is
+        # built from.
+        final_output = outputs_2[-1]
+        assert final_output.finished is True
+        assert final_output.cached_tokens == HIT
+        assert final_output.usage["cached_tokens"] == HIT
+
+        # Raw cached_tokens tracks the last response's value (0 on this
+        # decode step, matching the LLM-path's identical semantics); the
+        # peak is what's actually reported to the client and must survive.
+        assert mock_request.cached_tokens == 0
+        assert mock_request.peak_cached_tokens == HIT
 
 
 class TestMLLMBatch:
@@ -503,6 +659,7 @@ class TestMLLMRequest:
         assert req.status == RequestStatus.WAITING
         assert req.mllm_draft is False
         assert req.output_text == ""
+        assert req.cached_tokens == 0
 
 
 class TestMLLMSchedulerOutput:
@@ -2103,6 +2260,71 @@ class TestChunkedPrefillCacheHandling:
         gen._next()
 
         assert rewind_calls == [1]
+
+    def test_exact_hit_sets_cached_tokens(self):
+        """An exact hit must record cached_tokens = total_tokens - 1 on the
+        request so it survives to RequestOutput.cached_tokens."""
+        from vllm_mlx.mllm_batch_generator import (
+            MLLMBatchRequest,
+            install_chunked_prefill_mllm,
+        )
+
+        gen = self._make_fake_batch_gen()
+        fake_kv = [self._make_fake_kv_cache(offset=50)]
+
+        class FakePrefixCache:
+            def fetch(self, ids):
+                return fake_kv, []  # exact hit
+
+        gen.prefix_cache = FakePrefixCache()
+        gen.language_model = MagicMock()
+        gen._next = lambda: []
+
+        install_chunked_prefill_mllm(gen, budget=1024)
+
+        req = MLLMBatchRequest(uid=1, request_id="req-exact", prompt="hello")
+        req.input_ids = mx.array([[10, 20, 30, 40, 50]])
+        req.is_text_only = True
+        req.images = None
+        req.videos = None
+        gen.unprocessed_requests.append(req)
+        gen._preprocess_request = lambda r: None
+
+        gen._next()
+
+        assert req.cached_tokens == 4  # 5 input tokens, exact hit minus 1
+
+    def test_cache_miss_resets_cached_tokens(self):
+        """A cache miss must leave cached_tokens at 0, not a stale prior hit."""
+        from vllm_mlx.mllm_batch_generator import (
+            MLLMBatchRequest,
+            install_chunked_prefill_mllm,
+        )
+
+        gen = self._make_fake_batch_gen()
+
+        class MissingPrefixCache:
+            def fetch(self, ids):
+                return None, ids  # miss
+
+        gen.prefix_cache = MissingPrefixCache()
+        gen.language_model = MagicMock()
+        gen._next = lambda: []
+
+        install_chunked_prefill_mllm(gen, budget=1024)
+
+        req = MLLMBatchRequest(uid=2, request_id="req-miss", prompt="hello")
+        req.input_ids = mx.array([[10, 20, 30, 40, 50]])
+        req.is_text_only = True
+        req.images = None
+        req.videos = None
+        req.cached_tokens = 999  # stale value from a prior prefill on this uid
+        gen.unprocessed_requests.append(req)
+        gen._preprocess_request = lambda r: None
+
+        gen._next()
+
+        assert req.cached_tokens == 0
 
     def test_saturated_rotating_exact_hit_falls_back(self, monkeypatch):
         from mlx_lm.models.cache import CacheList, RotatingKVCache

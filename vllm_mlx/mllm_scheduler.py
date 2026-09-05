@@ -125,6 +125,11 @@ class MLLMRequest:
     num_output_tokens: int = 0
     mtp_drafts: int = 0
     mtp_accepted: int = 0
+    cached_tokens: int = 0  # Prompt tokens served from the prefix cache (0 = miss)
+    # High-water mark of cached_tokens across this request's responses. See
+    # the peak-tracking comment in the scheduler loop for why a separate
+    # field is needed rather than reading cached_tokens directly.
+    peak_cached_tokens: int = 0
 
     # Timing
     first_token_time: Optional[float] = None
@@ -687,6 +692,20 @@ class MLLMScheduler:
                 request.mtp_drafts += response.mtp_attempted_count
             if response.from_draft:
                 request.mtp_accepted += 1
+            request.cached_tokens = response.cached_tokens
+
+            # Track the high-water mark of prefix-cache reuse, mirroring the
+            # LLM-path scheduler (see scheduler.py's identical comment).
+            # cached_tokens is established once at prefill on the primary
+            # response, but synthetic/deferred responses -- e.g. the MTP
+            # wrapper's appended draft-token responses at
+            # mllm_batch_generator.py's deferred-draft augmentation sites --
+            # carry no cache accounting of their own and default to 0. Emit
+            # the peak so a draft response never makes a cache hit read back
+            # as a miss.
+            request.peak_cached_tokens = max(
+                request.peak_cached_tokens, request.cached_tokens
+            )
 
             if request.first_token_time is None and request.num_output_tokens > 0:
                 request.first_token_time = time.time()
@@ -711,6 +730,14 @@ class MLLMScheduler:
                 output_token_ids=request.output_tokens,
                 prompt_tokens=request.num_prompt_tokens,
                 completion_tokens=request.num_output_tokens,
+                # Populated from MLLMBatchGenerator's fetch-site accounting via
+                # response.cached_tokens above; getattr kept defensively in
+                # case a future request type reaches this path without the
+                # field (e.g. the error-response branch's plain Request-less
+                # construction elsewhere in this method). peak_cached_tokens,
+                # not cached_tokens, so a zero-default deferred/draft
+                # response can't clobber an already-reported cache hit.
+                cached_tokens=getattr(request, "peak_cached_tokens", 0),
                 mtp_drafts=request.mtp_drafts,
                 mtp_accepted=request.mtp_accepted,
             )
