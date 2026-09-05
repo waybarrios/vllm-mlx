@@ -196,6 +196,7 @@ jobs:
             tests/test_normalize_messages.py \
             tests/test_responses_api.py \
             tests/test_thinking_aware_processor.py \
+            tests/test_tool_argument_coercion.py \
             tests/test_tool_choice_forced.py \
             tests/test_tool_choice_none.py \
             tests/test_harmony_render.py \

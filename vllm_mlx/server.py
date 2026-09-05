@@ -1953,13 +1953,7 @@ def get_engine() -> BaseEngine:
 def _coerce_tool_arguments(
     arguments_json: str, tool_name: str, tools: list[dict] | None
 ) -> str:
-    """
-    Coerce tool call arguments to match the tool schema.
-
-    If a schema field expects "string" but the model produced an object/array,
-    JSON-stringify the value. This fixes a common LLM failure mode where models
-    output raw JSON objects instead of JSON strings for file content, etc.
-    """
+    """Losslessly recover tool argument types from the request schema."""
     if not tools:
         return arguments_json
 
@@ -1985,16 +1979,130 @@ def _coerce_tool_arguments(
     changed = False
 
     for key, value in arguments.items():
-        if key in properties:
-            expected_type = properties[key].get("type")
-            if expected_type == "string" and isinstance(value, (dict, list)):
-                arguments[key] = json.dumps(value, ensure_ascii=False, indent=2)
-                changed = True
+        property_schema = properties.get(key)
+        if not isinstance(property_schema, dict):
+            continue
+        normalized = _coerce_tool_argument_value(value, property_schema.get("type"))
+        if normalized != value or type(normalized) is not type(value):
+            arguments[key] = normalized
+            changed = True
 
     if changed:
-        return json.dumps(arguments, ensure_ascii=False)
+        try:
+            return json.dumps(arguments, ensure_ascii=False, allow_nan=False)
+        except ValueError:
+            # Do not replace non-JSON numbers or alter an invalid source payload.
+            return arguments_json
 
     return arguments_json
+
+
+def _coerce_tool_argument_value(value: object, declared_type: object) -> object:
+    if isinstance(declared_type, str):
+        expected_types = (declared_type,)
+    elif isinstance(declared_type, list):
+        expected_types = tuple(item for item in declared_type if isinstance(item, str))
+    else:
+        return value
+
+    if any(_tool_argument_matches_type(value, kind) for kind in expected_types):
+        return value
+
+    if "string" in expected_types and isinstance(value, (dict, list)):
+        try:
+            return json.dumps(
+                value, ensure_ascii=False, separators=(",", ":"), allow_nan=False
+            )
+        except ValueError:
+            return value
+
+    if not isinstance(value, str):
+        return value
+
+    for kind in expected_types:
+        normalized = _decode_tool_argument_string(value, kind)
+        if _tool_argument_matches_type(normalized, kind):
+            return normalized
+    return value
+
+
+def _decode_tool_argument_string(value: str, expected_type: str) -> object:
+    if expected_type not in {"array", "object", "integer", "number", "boolean", "null"}:
+        return value
+    try:
+        decoded = json.loads(value)
+        # Check nested values too: Python accepts NaN/Infinity and overflow
+        # during loads, but these must not become newly emitted JSON numbers.
+        json.dumps(decoded, allow_nan=False)
+    except (ValueError, TypeError):
+        return value
+    return decoded
+
+
+def _tool_argument_matches_type(value: object, expected_type: str) -> bool:
+    if expected_type == "string":
+        return isinstance(value, str)
+    if expected_type == "array":
+        return isinstance(value, list)
+    if expected_type == "object":
+        return isinstance(value, dict)
+    if expected_type == "integer":
+        return isinstance(value, int) and not isinstance(value, bool)
+    if expected_type == "number":
+        return isinstance(value, (int, float)) and not isinstance(value, bool)
+    if expected_type == "boolean":
+        return isinstance(value, bool)
+    if expected_type == "null":
+        return value is None
+    return False
+
+
+def _merge_streaming_tool_call_fragments(
+    calls: dict[int, dict], fragments: list[dict]
+) -> list[dict]:
+    """Buffer arguments, returning newly established call identity once."""
+    identities = []
+    for fragment in fragments:
+        index = int(fragment.get("index", 0))
+        call = calls.setdefault(
+            index,
+            {
+                "index": index,
+                "id": "",
+                "type": "function",
+                "function": {"name": "", "arguments": ""},
+            },
+        )
+        identity = {"index": index}
+        if fragment.get("id") and not call["id"]:
+            call["id"] = fragment["id"]
+            identity["id"] = call["id"]
+            identity["type"] = fragment.get("type") or "function"
+        if fragment.get("type"):
+            call["type"] = fragment["type"]
+        function = fragment.get("function") or {}
+        if function.get("name") and not call["function"]["name"]:
+            call["function"]["name"] = function["name"]
+            identity["function"] = {"name": function["name"]}
+        call["function"]["arguments"] += function.get("arguments") or ""
+        if len(identity) > 1:
+            identities.append(identity)
+    return identities
+
+
+def _finalize_streaming_tool_calls(
+    calls: dict[int, dict], tools: list[dict] | None
+) -> list[dict]:
+    """Emit complete arguments only; call identities have already streamed."""
+    finalized = []
+    for index in sorted(calls):
+        call = calls[index]
+        function = call["function"]
+        arguments = _coerce_tool_arguments(
+            function["arguments"], function["name"], tools
+        )
+        finalized.append({"index": index, "function": {"arguments": arguments}})
+    return finalized
 
 
 def _validate_model_name(request_model: str) -> None:
@@ -6277,6 +6385,7 @@ async def _stream_anthropic_messages(
                             tool_result = _finalize_streaming_tool_result(
                                 tool_parser, tool_accumulated_text, tool_result
                             )
+
                         if tool_result is None:
                             # Inside tool markup, so suppress this delta.
                             continue
@@ -6349,6 +6458,7 @@ async def _stream_anthropic_messages(
                             tool_result = _finalize_streaming_tool_result(
                                 tool_parser, tool_accumulated_text, tool_result
                             )
+
                         if tool_result is None:
                             # Inside tool markup, so suppress this delta.
                             continue
@@ -6596,6 +6706,8 @@ async def stream_chat_completion(
     tool_calls_detected = False
     tool_parser = _get_streaming_tool_parser(request, engine)
     tool_markup_possible = _requires_eager_tool_streaming(tool_parser)
+    buffer_typed_tool_calls = request.tool_argument_recovery == "buffered"
+    buffered_tool_calls: dict[int, dict] = {}
     # Whether any emitted chunk carried a terminal finish_reason. The engine's
     # finished=True output can be swallowed by a parser `continue` below (e.g.
     # a bare end-of-turn token arriving after a completed tool call); without
@@ -6691,6 +6803,14 @@ async def stream_chat_completion(
                                 tool_parser, tool_accumulated_text, tool_result
                             )
 
+                        if (
+                            output.finished
+                            and buffer_typed_tool_calls
+                            and buffered_tool_calls
+                            and not (tool_result or {}).get("tool_calls")
+                        ):
+                            tool_result = {**(tool_result or {}), "tool_calls": []}
+
                         if tool_result is None:
                             # Inside tool markup - suppress content output
                             if reasoning:
@@ -6714,21 +6834,33 @@ async def stream_chat_completion(
                         if "tool_calls" in tool_result:
                             # Emit structured tool calls
                             tool_calls_detected = True
-                            # Coerce arguments against tool schemas
-                            if tools_dict:
-                                for tc in tool_result["tool_calls"]:
-                                    fn = tc.get("function", {})
-                                    if "arguments" in fn and "name" in fn:
-                                        fn["arguments"] = _coerce_tool_arguments(
-                                            fn["arguments"], fn["name"], tools_dict
+                            emitted_tool_calls = tool_result["tool_calls"]
+                            if buffer_typed_tool_calls:
+                                emitted_tool_calls = (
+                                    _merge_streaming_tool_call_fragments(
+                                        buffered_tool_calls, emitted_tool_calls
+                                    )
+                                )
+                                if not output.finished:
+                                    if (
+                                        not emitted_tool_calls
+                                        and not tool_result.get("content")
+                                        and not reasoning
+                                    ):
+                                        continue
+                                else:
+                                    emitted_tool_calls += (
+                                        _finalize_streaming_tool_calls(
+                                            buffered_tool_calls, tools_dict
                                         )
+                                    )
                             chunk = ChatCompletionChunk(
                                 id=response_id,
                                 model=_response_model_name(request.model),
                                 choices=[
                                     ChatCompletionChunkChoice(
                                         delta=ChatCompletionChunkDelta(
-                                            tool_calls=tool_result["tool_calls"],
+                                            tool_calls=emitted_tool_calls or None,
                                             content=tool_result.get("content") or None,
                                             reasoning=reasoning,
                                         ),
@@ -6842,6 +6974,14 @@ async def stream_chat_completion(
                                 tool_parser, tool_accumulated_text, tool_result
                             )
 
+                        if (
+                            output.finished
+                            and buffer_typed_tool_calls
+                            and buffered_tool_calls
+                            and not (tool_result or {}).get("tool_calls")
+                        ):
+                            tool_result = {**(tool_result or {}), "tool_calls": []}
+
                         if tool_result is None:
                             # Inside tool markup - suppress output
                             continue
@@ -6849,21 +6989,31 @@ async def stream_chat_completion(
                         if "tool_calls" in tool_result:
                             # Emit structured tool calls
                             tool_calls_detected = True
-                            # Coerce arguments against tool schemas
-                            if tools_dict:
-                                for tc in tool_result["tool_calls"]:
-                                    fn = tc.get("function", {})
-                                    if "arguments" in fn and "name" in fn:
-                                        fn["arguments"] = _coerce_tool_arguments(
-                                            fn["arguments"], fn["name"], tools_dict
+                            emitted_tool_calls = tool_result["tool_calls"]
+                            if buffer_typed_tool_calls:
+                                emitted_tool_calls = (
+                                    _merge_streaming_tool_call_fragments(
+                                        buffered_tool_calls, emitted_tool_calls
+                                    )
+                                )
+                                if not output.finished:
+                                    if not emitted_tool_calls and not tool_result.get(
+                                        "content"
+                                    ):
+                                        continue
+                                else:
+                                    emitted_tool_calls += (
+                                        _finalize_streaming_tool_calls(
+                                            buffered_tool_calls, tools_dict
                                         )
+                                    )
                             chunk = ChatCompletionChunk(
                                 id=response_id,
                                 model=_response_model_name(request.model),
                                 choices=[
                                     ChatCompletionChunkChoice(
                                         delta=ChatCompletionChunkDelta(
-                                            tool_calls=tool_result["tool_calls"],
+                                            tool_calls=emitted_tool_calls or None,
                                             content=tool_result.get("content") or None,
                                         ),
                                         finish_reason=(

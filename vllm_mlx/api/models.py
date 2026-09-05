@@ -12,7 +12,7 @@ These models define the request and response schemas for:
 import re
 import time
 import uuid
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import AliasChoices, BaseModel, Field, model_serializer, model_validator
 
@@ -184,6 +184,9 @@ class ChatCompletionRequest(BaseModel):
     # Tool calling
     tools: list[ToolDefinition] | None = None
     tool_choice: str | dict | None = None  # "auto", "none", or specific tool
+    # Streaming extension: buffer arguments until generation finishes before
+    # schema-aware recovery. IDs/names and content still stream immediately.
+    tool_argument_recovery: Literal["none", "buffered"] = "none"
     # Structured output
     response_format: ResponseFormat | dict | None = None
     # OpenAI-compatible token bias map: token id string -> bias value
