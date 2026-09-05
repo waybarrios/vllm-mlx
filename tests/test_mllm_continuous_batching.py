@@ -2103,6 +2103,7 @@ class TestChunkedPrefillCacheHandling:
         gen._next()
 
         assert rewind_calls == [1]
+        assert req.cached_tokens == 4
 
     def test_saturated_rotating_exact_hit_falls_back(self, monkeypatch):
         from mlx_lm.models.cache import CacheList, RotatingKVCache
@@ -2145,6 +2146,7 @@ class TestChunkedPrefillCacheHandling:
         make_cache.assert_called_once()
         original_next.assert_called_once()
         assert [child.offset for child in stored[0].caches] == [6, 6]
+        assert request.cached_tokens == 0
 
     def test_partial_hit_uses_copy_prefix_cache(self, monkeypatch):
         """A partial hit clones storage and does not use exact-hit rewind."""
@@ -2190,6 +2192,7 @@ class TestChunkedPrefillCacheHandling:
             1
         ], f"Expected _copy_prefix_cache called once, got {copy_calls}"
         assert rewind_calls == []
+        assert req.cached_tokens == 3
 
     def test_abort_cleans_up_partial_prefill(self):
         """Aborting a request during chunked prefill must clean up _partial."""

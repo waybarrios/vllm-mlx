@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for MLLM + MTP per-request routing."""
 
+import pytest
+
 
 def test_has_media_content_text_only():
     from vllm_mlx.api.utils import has_media_content as _has_media_content
@@ -221,7 +223,8 @@ def test_mllm_mtp_attempt_metadata_only_marks_real_attempts():
     assert attempted == {}
 
 
-def test_mllm_scheduler_exposes_mtp_attempts_and_accepts_on_outputs():
+@pytest.mark.parametrize("cached_tokens", [3, 0, None, "3", True])
+def test_mllm_scheduler_exposes_mtp_attempts_and_accepts_on_outputs(cached_tokens):
     from vllm_mlx.mllm_batch_generator import MLLMBatchResponse
     from vllm_mlx.mllm_scheduler import MLLMRequest, MLLMScheduler
 
@@ -248,6 +251,7 @@ def test_mllm_scheduler_exposes_mtp_attempts_and_accepts_on_outputs():
                 logprobs=None,
                 mtp_attempted=True,
                 mtp_attempted_count=1,
+                cached_tokens=cached_tokens,
             ),
             MLLMBatchResponse(
                 uid=7,
@@ -256,6 +260,7 @@ def test_mllm_scheduler_exposes_mtp_attempts_and_accepts_on_outputs():
                 logprobs=None,
                 finish_reason="stop",
                 from_draft=True,
+                cached_tokens=cached_tokens,
             ),
         ]
     )
@@ -263,6 +268,8 @@ def test_mllm_scheduler_exposes_mtp_attempts_and_accepts_on_outputs():
     assert finished == {"req-7"}
     assert outputs[-1].mtp_drafts == 1
     assert outputs[-1].mtp_accepted == 1
+    expected = cached_tokens if type(cached_tokens) is int else None
+    assert outputs[-1].cached_tokens == expected
 
 
 def test_get_language_model():

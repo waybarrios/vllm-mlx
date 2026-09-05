@@ -32,6 +32,7 @@ from .models import (
     CompletionChoice,
     CompletionResponse,
     # Common
+    PromptTokensDetails,
     Usage,
     ModelInfo,
     ModelsResponse,
@@ -94,6 +95,7 @@ from .tool_calling import (
 )
 
 __all__ = [
+    "PromptTokensDetails",
     # Models
     "ImageUrl",
     "VideoUrl",

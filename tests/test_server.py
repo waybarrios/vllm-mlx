@@ -1613,6 +1613,7 @@ class TestMaxTokensLimit:
                     prompt_tokens=5,
                     completion_tokens=2,
                     finish_reason="stop",
+                    cached_tokens=4,
                 )
 
         fake_engine = FakeEngine()
@@ -1663,6 +1664,8 @@ class TestMaxTokensLimit:
         assert all(call == ("fake", user_stop) for call in helper_calls)
         assert captured["kwargs"]["stop"] == expected_stop
         assert response.choices[0].message.content == "ok"
+        assert response.usage.prompt_tokens == 5
+        assert response.usage.prompt_tokens_details.cached_tokens == 4
 
     @pytest.mark.anyio
     async def test_create_anthropic_message_rejects_over_limit_before_engine_lookup(
@@ -3203,6 +3206,7 @@ class TestStreamChatCompletion:
                     finish_reason=None,
                     prompt_tokens=3,
                     completion_tokens=1,
+                    cached_tokens=2,
                 )
 
         monkeypatch.setattr(server, "_model_name", "served-model")
@@ -3239,6 +3243,7 @@ class TestStreamChatCompletion:
             "prompt_tokens": 3,
             "completion_tokens": 1,
             "total_tokens": 4,
+            "prompt_tokens_details": {"cached_tokens": 2},
         }
 
     @pytest.mark.anyio

@@ -254,6 +254,7 @@ async def test_output_collector():
             output_token_ids=[1, 2],
             output_text="Hello World",
             finished=False,
+            cached_tokens=4,
         )
     )
 
@@ -261,6 +262,7 @@ async def test_output_collector():
     assert merged is not None
     assert merged.new_text == "Hello World"
     assert merged.new_token_ids == [1, 2]
+    assert merged.cached_tokens == 4
     print("  [PASS] Output aggregation")
 
     # Test async get
