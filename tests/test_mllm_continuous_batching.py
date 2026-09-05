@@ -537,6 +537,19 @@ class TestMultimodalProcessorBatch:
         result = processor.batch_pixel_values([None, None])
         assert result is None
 
+    def test_process_rejects_invalid_image_atomically(self, monkeypatch):
+        from vllm_mlx import multimodal_processor
+
+        processor = multimodal_processor.MultimodalProcessor(MagicMock(), MagicMock())
+        monkeypatch.setattr(
+            multimodal_processor,
+            "process_image_input",
+            lambda image: (_ for _ in ()).throw(ValueError("invalid image")),
+        )
+
+        with pytest.raises(ValueError, match="invalid image"):
+            processor.process("Describe", images=["bad-image"])
+
     def test_batch_pixel_values_single(self):
         """Test batching single pixel value."""
         from vllm_mlx.multimodal_processor import MultimodalProcessor
@@ -2014,6 +2027,29 @@ class TestPreprocessIdempotent:
 
         # Should NOT return early — will try to import prepare_inputs
         with pytest.raises(Exception):
+            gen._preprocess_request(req)
+
+    def test_invalid_media_fails_batched_preprocessing(self, monkeypatch):
+        from vllm_mlx.mllm_batch_generator import (
+            MLLMBatchGenerator,
+            MLLMBatchRequest,
+        )
+        from vllm_mlx.models import mllm
+
+        req = MLLMBatchRequest(
+            uid=0,
+            prompt="Describe",
+            request_id="bad-media",
+            images=["bad-image"],
+        )
+        gen = MLLMBatchGenerator.__new__(MLLMBatchGenerator)
+        monkeypatch.setattr(
+            mllm,
+            "process_image_input",
+            lambda image: (_ for _ in ()).throw(ValueError("invalid image")),
+        )
+
+        with pytest.raises(ValueError, match="invalid image"):
             gen._preprocess_request(req)
 
 

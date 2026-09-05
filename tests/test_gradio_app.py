@@ -42,6 +42,21 @@ def test_create_chat_function_uses_default_served_model_name(monkeypatch):
     assert captured["json"]["model"] == "default"
 
 
+def test_chat_function_does_not_print_prompt_or_file_details(monkeypatch, capsys):
+    monkeypatch.setattr(
+        gradio_app.requests, "post", lambda *args, **kwargs: DummyResponse("ok")
+    )
+    chat_fn = gradio_app.create_chat_function(
+        server_url="http://localhost:8000",
+        max_tokens=16,
+        temperature=0.0,
+    )
+
+    assert chat_fn({"text": "private prompt", "files": []}, history=[]) == "ok"
+    captured = capsys.readouterr()
+    assert "private prompt" not in captured.out
+
+
 def test_create_chat_function_uses_configured_served_model_name(monkeypatch):
     captured = {}
 

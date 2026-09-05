@@ -757,7 +757,9 @@ def _download_media(
         "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
     }
 
-    logger.info(f"Downloading {media_type} from: {url}")
+    # URLs may contain credentials or signed query parameters. Keep request
+    # targets out of normal logs while retaining useful operation context.
+    logger.info("Downloading remote %s", media_type)
 
     try:
         head_response = _request_with_safe_redirects(
@@ -1483,25 +1485,11 @@ class MLXMultimodalLM:
 
     def _prepare_images(self, images: list) -> list[str]:
         """Process remote/base64 image inputs into local temp file paths."""
-        processed = []
-        for img in images:
-            try:
-                path = process_image_input(img)
-                processed.append(path)
-            except Exception as e:
-                logger.warning(f"Failed to process image: {e}")
-        return processed
+        return [process_image_input(image) for image in images]
 
     def _prepare_audio(self, audio_inputs: list) -> list[str]:
         """Process audio inputs and return local file paths."""
-        processed = []
-        for audio_input in audio_inputs:
-            try:
-                path = process_audio_input(audio_input)
-                processed.append(path)
-            except Exception as e:
-                logger.warning(f"Failed to process audio: {e}")
-        return processed
+        return [process_audio_input(audio_input) for audio_input in audio_inputs]
 
     def _prepare_video(
         self,
