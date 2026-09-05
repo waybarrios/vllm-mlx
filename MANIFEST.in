@@ -1,0 +1,17 @@
+include LICENSE
+include README.md
+include MANIFEST.in
+include pyproject.toml
+include setup.py
+
+# Optional Metal Context Engine source distribution inputs.
+recursive-include native/metal_context *.metal *.mm *.hpp *.md
+include scripts/build_metal_context.py
+
+# Keep the portable/native foundation regression tests available to downstream
+# source checkouts without broadening the package's installed data files.
+include tests/test_attention_backend.py
+include tests/test_metal_context_native.py
+include tests/test_metal_context_page_runtime.py
+include docs/metal-context-page-runtime.md
+include vllm_mlx/metal_context_runtime.py

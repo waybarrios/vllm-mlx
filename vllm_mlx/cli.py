@@ -22,6 +22,11 @@ from .cli_arg_types import (
     make_positive_int_arg_parser,
     memory_budget_gb_arg,
 )
+from .attention_backend import (
+    ATTENTION_BACKEND_CHOICES,
+    AttentionBackendCapabilityError,
+    resolve_attention_backend,
+)
 from .tool_parsers import ToolParserManager
 
 _TOOL_PARSER_CHOICES = ToolParserManager.list_registered()
@@ -52,14 +57,39 @@ def serve_command(args):
     import os
     import sys
 
+    logger = logging.getLogger(__name__)
+    requested_attention_backend = getattr(args, "attention_backend", "mlx")
+    try:
+        attention_backend = resolve_attention_backend(requested_attention_backend)
+    except AttentionBackendCapabilityError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        sys.exit(1)
+
     import uvicorn
 
-    # Import unified server
+    # Import unified server only after the explicit backend capability check.
     from . import server
     from .model_registry import RegistryServeDefaults
     from .server import RateLimiter, app, load_model, load_model_registry
 
-    logger = logging.getLogger(__name__)
+    # Selection is deliberately separate from scheduler construction.  The
+    # native context runtime is opt-in and its executor is introduced by a
+    # later package; recording the validated selection now makes startup
+    # behavior explicit without changing the MLX execution path.
+    server.configure_attention_backend(attention_backend)
+    if attention_backend.fallback_reason:
+        logger.info(
+            "Attention backend: requested=%s selected=%s (%s)",
+            attention_backend.requested.value,
+            attention_backend.selected.value,
+            attention_backend.fallback_reason,
+        )
+    else:
+        logger.info(
+            "Attention backend: requested=%s selected=%s",
+            attention_backend.requested.value,
+            attention_backend.selected.value,
+        )
     model_arg = getattr(args, "model", None)
     models_config = getattr(args, "models_config", None)
     memory_budget_gb = getattr(args, "memory_budget_gb", None)
@@ -1097,6 +1127,17 @@ Examples:
         help="Host to bind (default: localhost; use 0.0.0.0 to expose externally)",
     )
     serve_parser.add_argument("--port", type=int, default=8000, help="Port to bind")
+    serve_parser.add_argument(
+        "--attention-backend",
+        type=str,
+        choices=ATTENTION_BACKEND_CHOICES,
+        default="mlx",
+        help=(
+            "Attention execution backend: mlx (default), metal-context "
+            "(explicit opt-in; requires the compiled native extension), or "
+            "auto (currently remains on mlx until qualification passes)."
+        ),
+    )
     serve_parser.add_argument(
         "--max-num-seqs", type=int, default=256, help="Max concurrent sequences"
     )
