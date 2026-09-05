@@ -678,6 +678,9 @@ class TestToolParserUsesLocalEngine:
         )
 
         class FakeRawRequest:
+            async def json(self):
+                return request.model_dump(mode="json", exclude_none=True)
+
             async def is_disconnected(self):
                 return False
 
@@ -809,8 +812,16 @@ class TestLifecycleFailureHandling:
             timeout=None,
         )
 
+        class FakeRawRequest:
+            async def json(self):
+                return {
+                    "model": request.model,
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "tools": request.tools,
+                }
+
         with pytest.raises(RuntimeError, match="boom"):
-            await srv.create_chat_completion(request, SimpleNamespace())
+            await srv.create_chat_completion(request, FakeRawRequest())
 
         assert calls["acquires"] == 1
         assert calls["releases"] == 1
@@ -3772,6 +3783,9 @@ class TestResponseModelFieldUsesServedName:
         monkeypatch.setattr(srv, "_reasoning_parser", None)
 
         class FakeRawRequest:
+            async def json(self):
+                return request.model_dump(mode="json", exclude_none=True)
+
             async def is_disconnected(self):
                 return False
 

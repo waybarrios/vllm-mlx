@@ -193,6 +193,7 @@ jobs:
             tests/test_ssd_shutdown_wiring.py \
             tests/test_lifecycle_cli.py \
             tests/test_lifecycle_server.py \
+            tests/test_outlines_backend_admission.py \
             tests/test_normalize_messages.py \
             tests/test_responses_api.py \
             tests/test_thinking_aware_processor.py \

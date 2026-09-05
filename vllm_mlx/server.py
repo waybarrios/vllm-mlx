@@ -453,6 +453,81 @@ def _raise_remote_media_http_error(exc: UnsafeRemoteURLError) -> None:
     raise HTTPException(status_code=400, detail=exc.public_message) from exc
 
 
+_OUTLINES_BACKEND_UNAVAILABLE_DETAIL = (
+    "response_format backend 'outlines' is unavailable"
+)
+
+
+def _is_outlines_backend_selector(value: object) -> bool:
+    """Return whether a backend selector explicitly names Outlines."""
+    return isinstance(value, str) and value.strip().casefold() == "outlines"
+
+
+def _response_format_uses_outlines_backend(response_format: object | None) -> bool:
+    """Inspect only response-format backend selector fields."""
+    if isinstance(response_format, dict):
+        return _is_outlines_backend_selector(
+            response_format.get("type")
+        ) or _is_outlines_backend_selector(response_format.get("backend"))
+
+    return _is_outlines_backend_selector(
+        getattr(response_format, "type", None)
+    ) or _is_outlines_backend_selector(getattr(response_format, "backend", None))
+
+
+def _request_uses_outlines_backend(payload: object) -> bool:
+    """Inspect approved OpenAI/vLLM backend selector paths only.
+
+    The request model intentionally permits vendor extensions.  This detector
+    therefore operates on the raw JSON payload so an explicit selector is not
+    lost to Pydantic's default extra-field handling, without forbidding or
+    recursively searching unrelated request/schema fields.
+    """
+    if not isinstance(payload, dict):
+        return False
+
+    if _is_outlines_backend_selector(payload.get("guided_decoding_backend")):
+        return True
+
+    for namespace in ("guided_decoding", "structured_outputs"):
+        options = payload.get(namespace)
+        if not isinstance(options, dict):
+            continue
+        if _is_outlines_backend_selector(options.get("backend")):
+            return True
+        if _is_outlines_backend_selector(options.get("guided_decoding_backend")):
+            return True
+
+    return _response_format_uses_outlines_backend(payload.get("response_format"))
+
+
+def _raise_if_outlines_backend_requested(payload: object) -> None:
+    """Fail closed for an explicit Outlines request without advertising it."""
+    if _request_uses_outlines_backend(payload):
+        raise HTTPException(
+            status_code=422,
+            detail=_OUTLINES_BACKEND_UNAVAILABLE_DETAIL,
+        )
+
+
+def _raise_if_outlines_response_format_requested(
+    response_format: object | None,
+) -> None:
+    """Fail closed for an internal response-format object or dict."""
+    if _response_format_uses_outlines_backend(response_format):
+        raise HTTPException(
+            status_code=422,
+            detail=_OUTLINES_BACKEND_UNAVAILABLE_DETAIL,
+        )
+
+
+async def _preflight_response_format_backend(raw_request: Request | None) -> None:
+    """Reject unsupported backend selectors before acquiring a model."""
+    if raw_request is None:
+        return
+    _raise_if_outlines_backend_requested(await raw_request.json())
+
+
 def _prepare_json_logits_processor(
     engine: BaseEngine,
     messages: list[dict],
@@ -464,6 +539,7 @@ def _prepare_json_logits_processor(
     thinking_model: bool = False,
 ) -> tuple[list[dict], object | None]:
     """Inject response_format instruction and build constrained decoding processor."""
+    _raise_if_outlines_response_format_requested(response_format)
     json_logits_processor = None
     if not response_format:
         return messages, json_logits_processor
@@ -5381,6 +5457,8 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
     """
     _validate_model_name(request.model)
     effective_max_tokens = _resolve_request_max_tokens(request.max_tokens)
+    _raise_if_outlines_response_format_requested(request.response_format)
+    await _preflight_response_format_backend(raw_request)
     tracker = _metrics.track_inference("chat_completions", stream=request.stream)
     total_timeout, deadline = _start_request_budget(request.timeout)
 
@@ -5610,6 +5688,12 @@ def _get_engine_tokenizer(engine) -> object | None:
 )
 async def create_response(request: ResponsesRequest, raw_request: Request):
     """Create a Responses API response."""
+    if _is_outlines_backend_selector(request.text.format.type):
+        raise HTTPException(
+            status_code=422,
+            detail=_OUTLINES_BACKEND_UNAVAILABLE_DETAIL,
+        )
+    await _preflight_response_format_backend(raw_request)
     try:
         if request.stream:
             chat_request = _responses_request_to_chat_request(request)
