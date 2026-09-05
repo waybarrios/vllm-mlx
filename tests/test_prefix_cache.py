@@ -597,7 +597,9 @@ class TestMLLMCompletionCacheStore:
         generator.prefix_cache = MagicMock()
         generator._think_suffix_len = 0
         request = SimpleNamespace(
-            request_id="saturated", input_ids=mx.array([[1, 2, 3, 4]])
+            request_id="saturated",
+            input_ids=mx.array([[1, 2, 3, 4]]),
+            is_text_only=True,
         )
         batch = SimpleNamespace(
             requests=[request],
@@ -627,7 +629,11 @@ class TestMLLMCompletionCacheStore:
         generator = MLLMBatchGenerator.__new__(MLLMBatchGenerator)
         generator.prefix_cache = MagicMock()
         generator._think_suffix_len = 0
-        request = SimpleNamespace(request_id="flat", input_ids=mx.array([[1, 2, 3, 4]]))
+        request = SimpleNamespace(
+            request_id="flat",
+            input_ids=mx.array([[1, 2, 3, 4]]),
+            is_text_only=True,
+        )
         batch = SimpleNamespace(
             requests=[request],
             num_tokens=[4],
@@ -654,7 +660,11 @@ class TestMLLMCompletionCacheStore:
         generator = MLLMBatchGenerator.__new__(MLLMBatchGenerator)
         generator.prefix_cache = MagicMock()
         generator._think_suffix_len = 0
-        request = SimpleNamespace(request_id="plain", input_ids=mx.array([[1, 2, 3]]))
+        request = SimpleNamespace(
+            request_id="plain",
+            input_ids=mx.array([[1, 2, 3]]),
+            is_text_only=True,
+        )
         batch = SimpleNamespace(
             requests=[request],
             num_tokens=[1],
@@ -667,6 +677,34 @@ class TestMLLMCompletionCacheStore:
         _, stored = generator.prefix_cache.store.call_args.args
         assert estimate_kv_cache_memory(stored) > 0
         assert [child.offset for child in stored[0].caches] == [3, 3]
+
+    def test_multimodal_request_is_never_stored_in_token_only_cache(self):
+        from types import SimpleNamespace
+
+        mx = pytest.importorskip("mlx.core")
+        pytest.importorskip("mlx.nn")
+
+        from vllm_mlx.mllm_batch_generator import MLLMBatchGenerator
+
+        generator = MLLMBatchGenerator.__new__(MLLMBatchGenerator)
+        generator.prefix_cache = MagicMock()
+        generator._think_suffix_len = 0
+        request = SimpleNamespace(
+            request_id="image-b",
+            input_ids=mx.array([[1, 2, 3]]),
+            is_text_only=False,
+        )
+        extract_cache = MagicMock()
+        batch = SimpleNamespace(
+            requests=[request],
+            num_tokens=[1],
+            extract_cache=extract_cache,
+        )
+
+        generator._maybe_store_prefix_cache(batch, [0])
+
+        extract_cache.assert_not_called()
+        generator.prefix_cache.store.assert_not_called()
 
     def test_zero_trim_flat_snapshot_does_not_alias_live_cache(self):
         mx = pytest.importorskip("mlx.core")

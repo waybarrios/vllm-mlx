@@ -853,6 +853,68 @@ if __name__ == "__main__":
 
 
 class TestMLLMBatchGeneratorMTPGuards:
+    def test_process_prompts_never_fetches_media_from_token_only_cache(
+        self, monkeypatch
+    ):
+        from vllm_mlx.mllm_batch_generator import (
+            MLLMBatchGenerator,
+            MLLMBatchRequest,
+            MLLMBatchStats,
+        )
+
+        class FakeCache:
+            def merge(self, caches):
+                return self
+
+        monkeypatch.setattr(mx, "stream", lambda stream: nullcontext())
+        monkeypatch.setattr(
+            "mlx_lm.models.cache.make_prompt_cache",
+            lambda model, **kwargs: [FakeCache()],
+        )
+        monkeypatch.setattr(
+            "mlx_lm.sample_utils.make_sampler",
+            lambda **_: MagicMock(return_value=mx.array([1], dtype=mx.uint32)),
+        )
+        monkeypatch.setattr(
+            "mlx_lm.sample_utils.make_logits_processors", lambda **_: []
+        )
+
+        generator = MLLMBatchGenerator.__new__(MLLMBatchGenerator)
+        generator.max_kv_size = 0
+        generator._stats = MLLMBatchStats()
+        generator._pending_error_responses = []
+        generator._aborted_request_ids = set()
+        generator._prefill_progress = {}
+        generator.prefix_cache = MagicMock()
+        generator._think_suffix_len = 0
+        generator.prefill_step_size = 512
+        generator.language_model = object()
+        generator.model = MagicMock()
+        generator.sampler = MagicMock()
+        generator._preprocess_request = lambda req: None
+        generator._run_chunked_text_prefill = MagicMock(
+            side_effect=AssertionError("media request used text prefill")
+        )
+        vision_prefill = MagicMock(
+            return_value=mx.array([[[0.0, 1.0]]], dtype=mx.float32)
+        )
+        generator._run_vision_encoding = vision_prefill
+
+        request = MLLMBatchRequest(
+            uid=1,
+            request_id="image-b",
+            prompt="same text, different image",
+            images=["image-b.png"],
+        )
+        request.input_ids = mx.array([[10, 20, 30]], dtype=mx.uint32)
+        request.is_text_only = False
+
+        batch = MLLMBatchGenerator._process_prompts(generator, [request])
+
+        generator.prefix_cache.fetch.assert_not_called()
+        vision_prefill.assert_called_once()
+        assert batch.requests == [request]
+
     def test_process_prompts_rejects_unsafe_exact_rotating_hit(self, monkeypatch):
         from mlx_lm.models.cache import CacheList, KVCache, RotatingKVCache
 
@@ -1959,6 +2021,22 @@ class TestBatchedMLLMConfigWiring:
         assert captured["config_kwargs"]["prefix_cache_memory_mb"] == 123
 
 
+@pytest.mark.parametrize("media_field", ["images", "videos", "audio"])
+def test_text_only_selectors_reject_every_media_kind(media_field):
+    from vllm_mlx.mllm_batch_generator import MLLMBatchRequest, _request_has_media
+
+    request = MLLMBatchRequest(uid=1, request_id=media_field, prompt="same text")
+    setattr(request, media_field, [f"{media_field}-input"])
+
+    assert _request_has_media(request) is True
+    assert (
+        _request_has_media(
+            MLLMBatchRequest(uid=2, request_id="text", prompt="text only")
+        )
+        is False
+    )
+
+
 class TestPreprocessIdempotent:
     """_preprocess_request must be idempotent for text-only requests.
 
@@ -2190,6 +2268,33 @@ class TestChunkedPrefillCacheHandling:
             1
         ], f"Expected _copy_prefix_cache called once, got {copy_calls}"
         assert rewind_calls == []
+
+    def test_audio_request_is_not_selected_for_text_only_chunked_prefill(self):
+        from vllm_mlx.mllm_batch_generator import (
+            MLLMBatchRequest,
+            install_chunked_prefill_mllm,
+        )
+
+        gen = self._make_fake_batch_gen()
+        gen.prefix_cache = MagicMock()
+        original_next = MagicMock(return_value=[])
+        gen._next = original_next
+        install_chunked_prefill_mllm(gen, budget=2)
+
+        request = MLLMBatchRequest(
+            uid=3,
+            request_id="audio-request",
+            prompt="transcribe",
+            audio=["audio.wav"],
+        )
+        request.input_ids = mx.array([[1, 2, 3, 4]])
+        request.is_text_only = False
+        gen.unprocessed_requests.append(request)
+
+        gen._next()
+
+        gen.prefix_cache.fetch.assert_not_called()
+        original_next.assert_called_once()
 
     def test_abort_cleans_up_partial_prefill(self):
         """Aborting a request during chunked prefill must clean up _partial."""

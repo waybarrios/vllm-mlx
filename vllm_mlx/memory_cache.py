@@ -40,9 +40,11 @@ _BYTES_PER_MB = 1024 * 1024
 _DEFAULT_MEMORY_PERCENT = 0.20  # 20% of available RAM
 _MIN_MEMORY_BYTES = 100 * _BYTES_PER_MB  # Minimum 100MB
 _MAX_ENTRIES_FALLBACK = 50  # Fallback if memory detection fails
-# Bump this when the cache on-disk format or KV semantics change.
+# Bump this when the cache on-disk format or KV semantics change. Version 5
+# invalidates entries written before MLLM caching became text-only; those files
+# cannot reveal whether their KV state contains vision/audio content.
 # Loading a cache with a different version is rejected automatically.
-_CACHE_PERSIST_VERSION = 4
+_CACHE_PERSIST_VERSION = 5
 
 
 def _get_available_memory() -> int:
