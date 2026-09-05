@@ -269,6 +269,9 @@ class MLLMBatch:
     requests: List[MLLMBatchRequest]  # Full request data
     logits_processors: Optional[List[Optional[List[Callable]]]] = None
     samplers: Optional[List[Optional[Callable]]] = None
+    _row_filter_hook: Optional[Callable[[List[int], List[int]], None]] = field(
+        default=None, repr=False
+    )
 
     def __len__(self) -> int:
         return len(self.uids)
@@ -280,6 +283,7 @@ class MLLMBatch:
         Args:
             keep_idx: Indices of requests to keep
         """
+        previous_uids = list(self.uids)
         self.uids = [self.uids[k] for k in keep_idx]
         self.request_ids = [self.request_ids[k] for k in keep_idx]
         self.logprobs = [self.logprobs[k] for k in keep_idx]
@@ -298,6 +302,14 @@ class MLLMBatch:
         for c in self.cache:
             if hasattr(c, "filter"):
                 c.filter(keep_idx_array)
+
+        if self._row_filter_hook is not None:
+            self._row_filter_hook(previous_uids, list(self.uids))
+
+    def notify_all_rows_removed(self) -> None:
+        """Notify an attached lifecycle owner before this batch is discarded."""
+        if self._row_filter_hook is not None and self.uids:
+            self._row_filter_hook(list(self.uids), [])
 
     def extend(self, other: "MLLMBatch") -> None:
         """
@@ -852,6 +864,7 @@ class MLLMBatchGenerator:
             if keep_idx:
                 self.active_batch.filter(keep_idx)
             else:
+                self.active_batch.notify_all_rows_removed()
                 self.active_batch = None
 
         # Remove from unprocessed
@@ -2084,6 +2097,7 @@ class MLLMBatchGenerator:
             if keep_idx:
                 batch.filter(keep_idx)
             else:
+                batch.notify_all_rows_removed()
                 self.active_batch = None
 
         self._stats.generation_tokens += len(responses)
@@ -2245,9 +2259,46 @@ def install_mtp_mllm(
     _orig_step = batch_gen._step
     _draft_sampler = make_sampler(temp=0.0)
     external_drafter = draft_model is not None
+    reconciliation_marker = (
+        getattr(draft_model, "requires_verified_token_reconciliation", None)
+        if external_drafter
+        else False
+    )
+    if reconciliation_marker is not None and type(reconciliation_marker) is not bool:
+        raise TypeError(
+            "Assistant drafter must declare "
+            "requires_verified_token_reconciliation as a literal boolean"
+        )
+    stateful_external_drafter = reconciliation_marker is True
     if external_drafter:
+        if reconciliation_marker is None:
+            # Released drafters predate the declaration. These hooks identify
+            # state reconciliation, not numerical continuous-batching support.
+            absent = object()
+            hooks = [
+                getattr(draft_model, name, absent)
+                for name in ("accept_verified_tokens_batch", "filter_batch")
+            ]
+            if all(callable(hook) for hook in hooks):
+                stateful_external_drafter = True
+            elif not all(hook is absent for hook in hooks):
+                raise TypeError(
+                    "Assistant drafter must provide both callable lifecycle hooks "
+                    "accept_verified_tokens_batch and filter_batch, or neither"
+                )
         batch_gen._require_uniform_mllm_draft = True
         batch_gen._allow_mid_batch_extend = False
+        if stateful_external_drafter:
+            missing_hooks = [
+                name
+                for name in ("accept_verified_tokens_batch", "filter_batch")
+                if not callable(getattr(draft_model, name, None))
+            ]
+            if missing_hooks:
+                raise TypeError(
+                    "Stateful assistant drafter is missing required continuous-"
+                    f"batching lifecycle hook(s): {', '.join(missing_hooks)}"
+                )
         draft_model.reset(batch_gen.model)
 
     def _model_parts(output: Any) -> Tuple[mx.array, Optional[mx.array]]:
@@ -2277,6 +2328,147 @@ def install_mtp_mllm(
     # Deferred drafts keyed by UID
     _deferred_drafts: Dict[int, dict] = {}
     _attempted_drafts_by_uid: Dict[int, int] = {}
+    _pending_external_sync: Optional[Dict[str, Any]] = None
+    _external_batch_active = False
+    _external_drafter_initialized = False
+
+    def _reset_external_drafter() -> None:
+        nonlocal _pending_external_sync, _external_batch_active
+        nonlocal _external_drafter_initialized
+        _pending_external_sync = None
+        _external_batch_active = False
+        _external_drafter_initialized = False
+        if external_drafter:
+            draft_model.reset(batch_gen.model)
+
+    def _reconcile_external_drafter(
+        verify_hidden: mx.array,
+        draft_tokens: mx.array,
+        accepted: List[int],
+        new_tokens: List[List[int]],
+        token_dtype: mx.Dtype,
+    ) -> None:
+        if not stateful_external_drafter:
+            return
+        draft_model.accept_verified_tokens_batch(
+            verify_hidden,
+            draft_tokens,
+            accepted,
+            new_tokens,
+            _draft_sampler,
+            token_dtype,
+            True,
+        )
+
+    def _sync_external_drafter_before_draft(
+        current_uids: List[int],
+        primary_tokens: mx.array,
+        hidden_states: mx.array,
+    ) -> None:
+        nonlocal _pending_external_sync, _external_drafter_initialized
+        pending = _pending_external_sync
+        if not stateful_external_drafter:
+            return
+        primary = [int(token) for token in primary_tokens.tolist()]
+        if pending is None:
+            if not _external_drafter_initialized:
+                # The serving loop does not retain full-prompt hidden states.
+                # Cold-start the owned drafter cache from the first decoded
+                # target hidden/token pair instead of drafting from an empty,
+                # prompt-independent state.
+                empty_drafts = mx.zeros(
+                    (len(current_uids), 0), dtype=primary_tokens.dtype
+                )
+                _reconcile_external_drafter(
+                    hidden_states,
+                    empty_drafts,
+                    [0] * len(current_uids),
+                    [[token] for token in primary],
+                    primary_tokens.dtype,
+                )
+                _external_drafter_initialized = True
+            return
+        if pending["uids"] != current_uids:
+            raise RuntimeError(
+                "Assistant drafter rows changed before verified state was filtered"
+            )
+
+        if pending["kind"] == "verified_round":
+            new_tokens = [
+                list(committed) + [token]
+                for committed, token in zip(pending["committed"], primary)
+            ]
+            _reconcile_external_drafter(
+                pending["verify_hidden"],
+                pending["draft_tokens"],
+                pending["accepted"],
+                new_tokens,
+                primary_tokens.dtype,
+            )
+        elif pending["kind"] == "advance_after_residual":
+            empty_drafts = mx.zeros((len(current_uids), 0), dtype=primary_tokens.dtype)
+            _reconcile_external_drafter(
+                hidden_states,
+                empty_drafts,
+                [0] * len(current_uids),
+                [[token] for token in primary],
+                primary_tokens.dtype,
+            )
+        else:
+            raise RuntimeError(
+                f"Unknown assistant drafter sync kind: {pending['kind']!r}"
+            )
+        _pending_external_sync = None
+        _external_drafter_initialized = True
+
+    def _filter_external_drafter_rows(
+        previous_uids: List[int], keep_uids: List[int]
+    ) -> None:
+        if not stateful_external_drafter or previous_uids == keep_uids:
+            return
+        removed_uids = set(previous_uids) - set(keep_uids)
+        for uid in removed_uids:
+            _skip_state_by_uid.pop(uid, None)
+            _deferred_drafts.pop(uid, None)
+            _attempted_drafts_by_uid.pop(uid, None)
+        if not keep_uids:
+            _reset_external_drafter()
+            return
+
+        index_by_uid = {uid: idx for idx, uid in enumerate(previous_uids)}
+        try:
+            keep = [index_by_uid[uid] for uid in keep_uids]
+        except KeyError as exc:
+            raise RuntimeError(
+                "Target batch introduced an unknown row while filtering the drafter"
+            ) from exc
+        keep_array = mx.array(keep, dtype=mx.int32)
+        try:
+            draft_model.filter_batch(keep_array)
+
+            pending = _pending_external_sync
+            if pending is None:
+                return
+            if pending["uids"] != previous_uids:
+                raise RuntimeError(
+                    "Pending assistant drafter state does not match target batch rows"
+                )
+            pending["uids"] = list(keep_uids)
+            pending["verify_hidden"] = pending["verify_hidden"][keep_array]
+            pending["draft_tokens"] = pending["draft_tokens"][keep_array]
+            pending["accepted"] = [pending["accepted"][idx] for idx in keep]
+            pending["committed"] = [pending["committed"][idx] for idx in keep]
+        except Exception:
+            _reset_external_drafter()
+            raise
+
+    def _attach_external_lifecycle_hook() -> None:
+        if stateful_external_drafter and batch_gen.active_batch is not None:
+            batch_gen.active_batch._row_filter_hook = _filter_external_drafter_rows
+
+    # Installation can occur with a pre-existing batch in tests or embedded
+    # callers. Bind lifecycle ownership before any public removal can mutate it.
+    _attach_external_lifecycle_hook()
 
     # MTP stats. These are intentionally exposed through get_mtp_stats() so
     # /v1/status can distinguish "weights injected" from useful draft work.
@@ -2288,7 +2480,38 @@ def install_mtp_mllm(
         "concurrent_batch": 0,
         "logits_processors": 0,
         "assistant_not_requested": 0,
+        "hidden_state_unavailable": 0,
     }
+
+    def _sample_primary_logits(
+        logits: mx.array,
+        logits_processors: Optional[List[Optional[List[Callable]]]],
+        output_tokens: Optional[List[List[int]]],
+        samplers: Optional[List[Optional[Callable]]],
+    ) -> Tuple[mx.array, List[mx.array]]:
+        """Sample one target token from logits already backed by the live cache."""
+        if logits_processors and output_tokens and any(logits_processors):
+            processed_logits = []
+            for row in range(logits.shape[0]):
+                sample_logits = logits[row : row + 1]
+                if logits_processors[row]:
+                    for processor in logits_processors[row]:
+                        sample_logits = processor(
+                            mx.array(output_tokens[row]), sample_logits
+                        )
+                processed_logits.append(sample_logits)
+            logits = mx.concatenate(processed_logits, axis=0)
+
+        logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+        if samplers and any(samplers):
+            sampled = []
+            for row in range(logprobs.shape[0]):
+                sampler = samplers[row] if samplers[row] else batch_gen.sampler
+                sampled.append(sampler(logprobs[row : row + 1]))
+            primary_tokens = mx.concatenate(sampled, axis=0)
+        else:
+            primary_tokens = batch_gen.sampler(logprobs)
+        return primary_tokens, list(logprobs)
 
     def _get_mtp_stats() -> Dict[str, Any]:
         with _mtp_stats_lock:
@@ -2326,12 +2549,14 @@ def install_mtp_mllm(
         samplers: Optional[List[Optional[Callable]]] = None,
     ) -> Tuple[mx.array, List[mx.array]]:
         """Extended _step with MTP always-advance strategy."""
+        nonlocal _pending_external_sync, _external_batch_active
         batch_size = input_tokens.shape[0]
         active_requests = (
             list(batch_gen.active_batch.requests)
             if batch_gen.active_batch is not None
             else []
         )
+        _attach_external_lifecycle_hook()
         # Prefill and request-local logits processors remain non-speculative.
         # Sampling and concurrent batches are supported below with per-request
         # distributions and UID-keyed verified state.
@@ -2366,6 +2591,8 @@ def install_mtp_mllm(
                 if assistant_not_requested_bypass:
                     _bypass_counts["assistant_not_requested"] += 1
             _skip_state_by_uid.clear()
+            if stateful_external_drafter and _pending_external_sync is not None:
+                _reset_external_drafter()
             return _orig_step(
                 input_tokens, cache, logits_processors, output_tokens, samplers
             )
@@ -2395,46 +2622,33 @@ def install_mtp_mllm(
             # Normal forward with return_hidden
             model_output = language_model(input_tokens, cache=cache, return_hidden=True)
             logits, hidden_states = _model_parts(model_output)
-            if hidden_states is None:
-                return _orig_step(
-                    input_tokens, cache, logits_processors, output_tokens, samplers
-                )
             logits = logits[:, -1, :]
+            if hidden_states is None:
+                _skip_state_by_uid.clear()
+                if stateful_external_drafter:
+                    _reset_external_drafter()
+                    with _mtp_stats_lock:
+                        _mtp_stats["errors"] += 1
+                    raise RuntimeError(
+                        "Stateful assistant MTP requires target hidden states; "
+                        "aborting after the single target forward instead of "
+                        "replaying against an advanced cache"
+                    )
+                with _mtp_stats_lock:
+                    _bypass_counts["hidden_state_unavailable"] += 1
+                return _sample_primary_logits(
+                    logits, logits_processors, output_tokens, samplers
+                )
 
-        # Apply logits processors before sampling
-        if logits_processors and output_tokens and any(logits_processors):
-            processed_logits = []
-            for e in range(batch_size):
-                sample_logits = logits[e : e + 1]
-                if logits_processors[e]:
-                    for processor in logits_processors[e]:
-                        sample_logits = processor(
-                            mx.array(output_tokens[e]), sample_logits
-                        )
-                processed_logits.append(sample_logits)
-            logits = mx.concatenate(processed_logits, axis=0)
-
-        # Sample primary (use per-request sampler if available)
-        logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
-        if samplers and any(samplers):
-            sampled_list = []
-            for e in range(logprobs.shape[0]):
-                s = samplers[e] if samplers[e] else batch_gen.sampler
-                sampled_list.append(s(logprobs[e : e + 1]))
-            primary_tokens = mx.concatenate(sampled_list, axis=0)
-        else:
-            primary_tokens = batch_gen.sampler(logprobs)
+        primary_tokens, logprobs = _sample_primary_logits(
+            logits, logits_processors, output_tokens, samplers
+        )
 
         # MTP draft + always-advance verify
+        target_verify_started = False
         try:
-            with _mtp_stats_lock:
-                _mtp_stats["attempted"] += 1
-            sampled_rows = [
-                _request_uses_stochastic_sampling(request)
-                for request in active_requests
-            ]
-            uses_stochastic_sampling = any(sampled_rows)
             if external_drafter:
+                _external_batch_active = True
                 from mlx_vlm.speculative.common import _batch_cache_left_padding
                 from mlx_vlm.speculative.mtp import _mtp_draft_position
 
@@ -2451,6 +2665,17 @@ def install_mtp_mllm(
                     kv_valid_len=mx.array(positions),
                     left_padding=_batch_cache_left_padding(cache),
                 )
+            _sync_external_drafter_before_draft(
+                current_uids, primary_tokens, hidden_states
+            )
+            with _mtp_stats_lock:
+                _mtp_stats["attempted"] += 1
+            sampled_rows = [
+                _request_uses_stochastic_sampling(request)
+                for request in active_requests
+            ]
+            uses_stochastic_sampling = any(sampled_rows)
+            if external_drafter:
                 # Sample-and-compare preserves the target distribution here only
                 # because the external draft is a point mass. Changing greedy=True
                 # requires a rejection-sampling verifier that accounts for q(x).
@@ -2507,6 +2732,7 @@ def install_mtp_mllm(
             verify_input = mx.concatenate(
                 [primary_tokens[:, None], draft_tokens[:, None]], axis=1
             )
+            target_verify_started = True
             verify_output = language_model(
                 verify_input, cache=cache, return_hidden=True
             )
@@ -2595,6 +2821,15 @@ def install_mtp_mllm(
                 if external_drafter:
                     draft_model.accept_lens.append(1)
                     draft_model.draft_lens.append(1)
+                if stateful_external_drafter:
+                    _pending_external_sync = {
+                        "kind": "verified_round",
+                        "uids": list(current_uids),
+                        "verify_hidden": verify_hidden,
+                        "draft_tokens": draft_tokens[:, None],
+                        "accepted": [1] * batch_size,
+                        "committed": [[int(token)] for token in draft_list],
+                    }
 
             else:
                 # A batch cache cannot roll back an individual row. On a mixed
@@ -2605,6 +2840,35 @@ def install_mtp_mllm(
                 sampled_reject = uses_stochastic_sampling and bool(
                     residual_tokens_by_uid
                 )
+                if stateful_external_drafter:
+                    if sampled_reject:
+                        residual_rows = [
+                            [int(residual_tokens_by_uid[uid])] for uid in current_uids
+                        ]
+                        _reconcile_external_drafter(
+                            verify_hidden,
+                            draft_tokens[:, None],
+                            [0] * batch_size,
+                            residual_rows,
+                            primary_tokens.dtype,
+                        )
+                        _pending_external_sync = {
+                            "kind": "advance_after_residual",
+                            "uids": list(current_uids),
+                            "verify_hidden": verify_hidden,
+                            "draft_tokens": draft_tokens[:, None],
+                            "accepted": [0] * batch_size,
+                            "committed": residual_rows,
+                        }
+                    else:
+                        _pending_external_sync = {
+                            "kind": "verified_round",
+                            "uids": list(current_uids),
+                            "verify_hidden": verify_hidden,
+                            "draft_tokens": draft_tokens[:, None],
+                            "accepted": [0] * batch_size,
+                            "committed": [[] for _ in current_uids],
+                        }
                 replay_tokens = primary_tokens
                 if sampled_reject:
                     residual_tokens = mx.array(
@@ -2709,8 +2973,16 @@ def install_mtp_mllm(
         except Exception as e:
             logger.warning(f"[MTP-MLLM] draft/verify failed: {e}")
             _skip_state_by_uid.clear()
+            if stateful_external_drafter:
+                _reset_external_drafter()
             with _mtp_stats_lock:
                 _mtp_stats["errors"] += 1
+            if target_verify_started:
+                raise RuntimeError(
+                    "MTP verification failed after the target cache may have "
+                    "advanced; aborting the batch instead of continuing with "
+                    "unverified cache state"
+                ) from e
 
         # Log MTP stats every 50 steps
         with _mtp_stats_lock:
@@ -2732,10 +3004,19 @@ def install_mtp_mllm(
 
     def _mtp_next() -> List[MLLMBatchResponse]:
         """Wrapper around _next that emits deferred MTP draft tokens."""
+        nonlocal _pending_external_sync
+        _attach_external_lifecycle_hook()
+        prior_active_uids = (
+            list(batch_gen.active_batch.uids)
+            if batch_gen.active_batch is not None
+            else []
+        )
         if batch_gen.active_batch is None:
             _skip_state_by_uid.clear()
             _deferred_drafts.clear()
             _attempted_drafts_by_uid.clear()
+            if _external_batch_active:
+                _reset_external_drafter()
 
         # `_inner_next` may extend a text-only request into an active batch
         # before the next `_mtp_step` call. That's fine: `_mtp_step` itself
@@ -2753,6 +3034,9 @@ def install_mtp_mllm(
                     prev_deferred[uid] = _deferred_drafts.pop(uid)
 
         responses = batch_gen._inner_next()
+        # Prompt or chunked-prefill work may have created a new active batch.
+        # Bind its lifecycle before control returns to public remove/abort paths.
+        _attach_external_lifecycle_hook()
 
         if responses:
             _mark_mtp_attempts_on_primary_responses(responses, _attempted_drafts_by_uid)
@@ -2836,13 +3120,31 @@ def install_mtp_mllm(
                 if keep:
                     batch_gen.active_batch.filter(keep)
                 else:
+                    batch_gen.active_batch.notify_all_rows_removed()
                     batch_gen.active_batch = None
+                    _pending_external_sync = None
 
         active_uids = (
             set(batch_gen.active_batch.uids)
             if batch_gen.active_batch is not None
             else set()
         )
+        # Stateful drafters are synchronized by MLLMBatch._row_filter_hook.
+        # Preserve the legacy positional lifecycle only for stateless external
+        # drafters, which intentionally do not install that hook.
+        if external_drafter and not stateful_external_drafter and prior_active_uids:
+            keep = [
+                index
+                for index, uid in enumerate(prior_active_uids)
+                if uid in active_uids
+            ]
+            if len(keep) != len(prior_active_uids):
+                if keep:
+                    filter_batch = getattr(draft_model, "filter_batch", None)
+                    if callable(filter_batch):
+                        filter_batch(keep)
+                else:
+                    _reset_external_drafter()
         for uid in list(_skip_state_by_uid):
             if uid not in active_uids:
                 _skip_state_by_uid.pop(uid, None)
@@ -2981,6 +3283,7 @@ def install_chunked_prefill_mllm(
             if keep_idx:
                 batch.filter(keep_idx)
             else:
+                batch.notify_all_rows_removed()
                 batch_gen.active_batch = None
 
         batch_gen._stats.generation_tokens += len(responses)
