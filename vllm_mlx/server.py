@@ -1654,6 +1654,14 @@ async def _release_default_engine(*, count_activity: bool = True) -> None:
     _sync_engine_from_residency()
 
 
+# Set by the serve entry points. When true, the process exits at the end of
+# lifespan shutdown instead of returning into asyncio's loop teardown, which
+# joins threads that have touched MLX and crashes in its thread-local compile
+# cache destructor. Left false for library/embedded use, where exiting the
+# host process would be indefensible.
+_exit_process_after_shutdown: bool = False
+
+
 async def lifespan(app: FastAPI):
     """FastAPI lifespan for startup/shutdown events."""
     global _engine, _mcp_manager, _model_manager, _lifecycle_task, _lifespan_active
@@ -1773,6 +1781,22 @@ async def lifespan(app: FastAPI):
     finally:
         _get_idle_unload_event().set()
         _lifespan_active = False
+        # Only a shutdown that raised nothing may skip finalization. If either
+        # the request-serving phase or the cleanup phase failed, fall through
+        # and let the exception propagate: the caller has to see it, and the
+        # process has to exit non-zero. Exiting here on a cleanup failure would
+        # report a failed shutdown as a success and make the raise below
+        # unreachable — reintroducing, in the fix, exactly the silent-failure
+        # class this change set exists to remove. The predicate lives in
+        # vllm_mlx.shutdown, which imports no engine code, so standard CI
+        # exercises it on every platform.
+        from .shutdown import exit_without_finalizing, should_exit_without_finalizing
+
+        if should_exit_without_finalizing(
+            primary_exc, cleanup_exc, _exit_process_after_shutdown
+        ):
+            logger.info("Shutdown complete")
+            exit_without_finalizing()
 
     if primary_exc is not None:
         if cleanup_exc is not None:
@@ -7240,6 +7264,9 @@ def main():
     # Start server with TCP keepalive for fast dead-client detection.
     # Without this, abrupt client disconnects (power-off, network loss) take
     # 2+ hours to detect via default TCP keepalive, wasting GPU cycles.
+    # Same guard the CLI serve path uses; see the module flag above.
+    global _exit_process_after_shutdown
+    _exit_process_after_shutdown = True
     uvicorn.run(
         app,
         host=args.host,

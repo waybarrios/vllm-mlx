@@ -87,6 +87,7 @@ jobs:
             tests/test_chat_template_safety.py \
             tests/test_simple_engine_thread_pinning.py \
             tests/test_engine_base.py \
+            tests/test_shutdown_decision.py \
             tests/test_harmony_parsers.py \
             tests/test_endpoint_model_policies.py \
             tests/test_truncation.py \
@@ -201,6 +202,8 @@ jobs:
             tests/test_harmony_render.py \
             tests/test_embeddings.py \
             tests/test_rerank.py \
+            tests/test_shutdown_decision.py \
+            tests/test_shutdown_exit.py \
             -v --tb=short \
             -m "not slow" \
             -k "not Integration"
