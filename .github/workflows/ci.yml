@@ -120,6 +120,33 @@ jobs:
           file: ./coverage.xml
           fail_ci_if_error: false
 
+      - name: Run MLX-stubbed scheduler tests
+        # Deliberately its own step (fresh process), not merged into "Run
+        # unit tests (no MLX required)" above: this file installs a
+        # MagicMock-backed mlx/mlx_lm stub (tests/_mlx_stub.py) so its
+        # mlx.core-importing dependencies load without the real package.
+        # Several files in the step above (e.g. test_memory_cache.py,
+        # test_prefix_cache.py) have their own real `except ImportError`
+        # mlx-optional handling that a stub in the same sys.modules/process
+        # would silently break (isinstance() against a MagicMock raises
+        # TypeError instead of behaving like "mlx absent") -- see
+        # tests/_mlx_stub.py's docstring.
+        #
+        # test_metrics.py is NOT included here: it needs the full
+        # vllm_mlx.server import chain (uvicorn, prometheus-client), neither
+        # of which this job installs, and mlx-stubbing them the same way
+        # broke fixture setup with ModuleNotFoundError. That file stays
+        # Apple-Silicon-only; the one contract it covers that also needed
+        # Linux coverage (get_stats()["steps_executed"] reaching the
+        # vllm_mlx_engine_steps_executed gauge) has a dependency-light
+        # equivalent below, in TestMetricsEngineStepsExecutedGauge, which
+        # calls MetricsCollector directly and needs neither of those.
+        # Refs #746 / PR #749 review.
+        run: |
+          pytest \
+            tests/test_mllm_steps_executed_stat.py \
+            -v --tb=short
+
   test-python-3-14:
     # Focused job for the CPython 3.14+ asyncio.shield() behavior change
     # that shield_task() (vllm_mlx/engine/base.py) works around -- the
@@ -180,6 +207,8 @@ jobs:
             tests/test_batched_engine_mllm_config.py \
             tests/test_mllm_continuous_batching.py \
             tests/test_mllm_cache.py \
+            tests/test_mllm_steps_executed_stat.py \
+            tests/test_metrics.py \
             tests/test_optimizations.py \
             tests/test_simple_engine.py \
             tests/test_simple_engine_prefix_trie_cache.py \
