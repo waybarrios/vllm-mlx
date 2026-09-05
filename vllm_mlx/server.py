@@ -7302,7 +7302,8 @@ Examples:
         "--mllm-draft-model",
         type=str,
         default=None,
-        help="Path to an mlx-vlm MLLM draft/assistant model.",
+        help="Local path or Hugging Face repo ID for an mlx-vlm MLLM "
+        "draft/assistant model.",
     )
     parser.add_argument(
         "--mllm-draft-kind",

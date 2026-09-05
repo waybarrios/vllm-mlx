@@ -458,6 +458,128 @@ def load_gemma4_assistant_drafter(model_path: str):
     return model
 
 
+class MTPDrafterLoadError(RuntimeError):
+    """Raised when a registered MTP drafter architecture is unavailable."""
+
+
+_GEMMA4_ASSISTANT_MODEL_TYPES = {
+    "gemma4_assistant",
+    "gemma4_unified_assistant",
+}
+
+
+def _read_mtp_drafter_model_type(config_path: Path) -> str:
+    try:
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Invalid MTP drafter config JSON: {config_path}") from exc
+    if not isinstance(config, dict):
+        raise ValueError(f"MTP drafter config must be a JSON object: {config_path}")
+
+    candidates = [config.get("model_type"), config.get("speculators_model_type")]
+    text_config = config.get("text_config")
+    if isinstance(text_config, dict):
+        candidates.append(text_config.get("model_type"))
+
+    model_types = [
+        value.strip().casefold()
+        for value in candidates
+        if isinstance(value, str) and value.strip()
+    ]
+    drafter_types = {
+        model_type
+        for model_type in model_types
+        if model_type.endswith("_mtp") or model_type in _GEMMA4_ASSISTANT_MODEL_TYPES
+    }
+    if len(drafter_types) > 1:
+        raise ValueError(
+            f"MTP drafter config has conflicting model types: {config_path}"
+        )
+    if drafter_types:
+        return drafter_types.pop()
+    if model_types:
+        return model_types[0]
+    raise ValueError(f"MTP drafter config has no valid model_type: {config_path}")
+
+
+def _resolve_mtp_drafter_path(path_or_repo: str) -> Path:
+    path = Path(path_or_repo)
+    if path.exists():
+        return path
+    try:
+        from mlx_vlm.utils import get_model_path
+    except ImportError as exc:
+        raise MTPDrafterLoadError(
+            "Resolving an MTP drafter repository requires mlx-vlm"
+        ) from exc
+    return Path(get_model_path(path_or_repo))
+
+
+def load_mtp_drafter(model_path: str, target_model=None):
+    """Load a local or Hugging Face MTP drafter without assuming Gemma layout."""
+    resolved_path = _resolve_mtp_drafter_path(model_path)
+    config_path = resolved_path / "config.json"
+    if not config_path.exists():
+        raise FileNotFoundError(f"MTP drafter config not found: {config_path}")
+    model_type = _read_mtp_drafter_model_type(config_path)
+    if model_type in _GEMMA4_ASSISTANT_MODEL_TYPES:
+        model = load_gemma4_assistant_drafter(str(resolved_path))
+        if target_model is not None:
+            try:
+                from mlx_vlm.speculative.drafters import (
+                    validate_drafter_compatibility,
+                )
+            except ImportError:
+                # Preserve compatibility with mlx-vlm releases that predate
+                # the shared validator; this is the existing Gemma loader.
+                pass
+            else:
+                validate_drafter_compatibility(target_model, model, "mtp")
+        return model
+
+    try:
+        from mlx_vlm.speculative.drafters import load_drafter
+    except ImportError as exc:
+        raise MTPDrafterLoadError(
+            "This MTP drafter requires an mlx-vlm build with the registered "
+            f"{model_type!r} architecture."
+        ) from exc
+
+    logger.info(
+        "Loading registered MTP drafter model_type=%s from %s",
+        model_type,
+        resolved_path,
+    )
+    try:
+        loaded = load_drafter(str(resolved_path), kind="mtp", lazy=False)
+    except ImportError as exc:
+        raise MTPDrafterLoadError(
+            "This MTP drafter requires an mlx-vlm build with the registered "
+            f"{model_type!r} architecture."
+        ) from exc
+    if not isinstance(loaded, tuple) or len(loaded) != 2:
+        raise ValueError("mlx-vlm load_drafter() must return (model, resolved_kind)")
+    model, resolved_kind = loaded
+    if model is None:
+        raise ValueError("mlx-vlm load_drafter() returned no model")
+    if resolved_kind != "mtp":
+        raise ValueError(
+            f"Configured MTP drafter resolved to unsupported kind {resolved_kind!r}"
+        )
+    if target_model is not None:
+        try:
+            from mlx_vlm.speculative.drafters import (
+                validate_drafter_compatibility,
+            )
+        except ImportError as exc:
+            raise MTPDrafterLoadError(
+                "This MTP drafter requires an mlx-vlm build with the registered "
+                f"{model_type!r} architecture."
+            ) from exc
+        validate_drafter_compatibility(target_model, model, resolved_kind)
+    return model
+
+
 _DRAFT_KWARG_NAMES = ("draft_model", "draft_kind", "draft_block_size")
 
 
@@ -1403,7 +1525,7 @@ class MLXMultimodalLM:
 
     def _load_draft_model(self):
         if self.draft_kind == "mtp":
-            return load_gemma4_assistant_drafter(self.draft_model_path)
+            return load_mtp_drafter(self.draft_model_path, target_model=self.model)
 
         from mlx_vlm.utils import load
 
