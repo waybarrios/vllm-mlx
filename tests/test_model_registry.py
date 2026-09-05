@@ -340,6 +340,65 @@ def test_preempt_policy_cancels_active_request_and_loads_waiting_model(tmp_path)
     asyncio.run(_run())
 
 
+def test_get_metrics_engine_returns_none_when_idle(tmp_path):
+    registry = _registry(tmp_path, {"alpha": 4})
+    manager = ModelManager(
+        _manager_config(budget_gb=8),
+        registry,
+        _defaults(),
+        engine_factory=lambda config: FakeEngine(config),
+    )
+
+    assert manager.get_metrics_engine() is None
+
+
+def test_get_metrics_engine_returns_sole_loaded_engine(tmp_path):
+    async def _run():
+        registry = _registry(tmp_path, {"alpha": 4})
+        manager = ModelManager(
+            _manager_config(budget_gb=8),
+            registry,
+            _defaults(),
+            engine_factory=lambda config: FakeEngine(config),
+        )
+
+        lease = await manager.acquire("alpha")
+
+        assert manager.get_metrics_engine() is manager._loaded["alpha"].engine
+
+        await lease.release()
+
+    asyncio.run(_run())
+
+
+def test_get_metrics_engine_returns_most_recently_used_when_multiple_loaded(tmp_path):
+    async def _run():
+        registry = _registry(tmp_path, {"alpha": 4, "beta": 4})
+        manager = ModelManager(
+            _manager_config(budget_gb=9),
+            registry,
+            _defaults(),
+            engine_factory=lambda config: FakeEngine(config),
+        )
+
+        lease_a = await manager.acquire("alpha")
+        await lease_a.release()
+        await asyncio.sleep(0.01)  # ensure last_used_at ordering is unambiguous
+        lease_b = await manager.acquire("beta")
+        await lease_b.release()
+
+        assert manager.get_metrics_engine() is manager._loaded["beta"].engine
+
+        # Touching alpha again makes it the most recently used.
+        await asyncio.sleep(0.01)
+        lease_a = await manager.acquire("alpha")
+        await lease_a.release()
+
+        assert manager.get_metrics_engine() is manager._loaded["alpha"].engine
+
+    asyncio.run(_run())
+
+
 def test_non_local_registry_entry_requires_explicit_memory_estimate():
     async def _run():
         registry = {

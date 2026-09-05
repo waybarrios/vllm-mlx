@@ -782,6 +782,21 @@ class ModelManager:
             )
         return data
 
+    def get_metrics_engine(self) -> BaseEngine | None:
+        """Return the engine to source Prometheus gauges from, or None if idle.
+
+        The gauges this feeds (``/metrics``) are unlabeled scalars with no
+        ``model=`` dimension, so they can only ever describe one engine at a
+        time. With a single resident model that engine is the obvious and
+        exact choice. With more than one resident, there is no way to report
+        all of them without a schema change, so this reports the most
+        recently used one as a representative sample rather than reporting
+        nothing.
+        """
+        if not self._loaded:
+            return None
+        return max(self._loaded.values(), key=lambda loaded: loaded.last_used_at).engine
+
     async def preload(self) -> None:
         """Preload any entries marked preload=true."""
         for entry in self._registry.values():

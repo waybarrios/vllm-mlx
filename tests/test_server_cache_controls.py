@@ -82,3 +82,93 @@ def test_clear_cache_clears_engine_managed_runtime_caches(monkeypatch):
             sys.modules["mlx_vlm.utils"] = original_module
         else:
             sys.modules.pop("mlx_vlm.utils", None)
+
+
+def test_clear_prefix_cache_routes_through_model_manager_in_registry_mode(monkeypatch):
+    """Regression: in registry mode (--models-config) the module-global
+    _engine is never populated (_sync_engine_from_residency only syncs from
+    _residency_manager, which is None in registry mode), so the endpoint
+    must resolve the live engine via _model_manager.get_metrics_engine() --
+    the same pattern /metrics already uses -- instead of silently returning
+    {"status": "no_engine"} while _engine stays None.
+    """
+    import vllm_mlx.server as server
+
+    calls = {"cleared": 0}
+
+    class DummyEngine:
+        def clear_prefix_cache(self):
+            calls["cleared"] += 1
+
+    class FakeModelManager:
+        def __init__(self, engine):
+            self._engine = engine
+
+        def get_metrics_engine(self):
+            return self._engine
+
+    original_engine = server._engine
+    original_model_manager = server._model_manager
+    original_api_key = server._api_key
+    try:
+        server._engine = None  # registry mode: global engine stays unset
+        server._model_manager = FakeModelManager(DummyEngine())
+        server._api_key = None
+        client = TestClient(server.app)
+
+        response = client.delete("/v1/cache/prefix")
+
+        assert response.status_code == 200
+        assert response.json()["status"] == "cleared"
+        assert calls["cleared"] == 1
+    finally:
+        server._engine = original_engine
+        server._model_manager = original_model_manager
+        server._api_key = original_api_key
+
+
+def test_clear_cache_routes_through_model_manager_in_registry_mode(monkeypatch):
+    """Same registry-mode fix as clear_prefix_cache, for DELETE /v1/cache."""
+    import vllm_mlx.server as server
+
+    calls = {"cleared": 0}
+    fake_utils = types.ModuleType("mlx_vlm.utils")
+    fake_utils.clear_multimodal_kv_cache = lambda: None
+    fake_utils.clear_pixel_values_cache = lambda: None
+
+    class DummyEngine:
+        def clear_runtime_caches(self):
+            calls["cleared"] += 1
+            return {"prefix_cache": True}
+
+    class FakeModelManager:
+        def __init__(self, engine):
+            self._engine = engine
+
+        def get_metrics_engine(self):
+            return self._engine
+
+    original_engine = server._engine
+    original_model_manager = server._model_manager
+    original_api_key = server._api_key
+    original_module = sys.modules.get("mlx_vlm.utils")
+    try:
+        server._engine = None  # registry mode: global engine stays unset
+        server._model_manager = FakeModelManager(DummyEngine())
+        server._api_key = None
+        sys.modules["mlx_vlm.utils"] = fake_utils
+        client = TestClient(server.app)
+
+        response = client.delete("/v1/cache")
+
+        assert response.status_code == 200
+        assert response.json()["engine_cache"] == {"prefix_cache": True}
+        assert calls["cleared"] == 1
+    finally:
+        server._engine = original_engine
+        server._model_manager = original_model_manager
+        server._api_key = original_api_key
+        if original_module is not None:
+            sys.modules["mlx_vlm.utils"] = original_module
+        else:
+            sys.modules.pop("mlx_vlm.utils", None)

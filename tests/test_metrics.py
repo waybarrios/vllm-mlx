@@ -153,6 +153,70 @@ class TestMetricsEndpoint:
 
         assert response.status_code == 404
 
+    def test_metrics_endpoint_reports_dead_gauges_without_engine_or_manager(
+        self, metrics_client
+    ):
+        client, server, collector = metrics_client
+
+        collector.configure(enabled=True)
+        assert server._engine is None
+        assert server._model_manager is None
+
+        response = client.get("/metrics")
+
+        assert response.status_code == 200
+        assert "vllm_mlx_model_loaded 0.0" in response.text
+        assert "vllm_mlx_scheduler_waiting_requests 0.0" in response.text
+
+    def test_metrics_endpoint_scrapes_registry_mode_engine(
+        self, metrics_client, monkeypatch
+    ):
+        client, server, collector = metrics_client
+
+        collector.configure(enabled=True)
+
+        class FakeModelManager:
+            def __init__(self, engine):
+                self._engine = engine
+
+            def get_metrics_engine(self):
+                return self._engine
+
+            async def shutdown(self):
+                return None
+
+        monkeypatch.setattr(server, "_model_manager", FakeModelManager(FakeEngine()))
+
+        response = client.get("/metrics")
+
+        assert response.status_code == 200
+        assert "vllm_mlx_model_loaded 1.0" in response.text
+        assert "vllm_mlx_scheduler_waiting_requests 2.0" in response.text
+        assert (
+            'vllm_mlx_cache_type{cache_type="memory_aware_cache"} 1.0' in response.text
+        )
+
+    def test_metrics_endpoint_registry_mode_dead_gauges_when_idle(
+        self, metrics_client, monkeypatch
+    ):
+        client, server, collector = metrics_client
+
+        collector.configure(enabled=True)
+
+        class FakeModelManager:
+            def get_metrics_engine(self):
+                return None
+
+            async def shutdown(self):
+                return None
+
+        monkeypatch.setattr(server, "_model_manager", FakeModelManager())
+
+        response = client.get("/metrics")
+
+        assert response.status_code == 200
+        assert "vllm_mlx_model_loaded 0.0" in response.text
+
     def test_metrics_endpoint_scrapes_runtime_stats(self, metrics_client, monkeypatch):
         client, server, collector = metrics_client
 
