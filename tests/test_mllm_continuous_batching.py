@@ -852,6 +852,99 @@ if __name__ == "__main__":
     pytest.main([__file__, "-v"])
 
 
+class TestMLLMPrefixCacheMediaIsolation:
+    def test_process_prompts_does_not_fetch_prefix_cache_for_media(self, monkeypatch):
+        from vllm_mlx.mllm_batch_generator import (
+            MLLMBatchGenerator,
+            MLLMBatchRequest,
+            MLLMBatchStats,
+        )
+
+        class FakeCache:
+            def merge(self, caches):
+                return self
+
+        prefix_cache = SimpleNamespace(fetch=MagicMock())
+        monkeypatch.setattr(mx, "stream", lambda stream: nullcontext())
+        monkeypatch.setattr(
+            "mlx_lm.models.cache.make_prompt_cache", lambda *_, **__: [FakeCache()]
+        )
+        monkeypatch.setattr(
+            "mlx_lm.sample_utils.make_sampler",
+            lambda **_: MagicMock(return_value=mx.array([1], dtype=mx.uint32)),
+        )
+        monkeypatch.setattr(
+            "mlx_lm.sample_utils.make_logits_processors", lambda **_: []
+        )
+
+        generator = MLLMBatchGenerator.__new__(MLLMBatchGenerator)
+        generator.max_kv_size = 0
+        generator._stats = MLLMBatchStats()
+        generator._pending_error_responses = []
+        generator._aborted_request_ids = set()
+        generator._prefill_progress = {}
+        generator.prefix_cache = prefix_cache
+        generator._think_suffix_len = 0
+        generator.prefill_step_size = 512
+        generator.language_model = object()
+        generator.model = MagicMock()
+        generator.sampler = MagicMock()
+        generator._preprocess_request = lambda req: None
+        vision_prefill = MagicMock(
+            return_value=mx.array([[[0.0, 1.0]]], dtype=mx.float32)
+        )
+        generator._run_vision_encoding = vision_prefill
+
+        request = MLLMBatchRequest(
+            uid=1,
+            request_id="media-prefix",
+            prompt="describe",
+            images=["image-a.png"],
+        )
+        request.input_ids = mx.array([[10, 20, 30]])
+        request.is_text_only = False
+
+        MLLMBatchGenerator._process_prompts(generator, [request])
+
+        prefix_cache.fetch.assert_not_called()
+        vision_prefill.assert_called_once()
+
+    def test_maybe_store_prefix_cache_skips_media(self):
+        from vllm_mlx.mllm_batch_generator import (
+            MLLMBatchGenerator,
+            MLLMBatchRequest,
+        )
+
+        media_request = MLLMBatchRequest(
+            uid=1,
+            request_id="media",
+            prompt="describe",
+            images=["image-a.png"],
+        )
+        media_request.input_ids = mx.array([[1, 2, 3]])
+        media_request.is_text_only = False
+
+        text_request = MLLMBatchRequest(uid=2, request_id="text", prompt="hello")
+        text_request.input_ids = mx.array([[1, 2, 3]])
+        text_request.is_text_only = True
+
+        batch = SimpleNamespace(
+            requests=[media_request, text_request],
+            num_tokens=[1, 1],
+            extract_cache=MagicMock(return_value=[object()]),
+        )
+        generator = MLLMBatchGenerator.__new__(MLLMBatchGenerator)
+        generator.prefix_cache = object()
+        generator._think_suffix_len = 0
+        generator._store_prefix_snapshot = MagicMock(return_value=True)
+
+        generator._maybe_store_prefix_cache(batch, [0, 1])
+
+        batch.extract_cache.assert_called_once_with(1)
+        generator._store_prefix_snapshot.assert_called_once()
+        assert generator._store_prefix_snapshot.call_args.args[3] == "text"
+
+
 class TestMLLMBatchGeneratorMTPGuards:
     def test_process_prompts_rejects_unsafe_exact_rotating_hit(self, monkeypatch):
         from mlx_lm.models.cache import CacheList, KVCache, RotatingKVCache
@@ -2052,6 +2145,32 @@ class TestChunkedPrefillCacheHandling:
             cache.update_and_fetch(k, v)
             mx.eval(cache.keys, cache.values)
         return cache
+
+    def test_chunked_prefill_skips_audio_request(self):
+        from vllm_mlx.mllm_batch_generator import (
+            MLLMBatchRequest,
+            install_chunked_prefill_mllm,
+        )
+
+        gen = self._make_fake_batch_gen()
+        gen.prefix_cache = SimpleNamespace(fetch=MagicMock())
+        gen.language_model = MagicMock()
+        original_next = MagicMock(return_value=[])
+        gen._next = original_next
+        install_chunked_prefill_mllm(gen, budget=1024)
+
+        request = MLLMBatchRequest(
+            uid=1,
+            request_id="audio-prefix",
+            prompt="transcribe",
+            audio=["sample.wav"],
+        )
+        gen.unprocessed_requests.append(request)
+
+        gen._next()
+
+        gen.prefix_cache.fetch.assert_not_called()
+        original_next.assert_called_once()
 
     def test_exact_hit_uses_safe_rewind(self):
         """An exact hit must use the type-preserving safe rewind path."""

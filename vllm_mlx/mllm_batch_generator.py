@@ -218,7 +218,7 @@ class MLLMBatchRequest:
     image_grid_thw: Optional[mx.array] = None
     extra_kwargs: Dict[str, Any] = field(default_factory=dict)
 
-    # Text-only flag (no images/videos — eligible for prefix cache)
+    # Text-only flag (no image, video, or audio — eligible for prefix cache)
     is_text_only: bool = False
 
     # Generation state
@@ -1490,15 +1490,16 @@ class MLLMBatchGenerator:
                     self._aborted_request_ids.discard(req.request_id)
                     raise PrefillAbortedError(req.request_id)
 
-                # Try prefix cache for all requests (text-only and multimodal).
-                # VLM forward writes the same KV state as language model forward
-                # for text tokens, so cached KV from a previous VLM run is valid.
-                # However, if the remaining (uncached) tokens contain image
-                # placeholders, we must fall back to VLM forward instead of
-                # running them through the language model alone.
+                # Token-only cache keys cannot distinguish media content. A
+                # multimodal hit could therefore reuse KV state from a different
+                # image, video, or audio input with the same text prompt.
                 cached_kv = None
                 remaining_ids = None
-                if self.prefix_cache is not None and req.input_ids is not None:
+                if (
+                    self.prefix_cache is not None
+                    and req.is_text_only
+                    and req.input_ids is not None
+                ):
                     input_ids_list = req.input_ids.reshape(-1).tolist()
                     # Strip think suffix from lookup key so stored entries
                     # (also stripped) match as clean PREFIX.
@@ -1928,7 +1929,11 @@ class MLLMBatchGenerator:
             self, "_allow_mid_batch_extend", True
         ):
             text_only = self._compatible_pending_requests(
-                [r for r in self.unprocessed_requests if not r.images and not r.videos],
+                [
+                    r
+                    for r in self.unprocessed_requests
+                    if not r.images and not r.videos and not r.audio
+                ],
                 self.completion_batch_size,
             )
 
@@ -2144,7 +2149,7 @@ class MLLMBatchGenerator:
             return
         for i in end_indices:
             req = batch.requests[i]
-            if req.input_ids is not None:
+            if req.is_text_only and req.input_ids is not None:
                 try:
                     extracted = batch.extract_cache(i)
                     input_ids_list = req.input_ids.reshape(-1).tolist()
@@ -3049,7 +3054,7 @@ def install_chunked_prefill_mllm(
                         else req
                     )
                     for r in batch_gen.unprocessed_requests:
-                        if r.images or r.videos:
+                        if r.images or r.videos or r.audio:
                             continue
                         if not batch_gen._compatible_pending_requests(
                             [r], 1, reference=reference
@@ -3189,7 +3194,11 @@ def install_chunked_prefill_mllm(
                     batch_gen.active_batch = new_batch
 
                 # Store in prefix cache (prompt-only)
-                if batch_gen.prefix_cache is not None and req.input_ids is not None:
+                if (
+                    batch_gen.prefix_cache is not None
+                    and req.is_text_only
+                    and req.input_ids is not None
+                ):
                     try:
                         input_ids_list = req.input_ids.reshape(-1).tolist()
                         S = batch_gen._think_suffix_len
@@ -3234,7 +3243,7 @@ def install_chunked_prefill_mllm(
                 len(batch_gen.unprocessed_requests),
             )
             for r in compatible_pending:
-                if not r.images and not r.videos:
+                if not r.images and not r.videos and not r.audio:
                     text_only_req = r
                     break
 
@@ -3269,7 +3278,7 @@ def install_chunked_prefill_mllm(
                 cached_count = 0
                 total_tokens = input_ids.shape[1]
 
-                if batch_gen.prefix_cache is not None:
+                if batch_gen.prefix_cache is not None and text_only_req.is_text_only:
                     input_ids_list = input_ids.reshape(-1).tolist()
                     S = batch_gen._think_suffix_len
                     lookup_ids = input_ids_list[:-S] if S > 0 else input_ids_list
