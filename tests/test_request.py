@@ -467,9 +467,20 @@ class TestRequestOutput:
         assert usage["completion_tokens"] == 20
         assert usage["total_tokens"] == 30
 
+    def test_usage_reports_request_owned_cached_tokens(self):
+        output = RequestOutput(
+            request_id="test-1",
+            prompt_tokens=10,
+            completion_tokens=20,
+            cached_tokens=4,
+        )
+
+        assert output.usage["prompt_tokens_details"] == {"cached_tokens": 4}
+
     def test_usage_defaults(self):
         output = RequestOutput(request_id="test-1")
         usage = output.usage
         assert usage["prompt_tokens"] == 0
         assert usage["completion_tokens"] == 0
         assert usage["total_tokens"] == 0
+        assert "prompt_tokens_details" not in usage

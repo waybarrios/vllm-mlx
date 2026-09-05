@@ -252,12 +252,27 @@ class ChatCompletionChoice(BaseModel):
     finish_reason: str | None = "stop"
 
 
+class PromptTokensDetails(BaseModel):
+    """Optional request-owned prompt cache usage."""
+
+    cached_tokens: int
+
+
 class Usage(BaseModel):
     """Token usage statistics."""
 
     prompt_tokens: int = 0
     completion_tokens: int = 0
     total_tokens: int = 0
+    prompt_tokens_details: PromptTokensDetails | None = None
+
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler) -> dict:
+        """Omit cache details when request-level accounting is unavailable."""
+        data = handler(self)
+        if self.prompt_tokens_details is None:
+            data.pop("prompt_tokens_details", None)
+        return data
 
 
 class GenerationMetadata(BaseModel):
