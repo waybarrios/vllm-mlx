@@ -105,6 +105,23 @@ FRAME_FACTOR = 2  # Frames must be divisible by this
 DEFAULT_FPS = 2.0  # Default frames per second for video
 MIN_FRAMES = 4
 MAX_FRAMES = 128  # Practical limit for most MLLMs
+MIN_FRAME_DIMENSION = 16  # Below this a "decoded" frame is not a real frame
+
+# Container suffix to use when spilling a base64 video to a temp file. The
+# subtype of the MIME type is not the container name ("video/quicktime" is a
+# .mov, "video/x-matroska" is a .mkv), and while ffmpeg content-sniffs, several
+# decoders infer the container from the filename extension instead.
+VIDEO_MIME_TO_SUFFIX = {
+    "video/quicktime": ".mov",
+    "video/mp4": ".mp4",
+    "video/webm": ".webm",
+    "video/ogg": ".ogg",
+    "video/x-matroska": ".mkv",
+    "video/x-msvideo": ".avi",
+    "video/mpeg": ".mpeg",
+    "video/x-m4v": ".m4v",
+    "video/3gpp": ".3gp",
+}
 IMAGE_FACTOR = 28  # For smart resize
 
 # Security: File size limits (in bytes)
@@ -863,9 +880,16 @@ def decode_base64_video(
     if base64_string.startswith("data:video/"):
         # Format: data:video/mp4;base64,AAAA...
         header, data = base64_string.split(",", 1)
-        # Extract extension from header (e.g., "data:video/mp4;base64" -> "mp4")
-        format_part = header.split(";")[0]  # "data:video/mp4"
-        ext = "." + format_part.split("/")[-1]  # ".mp4"
+        # Extract the MIME type from the header
+        # (e.g. "data:video/quicktime;base64" -> "video/quicktime")
+        mime_type = header.split(";")[0][len("data:") :].strip().lower()
+        ext = VIDEO_MIME_TO_SUFFIX.get(mime_type, "")
+        if not ext:
+            # Unknown MIME: the subtype is usually the container name, but
+            # never trust it blindly - "video/x-matroska" would yield
+            # ".x-matroska". Fall back to .mp4 for anything unrecognised.
+            subtype = mime_type.split("/")[-1]
+            ext = f".{subtype}" if subtype.isalnum() else ".mp4"
     else:
         # Assume mp4 if no header
         data = base64_string
@@ -1197,6 +1221,72 @@ def smart_nframes(
     return int(nframes)
 
 
+def _log_native_video_fallback(exc: Exception) -> None:
+    """Report a native-video pipeline failure before falling back to frames.
+
+    The frames-as-images path is a working substitute, not an equivalent one:
+    it sends stills through the image encoder instead of the model's temporal
+    3D conv, so the token cost per frame, the effective resolution and the
+    model's ability to track motion all differ. Results measured on one path
+    are not comparable with the other, which is why this is a warning and not
+    a debug line.
+    """
+    logger.warning(
+        f"Native video pipeline unavailable ({exc}); falling back to "
+        "frames-as-images. The two paths are NOT token-equivalent - do not "
+        "compare results across them."
+    )
+
+
+def assert_video_decoded(
+    frames: "list[np.ndarray] | np.ndarray",
+    video_path: str,
+    *,
+    height_axis: int = 0,
+    width_axis: int = 1,
+) -> tuple[int, int, int]:
+    """Validate a decoded frame sequence before it is handed to a model.
+
+    Every video failure mode seen so far (unreadable container, unseekable
+    input, a codec the build cannot decode) produced an empty or degenerate
+    frame list and then a perfectly plausible HTTP 200 answer of the form
+    "I don't see any video" — which reads as a model failure and is not one.
+    Assert on the frames, not on the absence of an exception.
+
+    Args:
+        frames: Decoded frames, either a list of HWC arrays or a stacked
+            array whose per-frame axes are given by height_axis/width_axis.
+        video_path: Source path, for the error message.
+        height_axis: Index of the height axis within a single frame.
+        width_axis: Index of the width axis within a single frame.
+
+    Returns:
+        Tuple of (frame_count, width, height).
+    """
+    count = len(frames)
+    if count == 0:
+        raise ValueError(
+            f"Decoded 0 frames from {video_path}. The container or codec could "
+            "not be read - this is a decode failure, not a model failure."
+        )
+
+    first = frames[0]
+    shape = getattr(first, "shape", ())
+    if len(shape) <= max(height_axis, width_axis):
+        raise ValueError(
+            f"Decoded frames from {video_path} have unexpected shape {shape}"
+        )
+
+    height, width = int(shape[height_axis]), int(shape[width_axis])
+    if height < MIN_FRAME_DIMENSION or width < MIN_FRAME_DIMENSION:
+        raise ValueError(
+            f"Implausible frame size {width}x{height} decoded from {video_path}"
+        )
+
+    logger.info(f"Video decode OK: {count} frames, {width}x{height}, from {video_path}")
+    return count, width, height
+
+
 def extract_video_frames_smart(
     video_path: str,
     fps: float = DEFAULT_FPS,
@@ -1260,6 +1350,15 @@ def extract_video_frames_smart(
         frames.append(frame)
 
     cap.release()
+
+    # Seeking by frame index can silently return nothing on long-GOP codecs,
+    # so report what was actually decoded rather than what was requested.
+    if len(frames) < nframes:
+        logger.warning(
+            f"Requested {nframes} frames from {video_path} but decoded "
+            f"{len(frames)}: seeking skipped {nframes - len(frames)} frame(s)"
+        )
+    assert_video_decoded(frames, video_path)
 
     return frames
 
@@ -1612,116 +1711,144 @@ class MLXMultimodalLM:
         video_fps: float = DEFAULT_FPS,
         video_max_frames: int = MAX_FRAMES,
         tools: list | None = None,
+        enable_thinking: bool = True,
+        chat_template_kwargs: dict | None = None,
     ) -> tuple[str, dict]:
-        """Preprocess messages into prompt + generation kwargs for native video.
+        """Preprocess messages into prompt + media kwargs for native video.
 
-        Mirrors the preprocessing in mlx_vlm.video_generate.main() so that
-        upstream improvements are easy to adopt. Returns the formatted prompt
-        text and a dict of kwargs ready to pass to video_generate.generate().
+        Returns the formatted prompt text and a dict of media kwargs ready to
+        pass to mlx_vlm.generate.generate() (decoded video frame arrays, plus
+        any image/audio paths).
+
+        mlx-vlm 0.6.x removed the `mlx_vlm.video_generate` module and
+        `process_vision_info` along with it; the equivalent entry points are
+        `mlx_vlm.utils.load_video` for decoding and `generate(video=...)`,
+        which routes the arrays through the processor's own video path
+        (temporal 3D conv + M-RoPE). Frames are decoded here rather than
+        inside prepare_inputs so that video_max_frames is honored - upstream's
+        default cap is 768 frames - and so a failed decode raises instead of
+        yielding an empty frame list that reaches the model as "no video".
 
         Currently Qwen-family-specific (video_token_id / video_token_index).
         """
-        import mlx.core as mx
-
         try:
-            from mlx_vlm.video_generate import process_vision_info
-        except ImportError:
+            from mlx_vlm.utils import load_video
+        except ImportError as exc:  # pragma: no cover - depends on mlx-vlm
             raise ImportError(
-                "mlx_vlm.video_generate is required for native video support. "
-                "Upgrade with: pip install --upgrade mlx-vlm"
-            )
+                "mlx_vlm.utils.load_video is required for native video "
+                "support. Upgrade with: pip install --upgrade mlx-vlm"
+            ) from exc
 
-        # Translate OpenAI API messages into process_vision_info format
+        # Translate OpenAI API messages into mlx-vlm's media format, resolving
+        # every URL / base64 payload to a local path.
         native_messages = self._translate_messages_for_native_video(
             messages, video_fps, video_max_frames
         )
 
-        # Use HF processor's chat template (handles timestamp interleaving)
-        template_kwargs: dict = {}
+        # Use HF processor's chat template (handles timestamp interleaving).
+        # enable_thinking and any other chat_template_kwargs have to reach this
+        # template too. The frames-as-images path forwards them, so a video
+        # request that dropped them would keep reasoning for thousands of
+        # tokens after the operator had turned thinking off server-wide with
+        # --default-chat-template-kwargs '{"enable_thinking": false}' - and the
+        # flag would appear to work, because text and image requests honor it.
+        template_kwargs: dict = dict(chat_template_kwargs or {})
         if tools:
             template_kwargs["tools"] = tools
+        template_kwargs.setdefault("enable_thinking", enable_thinking)
 
-        text = self.processor.apply_chat_template(
-            native_messages,
-            tokenize=False,
-            add_generation_prompt=True,
-            **template_kwargs,
-        )
+        try:
+            text = self.processor.apply_chat_template(
+                native_messages,
+                tokenize=False,
+                add_generation_prompt=True,
+                **template_kwargs,
+            )
+        except TypeError:
+            # This template doesn't accept some forwarded chat_template_kwargs
+            # - drop the optional ones and retry, mirroring the frames path.
+            for key in chat_template_kwargs or {}:
+                template_kwargs.pop(key, None)
+            text = self.processor.apply_chat_template(
+                native_messages,
+                tokenize=False,
+                add_generation_prompt=True,
+                **template_kwargs,
+            )
 
-        # Extract vision inputs via mlx-vlm's process_vision_info
-        image_inputs, video_inputs, fps_info = process_vision_info(
-            native_messages, return_video_kwargs=True
-        )
-
-        # Collect audio paths emitted by the translation step
-        # (explicit audio_url, or auto-extracted from video_url for omni
-        # models).
+        # Collect the media paths emitted by the translation step: images,
+        # videos, and audio (explicit audio_url, or auto-extracted from
+        # video_url for omni models).
+        image_paths: list[str] = []
+        video_paths: list[str] = []
         audio_inputs: list[str] = []
         for nmsg in native_messages:
             ncontent = nmsg.get("content", [])
             if not isinstance(ncontent, list):
                 continue
             for nitem in ncontent:
-                if isinstance(nitem, dict) and nitem.get("type") == "audio":
-                    apath = nitem.get("audio")
-                    if apath:
-                        audio_inputs.append(apath)
+                if not isinstance(nitem, dict):
+                    continue
+                ntype = nitem.get("type")
+                if ntype == "image" and nitem.get("image"):
+                    image_paths.append(nitem["image"])
+                elif ntype == "video" and nitem.get("video"):
+                    video_paths.append(nitem["video"])
+                elif ntype == "audio" and nitem.get("audio"):
+                    audio_inputs.append(nitem["audio"])
 
-        # Process through HF processor to get input_ids, pixel_values, grid_thw
-        # and (for omni models) sound_clips / input_features.
-        processor_kwargs: dict = {
-            "text": [text],
-            "images": image_inputs,
-            "videos": video_inputs,
-            "padding": True,
-            "return_tensors": "pt",
-        }
-        if audio_inputs:
-            processor_kwargs["audio"] = audio_inputs
-        inputs = self.processor(**processor_kwargs)
-
-        input_ids = mx.array(inputs["input_ids"])
-        pixel_values = inputs.get(
-            "pixel_values_videos", inputs.get("pixel_values", None)
-        )
-        if pixel_values is not None:
-            pixel_values = mx.array(pixel_values)
-        mask = mx.array(inputs["attention_mask"])
-
-        gen_kwargs: dict = {}
-        if inputs.get("video_grid_thw", None) is not None:
-            gen_kwargs["video_grid_thw"] = mx.array(inputs["video_grid_thw"])
-        if inputs.get("image_grid_thw", None) is not None:
-            gen_kwargs["image_grid_thw"] = mx.array(inputs["image_grid_thw"])
-
-        # Forward audio embeddings/clips from the processor so the omni
-        # model's sound encoder gets fed alongside the visual stream.
-        for audio_key in (
-            "sound_clips",
-            "input_features",
-            "feature_attention_mask",
-            "audio_feature_lengths",
-            "sound_feature_lengths",
-            "sound_attention_mask",
-        ):
-            val = inputs.get(audio_key, None)
-            if val is not None:
-                gen_kwargs[audio_key] = val
-        if audio_inputs:
-            logger.info(
-                f"Native video: forwarding audio ({len(audio_inputs)} clip(s)) "
-                f"to omni model via "
-                f"{[k for k in gen_kwargs if k in ('sound_clips', 'input_features')]}"
+        # Fail closed on multi-video requests: mlx_vlm.generate takes one
+        # scalar fps and fans it out to every clip, so a second video's frames
+        # would be timestamped with the first video's sampled rate - silently
+        # wrong timestamps rather than an error. Until per-video timestamp
+        # handling exists (calling the processor directly instead of going
+        # through mlx_vlm.generate), reject the request with the reason.
+        if len(video_paths) > 1:
+            raise ValueError(
+                f"Native video supports one video per request; got "
+                f"{len(video_paths)}. Multiple clips would share the first "
+                "clip's sampled fps for timestamp tokens, mislabeling every "
+                "frame of the others. Send one video per request, or "
+                "concatenate the clips first."
             )
 
-        gen_kwargs["input_ids"] = input_ids
-        gen_kwargs["pixel_values"] = pixel_values
-        gen_kwargs["mask"] = mask
+        # Decode each video to (T, C, H, W) frames and validate the result
+        # before it can reach the model.
+        videos: list[np.ndarray] = []
+        sample_fps: float | None = None
+        for path in video_paths:
+            frames, decoded_fps = load_video(
+                path,
+                fps=video_fps,
+                max_frames=video_max_frames,
+                min_frames=MIN_FRAMES,
+                frame_factor=FRAME_FACTOR,
+            )
+            # load_video stacks to (T, C, H, W), so H/W are axes 1 and 2 of
+            # a single frame.
+            assert_video_decoded(frames, path, height_axis=1, width_axis=2)
+            videos.append(frames)
+            if sample_fps is None:
+                sample_fps = decoded_fps
 
-        grid_thw_info = gen_kwargs.get("video_grid_thw")
+        gen_kwargs: dict = {"video": videos}
+        if image_paths:
+            gen_kwargs["image"] = image_paths
+        if audio_inputs:
+            gen_kwargs["audio"] = audio_inputs
+            logger.info(
+                f"Native video: forwarding audio ({len(audio_inputs)} clip(s)) "
+                "to omni model alongside the video stream"
+            )
+        if sample_fps:
+            # The processor needs the fps of the SAMPLED sequence (used for
+            # timestamp tokens), not the source video's fps.
+            gen_kwargs["fps"] = sample_fps
+
         logger.info(
-            f"Native video: {input_ids.size} input tokens, "
-            f"video_grid_thw={grid_thw_info.tolist() if grid_thw_info is not None else None}"
+            f"Native video: {len(videos)} video(s), "
+            f"{sum(len(v) for v in videos)} frames total, "
+            f"sampled at {sample_fps if sample_fps else video_fps:.2f} fps"
         )
 
         return text, gen_kwargs
@@ -1734,24 +1861,31 @@ class MLXMultimodalLM:
         video_fps: float = DEFAULT_FPS,
         video_max_frames: int = MAX_FRAMES,
         tools: list | None = None,
+        enable_thinking: bool = True,
+        chat_template_kwargs: dict | None = None,
         **kwargs,
     ) -> MLLMOutput:
         """Generate using native video pipeline (Qwen-family models).
 
         Delegates preprocessing to _prepare_native_video_inputs and generation
-        to mlx_vlm.video_generate.generate(), keeping our code aligned with
+        to mlx_vlm.generate.generate(), keeping our code aligned with
         upstream's video pipeline so improvements are easy to adopt.
         """
         try:
-            from mlx_vlm.video_generate import generate
-        except ImportError:
+            from mlx_vlm.generate import generate
+        except ImportError as exc:  # pragma: no cover - depends on mlx-vlm
             raise ImportError(
-                "mlx_vlm.video_generate is required for native video support. "
-                "Upgrade with: pip install --upgrade mlx-vlm"
-            )
+                "mlx_vlm.generate.generate is required for native video "
+                "support. Upgrade with: pip install --upgrade mlx-vlm"
+            ) from exc
 
         text, gen_kwargs = self._prepare_native_video_inputs(
-            messages, video_fps, video_max_frames, tools
+            messages,
+            video_fps,
+            video_max_frames,
+            tools,
+            enable_thinking=enable_thinking,
+            chat_template_kwargs=chat_template_kwargs,
         )
         gen_kwargs["temperature"] = temperature
 
@@ -2229,15 +2363,20 @@ class MLXMultimodalLM:
 
         # Use native video pipeline for supported models
         if self._video_native and _msg_video_inputs:
-            return self._generate_native_video(
-                messages=messages,
-                max_tokens=max_tokens,
-                temperature=temperature,
-                video_fps=video_fps,
-                video_max_frames=video_max_frames,
-                tools=tools,
-                **kwargs,
-            )
+            try:
+                return self._generate_native_video(
+                    messages=messages,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    video_fps=video_fps,
+                    video_max_frames=video_max_frames,
+                    tools=tools,
+                    enable_thinking=enable_thinking,
+                    chat_template_kwargs=chat_template_kwargs,
+                    **kwargs,
+                )
+            except ImportError as exc:
+                _log_native_video_fallback(exc)
 
         # Fallback: extract frames and treat as individual images
         _msg_video_frame_counts: dict[int, int] = {}
@@ -2633,22 +2772,30 @@ class MLXMultimodalLM:
 
         # Use native video pipeline for supported models.
         # NOTE: Native video yields a single chunk (not incremental streaming)
-        # because mlx_vlm.video_generate has no streaming API. The event loop
-        # is NOT blocked at the server level — SimpleEngine wraps this in
-        # asyncio.to_thread(). True token-level streaming requires upstream
-        # mlx-vlm support for video stream_generate.
+        # because we call mlx_vlm.generate.generate(). The event loop is NOT
+        # blocked at the server level — SimpleEngine wraps this in
+        # asyncio.to_thread(). Token-level streaming would mean switching to
+        # mlx_vlm.generate.stream_generate() and threading its chunks through
+        # the native-video branch in SimpleEngine.
         if self._video_native and _msg_video_inputs:
-            output = self._generate_native_video(
-                messages=messages,
-                max_tokens=max_tokens,
-                temperature=temperature,
-                video_fps=video_fps,
-                video_max_frames=video_max_frames,
-                tools=tools,
-                **kwargs,
-            )
-            yield output
-            return
+            output = None
+            try:
+                output = self._generate_native_video(
+                    messages=messages,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    video_fps=video_fps,
+                    video_max_frames=video_max_frames,
+                    tools=tools,
+                    enable_thinking=enable_thinking,
+                    chat_template_kwargs=chat_template_kwargs,
+                    **kwargs,
+                )
+            except ImportError as exc:
+                _log_native_video_fallback(exc)
+            if output is not None:
+                yield output
+                return
 
         # Fallback: frames as images
         _msg_video_frame_counts: dict[int, int] = {}

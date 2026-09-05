@@ -79,6 +79,7 @@ jobs:
             tests/test_mllm_cache.py \
             tests/test_api_models.py \
             tests/test_api_utils.py \
+            tests/test_video_pipeline.py \
             tests/test_request.py \
             tests/test_anthropic_models.py \
             tests/test_anthropic_adapter.py \

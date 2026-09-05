@@ -120,15 +120,21 @@ class MultimodalProcessor:
         """
         from mlx_vlm.utils import prepare_inputs
 
-        # Process raw images
+        # Process raw images.
+        #
+        # Media failures are raised, not logged: a dropped attachment leaves a
+        # request that still generates a fluent, confident answer about nothing
+        # ("I don't see any image"), which reads as a model failure and sends
+        # everyone debugging the wrong layer. A 4xx/5xx naming the real cause
+        # is worth far more than a plausible HTTP 200.
         all_images = []
         if images:
             for img in images:
                 try:
                     path = process_image_input(img)
-                    all_images.append(path)
                 except Exception as e:
-                    logger.warning(f"Failed to process image: {e}")
+                    raise ValueError(f"Failed to process image input: {e}") from e
+                all_images.append(path)
 
         # Extract frames from videos
         if videos:
@@ -141,10 +147,10 @@ class MultimodalProcessor:
                         max_frames=video_max_frames,
                     )
                     frame_paths = save_frames_to_temp(frames)
-                    all_images.extend(frame_paths)
-                    logger.debug(f"Extracted {len(frame_paths)} frames from video")
                 except Exception as e:
-                    logger.warning(f"Failed to process video: {e}")
+                    raise ValueError(f"Failed to process video input: {e}") from e
+                all_images.extend(frame_paths)
+                logger.info(f"Extracted {len(frame_paths)} frames from video")
 
         # Determine add_special_tokens based on model type
         if self.config and self.config.model_type in ["gemma3", "gemma3n"]:

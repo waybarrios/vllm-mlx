@@ -405,6 +405,22 @@ _VLM_ARCHITECTURE_KEYWORDS = (
 _MAX_CONFIG_JSON_BYTES = 1 * 1024 * 1024
 
 
+def _read_config_json_file(config_path: Path) -> dict | None:
+    """Parse a config.json file, bounded by _MAX_CONFIG_JSON_BYTES."""
+    if not config_path.is_file():
+        return None
+
+    try:
+        if config_path.stat().st_size > _MAX_CONFIG_JSON_BYTES:
+            return None
+        with config_path.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError, ValueError):
+        return None
+
+    return data if isinstance(data, dict) else None
+
+
 def _try_read_config_json(name_or_path: str) -> dict | None:
     """Read config.json from a local model directory.
 
@@ -419,19 +435,37 @@ def _try_read_config_json(name_or_path: str) -> dict | None:
     if not candidate.is_dir():
         return None
 
-    config_path = candidate / "config.json"
-    if not config_path.is_file():
+    return _read_config_json_file(candidate / "config.json")
+
+
+def _try_read_hub_config_json(repo_id: str) -> dict | None:
+    """Read config.json for a HuggingFace repo ID from the local hub cache.
+
+    A repo ID never resolves as a local directory, so without this the
+    authoritative config.json is skipped and detection falls back to matching
+    substrings against the repo name. That silently misclassifies multimodal
+    models whose name carries no VLM marker (e.g. Qwen3.8-27B-4bit, whose
+    config declares vision_config, image_token_id and video_token_id): the
+    model loads text-only and every image/video content part is dropped from
+    the request with no error. The weights are already in the hub cache by the
+    time a model is served, so the config is readable without a network call.
+
+    Returns None when the repo is not cached or the file cannot be parsed.
+    """
+    if not isinstance(repo_id, str) or repo_id.count("/") != 1:
         return None
 
     try:
-        if config_path.stat().st_size > _MAX_CONFIG_JSON_BYTES:
-            return None
-        with config_path.open("r", encoding="utf-8") as f:
-            data = json.load(f)
-    except (OSError, json.JSONDecodeError, UnicodeDecodeError, ValueError):
+        from huggingface_hub import try_to_load_from_cache
+
+        cached = try_to_load_from_cache(repo_id, "config.json")
+    except Exception:  # missing hub package, unreadable cache, malformed id
         return None
 
-    return data if isinstance(data, dict) else None
+    if not isinstance(cached, str):  # _CACHED_NO_EXIST sentinel or None
+        return None
+
+    return _read_config_json_file(Path(cached))
 
 
 def _config_indicates_vlm(config: dict) -> bool:
@@ -472,10 +506,11 @@ def is_mllm_model(model_name: str) -> bool:
     Two complementary validations are run:
 
     1. config.json inspection: when ``model_name`` resolves to a local
-       directory containing a readable config.json, inspect the model's
-       own metadata (``architectures`` field, ``vision_config``,
-       ``audio_config``, etc.). Authoritative when available because it
-       reflects what the model actually is, not how it is named on disk.
+       directory, or to a HuggingFace repo ID already present in the local
+       hub cache, inspect the model's own metadata (``architectures`` field,
+       ``vision_config``, ``audio_config``, etc.). Authoritative when
+       available because it reflects what the model actually is, not how it
+       is named on disk.
 
     2. Legacy substring match against ``MLLM_PATTERNS``: applied when no
        config.json is reachable (e.g., a HuggingFace repo ID before the
@@ -488,6 +523,8 @@ def is_mllm_model(model_name: str) -> bool:
         True if the model is detected as multimodal (MLLM/VLM).
     """
     config = _try_read_config_json(model_name)
+    if config is None:
+        config = _try_read_hub_config_json(model_name)
     if config is not None:
         return _config_indicates_vlm(config)
     return _check_legacy_string_patterns(model_name)
