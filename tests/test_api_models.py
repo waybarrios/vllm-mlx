@@ -159,6 +159,35 @@ class TestMessage:
         msg = Message(role="assistant", content=None)
         assert msg.content is None
 
+    @pytest.mark.parametrize("field", ["reasoning_content", "reasoning"])
+    def test_assistant_reasoning_survives_request_validation(self, field):
+        request = ChatCompletionRequest(
+            model="test-model",
+            messages=[
+                {"role": "user", "content": "Question"},
+                {"role": "assistant", "content": "Answer", field: "Exact thought\n"},
+                {"role": "user", "content": "Continue"},
+            ],
+        )
+        history = request.messages[1].model_dump(exclude_none=True)
+        assert history == {
+            "role": "assistant",
+            "content": "Answer",
+            "reasoning_content": "Exact thought\n",
+        }
+
+    def test_returned_assistant_message_can_be_replayed(self):
+        returned = AssistantMessage(content="Answer", reasoning_content="Thought")
+        replayed = Message.model_validate(returned.model_dump())
+        assert replayed.model_dump(exclude_none=True) == returned.model_dump()
+
+    def test_absent_reasoning_does_not_add_template_history(self):
+        msg = Message(role="assistant", content="Answer")
+        assert msg.model_dump(exclude_none=True) == {
+            "role": "assistant",
+            "content": "Answer",
+        }
+
 
 class TestToolCalling:
     """Tests for tool calling models."""
