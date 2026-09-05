@@ -191,6 +191,7 @@ jobs:
             tests/test_mllm_ssd_spill.py \
             tests/test_ssd_cache.py \
             tests/test_ssd_shutdown_wiring.py \
+            tests/test_batch_reshuffle_metadata.py \
             tests/test_lifecycle_cli.py \
             tests/test_lifecycle_server.py \
             tests/test_normalize_messages.py \
