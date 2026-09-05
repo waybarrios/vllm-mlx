@@ -175,6 +175,7 @@ jobs:
             tests/test_prefix_cache_untrimmable.py \
             tests/test_scheduler_max_kv_size.py \
             tests/test_qwen35_mtp_patch.py \
+            tests/test_llm_mtp_per_request_counters.py \
             tests/test_batched_engine_mllm_config.py \
             tests/test_mllm_continuous_batching.py \
             tests/test_mllm_cache.py \
