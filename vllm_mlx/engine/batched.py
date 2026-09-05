@@ -31,6 +31,10 @@ from .base import (
     run_blocking_startup_work,
 )
 from .chat_template_safety import normalize_messages_for_chat_template
+from .drafter_capabilities import (
+    continuous_batching_capability,
+    explicit_bool,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1177,13 +1181,20 @@ class BatchedEngine(BaseEngine):
                 mtp_stats = stats.setdefault("mtp", {})
                 mtp_stats.setdefault("enabled", True)
                 mtp_stats.setdefault("implementation", "external_assistant")
+                if "continuous_batching_supported" in mtp_stats:
+                    batch_capability = explicit_bool(
+                        mtp_stats["continuous_batching_supported"]
+                    )
+                else:
+                    loaded_drafter = getattr(self._mllm_instance, "_draft_model", None)
+                    batch_capability = continuous_batching_capability(loaded_drafter)
                 mtp_stats.update(
                     {
                         "draft_model": self._mllm_draft_model,
                         "draft_kind": self._mllm_draft_kind,
                         "draft_block_size": self._mllm_draft_block_size,
                         "default_enabled": self._default_mllm_draft,
-                        "continuous_batching_supported": True,
+                        "continuous_batching_supported": batch_capability,
                     }
                 )
             # MLLM engine is always "running" once loaded

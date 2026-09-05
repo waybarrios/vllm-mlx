@@ -543,6 +543,7 @@ Response fields:
 | `metal.peak_memory_gb` | Peak Metal GPU memory usage (GB) |
 | `metal.cache_memory_gb` | Metal cache memory usage (GB) |
 | `cache` | Cache statistics (type, entries, hit rate, memory usage) |
+| `mtp.continuous_batching_supported` | Drafter-declared batching capability: `true` (supported), `false` (unsupported), or `null` (undeclared or invalid/unknown). This reporting field does not block startup. |
 | `requests` | List of active requests with per-request details |
 
 Per-request fields in `requests`:

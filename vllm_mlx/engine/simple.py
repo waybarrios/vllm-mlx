@@ -46,6 +46,7 @@ from .chat_template_safety import (
     build_system_prompt_cache_prefix,
     normalize_messages_for_chat_template,
 )
+from .drafter_capabilities import continuous_batching_capability
 from ..mlx_streams import (
     bind_generation_streams,
     restore_generation_streams,
@@ -3427,6 +3428,7 @@ class SimpleEngine(BaseEngine):
             }
 
         if self._mllm_draft_model_path is not None:
+            loaded_drafter = getattr(self._model, "_draft_model", None)
             stats["mtp"] = {
                 "enabled": True,
                 "implementation": "mlx_vlm_assistant",
@@ -3434,7 +3436,9 @@ class SimpleEngine(BaseEngine):
                 "draft_kind": self._mllm_draft_kind,
                 "draft_block_size": self._mllm_draft_block_size,
                 "default_enabled": self._default_mllm_draft,
-                "continuous_batching_supported": True,
+                "continuous_batching_supported": continuous_batching_capability(
+                    loaded_drafter
+                ),
             }
 
         # System KV cache stats (LRU over multiple system prefixes)

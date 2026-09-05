@@ -171,6 +171,7 @@ jobs:
             tests/test_platform.py \
             tests/test_llm.py \
             tests/test_mllm.py \
+            tests/test_mllm_assistant_drafter.py \
             tests/test_server.py \
             tests/test_metrics.py \
             tests/test_paged_cache.py \
