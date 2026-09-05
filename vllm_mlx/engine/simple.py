@@ -305,11 +305,9 @@ class SimpleEngine(BaseEngine):
             "evictions": 0,
         }
         # True only when the model's prompt cache can be snapshotted and
-        # restored for the manual system-prefix cache branch. Plain KV caches
-        # and hybrid ``ArraysCache`` entries are safe when their state
-        # containers are copied at snapshot/restore boundaries. Sliding-window
-        # cache classes such as ``RotatingKVCache`` remain disabled because
-        # their extra cursor metadata is not captured by ``.state`` alone.
+        # restored for the manual system-prefix cache branch. Plain KV caches,
+        # hybrid ``ArraysCache`` entries, and ``RotatingKVCache`` are safe when
+        # their state and metadata are captured/restored at boundaries.
         self._supports_system_kv_cache: bool = False
 
         # Every MLX generation call runs on this one thread; see
@@ -461,7 +459,11 @@ class SimpleEngine(BaseEngine):
 
     @staticmethod
     def _clone_cache_state(value: Any) -> Any:
-        """Copy cache state containers without duplicating immutable MLX arrays."""
+        """Copy cache state containers without duplicating immutable MLX arrays.
+
+        Also handles meta_state containers (e.g. RotatingKVCache metadata) so
+        that sliding-window caches can be snapshotted and restored safely.
+        """
         if isinstance(value, tuple):
             return tuple(SimpleEngine._clone_cache_state(v) for v in value)
         if isinstance(value, list):
@@ -469,9 +471,17 @@ class SimpleEngine(BaseEngine):
         return value
 
     @classmethod
+    def _cache_entry_snapshot(cls, cache_entry: Any) -> Any:
+        """Capture both value state and cursor metadata for a cache entry."""
+        state = cls._clone_cache_state(cache_entry.state)
+        if hasattr(cache_entry, "meta_state"):
+            return (state, cache_entry.meta_state)
+        return state
+
+    @classmethod
     def _snapshot_prompt_cache(cls, prompt_cache: list[Any]) -> list[Any]:
         """Capture cache states without aliasing mutable state containers."""
-        return [cls._clone_cache_state(c.state) for c in prompt_cache]
+        return [cls._cache_entry_snapshot(c) for c in prompt_cache]
 
     @classmethod
     def _restore_prompt_cache(
@@ -479,7 +489,13 @@ class SimpleEngine(BaseEngine):
     ) -> None:
         """Restore cache states without letting decode mutate the saved snapshot."""
         for i, saved_state in enumerate(snapshot):
-            prompt_cache[i].state = cls._clone_cache_state(saved_state)
+            cache_entry = prompt_cache[i]
+            if isinstance(saved_state, tuple) and len(saved_state) == 2:
+                value_state, meta_state = saved_state
+                cache_entry.state = cls._clone_cache_state(value_state)
+                cache_entry.meta_state = meta_state
+            else:
+                cache_entry.state = cls._clone_cache_state(saved_state)
 
     @staticmethod
     def _iter_cache_state_arrays(value: Any):
@@ -498,12 +514,12 @@ class SimpleEngine(BaseEngine):
     @staticmethod
     def _cache_class_is_system_snapshot_safe(cache_entry: Any) -> bool:
         try:
-            from mlx_lm.models.cache import ArraysCache, KVCache
+            from mlx_lm.models.cache import ArraysCache, KVCache, RotatingKVCache
 
-            return isinstance(cache_entry, (KVCache, ArraysCache))
+            return isinstance(cache_entry, (KVCache, ArraysCache, RotatingKVCache))
         except Exception:
             cache_type = type(cache_entry).__name__
-            return cache_type in {"KVCache", "ArraysCache"}
+            return cache_type in {"KVCache", "ArraysCache", "RotatingKVCache"}
 
     @classmethod
     def _probe_system_kv_cache_support(cls, model: Any, route: str) -> bool:
