@@ -2356,3 +2356,206 @@ def test_scheduler_step_error_fails_every_request_once():
     assert "_fail_requests_after_step_error(e)" in inspect.getsource(
         MLLMScheduler._process_loop
     )
+
+
+class TestPromptBoundaryKeying:
+    """Prefix-cache keys and lookups must cut at the last complete message,
+    independent of the per-request thinking mode, at all four call sites.
+
+    ``_think_suffix_len`` is measured once at startup with
+    ``enable_thinking=True`` (``<think>\\n`` = 2 tokens). A request rendered
+    with ``enable_thinking=False`` carries ``<think>\\n\\n</think>\\n\\n``
+    (4 tokens), so a fixed strip leaves two generation-prompt tokens on the
+    key and the entry is never a strict prefix of the next turn.
+    """
+
+    IM_START, IM_END, ASSISTANT = 6, 7, 8
+    THINK, NL, NLNL, END_THINK = 9, 10, 11, 12
+    BODY = [1, 2, 3, IM_END, 4, 5, IM_END]  # two complete messages
+    SUFFIX_ON = [IM_START, ASSISTANT, THINK, NL]  # enable_thinking=True
+    SUFFIX_OFF = [IM_START, ASSISTANT, THINK, NLNL, END_THINK, NLNL]  # False
+    STARTUP_SUFFIX_LEN = 2  # what _compute_think_suffix_len() measures
+
+    @classmethod
+    def _ids(cls, thinking: bool):
+        return cls.BODY + (cls.SUFFIX_ON if thinking else cls.SUFFIX_OFF)
+
+    @classmethod
+    def _gen(cls):
+        from vllm_mlx.mllm_batch_generator import MLLMBatchGenerator, MLLMBatchStats
+
+        gen = MLLMBatchGenerator.__new__(MLLMBatchGenerator)
+        gen._stats = MLLMBatchStats()
+        gen._pending_error_responses = []
+        gen._aborted_request_ids = set()
+        gen._prefill_progress = {}
+        gen.active_batch = None
+        gen.stop_tokens = set()
+        gen.unprocessed_requests = []
+        gen.max_kv_size = 0
+        gen._think_suffix_len = cls.STARTUP_SUFFIX_LEN
+        gen._im_end_id = cls.IM_END
+        gen._has_empty_rotating_cache = lambda cache: False
+        return gen
+
+    BOUNDARY = len(BODY)
+
+    @pytest.mark.parametrize("thinking", [True, False])
+    def test_boundary_is_thinking_mode_independent(self, thinking):
+        gen = self._gen()
+        ids = self._ids(thinking)
+        assert gen._prompt_boundary_len(ids) == self.BOUNDARY
+        assert ids[: self.BOUNDARY] == self.BODY
+
+    def test_startup_suffix_strip_is_wrong_for_thinking_off(self):
+        # The pre-fix behavior, kept as the fallback for non-ChatML templates:
+        # right by construction for the mode it was measured in, two tokens
+        # long for the other one.
+        gen = self._gen()
+        gen._im_end_id = None
+        assert gen._prompt_boundary_len(self._ids(True)) == self.BOUNDARY + 2
+        assert gen._prompt_boundary_len(self._ids(False)) == self.BOUNDARY + 4
+        # +2 over the shared prefix: not a strict prefix of the next turn.
+
+    @pytest.mark.parametrize("thinking", [True, False])
+    def test_turn_one_key_is_strict_prefix_of_turn_two(self, thinking):
+        gen = self._gen()
+        turn1 = self._ids(thinking)
+        reply = [20, 21, self.IM_END]
+        turn2 = self.BODY + [self.IM_START, self.ASSISTANT] + reply
+        turn2 += [self.IM_START, 30, 31, self.IM_END]
+        turn2 += self.SUFFIX_ON if thinking else self.SUFFIX_OFF
+        key1 = turn1[: gen._prompt_boundary_len(turn1)]
+        assert turn2[: len(key1)] == key1 and len(turn2) > len(key1)
+
+    # -- canonical (non-chunked) path -----------------------------------------
+
+    @pytest.mark.parametrize("thinking", [True, False])
+    def test_canonical_fetch_looks_up_message_boundary(self, monkeypatch, thinking):
+        from vllm_mlx.mllm_batch_generator import MLLMBatchGenerator, MLLMBatchRequest
+
+        class FreshCache:
+            def merge(self, caches):
+                return self
+
+        lookups = []
+
+        class RecordingPrefixCache:
+            def fetch(self, ids):
+                lookups.append(list(ids))
+                return None, list(ids)  # miss
+
+        monkeypatch.setattr(mx, "stream", lambda stream: nullcontext())
+        monkeypatch.setattr(
+            "mlx_lm.models.cache.make_prompt_cache", lambda *_, **__: [FreshCache()]
+        )
+        monkeypatch.setattr(
+            "mlx_lm.sample_utils.make_sampler",
+            lambda **_: MagicMock(return_value=mx.array([1], dtype=mx.uint32)),
+        )
+        monkeypatch.setattr(
+            "mlx_lm.sample_utils.make_logits_processors", lambda **_: []
+        )
+
+        gen = self._gen()
+        gen.prefix_cache = RecordingPrefixCache()
+        gen.prefill_step_size = 512
+        gen.language_model = object()
+        gen.model = MagicMock()
+        gen.sampler = MagicMock()
+        gen._preprocess_request = lambda req: None
+        gen._run_chunked_text_prefill = MagicMock(
+            return_value=mx.array([[[0.0, 1.0]]], dtype=mx.float32)
+        )
+
+        ids = self._ids(thinking)
+        req = MLLMBatchRequest(uid=1, request_id="canon-fetch", prompt="x")
+        req.input_ids = mx.array([ids])
+        req.is_text_only = True
+
+        MLLMBatchGenerator._process_prompts(gen, [req])
+
+        assert lookups == [self.BODY]
+
+    @pytest.mark.parametrize("thinking", [True, False])
+    def test_canonical_store_keys_message_boundary(self, thinking):
+        from types import SimpleNamespace
+
+        from vllm_mlx.mllm_batch_generator import MLLMBatchGenerator, MLLMBatchRequest
+
+        gen = self._gen()
+        gen.prefix_cache = object()
+        stores = []
+        gen._store_prefix_snapshot = lambda key, cache, trim, rid, src: (
+            stores.append((list(key), trim)) or True
+        )
+
+        ids = self._ids(thinking)
+        req = MLLMBatchRequest(uid=1, request_id="canon-store", prompt="x")
+        req.input_ids = mx.array([ids])
+        batch = SimpleNamespace(
+            requests=[req],
+            num_tokens=[3],  # three generated tokens
+            extract_cache=lambda i: ["cache"],
+        )
+
+        MLLMBatchGenerator._maybe_store_prefix_cache(gen, batch, [0])
+
+        suffix_len = len(ids) - self.BOUNDARY
+        assert stores == [(self.BODY, 3 + suffix_len)]
+
+    # -- chunked (interleaved) prefill path ----------------------------------
+
+    @pytest.mark.parametrize("thinking", [True, False])
+    def test_chunked_fetch_and_store_use_message_boundary(self, thinking):
+        from mlx_lm.models.cache import KVCache
+
+        from vllm_mlx.mllm_batch_generator import (
+            MLLMBatchRequest,
+            install_chunked_prefill_mllm,
+        )
+
+        gen = self._gen()
+        ids = self._ids(thinking)
+
+        lookups, stores = [], []
+        cached = KVCache()
+        cached.update_and_fetch(mx.zeros((1, 1, 3, 4)), mx.zeros((1, 1, 3, 4)))
+        mx.eval(cached.keys, cached.values)
+
+        class RecordingPrefixCache:
+            def fetch(self, lookup):
+                lookups.append(list(lookup))
+                # partial hit on the first three body tokens
+                return [cached], list(lookup)[3:]
+
+        gen.prefix_cache = RecordingPrefixCache()
+        gen._copy_prefix_cache = lambda kv: kv
+        gen._rewind_prefix_cache = lambda kv, n: kv
+        gen._store_prefix_snapshot = lambda key, cache, trim, rid, src: (
+            stores.append((list(key), trim, src)) or True
+        )
+        # Real-shaped logits so the interleaved prefill runs to completion.
+        gen.language_model = lambda x, cache=None: mx.zeros((1, x.shape[1], 16))
+        gen.sampler = lambda logprobs: mx.array([1], dtype=mx.uint32)
+        gen._next = lambda: []
+        # A budget smaller than the uncached remainder keeps the request on
+        # the interleaved path (a remainder that fits in one step is handed
+        # back to the canonical path, which the tests above cover).
+        install_chunked_prefill_mllm(gen, budget=4)
+
+        req = MLLMBatchRequest(uid=2, request_id="chunked", prompt="hello")
+        req.input_ids = mx.array([ids])
+        req.is_text_only = True
+        req.images = None
+        req.videos = None
+        gen.unprocessed_requests.append(req)
+        gen._preprocess_request = lambda r: None
+
+        for _ in range(8):  # fetch, then chunks of 4 until the prefill completes
+            gen._next()
+            if gen._partial is None and stores:
+                break
+
+        assert lookups == [self.BODY]
+        assert stores == [(self.BODY, len(ids) - self.BOUNDARY, "interleaved prefill")]
