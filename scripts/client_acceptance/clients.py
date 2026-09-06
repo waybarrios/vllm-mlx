@@ -9,6 +9,7 @@ Preparing a plan never launches a client or reads an existing client profile.
 
 import ipaddress
 import json
+import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -210,6 +211,7 @@ def prepare_client(
             "sandbox_workspace_write.network_access": False,
             "allow_login_shell": False,
             "shell_environment_policy.inherit": "none",
+            "shell_environment_policy.set.PATH": os.defpath,
             "project_doc_max_bytes": 0,
             "web_search": "disabled",
             "features.apps": False,
@@ -381,7 +383,13 @@ def prepare_client(
                 "plugins": {"allow": ["vllm"], "slots": {"memory": "none"}},
             },
         )
-        env = {"OPENCLAW_STATE_DIR": str(state)}
+        env = {
+            "OPENCLAW_STATE_DIR": str(state),
+            # Keep startup in the runner's process group so its timeout can
+            # reap the CLI before the temporary profile is removed.
+            "OPENCLAW_NO_RESPAWN": "1",
+            "NODE_DISABLE_COMPILE_CACHE": "1",
+        }
         # --auth-env-only rejects --config. Empty HOME and explicit state keep
         # this pinned provider independent of existing CLI credential stores.
         argv = [

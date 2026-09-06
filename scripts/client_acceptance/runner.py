@@ -21,9 +21,11 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 PROMPT = (
-    "Read input.txt in the current workspace using a tool. "
-    "Copy its token to output.txt as one line. Leave input.txt unchanged. "
-    "Reply with that token after writing the file. Work only with those two files. "
+    "Read input.txt and output.txt in the current workspace using tools. "
+    "Replace the word pending in output.txt with the token from input.txt, "
+    "keeping the final newline. Leave input.txt unchanged. "
+    "Reply with that token after editing the file. "
+    "Work only with those two files. "
     "Do not use the network."
 )
 

@@ -60,13 +60,15 @@ for your own model using the [tool-calling guide](tool-calling.md).
 Run the initial pair:
 
 ```bash
+mkdir -p tmp/client-acceptance
+export TMPDIR="$PWD/tmp/client-acceptance"
 python -m scripts.client_acceptance \
   --clients opencode pi \
   --base-url http://127.0.0.1:8000/v1 \
   --model acceptance-model \
   --model-revision MODEL_COMMIT_OR_SHA256 \
   --server-revision SERVER_COMMIT \
-  --report /tmp/client-acceptance.json
+  --report tmp/client-acceptance/report.json
 ```
 
 Replace the revision placeholders with immutable 40-digit commit hashes,
@@ -94,9 +96,9 @@ upstream server has no key, client configurations receive an inert local key.
 
 Each client receives a private temporary home, configuration directories, and
 workspace. The workspace contains an input file holding a random token and an
-output file containing `pending`. The prompt asks the client to read the input,
-copy its token to the output, and answer with the token. The token is absent
-from the prompt.
+output file containing `pending`. The prompt asks the client to read both files,
+replace `pending` with the input token while preserving the final newline, and
+answer with the token. The token is absent from the prompt.
 
 A loopback proxy observes the client's API requests and streams upstream
 responses through unchanged. A passing run requires all of the following:
@@ -104,7 +106,7 @@ responses through unchanged. A passing run requires all of the following:
 - A matching result for every model-issued tool call, with at least one result carrying the token.
 - At least two inference requests through the expected API, using the selected model.
 - A completed streamed model response containing the token.
-- An actual output file containing the token on one line, with the input unchanged.
+- Exact output bytes: the token followed by one LF newline, with the input unchanged.
 - Successful client exit, no timeout, and no observed protocol errors.
 
 The runner rejects symlink or non-regular fixture files. Reports contain
@@ -128,6 +130,11 @@ configured sandbox and tool restrictions. Run acceptance on a dedicated trusted
 host. Client model traffic goes through the local proxy, but this does not by
 itself block unrelated client startup traffic. Install any required provider
 packages beforehand and verify client-specific offline behavior where needed.
+
+Codex's command tools receive the system executable search path while other
+operator environment variables remain excluded. OpenClaw's startup respawning
+and Node compile cache are disabled so the runner can terminate its process
+group before removing the temporary profile.
 
 ## CI and platform coverage
 

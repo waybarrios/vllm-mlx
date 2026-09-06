@@ -2,6 +2,7 @@
 """Check the local configuration passed across each real client boundary."""
 
 import json
+import shutil
 import stat
 from datetime import datetime
 from pathlib import Path
@@ -172,6 +173,24 @@ def test_codex_selects_responses_and_preserves_sandbox(tmp_path):
     assert Path(plan.env["CODEX_HOME"]).is_relative_to(tmp_path)
 
 
+def test_codex_shell_can_find_system_tools_without_inheriting_operator_path(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("PATH", "/operator/private/bin")
+    plan = prepare(tmp_path, "codex")
+    overrides = {
+        plan.argv[index + 1].split("=", 1)[0]: json.loads(
+            plan.argv[index + 1].split("=", 1)[1]
+        )
+        for index, value in enumerate(plan.argv)
+        if value == "-c"
+    }
+    path = overrides.get("shell_environment_policy.set.PATH", "")
+    assert shutil.which("cat", path=path) is not None
+    assert "/operator/private/bin" not in path
+    assert overrides["shell_environment_policy.inherit"] == "none"
+
+
 def test_claude_uses_messages_origin_and_api_key_only_bare_mode(tmp_path):
     plan = prepare(tmp_path, "claude")
     assert plan.protocol == "anthropic"
@@ -237,6 +256,8 @@ def test_openclaw_pins_config_in_embedded_exec_without_channel_delivery(tmp_path
     assert "--deliver" not in plan.argv
     assert "--auth-env-only" not in plan.argv  # Incompatible with --config upstream.
     assert Path(plan.env["OPENCLAW_STATE_DIR"]).is_relative_to(tmp_path)
+    assert plan.env.get("OPENCLAW_NO_RESPAWN") == "1"
+    assert plan.env.get("NODE_DISABLE_COMPILE_CACHE") == "1"
 
 
 @pytest.mark.parametrize(

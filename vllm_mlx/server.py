@@ -5543,6 +5543,7 @@ def _normalize_messages(messages: list[dict]) -> list[dict]:
 
     Only merges when both messages have string content. Messages with list
     content (multimodal) are left as-is to preserve image/video attachments.
+    Tool results and assistant tool calls retain their individual identities.
 
     Args:
         messages: List of message dicts with 'role' and 'content' keys.
@@ -5565,6 +5566,9 @@ def _normalize_messages(messages: list[dict]) -> list[dict]:
         role = _ROLE_MAP.get(msg["role"], msg["role"])
         if (
             role == prev["role"]
+            and role in ("system", "user", "assistant")
+            and not prev.get("tool_calls")
+            and not msg.get("tool_calls")
             and isinstance(prev.get("content"), str)
             and isinstance(msg.get("content"), str)
         ):
