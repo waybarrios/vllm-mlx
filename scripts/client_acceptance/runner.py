@@ -12,6 +12,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -71,36 +72,66 @@ def run_process(
     explicitly probing --version; arbitrary subprocess output never enters reports.
     """
     with tempfile.TemporaryFile() as output:
-        process = subprocess.Popen(
-            argv,
-            cwd=cwd,
-            env=env,
-            stdin=subprocess.DEVNULL,
-            stdout=output if capture_version else subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            start_new_session=True,
-        )
+        process = None
         timed_out = False
+        cleaning_up = False
+        termination = None
+
+        def terminate(signum, frame):
+            nonlocal termination
+            termination = signum
+            # Defer a signal during Popen until its PID is available, and do
+            # not let a second signal interrupt process-group cleanup.
+            if process is not None and not cleaning_up:
+                raise SystemExit(128 + signum)
+
+        handle_sigterm = (
+            threading.current_thread() is threading.main_thread()
+            and signal.getsignal(signal.SIGTERM) == signal.SIG_DFL
+        )
+        if handle_sigterm:
+            signal.signal(signal.SIGTERM, terminate)
         try:
-            process.wait(timeout=max(0.01, timeout))
-        except subprocess.TimeoutExpired:
-            timed_out = True
-        finally:
-            # Also stop helpers left behind by a successfully exited CLI.
             try:
-                os.killpg(process.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            process.wait()
-        version = None
-        if capture_version and not timed_out and process.returncode == 0:
-            output.seek(0)
-            match = re.search(
-                rb"\b\d+\.\d+\.\d+(?:[-+][A-Za-z0-9.]+)?\b", output.read(8192)
-            )
-            if match:
-                version = match.group().decode("ascii")
-        return ProcessResult(process.returncode, timed_out, version)
+                if termination is not None:
+                    raise SystemExit(128 + termination)
+                process = subprocess.Popen(
+                    argv,
+                    cwd=cwd,
+                    env=env,
+                    stdin=subprocess.DEVNULL,
+                    stdout=output if capture_version else subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    start_new_session=True,
+                )
+                if termination is not None:
+                    raise SystemExit(128 + termination)
+                process.wait(timeout=max(0.01, timeout))
+            except subprocess.TimeoutExpired:
+                timed_out = True
+            finally:
+                cleaning_up = True
+                if process is not None:
+                    # Stop helpers even when the CLI already exited normally.
+                    try:
+                        os.killpg(process.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    process.wait()
+            version = None
+            if capture_version and not timed_out and process.returncode == 0:
+                output.seek(0)
+                match = re.search(
+                    rb"\b\d+\.\d+\.\d+(?:[-+][A-Za-z0-9.]+)?\b", output.read(8192)
+                )
+                if match:
+                    version = match.group().decode("ascii")
+            return ProcessResult(process.returncode, timed_out, version)
+        finally:
+            if handle_sigterm:
+                signal.signal(signal.SIGTERM, signal.SIG_DFL)
+            if termination is not None:
+                raise SystemExit(128 + termination)
 
 
 def _file_matches(path: Path, expected: bytes) -> bool:

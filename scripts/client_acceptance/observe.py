@@ -236,8 +236,15 @@ class _Stream:
                 if not isinstance(function, dict):
                     self.errors.add("invalid_tool_call")
                     continue
+                # Qwen XML repeats a complete stable ID on argument deltas.
+                # The client returns that ID once, not its concatenated copies.
+                call_id = part.get("id")
+                if isinstance(call_id, str) and call_id:
+                    if call.get("id") and call["id"] != call_id:
+                        self.errors.add("invalid_tool_call")
+                    else:
+                        call["id"] = call_id
                 for key, value in (
-                    ("id", part.get("id")),
                     ("name", function.get("name")),
                     ("arguments", function.get("arguments")),
                 ):
@@ -342,11 +349,47 @@ class RecordingProxy:
         self.client_key = secrets.token_urlsafe(32) if api_key else ""
         self.evidence = Evidence(protocol)
         self._serial = threading.Lock()
+        self._connections_lock = threading.Lock()
+        self._connections = set()
+        self._closing = False
         self._server = None
         self._thread = None
 
+    def _track_connection(self, connection):
+        with self._connections_lock:
+            if self._closing:
+                raise OSError("Proxy is closing")
+            self._connections.add(connection)
+
+    def _untrack_connection(self, connection):
+        with self._connections_lock:
+            self._connections.discard(connection)
+
     def __enter__(self):
         owner = self
+
+        class Server(ThreadingHTTPServer):
+            # server_close joins the handlers after their sockets are cancelled.
+            daemon_threads = False
+
+            def process_request(self, request, client_address):
+                try:
+                    owner._track_connection(request)
+                    super().process_request(request, client_address)
+                except Exception:
+                    owner._untrack_connection(request)
+                    self.shutdown_request(request)
+                    raise
+
+            def process_request_thread(self, request, client_address):
+                try:
+                    super().process_request_thread(request, client_address)
+                finally:
+                    owner._untrack_connection(request)
+
+            def handle_error(self, request, client_address):
+                if not owner._closing:
+                    super().handle_error(request, client_address)
 
         class Handler(BaseHTTPRequestHandler):
             protocol_version = "HTTP/1.1"
@@ -365,6 +408,9 @@ class RecordingProxy:
                 self._dispatch()
 
             def _reject(self, status, code, *, record=True):
+                if owner._closing:
+                    self.close_connection = True
+                    return
                 if record:
                     self._error(code)
                 self.close_connection = True
@@ -452,6 +498,8 @@ class RecordingProxy:
                     self._reject(504, "request_queue_timeout")
                     return
                 try:
+                    if owner._closing:
+                        return
                     if inference and not owner.evidence.begin(body):
                         self._reject(429, "request_limit")
                         return
@@ -478,7 +526,18 @@ class RecordingProxy:
                 stream = _Stream(owner.protocol) if inference else None
                 started = False
                 self.close_connection = True
+                upstream = None
                 try:
+                    # Register the socket before connect(), so shutdown can also
+                    # cancel connection establishment. Keep this reference when
+                    # HTTPConnection relinquishes a Connection: close socket.
+                    family = socket.AF_INET6 if owner._host == "::1" else socket.AF_INET
+                    upstream = socket.socket(family, socket.SOCK_STREAM)
+                    upstream.settimeout(owner.timeout)
+                    upstream.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                    connection.sock = upstream
+                    owner._track_connection(upstream)
+                    upstream.connect((owner._host, owner._port))
                     connection.request(
                         self.command, self.path, body=raw or None, headers=headers
                     )
@@ -520,6 +579,10 @@ class RecordingProxy:
                             response.fp.raw._sock.settimeout(remaining)
                         chunk = response.read1(min(4096, MAX_RESPONSE_BYTES - size + 1))
                         if not chunk:
+                            # read1() permits EOF with Content-Length bytes still
+                            # outstanding; terminal SSE alone is insufficient.
+                            if response.length not in (None, 0):
+                                self._error("incomplete_http_response")
                             break
                         size += len(chunk)
                         if size > MAX_RESPONSE_BYTES:
@@ -539,11 +602,13 @@ class RecordingProxy:
                         self._reject(502, "upstream_io_error")
                 finally:
                     connection.close()
+                    if upstream is not None:
+                        upstream.close()
+                        owner._untrack_connection(upstream)
                     if stream:
                         owner.evidence.finish(stream)
 
-        self._server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-        self._server.daemon_threads = True
+        self._server = Server(("127.0.0.1", 0), Handler)
         self._thread = threading.Thread(
             target=self._server.serve_forever,
             kwargs={"poll_interval": 0.05},
@@ -562,6 +627,17 @@ class RecordingProxy:
         return True
 
     def __exit__(self, exc_type, exc_value, traceback):
+        with self._connections_lock:
+            self._closing = True
+            connections = tuple(self._connections)
+        # shutdown() wakes handlers blocked in buffered HTTP reads; close()
+        # alone cannot reliably interrupt a read holding a makefile reference.
+        for connection in connections:
+            try:
+                connection.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            connection.close()
         self._server.shutdown()
         self._server.server_close()
         self._thread.join(timeout=1)

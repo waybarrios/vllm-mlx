@@ -3,9 +3,11 @@
 
 import json
 import os
+import signal
 import subprocess
 import sys
 import time
+from pathlib import Path
 
 import pytest
 
@@ -127,6 +129,59 @@ def test_process_timeout_kills_descendant_before_delayed_write(tmp_path):
     assert result.timed_out
     time.sleep(1.1)
     assert not marker.exists()
+
+
+def test_sigterm_runner_kills_client_before_delayed_write(tmp_path):
+    ready = tmp_path / "client.pid"
+    marker = tmp_path / "orphan.txt"
+    client = (
+        "import os,time; from pathlib import Path; "
+        f"Path({str(ready)!r}).write_text(str(os.getpid())); "
+        f"time.sleep(0.6); Path({str(marker)!r}).touch(); time.sleep(30)"
+    )
+    program = (
+        "from pathlib import Path; import sys; "
+        "from scripts.client_acceptance.runner import run_process, isolated_environment; "
+        f"root=Path({str(tmp_path)!r}); "
+        f"run_process([sys.executable,'-c',{client!r}],isolated_environment(root),root,30)"
+    )
+    outer = subprocess.Popen(
+        [sys.executable, "-c", program],
+        env=isolated_environment(tmp_path),
+        cwd=Path(__file__).resolve().parents[1],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    child_pid = None
+    try:
+        deadline = time.monotonic() + 5
+        while not ready.exists() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert ready.exists()
+        child_pid = int(ready.read_text())
+        outer.terminate()
+        outer.wait(timeout=3)
+        assert outer.returncode != 0
+        time.sleep(0.8)
+        assert not marker.exists()
+    finally:
+        if outer.poll() is None:
+            outer.kill()
+            outer.wait(timeout=3)
+        if child_pid is not None:
+            try:
+                os.killpg(child_pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
+
+def test_process_restores_sigterm_handler(tmp_path):
+    original = signal.getsignal(signal.SIGTERM)
+    result = run_process(
+        [sys.executable, "-c", "pass"], isolated_environment(tmp_path), tmp_path, 5
+    )
+    assert result.returncode == 0
+    assert signal.getsignal(signal.SIGTERM) == original
 
 
 def test_process_output_is_not_retained_in_result(tmp_path):

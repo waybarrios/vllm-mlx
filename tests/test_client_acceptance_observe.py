@@ -857,3 +857,136 @@ def test_idle_wait_supports_an_exhausted_client_budget():
     with proxy._serial:
         assert wait_for_idle(0) is False
     assert proxy.evidence.summary(TOKEN)["errors"] == ["stream_finalize_timeout"]
+
+
+@pytest.mark.parametrize("later_id", ["call_1", "different_call"])
+def test_chat_repeated_stable_id_matches_results_but_conflicts_fail(later_id):
+    call = sse(
+        {
+            "choices": [
+                {
+                    "delta": {
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                "id": "call_1",
+                                "function": {"name": "read", "arguments": '{"path":'},
+                            }
+                        ]
+                    }
+                }
+            ]
+        },
+        {
+            "choices": [
+                {
+                    "delta": {
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                "id": later_id,
+                                "function": {"arguments": '"input.txt"}'},
+                            }
+                        ]
+                    }
+                }
+            ]
+        },
+        {"choices": [{"delta": {}, "finish_reason": "tool_calls"}]},
+        b"[DONE]",
+    )
+    _, result, final = exchange("chat")
+    with upstream([reply(call), reply(final)]) as (url, _):
+        with observer().RecordingProxy(url, "test-model", "chat") as proxy:
+            body = {"model": "test-model", "stream": True}
+            post(proxy.base_url, PATHS["chat"], body)
+            post(proxy.base_url, PATHS["chat"], {**body, **result})
+            assert proxy.wait_for_idle(1)
+            assert proxy.evidence.passed(TOKEN) is (later_id == "call_1")
+
+
+def test_terminal_sse_with_truncated_content_length_is_not_accepted():
+    call, result, final = exchange("chat")
+
+    def truncated(wfile):
+        wfile.write(final)
+        wfile.flush()
+
+    replies = [
+        reply(call),
+        (
+            200,
+            {
+                "Content-Type": "text/event-stream",
+                "Content-Length": str(len(final) + 100),
+            },
+            truncated,
+        ),
+    ]
+    with upstream(replies) as (url, _):
+        with observer().RecordingProxy(url, "test-model", "chat") as proxy:
+            body = {"model": "test-model", "stream": True}
+            post(proxy.base_url, PATHS["chat"], body)
+            post(proxy.base_url, PATHS["chat"], {**body, **result})
+            assert proxy.wait_for_idle(1)
+            assert not proxy.evidence.passed(TOKEN)
+            assert "incomplete_http_response" in proxy.evidence.summary(TOKEN)["errors"]
+
+
+@pytest.mark.parametrize("send_headers", [False, True], ids=["headers", "body"])
+def test_proxy_exit_disconnects_upstream_and_joins_handlers(send_headers):
+    request_seen = threading.Event()
+    peer_closed = threading.Event()
+
+    class Peer(BaseHTTPRequestHandler):
+        def do_POST(self):
+            self.rfile.read(int(self.headers["Content-Length"]))
+            if send_headers:
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Connection", "close")
+                self.end_headers()
+                self.wfile.write(b": waiting\n\n")
+                self.wfile.flush()
+            request_seen.set()
+            self.connection.settimeout(2)
+            if self.connection.recv(1) == b"":
+                peer_closed.set()
+
+        def log_message(self, *args):
+            pass
+
+    peer = ThreadingHTTPServer(("127.0.0.1", 0), Peer)
+    thread = threading.Thread(
+        target=peer.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True
+    )
+    thread.start()
+    client = None
+    try:
+        with observer().RecordingProxy(
+            f"http://127.0.0.1:{peer.server_port}/v1", "test-model", "chat", timeout=1
+        ) as proxy:
+            address = urlsplit(proxy.base_url)
+            client = HTTPConnection(address.hostname, address.port, timeout=2)
+            client.request(
+                "POST",
+                "/v1/chat/completions",
+                json.dumps({"model": "test-model", "stream": True}),
+            )
+            assert request_seen.wait(1)
+            if send_headers:
+                response = client.getresponse()
+                assert response.read(len(b": waiting\n\n")) == b": waiting\n\n"
+                response.close()
+            client.close()
+            assert not proxy.wait_for_idle(0)
+        assert peer_closed.wait(0.15), "upstream survived proxy context exit"
+        proof = proxy.evidence.summary(TOKEN)
+        time.sleep(0.05)
+        assert proxy.evidence.summary(TOKEN) == proof
+    finally:
+        if client is not None:
+            client.close()
+        peer.shutdown()
+        peer.server_close()
+        thread.join(timeout=2)
