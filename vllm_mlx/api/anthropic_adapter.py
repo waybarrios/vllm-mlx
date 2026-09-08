@@ -190,10 +190,49 @@ def _convert_message(msg: AnthropicMessage) -> list[Message]:
     text_parts = []
     tool_calls_for_assistant = []
     tool_results = []
+    # Ordered multimodal parts, built in parallel with text_parts. Only used when
+    # the message actually carries media, so the text-only path is byte-identical
+    # to before -- important because that path is the hot one.
+    content_parts: list[dict] = []
+    has_media = False
 
     for block in msg.content:
         if block.type == "text":
             text_parts.append(block.text or "")
+            content_parts.append({"type": "text", "text": block.text or ""})
+
+        elif block.type == "image":
+            # Anthropic image block -> OpenAI image_url part.
+            #
+            # Without this branch the block was parsed (AnthropicContentBlock
+            # carries `source`) and then silently DROPPED, so a vision request
+            # returned HTTP 200 with a confident text-only answer -- the model
+            # never saw the picture. vLLM's own Anthropic surface converts
+            # image blocks, so this was also a parity gap.
+            source = block.source or {}
+            src_type = source.get("type")
+            if src_type == "base64":
+                media_type = source.get("media_type") or "image/png"
+                data = source.get("data") or ""
+                if not data:
+                    # A data URI with an empty payload is worse than an error: the
+                    # request would look well-formed and the model would answer
+                    # about nothing.
+                    raise ValueError("image block carries no data")
+                url = f"data:{media_type};base64,{data}"
+            elif src_type == "url":
+                url = source.get("url") or ""
+            else:
+                # Refuse rather than drop: an unknown source type that silently
+                # vanishes is the exact failure this branch exists to end.
+                raise ValueError(
+                    f"unsupported image source type {src_type!r}; "
+                    "expected 'base64' or 'url'"
+                )
+            if not url:
+                raise ValueError("image block carries no data")
+            content_parts.append({"type": "image_url", "image_url": {"url": url}})
+            has_media = True
 
         elif block.type == "tool_use":
             # Assistant message with tool calls
@@ -210,6 +249,9 @@ def _convert_message(msg: AnthropicMessage) -> list[Message]:
             )
 
         elif block.type == "tool_result":
+            # Follow-up (out of scope for the image-block fix): images nested
+            # inside tool_result.content still go through this text-only
+            # extraction and are not converted to image_url parts.
             # Tool result → OpenAI tool message
             result_content = block.content
             if isinstance(result_content, list):
@@ -236,33 +278,47 @@ def _convert_message(msg: AnthropicMessage) -> list[Message]:
     if msg.role == "assistant":
         combined_text = "\n".join(text_parts) if text_parts else None
         if tool_calls_for_assistant:
+            # An assistant turn can carry an image alongside a tool call; the
+            # media extraction downstream is role-agnostic, so preserve the
+            # full part list rather than flattening to text and dropping it.
             messages.append(
                 Message(
                     role="assistant",
-                    content=combined_text or "",
+                    content=content_parts if has_media else (combined_text or ""),
                     tool_calls=tool_calls_for_assistant,
                 )
             )
+        elif has_media:
+            messages.append(Message(role="assistant", content=content_parts))
         elif combined_text is not None:
             messages.append(Message(role="assistant", content=combined_text))
         else:
             messages.append(Message(role="assistant", content=""))
     elif msg.role == "user":
         # User messages: collect text parts, then add tool results separately
-        if text_parts:
+        if has_media:
+            # Preserve the author's text/image interleaving: for document work the
+            # order of "here is the page" vs "now answer this" changes the task.
+            messages.append(Message(role="user", content=content_parts))
+        elif text_parts:
             combined_text = "\n".join(text_parts)
             messages.append(Message(role="user", content=combined_text))
 
         # Tool results become separate tool messages
         messages.extend(tool_results)
 
-        # If no text and no tool results, add empty user message
-        if not text_parts and not tool_results:
+        # If no text, no media and no tool results, add empty user message.
+        # has_media matters: an image-only message has no text_parts, and without
+        # this guard it emitted the image AND a stray empty user message.
+        if not text_parts and not tool_results and not has_media:
             messages.append(Message(role="user", content=""))
     else:
         # Other roles
-        combined_text = "\n".join(text_parts) if text_parts else ""
-        messages.append(Message(role=msg.role, content=combined_text))
+        if has_media:
+            messages.append(Message(role=msg.role, content=content_parts))
+        else:
+            combined_text = "\n".join(text_parts) if text_parts else ""
+            messages.append(Message(role=msg.role, content=combined_text))
 
     return messages
 

@@ -5827,8 +5827,14 @@ async def create_anthropic_message(
         _sanitize_log_text(last_user_preview, limit=300),
     )
 
-    # Convert Anthropic request -> OpenAI request
-    openai_request = anthropic_to_openai(anthropic_request)
+    # Convert Anthropic request -> OpenAI request. Conversion errors are
+    # client-input errors (e.g. an image block with an empty payload or an
+    # unknown source type) and must surface as 400s before any engine is
+    # acquired, never as unhandled 500s.
+    try:
+        openai_request = anthropic_to_openai(anthropic_request)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     total_timeout, deadline = _start_request_budget(None)
     engine = await _acquire_default_engine_for_request(
         request,
