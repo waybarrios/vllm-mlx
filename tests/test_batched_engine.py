@@ -108,7 +108,8 @@ class TestBatchedEngineCacheRestore:
         engine._is_mllm = True
         return engine
 
-    def test_load_cache_from_disk_bootstraps_mllm_batch_generator(self):
+    @pytest.mark.anyio
+    async def test_load_cache_from_disk_bootstraps_mllm_batch_generator(self):
         engine = self._make_mllm_engine()
 
         prefix_cache = MagicMock()
@@ -122,7 +123,7 @@ class TestBatchedEngineCacheRestore:
         scheduler._ensure_batch_generator.side_effect = ensure_batch_generator
         engine._mllm_scheduler = scheduler
 
-        loaded = engine.load_cache_from_disk("/tmp/cache")
+        loaded = await engine.load_cache_from_disk("/tmp/cache")
 
         assert loaded == 2
         scheduler._ensure_batch_generator.assert_called_once_with()
