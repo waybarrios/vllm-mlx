@@ -3245,7 +3245,7 @@ class SimpleEngine(BaseEngine):
                     prefill_step_size=self._prefill_step_size,
                     logits_processors=seeded_processors,
                     prompt_cache=prompt_cache,
-                    mtp=use_mtp,
+                    **({"mtp": True} if use_mtp else {}),
                 ):
                     if abort_event.is_set():
                         logger.info(
