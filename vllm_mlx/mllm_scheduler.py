@@ -1295,8 +1295,11 @@ class MLLMScheduler:
             "vision_cache": False,
             "prefix_cache": False,
         }
-        if self.vision_cache:
-            self.vision_cache.clear()
+        if (
+            self.batch_generator is not None
+            and self.batch_generator.vision_cache is not None
+        ):
+            self.batch_generator.vision_cache.clear()
             cleared["vision_cache"] = True
         if (
             self.batch_generator is not None
@@ -1321,8 +1324,7 @@ class MLLMScheduler:
         self._detokenizer_pool.clear()
 
         if self.batch_generator is not None:
+            if self.batch_generator.vision_cache is not None:
+                self.batch_generator.vision_cache.clear()
             self.batch_generator.close()
             self.batch_generator = None
-
-        if self.vision_cache:
-            self.vision_cache.clear()
