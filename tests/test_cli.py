@@ -1,3 +1,4 @@
+import json
 import sys
 from types import ModuleType, SimpleNamespace
 
@@ -109,6 +110,12 @@ def test_continuous_batching_forwards_prefill_step_size_to_scheduler_config(
     api = ModuleType("vllm_mlx.api")
     api_utils = ModuleType("vllm_mlx.api.utils")
     api_utils.is_mllm_model = lambda model: False
+    api_utils.MllmRouteUndetermined = RuntimeError
+    api_utils.resolve_mllm_route = (
+        lambda model_name, resolved_path=None, force_mllm=False: SimpleNamespace(
+            is_mllm=force_mllm, source="explicit" if force_mllm else "pattern"
+        )
+    )
 
     utils = ModuleType("vllm_mlx.utils")
     download = ModuleType("vllm_mlx.utils.download")
@@ -289,3 +296,150 @@ models:
 
     assert server._model_manager is not None
     assert server._model_manager.memory_budget_bytes == int(6.5 * (1024**3))
+
+
+class TestServeCommandMllmRouting:
+    """Regression coverage for issue #748, bound at the real single-model
+    CLI call site (cli.serve_command), not just the lower-level detection
+    helper.
+
+    Before the fix, is_mllm_model() only inspected config.json for inputs
+    that were already local directories, so a bare HF repo id like
+    "mlx-community/Qwen3.8-27B-8bit" always fell through to
+    MLLM_PATTERNS substring matching (which has no "Qwen3.8" entry) and
+    silently loaded the text-only engine. serve_command now resolves the
+    model first (reusing ensure_model_downloaded's own result) and
+    decides routing from that resolved snapshot's config.json before
+    calling load_model().
+    """
+
+    @staticmethod
+    def _write_config(tmp_path, name, payload):
+        model_dir = tmp_path / name
+        model_dir.mkdir()
+        (model_dir / "config.json").write_text(json.dumps(payload))
+        return model_dir
+
+    def test_cached_bare_repo_id_routes_via_config_not_pattern(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        """(a) A cached bare repo ID whose name matches no MLLM_PATTERNS
+        entry, but whose resolved config.json declares vision_config,
+        must route to the MLLM engine — with the decision attributed to
+        config, not pattern matching."""
+        from vllm_mlx import cli, server
+        from vllm_mlx.utils import download
+
+        model_dir = self._write_config(
+            tmp_path,
+            "Qwen3.8-27B-8bit",
+            {"model_type": "qwen3_8", "vision_config": {"hidden_size": 1024}},
+        )
+        loaded = {}
+        monkeypatch.setattr(
+            download, "ensure_model_downloaded", lambda *a, **k: model_dir
+        )
+        monkeypatch.setattr(
+            server,
+            "load_model",
+            lambda *a, **k: loaded.update({"args": a, "kwargs": k}),
+        )
+        monkeypatch.setattr("uvicorn.run", lambda *a, **k: None)
+
+        with caplog.at_level("INFO"):
+            cli.serve_command(_serve_args(model="mlx-community/Qwen3.8-27B-8bit"))
+
+        assert loaded["args"][0] == str(model_dir)
+        assert loaded["kwargs"]["force_mllm"] is True
+        assert loaded["kwargs"]["served_model_name"] == "mlx-community/Qwen3.8-27B-8bit"
+        assert "MLLM" in caplog.text
+        assert "source=config" in caplog.text
+
+    def test_uncached_metadata_failure_fails_closed(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """(b) Resolution succeeds (a snapshot directory exists) but its
+        config.json is unreadable/missing, and the repo id matches no
+        legacy pattern either. Must refuse to silently default to the
+        text-only engine — load_model must never be called."""
+        from vllm_mlx import cli, server
+        from vllm_mlx.utils import download
+
+        model_dir = tmp_path / "mystery-repo"
+        model_dir.mkdir()  # resolved, but no config.json inside
+        called = {}
+        monkeypatch.setattr(
+            download, "ensure_model_downloaded", lambda *a, **k: model_dir
+        )
+        monkeypatch.setattr(
+            server, "load_model", lambda *a, **k: called.setdefault("load_model", True)
+        )
+        monkeypatch.setattr("uvicorn.run", lambda *a, **k: None)
+
+        with pytest.raises(SystemExit) as exc:
+            cli.serve_command(_serve_args(model="someorg/mystery-repo"))
+
+        assert exc.value.code == 1
+        assert "someorg/mystery-repo" in capsys.readouterr().out
+        assert "load_model" not in called
+
+    def test_ordinary_text_only_repo_routes_llm(self, tmp_path, monkeypatch, caplog):
+        """(c) An ordinary text-only repo, resolved config.json has no
+        VLM markers and the name matches no legacy pattern: routes to the
+        LLM engine, decision attributed to config."""
+        from vllm_mlx import cli, server
+        from vllm_mlx.utils import download
+
+        model_dir = self._write_config(
+            tmp_path,
+            "Qwen3.8-27B-8bit",
+            {"model_type": "qwen3_8", "architectures": ["Qwen3ForCausalLM"]},
+        )
+        loaded = {}
+        monkeypatch.setattr(
+            download, "ensure_model_downloaded", lambda *a, **k: model_dir
+        )
+        monkeypatch.setattr(
+            server,
+            "load_model",
+            lambda *a, **k: loaded.update({"args": a, "kwargs": k}),
+        )
+        monkeypatch.setattr("uvicorn.run", lambda *a, **k: None)
+
+        with caplog.at_level("INFO"):
+            cli.serve_command(_serve_args(model="mlx-community/Qwen3.8-27B-8bit"))
+
+        assert loaded["kwargs"]["force_mllm"] is False
+        assert "LLM" in caplog.text
+        assert "source=config" in caplog.text
+
+    def test_explicit_mllm_flag_short_circuits_config(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        """--mllm still forces the MLLM route, and is reported as
+        "explicit" rather than "config", even when a resolved config.json
+        disagrees."""
+        from vllm_mlx import cli, server
+        from vllm_mlx.utils import download
+
+        model_dir = self._write_config(
+            tmp_path,
+            "text-model",
+            {"architectures": ["Qwen3ForCausalLM"]},
+        )
+        loaded = {}
+        monkeypatch.setattr(
+            download, "ensure_model_downloaded", lambda *a, **k: model_dir
+        )
+        monkeypatch.setattr(
+            server,
+            "load_model",
+            lambda *a, **k: loaded.update({"args": a, "kwargs": k}),
+        )
+        monkeypatch.setattr("uvicorn.run", lambda *a, **k: None)
+
+        with caplog.at_level("INFO"):
+            cli.serve_command(_serve_args(model="mlx-community/text-model", mllm=True))
+
+        assert loaded["kwargs"]["force_mllm"] is True
+        assert "source=explicit" in caplog.text
