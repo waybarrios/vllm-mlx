@@ -1840,23 +1840,52 @@ async def _metrics_middleware(request: Request, call_next):
 
     start_time = time.perf_counter()
     _metrics.observe_http_start(method=method, path=path)
-    try:
-        response = await call_next(request)
-    except Exception:
+
+    def finish(status_code: int) -> None:
         _metrics.observe_http_finish(
             method=method,
             path=path,
-            status_code=500,
+            status_code=status_code,
             duration=time.perf_counter() - start_time,
         )
+
+    try:
+        response = await call_next(request)
+    except Exception:
+        finish(500)
         raise
 
-    _metrics.observe_http_finish(
-        method=method,
-        path=path,
-        status_code=response.status_code,
-        duration=time.perf_counter() - start_time,
-    )
+    # `call_next()` resolves as soon as the ASGI response has STARTED
+    # (headers + earliest body availability), not when a streaming body
+    # finishes sending -- Starlette's BaseHTTPMiddleware.call_next() always
+    # hands back a `_StreamingResponse` wrapping `body_iterator`, a lazy
+    # generator the ASGI server pulls from *after* this middleware returns
+    # (see starlette/middleware/base.py). Finishing metrics right here would
+    # decrement the in-flight gauge (and record request duration) within
+    # milliseconds of request start for any streaming endpoint -- long
+    # before real generation happens, let alone finishes. Defer the finish
+    # call until the body is actually exhausted, instead. `body_iterator` is
+    # a private Starlette attribute (same caveat as `_find_uvicorn_cycle`
+    # above); if a future Starlette drops it, fall back to the old
+    # immediate-finish timing rather than raising.
+    body_iterator = getattr(response, "body_iterator", None)
+    if body_iterator is None:
+        finish(response.status_code)
+        return response
+
+    finished = False
+
+    async def tracked_body():
+        nonlocal finished
+        try:
+            async for chunk in body_iterator:
+                yield chunk
+        finally:
+            if not finished:
+                finished = True
+                finish(response.status_code)
+
+    response.body_iterator = tracked_body()
     return response
 
 
