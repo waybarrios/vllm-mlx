@@ -112,6 +112,36 @@ for chunk in stream:
         print(chunk.choices[0].delta.content, end="")
 ```
 
+#### Log probabilities
+
+With `--continuous-batching`, chat completions accept `logprobs: true` and
+`top_logprobs` (0-20), and text completions accept `logprobs` (0-5). The
+server then returns OpenAI-format per-token log probabilities, both streaming
+and non-streaming:
+
+```python
+response = client.chat.completions.create(
+    model="default",
+    messages=[{"role": "user", "content": "Hello!"}],
+    logprobs=True,
+    top_logprobs=5,
+)
+for token in response.choices[0].logprobs.content:
+    print(token.token, token.logprob)
+```
+
+Notes:
+
+- Values are taken after logits processors (JSON-schema constraints,
+  `logit_bias`, repetition and presence penalties) and before temperature,
+  top-p, top-k and min-p.
+- They cover every generated token except the final stop token. The server
+  post-processes text for reasoning and tool-call parsing, `response_format`
+  JSON normalization and whitespace trimming, so `message.content` can differ
+  from the concatenated tokens.
+- Requests that ask for logprobs skip speculative (MTP or drafter) decoding.
+- The default simple engine returns HTTP 400 for logprobs requests.
+
 ### Completions
 
 ```bash

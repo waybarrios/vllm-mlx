@@ -170,6 +170,10 @@ class BatchedEngine(BaseEngine):
         return self._model_name
 
     @property
+    def supports_logprobs(self) -> bool:
+        return True
+
+    @property
     def is_mllm(self) -> bool:
         """Check if this is a multimodal model."""
         return self._is_mllm
@@ -785,6 +789,7 @@ class BatchedEngine(BaseEngine):
                 presence_penalty=kwargs.pop("presence_penalty", 0.0),
                 repetition_penalty=kwargs.pop("repetition_penalty", 1.0),
                 logits_processors=kwargs.pop("logits_processors", None),
+                logprobs=kwargs.pop("logprobs", None),
                 mllm_draft=bool(kwargs.pop("mllm_draft", self._default_mllm_draft)),
             )
 
@@ -796,6 +801,7 @@ class BatchedEngine(BaseEngine):
                 finish_reason=output.finish_reason,
                 mtp_drafts=output.mtp_drafts,
                 mtp_accepted=output.mtp_accepted,
+                logprobs=getattr(output, "output_logprobs", None),
             )
 
         # Use LLM engine for text-only (non-MLLM models)
@@ -811,6 +817,7 @@ class BatchedEngine(BaseEngine):
             repetition_penalty=kwargs.pop("repetition_penalty", 1.0),
             stop=stop or [],
             logits_processors=kwargs.pop("logits_processors", None),
+            logprobs=kwargs.pop("logprobs", None),
         )
 
         output = await self._engine.generate(
@@ -826,6 +833,7 @@ class BatchedEngine(BaseEngine):
             prompt_tokens=output.prompt_tokens,
             completion_tokens=output.completion_tokens,
             finish_reason=output.finish_reason,
+            logprobs=getattr(output, "output_logprobs", None),
         )
 
     async def stream_generate(
@@ -875,6 +883,7 @@ class BatchedEngine(BaseEngine):
                 presence_penalty=kwargs.pop("presence_penalty", 0.0),
                 repetition_penalty=kwargs.pop("repetition_penalty", 1.0),
                 logits_processors=kwargs.pop("logits_processors", None),
+                logprobs=kwargs.pop("logprobs", None),
                 mllm_draft=bool(kwargs.pop("mllm_draft", self._default_mllm_draft)),
             )
 
@@ -888,6 +897,7 @@ class BatchedEngine(BaseEngine):
                     finish_reason=output.finish_reason,
                     mtp_drafts=output.mtp_drafts,
                     mtp_accepted=output.mtp_accepted,
+                    logprobs=getattr(output, "new_logprobs", None),
                 )
             return
 
@@ -904,6 +914,7 @@ class BatchedEngine(BaseEngine):
             repetition_penalty=kwargs.pop("repetition_penalty", 1.0),
             stop=stop or [],
             logits_processors=kwargs.pop("logits_processors", None),
+            logprobs=kwargs.pop("logprobs", None),
         )
 
         prefix_boundary = kwargs.pop("prefix_boundary", 0)
@@ -923,6 +934,7 @@ class BatchedEngine(BaseEngine):
                 completion_tokens=output.completion_tokens,
                 finished=output.finished,
                 finish_reason=output.finish_reason,
+                logprobs=getattr(output, "new_logprobs", None),
             )
 
     async def chat(

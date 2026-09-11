@@ -27,6 +27,7 @@ from .memory_cache import MemoryAwarePrefixCache, MemoryCacheConfig
 from .paged_cache import PagedCacheManager
 from .ssd_cache import SSDCacheConfig, SSDCacheTier
 from .prefix_cache import BlockAwarePrefixCache, PrefixCacheManager
+from .logprobs import logprobs_for_step
 from .request import Request, RequestOutput, RequestStatus, SamplingParams
 from .utils.mamba_cache import ensure_mamba_support
 
@@ -2816,6 +2817,13 @@ class Scheduler:
                 detok.add_token(response.token)
                 new_text = detok.last_segment
 
+            new_logprobs = logprobs_for_step(
+                request,
+                response,
+                request.sampling_params.logprobs,
+                self._actual_tokenizer,
+            )
+
             # Create output
             output = RequestOutput(
                 request_id=request_id,
@@ -2824,6 +2832,8 @@ class Scheduler:
                 output_token_ids=request.output_token_ids,
                 prompt_tokens=request.num_prompt_tokens,
                 completion_tokens=request.num_output_tokens,
+                new_logprobs=new_logprobs,
+                output_logprobs=request.output_logprobs,
             )
 
             # Check if finished

@@ -33,6 +33,9 @@ class GenerationOutput:
     # For streaming
     new_text: str = ""
     finished: bool = True
+    # Per-token logprobs (``vllm_mlx.logprobs.TokenLogprob``) when requested:
+    # this step's tokens for streaming outputs, all tokens for final outputs.
+    logprobs: list | None = None
     # MTP speculative decoding counters. Zero means no MTP attempt occurred.
     mtp_drafts: int = 0
     mtp_accepted: int = 0
@@ -269,6 +272,11 @@ class BaseEngine(ABC):
     @preserve_native_tool_format.setter
     def preserve_native_tool_format(self, value: bool) -> None:
         self._preserve_native_tool_format = value
+
+    @property
+    def supports_logprobs(self) -> bool:
+        """Whether generation can return per-token logprobs."""
+        return False
 
     def prepare_for_start(self) -> None:
         """Run blocking startup work before async engine start.
