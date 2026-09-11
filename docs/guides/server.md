@@ -140,6 +140,9 @@ Notes:
   JSON normalization and whitespace trimming, so `message.content` can differ
   from the concatenated tokens.
 - Requests that ask for logprobs skip speculative (MTP or drafter) decoding.
+- Batched forward passes accumulate floating-point results in a different
+  order from single requests, so values can differ slightly between batched
+  and unbatched runs. At an exact tie this can also flip the greedy token.
 - The default simple engine returns HTTP 400 for logprobs requests.
 
 ### Completions
