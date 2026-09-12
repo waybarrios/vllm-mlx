@@ -1122,18 +1122,6 @@ async def _acquire_request_model(request_model: str) -> RequestModelContext:
     )
 
 
-async def _stream_with_model_context(
-    context: RequestModelContext,
-    stream: AsyncIterator[str],
-) -> AsyncIterator[str]:
-    """Ensure model leases survive for the full streaming response."""
-    try:
-        async for chunk in stream:
-            yield chunk
-    finally:
-        await context.release()
-
-
 def _build_tool_parser(engine: BaseEngine | None):
     """Create a fresh tool parser instance for a single request/stream."""
     if not _enable_auto_tool_choice or not _tool_call_parser:
@@ -1328,13 +1316,6 @@ def _prepare_openai_stream_reasoning_state(
         and not _thinking_disabled(request, chat_kwargs)
     )
     return parser, is_thinking_model
-
-
-def _request_tool_definitions(request: ChatCompletionRequest) -> list | None:
-    """Return the request tool schema once for streaming argument coercion."""
-    if request and request.tools:
-        return request.model_dump(include={"tools"}).get("tools")
-    return None
 
 
 def _streaming_json_fence_stripper(
