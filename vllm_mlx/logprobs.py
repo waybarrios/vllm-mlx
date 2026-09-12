@@ -12,16 +12,23 @@ values. Call it on the engine thread: MLX arrays must be evaluated on the
 thread that built them, and no MLX arrays should reach the API layer.
 """
 
+import logging
 import math
 from dataclasses import dataclass, field
-from typing import Any, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, List, Optional, Tuple
 
 import mlx.core as mx
+
+if TYPE_CHECKING:
+    from .api.models import ChoiceLogprobs, CompletionLogprobs
+
+logger = logging.getLogger(__name__)
 
 # OpenAI reports -9999.0 for very unlikely tokens. The same floor replaces the
 # -inf values that masked logits (e.g. JSON-schema constraints) produce, which
 # are not valid JSON.
 LOGPROB_FLOOR = -9999.0
+# OpenAI's limit; ``ChatCompletionRequest.top_logprobs`` enforces the same bound.
 MAX_TOP_LOGPROBS = 20
 
 
@@ -36,7 +43,7 @@ class TokenLogprob:
     top_logprobs: List[Tuple[int, str, float]] = field(default_factory=list)
 
 
-def _finite(value: float) -> float:
+def _clamp_to_floor(value: float) -> float:
     if math.isnan(value) or value < LOGPROB_FLOOR:
         return LOGPROB_FLOOR
     return value
@@ -46,11 +53,14 @@ def _decode_token(tokenizer: Any, token_id: int) -> str:
     try:
         return tokenizer.decode([token_id])
     except Exception:
+        logger.debug(
+            "Could not decode token id %d for logprobs", token_id, exc_info=True
+        )
         return ""
 
 
 def extract_token_logprob(
-    logprobs: mx.array,
+    vocab_logprobs: mx.array,
     token_id: int,
     num_top: int,
     tokenizer: Any,
@@ -58,48 +68,50 @@ def extract_token_logprob(
     """
     Build a ``TokenLogprob`` for ``token_id`` from a vocabulary logprob row.
 
-    Returns ``None`` when ``logprobs`` does not cover ``token_id``, as with the
-    placeholder arrays that error paths emit.
+    Returns ``None`` when ``vocab_logprobs`` does not cover ``token_id``, as
+    with the placeholder arrays that error paths emit.
     """
-    row = logprobs.reshape(-1)
-    vocab = row.shape[0]
-    if token_id < 0 or token_id >= vocab:
+    row = vocab_logprobs.reshape(-1)
+    vocab_size = row.shape[0]
+    if token_id < 0 or token_id >= vocab_size:
         return None
-    num_top = max(0, min(int(num_top), MAX_TOP_LOGPROBS, vocab))
+    num_top = max(0, min(int(num_top), MAX_TOP_LOGPROBS, vocab_size))
     chosen = row[token_id]
     pairs: List[Tuple[int, float]] = []
     if num_top:
         top_ids = mx.argpartition(-row, kth=num_top - 1)[:num_top]
-        top_vals = row[top_ids]
-        mx.eval(chosen, top_ids, top_vals)
+        top_values = row[top_ids]
+        mx.eval(chosen, top_ids, top_values)
         pairs = sorted(
-            zip(top_ids.tolist(), top_vals.tolist()), key=lambda pair: -pair[1]
+            zip(top_ids.tolist(), top_values.tolist()), key=lambda pair: -pair[1]
         )
     else:
         mx.eval(chosen)
     return TokenLogprob(
         token_id=token_id,
         token=_decode_token(tokenizer, token_id),
-        logprob=_finite(chosen.item()),
+        logprob=_clamp_to_floor(chosen.item()),
         top_logprobs=[
-            (tid, _decode_token(tokenizer, tid), _finite(val)) for tid, val in pairs
+            (tid, _decode_token(tokenizer, tid), _clamp_to_floor(value))
+            for tid, value in pairs
         ],
     )
 
 
-def logprobs_for_step(
+def record_step_logprobs(
     request: Any,
     response: Any,
-    num_top: Optional[int],
     tokenizer: Any,
 ) -> Optional[List[TokenLogprob]]:
     """
-    Record the logprob of ``response.token`` on ``request`` when requested.
+    Append the logprob of ``response.token`` to ``request.output_logprobs``.
 
-    Returns ``None`` when the request did not ask for logprobs. Otherwise it
-    returns this step's entries (empty for stop tokens, which are not content)
-    and appends them to ``request.output_logprobs``.
+    Returns ``None`` without touching the request when it did not ask for
+    logprobs (``request.sampling_params.logprobs is None``). Otherwise it
+    creates ``request.output_logprobs`` on first use and returns this step's
+    entries, which are empty for stop tokens because those are not content.
     """
+    num_top = request.sampling_params.logprobs
     if num_top is None:
         return None
     if request.output_logprobs is None:
@@ -117,7 +129,7 @@ def _utf8(token: str) -> List[int]:
     return list(token.encode("utf-8", errors="replace"))
 
 
-def to_chat_logprobs(entries: List[TokenLogprob]) -> Any:
+def to_chat_logprobs(entries: List[TokenLogprob]) -> "ChoiceLogprobs":
     """Format entries as an OpenAI chat ``ChoiceLogprobs``."""
     # Imported here so engine modules can use this file without the API layer.
     from .api.models import ChatCompletionTokenLogprob, ChoiceLogprobs, TopLogprob
@@ -138,7 +150,9 @@ def to_chat_logprobs(entries: List[TokenLogprob]) -> Any:
     )
 
 
-def to_completion_logprobs(entries: List[TokenLogprob], text_offset: int = 0) -> Any:
+def to_completion_logprobs(
+    entries: List[TokenLogprob], text_offset: int = 0
+) -> "CompletionLogprobs":
     """Format entries in the legacy ``/v1/completions`` logprobs shape."""
     from .api.models import CompletionLogprobs
 

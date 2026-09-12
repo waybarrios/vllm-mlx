@@ -226,7 +226,8 @@ class ChatCompletionRequest(BaseModel):
     response_format: ResponseFormat | dict | None = None
     # OpenAI-compatible token bias map: token id string -> bias value
     logit_bias: dict[str, float] | None = None
-    # OpenAI-compatible log probabilities of the output tokens
+    # OpenAI-compatible log probabilities of the output tokens. The upper bound
+    # matches ``vllm_mlx.logprobs.MAX_TOP_LOGPROBS``.
     logprobs: bool | None = None
     top_logprobs: int | None = Field(default=None, ge=0, le=20)
     # Extra kwargs forwarded to tokenizer.apply_chat_template

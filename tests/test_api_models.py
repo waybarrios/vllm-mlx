@@ -475,6 +475,19 @@ class TestLogprobs:
                 top_logprobs=21,
             )
 
+    def test_chat_request_accepts_zero_top_logprobs(self):
+        req = ChatCompletionRequest(
+            model="test-model",
+            messages=[{"role": "user", "content": "Hi"}],
+            logprobs=True,
+            top_logprobs=0,
+        )
+        assert req.top_logprobs == 0
+
+    def test_completion_request_rejects_negative_logprobs(self):
+        with pytest.raises(ValidationError):
+            CompletionRequest(model="test-model", prompt="Hi", logprobs=-1)
+
     def test_completion_request_logprobs_bounds(self):
         req = CompletionRequest(model="test-model", prompt="Hi", logprobs=5)
         assert req.logprobs == 5

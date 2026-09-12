@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Union
 
 if TYPE_CHECKING:
+    from .logprobs import TokenLogprob
     from .paged_cache import BlockTable
 
 
@@ -112,7 +113,7 @@ class Request:
     output_token_ids: List[int] = field(default_factory=list)
     output_text: str = ""
     # Per-token logprobs, when requested (see ``vllm_mlx.logprobs``)
-    output_logprobs: Optional[List[Any]] = None
+    output_logprobs: Optional[List["TokenLogprob"]] = None
 
     # For BatchGenerator integration
     batch_uid: Optional[int] = None  # UID assigned by BatchGenerator
@@ -224,8 +225,8 @@ class RequestOutput:
     mtp_accepted: int = 0
     # Per-token logprobs when requested: entries for this step's content
     # tokens (stop tokens excluded) and the cumulative list.
-    new_logprobs: Optional[List[Any]] = None
-    output_logprobs: Optional[List[Any]] = None
+    new_logprobs: Optional[List["TokenLogprob"]] = None
+    output_logprobs: Optional[List["TokenLogprob"]] = None
 
     @property
     def usage(self) -> Dict[str, int]:

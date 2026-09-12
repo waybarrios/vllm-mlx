@@ -139,7 +139,12 @@ Notes:
   post-processes text for reasoning and tool-call parsing, `response_format`
   JSON normalization and whitespace trimming, so `message.content` can differ
   from the concatenated tokens.
-- Requests that ask for logprobs skip speculative (MTP or drafter) decoding.
+- Requests that ask for logprobs never receive speculatively drafted tokens:
+  they skip multimodal MTP and drafter decoding. The LLM path's MTP hook is
+  inactive with mlx-lm 0.31 and later.
+- `token` and `bytes` come from decoding each token on its own, so a token
+  that is only part of a multi-byte UTF-8 character reports the replacement
+  character (U+FFFD), as in vLLM.
 - Batched forward passes accumulate floating-point results in a different
   order from single requests, so values can differ slightly between batched
   and unbatched runs. At an exact tie this can also flip the greedy token.

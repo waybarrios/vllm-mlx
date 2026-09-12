@@ -10,7 +10,10 @@ from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from ..logprobs import TokenLogprob
 
 logger = logging.getLogger(__name__)
 
@@ -33,9 +36,10 @@ class GenerationOutput:
     # For streaming
     new_text: str = ""
     finished: bool = True
-    # Per-token logprobs (``vllm_mlx.logprobs.TokenLogprob``) when requested:
-    # this step's tokens for streaming outputs, all tokens for final outputs.
-    logprobs: list | None = None
+    # Per-token logprobs when requested: all tokens so far (like ``text``)
+    # and this step's tokens (like ``new_text``).
+    logprobs: list["TokenLogprob"] | None = None
+    new_logprobs: list["TokenLogprob"] | None = None
     # MTP speculative decoding counters. Zero means no MTP attempt occurred.
     mtp_drafts: int = 0
     mtp_accepted: int = 0

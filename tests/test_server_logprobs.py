@@ -31,9 +31,61 @@ def _sse_payloads(chunks):
     return payloads
 
 
+def _streamed_chat_tokens(chunks):
+    return [
+        token["token"]
+        for payload in _sse_payloads(chunks)
+        for choice in payload.get("choices", [])
+        if choice.get("logprobs")
+        for token in choice["logprobs"]["content"]
+    ]
+
+
+class FakeChatEngine:
+    """Chat engine double that records its kwargs and returns canned outputs."""
+
+    model_name = "fake-engine"
+    is_mllm = False
+    preserve_native_tool_format = False
+
+    def __init__(self, result=None, stream=(), supports_logprobs=True):
+        self.result = result
+        self.stream = list(stream)
+        self.supports_logprobs = supports_logprobs
+        self.kwargs = None
+
+    async def chat(self, messages, **kwargs):
+        self.kwargs = kwargs
+        return self.result
+
+    async def stream_chat(self, messages, **kwargs):
+        self.kwargs = kwargs
+        for output in self.stream:
+            yield output
+
+
+class FakeCompletionEngine:
+    """Completion engine double that records its kwargs and returns canned outputs."""
+
+    def __init__(self, result=None, stream=(), supports_logprobs=True):
+        self.result = result
+        self.stream = list(stream)
+        self.supports_logprobs = supports_logprobs
+        self.kwargs = None
+
+    async def generate(self, **kwargs):
+        self.kwargs = kwargs
+        return self.result
+
+    async def stream_generate(self, **kwargs):
+        self.kwargs = kwargs
+        for output in self.stream:
+            yield output
+
+
 @pytest.fixture
 def chat_server(monkeypatch):
-    """Patch server globals so chat handlers run against a fake engine."""
+    """Patch server globals so chat handlers run against ``state["engine"]``."""
     import vllm_mlx.server as server
 
     state = {"engine": None}
@@ -65,229 +117,276 @@ def chat_server(monkeypatch):
     return state
 
 
+@pytest.fixture
+def hides_tag_parser(monkeypatch):
+    """Install a reasoning parser that consumes ``<tag>`` without emitting a chunk."""
+    import vllm_mlx.server as server
+    from vllm_mlx.reasoning import DeltaMessage
+
+    class HidesTagParser:
+        def __init__(self, tokenizer=None):
+            pass
+
+        def reset_state(self, implicit_mode: bool = False):
+            pass
+
+        def extract_reasoning_streaming(self, previous_text, current_text, delta_text):
+            if delta_text == "<tag>":
+                return None
+            return DeltaMessage(content=delta_text)
+
+    monkeypatch.setattr(server, "_reasoning_parser_name", "hides-tag")
+    monkeypatch.setattr(server, "_reasoning_parser", None)
+    monkeypatch.setattr(server, "get_reasoning_parser", lambda name: HidesTagParser)
+
+
+@pytest.fixture
+def completion_server(monkeypatch):
+    """Patch server globals so completion handlers use ``state["engine"]``."""
+    import vllm_mlx.server as server
+
+    state = {"engine": None}
+    monkeypatch.setattr(server, "_model_name", "test-model")
+    monkeypatch.setattr(server, "_model_manager", None)
+    monkeypatch.setattr(server, "_residency_manager", None)
+    monkeypatch.setattr(server, "_default_model_key", None)
+    monkeypatch.setattr(server, "get_engine", lambda: state["engine"])
+    return state
+
+
+def _chat_request(**fields):
+    from vllm_mlx.server import ChatCompletionRequest, Message
+
+    return ChatCompletionRequest(
+        model="served-model",
+        messages=[Message(role="user", content="Hello")],
+        **fields,
+    )
+
+
+async def _stream_chat(engine, request):
+    from vllm_mlx.server import stream_chat_completion
+
+    return [
+        chunk
+        async for chunk in stream_chat_completion(engine, request.messages, request)
+    ]
+
+
 class TestChatCompletionLogprobs:
     @pytest.mark.anyio
     async def test_nonstream_returns_logprobs_and_forwards_top(self, chat_server):
         from vllm_mlx.engine.base import GenerationOutput
-        from vllm_mlx.server import (
-            ChatCompletionRequest,
-            Message,
-            create_chat_completion,
+        from vllm_mlx.server import create_chat_completion
+
+        engine = FakeChatEngine(
+            result=GenerationOutput(
+                text="Hi!",
+                prompt_tokens=3,
+                completion_tokens=2,
+                finish_reason="stop",
+                logprobs=[
+                    _entry(0, "Hi", -0.1, [(0, "Hi", -0.1), (1, "Hey", -2.0)]),
+                    _entry(2, "!", -0.3),
+                ],
+            )
+        )
+        chat_server["engine"] = engine
+
+        response = await create_chat_completion(
+            _chat_request(logprobs=True, top_logprobs=2), raw_request=None
         )
 
-        captured = {}
-
-        class FakeEngine:
-            model_name = "fake-engine"
-            is_mllm = False
-            preserve_native_tool_format = False
-            supports_logprobs = True
-
-            async def chat(self, messages, **kwargs):
-                captured.update(kwargs)
-                return GenerationOutput(
-                    text="Hi!",
-                    prompt_tokens=3,
-                    completion_tokens=2,
-                    finish_reason="stop",
-                    logprobs=[
-                        _entry(0, "Hi", -0.1, [(0, "Hi", -0.1), (1, "Hey", -2.0)]),
-                        _entry(2, "!", -0.3),
-                    ],
-                )
-
-        chat_server["engine"] = FakeEngine()
-        request = ChatCompletionRequest(
-            model="served-model",
-            messages=[Message(role="user", content="Hello")],
-            logprobs=True,
-            top_logprobs=2,
-        )
-
-        response = await create_chat_completion(request, raw_request=None)
-
-        assert captured["logprobs"] == 2
+        assert engine.kwargs["logprobs"] == 2
         content = response.choices[0].logprobs.content
         assert [token.token for token in content] == ["Hi", "!"]
         assert [top.token for top in content[0].top_logprobs] == ["Hi", "Hey"]
-        assert content[1].bytes == [33]
+        assert content[1].bytes == [ord("!")]
 
     @pytest.mark.anyio
     async def test_nonstream_without_logprobs_sends_no_flag(self, chat_server):
         from vllm_mlx.engine.base import GenerationOutput
-        from vllm_mlx.server import (
-            ChatCompletionRequest,
-            Message,
-            create_chat_completion,
+        from vllm_mlx.server import create_chat_completion
+
+        engine = FakeChatEngine(
+            result=GenerationOutput(text="ok", finish_reason="stop"),
+            supports_logprobs=False,
         )
+        chat_server["engine"] = engine
 
-        captured = {}
+        response = await create_chat_completion(_chat_request(), raw_request=None)
 
-        class FakeEngine:
-            model_name = "fake-engine"
-            is_mllm = False
-            preserve_native_tool_format = False
-
-            async def chat(self, messages, **kwargs):
-                captured.update(kwargs)
-                return GenerationOutput(text="ok", finish_reason="stop")
-
-        chat_server["engine"] = FakeEngine()
-        request = ChatCompletionRequest(
-            model="served-model", messages=[Message(role="user", content="Hello")]
-        )
-
-        response = await create_chat_completion(request, raw_request=None)
-
-        assert "logprobs" not in captured
+        assert "logprobs" not in engine.kwargs
         assert response.choices[0].logprobs is None
 
     @pytest.mark.anyio
     async def test_engine_without_support_is_rejected(self, chat_server):
         from fastapi import HTTPException
 
-        from vllm_mlx.server import (
-            ChatCompletionRequest,
-            Message,
-            create_chat_completion,
-        )
+        from vllm_mlx.server import create_chat_completion
 
-        class FakeEngine:
-            model_name = "fake-engine"
-            is_mllm = False
-            preserve_native_tool_format = False
-
-            async def chat(self, messages, **kwargs):
-                raise AssertionError("engine must not be called")
-
-        chat_server["engine"] = FakeEngine()
-        request = ChatCompletionRequest(
-            model="served-model",
-            messages=[Message(role="user", content="Hello")],
-            logprobs=True,
-        )
+        engine = FakeChatEngine(supports_logprobs=False)
+        chat_server["engine"] = engine
 
         with pytest.raises(HTTPException) as excinfo:
-            await create_chat_completion(request, raw_request=None)
+            await create_chat_completion(_chat_request(logprobs=True), raw_request=None)
+
         assert excinfo.value.status_code == 400
         assert "continuous-batching" in excinfo.value.detail
+        assert engine.kwargs is None
 
     @pytest.mark.anyio
     async def test_stream_emits_each_token_logprob_once(self, chat_server):
         from vllm_mlx.engine.base import GenerationOutput
-        from vllm_mlx.server import (
-            ChatCompletionRequest,
-            Message,
-            stream_chat_completion,
-        )
 
-        class FakeEngine:
-            model_name = "fake-engine"
-            supports_logprobs = True
-
-            async def stream_chat(self, messages, **kwargs):
-                yield GenerationOutput(
+        engine = FakeChatEngine(
+            stream=[
+                GenerationOutput(
                     text="",
                     new_text="Hi",
                     finished=False,
-                    logprobs=[_entry(0, "Hi", -0.1)],
-                )
-                yield GenerationOutput(
+                    new_logprobs=[_entry(0, "Hi", -0.1)],
+                ),
+                GenerationOutput(
                     text="",
                     new_text="!",
                     finished=True,
                     finish_reason="stop",
-                    logprobs=[_entry(2, "!", -0.3)],
-                )
-
-        request = ChatCompletionRequest(
-            model="served-model",
-            messages=[Message(role="user", content="Hello")],
-            stream=True,
-            logprobs=True,
+                    new_logprobs=[_entry(2, "!", -0.3)],
+                ),
+            ]
         )
 
-        chunks = [
-            chunk
-            async for chunk in stream_chat_completion(
-                FakeEngine(), request.messages, request
-            )
-        ]
+        chunks = await _stream_chat(engine, _chat_request(stream=True, logprobs=True))
 
-        tokens = [
-            token["token"]
+        assert _streamed_chat_tokens(chunks) == ["Hi", "!"]
+
+    @pytest.mark.anyio
+    async def test_stream_keeps_logprobs_of_a_consumed_final_token(
+        self, chat_server, hides_tag_parser
+    ):
+        """A parser that swallows the finishing output forces the terminal chunk."""
+        from vllm_mlx.engine.base import GenerationOutput
+
+        engine = FakeChatEngine(
+            stream=[
+                GenerationOutput(
+                    text="",
+                    new_text="Hi",
+                    finished=False,
+                    new_logprobs=[_entry(0, "Hi", -0.1)],
+                ),
+                GenerationOutput(
+                    text="",
+                    new_text="<tag>",
+                    finished=True,
+                    finish_reason="stop",
+                    new_logprobs=[_entry(9, "<tag>", -0.2)],
+                ),
+            ]
+        )
+
+        chunks = await _stream_chat(engine, _chat_request(stream=True, logprobs=True))
+
+        assert _streamed_chat_tokens(chunks) == ["Hi", "<tag>"]
+        finishing = [
+            choice
             for payload in _sse_payloads(chunks)
             for choice in payload.get("choices", [])
-            if choice.get("logprobs")
-            for token in choice["logprobs"]["content"]
+            if choice.get("finish_reason")
         ]
-        assert tokens == ["Hi", "!"]
+        assert finishing and finishing[-1]["logprobs"]["content"][0]["token"] == "<tag>"
 
-    def test_pending_logprobs_wait_for_a_chunk_with_choices(self):
+    @pytest.mark.anyio
+    async def test_stream_flushes_consumed_tokens_when_stream_ends_early(
+        self, chat_server, hides_tag_parser
+    ):
+        from vllm_mlx.engine.base import GenerationOutput
+
+        engine = FakeChatEngine(
+            stream=[
+                GenerationOutput(
+                    text="",
+                    new_text="Hi",
+                    finished=False,
+                    new_logprobs=[_entry(0, "Hi", -0.1)],
+                ),
+                GenerationOutput(
+                    text="",
+                    new_text="<tag>",
+                    finished=False,
+                    new_logprobs=[_entry(9, "<tag>", -0.2)],
+                ),
+            ]
+        )
+
+        chunks = await _stream_chat(engine, _chat_request(stream=True, logprobs=True))
+
+        assert _streamed_chat_tokens(chunks) == ["Hi", "<tag>"]
+
+
+class TestAttachPendingLogprobs:
+    def _chunk_with_choice(self):
         from vllm_mlx.api.models import (
             ChatCompletionChunk,
             ChatCompletionChunkChoice,
             ChatCompletionChunkDelta,
         )
+
+        return ChatCompletionChunk(
+            model="m",
+            choices=[
+                ChatCompletionChunkChoice(delta=ChatCompletionChunkDelta(content="Hi"))
+            ],
+        )
+
+    def test_chunk_without_choices_leaves_entries_pending(self):
+        from vllm_mlx.api.models import ChatCompletionChunk
         from vllm_mlx.server import _attach_pending_logprobs
 
         pending = [_entry(0, "Hi", -0.1)]
+        _attach_pending_logprobs(ChatCompletionChunk(model="m", choices=[]), pending)
 
-        usage_only = _attach_pending_logprobs(
-            ChatCompletionChunk(model="m", choices=[]), pending
-        )
-        assert usage_only.choices == []
         assert len(pending) == 1
 
-        chunk = _attach_pending_logprobs(
-            ChatCompletionChunk(
-                model="m",
-                choices=[
-                    ChatCompletionChunkChoice(
-                        delta=ChatCompletionChunkDelta(content="Hi")
-                    )
-                ],
-            ),
-            pending,
-        )
+    def test_entries_move_onto_the_next_chunk_with_choices(self):
+        from vllm_mlx.server import _attach_pending_logprobs
+
+        pending = [_entry(0, "Hi", -0.1)]
+        chunk = self._chunk_with_choice()
+        _attach_pending_logprobs(chunk, pending)
+
         assert [t.token for t in chunk.choices[0].logprobs.content] == ["Hi"]
         assert pending == []
 
 
 class TestCompletionLogprobs:
     @pytest.mark.anyio
-    async def test_nonstream_completion_returns_legacy_logprobs(self, monkeypatch):
-        import vllm_mlx.server as server
+    async def test_nonstream_completion_returns_legacy_logprobs(
+        self, completion_server
+    ):
         from vllm_mlx.server import CompletionRequest, create_completion
 
-        captured = {}
+        engine = FakeCompletionEngine(
+            result=SimpleNamespace(
+                text="ab",
+                finish_reason="stop",
+                completion_tokens=2,
+                prompt_tokens=1,
+                logprobs=[
+                    _entry(0, "a", -0.2, [(0, "a", -0.2), (1, "b", -1.9)]),
+                    _entry(1, "b", -0.4),
+                ],
+            )
+        )
+        completion_server["engine"] = engine
 
-        class DummyEngine:
-            supports_logprobs = True
+        response = await create_completion(
+            CompletionRequest(model="test-model", prompt="hello", logprobs=1),
+            raw_request=None,
+        )
 
-            async def generate(self, **kwargs):
-                captured.update(kwargs)
-                return SimpleNamespace(
-                    text="ab",
-                    finish_reason="stop",
-                    completion_tokens=2,
-                    prompt_tokens=1,
-                    logprobs=[
-                        _entry(0, "a", -0.2, [(0, "a", -0.2), (1, "b", -1.9)]),
-                        _entry(1, "b", -0.4),
-                    ],
-                )
-
-        monkeypatch.setattr(server, "_model_name", "test-model")
-        monkeypatch.setattr(server, "_model_manager", None)
-        monkeypatch.setattr(server, "_residency_manager", None)
-        monkeypatch.setattr(server, "_default_model_key", None)
-        monkeypatch.setattr(server, "get_engine", lambda: DummyEngine())
-
-        request = CompletionRequest(model="test-model", prompt="hello", logprobs=1)
-        response = await create_completion(request, raw_request=None)
-
-        assert captured["logprobs"] == 1
+        assert engine.kwargs["logprobs"] == 1
         logprobs = response.choices[0].logprobs
         assert logprobs.tokens == ["a", "b"]
         assert logprobs.token_logprobs == [-0.2, -0.4]
@@ -295,26 +394,24 @@ class TestCompletionLogprobs:
         assert logprobs.top_logprobs[0] == {"a": -0.2, "b": -1.9}
 
     @pytest.mark.anyio
-    async def test_completion_engine_without_support_is_rejected(self, monkeypatch):
+    async def test_completion_engine_without_support_is_rejected(
+        self, completion_server
+    ):
         from fastapi import HTTPException
 
-        import vllm_mlx.server as server
         from vllm_mlx.server import CompletionRequest, create_completion
 
-        class DummyEngine:
-            async def generate(self, **kwargs):
-                raise AssertionError("engine must not be called")
+        engine = FakeCompletionEngine(supports_logprobs=False)
+        completion_server["engine"] = engine
 
-        monkeypatch.setattr(server, "_model_name", "test-model")
-        monkeypatch.setattr(server, "_model_manager", None)
-        monkeypatch.setattr(server, "_residency_manager", None)
-        monkeypatch.setattr(server, "_default_model_key", None)
-        monkeypatch.setattr(server, "get_engine", lambda: DummyEngine())
-
-        request = CompletionRequest(model="test-model", prompt="hello", logprobs=0)
         with pytest.raises(HTTPException) as excinfo:
-            await create_completion(request, raw_request=None)
+            await create_completion(
+                CompletionRequest(model="test-model", prompt="hello", logprobs=0),
+                raw_request=None,
+            )
+
         assert excinfo.value.status_code == 400
+        assert engine.kwargs is None
 
     @pytest.mark.anyio
     async def test_stream_completion_offsets_continue_across_chunks(self):
@@ -322,36 +419,33 @@ class TestCompletionLogprobs:
         from vllm_mlx.engine.base import GenerationOutput
         from vllm_mlx.server import stream_completion
 
-        captured = {}
-
-        class DummyEngine:
-            async def stream_generate(self, **kwargs):
-                captured.update(kwargs)
-                yield GenerationOutput(
+        engine = FakeCompletionEngine(
+            stream=[
+                GenerationOutput(
                     text="",
                     new_text="ab",
                     finished=False,
-                    logprobs=[_entry(0, "ab", -0.5)],
-                )
-                yield GenerationOutput(
+                    new_logprobs=[_entry(0, "ab", -0.5)],
+                ),
+                GenerationOutput(
                     text="",
                     new_text="c",
                     finished=True,
                     finish_reason="stop",
                     completion_tokens=2,
                     prompt_tokens=1,
-                    logprobs=[_entry(2, "c", -0.7)],
-                )
-
+                    new_logprobs=[_entry(2, "c", -0.7)],
+                ),
+            ]
+        )
         request = CompletionRequest(model="test-model", prompt="hello", logprobs=0)
+
         chunks = [
             chunk
-            async for chunk in stream_completion(
-                DummyEngine(), "hello", request, max_tokens=8
-            )
+            async for chunk in stream_completion(engine, "hello", request, max_tokens=8)
         ]
 
-        assert captured["logprobs"] == 0
+        assert engine.kwargs["logprobs"] == 0
         choice_logprobs = [
             payload["choices"][0]["logprobs"] for payload in _sse_payloads(chunks)
         ]

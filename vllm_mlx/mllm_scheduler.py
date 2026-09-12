@@ -37,7 +37,7 @@ from .mllm_batch_generator import (
 )
 from .mlx_streams import bind_generation_streams
 from .multimodal_processor import MultimodalProcessor
-from .logprobs import logprobs_for_step
+from .logprobs import TokenLogprob, record_step_logprobs
 from .request import RequestOutput, RequestStatus, SamplingParams
 
 logger = logging.getLogger(__name__)
@@ -120,7 +120,7 @@ class MLLMRequest:
     output_text: str = ""
     output_tokens: List[int] = field(default_factory=list)
     # Per-token logprobs, when requested (see ``vllm_mlx.logprobs``)
-    output_logprobs: Optional[List[Any]] = None
+    output_logprobs: Optional[List[TokenLogprob]] = None
     finish_reason: Optional[str] = None
 
     # Token counts
@@ -708,9 +708,7 @@ class MLLMScheduler:
                 detok.add_token(response.token)
                 new_text = detok.last_segment
 
-            new_logprobs = logprobs_for_step(
-                request, response, request.sampling_params.logprobs, tokenizer
-            )
+            new_logprobs = record_step_logprobs(request, response, tokenizer)
 
             # Create output
             output = RequestOutput(
@@ -878,6 +876,7 @@ class MLLMScheduler:
                         RequestOutput(
                             request_id=request_id,
                             output_token_ids=list(request.output_tokens),
+                            output_logprobs=getattr(request, "output_logprobs", None),
                             output_text=request.output_text,
                             finished=True,
                             finish_reason="error",

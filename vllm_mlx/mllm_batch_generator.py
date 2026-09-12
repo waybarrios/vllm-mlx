@@ -2345,6 +2345,9 @@ def install_mtp_mllm(
         logits_processors_bypass = logits_processors is not None and any(
             logits_processors
         )
+        # ``logprobs`` is Optional[int]. Checking the type rather than
+        # ``is not None`` keeps request doubles without the field (e.g.
+        # ``MagicMock``) from reading as logprobs requests.
         logprobs_bypass = any(
             isinstance(getattr(request, "logprobs", None), int)
             for request in active_requests

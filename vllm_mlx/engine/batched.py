@@ -897,7 +897,8 @@ class BatchedEngine(BaseEngine):
                     finish_reason=output.finish_reason,
                     mtp_drafts=output.mtp_drafts,
                     mtp_accepted=output.mtp_accepted,
-                    logprobs=getattr(output, "new_logprobs", None),
+                    logprobs=getattr(output, "output_logprobs", None),
+                    new_logprobs=getattr(output, "new_logprobs", None),
                 )
             return
 
@@ -934,7 +935,8 @@ class BatchedEngine(BaseEngine):
                 completion_tokens=output.completion_tokens,
                 finished=output.finished,
                 finish_reason=output.finish_reason,
-                logprobs=getattr(output, "new_logprobs", None),
+                logprobs=getattr(output, "output_logprobs", None),
+                new_logprobs=getattr(output, "new_logprobs", None),
             )
 
     async def chat(
