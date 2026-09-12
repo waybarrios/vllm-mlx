@@ -10,7 +10,10 @@ from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from ..logprobs import TokenLogprob
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +36,10 @@ class GenerationOutput:
     # For streaming
     new_text: str = ""
     finished: bool = True
+    # Per-token logprobs when requested: all tokens so far (like ``text``)
+    # and this step's tokens (like ``new_text``).
+    logprobs: list["TokenLogprob"] | None = None
+    new_logprobs: list["TokenLogprob"] | None = None
     # MTP speculative decoding counters. Zero means no MTP attempt occurred.
     mtp_drafts: int = 0
     mtp_accepted: int = 0
@@ -269,6 +276,11 @@ class BaseEngine(ABC):
     @preserve_native_tool_format.setter
     def preserve_native_tool_format(self, value: bool) -> None:
         self._preserve_native_tool_format = value
+
+    @property
+    def supports_logprobs(self) -> bool:
+        """Whether generation can return per-token logprobs."""
+        return False
 
     def prepare_for_start(self) -> None:
         """Run blocking startup work before async engine start.

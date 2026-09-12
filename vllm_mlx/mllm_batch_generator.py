@@ -210,6 +210,10 @@ class MLLMBatchRequest:
     # Merged with built-in repetition/presence penalty processors in
     # ``_prefill_batch``.
     logits_processors: Optional[List[Callable]] = None
+    # Most likely alternatives to report per token; ``None`` disables logprobs.
+    # Requests with logprobs skip speculative drafting, whose draft tokens
+    # report logprobs from a different distribution.
+    logprobs: Optional[int] = None
 
     # Processed inputs (set after vision preprocessing)
     input_ids: Optional[mx.array] = None
@@ -2287,6 +2291,7 @@ def install_mtp_mllm(
         "no_active_batch": 0,
         "concurrent_batch": 0,
         "logits_processors": 0,
+        "logprobs": 0,
         "assistant_not_requested": 0,
     }
 
@@ -2340,6 +2345,13 @@ def install_mtp_mllm(
         logits_processors_bypass = logits_processors is not None and any(
             logits_processors
         )
+        # ``logprobs`` is Optional[int]. Checking the type rather than
+        # ``is not None`` keeps request doubles without the field (e.g.
+        # ``MagicMock``) from reading as logprobs requests.
+        logprobs_bypass = any(
+            isinstance(getattr(request, "logprobs", None), int)
+            for request in active_requests
+        )
         assistant_not_requested_bypass = external_drafter and (
             not active_requests
             or not all(request.mllm_draft for request in active_requests)
@@ -2348,6 +2360,7 @@ def install_mtp_mllm(
             prefill_bypass
             or no_active_batch_bypass
             or logits_processors_bypass
+            or logprobs_bypass
             or assistant_not_requested_bypass
         ):
             # Keep the descriptions near the guards so operator-facing
@@ -2363,6 +2376,8 @@ def install_mtp_mllm(
                     _bypass_counts["no_active_batch"] += 1
                 if logits_processors_bypass:
                     _bypass_counts["logits_processors"] += 1
+                if logprobs_bypass:
+                    _bypass_counts["logprobs"] += 1
                 if assistant_not_requested_bypass:
                     _bypass_counts["assistant_not_requested"] += 1
             _skip_state_by_uid.clear()

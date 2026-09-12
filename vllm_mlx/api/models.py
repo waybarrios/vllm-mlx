@@ -165,6 +165,44 @@ class StreamOptions(BaseModel):
     include_usage: bool = False  # Include usage stats in final chunk
 
 
+# =============================================================================
+# Log Probabilities (OpenAI-compatible)
+# =============================================================================
+
+
+class TopLogprob(BaseModel):
+    """One of the most likely tokens at a position, with its log probability."""
+
+    token: str
+    logprob: float
+    bytes: list[int] | None = None
+
+
+class ChatCompletionTokenLogprob(BaseModel):
+    """Log probability information for one generated token."""
+
+    token: str
+    logprob: float
+    bytes: list[int] | None = None
+    top_logprobs: list[TopLogprob] = Field(default_factory=list)
+
+
+class ChoiceLogprobs(BaseModel):
+    """Log probability information for a chat completion choice."""
+
+    content: list[ChatCompletionTokenLogprob] | None = None
+    refusal: list[ChatCompletionTokenLogprob] | None = None
+
+
+class CompletionLogprobs(BaseModel):
+    """Legacy log probability format for text completions."""
+
+    tokens: list[str] = Field(default_factory=list)
+    token_logprobs: list[float] = Field(default_factory=list)
+    top_logprobs: list[dict[str, float]] | None = None
+    text_offset: list[int] = Field(default_factory=list)
+
+
 class ChatCompletionRequest(BaseModel):
     """Request for chat completion."""
 
@@ -188,6 +226,10 @@ class ChatCompletionRequest(BaseModel):
     response_format: ResponseFormat | dict | None = None
     # OpenAI-compatible token bias map: token id string -> bias value
     logit_bias: dict[str, float] | None = None
+    # OpenAI-compatible log probabilities of the output tokens. The upper bound
+    # matches ``vllm_mlx.logprobs.MAX_TOP_LOGPROBS``.
+    logprobs: bool | None = None
+    top_logprobs: int | None = Field(default=None, ge=0, le=20)
     # Extra kwargs forwarded to tokenizer.apply_chat_template
     chat_template_kwargs: dict[str, Any] | None = None
     # MLLM-specific parameters
@@ -212,6 +254,12 @@ class ChatCompletionRequest(BaseModel):
     # Thinking token budget: cap reasoning tokens by forcing </think> when
     # budget exhausted (None = no budget, unlimited reasoning)
     thinking_token_budget: int | None = Field(default=None, gt=0)
+
+    @model_validator(mode="after")
+    def _top_logprobs_requires_logprobs(self) -> "ChatCompletionRequest":
+        if self.top_logprobs is not None and not self.logprobs:
+            raise ValueError("`logprobs` must be true when `top_logprobs` is set")
+        return self
 
 
 class AssistantMessage(BaseModel):
@@ -250,6 +298,7 @@ class ChatCompletionChoice(BaseModel):
     index: int = 0
     message: AssistantMessage
     finish_reason: str | None = "stop"
+    logprobs: ChoiceLogprobs | None = None
 
 
 class Usage(BaseModel):
@@ -299,6 +348,8 @@ class CompletionRequest(BaseModel):
     max_tokens: int | None = Field(default=None, gt=0)
     stream: bool = False
     stop: list[str] | None = None
+    # OpenAI-compatible: number of most likely tokens to return per position
+    logprobs: int | None = Field(default=None, ge=0, le=5)
     # Sampling penalties
     repetition_penalty: float | None = None  # mlx-lm style (>1.0 penalizes)
     # Request timeout in seconds (None = use server default)
@@ -319,6 +370,7 @@ class CompletionChoice(BaseModel):
     index: int = 0
     text: str
     finish_reason: str | None = "stop"
+    logprobs: CompletionLogprobs | None = None
 
 
 class CompletionResponse(BaseModel):
@@ -566,6 +618,7 @@ class ChatCompletionChunkChoice(BaseModel):
     index: int = 0
     delta: ChatCompletionChunkDelta
     finish_reason: str | None = None
+    logprobs: ChoiceLogprobs | None = None
 
 
 class ChatCompletionChunk(BaseModel):

@@ -1088,6 +1088,7 @@ class TestMLLMBatchGeneratorMTPGuards:
             "no_active_batch": 0,
             "concurrent_batch": 0,
             "logits_processors": 0,
+            "logprobs": 0,
             "assistant_not_requested": 0,
         }
 
@@ -1110,6 +1111,53 @@ class TestMLLMBatchGeneratorMTPGuards:
         stats = batch_gen.get_mtp_stats()
         assert stats["attempted"] == 0
         assert stats["bypass_counts"]["logits_processors"] == 1
+
+    def test_install_mtp_mllm_disables_mtp_when_logprobs_requested(self):
+        """Draft tokens report logprobs from a different distribution, so
+        requests that ask for logprobs must take the non-speculative step."""
+        from vllm_mlx.mllm_batch_generator import install_mtp_mllm
+
+        expected_tokens = mx.array([7])
+        expected_logprobs = [mx.array([0.1, 0.9])]
+        original_step = MagicMock(return_value=(expected_tokens, expected_logprobs))
+
+        class FakeBatchGen:
+            def __init__(self):
+                self._step = original_step
+                self._next = MagicMock(return_value=[])
+                self.active_batch = MagicMock()
+                self.active_batch.__len__.return_value = 1
+                self.active_batch.requests = [
+                    MagicMock(
+                        temperature=0.0,
+                        top_p=1.0,
+                        top_k=0,
+                        min_p=0.0,
+                        logprobs=0,
+                    )
+                ]
+                self.sampler = MagicMock()
+
+        batch_gen = FakeBatchGen()
+        language_model = MagicMock()
+
+        install_mtp_mllm(batch_gen, language_model, num_draft_tokens=4)
+
+        tokens, logprobs = batch_gen._step(
+            mx.array([[123]]),
+            cache=[],
+            logits_processors=None,
+            output_tokens=[[1, 2]],
+            samplers=[None],
+        )
+
+        assert tokens.tolist() == expected_tokens.tolist()
+        original_step.assert_called_once()
+        language_model.mtp_forward.assert_not_called()
+        stats = batch_gen.get_mtp_stats()
+        assert stats["attempted"] == 0
+        assert stats["bypass_counts"]["logprobs"] == 1
+        assert stats["bypass_counts"]["logits_processors"] == 0
 
     def test_external_mtp_requires_every_active_request_to_opt_in(self):
         from vllm_mlx.mllm_batch_generator import install_mtp_mllm

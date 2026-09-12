@@ -112,6 +112,44 @@ for chunk in stream:
         print(chunk.choices[0].delta.content, end="")
 ```
 
+#### Log probabilities
+
+With `--continuous-batching`, chat completions accept `logprobs: true` and
+`top_logprobs` (0-20), and text completions accept `logprobs` (0-5). The
+server then returns OpenAI-format per-token log probabilities, both streaming
+and non-streaming:
+
+```python
+response = client.chat.completions.create(
+    model="default",
+    messages=[{"role": "user", "content": "Hello!"}],
+    logprobs=True,
+    top_logprobs=5,
+)
+for token in response.choices[0].logprobs.content:
+    print(token.token, token.logprob)
+```
+
+Notes:
+
+- Values are taken after logits processors (JSON-schema constraints,
+  `logit_bias`, repetition and presence penalties) and before temperature,
+  top-p, top-k and min-p.
+- They cover every generated token except the final stop token. The server
+  post-processes text for reasoning and tool-call parsing, `response_format`
+  JSON normalization and whitespace trimming, so `message.content` can differ
+  from the concatenated tokens.
+- Requests that ask for logprobs never receive speculatively drafted tokens:
+  they skip multimodal MTP and drafter decoding. The LLM path's MTP hook is
+  inactive with mlx-lm 0.31 and later.
+- `token` and `bytes` come from decoding each token on its own, so a token
+  that is only part of a multi-byte UTF-8 character reports the replacement
+  character (U+FFFD), as in vLLM.
+- Batched forward passes accumulate floating-point results in a different
+  order from single requests, so values can differ slightly between batched
+  and unbatched runs. At an exact tie this can also flip the greedy token.
+- The default simple engine returns HTTP 400 for logprobs requests.
+
 ### Completions
 
 ```bash

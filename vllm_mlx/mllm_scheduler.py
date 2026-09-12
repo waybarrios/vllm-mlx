@@ -37,6 +37,7 @@ from .mllm_batch_generator import (
 )
 from .mlx_streams import bind_generation_streams
 from .multimodal_processor import MultimodalProcessor
+from .logprobs import TokenLogprob, record_step_logprobs
 from .request import RequestOutput, RequestStatus, SamplingParams
 
 logger = logging.getLogger(__name__)
@@ -118,6 +119,8 @@ class MLLMRequest:
     status: RequestStatus = RequestStatus.WAITING
     output_text: str = ""
     output_tokens: List[int] = field(default_factory=list)
+    # Per-token logprobs, when requested (see ``vllm_mlx.logprobs``)
+    output_logprobs: Optional[List[TokenLogprob]] = None
     finish_reason: Optional[str] = None
 
     # Token counts
@@ -449,6 +452,7 @@ class MLLMScheduler:
             presence_penalty=kwargs.pop("presence_penalty", 0.0),
             repetition_penalty=kwargs.pop("repetition_penalty", 1.0),
             logits_processors=kwargs.pop("logits_processors", None),
+            logprobs=kwargs.pop("logprobs", None),
         )
 
         request = MLLMRequest(
@@ -606,6 +610,7 @@ class MLLMScheduler:
                 presence_penalty=request.sampling_params.presence_penalty,
                 repetition_penalty=request.sampling_params.repetition_penalty,
                 logits_processors=request.sampling_params.logits_processors,
+                logprobs=request.sampling_params.logprobs,
                 mllm_draft=request.mllm_draft,
             )
             batch_requests.append(batch_req)
@@ -703,6 +708,8 @@ class MLLMScheduler:
                 detok.add_token(response.token)
                 new_text = detok.last_segment
 
+            new_logprobs = record_step_logprobs(request, response, tokenizer)
+
             # Create output
             output = RequestOutput(
                 request_id=request_id,
@@ -713,6 +720,8 @@ class MLLMScheduler:
                 completion_tokens=request.num_output_tokens,
                 mtp_drafts=request.mtp_drafts,
                 mtp_accepted=request.mtp_accepted,
+                new_logprobs=new_logprobs,
+                output_logprobs=request.output_logprobs,
             )
 
             # Check if finished
@@ -867,6 +876,7 @@ class MLLMScheduler:
                         RequestOutput(
                             request_id=request_id,
                             output_token_ids=list(request.output_tokens),
+                            output_logprobs=getattr(request, "output_logprobs", None),
                             output_text=request.output_text,
                             finished=True,
                             finish_reason="error",

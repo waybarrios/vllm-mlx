@@ -23,7 +23,10 @@ from vllm_mlx.api.models import (
     ChatCompletionChoice,
     ChatCompletionRequest,
     ChatCompletionResponse,
+    ChatCompletionTokenLogprob,
+    ChoiceLogprobs,
     CompletionChoice,
+    CompletionLogprobs,
     CompletionRequest,
     CompletionResponse,
     ContentPart,
@@ -46,6 +49,7 @@ from vllm_mlx.api.models import (
     StreamOptions,
     ToolCall,
     ToolDefinition,
+    TopLogprob,
     Usage,
     VideoUrl,
     AudioUrl,
@@ -432,6 +436,107 @@ class TestTextCompletion:
         assert resp.object == "text_completion"
         assert resp.id.startswith("cmpl-")
         assert len(resp.choices) == 1
+
+
+class TestLogprobs:
+    """Tests for OpenAI-compatible logprobs request fields and response models."""
+
+    def test_chat_request_logprobs_default_none(self):
+        req = ChatCompletionRequest(
+            model="test-model", messages=[{"role": "user", "content": "Hi"}]
+        )
+        assert req.logprobs is None
+        assert req.top_logprobs is None
+
+    def test_chat_request_accepts_logprobs_and_top_logprobs(self):
+        req = ChatCompletionRequest(
+            model="test-model",
+            messages=[{"role": "user", "content": "Hi"}],
+            logprobs=True,
+            top_logprobs=20,
+        )
+        assert req.logprobs is True
+        assert req.top_logprobs == 20
+
+    def test_chat_request_rejects_top_logprobs_without_logprobs(self):
+        with pytest.raises(ValidationError, match="logprobs"):
+            ChatCompletionRequest(
+                model="test-model",
+                messages=[{"role": "user", "content": "Hi"}],
+                top_logprobs=3,
+            )
+
+    def test_chat_request_rejects_top_logprobs_above_20(self):
+        with pytest.raises(ValidationError):
+            ChatCompletionRequest(
+                model="test-model",
+                messages=[{"role": "user", "content": "Hi"}],
+                logprobs=True,
+                top_logprobs=21,
+            )
+
+    def test_chat_request_accepts_zero_top_logprobs(self):
+        req = ChatCompletionRequest(
+            model="test-model",
+            messages=[{"role": "user", "content": "Hi"}],
+            logprobs=True,
+            top_logprobs=0,
+        )
+        assert req.top_logprobs == 0
+
+    def test_completion_request_rejects_negative_logprobs(self):
+        with pytest.raises(ValidationError):
+            CompletionRequest(model="test-model", prompt="Hi", logprobs=-1)
+
+    def test_completion_request_logprobs_bounds(self):
+        req = CompletionRequest(model="test-model", prompt="Hi", logprobs=5)
+        assert req.logprobs == 5
+        with pytest.raises(ValidationError):
+            CompletionRequest(model="test-model", prompt="Hi", logprobs=6)
+
+    def test_chat_choice_logprobs_default_none(self):
+        choice = ChatCompletionChoice(message=AssistantMessage(content="Hi"))
+        assert choice.model_dump()["logprobs"] is None
+
+    def test_chat_choice_with_token_logprobs(self):
+        token = ChatCompletionTokenLogprob(
+            token="Hi",
+            logprob=-0.25,
+            bytes=[72, 105],
+            top_logprobs=[
+                TopLogprob(token="Hi", logprob=-0.25, bytes=[72, 105]),
+                TopLogprob(token="Hey", logprob=-1.5, bytes=[72, 101, 121]),
+            ],
+        )
+        choice = ChatCompletionChoice(
+            message=AssistantMessage(content="Hi"),
+            logprobs=ChoiceLogprobs(content=[token]),
+        )
+        dumped = choice.model_dump()
+        assert dumped["logprobs"]["content"][0]["token"] == "Hi"
+        assert dumped["logprobs"]["content"][0]["top_logprobs"][1]["logprob"] == -1.5
+        assert dumped["logprobs"]["refusal"] is None
+
+    def test_chunk_choice_carries_logprobs(self):
+        chunk_choice = ChatCompletionChunkChoice(
+            delta=ChatCompletionChunkDelta(content="Hi"),
+            logprobs=ChoiceLogprobs(
+                content=[ChatCompletionTokenLogprob(token="Hi", logprob=-0.1)]
+            ),
+        )
+        assert chunk_choice.logprobs.content[0].top_logprobs == []
+
+    def test_completion_choice_legacy_logprobs(self):
+        choice = CompletionChoice(
+            text=" there",
+            logprobs=CompletionLogprobs(
+                tokens=[" there"],
+                token_logprobs=[-0.5],
+                top_logprobs=[{" there": -0.5, " here": -1.2}],
+                text_offset=[0],
+            ),
+        )
+        assert choice.model_dump()["logprobs"]["token_logprobs"] == [-0.5]
 
 
 class TestModelsEndpoint:
