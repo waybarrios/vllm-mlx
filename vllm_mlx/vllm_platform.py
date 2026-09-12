@@ -8,9 +8,7 @@ GPU acceleration.
 """
 
 import logging
-import platform
 import subprocess
-import sys
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -48,24 +46,6 @@ def _get_unified_memory_size() -> int:
     except Exception:
         # Fallback: return 8GB
         return 8 * 1024 * 1024 * 1024
-
-
-def _is_mlx_available() -> bool:
-    """Check if MLX is available and working."""
-    try:
-        import mlx.core as mx
-
-        # Verify we can actually use MLX
-        _ = mx.array([1.0, 2.0, 3.0])
-        return True
-    except Exception as e:
-        logger.debug("MLX not available: %s", e)
-        return False
-
-
-def _is_apple_silicon() -> bool:
-    """Check if running on Apple Silicon."""
-    return sys.platform == "darwin" and platform.machine() == "arm64"
 
 
 class MLXPlatform:

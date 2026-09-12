@@ -9,7 +9,6 @@ engine_core, or the batched engine stack.
 
 from __future__ import annotations
 
-_ENGINE_CORE_NAMES = frozenset({"EngineCore", "AsyncEngineCore", "EngineConfig"})
 from typing import TYPE_CHECKING
 
 from .base import BaseEngine, GenerationOutput
