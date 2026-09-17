@@ -41,6 +41,24 @@ export ANTHROPIC_API_KEY=not-needed
 claude
 ```
 
+### Optional Metal Context foundation
+
+The normal package and editable installs keep the experimental compiled Metal
+Context foundation disabled.  This preserves the portable MLX path and avoids
+silently requiring an Xcode/Metal toolchain.  On an Apple Silicon Mac with
+Xcode installed, opt in explicitly when building from source:
+
+```bash
+VLLM_MLX_BUILD_METAL_CONTEXT=1 python -m pip install -e .
+```
+
+The strict build rejects non-Apple-Silicon hosts or missing Metal tools.  The
+foundation currently provides a validated kernel/oracle surface only; it is
+not a qualified serving executor.  Keep `--attention-backend mlx` (the
+default), or use `auto` while qualification is pending.  An explicit
+`--attention-backend metal-context` request fails closed until the executor is
+integrated and qualified.
+
 ## Features
 
 ### APIs

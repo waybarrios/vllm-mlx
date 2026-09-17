@@ -144,6 +144,7 @@ include = ["vllm_mlx*"]
 
 [tool.setuptools.package-data]
 "vllm_mlx.bench_serve_prompts" = ["*.json"]
+"vllm_mlx" = ["*.metallib"]
 
 [tool.black]
 line-length = 88
