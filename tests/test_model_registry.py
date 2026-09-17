@@ -1072,7 +1072,9 @@ def test_log_memory_budget_report_reports_ceiling_and_cache(tmp_path, caplog):
         _defaults_with(
             gpu_memory_utilization=0.5,
             continuous_batching=True,
-            scheduler_config=SchedulerConfig(cache_memory_mb=20480),
+            scheduler_config=SchedulerConfig(
+                cache_memory_mb=20480, cache_memory_percent=0.35
+            ),
         ),
         device_working_set_bytes=128 * GB,
     )
@@ -1083,6 +1085,44 @@ def test_log_memory_budget_report_reports_ceiling_and_cache(tmp_path, caplog):
     assert "Metal allocation ceiling 64.0 GB" in caplog.text
     assert "20.0 GB per memory-aware prefix-cache engine" in caplog.text
     assert "2 of 2 entries" in caplog.text
+    assert report.per_engine_cache_percent is None
+    assert "% of available RAM" not in caplog.text
+
+
+@pytest.mark.parametrize("percent", [None, 0.35])
+def test_log_memory_budget_report_describes_effective_cache_percent(
+    tmp_path, caplog, percent
+):
+    from vllm_mlx.scheduler import SchedulerConfig
+
+    config = SchedulerConfig()
+    if percent is not None:
+        config.cache_memory_percent = percent
+    report = build_memory_budget_report(
+        _manager_config(budget_gb=40),
+        _registry(tmp_path, {"alpha": 32, "beta": 4}),
+        _defaults_with(
+            gpu_memory_utilization=0.5,
+            continuous_batching=True,
+            scheduler_config=config,
+        ),
+        device_working_set_bytes=128 * GB,
+    )
+    with caplog.at_level(logging.INFO, logger="vllm_mlx.model_registry"):
+        log_memory_budget_report(report)
+
+    expected = 0.20 if percent is None else percent
+    assert report.per_engine_cache_percent == pytest.approx(expected)
+    # A startup report describes the policy, not a second RAM snapshot that
+    # could disagree with the limit computed later by each cache.
+    assert report.per_engine_cache_limit_bytes is None
+    assert f"~{expected * 100:.0f}% of available RAM per" in caplog.text
+    assert "2 of 2 entries" in caplog.text
+    assert "computed once at each cache's initialization" in caplog.text
+    assert "not dynamically resized" in caplog.text
+    assert "limits apply independently per engine" in caplog.text
+    assert "none configured" not in caplog.text
+    assert "scales at runtime" not in caplog.text
 
 
 def test_log_memory_budget_report_says_so_when_ceiling_unknown(
