@@ -366,6 +366,106 @@ class TestMLLMBatch:
         assert batch.uids == [1, 3]
         assert batch.request_ids == ["req-1", "req-3"]
 
+    def test_batch_filter_preserves_request_local_mrope_rows(self):
+        from vllm_mlx.mllm_batch_generator import (
+            MLLMBatch,
+            MLLMBatchGenerator,
+            MLLMBatchRequest,
+        )
+
+        requests = [
+            MLLMBatchRequest(
+                uid=i,
+                request_id=f"req-{i}",
+                prompt="prompt",
+                rope_deltas=mx.array([[delta]], dtype=mx.int32),
+            )
+            for i, delta in enumerate((4, 9))
+        ]
+        batch = MLLMBatch(
+            uids=[0, 1],
+            request_ids=["req-0", "req-1"],
+            y=mx.array([100, 200]),
+            logprobs=[mx.array([0.1]), mx.array([0.2])],
+            max_tokens=[10, 10],
+            num_tokens=[0, 0],
+            cache=[],
+            requests=requests,
+        )
+
+        assert MLLMBatchGenerator._batch_rope_deltas(batch.requests).tolist() == [
+            [4],
+            [9],
+        ]
+        batch.filter([1])
+        assert MLLMBatchGenerator._batch_rope_deltas(batch.requests).tolist() == [[9]]
+
+    def test_step_forwards_explicit_request_local_mrope(self):
+        from vllm_mlx.mllm_batch_generator import MLLMBatchGenerator
+
+        captured = []
+
+        def language_model(tokens, cache=None, rope_deltas=None):
+            del cache
+            captured.append(rope_deltas.tolist())
+            return mx.zeros((tokens.shape[0], tokens.shape[1], 4))
+
+        generator = MLLMBatchGenerator.__new__(MLLMBatchGenerator)
+        generator.language_model = language_model
+        generator.sampler = lambda logprobs: mx.argmax(logprobs, axis=-1)
+        generator._step(
+            mx.array([[1], [2]]),
+            [],
+            rope_deltas=mx.array([[4], [9]], dtype=mx.int32),
+        )
+
+        assert captured == [[[4], [9]]]
+
+    def test_request_mrope_is_derived_from_full_processed_prompt(self):
+        from vllm_mlx.mllm_batch_generator import (
+            MLLMBatchGenerator,
+            MLLMBatchRequest,
+        )
+
+        captured = {}
+
+        class LanguageModel:
+            def get_rope_index(
+                self,
+                input_ids,
+                image_grid_thw=None,
+                video_grid_thw=None,
+                attention_mask=None,
+            ):
+                captured["input_ids"] = input_ids.tolist()
+                captured["image_grid_thw"] = image_grid_thw.tolist()
+                captured["video_grid_thw"] = video_grid_thw.tolist()
+                captured["attention_mask"] = attention_mask.tolist()
+                return mx.zeros((3, input_ids.shape[1])), mx.array([[11]])
+
+        generator = MLLMBatchGenerator.__new__(MLLMBatchGenerator)
+        generator.language_model = LanguageModel()
+        request = MLLMBatchRequest(uid=1, request_id="media", prompt="prompt")
+        request.input_ids = mx.array([[1, 2, 3, 4]])
+        request.image_grid_thw = mx.array([[1, 2, 2]])
+        request.attention_mask = mx.ones((1, 4))
+        request.extra_kwargs = {"video_grid_thw": mx.array([[2, 2, 2]])}
+
+        rope_deltas = generator._derive_request_rope_deltas(request)
+
+        assert rope_deltas.tolist() == [[11]]
+        assert request.prompt_position_ids.tolist() == [
+            [0.0, 0.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0, 0.0],
+        ]
+        assert captured == {
+            "input_ids": [[1, 2, 3, 4]],
+            "image_grid_thw": [[1, 2, 2]],
+            "video_grid_thw": [[2, 2, 2]],
+            "attention_mask": [[1.0, 1.0, 1.0, 1.0]],
+        }
+
     def test_batch_extend_handles_empty_protocol_caches_without_keys(self):
         """Caches with empty()/extend() but no .keys still need batch extension."""
         from vllm_mlx.mllm_batch_generator import MLLMBatch, MLLMBatchRequest
@@ -997,6 +1097,191 @@ class TestMLLMBatchGeneratorMTPGuards:
         fallback_sampler.assert_not_called()
         assert sampler_calls == [{"temp": 0.3, "top_p": 0.8, "top_k": 0, "min_p": 0.0}]
 
+    def test_process_prompts_cold_and_prefix_hit_use_full_prompt_mrope(
+        self, monkeypatch
+    ):
+        from vllm_mlx.mllm_batch_generator import (
+            MLLMBatchGenerator,
+            MLLMBatchRequest,
+            MLLMBatchStats,
+        )
+
+        class FakeCache:
+            offset = 1
+
+            def is_trimmable(self):
+                return True
+
+            def merge(self, _caches):
+                return self
+
+        class PrefixCache:
+            warm = False
+
+            def fetch(self, _tokens):
+                return ([FakeCache()], [4]) if self.warm else (None, None)
+
+        class QwenLikeLanguageModel:
+            def __init__(self):
+                self.calls = []
+
+            def get_rope_index(self, input_ids, *_args):
+                positions = mx.broadcast_to(
+                    mx.arange(input_ids.shape[1])[None, None, :],
+                    (3, 1, input_ids.shape[1]),
+                )
+                return positions, mx.array([[13]])
+
+            def __call__(self, tokens, cache=None, rope_deltas=None, position_ids=None):
+                del cache
+                self.calls.append(
+                    (
+                        tokens.tolist(),
+                        rope_deltas.tolist(),
+                        position_ids.tolist(),
+                    )
+                )
+                logits = mx.zeros((1, tokens.shape[1], 4))
+                logits[:, -1, 2] = 5.0
+                return logits
+
+        monkeypatch.setattr(mx, "stream", lambda _stream: nullcontext())
+        monkeypatch.setattr(
+            "mlx_lm.models.cache.make_prompt_cache", lambda *_a, **_k: [FakeCache()]
+        )
+        monkeypatch.setattr(
+            "mlx_lm.sample_utils.make_sampler",
+            lambda **_kwargs: lambda scores: mx.argmax(scores, axis=-1),
+        )
+        monkeypatch.setattr(
+            "mlx_lm.sample_utils.make_logits_processors", lambda **_kwargs: []
+        )
+
+        generator = MLLMBatchGenerator.__new__(MLLMBatchGenerator)
+        generator.max_kv_size = 0
+        generator._stats = MLLMBatchStats()
+        generator._pending_error_responses = []
+        generator._aborted_request_ids = set()
+        generator._prefill_progress = {}
+        generator._prefix_checkpoint_lock = threading.Lock()
+        generator._request_prefix_checkpoints = {}
+        generator.prefill_step_size = 512
+        generator._think_suffix_len = 0
+        generator.language_model = QwenLikeLanguageModel()
+        generator.model = MagicMock()
+        generator.sampler = lambda scores: mx.argmax(scores, axis=-1)
+        generator.prefix_cache = PrefixCache()
+        generator._preprocess_request = lambda _request: None
+        generator._prepare_rotating_caches = lambda _cache: True
+        generator._copy_prefix_cache = lambda cache: cache
+
+        def request(request_id):
+            req = MLLMBatchRequest(uid=1, request_id=request_id, prompt="prompt")
+            req.input_ids = mx.array([[1, 2, 3, 4]])
+            req.is_text_only = True
+            return req
+
+        cold = generator._process_prompts([request("cold")])
+        generator.prefix_cache.warm = True
+        warm = generator._process_prompts([request("warm")])
+
+        assert cold.y.tolist() == warm.y.tolist() == [2]
+        assert generator.language_model.calls == [
+            (
+                [[1, 2, 3, 4]],
+                [[13]],
+                [[[0, 1, 2, 3]], [[0, 1, 2, 3]], [[0, 1, 2, 3]]],
+            ),
+            ([[4]], [[13]], [[[3]], [[3]], [[3]]]),
+        ]
+
+    def test_hybrid_cold_path_keeps_request_cache_and_prompt_logits(self, monkeypatch):
+        from vllm_mlx.mllm_batch_generator import (
+            MLLMBatchGenerator,
+            MLLMBatchRequest,
+            MLLMBatchStats,
+        )
+
+        class FakeCache:
+            def merge(self, _caches):
+                return self
+
+        call_order = []
+
+        class PrefixCache:
+            def fetch(self, tokens):
+                return None, tokens
+
+            def prepare_store(self, tokens, cache, auxiliary=None):
+                call_order.append("prepare")
+                assert int(mx.argmax(auxiliary["last_logits"], axis=-1).item()) == 1
+                return SimpleNamespace(
+                    tokens=tuple(tokens),
+                    cache=cache,
+                    auxiliary={"last_logits": mx.array([[0.0, 0.0, 9.0, 0.0]])},
+                )
+
+            def commit_prepared(self, _entry, **kwargs):
+                return kwargs["commit_guard"]()
+
+        monkeypatch.setattr(mx, "stream", lambda _stream: nullcontext())
+        original_eval = mx.eval
+
+        def tracked_eval(*values):
+            call_order.append("eval")
+            return original_eval(*values)
+
+        monkeypatch.setattr(mx, "eval", tracked_eval)
+        monkeypatch.setattr(
+            "mlx_lm.models.cache.make_prompt_cache", lambda *_a, **_k: [FakeCache()]
+        )
+
+        def sample(scores):
+            call_order.append("sample")
+            return mx.argmax(scores, axis=-1)
+
+        monkeypatch.setattr(
+            "mlx_lm.sample_utils.make_sampler",
+            lambda **_kwargs: sample,
+        )
+        monkeypatch.setattr(
+            "mlx_lm.sample_utils.make_logits_processors", lambda **_kwargs: []
+        )
+
+        generator = MLLMBatchGenerator.__new__(MLLMBatchGenerator)
+        generator.max_kv_size = 0
+        generator._stats = MLLMBatchStats()
+        generator._pending_error_responses = []
+        generator._aborted_request_ids = set()
+        generator._prefill_progress = {}
+        generator._prefix_checkpoint_lock = threading.Lock()
+        generator._request_prefix_checkpoints = {}
+        generator.prefill_step_size = 512
+        generator._think_suffix_len = 0
+        generator.language_model = object()
+        generator.model = MagicMock()
+        generator.sampler = sample
+        generator.prefix_cache = PrefixCache()
+        generator._preprocess_request = lambda _request: None
+        generator._needs_prefill_checkpoint = lambda _cache: True
+        generator._clone_prefix_for_replay = MagicMock(
+            side_effect=AssertionError("cold request must not replay stored state")
+        )
+        generator._prepare_rotating_caches = lambda _cache: True
+        generator._run_chunked_text_prefill = lambda _request, cache: mx.array(
+            [[[0.0, 8.0, 0.0, 0.0]]]
+        )
+
+        request = MLLMBatchRequest(uid=1, request_id="cold-owned", prompt="prompt")
+        request.input_ids = mx.array([[1, 2, 3, 4]])
+        request.is_text_only = True
+
+        batch = generator._process_prompts([request])
+
+        assert batch.y.tolist() == [1]
+        assert call_order[:3] == ["sample", "eval", "prepare"]
+        generator._clone_prefix_for_replay.assert_not_called()
+
     def test_next_passes_current_token_to_logits_processor_prefix(self):
         from vllm_mlx.mllm_batch_generator import (
             MLLMBatch,
@@ -1045,6 +1330,59 @@ class TestMLLMBatchGeneratorMTPGuards:
         assert captured["input_tokens"] == [[7]]
         assert captured["output_tokens"] == [[5, 7]]
         assert request.output_tokens == [5, 7]
+
+    def test_next_reorders_request_local_mrope_after_filter(self):
+        from vllm_mlx.mllm_batch_generator import (
+            MLLMBatch,
+            MLLMBatchGenerator,
+            MLLMBatchRequest,
+            MLLMBatchStats,
+        )
+
+        captured = []
+
+        def fake_step(*_args, rope_deltas=None, **_kwargs):
+            captured.append(rope_deltas.tolist())
+            size = rope_deltas.shape[0]
+            return mx.ones((size,), dtype=mx.int32), [mx.zeros((4,))] * size
+
+        generator = MLLMBatchGenerator.__new__(MLLMBatchGenerator)
+        generator.max_kv_size = 0
+        generator._stats = MLLMBatchStats()
+        generator.stop_tokens = set()
+        generator.unprocessed_requests = []
+        generator._pending_error_responses = []
+        generator._prefill_progress = {}
+        generator.prefix_cache = None
+        generator._maybe_store_prefix_cache = lambda *_args: None
+        generator._step = fake_step
+
+        requests = [
+            MLLMBatchRequest(
+                uid=i,
+                request_id=f"req-{i}",
+                prompt="prompt",
+                max_tokens=10,
+                rope_deltas=mx.array([[delta]]),
+            )
+            for i, delta in enumerate((4, 9))
+        ]
+        generator.active_batch = MLLMBatch(
+            uids=[0, 1],
+            request_ids=["req-0", "req-1"],
+            y=mx.array([1, 1]),
+            logprobs=[mx.zeros((4,)), mx.zeros((4,))],
+            max_tokens=[10, 10],
+            num_tokens=[0, 0],
+            cache=[],
+            requests=requests,
+        )
+
+        generator._next()
+        generator.active_batch.filter([1])
+        generator._next()
+
+        assert captured == [[[4], [9]], [[9]]]
 
     def test_install_mtp_mllm_disables_mtp_when_logits_processors_active(self):
         from vllm_mlx.mllm_batch_generator import install_mtp_mllm
@@ -1153,6 +1491,48 @@ class TestMLLMBatchGeneratorMTPGuards:
         original_step.assert_called_once()
         language_model.assert_not_called()
         assert batch_gen.get_mtp_stats()["attempted"] == 0
+        assert (
+            batch_gen.get_mtp_stats()["bypass_counts"]["assistant_not_requested"] == 1
+        )
+
+    def test_external_media_mtp_bypass_preserves_target_mrope(self):
+        from vllm_mlx.mllm_batch_generator import (
+            MLLMBatchRequest,
+            install_mtp_mllm,
+        )
+
+        rope_deltas = mx.array([[21]], dtype=mx.int32)
+        expected = (mx.array([2]), [mx.zeros((4,))])
+        original_step = MagicMock(return_value=expected)
+        request = MLLMBatchRequest(
+            uid=1,
+            request_id="media",
+            prompt="prompt",
+            images=["image"],
+            mllm_draft=True,
+            rope_deltas=rope_deltas,
+        )
+        batch_gen = SimpleNamespace(
+            model=object(),
+            _step=original_step,
+            _next=lambda: [],
+            active_batch=SimpleNamespace(uids=[1], requests=[request]),
+            sampler=lambda scores: mx.argmax(scores, axis=-1),
+        )
+        language_model = MagicMock()
+        draft_model = MagicMock()
+        install_mtp_mllm(batch_gen, language_model, draft_model=draft_model)
+
+        result = batch_gen._step(
+            mx.array([[1]]),
+            [],
+            rope_deltas=rope_deltas,
+        )
+
+        assert result is expected
+        original_step.assert_called_once()
+        assert original_step.call_args.kwargs["rope_deltas"].tolist() == [[21]]
+        language_model.assert_not_called()
         assert (
             batch_gen.get_mtp_stats()["bypass_counts"]["assistant_not_requested"] == 1
         )
@@ -1306,6 +1686,8 @@ class TestMLLMBatchGeneratorMTPGuards:
         generator._require_uniform_mllm_draft = True
         generator._allow_mid_batch_extend = False
         generator._pending_error_responses = []
+        generator._prefix_checkpoint_lock = threading.Lock()
+        generator._request_prefix_checkpoints = {}
         generator._process_prompts = MagicMock(side_effect=RuntimeError("failed"))
 
         responses = MLLMBatchGenerator._next(generator)
@@ -1408,6 +1790,78 @@ class TestMLLMBatchGeneratorMTPGuards:
         assert model.mtp_calls == 1
         assert generator.get_mtp_stats()["attempted"] == 1
         assert generator.get_mtp_stats()["accepted"] == 1
+
+    def test_native_mtp_forwards_mrope_through_verify_and_hybrid_replay(self):
+        from vllm_mlx.mllm_batch_generator import (
+            MLLMBatchRequest,
+            install_mtp_mllm,
+        )
+
+        rope_deltas = mx.array([[7]], dtype=mx.int32)
+        request = MLLMBatchRequest(uid=7, request_id="mrope", prompt="prompt")
+
+        class Batch:
+            uids = [7]
+            requests = [request]
+
+            def __len__(self):
+                return 1
+
+        class Generator:
+            def __init__(self):
+                self.active_batch = Batch()
+                self._step = self._original_step
+                self._next = lambda: []
+                self.sampler = lambda logprobs: mx.argmax(logprobs, axis=-1)
+
+            @staticmethod
+            def _original_step(*_args, **_kwargs):
+                raise AssertionError("native MTP must not take the bypass path")
+
+        class HybridCache:
+            def __init__(self):
+                self.state = [mx.zeros((1, 1))]
+
+            def is_trimmable(self):
+                return False
+
+        class LanguageModel:
+            def __init__(self):
+                self.calls = []
+
+            def mtp_forward(self, hidden_states, next_token_ids, mtp_cache=None):
+                del hidden_states, next_token_ids, mtp_cache
+                return mx.array([[[0.0, 5.0, -3.0]]])
+
+            def __call__(
+                self,
+                input_tokens,
+                cache=None,
+                return_hidden=False,
+                rope_deltas=None,
+            ):
+                del cache, return_hidden
+                self.calls.append((input_tokens.shape[1], rope_deltas.tolist()))
+                seq_len = input_tokens.shape[1]
+                logits = mx.full((1, seq_len, 3), -3.0)
+                if seq_len == 1:
+                    logits[:, :, 1] = 5.0
+                else:
+                    logits[:, 0, 2] = 5.0
+                    logits[:, 1, 2] = 5.0
+                return logits, mx.zeros((1, seq_len, 2))
+
+        generator = Generator()
+        model = LanguageModel()
+        install_mtp_mllm(generator, model)
+        generator._step(
+            mx.array([[0]], dtype=mx.uint32),
+            cache=[HybridCache()],
+            rope_deltas=rope_deltas,
+        )
+
+        assert model.calls == [(1, [[7]]), (2, [[7]]), (2, [[7]])]
+        assert generator.get_mtp_stats()["rejected"] == 1
 
     def test_concurrent_mtp_keeps_verified_state_with_uid_reordering(self):
         from vllm_mlx.mllm_batch_generator import install_mtp_mllm
@@ -2029,6 +2483,8 @@ class TestChunkedPrefillCacheHandling:
         gen._pending_error_responses = []
         gen._aborted_request_ids = set()
         gen._prefill_progress = {}
+        gen._prefix_checkpoint_lock = threading.Lock()
+        gen._request_prefix_checkpoints = {}
         gen.active_batch = None
         gen.stop_tokens = set()
         gen.unprocessed_requests = []
@@ -2233,6 +2689,216 @@ class TestChunkedPrefillCacheHandling:
         abort_responses = [r for r in responses if r.finish_reason == "abort"]
         assert len(abort_responses) == 1
         assert abort_responses[0].request_id == "req-abort"
+
+    def test_interleaved_hybrid_publishes_boundary_checkpoint(self, monkeypatch):
+        from mlx_lm.models.cache import ArraysCache, KVCache
+
+        from vllm_mlx.memory_cache import MemoryAwarePrefixCache, MemoryCacheConfig
+        from vllm_mlx.mllm_batch_generator import (
+            MLLMBatchRequest,
+            install_chunked_prefill_mllm,
+        )
+
+        gen = self._make_fake_batch_gen()
+        gen._think_suffix_len = 2
+        gen.prefix_cache = MemoryAwarePrefixCache(
+            MagicMock(),
+            MemoryCacheConfig(max_memory_mb=1, min_prefix_tokens=1),
+        )
+        call_order = []
+        original_eval = mx.eval
+
+        def tracked_eval(*values):
+            call_order.append("eval")
+            return original_eval(*values)
+
+        monkeypatch.setattr(mx, "eval", tracked_eval)
+
+        def request_sample(logprobs):
+            call_order.append("sample")
+            return mx.argmax(logprobs, axis=-1)
+
+        def global_sample(_logprobs):
+            raise AssertionError("interleaved prefill must use the request sampler")
+
+        def make_request_sampler(**kwargs):
+            assert kwargs == {
+                "temp": 0.0,
+                "top_p": 1.0,
+                "top_k": 0,
+                "min_p": 0.0,
+            }
+            return request_sample
+
+        monkeypatch.setattr("mlx_lm.sample_utils.make_sampler", make_request_sampler)
+        gen.sampler = global_sample
+        gen.stop_tokens = {1}
+
+        original_prepare_store = gen.prefix_cache.prepare_store
+
+        def prepare_store(tokens, cache, auxiliary=None):
+            call_order.append("prepare")
+            assert auxiliary is not None
+            assert auxiliary["last_logits"].tolist() == [[0.0, 0.0, 0.0, 0.0]]
+            return original_prepare_store(tokens, cache, auxiliary=auxiliary)
+
+        gen.prefix_cache.prepare_store = prepare_store
+
+        prompt_cache = [ArraysCache(size=1), KVCache()]
+        monkeypatch.setattr(
+            "mlx_lm.models.cache.make_prompt_cache",
+            lambda *_args, **_kwargs: prompt_cache,
+        )
+
+        class LanguageModel:
+            def __init__(self):
+                self.rope_calls = []
+
+            def get_rope_index(self, input_ids, *_args):
+                return mx.zeros((3, 1, input_ids.shape[1])), mx.array([[17]])
+
+            def __call__(self, tokens, cache, rope_deltas=None, position_ids=None):
+                self.rope_calls.append(rope_deltas.tolist())
+                previous = 0 if cache[0][0] is None else int(cache[0][0].item())
+                cache[0][0] = mx.array([[previous + tokens.shape[1]]])
+                start = int(cache[1].offset)
+                values = mx.arange(start + 1, start + 1 + tokens.shape[1]).reshape(
+                    1, 1, -1, 1
+                )
+                cache[1].update_and_fetch(values, values + 100)
+                return mx.zeros((1, tokens.shape[1], 4))
+
+        gen.language_model = LanguageModel()
+        gen._next = lambda: []
+        install_chunked_prefill_mllm(gen, budget=4)
+        gen._clone_prefix_for_replay = MagicMock(
+            side_effect=AssertionError("cold request must not replay stored state")
+        )
+
+        req = MLLMBatchRequest(uid=5, request_id="hybrid-interleaved", prompt="x")
+        req.input_ids = mx.array([[1, 2, 3, 4, 5, 6, 7, 8, 9, 10]])
+        req.is_text_only = True
+        req.temperature = 0.0
+        req.top_p = 1.0
+        req.logits_processors = [
+            lambda _tokens, logits: logits + mx.array([[0.0, 1.0, 0.0, 0.0]])
+        ]
+        gen.unprocessed_requests.append(req)
+        gen._preprocess_request = lambda _: None
+
+        assert gen._next() == []
+        assert gen._next() == []
+        assert gen._partial["checkpoint_entry"] is None
+        gen._next()
+
+        gen._clone_prefix_for_replay.assert_not_called()
+        sample_index = call_order.index("sample")
+        assert call_order[sample_index : sample_index + 3] == [
+            "sample",
+            "eval",
+            "prepare",
+        ]
+
+        assert gen.language_model.rope_calls == [[[17]], [[17]], [[17]], [[17]]]
+
+        full_prompt = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+        stored, remaining = gen.prefix_cache.fetch(full_prompt)
+        assert remaining == []
+        assert gen.prefix_cache.fetch_exact_auxiliary(full_prompt) is not None
+        assert int(stored[0][0].item()) == 10
+        assert stored[1].offset == 10
+        assert stored[1].keys.shape[2] == 10
+        assert stored[1].keys.reshape(-1).tolist() == list(range(1, 11))
+
+    def test_interleaved_abort_during_checkpoint_commit_is_request_local(self):
+        from types import SimpleNamespace
+
+        from vllm_mlx.mllm_batch_generator import (
+            MLLMBatchRequest,
+            PrefillAbortedError,
+            install_chunked_prefill_mllm,
+        )
+
+        gen = self._make_fake_batch_gen()
+        gen.language_model = lambda tokens, cache: mx.zeros((1, tokens.shape[1], 4))
+        gen.sampler = lambda _logprobs: mx.array([0])
+        gen._next = lambda: []
+        install_chunked_prefill_mllm(gen, budget=4)
+
+        req = MLLMBatchRequest(uid=6, request_id="abort-at-commit", prompt="x")
+        req.input_ids = mx.array([[1, 2, 3, 4, 5]])
+        req.is_text_only = True
+        gen._partial = {
+            "request": req,
+            "cache": [self._make_fake_kv_cache(offset=3)],
+            "remaining_ids": mx.array([[4, 5]]),
+            "processed": 3,
+            "total": 5,
+            "cached_count": 0,
+            "chunk_count": 1,
+            "checkpoint_at": 3,
+            "checkpoint_key": [1, 2, 3],
+            "checkpoint_entry": SimpleNamespace(tokens=(1, 2, 3)),
+        }
+        gen._publish_prefill_checkpoint = MagicMock(
+            side_effect=PrefillAbortedError(req.request_id)
+        )
+
+        responses = gen._next()
+
+        assert gen._partial is None
+        assert len(responses) == 1
+        assert responses[0].request_id == req.request_id
+        assert responses[0].finish_reason == "abort"
+
+    def test_interleaved_abort_during_full_prompt_commit_is_request_local(self):
+        from types import SimpleNamespace
+
+        from vllm_mlx.mllm_batch_generator import (
+            MLLMBatchRequest,
+            PrefillAbortedError,
+            install_chunked_prefill_mllm,
+        )
+
+        gen = self._make_fake_batch_gen()
+        gen.language_model = lambda tokens, cache: mx.zeros((1, tokens.shape[1], 4))
+        gen.sampler = lambda _logprobs: mx.array([0])
+        gen._next = lambda: []
+        gen._needs_prefill_checkpoint = lambda _cache: True
+        full_prompt_entry = SimpleNamespace(tokens=(1, 2, 3, 4, 5))
+        gen.prefix_cache = SimpleNamespace(
+            prepare_store=lambda *_args, **_kwargs: full_prompt_entry
+        )
+        install_chunked_prefill_mllm(gen, budget=4)
+
+        req = MLLMBatchRequest(uid=7, request_id="abort-full-prompt", prompt="x")
+        req.input_ids = mx.array([[1, 2, 3, 4, 5]])
+        req.is_text_only = True
+        gen._partial = {
+            "request": req,
+            "cache": [self._make_fake_kv_cache(offset=3)],
+            "remaining_ids": mx.array([[4, 5]]),
+            "processed": 3,
+            "total": 5,
+            "cached_count": 0,
+            "chunk_count": 1,
+            "checkpoint_at": None,
+            "checkpoint_key": None,
+            "checkpoint_entry": None,
+        }
+
+        def publish(_request_id, entry):
+            assert entry is full_prompt_entry
+            raise PrefillAbortedError(req.request_id)
+
+        gen._publish_prefill_checkpoint = publish
+
+        responses = gen._next()
+
+        assert gen._partial is None
+        assert len(responses) == 1
+        assert responses[0].request_id == req.request_id
+        assert responses[0].finish_reason == "abort"
 
     def test_short_prompt_falls_through_to_orig_next(self):
         """Short prompts (< budget) with no prefix cache must fall through

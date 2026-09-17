@@ -6,6 +6,8 @@ These tests verify the PrefixCacheManager for KV cache reuse
 to speed up inference with repeated prompts.
 """
 
+import threading
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -596,6 +598,8 @@ class TestMLLMCompletionCacheStore:
         generator = MLLMBatchGenerator.__new__(MLLMBatchGenerator)
         generator.prefix_cache = MagicMock()
         generator._think_suffix_len = 0
+        generator._prefix_checkpoint_lock = threading.Lock()
+        generator._request_prefix_checkpoints = {}
         request = SimpleNamespace(
             request_id="saturated", input_ids=mx.array([[1, 2, 3, 4]])
         )
@@ -627,6 +631,8 @@ class TestMLLMCompletionCacheStore:
         generator = MLLMBatchGenerator.__new__(MLLMBatchGenerator)
         generator.prefix_cache = MagicMock()
         generator._think_suffix_len = 0
+        generator._prefix_checkpoint_lock = threading.Lock()
+        generator._request_prefix_checkpoints = {}
         request = SimpleNamespace(request_id="flat", input_ids=mx.array([[1, 2, 3, 4]]))
         batch = SimpleNamespace(
             requests=[request],
@@ -654,6 +660,8 @@ class TestMLLMCompletionCacheStore:
         generator = MLLMBatchGenerator.__new__(MLLMBatchGenerator)
         generator.prefix_cache = MagicMock()
         generator._think_suffix_len = 0
+        generator._prefix_checkpoint_lock = threading.Lock()
+        generator._request_prefix_checkpoints = {}
         request = SimpleNamespace(request_id="plain", input_ids=mx.array([[1, 2, 3]]))
         batch = SimpleNamespace(
             requests=[request],
@@ -687,6 +695,290 @@ class TestMLLMCompletionCacheStore:
         assert stored[0] is not live
         live.offset = 99
         assert stored[0].offset == 3
+
+
+class TestMLLMHybridPrefillCheckpoint:
+    @pytest.fixture(autouse=True)
+    def _require_full_mlx_runtime(self):
+        pytest.importorskip("mlx.nn")
+
+    class _HybridCache:
+        def __init__(self, position=0):
+            self.position = position
+
+        @property
+        def state(self):
+            return [self.position]
+
+        @state.setter
+        def state(self, value):
+            self.position = value[0]
+
+        @property
+        def meta_state(self):
+            return []
+
+        @classmethod
+        def from_state(cls, state, _meta_state):
+            return cls(state[0])
+
+        def is_trimmable(self):
+            return False
+
+    class _KVCache(_HybridCache):
+        def is_trimmable(self):
+            return True
+
+    @staticmethod
+    def _request(input_ids):
+        return SimpleNamespace(
+            request_id="hybrid-prefill",
+            input_ids=input_ids,
+            vision_encoded=False,
+            pixel_values=None,
+            attention_mask=None,
+            image_grid_thw=None,
+            extra_kwargs={},
+        )
+
+    def test_nonrewindable_prompt_defers_store_until_full_prompt(self, monkeypatch):
+        import numpy as np
+
+        import vllm_mlx.mllm_batch_generator as module
+        from vllm_mlx.memory_cache import MemoryAwarePrefixCache, MemoryCacheConfig
+        from vllm_mlx.mllm_batch_generator import MLLMBatchGenerator
+
+        generator = MLLMBatchGenerator.__new__(MLLMBatchGenerator)
+        generator.prefix_cache = MemoryAwarePrefixCache(
+            MagicMock(),
+            MemoryCacheConfig(max_memory_mb=1, min_prefix_tokens=1),
+        )
+        generator.prefill_step_size = 32
+        generator._think_suffix_len = 2
+        generator._aborted_request_ids = set()
+        generator._prefill_progress = {}
+        generator._prefix_checkpoint_lock = threading.Lock()
+        generator._request_prefix_checkpoints = {}
+        cache = [self._HybridCache()]
+        calls = []
+
+        def language_model(tokens, cache):
+            calls.append(tokens.tolist())
+            cache[0].position += tokens.shape[1]
+            return np.zeros((1, tokens.shape[1], 4), dtype=np.float32)
+
+        generator.language_model = language_model
+        monkeypatch.setattr(module, "_eval_prompt_cache", lambda _cache: None)
+        monkeypatch.setattr(module.mx, "eval", lambda *_args: None)
+
+        request = self._request(np.array([[10, 11, 12, 13, 14]]))
+        generator._run_chunked_text_prefill(request, cache)
+
+        assert calls == [[[10, 11, 12, 13, 14]]]
+        assert generator.prefix_cache.get_stats()["entry_count"] == 0
+        assert cache[0].position == 5
+
+    def test_rewindable_prompt_keeps_single_forward(self, monkeypatch):
+        import numpy as np
+
+        import vllm_mlx.mllm_batch_generator as module
+        from vllm_mlx.mllm_batch_generator import MLLMBatchGenerator
+
+        generator = MLLMBatchGenerator.__new__(MLLMBatchGenerator)
+        generator.prefix_cache = MagicMock()
+        generator.prefill_step_size = 32
+        generator._think_suffix_len = 2
+        generator._aborted_request_ids = set()
+        generator._prefill_progress = {}
+        generator._prefix_checkpoint_lock = threading.Lock()
+        generator._request_prefix_checkpoints = {}
+        cache = [self._KVCache()]
+        calls = []
+
+        def language_model(tokens, cache):
+            calls.append(tokens.tolist())
+            cache[0].position += tokens.shape[1]
+            return np.zeros((1, tokens.shape[1], 4), dtype=np.float32)
+
+        generator.language_model = language_model
+        monkeypatch.setattr(module, "_eval_prompt_cache", lambda _cache: None)
+
+        request = self._request(np.array([[10, 11, 12, 13, 14]]))
+        generator._run_chunked_text_prefill(request, cache)
+
+        assert calls == [[[10, 11, 12, 13, 14]]]
+        generator.prefix_cache.prepare_store.assert_not_called()
+        generator.prefix_cache.commit_prepared.assert_not_called()
+
+    def test_no_think_hybrid_defers_store_until_final_logits_exist(self, monkeypatch):
+        import numpy as np
+
+        import vllm_mlx.mllm_batch_generator as module
+        from vllm_mlx.memory_cache import MemoryAwarePrefixCache, MemoryCacheConfig
+        from vllm_mlx.mllm_batch_generator import MLLMBatchGenerator
+
+        generator = MLLMBatchGenerator.__new__(MLLMBatchGenerator)
+        generator.prefix_cache = MemoryAwarePrefixCache(
+            MagicMock(),
+            MemoryCacheConfig(max_memory_mb=1, min_prefix_tokens=1),
+        )
+        generator.prefill_step_size = 32
+        generator._think_suffix_len = 0
+        generator._aborted_request_ids = set()
+        generator._prefill_progress = {}
+        generator._prefix_checkpoint_lock = threading.Lock()
+        generator._request_prefix_checkpoints = {}
+        cache = [self._HybridCache()]
+
+        def language_model(tokens, cache):
+            cache[0].position += tokens.shape[1]
+            return np.zeros((1, tokens.shape[1], 4), dtype=np.float32)
+
+        generator.language_model = language_model
+        monkeypatch.setattr(module, "_eval_prompt_cache", lambda _cache: None)
+        monkeypatch.setattr(module.mx, "eval", lambda *_args: None)
+
+        request = self._request(np.array([[10, 11, 12, 13, 14]]))
+        generator._run_chunked_text_prefill(request, cache)
+
+        stored, remaining = generator.prefix_cache.fetch([10, 11, 12, 13, 14])
+        assert stored is None
+        assert remaining == [10, 11, 12, 13, 14]
+
+    def test_full_prompt_store_does_not_replace_existing_prefix_during_prefill(
+        self, monkeypatch
+    ):
+        import numpy as np
+
+        import vllm_mlx.mllm_batch_generator as module
+        from vllm_mlx.memory_cache import MemoryAwarePrefixCache, MemoryCacheConfig
+        from vllm_mlx.mllm_batch_generator import MLLMBatchGenerator
+
+        prefix_cache = MemoryAwarePrefixCache(
+            MagicMock(),
+            MemoryCacheConfig(max_memory_mb=1, min_prefix_tokens=1),
+        )
+        assert prefix_cache.store([10, 11], [self._HybridCache(2)])
+
+        generator = MLLMBatchGenerator.__new__(MLLMBatchGenerator)
+        generator.prefix_cache = prefix_cache
+        generator.prefill_step_size = 32
+        generator._think_suffix_len = 2
+        generator._aborted_request_ids = set()
+        generator._prefill_progress = {}
+        generator._prefix_checkpoint_lock = threading.Lock()
+        generator._request_prefix_checkpoints = {}
+        cache = [self._HybridCache()]
+
+        def language_model(tokens, cache):
+            cache[0].position += tokens.shape[1]
+            return np.zeros((1, tokens.shape[1], 4), dtype=np.float32)
+
+        generator.language_model = language_model
+        monkeypatch.setattr(module, "_eval_prompt_cache", lambda _cache: None)
+        monkeypatch.setattr(module.mx, "eval", lambda *_args: None)
+        request = self._request(np.array([[10, 11, 12, 13, 14]]))
+        generator._run_chunked_text_prefill(request, cache)
+
+        assert (10, 11) in prefix_cache._entries
+        assert (10, 11, 12) not in prefix_cache._entries
+
+        original_entry = prefix_cache._entries[(10, 11)]
+        second = self._request(np.array([[10, 11, 12, 13, 14]]))
+        second.request_id = "duplicate-checkpoint"
+        generator._run_chunked_text_prefill(second, [self._HybridCache()])
+        generator.abort_prefill(second.request_id)
+
+        assert prefix_cache._entries[(10, 11)] is original_entry
+
+    def test_abort_after_checkpoint_does_not_publish_entry(self, monkeypatch):
+        import numpy as np
+
+        import vllm_mlx.mllm_batch_generator as module
+        from vllm_mlx.mllm_batch_generator import (
+            MLLMBatchGenerator,
+            PrefillAbortedError,
+        )
+
+        generator = MLLMBatchGenerator.__new__(MLLMBatchGenerator)
+        generator.prefix_cache = MagicMock()
+        generator.prefill_step_size = 32
+        generator._think_suffix_len = 2
+        generator._aborted_request_ids = set()
+        generator._prefill_progress = {}
+        generator._prefix_checkpoint_lock = threading.Lock()
+        generator._request_prefix_checkpoints = {}
+        cache = [self._HybridCache()]
+
+        def language_model(tokens, cache):
+            cache[0].position += tokens.shape[1]
+            generator._aborted_request_ids.add("hybrid-prefill")
+            return np.zeros((1, tokens.shape[1], 4), dtype=np.float32)
+
+        generator.language_model = language_model
+        monkeypatch.setattr(module, "_eval_prompt_cache", lambda _cache: None)
+
+        request = self._request(np.array([[10, 11, 12, 13, 14]]))
+        with pytest.raises(PrefillAbortedError):
+            generator._run_chunked_text_prefill(request, cache)
+
+        generator.prefix_cache.prepare_store.assert_not_called()
+        generator.prefix_cache.commit_prepared.assert_not_called()
+
+    def test_abort_during_checkpoint_commit_rejects_publication(self, monkeypatch):
+        from vllm_mlx.mllm_batch_generator import MLLMBatchGenerator
+
+        store_started = threading.Event()
+        release_store = threading.Event()
+        prefix_cache = MagicMock()
+        prefix_cache._config = SimpleNamespace(min_prefix_tokens=1)
+
+        prepared_entry = SimpleNamespace(tokens=(10, 11, 12))
+        prefix_cache.prepare_store.return_value = prepared_entry
+
+        def commit_prepared(_entry, **kwargs):
+            store_started.set()
+            assert release_store.wait(timeout=5)
+            with kwargs["commit_lock"]:
+                return kwargs["commit_guard"]()
+
+        prefix_cache.commit_prepared.side_effect = commit_prepared
+        generator = MLLMBatchGenerator.__new__(MLLMBatchGenerator)
+        generator.prefix_cache = prefix_cache
+        generator.prefill_step_size = 32
+        generator._think_suffix_len = 2
+        generator._aborted_request_ids = set()
+        generator._prefill_progress = {}
+        generator._prefix_checkpoint_lock = threading.Lock()
+        generator._request_prefix_checkpoints = {}
+        request_id = "hybrid-prefill"
+
+        prefill_errors = []
+
+        def run_prefill():
+            try:
+                generator._publish_prefill_checkpoint(request_id, prepared_entry)
+            except Exception as exc:
+                prefill_errors.append(exc)
+
+        prefill = threading.Thread(target=run_prefill)
+        prefill.start()
+        assert store_started.wait(timeout=5)
+        abort = threading.Thread(
+            target=generator.abort_prefill,
+            args=(request_id,),
+        )
+        abort.start()
+        release_store.set()
+        prefill.join(timeout=5)
+        abort.join(timeout=5)
+
+        assert not prefill.is_alive()
+        assert not abort.is_alive()
+        assert len(prefill_errors) == 1
+        assert type(prefill_errors[0]).__name__ == "PrefillAbortedError"
+        assert prefix_cache.commit_prepared.call_count == 1
+        assert request_id not in generator._request_prefix_checkpoints
 
 
 if __name__ == "__main__":

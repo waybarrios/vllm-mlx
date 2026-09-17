@@ -265,6 +265,14 @@ class TestCacheEntry:
         assert entry.cache is cache
         assert entry.memory_bytes == 200
 
+    def test_create_entry_accounts_for_auxiliary_arrays(self):
+        cache = [MockKVCache(100, 100)]
+        entry = _CacheEntry.create(
+            [1, 2, 3], cache, auxiliary={"last_logits": MockArray(64)}
+        )
+
+        assert entry.memory_bytes == 264
+
 
 class TestMemoryAwarePrefixCache:
     """Tests for MemoryAwarePrefixCache."""
@@ -298,6 +306,35 @@ class TestMemoryAwarePrefixCache:
         assert len(cache) == 0
         assert cache.memory_limit_mb == 100.0
 
+    def test_prepare_store_rejects_auxiliary_over_memory_limit(
+        self, small_cache, mock_kv_cache
+    ):
+        entry = small_cache.prepare_store(
+            [1, 2, 3],
+            mock_kv_cache(512 * 1024),
+            auxiliary={"last_logits": MockArray(600 * 1024)},
+        )
+
+        assert entry is None
+        assert len(small_cache) == 0
+        stats = small_cache.get_stats()
+        assert stats["store_rejections"] == 1
+        assert stats["current_memory_mb"] == 0
+
+    def test_commit_rejects_oversized_prepared_entry(self, small_cache):
+        entry = _CacheEntry(
+            tokens=(1, 2, 3),
+            cache=[],
+            memory_bytes=2 * 1024 * 1024,
+            auxiliary=None,
+        )
+
+        assert small_cache.commit_prepared(entry) is False
+        assert len(small_cache) == 0
+        stats = small_cache.get_stats()
+        assert stats["store_rejections"] == 1
+        assert stats["current_memory_mb"] == 0
+
     def test_store_and_fetch_exact_match(self, small_cache, mock_kv_cache):
         tokens = [1, 2, 3, 4, 5]
         kv = mock_kv_cache(1000)
@@ -315,6 +352,85 @@ class TestMemoryAwarePrefixCache:
         assert result[0].keys is kv[0].keys
         assert result[0].values is kv[0].values
         assert remaining == []
+
+    def test_prepared_kv_entry_is_not_contaminated_by_live_suffix(self, small_cache):
+        mx = pytest.importorskip("mlx.core")
+        KVCache = pytest.importorskip("mlx_lm.models.cache").KVCache
+
+        live = KVCache()
+        first_keys = mx.array([[[[1.0], [2.0], [3.0]]]])
+        first_values = mx.array([[[[11.0], [12.0], [13.0]]]])
+        live.update_and_fetch(first_keys, first_values)
+
+        prepared = small_cache.prepare_store([1, 2, 3], [live])
+        assert prepared is not None
+
+        live.update_and_fetch(
+            mx.array([[[[4.0], [5.0]]]]),
+            mx.array([[[[14.0], [15.0]]]]),
+        )
+        assert small_cache.commit_prepared(prepared)
+
+        stored, remaining = small_cache.fetch([1, 2, 3])
+        assert remaining == []
+        assert stored[0].offset == 3
+        assert stored[0].keys.shape[2] == 3
+        assert stored[0].keys.tolist() == first_keys.tolist()
+        assert stored[0].values.tolist() == first_values.tolist()
+
+    def test_prepared_hybrid_entry_owns_arrays_and_state_containers(self, small_cache):
+        mx = pytest.importorskip("mlx.core")
+        cache_module = pytest.importorskip("mlx_lm.models.cache")
+
+        live_arrays = cache_module.ArraysCache(size=1)
+        prompt_state = mx.array([[1.0, 2.0, 3.0]])
+        live_arrays[0] = prompt_state
+        live_kv = cache_module.KVCache()
+        prompt_keys = mx.array([[[[1.0], [2.0], [3.0]]]])
+        prompt_values = prompt_keys + 10
+        live_kv.update_and_fetch(prompt_keys, prompt_values)
+
+        prepared = small_cache.prepare_store(
+            [1, 2, 3],
+            [live_arrays, live_kv],
+        )
+        assert prepared is not None
+
+        live_arrays[0] = mx.array([[9.0, 9.0, 9.0]])
+        live_kv.update_and_fetch(
+            mx.array([[[[4.0]]]]),
+            mx.array([[[[14.0]]]]),
+        )
+        assert small_cache.commit_prepared(prepared)
+
+        stored, remaining = small_cache.fetch([1, 2, 3])
+        assert remaining == []
+        assert stored[0] is not live_arrays
+        assert stored[0].state is not live_arrays.state
+        assert stored[0][0] is not prompt_state
+        assert stored[0][0].tolist() == [[1.0, 2.0, 3.0]]
+        assert stored[1] is not live_kv
+        assert stored[1].keys is not live_kv.keys
+        assert stored[1].keys.tolist() == prompt_keys.tolist()
+        assert stored[1].values.tolist() == prompt_values.tolist()
+
+    def test_commit_guard_rejects_before_prefix_eviction(
+        self, small_cache, mock_kv_cache
+    ):
+        base = [1, 2]
+        candidate = [1, 2, 3]
+        assert small_cache.store(base, mock_kv_cache(1000))
+
+        prepared = small_cache.prepare_store(candidate, mock_kv_cache(1000))
+        assert prepared is not None
+        assert not small_cache.commit_prepared(
+            prepared,
+            commit_lock=threading.Lock(),
+            commit_guard=lambda: False,
+        )
+
+        assert tuple(base) in small_cache._entries
+        assert tuple(candidate) not in small_cache._entries
 
     def test_short_prefix_reuse_is_rejected(self, model, mock_kv_cache):
         cache = MemoryAwarePrefixCache(
