@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "vllm-mlx"
-version = "0.4.1"
+version = "0.5.0"
 description = "OpenAI and Anthropic compatible LLM inference server for Apple Silicon, powered by MLX"
 readme = "README.md"
 license = {text = "Apache-2.0"}

@@ -583,3 +583,122 @@ def test_new_worker_never_binds_the_retired_workers_stream(engine_module, monkey
         "a thread bound a stream created by another thread: "
         f"{cross_thread} (stream, owner, binder)"
     )
+
+
+@pytest.fixture()
+def cache_chat_engine(engine_module, monkeypatch):
+    """Exercise the real cache producer/consumer with an in-memory cache sink."""
+
+    class PromptTrie:
+        nbytes = 0
+
+        def __init__(self):
+            self.entries = []
+
+        def __len__(self):
+            return len(self.entries)
+
+        def fetch_nearest_cache(self, model, tokens):
+            return None, tokens
+
+        def insert_cache(self, model, tokens, cache):
+            self.entries.append((model, list(tokens), cache))
+
+    lm = types.ModuleType("mlx_lm")
+    lm.__path__ = []
+    cache_module = types.ModuleType("mlx_lm.models.cache")
+    cache_module.make_prompt_cache = lambda model: [object()]
+    sample_module = types.ModuleType("mlx_lm.sample_utils")
+    sample_module.make_sampler = lambda **kwargs: None
+    monkeypatch.setitem(sys.modules, "mlx_lm", lm)
+    monkeypatch.setitem(sys.modules, "mlx_lm.models.cache", cache_module)
+    monkeypatch.setitem(sys.modules, "mlx_lm.sample_utils", sample_module)
+
+    engine = engine_module.SimpleEngine("test-model", prefix_trie_cache=True)
+    engine._loaded = True
+    engine._supports_system_kv_cache = True
+    engine._model = types.SimpleNamespace(
+        model=object(),
+        tokenizer=types.SimpleNamespace(
+            encode=lambda text, **kwargs: [ord(char) for char in text],
+            bos_token=None,
+        ),
+    )
+    trie = PromptTrie()
+    engine._prefix_trie_cache = trie
+    yield engine, lm, trie
+    if engine._generation_executor is not None:
+        engine._generation_executor.shutdown(wait=True)
+
+
+@pytest.mark.parametrize(
+    "finish_reason,max_tokens", [("stop", 4), (None, 1)], ids=["eos", "token-limit"]
+)
+def test_completed_cached_stream_finishes_cache_insert(
+    cache_chat_engine, finish_reason, max_tokens
+):
+    engine, lm, trie = cache_chat_engine
+    release_worker = threading.Event()
+
+    def generate(*args, **kwargs):
+        yield types.SimpleNamespace(
+            text="X", token=ord("X"), finish_reason=finish_reason
+        )
+        assert release_worker.wait(timeout=5), "consumer never released the worker"
+
+    lm.stream_generate = generate
+
+    async def scenario():
+        chunks = []
+        async for chunk in engine.stream_chat(
+            [{"role": "user", "content": "hello"}], max_tokens=max_tokens
+        ):
+            chunks.append(chunk)
+            # The worker resumes only after the consumer enters stream cleanup
+            # and awaits the producer. No scheduling-speed assumption is needed.
+            asyncio.get_running_loop().call_soon(release_worker.set)
+        return chunks
+
+    try:
+        chunks = asyncio.run(scenario())
+    finally:
+        release_worker.set()
+
+    assert len(chunks) == 1
+    assert chunks[0].finished
+    assert len(trie.entries) == 1
+    assert trie.entries[0][1][-1] == ord("X")
+    assert engine.get_stats()["prefix_trie_cache"]["inserts"] == 1
+
+
+def test_closing_incomplete_cached_stream_does_not_insert(cache_chat_engine):
+    engine, lm, trie = cache_chat_engine
+    release_worker = threading.Event()
+    worker_finished = threading.Event()
+
+    def generate(*args, **kwargs):
+        try:
+            yield types.SimpleNamespace(text="X", token=ord("X"), finish_reason=None)
+            assert release_worker.wait(timeout=5), "consumer never released the worker"
+        finally:
+            worker_finished.set()
+
+    lm.stream_generate = generate
+
+    async def scenario():
+        stream = engine.stream_chat(
+            [{"role": "user", "content": "hello"}], max_tokens=4
+        )
+        first = await anext(stream)
+        assert not first.finished
+        asyncio.get_running_loop().call_soon(release_worker.set)
+        await stream.aclose()
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        release_worker.set()
+
+    assert worker_finished.is_set()
+    assert trie.entries == []
+    assert engine.get_stats()["prefix_trie_cache"]["inserts"] == 0

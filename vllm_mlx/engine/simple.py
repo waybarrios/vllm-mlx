@@ -2372,7 +2372,11 @@ class SimpleEngine(BaseEngine):
                         break
             finally:
                 if not producer_task.done():
-                    abort_event.set()
+                    # The terminal chunk can arrive before the worker stores
+                    # the completed prefix. Let normal completion finish;
+                    # only an incomplete stream should abort the producer.
+                    if not finished:
+                        abort_event.set()
                     try:
                         await producer_task
                     except BaseException:
