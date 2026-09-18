@@ -139,6 +139,7 @@ jobs:
         run: |
           pytest \
             tests/test_platform.py \
+            tests/test_audio.py \
             tests/test_llm.py \
             tests/test_mllm.py \
             tests/test_server.py \
