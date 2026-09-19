@@ -1357,7 +1357,8 @@ Examples:
         "--mllm-draft-model",
         type=str,
         default=None,
-        help="Path to an mlx-vlm MLLM draft/assistant model. "
+        help="Local path or Hugging Face repo ID for an mlx-vlm MLLM "
+        "draft/assistant model. "
         "For Gemma 4 assistant drafters, use with --mllm-draft-kind mtp.",
     )
     serve_parser.add_argument(
