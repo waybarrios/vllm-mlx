@@ -8,10 +8,13 @@ from vllm_mlx/api/utils.py. No MLX dependency.
 
 import json
 
+import pytest
+
 from vllm_mlx.api.models import ContentPart, ImageUrl, Message
 from vllm_mlx.api.utils import (
     MLLM_PATTERNS,
     SPECIAL_TOKENS_PATTERN,
+    MllmRouteUndetermined,
     _check_legacy_string_patterns,
     _config_indicates_vlm,
     _content_to_text,
@@ -20,6 +23,7 @@ from vllm_mlx.api.utils import (
     extract_multimodal_content,
     is_mllm_model,
     is_vlm_model,
+    resolve_mllm_route,
 )
 
 
@@ -318,6 +322,100 @@ class TestIsMllmModelConfigPriority:
 
     def test_config_indicates_vlm_handles_non_list_architectures(self):
         assert _config_indicates_vlm({"architectures": "Qwen3ForCausalLM"}) is False
+
+
+class TestResolveMllmRoute:
+    """Tests for resolve_mllm_route, the config-json-first routing decision
+    used ahead of engine construction on the single-model CLI path.
+
+    Regression coverage for issue #748: a bare HF repo id (no local
+    directory to inspect yet) used to bypass config.json inspection
+    entirely and fall straight to the legacy substring matcher, so a model
+    like "mlx-community/Qwen3.8-27B-8bit" (declares vision_config, but
+    matches no MLLM_PATTERNS entry) silently routed to the text-only
+    engine. resolve_mllm_route is meant to be called with an
+    already-resolved local snapshot path (e.g. from
+    ensure_model_downloaded()) so this same repo id gets authoritative
+    config.json inspection instead.
+    """
+
+    @staticmethod
+    def _write_config(tmp_path, name, payload):
+        model_dir = tmp_path / name
+        model_dir.mkdir()
+        (model_dir / "config.json").write_text(json.dumps(payload))
+        return model_dir
+
+    def test_explicit_override_wins_regardless_of_config(self, tmp_path):
+        model_dir = self._write_config(
+            tmp_path,
+            "text-model",
+            {"architectures": ["Qwen3ForCausalLM"]},
+        )
+        route = resolve_mllm_route(
+            "mlx-community/text-model", str(model_dir), force_mllm=True
+        )
+        assert route.is_mllm is True
+        assert route.source == "explicit"
+
+    def test_bare_repo_id_with_resolved_vlm_config_routes_mllm(self, tmp_path):
+        # "Qwen3.8" matches nothing in MLLM_PATTERNS (the exact #748 repro),
+        # but its resolved config.json declares vision_config.
+        model_dir = self._write_config(
+            tmp_path,
+            "Qwen3.8-27B-8bit",
+            {"model_type": "qwen3_8", "vision_config": {"hidden_size": 1024}},
+        )
+        assert _check_legacy_string_patterns("mlx-community/Qwen3.8-27B-8bit") is False
+
+        route = resolve_mllm_route("mlx-community/Qwen3.8-27B-8bit", str(model_dir))
+
+        assert route.is_mllm is True
+        assert route.source == "config"
+
+    def test_bare_repo_id_with_resolved_text_only_config_routes_llm(self, tmp_path):
+        # An ordinary text-only repo: resolved config.json has no VLM
+        # markers, and the name matches no legacy pattern either.
+        model_dir = self._write_config(
+            tmp_path,
+            "Qwen3.8-27B-8bit",
+            {"model_type": "qwen3_8", "architectures": ["Qwen3ForCausalLM"]},
+        )
+
+        route = resolve_mllm_route("mlx-community/Qwen3.8-27B-8bit", str(model_dir))
+
+        assert route.is_mllm is False
+        assert route.source == "config"
+
+    def test_resolved_snapshot_missing_config_fails_closed(self, tmp_path):
+        # Resolution genuinely produced a snapshot directory (as
+        # ensure_model_downloaded() would), but it has no config.json and
+        # the repo id matches no legacy pattern either: refuse to guess.
+        model_dir = tmp_path / "mystery-repo"
+        model_dir.mkdir()
+
+        with pytest.raises(MllmRouteUndetermined):
+            resolve_mllm_route("someorg/mystery-repo", str(model_dir))
+
+    def test_resolved_snapshot_missing_config_but_name_matches_pattern(self, tmp_path):
+        model_dir = tmp_path / "llava-mystery"
+        model_dir.mkdir()
+
+        route = resolve_mllm_route("someorg/llava-mystery", str(model_dir))
+
+        assert route.is_mllm is True
+        assert route.source == "pattern"
+
+    def test_no_resolved_path_falls_back_to_pattern_like_before(self):
+        # Mirrors is_mllm_model()'s existing behaviour for callers that
+        # never resolved anything (e.g. bare repo id, no download step).
+        route = resolve_mllm_route("mlx-community/Qwen3-VL-4B-Instruct-3bit", None)
+        assert route.is_mllm is True
+        assert route.source == "pattern"
+
+        route = resolve_mllm_route("mlx-community/Qwen3-8B-4bit", None)
+        assert route.is_mllm is False
+        assert route.source == "pattern"
 
 
 class TestExtractMultimodalContent:

@@ -6,6 +6,7 @@ Utility functions for text processing and model detection.
 import json
 import logging
 import re
+from dataclasses import dataclass
 from pathlib import Path
 
 from .models import Message
@@ -495,6 +496,88 @@ def is_mllm_model(model_name: str) -> bool:
 
 # Backwards compatibility alias
 is_vlm_model = is_mllm_model
+
+
+class MllmRouteUndetermined(RuntimeError):
+    """Raised when MLLM/LLM routing cannot be determined from a resolved
+    model snapshot and no known name pattern or explicit override applies.
+
+    This is a fail-closed guard: it only fires when a config.json was
+    supposed to be available (the caller already resolved/downloaded the
+    model) but could not be read, and the model's name also matches
+    nothing in ``MLLM_PATTERNS``. Silently defaulting to the text-only
+    engine in that situation is exactly the bug this guards against.
+    """
+
+
+@dataclass(frozen=True)
+class MllmRoute:
+    """The outcome of an MLLM/LLM routing decision, and how it was made."""
+
+    is_mllm: bool
+    # "explicit": caller passed --mllm.
+    # "config": decided from a resolved snapshot's config.json.
+    # "pattern": config.json was unavailable; decided via MLLM_PATTERNS.
+    source: str
+
+
+def resolve_mllm_route(
+    model_name: str,
+    resolved_path: str | Path | None = None,
+    *,
+    force_mllm: bool = False,
+) -> MllmRoute:
+    """Determine MLLM/LLM routing from an already-resolved local snapshot.
+
+    Unlike ``is_mllm_model()``, which only inspects config.json for inputs
+    that are already local directories, this is meant to be called with
+    ``resolved_path`` set to a snapshot that a caller has just downloaded
+    (e.g. via ``ensure_model_downloaded()``) — so a bare HF repo id gets
+    the same authoritative config.json inspection a local path does,
+    without a second network lookup.
+
+    Args:
+        model_name: the original CLI/user-facing model identifier (bare
+            repo id or path). Used only for the legacy pattern fallback.
+        resolved_path: a local directory already resolved for
+            ``model_name`` (e.g. the return value of
+            ``ensure_model_downloaded()``), if one is available.
+        force_mllm: explicit user override (e.g. ``--mllm``).
+
+    Returns:
+        The routing decision and which signal produced it.
+
+    Raises:
+        MllmRouteUndetermined: ``resolved_path`` was given but its
+            config.json could not be read, and ``model_name`` matches no
+            entry in ``MLLM_PATTERNS`` either.
+    """
+    if force_mllm:
+        return MllmRoute(True, "explicit")
+
+    config = (
+        _try_read_config_json(str(resolved_path)) if resolved_path is not None else None
+    )
+    if config is not None:
+        return MllmRoute(_config_indicates_vlm(config), "config")
+
+    if _check_legacy_string_patterns(model_name):
+        return MllmRoute(True, "pattern")
+
+    # Only fail closed when resolution genuinely produced a snapshot
+    # directory whose config.json we still couldn't read — that's a real
+    # metadata failure. A resolved_path that isn't an actual directory
+    # (e.g. resolution wasn't really performed) has nothing more to go
+    # on than the pattern check already ran, so fall through like before.
+    if resolved_path is not None and Path(resolved_path).is_dir():
+        raise MllmRouteUndetermined(
+            f"Cannot determine whether '{model_name}' is a multimodal "
+            f"model: its resolved config.json at '{resolved_path}' could "
+            "not be read, and its name matches no known multimodal "
+            "pattern. Pass --mllm explicitly if this model is multimodal."
+        )
+
+    return MllmRoute(False, "pattern")
 
 
 # =============================================================================
