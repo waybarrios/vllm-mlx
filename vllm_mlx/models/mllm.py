@@ -189,14 +189,15 @@ def _append_ordered_mllm_content_part(
     text_parts: list[str],
     all_image_urls: list[str],
     video_frame_count: int,
-) -> int:
+    video_audio_count: int = 0,
+) -> tuple[int, int]:
     item = _normalize_content_part(raw_item)
     if isinstance(item, str):
         _append_text_content_part(built_parts, text_parts, item)
-        return video_frame_count
+        return video_frame_count, video_audio_count
 
     if not isinstance(item, dict):
-        return video_frame_count
+        return video_frame_count, video_audio_count
 
     item_type = item.get("type", "")
     if item_type in {"text", "input_text"}:
@@ -216,8 +217,14 @@ def _append_ordered_mllm_content_part(
         # Native video models bypass this helper. For fallback frame extraction,
         # preserve the video position by inserting that message's frames here.
         built_parts.extend({"type": "image"} for _ in range(video_frame_count))
-        return 0
-    return video_frame_count
+        # Omni models auto-extract the clip's soundtrack. The file already
+        # reaches generate(audio=...) and the encoder, but the chat template
+        # only renders an audio placeholder for an audio content PART - and
+        # without one the model has N audio features and zero slots to put
+        # them in ("Sound token count (0) does not match feature count").
+        built_parts.extend({"type": "audio"} for _ in range(video_audio_count))
+        return 0, 0
+    return video_frame_count, video_audio_count
 
 
 def _build_ordered_mllm_message_content(
@@ -226,6 +233,7 @@ def _build_ordered_mllm_message_content(
     role: str,
     all_image_urls: list[str],
     video_frame_count: int = 0,
+    video_audio_count: int = 0,
 ) -> tuple[object, bool]:
     """Build template content while preserving OpenAI media/text part order."""
     if isinstance(content, str):
@@ -237,14 +245,18 @@ def _build_ordered_mllm_message_content(
     built_parts: list[dict[str, str]] = []
     text_parts: list[str] = []
     remaining_video_frames = video_frame_count
+    remaining_video_audio = video_audio_count
 
     for raw_item in content:
-        remaining_video_frames = _append_ordered_mllm_content_part(
-            raw_item,
-            built_parts=built_parts,
-            text_parts=text_parts,
-            all_image_urls=all_image_urls,
-            video_frame_count=remaining_video_frames,
+        remaining_video_frames, remaining_video_audio = (
+            _append_ordered_mllm_content_part(
+                raw_item,
+                built_parts=built_parts,
+                text_parts=text_parts,
+                all_image_urls=all_image_urls,
+                video_frame_count=remaining_video_frames,
+                video_audio_count=remaining_video_audio,
+            )
         )
 
     if role == "assistant":
@@ -273,6 +285,7 @@ def _build_mllm_chat_messages(
     *,
     all_image_urls: list[str],
     video_frame_counts: dict[int, int],
+    video_audio_counts: dict[int, int] | None = None,
 ) -> list[dict]:
     """Build chat-template messages without reordering multimodal content parts."""
     chat_messages: list[dict] = []
@@ -286,6 +299,7 @@ def _build_mllm_chat_messages(
             role=role,
             all_image_urls=all_image_urls,
             video_frame_count=video_frame_counts.get(msg_idx, 0),
+            video_audio_count=(video_audio_counts or {}).get(msg_idx, 0),
         )
         chat_message = {"role": role, "content": content}
 
@@ -1005,6 +1019,7 @@ def _video_has_audio_track(video_path: str) -> bool:
                 "csv=p=0",
                 video_path,
             ],
+            stdin=subprocess.DEVNULL,
             capture_output=True,
             timeout=30,
             text=True,
@@ -1052,6 +1067,12 @@ def extract_audio_from_video(video_path: str) -> str | None:
         r = subprocess.run(
             [
                 "ffmpeg",
+                # ffmpeg polls stdin for interactive keys. Under a job-control
+                # launcher the server sits in a background process group, and
+                # a background read of the terminal raises SIGTTIN against the
+                # WHOLE group - server included - freezing every request with
+                # 0% CPU until the 600s timeout silently drops the audio.
+                "-nostdin",
                 "-y",
                 "-i",
                 video_path,
@@ -1064,6 +1085,7 @@ def extract_audio_from_video(video_path: str) -> str | None:
                 "pcm_s16le",
                 out_path,
             ],
+            stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             timeout=600,
@@ -2281,6 +2303,7 @@ class MLXMultimodalLM:
             messages,
             all_image_urls=all_image_urls,
             video_frame_counts=_msg_video_frame_counts,
+            video_audio_counts={k: len(v) for k, v in _msg_extra_audio.items()},
         )
 
         # Process images
@@ -2685,6 +2708,7 @@ class MLXMultimodalLM:
             messages,
             all_image_urls=all_image_urls,
             video_frame_counts=_msg_video_frame_counts,
+            video_audio_counts={k: len(v) for k, v in _msg_extra_audio.items()},
         )
 
         all_images = []
