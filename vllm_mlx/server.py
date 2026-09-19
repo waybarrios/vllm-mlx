@@ -4022,10 +4022,14 @@ async def cache_stats():
 @app.delete("/v1/cache", dependencies=[Depends(verify_api_key)])
 async def clear_cache():
     """Clear all caches."""
+    # In registry mode (--models-config) the module-global _engine is never
+    # populated (_sync_engine_from_residency only syncs from _residency_manager,
+    # which is None here) -- resolve the live engine the same way /metrics does.
+    engine = _model_manager.get_metrics_engine() if _model_manager is not None else _engine
     cleared_engine = None
-    if _engine is not None and hasattr(_engine, "clear_runtime_caches"):
+    if engine is not None and hasattr(engine, "clear_runtime_caches"):
         try:
-            cleared_engine = _engine.clear_runtime_caches()
+            cleared_engine = engine.clear_runtime_caches()
         except Exception as exc:
             logger.warning("Failed to clear engine caches: %s", exc, exc_info=True)
             cleared_engine = {"error": str(exc)}
@@ -4060,12 +4064,18 @@ async def clear_prefix_cache():
     hits the cache. Response returns immediately without waiting for
     the re-warm to finish.
     """
-    if _engine is None:
+    # In registry mode (--models-config) the module-global _engine is never
+    # populated (_sync_engine_from_residency only syncs from _residency_manager,
+    # which is None here) -- resolve the live engine the same way /metrics does.
+    # Without this, the endpoint returns HTTP 200 with {"status": "no_engine"}
+    # and silently clears nothing.
+    engine = _model_manager.get_metrics_engine() if _model_manager is not None else _engine
+    if engine is None:
         return {"status": "no_engine"}
     cleared = False
-    if hasattr(_engine, "clear_prefix_cache"):
+    if hasattr(engine, "clear_prefix_cache"):
         try:
-            _engine.clear_prefix_cache()
+            engine.clear_prefix_cache()
             cleared = True
         except Exception as e:
             logger.warning(
@@ -4075,7 +4085,7 @@ async def clear_prefix_cache():
 
     # Auto re-warm in background if warm-prompts was configured.
     rewarm_scheduled = False
-    if cleared and _warm_prompts_path and hasattr(_engine, "stream_chat"):
+    if cleared and _warm_prompts_path and hasattr(engine, "stream_chat"):
 
         async def _rewarm():
             try:
@@ -4085,7 +4095,7 @@ async def clear_prefix_cache():
                 )
 
                 prompts = load_warmup_file(_warm_prompts_path)
-                result = await warm_prefix_cache(_engine, prompts)
+                result = await warm_prefix_cache(engine, prompts)
                 logger.info(
                     "[clear_prefix_cache] re-warm done: %d completed, %d skipped, %.1fs",
                     result["count"],
