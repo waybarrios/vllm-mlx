@@ -1,5 +1,21 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Tests for Prometheus server metrics."""
+"""Tests for Prometheus server metrics.
+
+Runs against a real FastAPI TestClient built from vllm_mlx.server, which
+pulls in the full server dependency chain (uvicorn, fastapi, prometheus-client,
+mlx.core). Kept Apple-Silicon-only rather than mlx-stubbed: unlike
+test_mllm_steps_executed_stat.py's mlx.core-only need, this file's import
+chain also needs uvicorn/prometheus-client, neither of which the Linux
+test-matrix job installs (see PR #749's review -- an earlier version of
+this file ran here via tests/_mlx_stub.py and errored at fixture setup
+with ModuleNotFoundError: No module named 'uvicorn'). The one assertion
+that specifically needed Linux coverage (get_stats()["steps_executed"]
+reaching the vllm_mlx_engine_steps_executed gauge) now has a dependency-light
+equivalent in test_mllm_steps_executed_stat.py's
+TestMetricsEngineStepsExecutedGauge, which calls MetricsCollector directly
+and needs neither uvicorn nor a real prometheus_client registry. This file
+still runs in the Apple job for full HTTP-layer integration coverage.
+"""
 
 import platform
 import sys
@@ -234,6 +250,10 @@ class TestMetricsEndpoint:
         assert (
             'vllm_mlx_cache_type{cache_type="memory_aware_cache"} 1.0' in response.text
         )
+        # get_stats()["steps_executed"] must reach the gauge -- the
+        # duck-typed read side of #746 (the producer side, MLLMScheduler /
+        # BatchedEngine, is covered by test_mllm_steps_executed_stat.py).
+        assert "vllm_mlx_engine_steps_executed 7.0" in response.text
 
     def test_metrics_collapse_unmatched_paths(self, metrics_client, monkeypatch):
         client, server, collector = metrics_client

@@ -1161,6 +1161,7 @@ class BatchedEngine(BaseEngine):
                 "num_requests_processed",
                 "total_prompt_tokens",
                 "total_completion_tokens",
+                "steps_executed",
                 "metal_active_memory_gb",
                 "metal_peak_memory_gb",
                 "metal_cache_memory_gb",
