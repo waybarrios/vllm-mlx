@@ -149,6 +149,15 @@ vllm-mlx serve model --continuous-batching --cache-memory-percent 0.10
 | `--cache-memory-percent` | Fraction of available RAM (default: 0.20) |
 | `--no-memory-aware-cache` | Use legacy entry-count based cache |
 
+Without `--cache-memory-mb`, each memory-aware prefix cache computes its limit
+once at initialization using the available system RAM and the effective
+`--cache-memory-percent` (default: 20%). The limit does not dynamically resize
+as system memory changes. Limits apply independently to each applicable engine,
+so multiple resident models can have multiple cache budgets; this is not a
+shared process-wide reservation. An explicit `--cache-memory-mb` takes precedence
+over the percentage. The registry startup report describes the percentage
+policy rather than predicting an exact byte limit before caches initialize.
+
 ## Prefix Cache
 
 Prefix caching reuses KV cache for repeated prompts.
