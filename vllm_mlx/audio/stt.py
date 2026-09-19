@@ -18,6 +18,19 @@ logger = logging.getLogger(__name__)
 DEFAULT_WHISPER_MODEL = "mlx-community/whisper-large-v3-mlx"
 DEFAULT_PARAKEET_MODEL = "mlx-community/parakeet-tdt-0.6b-v2"
 
+_WHISPER_PROCESSOR_REPOS = {
+    "mlx-community/whisper-tiny-mlx": "openai/whisper-tiny",
+    "mlx-community/whisper-small-mlx": "openai/whisper-small",
+    "mlx-community/whisper-medium-mlx": "openai/whisper-medium",
+    "mlx-community/whisper-large-v3-mlx": "openai/whisper-large-v3",
+    "mlx-community/whisper-large-v3-turbo": "openai/whisper-large-v3-turbo",
+}
+
+
+def _canonical_whisper_processor(model_name: str) -> Optional[str]:
+    """Return the processor repository for a documented MLX Whisper model."""
+    return _WHISPER_PROCESSOR_REPOS.get(model_name.lower())
+
 
 @dataclass
 class TranscriptionResult:
@@ -69,7 +82,17 @@ class STTEngine:
         try:
             from mlx_audio.stt.utils import load_model
 
-            self.model = load_model(self.model_name)
+            model = load_model(self.model_name)
+            processor_repo = _canonical_whisper_processor(self.model_name)
+            if (
+                processor_repo is not None
+                and getattr(model, "_processor", None) is None
+            ):
+                from transformers import WhisperProcessor
+
+                model._processor = WhisperProcessor.from_pretrained(processor_repo)
+                logger.info("Loaded Whisper processor from %s", processor_repo)
+            self.model = model
             self._loaded = True
             logger.info(f"STT model loaded: {self.model_name}")
         except ImportError as e:
@@ -119,7 +142,9 @@ class STTEngine:
             duration = None
             if segments:
                 last_seg = segments[-1] if segments else None
-                if last_seg and hasattr(last_seg, "end"):
+                if isinstance(last_seg, dict):
+                    duration = last_seg.get("end")
+                elif last_seg and hasattr(last_seg, "end"):
                     duration = last_seg.end
 
             return TranscriptionResult(

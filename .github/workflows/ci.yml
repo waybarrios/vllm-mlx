@@ -80,6 +80,7 @@ jobs:
             tests/test_memory_cache.py \
             tests/test_prefix_cache.py \
             tests/test_mllm_cache.py \
+            tests/test_audio.py \
             tests/test_api_models.py \
             tests/test_api_utils.py \
             tests/test_request.py \
@@ -172,6 +173,7 @@ jobs:
         run: |
           pytest \
             tests/test_platform.py \
+            tests/test_audio.py \
             tests/test_llm.py \
             tests/test_mllm.py \
             tests/test_server.py \
