@@ -23,6 +23,7 @@ import mlx.core as mx
 
 from .request import Request, RequestOutput, SamplingParams
 from .scheduler import Scheduler, SchedulerConfig
+from .engine.base import suspend_cancellation
 from .output_collector import RequestOutputCollector, RequestStreamState
 from .model_registry import get_registry
 from .mlx_streams import bind_generation_streams
@@ -181,10 +182,18 @@ class EngineCore:
             self._task = None
             # Safety nets for a loop that never started or whose cleanup
             # raised. Both operations are idempotent.
-            try:
-                self.scheduler._close_batch_generator()
-            finally:
-                await asyncio.to_thread(self.scheduler.close_ssd_tier)
+            with suspend_cancellation():
+                try:
+                    worker = getattr(self, "_external_generation_worker", None)
+                    if worker is None:
+                        self.scheduler._close_batch_generator()
+                    else:
+                        loop = asyncio.get_running_loop()
+                        await loop.run_in_executor(
+                            worker, self.scheduler._close_batch_generator
+                        )
+                finally:
+                    await asyncio.to_thread(self.scheduler.close_ssd_tier)
         logger.info("Engine stopped")
 
     def is_running(self) -> bool:
@@ -306,8 +315,11 @@ class EngineCore:
                                     worker, _step_on_worker
                                 )
                             except Exception as e:
+                                # Only an internally created worker may be
+                                # abandoned. A supplied worker owns the model.
                                 if (
                                     _is_stream_thread_error(e)
+                                    and owns_worker
                                     and not stream_thread_fallback_used
                                 ):
                                     await loop.run_in_executor(
