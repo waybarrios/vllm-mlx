@@ -654,3 +654,97 @@ def test_load_rejects_v3_cache_after_rewind_semantics_change(tmp_path, caplog):
     ):
         assert cache.load_from_disk(str(tmp_path)) == 0
     assert "version mismatch: disk=3 current=4" in caplog.text
+
+
+class _TrimmableKV(MockKVCache):
+    """KV-style layer that reports itself rewindable, like KVCache."""
+
+    def __init__(self, nbytes: int):
+        super().__init__(nbytes // 2, nbytes // 2)
+        self.offset = 8
+
+    def is_trimmable(self) -> bool:
+        return True
+
+
+class _RecurrentLayer:
+    """State-container layer without a token dimension, like ArraysCache."""
+
+    def __init__(self, nbytes: int):
+        self.state = [MockArray(nbytes)]
+
+
+class TestPrefixSubsetEvictionHybrid:
+    """store() must not evict strict-prefix entries of a hybrid cache.
+
+    For a rewindable cache the longer entry subsumes the shorter one, so
+    evicting the prefix is a pure win.  A hybrid (recurrent + attention)
+    cache cannot be rewound, fetch() refuses LCP/supersequence reuse for
+    it, and the strict-prefix entry is therefore the only entry a request
+    that branches after it can ever hit.
+    """
+
+    @staticmethod
+    def _cache(max_entries: int = 10, max_memory_mb: float = 1.0):
+        return MemoryAwarePrefixCache(
+            MagicMock(),
+            MemoryCacheConfig(
+                max_memory_mb=max_memory_mb,
+                max_entries=max_entries,
+                min_prefix_tokens=1,
+            ),
+        )
+
+    def test_trimmable_cache_still_evicts_strict_prefix(self):
+        cache = self._cache()
+        assert cache.store([1, 2, 3], [_TrimmableKV(4 * 1024)])
+        assert cache.store([1, 2, 3, 4, 5], [_TrimmableKV(4 * 1024)])
+
+        assert [1, 2, 3] not in cache
+        assert [1, 2, 3, 4, 5] in cache
+        assert cache.get_stats()["evictions"] == 1
+
+    def test_hybrid_cache_keeps_strict_prefix(self):
+        cache = self._cache()
+        prewarmed = [1, 2, 3]
+        turn_a = [1, 2, 3, 4, 5]
+        turn_b = [1, 2, 3, 6, 7]
+        hybrid = lambda: [
+            _TrimmableKV(4 * 1024),
+            _RecurrentLayer(2 * 1024),
+        ]  # noqa: E731
+
+        assert cache.store(prewarmed, hybrid())
+        # request A extends the prewarmed prefix and stores its own entry ...
+        assert cache.store(turn_a, hybrid())
+        # ... which must NOT have evicted the prefix request B needs
+        assert prewarmed in cache
+        assert turn_a in cache
+        assert cache.get_stats()["evictions"] == 0
+
+        assert cache.store(turn_b, hybrid())
+        assert prewarmed in cache
+        assert len(cache) == 3
+
+    def test_hybrid_cache_respects_explicit_evict_prefixes_false(self):
+        # The exemption only ever turns eviction OFF; the explicit opt-out
+        # callers already use keeps working.
+        cache = self._cache()
+        assert cache.store([1, 2], [_TrimmableKV(1024), _RecurrentLayer(512)])
+        assert cache.store(
+            [1, 2, 3], [_TrimmableKV(1024), _RecurrentLayer(512)], evict_prefixes=False
+        )
+        assert [1, 2] in cache and [1, 2, 3] in cache
+
+    def test_hybrid_entries_still_bounded_by_lru(self):
+        # Memory pressure still evicts hybrid entries; only the proactive
+        # prefix deletion is skipped.
+        cache = self._cache(max_entries=100, max_memory_mb=0.5)
+        for i in range(6):
+            tokens = list(range(1, 4 + i))  # each a strict prefix of the next
+            assert cache.store(
+                tokens, [_TrimmableKV(150 * 1024), _RecurrentLayer(50 * 1024)]
+            )
+        assert cache.memory_usage_mb <= 0.5
+        assert cache.get_stats()["evictions"] > 0
+        assert len(cache) < 6

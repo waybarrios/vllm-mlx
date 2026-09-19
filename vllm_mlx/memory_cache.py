@@ -1396,6 +1396,29 @@ class MemoryAwarePrefixCache:
                 # Prefix-subset eviction: remove entries whose token sequence
                 # is a strict prefix of the new entry.  Uses sorted index for
                 # O(log N + K) lookup instead of O(N) scan.
+                #
+                # Hybrid caches are exempt.  The eviction assumes the longer
+                # entry subsumes the shorter one, which holds only when the
+                # cache can be trimmed back to the shorter length.  Recurrent
+                # layers cannot be rewound — fetch() refuses LCP and
+                # supersequence reuse for them for exactly that reason — so a
+                # strict-prefix entry is the only one such a model can reuse
+                # for a request that branches after it.  Evicting it makes
+                # each request destroy what the next one needs (measured: a
+                # prewarmed shared system prefix served one hit instead of
+                # two, because the first request's store evicted it).  LRU
+                # eviction under the memory limit is unaffected; this only
+                # stops the proactive deletion of still-usable prefixes.
+                if evict_prefixes and any(
+                    not _is_cache_layer_trimmable(lc) for lc in cache
+                ):
+                    evict_prefixes = False
+                    logger.debug(
+                        "[prefix_evict] skipped for new_entry=%s tokens: "
+                        "non-trimmable cache layers (hybrid model), prefix "
+                        "entries stay reusable",
+                        len(tokens_key),
+                    )
                 if evict_prefixes and self._sorted_keys:
                     to_remove = []
                     idx = bisect.bisect_left(self._sorted_keys, tokens_key)
