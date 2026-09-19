@@ -157,6 +157,7 @@ def build_text_model(
                 text_model,
                 group_size=quantization.get("group_size", 64),
                 bits=quantization.get("bits", 8),
+                mode=quantization.get("mode", "affine"),
                 class_predicate=_class_predicate,
             )
 
