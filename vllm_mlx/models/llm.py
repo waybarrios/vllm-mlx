@@ -57,6 +57,7 @@ class MLXLanguageModel:
         trust_remote_code: bool = False,
         mtp: bool = False,
         mtp_num_draft_tokens: int = 1,
+        enable_native_models: bool = False,
     ):
         """
         Initialize the MLX language model.
@@ -67,12 +68,14 @@ class MLXLanguageModel:
             trust_remote_code: Whether to trust remote code
             mtp: Enable native MTP speculative decoding (model must have MTP head)
             mtp_num_draft_tokens: Draft tokens per speculative MTP step
+            enable_native_models: Enable native fused model implementations
         """
         self.model_name = model_name
         self.tokenizer_name = tokenizer_name or model_name
         self.trust_remote_code = trust_remote_code
         self._mtp = mtp
         self._mtp_num_draft_tokens = mtp_num_draft_tokens
+        self._enable_native_models = enable_native_models
 
         self.model = None
         self.tokenizer = None
@@ -100,6 +103,7 @@ class MLXLanguageModel:
             self.model, self.tokenizer = load_model_with_fallback(
                 self.model_name,
                 tokenizer_config=tokenizer_config,
+                enable_native_models=self._enable_native_models,
             )
 
             self._loaded = True

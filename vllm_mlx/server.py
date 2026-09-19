@@ -1474,6 +1474,7 @@ def _build_engine(spec: ModelSpec) -> BaseEngine:
             scheduler_config=spec.scheduler_config,
             stream_interval=spec.stream_interval,
             force_mllm=spec.force_mllm,
+            enable_native_models=spec.enable_native_models,
         )
 
     from .engine.simple import SimpleEngine
@@ -1496,6 +1497,7 @@ def _build_engine(spec: ModelSpec) -> BaseEngine:
         prefix_trie_cache=spec.prefix_trie_cache,
         prefix_trie_cache_size=spec.prefix_trie_cache_size,
         prefix_trie_cache_memory_mb=spec.prefix_trie_cache_memory_mb,
+        enable_native_models=spec.enable_native_models,
     )
 
 
@@ -3565,6 +3567,7 @@ def load_model(
     auto_unload_idle_seconds: float = 0.0,
     lazy_load_model: bool = False,
     default_mllm_draft: bool = False,
+    enable_native_models: bool = False,
 ):
     """
     Load a model (auto-detects MLLM vs LLM).
@@ -3694,6 +3697,7 @@ def load_model(
             prefix_trie_cache=prefix_trie_cache,
             prefix_trie_cache_size=prefix_trie_cache_size,
             prefix_trie_cache_memory_mb=prefix_trie_cache_memory_mb,
+            enable_native_models=enable_native_models,
         )
         _residency_manager = ResidencyManager(
             _engine_factory,
@@ -3726,6 +3730,7 @@ def load_model(
             mllm_draft_kind=mllm_draft_kind,
             mllm_draft_block_size=mllm_draft_block_size,
             default_mllm_draft=default_mllm_draft,
+            enable_native_models=enable_native_models,
         )
         # BatchedEngine will be started in lifespan (uvicorn's event loop)
         # Just log for now
@@ -3758,6 +3763,7 @@ def load_model(
             prefix_trie_cache_size=prefix_trie_cache_size,
             prefix_trie_cache_memory_mb=prefix_trie_cache_memory_mb,
             default_mllm_draft=default_mllm_draft,
+            enable_native_models=enable_native_models,
         )
         # Start SimpleEngine synchronously (no background loop)
         # Use new_event_loop() for Python 3.10+ compatibility (get_event_loop() is deprecated)

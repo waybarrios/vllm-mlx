@@ -127,6 +127,7 @@ class BatchedEngine(BaseEngine):
         mllm_draft_kind: str | None = None,
         mllm_draft_block_size: int | None = None,
         default_mllm_draft: bool = False,
+        enable_native_models: bool = False,
     ):
         """
         Initialize the batched engine.
@@ -141,6 +142,8 @@ class BatchedEngine(BaseEngine):
                 limit and emergency threshold (0.0-1.0, default 0.90)
             default_mllm_draft: Enable the configured assistant drafter unless a
                 request explicitly sets ``mllm_draft`` to false.
+            enable_native_models: Enable high-performance fused native model implementations
+                (e.g., fused QKV and MLP) when available.
         """
         self._model_name = model_name
         self._created_at = time.time()
@@ -152,6 +155,7 @@ class BatchedEngine(BaseEngine):
         self._mllm_draft_kind = mllm_draft_kind
         self._mllm_draft_block_size = mllm_draft_block_size
         self._default_mllm_draft = default_mllm_draft
+        self._enable_native_models = enable_native_models
         self._is_mllm = force_mllm or is_mllm_model(model_name)
 
         self._model = None
@@ -498,6 +502,7 @@ class BatchedEngine(BaseEngine):
         self._model, self._tokenizer = load_model_with_fallback(
             self._model_name,
             tokenizer_config=tokenizer_config,
+            enable_native_models=self._enable_native_models,
         )
 
         # Validate MTP support if enabled

@@ -400,6 +400,7 @@ def run_benchmark(
     max_tokens: int = 256,
     temperature: float = 0.7,
     warmup_runs: int = 1,
+    enable_native_models: bool = False,
 ) -> Optional[BenchmarkSummary]:
     """
     Run the full benchmark suite.
@@ -492,7 +493,9 @@ def run_benchmark(
     # Load model
     print(f"Loading model: {model_name}...")
     load_start = time.perf_counter()
-    model, tokenizer = load_model_with_fallback(model_name)
+    model, tokenizer = load_model_with_fallback(
+        model_name, enable_native_models=enable_native_models
+    )
     load_time = time.perf_counter() - load_start
     print(f"Model loaded in {load_time:.2f}s\n")
 
@@ -1529,6 +1532,12 @@ Examples:
         default=None,
         help="Local path to video file for benchmark",
     )
+    parser.add_argument(
+        "--enable-native-models",
+        action="store_true",
+        default=False,
+        help="Enable native fused model implementations (e.g. fused QKV and MLP) for supported architectures",
+    )
 
     args = parser.parse_args()
 
@@ -1626,6 +1635,7 @@ Examples:
             max_tokens=args.max_tokens,
             temperature=args.temperature,
             warmup_runs=args.warmup,
+            enable_native_models=args.enable_native_models,
         )
 
         if summary:

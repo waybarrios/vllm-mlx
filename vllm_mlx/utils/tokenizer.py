@@ -75,25 +75,70 @@ def _install_custom_chat_template(model_name: str, tokenizer):
     return install_deepseek_v4(tokenizer, model_name=model_name)
 
 
-def load_model_with_fallback(model_name: str, tokenizer_config: dict = None):
+def load_model_with_fallback(
+    model_name: str,
+    tokenizer_config: dict = None,
+    enable_native_models: bool = False,
+):
     """
     Load model and tokenizer with fallback for non-standard tokenizers.
 
     Args:
         model_name: HuggingFace model name or local path
         tokenizer_config: Optional tokenizer configuration
+        enable_native_models: Enable native fused model implementations
 
     Returns:
         Tuple of (model, tokenizer)
     """
-    model, tokenizer = _load_model_with_fallback(model_name, tokenizer_config)
+    model, tokenizer = _load_model_with_fallback(
+        model_name,
+        tokenizer_config=tokenizer_config,
+        enable_native_models=enable_native_models,
+    )
     return model, _install_custom_chat_template(model_name, tokenizer)
 
 
-def _load_model_with_fallback(model_name: str, tokenizer_config: dict = None):
+def _load_model_with_fallback(
+    model_name: str,
+    tokenizer_config: dict = None,
+    enable_native_models: bool = False,
+):
     from mlx_lm import load
 
     tokenizer_config = tokenizer_config or {}
+
+    # Check for native model implementation if enabled
+    if enable_native_models:
+        try:
+            from pathlib import Path
+            from mlx_lm.utils import _download, load_config, load_model, load_tokenizer
+            from ..native_models import has_native_model, get_native_model_class
+
+            model_path = Path(_download(model_name))
+            config = load_config(model_path)
+            m_type = config.get("text_config", config).get("model_type", "").lower()
+            if has_native_model(m_type):
+                classes = get_native_model_class(m_type)
+                if classes is not None:
+                    model_cls, args_cls = classes
+                    logger.info(
+                        f"[Native Model] Loading native optimized model for {m_type} from {model_path}..."
+                    )
+                    model, _ = load_model(
+                        model_path,
+                        get_model_classes=lambda *args, **kwargs: (model_cls, args_cls),
+                    )
+                    tokenizer = load_tokenizer(
+                        model_path,
+                        tokenizer_config,
+                        eos_token_ids=config.get("eos_token_id", None),
+                    )
+                    return model, tokenizer
+        except Exception as e:
+            logger.warning(
+                f"[Native Model] Native load failed for {model_name} ({e}), falling back to standard load"
+            )
 
     # Check if model needs fallback (e.g., Nemotron)
     if _needs_tokenizer_fallback(model_name):

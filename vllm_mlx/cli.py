@@ -448,6 +448,7 @@ def serve_command(args):
             warm_prompts_path=getattr(args, "warm_prompts", None),
             auto_unload_idle_seconds=args.auto_unload_idle_seconds,
             lazy_load_model=args.lazy_load_model,
+            enable_native_models=getattr(args, "enable_native_models", False),
         )
 
     # Start server
@@ -570,7 +571,6 @@ def bench_command(args):
     import asyncio
     import time
 
-    from mlx_lm import load
 
     from .engine_core import AsyncEngineCore, EngineConfig
     from .request import SamplingParams
@@ -581,7 +581,12 @@ def bench_command(args):
 
     async def run_benchmark():
         print(f"Loading model: {args.model}")
-        model, tokenizer = load(args.model)
+        from .utils.tokenizer import load_model_with_fallback
+
+        model, tokenizer = load_model_with_fallback(
+            args.model,
+            enable_native_models=getattr(args, "enable_native_models", False),
+        )
 
         scheduler_config = SchedulerConfig(
             max_num_seqs=args.max_num_seqs,
@@ -1580,9 +1585,21 @@ Examples:
         action="store_true",
         help="Offline mode — only use locally cached models",
     )
+    serve_parser.add_argument(
+        "--enable-native-models",
+        action="store_true",
+        default=False,
+        help="Enable native fused model implementations (e.g. fused QKV and MLP) for supported architectures",
+    )
     # Bench command
     bench_parser = subparsers.add_parser("bench", help="Run benchmark")
     bench_parser.add_argument("model", type=str, help="Model to benchmark")
+    bench_parser.add_argument(
+        "--enable-native-models",
+        action="store_true",
+        default=False,
+        help="Enable native fused model implementations (e.g. fused QKV and MLP) for supported architectures",
+    )
     bench_parser.add_argument(
         "--num-prompts", type=int, default=10, help="Number of prompts"
     )
