@@ -2113,7 +2113,8 @@ class TestSimpleEngineConcurrency:
         assert seen["tokens"] == [10, 11, 12, 13]
 
     @pytest.mark.anyio
-    async def test_specprefill_success_preserves_mtp_path(self):
+    @pytest.mark.parametrize("mtp", [False, True])
+    async def test_specprefill_success_preserves_mtp_path(self, mtp):
         """Successful sparse prefill should continue through the normal MTP path."""
         from types import SimpleNamespace
 
@@ -2148,13 +2149,13 @@ class TestSimpleEngineConcurrency:
         )
 
         text_model = MagicMock()
-        text_model.mtp = object()
+        text_model.mtp = object() if mtp else None
         text_model.make_mtp_cache.return_value = ["mtp-cache"]
 
         engine = SimpleEngine(
             "test-model",
             force_mllm=True,
-            mtp=True,
+            mtp=mtp,
             mtp_num_draft_tokens=4,
             specprefill_enabled=True,
             specprefill_threshold=1,
@@ -2209,8 +2210,12 @@ class TestSimpleEngineConcurrency:
             "min_p": 0.0,
         }
         assert captured["prompt"] == [17]
-        assert captured["kwargs"]["mtp"] is True
-        assert captured["kwargs"]["prompt_cache"] == ["backbone-cache", "mtp-cache"]
+        if mtp:
+            assert captured["kwargs"]["mtp"] is True
+            assert captured["kwargs"]["prompt_cache"] == ["backbone-cache", "mtp-cache"]
+        else:
+            assert "mtp" not in captured["kwargs"]
+            assert captured["kwargs"]["prompt_cache"] == ["backbone-cache"]
         assert captured["kwargs"]["max_tokens"] == 3
         assert captured["kwargs"]["logits_processors"] is None
         assert captured["select_chunks_kwargs"]["backbone_pct"] == 0.25

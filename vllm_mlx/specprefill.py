@@ -328,7 +328,9 @@ def score_tokens(
     # Auto-detect query extractor from model_type (explicit registry, not
     # attribute sniffing -- avoids silent misclassification on new models).
     if query_extractor is None:
-        model_type = getattr(getattr(model, "config", None), "model_type", "")
+        model_type = getattr(model, "model_type", None) or getattr(
+            getattr(model, "config", None), "model_type", ""
+        )
         _EXTRACTOR_REGISTRY = {
             "qwen3_5": _qwen35_extract_queries,
             "qwen3_5_moe": _qwen35_extract_queries,
@@ -644,7 +646,8 @@ def _get_rope(attn):
 
     mlx_lm models use ``self.rope``; mlx_vlm models use ``self.rotary_emb``.
     """
-    return getattr(attn, "rope", None) or getattr(attn, "rotary_emb", None)
+    rope = getattr(attn, "rope", None)
+    return rope if rope is not None else getattr(attn, "rotary_emb", None)
 
 
 def _set_rope(attn, rope_module):
