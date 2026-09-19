@@ -1200,6 +1200,7 @@ class SimpleEngine(BaseEngine):
             tokens=list(last_output.tokens),
             prompt_tokens=last_output.prompt_tokens,
             completion_tokens=last_output.completion_tokens,
+            cached_tokens=getattr(last_output, "cached_tokens", 0),
             finish_reason=last_output.finish_reason,
             finished=True,
         )
@@ -1597,6 +1598,7 @@ class SimpleEngine(BaseEngine):
                 tokens=list(final_output.tokens),
                 prompt_tokens=final_output.prompt_tokens,
                 completion_tokens=final_output.completion_tokens,
+                cached_tokens=getattr(final_output, "cached_tokens", 0),
                 finish_reason=final_output.finish_reason,
                 mtp_drafts=final_output.mtp_drafts,
                 mtp_accepted=final_output.mtp_accepted,
@@ -2365,6 +2367,9 @@ class SimpleEngine(BaseEngine):
                         new_text=new_text,
                         prompt_tokens=full_token_count,
                         completion_tokens=token_count,
+                        # System-prefix KV-cache reuse: on a HIT the whole system
+                        # prefix is served from cache; a MISS prefills it fresh.
+                        cached_tokens=system_token_count if cache_hit else 0,
                         finished=finished,
                         finish_reason=finish_reason,
                     )

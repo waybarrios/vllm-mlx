@@ -2816,6 +2816,17 @@ class Scheduler:
                 detok.add_token(response.token)
                 new_text = detok.last_segment
 
+            # Track the high-water mark of prefix-cache reuse. ``cached_tokens``
+            # holds the reuse count set at prefill (memory-tier LCP hit, SSD-tier
+            # promotion, or legacy/paged hit); it can be cleared later on a
+            # cache-fallback/retry path, so we carry the peak forward. This is
+            # what lets the FINAL output — the finished streaming chunk as well
+            # as the aggregated non-streaming result — report cache reuse even
+            # though the streamed chunks are consumed one at a time.
+            request.peak_cached_tokens = max(
+                request.peak_cached_tokens, request.cached_tokens
+            )
+
             # Create output
             output = RequestOutput(
                 request_id=request_id,
@@ -2824,6 +2835,7 @@ class Scheduler:
                 output_token_ids=request.output_token_ids,
                 prompt_tokens=request.num_prompt_tokens,
                 completion_tokens=request.num_output_tokens,
+                cached_tokens=request.peak_cached_tokens,
             )
 
             # Check if finished

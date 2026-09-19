@@ -160,6 +160,9 @@ class RequestOutputCollector:
             finish_reason=new.finish_reason,
             prompt_tokens=new.prompt_tokens,
             completion_tokens=new.completion_tokens,
+            # Cache reuse is a per-request constant; keep the max so it is never
+            # lost when a cache-bearing early step is merged with a later one.
+            cached_tokens=max(existing.cached_tokens, new.cached_tokens),
         )
 
     def clear(self) -> None:

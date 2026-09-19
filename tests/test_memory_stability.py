@@ -228,6 +228,11 @@ class TestIncrementalCacheEval:
         mock_request.output_token_ids = [100]
         mock_request.num_output_tokens = 1
         mock_request.num_prompt_tokens = 3
+        # Prefix-cache reuse counters are real ints on a Request; set them so the
+        # peak-tracking arithmetic in _process_batch_responses has numbers to work
+        # with rather than MagicMock attributes.
+        mock_request.cached_tokens = 0
+        mock_request.peak_cached_tokens = 0
         scheduler.running["req-1"] = mock_request
         scheduler.uid_to_request_id[42] = "req-1"
 
