@@ -248,6 +248,7 @@ class MLLMBatchResponse:
     from_draft: bool = False  # True when this response is an accepted MTP draft
     mtp_attempted: bool = False  # True when the primary step attempted MTP
     mtp_attempted_count: int = 0  # Number of draft tokens attempted
+    prompt_tokens: Optional[int] = None  # Authoritative prompt token count from prefill
 
 
 @dataclass
@@ -2054,6 +2055,9 @@ class MLLMBatchGenerator:
                 # Cleanup prefill progress tracking
                 self._prefill_progress.pop(request_id, None)
 
+            req = batch.requests[i]
+            prompt_tokens = req.input_ids.size if req.input_ids is not None else None
+
             responses.append(
                 MLLMBatchResponse(
                     uid=uid,
@@ -2062,6 +2066,7 @@ class MLLMBatchGenerator:
                     logprobs=logprobs[i],
                     finish_reason=finish_reason,
                     prompt_cache=cache_fn,
+                    prompt_tokens=prompt_tokens,
                 )
             )
 
@@ -2781,6 +2786,7 @@ def install_mtp_mllm(
                                 logprobs=draft_lp,
                                 finish_reason="stop",
                                 from_draft=from_draft,
+                                prompt_tokens=r.prompt_tokens,
                             )
                         )
                         draft_end_uids.add(uid)
@@ -2805,6 +2811,7 @@ def install_mtp_mllm(
                                 logprobs=draft_lp,
                                 finish_reason=draft_finish,
                                 from_draft=from_draft,
+                                prompt_tokens=r.prompt_tokens,
                             )
                         )
 
@@ -2947,6 +2954,9 @@ def install_chunked_prefill_mllm(
             if finish_reason is not None:
                 batch_gen._prefill_progress.pop(request_id, None)
 
+            req = batch.requests[i]
+            prompt_tokens = req.input_ids.size if req.input_ids is not None else None
+
             responses.append(
                 MLLMBatchResponse(
                     uid=uid,
@@ -2959,6 +2969,7 @@ def install_chunked_prefill_mllm(
                         if finish_reason is not None
                         else None
                     ),
+                    prompt_tokens=prompt_tokens,
                 )
             )
 

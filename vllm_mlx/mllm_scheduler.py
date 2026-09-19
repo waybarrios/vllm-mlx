@@ -471,8 +471,10 @@ class MLLMScheduler:
         )
         try:
             request.num_prompt_tokens = len(tokenizer.encode(prompt))
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(
+                f"Could not pre-estimate prompt tokens for request {request_id}: {e}"
+            )
 
         self.requests[request_id] = request
         self.waiting.append(request)
@@ -679,6 +681,13 @@ class MLLMScheduler:
                 logger.warning(f"Request {request_id} failed during preprocessing")
                 outputs.append(output)
                 continue
+
+            # Update authoritative prompt token count from batch generator prefill
+            if response.prompt_tokens is not None and response.prompt_tokens > 0:
+                diff = response.prompt_tokens - request.num_prompt_tokens
+                if diff != 0:
+                    self.total_prompt_tokens += diff
+                    request.num_prompt_tokens = response.prompt_tokens
 
             # Append token to request
             request.output_tokens.append(response.token)
