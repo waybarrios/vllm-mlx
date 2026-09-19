@@ -41,6 +41,16 @@ export ANTHROPIC_API_KEY=not-needed
 claude
 ```
 
+## Coding CLI compatibility
+
+**Validated with OpenCode, pi, Codex, Claude Code, GitHub Copilot CLI, Cline CLI,
+and OpenClaw's embedded agent.** All seven completed a streamed tool interaction
+and an exact file edit in one local run with Qwen3.8-27B-4bit on September 19,
+2026. Results apply to the tested client versions and settings.
+
+See the [validated CLI matrix and setup guide](docs/guides/client-acceptance.md#validated-cli-versions)
+for versions, API transports, reproduction commands, and coverage limits.
+
 ## Features
 
 ### APIs

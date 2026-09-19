@@ -36,6 +36,109 @@ Continue and Aider are follow-up candidates. Cursor's native agent is outside
 this local test matrix because its documented BYOK requests pass through Cursor
 infrastructure. See [Cursor's BYOK documentation](https://cursor.com/help/models-and-usage/api-keys).
 
+## Validated CLI versions
+
+On **September 19, 2026**, all seven clients passed in one complete local run
+against **Qwen3.8-27B-4bit**. These were the stable client versions checked on
+that date. The [published validation report](https://github.com/waybarrios/vllm-mlx/pull/774#issuecomment-5743957039)
+includes the structured results and earlier attempts.
+
+| Client | Executable | Tested version | API exercised | Result |
+| --- | --- | --- | --- | --- |
+| OpenCode | `opencode` | `1.18.31` | Chat Completions | Passed |
+| pi | `pi` | `0.85.1` | Chat Completions | Passed |
+| Codex | `codex` | `0.155.1` | Responses | Passed |
+| Claude Code | `claude` | `2.1.278` | Anthropic Messages | Passed |
+| GitHub Copilot CLI | `copilot` | `1.0.86` | Chat Completions | Passed |
+| Cline CLI | `cline` | `3.0.62` | Chat Completions | Passed |
+| OpenClaw embedded agent | `openclaw` | `2026.9.5` | Responses | Passed |
+
+Each pass met all [acceptance conditions](#what-a-passing-run-establishes),
+including an unchanged input file, exact output bytes with a final newline,
+completed streamed tool calls/results, and a successful client exit. The result
+describes these versions, model, and settings; other models and client releases
+need their own acceptance run.
+
+### Tested configuration
+
+- **Model:** `mlx-community/Qwen3.8-27B-4bit`, snapshot
+  `3e6447f082e89cc7f0bc6e5441afd38dfce760ff`, with the `qwen3_xml` parser.
+- **Server source:** clean integration commit
+  `9972164863791801116ae3071e6c1869aa8e1968`, combining PR head
+  `00dbf22d6f64fdd64cf4ed99cb64525ba042aed2` with main
+  `e81dbb4a0060c5ef8ef5673e31c91165ce1454ea`.
+- **Runtime:** macOS 27.0 on Apple Silicon, Python 3.12.14, MLX 0.32.2,
+  mlx-lm 0.31.3, mlx-vlm 0.6.17, Node 26.8.1, and npm 11.19.0.
+- **Generation:** thinking disabled; server defaults of temperature 0 and
+  512 maximum output tokens. Clients can override generation defaults.
+- **Resources:** cache memory 256 MiB, GPU memory utilization 0.25, and a
+  **300-second budget per client**. Clients ran sequentially against one server.
+- **Cline installation:** unmodified official source at tag `cli-v3.0.62`,
+  commit `d718dd16f850c4c915a8214441a831e00cb28c75`, with Bun 1.3.13 and its
+  SDK built using the frozen lockfile. The published macOS ARM64 binary was
+  rejected with `CODESIGNING / Invalid Page`; see [Cline #14150](https://github.com/cline/cline/issues/14150).
+  This row establishes the source CLI's behavior, not that binary's installation
+  or the editor extension's behavior.
+
+### Reproduce the seven-client matrix
+
+Install the versions in the table and make all seven executables available on
+`PATH`. Use the pinned model snapshot and server revision above to reproduce
+that configuration. With another checkout or snapshot, record its actual
+revision in the runner arguments instead.
+
+Start the server in one terminal, replacing the model path with your snapshot:
+
+```bash
+vllm-mlx serve /absolute/path/to/Qwen3.8-27B-4bit-snapshot \
+  --served-model-name review-qwen38-27b \
+  --host 127.0.0.1 --port 8000 \
+  --enable-auto-tool-choice --tool-call-parser qwen3_xml \
+  --default-chat-template-kwargs '{"enable_thinking": false}' \
+  --default-temperature 0 --max-tokens 512 \
+  --cache-memory-mb 256 --gpu-memory-utilization 0.25
+```
+
+From the repository checkout in another terminal:
+
+```bash
+mkdir -p tmp/client-acceptance
+export TMPDIR="$PWD/tmp/client-acceptance"
+python -m scripts.client_acceptance \
+  --clients pi opencode claude codex copilot cline openclaw \
+  --base-url http://127.0.0.1:8000/v1 \
+  --model review-qwen38-27b \
+  --model-revision 3e6447f082e89cc7f0bc6e5441afd38dfce760ff \
+  --server-revision 9972164863791801116ae3071e6c1869aa8e1968 \
+  --expect-version opencode=1.18.31 --expect-version pi=0.85.1 \
+  --expect-version codex=0.155.1 --expect-version claude=2.1.278 \
+  --expect-version copilot=1.0.86 --expect-version cline=3.0.62 \
+  --expect-version openclaw=2026.9.5 \
+  --timeout 300 \
+  --report tmp/client-acceptance/qwen38-27b.json
+```
+
+### Earlier attempts and coverage limits
+
+The complete run above passed **7/7**; earlier failures were kept separately:
+
+- Qwen3-8B-6bit with the same client versions and a 60-second budget passed
+  **6/7**. Codex failed the file edit and final answer; a diagnostic run showed
+  GNU-style `sed -i` commands failing on macOS. Cline also failed an earlier
+  diagnostic edit before passing the complete 8B matrix.
+- The first 27B matrix with a 180-second budget passed **6/7** because OpenClaw
+  failed the exact-file check. Its original output bytes were not captured, so
+  the cause remains unproven. Four standalone diagnostic repeats passed.
+- The next complete 27B matrix at 180 seconds passed OpenClaw, but Cline timed
+  out while finishing its final response after editing correctly. That run
+  remained **6/7**. The budget was increased to 300 seconds for the new complete
+  run in the table.
+
+This is an observed acceptance result, not a reliability estimate. OpenClaw
+coverage is limited to embedded `agent exec` over Responses, and Cline coverage
+is limited to its CLI. The validation was local; the manual main-only GitHub
+workflow was not dispatched.
+
 ## Prepare the server and clients
 
 Install the desired clients separately, using explicit versions. The runner
