@@ -1466,8 +1466,38 @@ class MemoryAwarePrefixCache:
         if idx < len(self._sorted_keys) and self._sorted_keys[idx] == key:
             self._sorted_keys.pop(idx)
 
+    def _find_superseded_lru(self) -> tuple[int, ...] | None:
+        """Oldest resident entry that is a strict prefix of another resident entry.
+
+        Such an entry is the cheapest thing to give up under memory pressure:
+        anything it could serve, the longer entry serves at least as well, since a
+        strict-prefix hit on the longer key covers everything the shorter key
+        covers and more.
+
+        This matters because multi-turn conversations generate exactly this shape
+        -- one entry per turn, each a strict prefix of the next. Without it the
+        cache fills with superseded turns and plain LRU, walking oldest-first,
+        sacrifices an older conversation's *newest* entry (the one it is about to
+        need) before it touches a newer conversation's already-superseded turns.
+
+        The one case that loses is a conversation branched *below* the longer
+        entry (an edited or retried turn). That request re-prefills -- which is
+        what would have happened anyway had plain LRU chosen it.
+
+        Extensions of a key sort immediately after it, so checking the single
+        successor in ``_sorted_keys`` is sufficient: any key ordered between a key
+        and one of its extensions would itself have to start with that key.
+        """
+        for key in self._entries:  # OrderedDict iterates oldest-first (LRU order)
+            idx = bisect.bisect_right(self._sorted_keys, key)
+            if idx < len(self._sorted_keys):
+                nxt = self._sorted_keys[idx]
+                if len(nxt) > len(key) and nxt[: len(key)] == key:
+                    return key
+        return None
+
     def _evict_lru(self) -> None:
-        """Evict the least recently used entry.
+        """Evict one entry, preferring a superseded prefix over the LRU entry.
 
         If an SSD tier is attached, the entry is spilled to disk instead
         of being discarded.
@@ -1476,8 +1506,18 @@ class MemoryAwarePrefixCache:
             if not self._entries:
                 return
 
-            # popitem(last=False) removes oldest entry (FIFO order = LRU)
-            tokens_key, entry = self._entries.popitem(last=False)
+            # Prefer an entry that another resident entry already subsumes, else
+            # popitem(last=False) (oldest = LRU). This never deletes proactively --
+            # it only chooses the victim once eviction is already required, so the
+            # hybrid-model prefix-eviction exemption in store() is unaffected.
+            superseded = self._find_superseded_lru()
+            if superseded is not None:
+                tokens_key = superseded
+                entry = self._entries.pop(tokens_key)
+                evict_reason = "superseded"
+            else:
+                tokens_key, entry = self._entries.popitem(last=False)
+                evict_reason = "lru"
             self._current_memory -= entry.memory_bytes
             self._remove_from_sorted(tokens_key)
             self._stats.evictions += 1
@@ -1489,7 +1529,7 @@ class MemoryAwarePrefixCache:
             self._ssd_tier.enqueue_spill(tokens_key, entry.cache, entry.memory_bytes)
 
         logger.debug(
-            f"[lru_evict] removed {len(tokens_key)} tokens, "
+            f"[lru_evict:{evict_reason}] removed {len(tokens_key)} tokens, "
             f"freed {entry.memory_bytes / _BYTES_PER_MB:.2f}MB"
             f"{'  (spilled to SSD)' if self._ssd_tier is not None else ''}"
         )
