@@ -841,6 +841,17 @@ def _install_mtp(
     # Format: {uid: {'token': int, 'logprobs': mx.array}}
     _deferred_drafts = {}
 
+    # Per-UID MTP attempt/accept deltas accumulated since the last drain,
+    # keyed by UID the same way _deferred_drafts is. _mtp_stats above only
+    # tracks batch-global totals; these let the scheduler attribute a
+    # step's attempted/accepted events to the specific requests whose UID
+    # was actually part of the batch when they happened, mirroring
+    # MLLMRequest.mtp_drafts/mtp_accepted (mllm_scheduler.py). Drained (read
+    # + cleared) once per Scheduler.step() call so a later UID reuse can't
+    # inherit a finished request's stale counts.
+    _mtp_drafts_by_uid: Dict[int, int] = {}
+    _mtp_accepted_by_uid: Dict[int, int] = {}
+
     # Scheduler-created generators share one state so sampler-driven generator
     # replacement does not reset the operator-facing counters.
     if stats_state is None:
@@ -874,6 +885,18 @@ def _install_mtp(
         }
 
     batch_gen.get_mtp_stats = _get_mtp_stats
+
+    def _drain_mtp_uid_deltas() -> Tuple[Dict[int, int], Dict[int, int]]:
+        """Return and clear the per-UID attempt/accept deltas accumulated
+        since the last call. Meant to be drained exactly once per
+        Scheduler.step() call."""
+        drafts = dict(_mtp_drafts_by_uid)
+        accepted = dict(_mtp_accepted_by_uid)
+        _mtp_drafts_by_uid.clear()
+        _mtp_accepted_by_uid.clear()
+        return drafts, accepted
+
+    batch_gen.drain_mtp_uid_deltas = _drain_mtp_uid_deltas
 
     def _mtp_bypass_reasons(input_tokens, prompt_cache):
         reasons = []
@@ -996,6 +1019,13 @@ def _install_mtp(
         try:
             with _mtp_stats_lock:
                 _mtp_stats["attempted"] += 1
+            # Every UID currently in the batch had a draft attempted this
+            # step (num_draft_tokens is always 1 in the batched path -- see
+            # the warning below), regardless of the eventual accept/reject
+            # outcome, which is why this increments unconditionally here
+            # rather than in the accept-only branches below.
+            for uid in current_uids:
+                _mtp_drafts_by_uid[uid] = _mtp_drafts_by_uid.get(uid, 0) + 1
             # Draft: predict token n+2 from hidden states + primary (n+1)
             draft_logits = model.mtp_forward(
                 hidden_states[:, -1:, :],
@@ -1222,6 +1252,11 @@ def _install_mtp(
             # Emit deferred draft AFTER its primary
             if uid in prev_deferred:
                 draft_info = prev_deferred.pop(uid)
+                # The draft is only really "accepted" once it's actually
+                # surfaced as an output token here, not when _mtp_step
+                # merely predicted an accept -- mirrors MLLM's from_draft
+                # response flag, which is likewise set at emission time.
+                _mtp_accepted_by_uid[uid] = _mtp_accepted_by_uid.get(uid, 0) + 1
                 if "token" in draft_info:
                     draft_t = draft_info["token"]
                 else:
@@ -2773,6 +2808,18 @@ class Scheduler:
         outputs = []
         finished_ids = set()
 
+        # Per-UID MTP deltas accumulated by _install_mtp's closures since
+        # the last drain (no-op {}/{} when MTP isn't installed). Applied at
+        # most once per UID below so a UID with both a primary and a
+        # deferred-draft response this step (see _mtp_next) doesn't have
+        # the same step's deltas counted twice.
+        mtp_drafts_delta: Dict[int, int] = {}
+        mtp_accepted_delta: Dict[int, int] = {}
+        drain_mtp = getattr(self.batch_generator, "drain_mtp_uid_deltas", None)
+        if drain_mtp is not None:
+            mtp_drafts_delta, mtp_accepted_delta = drain_mtp()
+        mtp_delta_applied: Set[int] = set()
+
         for response in responses:
             request_id = self.uid_to_request_id.get(response.uid)
             if request_id is None:
@@ -2781,6 +2828,12 @@ class Scheduler:
             request = self.running.get(request_id)
             if request is None:
                 continue
+
+            uid = response.uid
+            if uid not in mtp_delta_applied:
+                mtp_delta_applied.add(uid)
+                request.mtp_drafts += mtp_drafts_delta.get(uid, 0)
+                request.mtp_accepted += mtp_accepted_delta.get(uid, 0)
 
             # Snapshot the cache while it still covers exactly the prompt, i.e.
             # before the first generated token is appended. Storing that under
@@ -2824,6 +2877,8 @@ class Scheduler:
                 output_token_ids=request.output_token_ids,
                 prompt_tokens=request.num_prompt_tokens,
                 completion_tokens=request.num_output_tokens,
+                mtp_drafts=request.mtp_drafts,
+                mtp_accepted=request.mtp_accepted,
             )
 
             # Check if finished

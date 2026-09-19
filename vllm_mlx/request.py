@@ -143,6 +143,13 @@ class Request:
         None  # Type of cache hit: exact/prefix/supersequence/lcp/miss
     )
 
+    # MTP (multi-token prediction) per-request counters, mirroring
+    # MLLMRequest.mtp_drafts/mtp_accepted (mllm_scheduler.py). Attributed by
+    # UID in Scheduler._process_batch_responses from the deltas
+    # _install_mtp's closures accumulate per step (see scheduler.py).
+    mtp_drafts: int = 0
+    mtp_accepted: int = 0
+
     @property
     def num_output_tokens(self) -> int:
         """Number of output tokens generated so far."""
