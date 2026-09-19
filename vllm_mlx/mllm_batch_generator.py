@@ -299,6 +299,46 @@ class MLLMBatch:
             if hasattr(c, "filter"):
                 c.filter(keep_idx_array)
 
+        self._sync_reshuffle_metadata()
+
+    def _sync_reshuffle_metadata(self) -> None:
+        """Materialize per-layer cache metadata after a membership change.
+
+        The decode loop only evaluates ``y``/``logprobs`` and their
+        ancestors. ``BatchKVCache.offset`` is written every step and rebuilt
+        on every filter/extend but never read by the decode-time forward
+        graph (``make_mask`` passes the Python-int ``_idx`` as the mask
+        offset), so it stays lazy and transitively retains the pre-reshuffle
+        graph -- and every buffer feeding it -- for the lifetime of the
+        batch. Under continuous traffic the batch never drains, so the
+        retained Metal buffer handles accumulate per membership change until
+        the per-process resource limit (499000) aborts the server.
+        ``left_padding`` is consumed by ``make_mask`` and forced by
+        ``filter()`` itself, so it usually self-materializes; it and
+        ``lengths`` are swept anyway because ``ArraysCache`` metadata has no
+        decode-time reader on hybrid models and evaluating an
+        already-materialized array is free. ``BatchRotatingKVCache`` guards
+        itself against the same hazard upstream via ``mx.depends`` on
+        ``(left_padding, offset)``; plain ``BatchKVCache`` has no such
+        guard. Recurses into ``CacheList`` containers so hybrid models that
+        wrap per-layer caches get the same protection.
+        """
+        sync = []
+        stack = list(self.cache)
+        while stack:
+            c = stack.pop()
+            if c is None:
+                continue
+            children = getattr(c, "caches", None)
+            if children is not None:
+                stack.extend(children)
+            for name in ("offset", "left_padding", "lengths"):
+                a = getattr(c, name, None)
+                if isinstance(a, mx.array):
+                    sync.append(a)
+        if sync:
+            mx.eval(*sync)
+
     def extend(self, other: "MLLMBatch") -> None:
         """
         Extend this batch with another batch.
@@ -343,6 +383,8 @@ class MLLMBatch:
                         c.extend(o)
                 except Exception as e:
                     logger.warning(f"Failed to extend cache: {e}")
+
+        self._sync_reshuffle_metadata()
 
     def extract_cache(self, idx: int) -> List[Any]:
         """
