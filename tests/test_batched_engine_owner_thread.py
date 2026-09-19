@@ -333,3 +333,33 @@ def test_async_engine_core_passes_the_worker_through():
         assert async_core.engine._external_generation_worker is worker
     finally:
         worker.shutdown(wait=True)
+
+
+@pytest.mark.anyio
+async def test_add_request_runs_on_generation_worker(monkeypatch):
+    """vLLM-style worker ownership: add_request must execute on the generation_worker."""
+    from vllm_mlx.request import SamplingParams
+
+    worker = ThreadPoolExecutor(max_workers=1, thread_name_prefix="engine-core")
+    try:
+        core = _bare_engine_core(monkeypatch, worker=worker)
+        add_request_threads: list[int] = []
+
+        def tracked_add_request(request):
+            add_request_threads.append(threading.get_ident())
+            return "fake-id"
+
+        core.scheduler.add_request = tracked_add_request
+        worker_tid = worker.submit(threading.get_ident).result()
+
+        await core.add_request(prompt="test", sampling_params=SamplingParams())
+
+        assert len(add_request_threads) == 1
+        assert add_request_threads[0] == worker_tid, (
+            f"add_request executed on thread {add_request_threads[0]}, "
+            f"expected generation_worker {worker_tid}"
+        )
+        assert core._external_generation_worker is worker
+    finally:
+        worker.shutdown(wait=True)
+

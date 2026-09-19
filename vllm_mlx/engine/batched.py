@@ -18,6 +18,8 @@ import os
 import time
 from collections.abc import AsyncIterator
 from concurrent.futures import ThreadPoolExecutor
+
+from ..mlx_executor import MLXExecutor
 from typing import Any
 
 import mlx.core as mx
@@ -161,8 +163,10 @@ class BatchedEngine(BaseEngine):
         self._mllm_scheduler = None  # MLLMScheduler for MLLM
         self._mllm_instance = None  # MLXMultimodalLM instance
         self._loaded = False
-        # Single thread that owns the model; see _generation_worker.
-        self._generation_executor: ThreadPoolExecutor | None = None
+        # MLXExecutor: owns the single thread where all MLX operations run.
+        # Replaces the raw _generation_executor (ThreadPoolExecutor).
+        self._mlx_executor: MLXExecutor | None = None
+
 
     @property
     def model_name(self) -> str:
@@ -259,18 +263,38 @@ class BatchedEngine(BaseEngine):
             return None
         return self._generation_worker()
 
-    def _generation_worker(self) -> ThreadPoolExecutor:
-        """Return the single thread that owns the model and drives stepping.
+    @property
+    def _generation_executor(self) -> ThreadPoolExecutor | None:
+        """ThreadPoolExecutor inside the MLXExecutor, kept for back-compat."""
+        executor = getattr(self, "_mlx_executor", None)
+        if executor is not None:
+            return executor.worker
+        return None
 
-        The residency manager also looks this up by name to load models here,
-        so it must exist before ``prepare_for_start`` runs and must outlive the
-        engine loop.
+    @_generation_executor.setter
+    def _generation_executor(self, val: ThreadPoolExecutor | None) -> None:
+        if val is None:
+            self._mlx_executor = None
+        else:
+            self._mlx_executor = MLXExecutor(worker=val, owns_worker=False)
+
+    def _generation_worker(self) -> ThreadPoolExecutor | None:
+        """Return the ThreadPoolExecutor that owns the model (inside MLXExecutor).
+
+        Kept for back-compat: ResidencyManager and other callers look this up by
+        name to load models on the correct thread. The underlying pool is now
+        owned by MLXExecutor; callers get a stable reference to the same pool.
         """
-        if self._generation_executor is None:
-            self._generation_executor = ThreadPoolExecutor(
-                max_workers=1, thread_name_prefix="engine-core"
-            )
-        return self._generation_executor
+        return self._get_mlx_executor().worker
+
+    def _get_mlx_executor(self) -> MLXExecutor:
+        """Return (or lazily create) the MLXExecutor for this engine."""
+        executor = getattr(self, "_mlx_executor", None)
+        if executor is None:
+            executor = MLXExecutor(thread_name_prefix="engine-core")
+            self._mlx_executor = executor
+        return executor
+
 
     def _prepare_mllm_model(self) -> None:
         """Load the MLLM model before scheduler startup."""
@@ -575,11 +599,12 @@ class BatchedEngine(BaseEngine):
         )
 
         # Create async engine, stepping on the thread that loaded the model.
+        # Pass the MLXExecutor so EngineCore routes all MLX ops through it.
         self._engine = AsyncEngineCore(
             model=self._model,
             tokenizer=self._tokenizer,
             config=engine_config,
-            generation_worker=self._generation_worker(),
+            mlx_executor=self._get_mlx_executor(),
         )
 
         await self._engine.engine.start()
@@ -600,12 +625,17 @@ class BatchedEngine(BaseEngine):
         self._processor = None
         self._mllm_instance = None
         self._loaded = False
-        if self._generation_executor is not None:
-            # The model and its streams lived on this thread; both go with it.
-            self._generation_executor.shutdown(wait=True)
-            self._generation_executor = None
-        mx.clear_cache()
+        if self._mlx_executor is not None:
+            # clear_cache must run on the MLX owner thread; mx.clear_cache() on
+            # MainThread after worker shutdown would silently be a no-op for Metal.
+            self._mlx_executor.run(mx.clear_cache)
+            # Shut down only if we own the executor (not supplied externally).
+            self._mlx_executor.shutdown(wait=True)
+            self._mlx_executor = None
+        else:
+            mx.clear_cache()
         logger.info("BatchedEngine stopped")
+
 
     def _apply_chat_template(
         self,

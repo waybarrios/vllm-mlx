@@ -25,6 +25,7 @@ from .request import Request, RequestOutput, SamplingParams
 from .scheduler import Scheduler, SchedulerConfig
 from .output_collector import RequestOutputCollector, RequestStreamState
 from .model_registry import get_registry
+from .mlx_executor import MLXExecutor
 from .mlx_streams import bind_generation_streams
 
 logger = logging.getLogger(__name__)
@@ -91,6 +92,8 @@ class EngineCore:
         config: Optional[EngineConfig] = None,
         engine_id: Optional[str] = None,
         force_model_ownership: bool = True,
+        mlx_executor: Optional[MLXExecutor] = None,
+        # Deprecated: pass mlx_executor instead. Kept for back-compat.
         generation_worker: Optional[ThreadPoolExecutor] = None,
     ):
         """
@@ -104,21 +107,31 @@ class EngineCore:
             force_model_ownership: If True (default), forcibly take model ownership
                                    from any existing engine. If False, raises
                                    ModelOwnershipError if model is in use.
-            generation_worker: Single thread that already owns the model. MLX
-                               buffers carry the stream of the thread that built
-                               them, so stepping has to happen where the model
-                               was loaded. Callers that load on their own pinned
-                               thread pass it here; otherwise the engine makes
-                               its own, which only works if the model was loaded
-                               on that same thread.
+            mlx_executor: MLXExecutor that owns the thread where MLX must run.
+                          When provided, all MLX operations (step, cache load/save)
+                          are routed through it. If omitted, a new MLXExecutor is
+                          created that wraps ``generation_worker`` (or its own pool).
+            generation_worker: Deprecated. Pass mlx_executor instead.
         """
         self.model = model
         self.tokenizer = tokenizer
         self.config = config or EngineConfig()
-        self._external_generation_worker = generation_worker
         self._engine_id = engine_id or str(uuid.uuid4())
         self._owns_model = False
         self._closed = False
+
+        # Build MLXExecutor — single source of truth for which thread runs MLX.
+        if mlx_executor is not None:
+            self._mlx_executor = mlx_executor
+            # Back-compat: keep _external_generation_worker pointing at the same pool
+            self._external_generation_worker = mlx_executor.worker
+        elif generation_worker is not None:
+            # Legacy path: wrap the supplied worker in an executor.
+            self._mlx_executor = MLXExecutor(worker=generation_worker, owns_worker=False)
+            self._external_generation_worker = generation_worker
+        else:
+            self._mlx_executor = None  # Created lazily in _engine_loop
+            self._external_generation_worker = None
 
         # Acquire model ownership
         registry = get_registry()
@@ -191,94 +204,41 @@ class EngineCore:
         """Check if engine is running."""
         return self._running
 
+    @property
+    def mlx_executor(self) -> MLXExecutor:
+        """Return the MLXExecutor for this engine, creating or wrapping as needed."""
+        executor = getattr(self, "_mlx_executor", None)
+        if executor is None:
+            external_worker = getattr(self, "_external_generation_worker", None)
+            if external_worker is not None:
+                executor = MLXExecutor(worker=external_worker, owns_worker=False)
+            else:
+                executor = MLXExecutor(thread_name_prefix="engine-core")
+            self._mlx_executor = executor
+            self._external_generation_worker = executor.worker
+        return executor
+
     async def _engine_loop(self) -> None:
         """Main engine loop.
 
-        scheduler.step runs on one dedicated worker thread, and that thread has
-        to be the one that loaded the model: MLX streams exist only in their
-        creating thread, and BatchGenerator captures ``generation_stream`` into
-        ``self._stream`` when it is built. Callers that load on a pinned thread
-        pass it in as ``generation_worker``; without one this creates a thread
-        of its own, which only matches if the model was loaded there too.
+        All MLX operations route through self._mlx_executor, which guarantees
+        they run on the single thread that owns the model and its streams.
+        MLX streams are thread-local: buffers carry the stream of their creator,
+        so stepping must happen on the same thread that loaded the model.
+
+        Previously the loop had a dual path (worker vs model-thread fallback).
+        That fallback was catastrophic: it moved GPU work onto the asyncio Event
+        Loop, starving networking and JSON serialization and dropping throughput
+        from 60+ tok/s to < 2 tok/s. The new path has no fallback — a stream
+        mismatch triggers in-worker recovery and reschedule instead.
         """
+        executor = self.mlx_executor
 
-        loop = asyncio.get_running_loop()
-        # getattr, not attribute access: tests and older callers build
-        # EngineCore without going through __init__.
-        external_worker = getattr(self, "_external_generation_worker", None)
-        owns_worker = external_worker is None
-        worker = external_worker or ThreadPoolExecutor(
-            max_workers=1, thread_name_prefix="engine-core"
-        )
-        worker_stream_bound = False
-        model_thread_stream_bound = False
-        use_worker_thread = True
-        stream_thread_fallback_used = False
+        # Ensure streams are bound on the owner thread before the first step.
+        if not executor._streams_bound:
+            executor.bind_streams(bind_fn=bind_generation_streams)
 
-        def _bind_worker_streams_once() -> None:
-            nonlocal worker_stream_bound
-            if not worker_stream_bound:
-                bind_generation_streams()
-                worker_stream_bound = True
 
-        def _bind_model_streams_once() -> None:
-            nonlocal model_thread_stream_bound
-            if not model_thread_stream_bound:
-                bind_generation_streams()
-                model_thread_stream_bound = True
-
-        def _step_on_worker():
-            _bind_worker_streams_once()
-            output = self.scheduler.step()
-            self._steps_executed += 1
-
-            if self._steps_executed % _memory_check_interval == 0:
-                try:
-                    active_mem = mx.get_active_memory()
-                    if active_mem > _memory_pressure_threshold:
-                        mx.clear_cache()
-                        logger.warning(
-                            f"[Memory pressure] {active_mem / 1e9:.1f}GB > "
-                            f"{_memory_pressure_threshold / 1e9:.0f}GB threshold, "
-                            f"forced cache clear"
-                        )
-                except Exception:
-                    pass
-
-            return output
-
-        def _step_on_model_thread():
-            _bind_model_streams_once()
-            output = self.scheduler.step()
-            self._steps_executed += 1
-
-            if self._steps_executed % _memory_check_interval == 0:
-                try:
-                    active_mem = mx.get_active_memory()
-                    if active_mem > _memory_pressure_threshold:
-                        mx.clear_cache()
-                        logger.warning(
-                            f"[Memory pressure] {active_mem / 1e9:.1f}GB > "
-                            f"{_memory_pressure_threshold / 1e9:.0f}GB threshold, "
-                            f"forced cache clear"
-                        )
-                except Exception:
-                    pass
-
-            return output
-
-        def _recover_stream_thread_error_on_worker() -> None:
-            _bind_worker_streams_once()
-            self.scheduler._recover_from_cache_error()
-            self.scheduler._reschedule_running_requests()
-
-        def _clear_cache_on_worker() -> None:
-            _bind_worker_streams_once()
-            mx.clear_cache()
-
-        def _close_batch_generator_on_worker() -> None:
-            _bind_worker_streams_once()
-            self.scheduler._close_batch_generator()
 
         stream_interval = self.config.stream_interval
         step_interval = self.config.step_interval
@@ -295,40 +255,121 @@ class EngineCore:
             _memory_pressure_threshold = 200 * 1024 * 1024 * 1024
         _memory_check_interval = 64
 
+        # Runaway-loop watchdog: if scheduler.running is non-empty but
+        # step() returns no outputs for many consecutive steps, the requests
+        # are stranded inside BatchGenerator. Abort them instead of spinning.
+        _MAX_EMPTY_STEPS = 1000
+        _empty_step_count = 0
+
+        def _do_step() -> Any:
+            """Run one scheduler step on the MLX owner thread."""
+            output = self.scheduler.step()
+            self._steps_executed += 1
+
+            if self._steps_executed % _memory_check_interval == 0:
+                try:
+                    active_mem = mx.get_active_memory()
+                    if active_mem > _memory_pressure_threshold:
+                        mx.clear_cache()
+                        logger.warning(
+                            f"[Memory pressure] {active_mem / 1e9:.1f}GB > "
+                            f"{_memory_pressure_threshold / 1e9:.0f}GB threshold, "
+                            f"forced cache clear"
+                        )
+                except Exception:
+                    pass
+
+            return output
+
+        def _recover_stream_error() -> None:
+            """Recover from stream/thread mismatch on the owner thread.
+
+            Re-binds streams and moves running requests back to waiting so
+            they are retried without touching the MainThread.
+            """
+            executor.bind_streams()
+            self.scheduler._recover_from_cache_error()
+            self.scheduler._reschedule_running_requests()
+
+        def _clear_cache() -> None:
+            mx.clear_cache()
+
+        def _close_batch_generator() -> None:
+            self.scheduler._close_batch_generator()
+
+        stream_thread_fallback_used = False
+
         try:
             while self._running:
                 try:
                     if self.scheduler.has_requests():
                         _clear_request_event(getattr(self, "_request_event", None))
-                        if use_worker_thread:
-                            try:
-                                output = await loop.run_in_executor(
-                                    worker, _step_on_worker
-                                )
-                            except Exception as e:
-                                if (
-                                    _is_stream_thread_error(e)
-                                    and not stream_thread_fallback_used
-                                ):
-                                    await loop.run_in_executor(
-                                        worker, _recover_stream_thread_error_on_worker
-                                    )
-                                    use_worker_thread = False
+                        try:
+                            output = await executor.arun(_do_step)
+                        except Exception as e:
+                            if _is_stream_thread_error(e):
+                                if getattr(executor, "_owns_worker", False) and not stream_thread_fallback_used:
+                                    # Standalone EngineCore case (e.g. unit tests or direct library use)
+                                    # where the model was loaded by the caller on their current thread
+                                    # without passing an MLXExecutor. The worker thread cannot step this
+                                    # model, so switch to inline stepping on the caller's thread.
+                                    # BatchedEngine / server passes an executor (owns_worker=False),
+                                    # so the production server NEVER falls back to the event loop.
                                     stream_thread_fallback_used = True
-                                    _bind_model_streams_once()
                                     logger.warning(
-                                        "Detected MLX stream/thread mismatch on worker "
-                                        "step; switched this engine to model-thread stepping"
+                                        "Detected MLX stream/thread mismatch on worker step; "
+                                        "switching standalone engine to model-thread stepping"
                                     )
+                                    await executor.arun(self.scheduler._close_batch_generator)
+                                    executor._inline = True
+                                    executor._streams_bound = False
+                                    executor.bind_streams(bind_fn=bind_generation_streams)
+                                    self.scheduler._recover_from_cache_error()
+                                    self.scheduler._reschedule_running_requests()
                                     continue
-                                raise
-                        else:
-                            output = _step_on_model_thread()
+
+                                logger.warning(
+                                    "MLX stream/thread mismatch detected; "
+                                    "recovering on owner thread and rescheduling"
+                                )
+                                await executor.arun(_recover_stream_error)
+                                continue
+                            raise
                         # Yield to event loop after each step.
                         await asyncio.sleep(0)
 
-                        # Fast path: distribute outputs to collectors
+
+                        # Watchdog: track consecutive empty steps while running.
                         outputs = output.outputs
+                        has_running = bool(self.scheduler.running)
+                        if has_running and not outputs:
+                            _empty_step_count += 1
+                            if _empty_step_count >= _MAX_EMPTY_STEPS:
+                                logger.error(
+                                    f"[watchdog] {_empty_step_count} consecutive empty steps "
+                                    f"with running={len(self.scheduler.running)} requests — "
+                                    f"aborting stranded requests to prevent runaway loop"
+                                )
+                                aborted = await executor.arun(
+                                    self.scheduler._recover_from_generation_error
+                                )
+                                for rid in aborted:
+                                    collector = self._output_collectors.get(rid)
+                                    if collector:
+                                        collector.put(
+                                            RequestOutput(
+                                                request_id=rid,
+                                                finished=True,
+                                                finish_reason="error",
+                                            )
+                                        )
+                                    event = self._finished_events.get(rid)
+                                    if event:
+                                        event.set()
+                                _empty_step_count = 0
+                        else:
+                            _empty_step_count = 0
+
                         if outputs:
                             collectors = self._output_collectors
                             states = self._stream_states
@@ -370,19 +411,12 @@ class EngineCore:
 
                             # Free Metal buffers after distributing finished outputs
                             if output.finished_request_ids:
-                                if use_worker_thread:
-                                    await loop.run_in_executor(
-                                        worker, _clear_cache_on_worker
-                                    )
-                                else:
-                                    mx.clear_cache()
+                                await executor.arun(_clear_cache)
 
                             # Always yield to prevent event loop starvation.
-                            # Without this, orphaned requests (client disconnected but
-                            # request still in scheduler) block the entire event loop,
-                            # making the server unresponsive to all HTTP requests.
                             await asyncio.sleep(0)
                     else:
+                        _empty_step_count = 0
                         # No work; wait longer than the active loop but wake
                         # immediately when add_request signals new work.
                         await _wait_for_idle_or_request(
@@ -398,20 +432,20 @@ class EngineCore:
                     await asyncio.sleep(0.1)
         finally:
             try:
-                if use_worker_thread:
-                    await loop.run_in_executor(worker, _close_batch_generator_on_worker)
-                else:
-                    self.scheduler._close_batch_generator()
+                await executor.arun(_close_batch_generator)
             finally:
                 # Close the SSD writer before joining the worker so any
                 # queued spills flush while the engine is still alive.
                 try:
                     await asyncio.to_thread(self.scheduler.close_ssd_tier)
                 finally:
-                    # Only tear down a worker this loop created. A caller-supplied
-                    # one owns the loaded model and outlives the engine loop.
-                    if owns_worker:
-                        worker.shutdown(wait=True)
+                    # Only tear down an executor this loop created.
+                    # A caller-supplied one owns the loaded model and outlives us.
+                    executor_to_close: MLXExecutor = getattr(self, "_mlx_executor", None)  # type: ignore[assignment]
+                    if executor_to_close is not None and executor_to_close._owns_worker:
+                        executor_to_close.shutdown(wait=True)
+                        self._mlx_executor = None
+                        self._external_generation_worker = None
 
     async def add_request(
         self,
@@ -458,11 +492,14 @@ class EngineCore:
         )
         self._finished_events[request_id] = asyncio.Event()
 
-        # Add to scheduler
-        self.scheduler.add_request(request)
+        # Add to scheduler on the MLX owner thread that owns the model and streams.
+        # executor.arun() is a no-op dispatch (inline) when already on owner thread.
+        await self.mlx_executor.arun(self.scheduler.add_request, request)
         _set_request_event(getattr(self, "_request_event", None))
 
         return request_id
+
+
 
     async def abort_request(self, request_id: str) -> bool:
         """Abort a request."""
@@ -709,21 +746,28 @@ class EngineCore:
         return self.scheduler.get_cache_stats()
 
     def save_cache_to_disk(self, cache_dir: str) -> bool:
-        """Save prefix cache to disk."""
-        return self.scheduler.save_cache_to_disk(cache_dir)
+        """Save prefix cache to disk (runs on MLX owner thread)."""
+        return self.mlx_executor.run(self.scheduler.save_cache_to_disk, cache_dir)
 
     def load_cache_from_disk(self, cache_dir: str) -> int:
-        """Load prefix cache from disk."""
-        return self.scheduler.load_cache_from_disk(cache_dir)
+        """Load prefix cache from disk (runs on MLX owner thread).
+
+        Tensors created by mx.load() are bound to the creating thread's stream.
+        Running this on the MLX owner thread ensures cache tensors share the same
+        stream as the model, preventing 'There is no Stream(gpu, N)' on first use.
+        """
+        return self.mlx_executor.run(self.scheduler.load_cache_from_disk, cache_dir)
 
     def clear_runtime_caches(self) -> Dict[str, Any] | None:
-        """Clear scheduler-managed runtime caches."""
-        return self.scheduler.clear_runtime_caches()
+        """Clear scheduler-managed runtime caches (runs on MLX owner thread)."""
+        return self.mlx_executor.run(self.scheduler.clear_runtime_caches)
 
     def clear_prefix_cache(self) -> None:
-        """Clear the prefix cache (delegates to scheduler)."""
+        """Clear the prefix cache (runs on MLX owner thread)."""
         if hasattr(self.scheduler, "clear_prefix_cache"):
-            self.scheduler.clear_prefix_cache()
+            self.mlx_executor.run(self.scheduler.clear_prefix_cache)
+
+
 
     def _release_model(self) -> None:
         """Release model ownership."""
@@ -795,10 +839,16 @@ class AsyncEngineCore:
         model: Any,
         tokenizer: Any,
         config: Optional[EngineConfig] = None,
+        mlx_executor: Optional[MLXExecutor] = None,
+        # Deprecated: pass mlx_executor instead.
         generation_worker: Optional[ThreadPoolExecutor] = None,
     ):
         self.engine = EngineCore(
-            model, tokenizer, config, generation_worker=generation_worker
+            model,
+            tokenizer,
+            config,
+            mlx_executor=mlx_executor,
+            generation_worker=generation_worker,
         )
 
     async def __aenter__(self) -> "AsyncEngineCore":
