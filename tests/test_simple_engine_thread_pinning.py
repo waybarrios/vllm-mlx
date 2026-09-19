@@ -266,6 +266,63 @@ def test_stream_done_sentinel_is_distinct(engine_module):
     assert next(iter([_Chunk("x")]), sentinel) is not sentinel
 
 
+@pytest.mark.parametrize("route", ["chat", "stream_chat", "native_video"])
+@pytest.mark.parametrize("top_p", [None, 0.37, 1.0])
+def test_mllm_chat_sampling_reaches_generation_worker(
+    engine_module, monkeypatch, route, top_p
+):
+    """Both worker dispatch paths must retain the request's nucleus sampling."""
+    from vllm_mlx.models.mllm import MLLMOutput
+
+    class SamplingModel:
+        _video_native = route == "native_video"
+
+        def _collect_video_inputs(self, messages):
+            return ["test-video"] if self._video_native else []
+
+        def chat(self, *, temperature=0.0, top_p=1.0, top_k=0, **kwargs):
+            return MLLMOutput(
+                text=f"{temperature}:{top_p}:{top_k}",
+                prompt_tokens=3,
+                completion_tokens=1,
+                finish_reason="stop",
+            )
+
+        def stream_chat(self, **kwargs):
+            yield self.chat(**kwargs)
+
+    engine = engine_module.SimpleEngine("test-model", force_mllm=True)
+    engine._loaded = True
+    engine._model = SamplingModel()
+    engine._text_model_initialization_attempted = True
+    monkeypatch.setattr(engine, "_bind_generation_streams_once", lambda: None)
+    media_type = "video_url" if route == "native_video" else "image_url"
+    messages = [
+        {
+            "role": "user",
+            "content": [{"type": media_type, media_type: {"url": "test-media"}}],
+        }
+    ]
+
+    async def scenario():
+        kwargs = {"temperature": 0.8, "top_k": 17}
+        if top_p is not None:
+            kwargs["top_p"] = top_p
+        if route == "chat":
+            return await engine.chat(messages, **kwargs)
+        chunks = [chunk async for chunk in engine.stream_chat(messages, **kwargs)]
+        return chunks[-1]
+
+    try:
+        result = asyncio.run(scenario())
+    finally:
+        if engine._generation_executor is not None:
+            engine._generation_executor.shutdown(wait=True)
+
+    expected_top_p = 0.9 if top_p is None else top_p
+    assert result.text == f"0.8:{expected_top_p}:17"
+
+
 def test_stop_does_not_block_the_event_loop(engine_module):
     """stop() must stay bounded while the worker is inside a generation.
 

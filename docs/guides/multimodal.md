@@ -46,6 +46,11 @@ response = client.chat.completions.create(
 print(response.choices[0].message.content)
 ```
 
+Image requests honor `temperature` and `top_p` in both streaming and
+non-streaming responses. For sampling, pass values such as `temperature=0.8`
+and `top_p=0.9` to `client.chat.completions.create`; use `temperature=0.0`
+for greedy decoding.
+
 ### Base64 Images
 
 ```python

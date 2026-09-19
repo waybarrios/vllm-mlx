@@ -183,6 +183,7 @@ jobs:
             tests/test_batched_engine_mllm_config.py \
             tests/test_mllm_continuous_batching.py \
             tests/test_mllm_cache.py \
+            tests/test_mllm_sampling.py \
             tests/test_optimizations.py \
             tests/test_simple_engine.py \
             tests/test_simple_engine_prefix_trie_cache.py \
