@@ -934,6 +934,18 @@ class MLLMScheduler:
 
         logger.info("MLLM Scheduler stopped")
 
+    def is_healthy(self) -> bool:
+        """True unless the processing task exited without stop() being called.
+
+        Mirrors EngineCore.is_healthy(): the loop's inner try/except
+        swallows ordinary per-step exceptions and keeps running, so a
+        done-but-not-stopped task means something fatal escaped the loop.
+        """
+        if not self._running:
+            return True
+        task = self._processing_task
+        return task is None or not task.done()
+
     async def _process_loop(self) -> None:
         """Main async processing loop.
 

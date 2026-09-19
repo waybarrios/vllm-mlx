@@ -191,6 +191,20 @@ class EngineCore:
         """Check if engine is running."""
         return self._running
 
+    def is_healthy(self) -> bool:
+        """True unless the engine loop task exited without stop() being called.
+
+        The loop itself only breaks out on cancellation (stop()) since its
+        inner per-step try/except swallows ordinary exceptions and keeps
+        looping, so a done-but-not-stopped task means something fatal
+        escaped the loop's own cleanup (e.g. the finally block) rather than
+        a clean shutdown.
+        """
+        if not self._running:
+            return True
+        task = self._task
+        return task is None or not task.done()
+
     async def _engine_loop(self) -> None:
         """Main engine loop.
 
@@ -864,6 +878,10 @@ class AsyncEngineCore:
     def get_cache_stats(self) -> Optional[Dict[str, Any]]:
         """Get prefix cache statistics."""
         return self.engine.get_cache_stats()
+
+    def is_healthy(self) -> bool:
+        """Check whether the wrapped engine's loop task is still alive."""
+        return self.engine.is_healthy()
 
     def save_cache_to_disk(self, cache_dir: str) -> bool:
         """Save prefix cache to disk."""

@@ -401,6 +401,17 @@ class BaseEngine(ABC):
         """
         pass
 
+    def is_healthy(self) -> bool:
+        """Check whether the engine's background work is still alive.
+
+        Engines without a persistent background loop (e.g. SimpleEngine,
+        which runs each request synchronously to completion) can't go
+        stale this way, so the default is always healthy. Engines that run
+        a background task (BatchedEngine) override this to detect a task
+        that has exited without going through the engine's own stop path.
+        """
+        return True
+
     def get_stats(self) -> dict[str, Any]:
         """Get engine statistics. Override in subclasses."""
         return {}

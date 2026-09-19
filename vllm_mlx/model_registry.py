@@ -746,10 +746,15 @@ class ModelManager:
         data = []
         for name, entry in self._registry.items():
             loaded = self._loaded.get(name)
+            dead = loaded is not None and not loaded.engine.is_healthy()
             unloading = self._unloading.get(name)
             loading = self._loading.get(name)
             state = "unloaded"
-            if loaded is not None:
+            if dead:
+                # Reported truthfully at read time; the stale entry itself is
+                # reaped the next time acquire() is called for this model.
+                state = "dead"
+            elif loaded is not None:
                 state = "preempting" if loaded.preempting else "loaded"
             elif loading is not None:
                 state = "loading"
@@ -773,7 +778,7 @@ class ModelManager:
                 {
                     "id": name,
                     "status": state,
-                    "loaded": loaded is not None,
+                    "loaded": loaded is not None and not dead,
                     "owned_by": "vllm-mlx",
                     "source": entry.source,
                     "memory_gb": round(estimated / (1024**3), 2) if estimated else None,
@@ -854,35 +859,44 @@ class ModelManager:
                 if self._shutting_down:
                     raise RuntimeError("Model manager is shutting down")
 
-                claimed = self._claim_loaded_locked(model_name)
-                if claimed is not None:
-                    return claimed
-
-                same_model_future = self._loading.get(model_name, None)
-                if same_model_future is not None:
-                    same_model_future = same_model_future.future
-                elif model_name in self._unloading:
-                    wait_timeout = self._remaining_wait_timeout(start)
+                reaped = self._reap_dead_locked(model_name)
+                if reaped is not None:
+                    # Engine died without going through an explicit unload;
+                    # tear it down like any other idle unload, then loop
+                    # back around and load a fresh engine.
+                    unloads = [reaped]
                 else:
-                    entry = self._registry[model_name]
-                    required_bytes = self._resolve_estimated_bytes(entry, entry.source)
-                    unloads = self._collect_idle_unloads_locked(
-                        model_name, required_bytes
-                    )
-                    if not unloads and self._can_reserve_locked(required_bytes):
-                        load = self._reserve_load_locked(model_name, required_bytes)
-                    elif not unloads:
-                        cancel_tasks = self._maybe_preempt_locked(
-                            model_name=model_name,
-                            required_bytes=required_bytes,
-                            start=start,
-                        )
-                        if not cancel_tasks and not self._should_wait_locked(start):
-                            raise RuntimeError(
-                                f"Cannot load '{model_name}' within memory budget "
-                                f"({self._config.memory_budget_bytes / (1024**3):.1f} GB)"
-                            )
+                    claimed = self._claim_loaded_locked(model_name)
+                    if claimed is not None:
+                        return claimed
+
+                    same_model_future = self._loading.get(model_name, None)
+                    if same_model_future is not None:
+                        same_model_future = same_model_future.future
+                    elif model_name in self._unloading:
                         wait_timeout = self._remaining_wait_timeout(start)
+                    else:
+                        entry = self._registry[model_name]
+                        required_bytes = self._resolve_estimated_bytes(
+                            entry, entry.source
+                        )
+                        unloads = self._collect_idle_unloads_locked(
+                            model_name, required_bytes
+                        )
+                        if not unloads and self._can_reserve_locked(required_bytes):
+                            load = self._reserve_load_locked(model_name, required_bytes)
+                        elif not unloads:
+                            cancel_tasks = self._maybe_preempt_locked(
+                                model_name=model_name,
+                                required_bytes=required_bytes,
+                                start=start,
+                            )
+                            if not cancel_tasks and not self._should_wait_locked(start):
+                                raise RuntimeError(
+                                    f"Cannot load '{model_name}' within memory budget "
+                                    f"({self._config.memory_budget_bytes / (1024**3):.1f} GB)"
+                                )
+                            wait_timeout = self._remaining_wait_timeout(start)
 
             if unloads:
                 await self._run_unloads(unloads)
@@ -1114,6 +1128,29 @@ class ModelManager:
             ),
             key=lambda item: item.last_used_at,
         )
+
+    def _reap_dead_locked(self, model_name: str) -> LoadedModel | None:
+        """Evict a loaded entry whose engine died without an explicit unload.
+
+        Only reaps idle entries (no active requests) so an in-flight lease
+        is never yanked out from under its caller; a dead engine still
+        holding requests gets reaped on the next acquire() once those
+        requests finish and release() drops active_requests to zero.
+        Returns the evicted entry (already moved into `_unloading`, ready
+        for the caller to run through `_run_unloads`), or None if nothing
+        needed reaping.
+        """
+        loaded = self._loaded.get(model_name)
+        if loaded is None or loaded.active_requests > 0:
+            return None
+        if loaded.engine.is_healthy():
+            return None
+        logger.warning(
+            "Model '%s' engine died without an explicit unload; reaping "
+            "stale entry so it can be reloaded",
+            model_name,
+        )
+        return self._begin_unload_locked(model_name)
 
     def _collect_idle_unloads_locked(
         self, requested_model: str, required_bytes: int
