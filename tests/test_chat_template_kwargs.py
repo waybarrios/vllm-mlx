@@ -198,6 +198,67 @@ def test_chat_completion_endpoint_applies_server_default_chat_template_kwargs():
     assert response.json()["choices"][0]["message"]["content"] == "ORBIT"
 
 
+def test_resolve_chat_template_kwargs_none_effort_disables_thinking():
+    resolved = srv._resolve_chat_template_kwargs(None, request_reasoning_effort="none")
+
+    assert resolved == {"enable_thinking": False}
+    # The sentinel must never reach the chat template: effort-ladder templates
+    # (Qwen3-style) reject "none" and fail rendering.
+    assert "reasoning_effort" not in resolved
+
+
+def test_resolve_chat_template_kwargs_none_effort_overridden_by_explicit_kwargs():
+    resolved = srv._resolve_chat_template_kwargs(
+        {"enable_thinking": True}, request_reasoning_effort="none"
+    )
+
+    assert resolved == {"enable_thinking": True}
+
+
+def test_chat_completion_endpoint_none_reasoning_effort_disables_thinking():
+    captured = {}
+
+    class FakeEngine:
+        model_name = "test-model"
+        is_mllm = False
+        preserve_native_tool_format = False
+
+        async def chat(self, messages, **kwargs):
+            captured["messages"] = messages
+            captured["kwargs"] = kwargs
+            return GenerationOutput(
+                text="ORBIT",
+                prompt_tokens=4,
+                completion_tokens=1,
+                finish_reason="stop",
+            )
+
+    client = TestClient(srv.app)
+    original_engine = srv._engine
+    original_model_name = srv._model_name
+    srv._engine = FakeEngine()
+    srv._model_name = "test-model"
+    try:
+        response = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "Reply with ORBIT."}],
+                "max_tokens": 8,
+                "reasoning_effort": "none",
+            },
+        )
+    finally:
+        srv._engine = original_engine
+        srv._model_name = original_model_name
+
+    assert response.status_code == 200
+    assert captured["kwargs"]["chat_template_kwargs"] == {"enable_thinking": False}
+    assert "reasoning_effort" not in captured["kwargs"]["chat_template_kwargs"]
+    assert captured["kwargs"]["enable_thinking"] is False
+    assert response.json()["choices"][0]["message"]["content"] == "ORBIT"
+
+
 def test_chat_completion_endpoint_request_kwargs_override_server_defaults():
     captured = {}
 
