@@ -1174,6 +1174,27 @@ def floor_by_factor(x: float, factor: int) -> int:
     return math.floor(x / factor) * factor
 
 
+def disable_video_frame_resampling(processor) -> bool:
+    """Stop the HF video processor from re-sampling frames we already sampled.
+
+    Both native-video paths hand the processor frames that were already
+    sampled at the request's ``video_fps``. Qwen-VL video processors default to
+    ``do_sample_frames=True`` and sample again, and our sampled fps never
+    reaches them (mlx-vlm forwards only kwargs named in the processor's
+    signature; the direct call passes none). With no metadata the processor
+    assumes a 24 fps source, so a 16-frame clip becomes 16/24 s at 2 fps and is
+    clamped to its 4-frame minimum: 2 temporal positions after pairwise fusion,
+    which the model describes as a single ghosted still.
+
+    Returns True if resampling was on and has been disabled.
+    """
+    video_processor = getattr(processor, "video_processor", None)
+    if not getattr(video_processor, "do_sample_frames", False):
+        return False
+    video_processor.do_sample_frames = False
+    return True
+
+
 def smart_nframes(
     total_frames: int,
     video_fps: float,
@@ -1371,6 +1392,8 @@ class MLXMultimodalLM:
 
             self.model, self.processor = load(self.model_name)
             self.config = load_config(self.model_name)
+            if disable_video_frame_resampling(self.processor):
+                logger.info("Video processor frame resampling disabled")
             if self.draft_model_path:
                 self._draft_model = self._load_draft_model()
                 _install_draft_metrics_hooks(self._draft_model)
