@@ -775,6 +775,13 @@ def _configure_chunked_prefill(
         )
     )
     if native_api:
+        if prompt_cache_save is not None:
+            logger.warning(
+                "Prompt cache save disabled: prompt-cache-save is "
+                "unavailable on modern mlx-lm (native BatchGenerator has "
+                "no safe extension point for save callbacks). Continuing "
+                "with chunked prefill on native step size."
+            )
         # Native mlx-lm chunking processes at most this many prompt tokens per
         # scheduler turn and returns to generation between turns. Its internal
         # API has no safe extension point for the legacy prompt-cache and
@@ -1543,6 +1550,13 @@ class Scheduler:
         if not need_chunked and prompt_cache_cb is not None:
             if hasattr(bg, "_process_prompts"):
                 _install_prompt_cache_save(bg, prompt_cache_cb)
+            else:
+                logger.warning(
+                    "Prompt cache save disabled: prompt-cache-save is "
+                    "unavailable on modern mlx-lm (BatchGenerator lacks "
+                    "the _process_prompts hook). Continuing without "
+                    "prompt cache save."
+                )
 
         # Install MTP if the model supports it
         if self.config.enable_mtp:
