@@ -112,6 +112,7 @@ def _get_eos_token_id(tokenizer: Any) -> int | list[int]:
 
 
 def _get_vocab_size(tokenizer: Any) -> int:
+    tokenizer = _resolve_inner_tokenizer(tokenizer)
     vs = getattr(tokenizer, "vocab_size", None)
     if isinstance(vs, int) and vs > 0:
         return vs
