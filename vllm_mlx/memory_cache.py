@@ -982,6 +982,178 @@ def _compute_model_fingerprint(model: Any) -> str:
     return fingerprint
 
 
+def _resolve_model_revision(model: Any) -> str:
+    """Resolve the model snapshot revision for cache provenance.
+
+    Scans candidate path strings for a ``snapshots/<40-hex>`` segment
+    (Hugging Face cache layout) and returns the hex digest when found.
+    Returns ``"unknown-<hash>"`` derived from the first candidate path
+    when no snapshot hash is present, or bare ``"unknown"`` when no
+    candidate path exists at all.
+    """
+    import hashlib
+    import re
+
+    candidates: list[str] = []
+    if isinstance(model, str):
+        candidates.append(model)
+    else:
+        cfg: Any = None
+        for cfg_attr in ("config", "args", "model_config"):
+            cfg = getattr(model, cfg_attr, None)
+            if cfg is not None:
+                break
+        for obj in (model, cfg):
+            if obj is None:
+                continue
+            for key in ("_name_or_path", "name_or_path"):
+                try:
+                    val = getattr(obj, key, None)
+                except Exception:
+                    continue
+                if isinstance(val, str) and val:
+                    candidates.append(val)
+    pattern = re.compile(r"snapshots/([0-9a-fA-F]{40})")
+    for cand in candidates:
+        match = pattern.search(cand)
+        if match:
+            return match.group(1).lower()
+    if candidates:
+        return "unknown-" + hashlib.sha256(candidates[0].encode()).hexdigest()[:8]
+    return "unknown"
+
+
+def _quant_signature_from_config(config: Any) -> str:
+    """Build a canonical signature of the KV quantization settings.
+
+    Returns an envelope with quantization dict, threshold, and
+    enabled flag as canonical sorted JSON, else ``""`` when absent.
+    """
+    import json
+
+    if config is None:
+        return ""
+    quant: Any = None
+    enabled: bool = False
+    threshold: Any = None
+    if isinstance(config, dict):
+        # Explicit quantization dict takes precedence.
+        for key in ("quantization", "quantization_config", "quant_config"):
+            cand = config.get(key)
+            if isinstance(cand, dict) and cand:
+                quant = cand
+                break
+        if quant is None and "bits" in config:
+            # The dict itself is a quantization dict.
+            quant = config
+        if isinstance(config.get("kv_quantize"), bool):
+            enabled = config["kv_quantize"]
+        else:
+            enabled = bool(config.get("kv_quantize", False))
+        threshold = config.get("kv_min_quantize_tokens", None)
+        if threshold is None:
+            threshold = config.get("min_quantize_tokens", None)
+        if quant is None and enabled:
+            # Build quantization view from kv_* keys when enabled.
+            bits = config.get("kv_bits", config.get("bits", None))
+            group = config.get("kv_group_size", config.get("group_size", None))
+            payload = {}
+            if bits is not None:
+                payload["bits"] = bits
+            if group is not None:
+                payload["group_size"] = group
+            if payload:
+                quant = payload
+    else:
+        for attr in ("quantization", "quant_config", "quantization_config"):
+            try:
+                cand = getattr(config, attr, None)
+            except Exception:
+                continue
+            if isinstance(cand, dict) and cand:
+                quant = cand
+                break
+        try:
+            enabled = bool(getattr(config, "kv_quantize", False))
+        except Exception:
+            enabled = False
+        try:
+            threshold = getattr(config, "kv_min_quantize_tokens", None)
+        except Exception:
+            threshold = None
+        if threshold is None:
+            try:
+                threshold = getattr(config, "min_quantize_tokens", None)
+            except Exception:
+                threshold = None
+        if quant is None and enabled:
+            # Build quantization view from kv_* attrs when enabled.
+            try:
+                bits = getattr(config, "kv_bits", None)
+            except Exception:
+                bits = None
+            try:
+                group = getattr(config, "kv_group_size", None)
+            except Exception:
+                group = None
+            payload = {}
+            if bits is not None:
+                payload["bits"] = bits
+            if group is not None:
+                payload["group_size"] = group
+            if payload:
+                quant = payload
+    if quant is None and not enabled:
+        # Threshold alone does not enable quantization; default configs
+        # carry a threshold with kv_quantize False and must stay "".
+        return ""
+    envelope = {
+        "quantization": quant,
+        "min_quantize_tokens": threshold,
+        "enabled": bool(enabled),
+    }
+    try:
+        return json.dumps(envelope, sort_keys=True, default=str)
+    except Exception:
+        return ""
+
+
+def _runtime_versions() -> str:
+    """Return the runtime versions string for cache provenance.
+
+    Covers mlx/mlx-lm/mlx-vlm with an Unknown fallback each.
+    """
+    mlx_v: Any = "Unknown"
+    lm_v: Any = "Unknown"
+    vlm_v: Any = "Unknown"
+    try:
+        import mlx
+
+        mlx_v = getattr(mlx, "__version__", "Unknown")
+    except Exception:
+        pass
+    try:
+        import mlx_lm
+
+        lm_v = getattr(mlx_lm, "__version__", "Unknown")
+    except Exception:
+        pass
+    try:
+        import mlx_vlm
+
+        vlm_v = getattr(mlx_vlm, "__version__", "Unknown")
+    except Exception:
+        pass
+    return f"mlx={mlx_v}|mlx-lm={lm_v}|mlx-vlm={vlm_v}"
+
+
+def _provenance_hash(rev: str, quant: str, rt: str) -> str:
+    """Hash the provenance triple into a path-safe directory name."""
+    import hashlib
+
+    return hashlib.sha256("|".join([rev, quant, rt]).encode()).hexdigest()[:16]
+
+
 class MemoryAwarePrefixCache:
     """
     Prefix cache with memory-based eviction.
@@ -1015,6 +1187,13 @@ class MemoryAwarePrefixCache:
         self._model_id = id(model)
         self._config = config or MemoryCacheConfig()
         self._model_fingerprint = _compute_model_fingerprint(model)
+        # Provenance triple isolates disk entries across revisions.
+        self._model_revision = _resolve_model_revision(model)
+        self._quant_signature = _quant_signature_from_config(self._config)
+        self._runtime_versions = _runtime_versions()
+        self._provenance_hash = _provenance_hash(
+            self._model_revision, self._quant_signature, self._runtime_versions
+        )
 
         # OrderedDict maintains insertion order for LRU
         # Key: tuple(tokens), Value: _CacheEntry
@@ -1634,7 +1813,7 @@ class MemoryAwarePrefixCache:
 
         Directory layout::
 
-            cache_dir/
+            cache_dir/<provenance_hash>/
               index.json          # token keys + metadata per entry
               entry_0.safetensors # KV arrays for entry 0
               entry_1.safetensors
@@ -1651,7 +1830,10 @@ class MemoryAwarePrefixCache:
             return False
 
         t0 = _time.monotonic()
-        os.makedirs(cache_dir, exist_ok=True)
+        # Provenanced subdir owns all new writes; legacy top-level
+        # orphans are never migrated.
+        real_dir = os.path.join(cache_dir, self._provenance_hash)
+        os.makedirs(real_dir, exist_ok=True)
 
         try:
             from mlx_lm.models.cache import save_prompt_cache
@@ -1662,6 +1844,9 @@ class MemoryAwarePrefixCache:
         index = {
             "version": _CACHE_PERSIST_VERSION,
             "model_fingerprint": self._model_fingerprint,
+            "model_revision": self._model_revision,
+            "quant_signature": self._quant_signature,
+            "runtime_versions": self._runtime_versions,
             "num_entries": len(self._entries),
             "total_memory_bytes": self._current_memory,
             "entries": [],
@@ -1669,7 +1854,7 @@ class MemoryAwarePrefixCache:
 
         saved = 0
         for i, (tokens_key, entry) in enumerate(self._entries.items()):
-            entry_path = os.path.join(cache_dir, f"entry_{i}.safetensors")
+            entry_path = os.path.join(real_dir, f"entry_{i}.safetensors")
             try:
                 # Dequantize _QuantizedCacheWrapper layers before saving.
                 # save_prompt_cache requires .state and .meta_state which
@@ -1686,7 +1871,7 @@ class MemoryAwarePrefixCache:
                     metadata={"num_tokens": str(len(tokens_key))},
                 )
                 # Save tokens separately (can be 100K+ ints → binary is smaller)
-                tokens_path = os.path.join(cache_dir, f"entry_{i}_tokens.bin")
+                tokens_path = os.path.join(real_dir, f"entry_{i}_tokens.bin")
                 import array as _array
 
                 arr = _array.array("i", tokens_key)  # 32-bit signed ints
@@ -1710,7 +1895,7 @@ class MemoryAwarePrefixCache:
             except Exception as e:
                 logger.warning(f"[cache_persist] failed to save entry {i}: {e}")
 
-        index_path = os.path.join(cache_dir, "index.json")
+        index_path = os.path.join(real_dir, "index.json")
         with open(index_path, "w") as f:
             json.dump(index, f, indent=2)
 
@@ -1731,7 +1916,16 @@ class MemoryAwarePrefixCache:
         import os
         import time as _time
 
-        index_path = os.path.join(cache_dir, "index.json")
+        # Provenanced subdir owns current caches; top-level fallback
+        # reads legacy orphans only, never migrates them.
+        real_dir = os.path.join(cache_dir, self._provenance_hash)
+        real_path = os.path.join(real_dir, "index.json")
+        if os.path.exists(real_path):
+            index_path, base_dir = real_path, real_dir
+        else:
+            # Legacy fallback preserves v3 log.
+            index_path = os.path.join(cache_dir, "index.json")
+            base_dir = cache_dir
         if not os.path.exists(index_path):
             logger.info(f"[cache_persist] no index at {index_path}, nothing to load")
             return 0
@@ -1764,11 +1958,42 @@ class MemoryAwarePrefixCache:
             )
             return 0
 
+        # Legacy v4 top-level caches without provenance are discarded,
+        # never migrated, safe to delete.
+        disk_rev = index.get("model_revision", None)
+        if disk_rev is None or disk_rev != self._model_revision:
+            logger.warning(
+                f"[cache_persist] model revision mismatch: "
+                f"disk={disk_rev} current={self._model_revision}, "
+                f"discarding incompatible cache"
+            )
+            return 0
+
+        # Missing quant signature rejects; empty matches empty.
+        if "quant_signature" not in index or (
+            index["quant_signature"] != self._quant_signature
+        ):
+            logger.warning(
+                f"[cache_persist] quant signature mismatch: "
+                f"disk={index.get('quant_signature')} "
+                f"current={self._quant_signature}, "
+                f"discarding incompatible cache"
+            )
+            return 0
+
+        # Runtime versions differ warns only; directory isolation applies.
+        if index.get("runtime_versions") != self._runtime_versions:
+            logger.warning(
+                f"[cache_persist] runtime versions differ: "
+                f"disk={index.get('runtime_versions')} "
+                f"current={self._runtime_versions}, "
+                f"directory isolation applies"
+            )
         loaded = 0
         for entry_meta in index.get("entries", []):
             i = entry_meta["index"]
-            entry_path = os.path.join(cache_dir, f"entry_{i}.safetensors")
-            tokens_path = os.path.join(cache_dir, f"entry_{i}_tokens.bin")
+            entry_path = os.path.join(base_dir, f"entry_{i}.safetensors")
+            tokens_path = os.path.join(base_dir, f"entry_{i}_tokens.bin")
 
             if not os.path.exists(entry_path) or not os.path.exists(tokens_path):
                 logger.warning(f"[cache_persist] missing files for entry {i}, skipping")
