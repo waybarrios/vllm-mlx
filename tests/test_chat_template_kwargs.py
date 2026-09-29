@@ -105,6 +105,7 @@ def test_chat_completion_endpoint_forwards_chat_template_kwargs():
                 "model": "test-model",
                 "messages": [{"role": "user", "content": "Reply with ORBIT."}],
                 "max_tokens": 8,
+                "reasoning_effort": "medium",
                 "chat_template_kwargs": {"enable_thinking": False},
             },
         )
@@ -113,8 +114,44 @@ def test_chat_completion_endpoint_forwards_chat_template_kwargs():
         srv._model_name = original_model_name
 
     assert response.status_code == 200
-    assert captured["kwargs"]["chat_template_kwargs"] == {"enable_thinking": False}
+    assert captured["kwargs"]["chat_template_kwargs"] == {
+        "enable_thinking": False,
+        "reasoning_effort": "medium",
+    }
     assert response.json()["choices"][0]["message"]["content"] == "ORBIT"
+
+
+@pytest.mark.parametrize(
+    ("request_effort", "request_kwargs", "expected_effort"),
+    [
+        (None, None, "low"),
+        ("medium", None, "medium"),
+        ("medium", {"reasoning_effort": "high"}, "high"),
+    ],
+)
+def test_chat_completion_preparation_resolves_reasoning_effort_precedence(
+    monkeypatch, request_effort, request_kwargs, expected_effort
+):
+    monkeypatch.setattr(
+        srv,
+        "_default_chat_template_kwargs",
+        {"reasoning_effort": "low", "server_only": True},
+    )
+    request = srv.ChatCompletionRequest(
+        model="test-model",
+        messages=[srv.Message(role="user", content="Hello")],
+        reasoning_effort=request_effort,
+        chat_template_kwargs=request_kwargs,
+    )
+    engine = SimpleNamespace(is_mllm=False, preserve_native_tool_format=False)
+
+    prepared = srv._prepare_chat_completion_invocation(engine, request, 8)
+
+    assert prepared.chat_kwargs["chat_template_kwargs"] == {
+        "reasoning_effort": expected_effort,
+        "server_only": True,
+        **({} if request_kwargs is None else request_kwargs),
+    }
 
 
 def test_chat_completion_endpoint_applies_server_default_chat_template_kwargs():

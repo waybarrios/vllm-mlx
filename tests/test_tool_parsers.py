@@ -273,6 +273,36 @@ class TestQwenToolParser:
         assert not result.tools_called
 
 
+class TestQwenStreamingCallIdentity:
+    @pytest.mark.parametrize(
+        "call",
+        [
+            '<tool_call>{"name":"read","arguments":{"path":"input.txt"}}</tool_call>',
+            '[Calling tool: read({"path":"input.txt"})]',
+        ],
+    )
+    def test_completed_calls_are_emitted_once_across_trailing_chunks(self, call):
+        parser = QwenToolParser()
+        text = ""
+        calls = []
+        # Two identical calls are distinct invocations. Include a split closing
+        # marker, trailing whitespace, and the engine's final empty delta.
+        for chunk in [call[:-2], call[-2:], "\n", "", call, "\n", ""]:
+            previous = text
+            text += chunk
+            delta = parser.extract_tool_calls_streaming(previous, text, chunk)
+            calls.extend((delta or {}).get("tool_calls", []))
+        assert [item["index"] for item in calls] == [0, 1]
+        assert len({item["id"] for item in calls}) == 2
+        for item in calls:
+            assert item["function"]["name"] == "read"
+            assert json.loads(item["function"]["arguments"]) == {"path": "input.txt"}
+
+        parser.reset()
+        delta = parser.extract_tool_calls_streaming("", call, call)
+        assert [item["index"] for item in delta["tool_calls"]] == [0]
+
+
 class TestLlamaToolParser:
     """Test the Llama tool parser."""
 

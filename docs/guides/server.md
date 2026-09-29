@@ -45,6 +45,13 @@ Clients route requests by setting the OpenAI `model` field to one of the configu
 Set server defaults for chat template kwargs. Request-level `chat_template_kwargs`
 values still win per key.
 
+For chat requests, top-level `reasoning_effort` is forwarded verbatim to the
+model's chat template. It overrides the server default; an explicit
+`chat_template_kwargs.reasoning_effort` overrides both. Accepted values and
+fallback behavior are template-specific: OpenAI's `low`/`medium`/`high` values
+are not portable across models. Check the selected model's template before
+choosing a value; a template may ignore the field or use its own fallback.
+
 ```bash
 vllm-mlx serve mlx-community/Qwen3-8B-4bit \
   --reasoning-parser qwen3 \

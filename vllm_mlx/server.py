@@ -302,11 +302,14 @@ def _resolve_request_max_tokens(requested_value: int | None) -> int:
 
 def _resolve_chat_template_kwargs(
     request_value: dict[str, object] | None,
+    request_reasoning_effort: str | None = None,
 ) -> dict[str, object]:
-    """Resolve chat template kwargs: request > server default > empty dict."""
+    """Resolve chat kwargs: server default < effort < explicit request kwargs."""
     resolved: dict[str, object] = {}
     if _default_chat_template_kwargs:
         resolved.update(_default_chat_template_kwargs)
+    if request_reasoning_effort is not None:
+        resolved["reasoning_effort"] = request_reasoning_effort
     if request_value:
         resolved.update(request_value)
     return resolved
@@ -860,7 +863,8 @@ def _prepare_chat_completion_invocation(
     if specprefill_backbone_pct is not None:
         chat_kwargs["specprefill_backbone_pct"] = specprefill_backbone_pct
     resolved_chat_template_kwargs = _resolve_chat_template_kwargs(
-        request.chat_template_kwargs
+        request.chat_template_kwargs,
+        request_reasoning_effort=getattr(request, "reasoning_effort", None),
     )
     if resolved_chat_template_kwargs:
         chat_kwargs["chat_template_kwargs"] = resolved_chat_template_kwargs
@@ -1167,18 +1171,6 @@ async def _acquire_request_model(request_model: str) -> RequestModelContext:
     )
 
 
-async def _stream_with_model_context(
-    context: RequestModelContext,
-    stream: AsyncIterator[str],
-) -> AsyncIterator[str]:
-    """Ensure model leases survive for the full streaming response."""
-    try:
-        async for chunk in stream:
-            yield chunk
-    finally:
-        await context.release()
-
-
 def _build_tool_parser(engine: BaseEngine | None):
     """Create a fresh tool parser instance for a single request/stream."""
     if not _enable_auto_tool_choice or not _tool_call_parser:
@@ -1373,13 +1365,6 @@ def _prepare_openai_stream_reasoning_state(
         and not _thinking_disabled(request, chat_kwargs)
     )
     return parser, is_thinking_model
-
-
-def _request_tool_definitions(request: ChatCompletionRequest) -> list | None:
-    """Return the request tool schema once for streaming argument coercion."""
-    if request and request.tools:
-        return request.model_dump(include={"tools"}).get("tools")
-    return None
 
 
 def _streaming_json_fence_stripper(
@@ -2852,6 +2837,24 @@ async def _stream_responses_request(request: ResponsesRequest) -> AsyncIterator[
     tool_parser = _get_streaming_tool_parser(chat_request, engine)
     tool_accumulated_text = ""
     tool_markup_possible = _requires_eager_tool_streaming(tool_parser)
+    tool_calls_detected = False
+    drop_post_call_text = _parser_drops_text_after_tool_call(tool_parser)
+
+    def _tool_result_content(result: dict | None) -> str:
+        """Keep incremental text consistent across both Responses branches."""
+        nonlocal tool_calls_detected
+        if result is None:
+            return ""
+        if drop_post_call_text and tool_calls_detected:
+            return ""
+        content = result.get("content") or ""
+        if result.get("tool_calls"):
+            tool_calls_detected = True
+            if drop_post_call_text:
+                content = _assistant_text_before_tool_call(
+                    tool_parser, tool_accumulated_text, content
+                )
+        return content
 
     async for output in engine.stream_chat(messages=messages, **chat_kwargs):
         last_output = output
@@ -2919,10 +2922,7 @@ async def _stream_responses_request(request: ResponsesRequest) -> AsyncIterator[
                     tool_result = _finalize_streaming_tool_result(
                         tool_parser, tool_accumulated_text, tool_result
                     )
-                if tool_result is None or "tool_calls" in tool_result:
-                    content = ""
-                else:
-                    content = tool_result.get("content", "")
+                content = _tool_result_content(tool_result)
 
             if content:
                 for event in _start_text_item():
@@ -2970,14 +2970,7 @@ async def _stream_responses_request(request: ResponsesRequest) -> AsyncIterator[
                     tool_result = _finalize_streaming_tool_result(
                         tool_parser, tool_accumulated_text, tool_result
                     )
-                if tool_result is None:
-                    continue
-                if "tool_calls" in tool_result:
-                    content = tool_result.get("content", "")
-                    if not content:
-                        continue
-                else:
-                    content = tool_result.get("content", "")
+                content = _tool_result_content(tool_result)
 
         if not content:
             continue
@@ -3391,6 +3384,56 @@ def _stream_request_metadata(
     return {"tools": tools or []}, tools, include_usage
 
 
+def _parser_drops_text_after_tool_call(parser) -> bool:
+    """Whether this parser's non-streaming contract discards post-call text.
+
+    ``Glm47ToolParser`` and its ``PoolsideV1ToolParser`` subclass cut the
+    visible content at the first ``_START`` and return only the prefix, so
+    text arriving after the call is not user-visible. They are identified by
+    declaring the ``_END`` marker; parsers without it keep today's behaviour,
+    which is what stops this from touching the DeepSeek-V4 split-marker path
+    (that parser uses module-level constants, not a class attribute).
+    """
+    return isinstance(getattr(parser, "_END", None), str)
+
+
+def _text_after_tool_call(parser, accumulated_text: str) -> str:
+    """Raw text that follows the last completed tool call, if the parser marks one."""
+    end_marker = getattr(parser, "_END", None)
+    if not isinstance(end_marker, str) or not end_marker:
+        return ""
+    tail = accumulated_text.rfind(end_marker)
+    if tail < 0:
+        return ""
+    return accumulated_text[tail + len(end_marker) :]
+
+
+def _assistant_text_before_tool_call(
+    parser, accumulated_text: str, parsed_content: str
+) -> str:
+    """Drop text a buffering parser folded in from *after* the tool call.
+
+    Non-streaming keeps only the prefix — ``PoolsideV1ToolParser`` returns
+    ``cleaned_text[:cleaned_text.find("<tool_call>")]`` and discards the rest —
+    but its streaming counterpart buffers prose and can hand back both sides
+    concatenated, so ``Before<tool_call>…</tool_call>After`` arrives as
+    ``"BeforeAfter"``. Streaming would then answer a different string than
+    non-streaming for the same model output.
+
+    Only the trailing part is removed, and only when it matches the raw text
+    following the call: the parser's content is what this delta has not emitted
+    yet, so recomputing it from the accumulated deltas would re-send text the
+    client already has.
+    """
+    content = _TOOL_MARKUP_PATTERN.sub("", parsed_content)
+    after = _text_after_tool_call(parser, accumulated_text)
+    if after and content.endswith(after):
+        content = content[: -len(after)]
+    # This delta may continue previously emitted text. Its whitespace can be
+    # a word separator, paragraph break, or indentation and must be preserved.
+    return content
+
+
 def _parse_streaming_tool_content(
     parser,
     accumulated_text: str,
@@ -3403,7 +3446,11 @@ def _parse_streaming_tool_content(
         delta_text,
         request_context,
     )
-    suppress = result is None or "tool_calls" in result
+    # A delta may legitimately carry both. A parser that has buffered prose and
+    # then sees the whole tool-call block arrive in one delta has nowhere else
+    # to put that prose, and dropping it loses user-visible assistant text.
+    # Suppress only when there is nothing to show.
+    suppress = result is None or ("tool_calls" in result and not result.get("content"))
     return accumulated_text, result, suppress
 
 
@@ -5596,6 +5643,7 @@ def _normalize_messages(messages: list[dict]) -> list[dict]:
 
     Only merges when both messages have string content. Messages with list
     content (multimodal) are left as-is to preserve image/video attachments.
+    Tool results and assistant tool calls retain their individual identities.
 
     Args:
         messages: List of message dicts with 'role' and 'content' keys.
@@ -5618,6 +5666,9 @@ def _normalize_messages(messages: list[dict]) -> list[dict]:
         role = _ROLE_MAP.get(msg["role"], msg["role"])
         if (
             role == prev["role"]
+            and role in ("system", "user", "assistant")
+            and not prev.get("tool_calls")
+            and not msg.get("tool_calls")
             and isinstance(prev.get("content"), str)
             and isinstance(msg.get("content"), str)
         ):
@@ -6784,6 +6835,33 @@ async def stream_chat_completion(
                             continue
 
                         if "tool_calls" in tool_result:
+                            # Text buffered ahead of the block arrives in the
+                            # same delta when the whole block lands at once.
+                            # Emit it as its own chunk first — dropping it with
+                            # the `continue` below loses assistant text the
+                            # non-streaming path returns.
+                            leading = _assistant_text_before_tool_call(
+                                tool_parser,
+                                tool_accumulated_text,
+                                tool_result.get("content", ""),
+                            )
+                            if leading:
+                                leading_chunk = ChatCompletionChunk(
+                                    id=response_id,
+                                    model=_response_model_name(request.model),
+                                    choices=[
+                                        ChatCompletionChunkChoice(
+                                            delta=ChatCompletionChunkDelta(
+                                                content=leading
+                                            )
+                                        )
+                                    ],
+                                )
+                                _attach_pending_logprobs(
+                                    leading_chunk, pending_logprobs
+                                )
+                                yield f"data: {leading_chunk.model_dump_json()}\n\n"
+
                             # Emit structured tool calls
                             tool_calls_detected = True
                             # Coerce arguments against tool schemas
@@ -6801,7 +6879,10 @@ async def stream_chat_completion(
                                     ChatCompletionChunkChoice(
                                         delta=ChatCompletionChunkDelta(
                                             tool_calls=tool_result["tool_calls"],
-                                            content=tool_result.get("content") or None,
+                                            # `leading` above already emitted
+                                            # this text as its own chunk, so
+                                            # repeating it here would double it.
+                                            content=None,
                                             reasoning=reasoning,
                                         ),
                                         finish_reason=(
@@ -6820,6 +6901,17 @@ async def stream_chat_completion(
 
                         # Normal content from tool parser
                         content = tool_result.get("content", "")
+                        if (
+                            content
+                            and tool_calls_detected
+                            and _parser_drops_text_after_tool_call(tool_parser)
+                        ):
+                            # The call already went out, and this parser's
+                            # non-streaming contract keeps only the prefix.
+                            # Emitting a later delta's text here is what makes
+                            # streaming answer "BeforeAfter" where
+                            # extract_tool_calls() answers "Before".
+                            content = ""
                         # Strip any leaked tool markup tags
                         if content:
                             content = _TOOL_MARKUP_PATTERN.sub("", content)
@@ -6921,6 +7013,33 @@ async def stream_chat_completion(
                             continue
 
                         if "tool_calls" in tool_result:
+                            # Text buffered ahead of the block arrives in the
+                            # same delta when the whole block lands at once.
+                            # Emit it as its own chunk first — dropping it with
+                            # the `continue` below loses assistant text the
+                            # non-streaming path returns.
+                            leading = _assistant_text_before_tool_call(
+                                tool_parser,
+                                tool_accumulated_text,
+                                tool_result.get("content", ""),
+                            )
+                            if leading:
+                                leading_chunk = ChatCompletionChunk(
+                                    id=response_id,
+                                    model=_response_model_name(request.model),
+                                    choices=[
+                                        ChatCompletionChunkChoice(
+                                            delta=ChatCompletionChunkDelta(
+                                                content=leading
+                                            )
+                                        )
+                                    ],
+                                )
+                                _attach_pending_logprobs(
+                                    leading_chunk, pending_logprobs
+                                )
+                                yield f"data: {leading_chunk.model_dump_json()}\n\n"
+
                             # Emit structured tool calls
                             tool_calls_detected = True
                             # Coerce arguments against tool schemas
@@ -6938,7 +7057,10 @@ async def stream_chat_completion(
                                     ChatCompletionChunkChoice(
                                         delta=ChatCompletionChunkDelta(
                                             tool_calls=tool_result["tool_calls"],
-                                            content=tool_result.get("content") or None,
+                                            # `leading` above already emitted
+                                            # this text as its own chunk, so
+                                            # repeating it here would double it.
+                                            content=None,
                                         ),
                                         finish_reason=(
                                             "tool_calls" if output.finished else None
@@ -6956,6 +7078,17 @@ async def stream_chat_completion(
 
                         # Normal content from tool parser
                         content = tool_result.get("content", "")
+                        if (
+                            content
+                            and tool_calls_detected
+                            and _parser_drops_text_after_tool_call(tool_parser)
+                        ):
+                            # The call already went out, and this parser's
+                            # non-streaming contract keeps only the prefix.
+                            # Emitting a later delta's text here is what makes
+                            # streaming answer "BeforeAfter" where
+                            # extract_tool_calls() answers "Before".
+                            content = ""
                         # Strip any leaked tool markup tags
                         if content:
                             content = _TOOL_MARKUP_PATTERN.sub("", content)

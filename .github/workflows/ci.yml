@@ -23,10 +23,10 @@ jobs:
           pip install ruff black
 
       - name: Run ruff
-        run: ruff check vllm_mlx/ tests/ --select E,F,W --ignore E402,E501,E731,F811,F841
+        run: ruff check vllm_mlx/ tests/ scripts/client_acceptance/ --select E,F,W --ignore E402,E501,E731,F811,F841
 
       - name: Run black
-        run: black --check vllm_mlx/ tests/
+        run: black --check vllm_mlx/ tests/ scripts/client_acceptance/
 
   type-check:
     runs-on: ubuntu-latest
@@ -68,6 +68,9 @@ jobs:
       - name: Run unit tests (no MLX required)
         run: |
           pytest \
+            tests/test_client_acceptance_runner.py \
+            tests/test_client_acceptance_clients.py \
+            tests/test_client_acceptance_observe.py \
             tests/test_mcp_security.py \
             tests/test_structured_output.py \
             tests/test_reasoning_parser.py \
@@ -119,6 +122,33 @@ jobs:
         with:
           file: ./coverage.xml
           fail_ci_if_error: false
+
+      - name: Run MLX-stubbed scheduler tests
+        # Deliberately its own step (fresh process), not merged into "Run
+        # unit tests (no MLX required)" above: this file installs a
+        # MagicMock-backed mlx/mlx_lm stub (tests/_mlx_stub.py) so its
+        # mlx.core-importing dependencies load without the real package.
+        # Several files in the step above (e.g. test_memory_cache.py,
+        # test_prefix_cache.py) have their own real `except ImportError`
+        # mlx-optional handling that a stub in the same sys.modules/process
+        # would silently break (isinstance() against a MagicMock raises
+        # TypeError instead of behaving like "mlx absent") -- see
+        # tests/_mlx_stub.py's docstring.
+        #
+        # test_metrics.py is NOT included here: it needs the full
+        # vllm_mlx.server import chain (uvicorn, prometheus-client), neither
+        # of which this job installs, and mlx-stubbing them the same way
+        # broke fixture setup with ModuleNotFoundError. That file stays
+        # Apple-Silicon-only; the one contract it covers that also needed
+        # Linux coverage (get_stats()["steps_executed"] reaching the
+        # vllm_mlx_engine_steps_executed gauge) has a dependency-light
+        # equivalent below, in TestMetricsEngineStepsExecutedGauge, which
+        # calls MetricsCollector directly and needs neither of those.
+        # Refs #746 / PR #749 review.
+        run: |
+          pytest \
+            tests/test_mllm_steps_executed_stat.py \
+            -v --tb=short
 
   test-python-3-14:
     # Focused job for the CPython 3.14+ asyncio.shield() behavior change
@@ -172,14 +202,19 @@ jobs:
             tests/test_llm.py \
             tests/test_mllm.py \
             tests/test_server.py \
+            tests/test_server_logprobs.py \
             tests/test_metrics.py \
             tests/test_paged_cache.py \
             tests/test_prefix_cache_untrimmable.py \
             tests/test_scheduler_max_kv_size.py \
             tests/test_qwen35_mtp_patch.py \
+            tests/test_batched_engine.py \
             tests/test_batched_engine_mllm_config.py \
             tests/test_mllm_continuous_batching.py \
             tests/test_mllm_cache.py \
+            tests/test_mllm_sampling.py \
+            tests/test_mllm_steps_executed_stat.py \
+            tests/test_metrics.py \
             tests/test_optimizations.py \
             tests/test_simple_engine.py \
             tests/test_simple_engine_prefix_trie_cache.py \
@@ -189,6 +224,7 @@ jobs:
             tests/test_chat_template_kwargs.py \
             tests/test_batching.py \
             tests/test_continuous_batching.py \
+            tests/test_logprobs.py \
             tests/test_memory_cache_mlx.py \
             tests/test_mllm_ssd_spill.py \
             tests/test_ssd_cache.py \
@@ -206,6 +242,17 @@ jobs:
             -v --tb=short \
             -m "not slow" \
             -k "not Integration"
+
+      - name: Run streaming text-with-tool-calls regression tests
+        run: |
+          # Kept out of the list above because that invocation filters with
+          # -k "not Integration", which would deselect the endpoint file by
+          # name and silently skip every regression in it.
+          pytest \
+            tests/test_streaming_content_with_tool_calls.py \
+            tests/test_streaming_content_with_tool_calls_integration.py \
+            -v --tb=short \
+            -m "not slow"
 
       - name: Run EngineCore stream-affinity regression tests
         run: |

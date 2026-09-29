@@ -78,6 +78,11 @@ class Message(BaseModel):
 
     role: str
     content: str | list[ContentPart] | list[dict] | None = None
+    # Preserve returned reasoning when assistant history is replayed to a template.
+    reasoning_content: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("reasoning_content", "reasoning"),
+    )
     # For assistant messages with tool calls
     tool_calls: list[dict] | None = None
     # For tool response messages (role="tool")
@@ -230,6 +235,8 @@ class ChatCompletionRequest(BaseModel):
     # matches ``vllm_mlx.logprobs.MAX_TOP_LOGPROBS``.
     logprobs: bool | None = None
     top_logprobs: int | None = Field(default=None, ge=0, le=20)
+    # Per-request reasoning effort forwarded through chat template kwargs
+    reasoning_effort: str | None = None
     # Extra kwargs forwarded to tokenizer.apply_chat_template
     chat_template_kwargs: dict[str, Any] | None = None
     # MLLM-specific parameters

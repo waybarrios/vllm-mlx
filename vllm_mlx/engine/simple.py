@@ -1634,6 +1634,7 @@ class SimpleEngine(BaseEngine):
                 messages=messages,
                 max_tokens=max_tokens,
                 temperature=temperature,
+                top_p=top_p,
                 tools=template_tools,
                 **kwargs,
             )
@@ -1777,6 +1778,7 @@ class SimpleEngine(BaseEngine):
 
         def mllm_call_kwargs() -> dict:
             local_kwargs = dict(kwargs)
+            local_kwargs["top_p"] = top_p
             if chat_template_kwargs:
                 local_kwargs["chat_template_kwargs"] = chat_template_kwargs
             local_kwargs["mllm_draft"] = mllm_draft_requested
@@ -2372,7 +2374,11 @@ class SimpleEngine(BaseEngine):
                         break
             finally:
                 if not producer_task.done():
-                    abort_event.set()
+                    # The terminal chunk can arrive before the worker stores
+                    # the completed prefix. Let normal completion finish;
+                    # only an incomplete stream should abort the producer.
+                    if not finished:
+                        abort_event.set()
                     try:
                         await producer_task
                     except BaseException:
