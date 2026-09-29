@@ -204,11 +204,13 @@ jobs:
             tests/test_llm.py \
             tests/test_mllm.py \
             tests/test_server.py \
+            tests/test_server_logprobs.py \
             tests/test_metrics.py \
             tests/test_paged_cache.py \
             tests/test_prefix_cache_untrimmable.py \
             tests/test_scheduler_max_kv_size.py \
             tests/test_qwen35_mtp_patch.py \
+            tests/test_batched_engine.py \
             tests/test_batched_engine_mllm_config.py \
             tests/test_mllm_continuous_batching.py \
             tests/test_mllm_cache.py \
@@ -226,6 +228,7 @@ jobs:
             tests/test_collect_eos_token_ids.py \
             tests/test_batching.py \
             tests/test_continuous_batching.py \
+            tests/test_logprobs.py \
             tests/test_memory_cache_mlx.py \
             tests/test_mllm_ssd_spill.py \
             tests/test_ssd_cache.py \

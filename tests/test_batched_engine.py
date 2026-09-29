@@ -74,6 +74,42 @@ class TestBatchedEngineGenerate:
         assert result.tokens == []
 
     @pytest.mark.anyio
+    async def test_logprobs_are_forwarded_and_returned(self):
+        """logprobs travel into SamplingParams and back out on the output."""
+        engine = self._make_engine()
+        mock_output = self._make_mock_request_output()
+        mock_output.output_logprobs = ["entry"]
+
+        mock_engine = MagicMock()
+        mock_engine.generate = AsyncMock(return_value=mock_output)
+        engine._engine = mock_engine
+
+        result = await engine.generate(prompt="test", max_tokens=10, logprobs=3)
+
+        sampling_params = mock_engine.generate.call_args.kwargs["sampling_params"]
+        assert sampling_params.logprobs == 3
+        assert result.logprobs == ["entry"]
+
+    @pytest.mark.anyio
+    async def test_mllm_logprobs_are_forwarded_and_returned(self):
+        """The MLLM route forwards logprobs to the scheduler and returns them."""
+        engine = self._make_engine()
+        engine._is_mllm = True
+        mock_output = self._make_mock_request_output()
+        mock_output.output_logprobs = ["entry"]
+        mock_output.mtp_drafts = 0
+        mock_output.mtp_accepted = 0
+
+        scheduler = MagicMock()
+        scheduler.generate = AsyncMock(return_value=mock_output)
+        engine._mllm_scheduler = scheduler
+
+        result = await engine.generate(prompt="test", max_tokens=10, logprobs=3)
+
+        assert scheduler.generate.call_args.kwargs["logprobs"] == 3
+        assert result.logprobs == ["entry"]
+
+    @pytest.mark.anyio
     async def test_other_output_fields_still_populated(self):
         """Existing fields (text, prompt_tokens, etc.) must remain correct."""
         engine = self._make_engine()
