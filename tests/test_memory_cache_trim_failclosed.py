@@ -153,3 +153,39 @@ class TestTrimCacheOffsetFailClosed:
         assert out[0] is not wrapper
         assert out[0].offset == 6
         assert wrapper.offset == 10
+
+    def test_mixed_stack_is_whole_stack_veto(self, _fake_mlx_modules):
+        """Whole-stack (P2-1): one veto freezes the entire stack."""
+        trimmable = _PlainTrimmable(length=10)
+        frozen = _NonTrimmableByMethod(length=10)
+
+        out = _trim_cache_offset([trimmable, frozen], 4)
+
+        assert out[0] is trimmable
+        assert out[1] is frozen
+        assert trimmable.offset == 10
+        assert trimmable.keys.shape[-2] == 10
+        assert frozen.offset == 10
+        assert frozen.keys.shape[-2] == 10
+
+    def test_mixed_stack_reversed_is_whole_stack_veto(self, _fake_mlx_modules):
+        frozen = _NonTrimmableByMethod(length=10)
+        trimmable = _PlainTrimmable(length=10)
+
+        out = _trim_cache_offset([frozen, trimmable], 4)
+
+        assert out[0] is frozen
+        assert out[1] is trimmable
+        assert trimmable.offset == 10
+        assert frozen.offset == 10
+
+    def test_empty_cache_returns_empty(self, _fake_mlx_modules):
+        assert _trim_cache_offset([], 4) == []
+
+    def test_trim_zero_and_negative_are_noop(self, _fake_mlx_modules):
+        for trim_by in (0, -1, -5):
+            layer = _PlainTrimmable(length=10)
+            out = _trim_cache_offset([layer], trim_by)
+            assert out[0] is layer
+            assert layer.offset == 10
+            assert layer.keys.shape[-2] == 10

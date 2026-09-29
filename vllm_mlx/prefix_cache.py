@@ -314,23 +314,48 @@ class PrefixCacheManager:
                 del parent[tok]
 
     def _can_trim_cache(self, prompt_cache: List[Any]) -> bool:
-        """Check if cache can be trimmed."""
+        """Check if cache can be trimmed.
+
+        Compatibility note: trim-capable layers without ``is_trimmable``
+        (old KVCache) are trusted via ``hasattr(cache, "trim")``.
+        """
         if not prompt_cache:
             return False
-        # Check if first cache layer has is_trimmable method
-        first_cache = prompt_cache[0]
-        if hasattr(first_cache, "is_trimmable"):
-            trimmable = first_cache.is_trimmable()
-            if not trimmable:
-                logger.debug(
-                    "Prefix cache reuse skipped: cache is not trimmable "
-                    "(RotatingKVCache does not support trimming)"
-                )
-            return trimmable
-        return hasattr(first_cache, "trim")
+        # Fail-closed: any layer vetoing via is_trimmable blocks the stack.
+        for cache in prompt_cache:
+            fn = getattr(cache, "is_trimmable", None)
+            if callable(fn):
+                try:
+                    if not fn():
+                        logger.debug(
+                            "Prefix cache reuse skipped: %s is not trimmable",
+                            type(cache).__name__,
+                        )
+                        return False
+                except Exception:
+                    logger.debug(
+                        "Prefix cache reuse skipped: is_trimmable check "
+                        "failed for %s",
+                        type(cache).__name__,
+                        exc_info=True,
+                    )
+                    return False
+            elif fn is not None:
+                if not bool(fn):
+                    logger.debug(
+                        "Prefix cache reuse skipped: %s is not trimmable",
+                        type(cache).__name__,
+                    )
+                    return False
+        return all(hasattr(cache, "trim") for cache in prompt_cache)
 
     def _trim_cache(self, prompt_cache: List[Any], num_tokens: int) -> List[Any]:
         """Trim cache by removing num_tokens from the end."""
+        if num_tokens <= 0:
+            return prompt_cache
+        # Fail-closed: never partially trim a mixed stack.
+        if not self._can_trim_cache(prompt_cache):
+            return prompt_cache
         for cache in prompt_cache:
             if hasattr(cache, "trim"):
                 cache.trim(num_tokens)

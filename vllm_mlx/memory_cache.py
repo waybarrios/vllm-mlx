@@ -357,20 +357,24 @@ def _trim_cache_offset(cache: list[Any], trim_by: int) -> list[Any]:
 
     Supports KVCache, RotatingKVCache, and _QuantizedCacheWrapper.
 
-    Fail-closed hardening (issue #678): each layer is first checked with
-    ``_is_cache_layer_trimmable``; non-trimmable layers are appended
-    unchanged (no trim). Callers are guarded (#680/#683/#691) but this
-    per-layer veto keeps direct calls safe.
+    Fail-closed hardening (issue #678): whole-stack fail-closed — if any
+    layer is not trimmable per ``_is_cache_layer_trimmable``, the entire
+    stack is returned unchanged (no partial trim).
     """
+    if trim_by <= 0:
+        return list(cache)
+    if any(not _is_cache_layer_trimmable(lc) for lc in cache):
+        logger.debug(
+            "Trim skipped: non-trimmable cache layer in stack: %s",
+            [type(lc).__name__ for lc in cache],
+        )
+        return list(cache)
     import mlx.core as mx
     from mlx_lm.models.cache import RotatingKVCache
 
     trimmed: list[Any] = []
     eval_targets: list[Any] = []
     for layer_cache in cache:
-        if not _is_cache_layer_trimmable(layer_cache):
-            trimmed.append(layer_cache)
-            continue
         if isinstance(layer_cache, _QuantizedCacheWrapper):
             # Shallow copy with reduced offset
             tc = _QuantizedCacheWrapper.__new__(_QuantizedCacheWrapper)
