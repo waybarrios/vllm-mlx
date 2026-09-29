@@ -356,6 +356,11 @@ def _trim_cache_offset(cache: list[Any], trim_by: int) -> list[Any]:
     alone breaks ``size()`` / ``_temporal_order`` invariants.
 
     Supports KVCache, RotatingKVCache, and _QuantizedCacheWrapper.
+
+    Fail-closed hardening (issue #678): each layer is first checked with
+    ``_is_cache_layer_trimmable``; non-trimmable layers are appended
+    unchanged (no trim). Callers are guarded (#680/#683/#691) but this
+    per-layer veto keeps direct calls safe.
     """
     import mlx.core as mx
     from mlx_lm.models.cache import RotatingKVCache
@@ -363,6 +368,9 @@ def _trim_cache_offset(cache: list[Any], trim_by: int) -> list[Any]:
     trimmed: list[Any] = []
     eval_targets: list[Any] = []
     for layer_cache in cache:
+        if not _is_cache_layer_trimmable(layer_cache):
+            trimmed.append(layer_cache)
+            continue
         if isinstance(layer_cache, _QuantizedCacheWrapper):
             # Shallow copy with reduced offset
             tc = _QuantizedCacheWrapper.__new__(_QuantizedCacheWrapper)
