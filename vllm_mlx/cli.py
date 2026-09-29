@@ -46,6 +46,41 @@ def _add_tool_calling_args(serve_parser: argparse.ArgumentParser) -> None:
     )
 
 
+def _exit_without_finalizing(status: int = 0) -> None:
+    """Leave the serve process without running interpreter finalization.
+
+    ``uvicorn.run()`` returns only after a graceful shutdown: the socket is
+    closed, lifespan shutdown has run (engine stopped, caches persisted, MCP
+    stopped) and no request is in flight. All that is left is CPython teardown,
+    which joins the non-daemon threads that have touched MLX - and MLX keeps
+    its compile cache in thread-local storage whose entries own Python objects.
+    When such a thread exits, dyld runs the TLS destructor, which calls
+    _Py_Dealloc without a thread state or the GIL:
+
+        _pthread_exit -> _pthread_tsd_cleanup
+          -> dyld::ThreadLocalVariables::finalizeList
+            -> mlx::core::detail::CompileCache::CacheEntry::~CacheEntry()
+              -> _Py_Dealloc            EXC_BAD_ACCESS at 0x350
+
+    Six identical crash reports, on both the pinned generation worker
+    (``simple-generate_0``) and the default executor thread that lifespan
+    shutdown itself creates for cache persistence (``asyncio_0``). MLX exposes
+    no way to clear that cache from Python - ``clear_streams`` covers streams
+    and ``clear_cache`` covers memory - so the crash cannot be prevented, only
+    outrun. Every request has already been served by this point; the only thing
+    lost is cleanup the OS does anyway.
+
+    Run the one atexit handler we own first. Set VLLM_MLX_CLEAN_EXIT=0 to keep
+    normal finalization when debugging.
+
+    The decision policy and exit mechanics live in ``vllm_mlx.shutdown`` so
+    they are testable without MLX; this name is kept for its call sites.
+    """
+    from .shutdown import exit_without_finalizing
+
+    exit_without_finalizing(status)
+
+
 def serve_command(args):
     """Start the OpenAI-compatible server."""
     import logging
@@ -452,6 +487,11 @@ def serve_command(args):
 
     # Start server
     print(f"Starting server at http://{args.host}:{args.port}")
+    # Exit is handled at the end of lifespan shutdown (see
+    # server._exit_process_after_shutdown): uvicorn.run() joins the
+    # asyncio default-executor threads inside itself, so a guard placed
+    # after it runs too late to matter.
+    server._exit_process_after_shutdown = True
     uvicorn.run(app, host=args.host, port=args.port, log_level="info")
 
 

@@ -126,6 +126,7 @@ Create `mcp.json`:
 | Variable | Description |
 |----------|-------------|
 | `VLLM_MLX_TEST_MODEL` | Default model for tests |
+| `VLLM_MLX_CLEAN_EXIT` | Set to `0` to keep normal interpreter finalization on shutdown. Default `1`: the serve process exits at the end of lifespan shutdown, once every request is served and caches are persisted, because MLX's thread-local compile cache segfaults during CPython teardown. Only affects the `serve` entry points, never library use. |
 | `HF_TOKEN` | HuggingFace authentication token |
 | `OPENAI_API_KEY` | Set to any value for SDK compatibility |
 
