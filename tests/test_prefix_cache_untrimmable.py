@@ -464,3 +464,47 @@ class TestUnknownCoverageFailsClosed:
             )
             is None
         )
+
+
+class TestSequentialPrefixLcpFailClosed:
+    """Sequential prefix LCP must fail closed on a rotating cache (#775).
+
+    Q1 ``[1..8]`` is stored with a wrapped RotatingKVCache, Q2 ``[1..7, 99]``
+    shares a 7-token prefix but diverges on the last token. Trimming the
+    excess off is impossible once the ring has wrapped, so fetch must MISS
+    rather than return a rewound state. The control pins the other half:
+    the same fetch HITS when every layer reports trimmable.
+    """
+
+    @staticmethod
+    def _prefix_cache():
+        from vllm_mlx.memory_cache import MemoryAwarePrefixCache, MemoryCacheConfig
+
+        class _Model:
+            pass
+
+        return MemoryAwarePrefixCache(
+            _Model(), MemoryCacheConfig(max_memory_mb=64, min_prefix_tokens=1)
+        )
+
+    def test_775_sequential_prefix_lcp_misses_on_rotating_cache(self):
+        mc = self._prefix_cache()
+        assert mc.store([1, 2, 3, 4, 5, 6, 7, 8], _rotating_past_its_window())
+
+        fetched, remaining = mc.fetch([1, 2, 3, 4, 5, 6, 7, 99])
+
+        assert fetched is None
+        assert remaining == [1, 2, 3, 4, 5, 6, 7, 99]
+
+    def test_775_sequential_prefix_lcp_hits_when_trimmable(self, monkeypatch):
+        monkeypatch.setattr(
+            "vllm_mlx.memory_cache._is_cache_layer_trimmable",
+            lambda _layer: True,
+        )
+        mc = self._prefix_cache()
+        assert mc.store([1, 2, 3, 4, 5, 6, 7, 8], _rotating_past_its_window())
+
+        fetched, remaining = mc.fetch([1, 2, 3, 4, 5, 6, 7, 99])
+
+        assert fetched is not None
+        assert remaining == [99]
