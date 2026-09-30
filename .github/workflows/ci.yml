@@ -80,6 +80,7 @@ jobs:
             tests/test_memory_cache.py \
             tests/test_prefix_cache.py \
             tests/test_mllm_cache.py \
+            tests/test_audio.py \
             tests/test_api_models.py \
             tests/test_api_utils.py \
             tests/test_request.py \
@@ -91,6 +92,7 @@ jobs:
             tests/test_chat_template_safety.py \
             tests/test_simple_engine_thread_pinning.py \
             tests/test_engine_base.py \
+            tests/test_engine_core_request_owner.py \
             tests/test_harmony_parsers.py \
             tests/test_endpoint_model_policies.py \
             tests/test_truncation.py \
@@ -194,11 +196,13 @@ jobs:
         run: |
           python -c "import platform; assert platform.machine() == 'arm64', 'Not ARM64'"
           python -c "import mlx.core as mx; print(f'MLX OK: {mx.default_device()}')"
+          python -m pip show mlx mlx-lm
 
       - name: Run MLX-dependent tests
         run: |
           pytest \
             tests/test_platform.py \
+            tests/test_audio.py \
             tests/test_llm.py \
             tests/test_mllm.py \
             tests/test_server.py \
@@ -214,12 +218,14 @@ jobs:
             tests/test_mllm_steps_executed_stat.py \
             tests/test_metrics.py \
             tests/test_optimizations.py \
+            tests/test_batched_engine.py \
             tests/test_simple_engine.py \
             tests/test_simple_engine_prefix_trie_cache.py \
             tests/test_text_model_dispatch.py \
             tests/test_cli.py \
             tests/test_model_registry.py \
             tests/test_chat_template_kwargs.py \
+            tests/test_collect_eos_token_ids.py \
             tests/test_batching.py \
             tests/test_continuous_batching.py \
             tests/test_memory_cache_mlx.py \

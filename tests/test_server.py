@@ -414,6 +414,116 @@ class TestAnthropicRequest:
             )
 
 
+class TestWhisperTranscriptionEndpoint:
+    """Exercise processor recovery through the real HTTP route and STT engine."""
+
+    @pytest.mark.parametrize(
+        "fail_first_download",
+        [False, True],
+        ids=["missing-processor", "download-retry"],
+    )
+    def test_transcription_recovers_processor(self, monkeypatch, fail_first_download):
+        import io
+        import wave
+        from pathlib import Path
+        from types import ModuleType
+
+        import vllm_mlx.server as srv
+        from vllm_mlx.audio.stt import STTEngine
+        from vllm_mlx.metrics import MetricsCollector
+
+        wav_buffer = io.BytesIO()
+        with wave.open(wav_buffer, "wb") as wav:
+            wav.setnchannels(1)
+            wav.setsampwidth(2)
+            wav.setframerate(16000)
+            wav.writeframes(b"\x00\x00" * 20000)
+        audio_bytes = wav_buffer.getvalue()
+        processor = object()
+        models = []
+        processor_calls = []
+        generated_paths = []
+
+        def load_model(model_name):
+            assert model_name == "mlx-community/whisper-small-mlx"
+            model = SimpleNamespace(_processor=None)
+
+            def generate(audio_path, *, verbose, language, task):
+                assert model._processor is processor
+                assert verbose is False
+                assert language == "en"
+                assert task == "transcribe"
+                assert Path(audio_path).read_bytes() == audio_bytes
+                generated_paths.append(Path(audio_path))
+                return SimpleNamespace(
+                    text=" hello ",
+                    language="en",
+                    segments=[{"start": 0.0, "end": 1.25, "text": "hello"}],
+                )
+
+            model.generate = generate
+            models.append(model)
+            return model
+
+        def load_processor(processor_repo):
+            processor_calls.append(processor_repo)
+            if fail_first_download and len(processor_calls) == 1:
+                raise OSError("processor download failed")
+            return processor
+
+        utils_module = ModuleType("mlx_audio.stt.utils")
+        utils_module.load_model = load_model
+        stt_module = ModuleType("mlx_audio.stt")
+        stt_module.utils = utils_module
+        mlx_audio_module = ModuleType("mlx_audio")
+        mlx_audio_module.stt = stt_module
+        monkeypatch.setitem(sys.modules, "mlx_audio", mlx_audio_module)
+        monkeypatch.setitem(sys.modules, "mlx_audio.stt", stt_module)
+        monkeypatch.setitem(sys.modules, "mlx_audio.stt.utils", utils_module)
+        monkeypatch.setattr(
+            "transformers.WhisperProcessor.from_pretrained", load_processor
+        )
+        monkeypatch.setattr(srv, "_stt_engine", None)
+        monkeypatch.setattr(srv, "_api_key", "test-api-key")
+        monkeypatch.setattr(srv, "_metrics", MetricsCollector())
+
+        client = TestClient(srv.app, headers={"Authorization": "Bearer test-api-key"})
+        try:
+            if fail_first_download:
+                failed = client.post(
+                    "/v1/audio/transcriptions",
+                    params={"model": "whisper-small", "language": "en"},
+                    files={"file": ("speech.wav", audio_bytes, "audio/wav")},
+                )
+                assert failed.status_code == 500
+                assert failed.json() == {"detail": "Transcription failed"}
+                assert srv._stt_engine.model is None
+                assert srv._stt_engine._loaded is False
+                assert generated_paths == []
+
+            for _ in range(2):
+                response = client.post(
+                    "/v1/audio/transcriptions",
+                    params={"model": "whisper-small", "language": "en"},
+                    files={"file": ("speech.wav", audio_bytes, "audio/wav")},
+                )
+                assert response.status_code == 200, response.text
+                assert response.json() == {
+                    "text": "hello",
+                    "language": "en",
+                    "duration": 1.25,
+                }
+        finally:
+            client.close()
+
+        assert isinstance(srv._stt_engine, STTEngine)
+        assert len(models) == (2 if fail_first_download else 1)
+        assert srv._stt_engine.model is models[-1]
+        assert processor_calls == ["openai/whisper-small"] * len(models)
+        assert len(generated_paths) == 2
+        assert all(not path.exists() for path in generated_paths)
+
+
 class TestMCPExecuteEndpoint:
     """Test MCP execute endpoint sandbox routing."""
 

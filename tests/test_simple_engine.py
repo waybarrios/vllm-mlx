@@ -1492,7 +1492,14 @@ class TestSimpleEngineConcurrency:
                 )
 
                 assert engine._text_model is text_model
-                assert engine._text_tokenizer is tokenizer
+                # The text route wraps the processor tokenizer with the model's
+                # full EOS set; the wrapper must delegate to the original.
+                from mlx_lm.tokenizer_utils import TokenizerWrapper
+
+                assert isinstance(engine._text_tokenizer, TokenizerWrapper)
+                assert engine._text_tokenizer._tokenizer is tokenizer
+                # Qwen3 <|im_end|> fix feeds the wrapper's stop set.
+                assert 42 in engine._text_tokenizer.eos_token_ids
                 assert captured["build_thread"] == worker_thread
                 assert captured["build_thread"] != event_loop_thread
                 assert captured["enable_mtp"] is False
@@ -1500,6 +1507,67 @@ class TestSimpleEngineConcurrency:
                 await engine.stop()
 
         assert engine._text_model_initialization_attempted is False
+
+    @pytest.mark.anyio
+    async def test_deferred_text_route_still_wraps_the_full_eos_set(self):
+        """A drafter-deferred text route must get the same EOS wrap.
+
+        With an MLLM drafter configured, start() no longer builds the text
+        route -- it is deferred until a request opts out of the drafter path.
+        Both entries go through _initialize_text_model, and the EOS wrap lives
+        there, so the deferred route must stop on the config EOS set exactly
+        like the eager one. Without this, a model whose turn terminator is
+        declared only in config.json free-runs to max_tokens on the deferred
+        path only, which is the hard kind of bug to see.
+        """
+        from mlx_lm.tokenizer_utils import TokenizerWrapper
+
+        from vllm_mlx.engine.simple import SimpleEngine
+
+        text_model = MagicMock()
+        text_model.mtp = None
+        tokenizer = MagicMock()
+        tokenizer.convert_tokens_to_ids.return_value = 42
+
+        mock_mllm = MagicMock()
+        mock_mllm.model = MagicMock()
+        mock_mllm.get_tokenizer.return_value = tokenizer
+
+        with (
+            patch(
+                "vllm_mlx.models.mllm.MLXMultimodalLM",
+                return_value=mock_mllm,
+            ),
+            patch(
+                "vllm_mlx.text_model_from_vlm.build_text_model",
+                return_value=text_model,
+            ),
+            patch(
+                "vllm_mlx.utils.tokenizer.collect_eos_token_ids",
+                return_value={1, 50, 106},
+            ),
+        ):
+            engine = SimpleEngine("gemma-4-test", force_mllm=True, mtp=False)
+            engine._mllm_draft_model_path = "some/drafter"
+            try:
+                await engine.start()
+
+                # Deferred: the drafter owns the route until someone opts out.
+                assert engine._text_model is None
+                assert engine._text_model_initialization_attempted is False
+
+                # A drafter request must NOT trigger the build.
+                await engine._ensure_text_model_for_request(mllm_draft_requested=True)
+                assert engine._text_model is None
+
+                # A non-drafter request builds it -- wrapped.
+                await engine._ensure_text_model_for_request(mllm_draft_requested=False)
+                assert engine._text_model is text_model
+                assert isinstance(engine._text_tokenizer, TokenizerWrapper)
+                assert engine._text_tokenizer._tokenizer is tokenizer
+                assert {1, 50, 106} <= set(engine._text_tokenizer.eos_token_ids)
+            finally:
+                await engine.stop()
 
     @pytest.mark.anyio
     async def test_mllm_media_stream_stays_on_owner_thread_with_text_route(self):
@@ -2346,7 +2414,16 @@ class TestSimpleEngineConcurrency:
 
         assert outputs[-1].text == "Hello"
         assert captured_prompts == [tokenizer.apply_chat_template.return_value]
-        tokenizer.encode.assert_not_called()
+        # The manual system-cache path is skipped -- asserted by
+        # fail_if_manual_cache_path_runs above. encode() is no longer a proxy
+        # for that: the full prompt is now tokenized on every request so
+        # usage.prompt_tokens can be reported (it used to be 0 on this route).
+        # What must NOT happen is the second, system-prefix encode.
+        assert tokenizer.encode.call_count == 1
+        assert (
+            tokenizer.encode.call_args.args[0]
+            == tokenizer.apply_chat_template.return_value
+        )
 
     @pytest.mark.anyio
     async def test_stream_generate_text_normal_path_uses_generation_worker(self):
