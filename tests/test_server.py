@@ -1814,7 +1814,7 @@ class TestLogAndExceptionSanitization:
                     prompt_tokens=1,
                 )
 
-        async def fake_wait(task, raw_request, timeout):
+        async def fake_wait(task, raw_request, timeout, **_kwargs):
             return await task
 
         monkeypatch.setattr(server, "_model_name", "test-model")
