@@ -247,6 +247,35 @@ class TestSTTEngine:
 
         assert model._processor is None
 
+    def test_load_warns_for_undocumented_whisper_checkpoint(self, monkeypatch, caplog):
+        """Undocumented Whisper checkpoints warn and skip processor recovery."""
+        from types import SimpleNamespace
+
+        from vllm_mlx.audio.stt import STTEngine
+
+        model = SimpleNamespace(_processor=None)
+        _install_fake_stt_loader(monkeypatch, model)
+
+        def unexpected_processor_load(_model_name):
+            raise AssertionError("no canonical processor, should not load")
+
+        monkeypatch.setattr(
+            "transformers.WhisperProcessor.from_pretrained",
+            unexpected_processor_load,
+        )
+
+        engine = STTEngine("mlx-community/whisper-base-mlx")
+        with caplog.at_level("WARNING", logger="vllm_mlx.audio.stt"):
+            engine.load()
+
+        assert engine._loaded is True
+        assert engine.model is model
+        assert model._processor is None
+        assert any(
+            "No canonical processor for mlx-community/whisper-base-mlx" in r.message
+            for r in caplog.records
+        )
+
     def test_transcription_duration_supports_dictionary_segments(self):
         """mlx-audio Whisper returns segment dictionaries."""
         from types import SimpleNamespace

@@ -28,7 +28,12 @@ _WHISPER_PROCESSOR_REPOS = {
 
 
 def _canonical_whisper_processor(model_name: str) -> Optional[str]:
-    """Return the processor repository for a documented MLX Whisper model."""
+    """Return the processor repository for a documented MLX Whisper model.
+
+    Only the 5 documented checkpoints in `_WHISPER_PROCESSOR_REPOS`
+    have processor recovery; any other Whisper-named checkpoint
+    returns None and loads without recovery.
+    """
     return _WHISPER_PROCESSOR_REPOS.get(model_name.lower())
 
 
@@ -75,7 +80,12 @@ class STTEngine:
         self._is_parakeet = "parakeet" in model_name.lower()
 
     def load(self) -> None:
-        """Load the STT model."""
+        """Load the STT model.
+
+        Only the 5 documented Whisper checkpoints have processor
+        recovery; other Whisper-named models warn and continue
+        without recovery.
+        """
         if self._loaded:
             return
 
@@ -92,6 +102,11 @@ class STTEngine:
 
                 model._processor = WhisperProcessor.from_pretrained(processor_repo)
                 logger.info("Loaded Whisper processor from %s", processor_repo)
+            elif "whisper" in self.model_name.lower() and not self._is_parakeet:
+                logger.warning(
+                    "No canonical processor for %s; continuing without recovery",
+                    self.model_name,
+                )
             self.model = model
             self._loaded = True
             logger.info(f"STT model loaded: {self.model_name}")
