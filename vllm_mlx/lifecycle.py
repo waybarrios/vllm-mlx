@@ -35,7 +35,6 @@ class ModelSpec:
     scheduler_config: Any | None = None
     stream_interval: int = 1
     max_tokens: int = 32768
-    max_model_len: int = DEFAULT_MAX_MODEL_LEN
     force_mllm: bool = False
     mtp: bool = False
     prefill_step_size: int = 2048
@@ -47,6 +46,7 @@ class ModelSpec:
     prefix_trie_cache: bool = False
     prefix_trie_cache_size: int = 32
     prefix_trie_cache_memory_mb: int | None = None
+    max_model_len: int = DEFAULT_MAX_MODEL_LEN
 
 
 @dataclass

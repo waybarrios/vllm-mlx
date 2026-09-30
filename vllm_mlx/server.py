@@ -55,7 +55,7 @@ import uuid
 from collections import OrderedDict, defaultdict
 from collections.abc import AsyncIterator
 from contextlib import suppress
-from typing import Any, NoReturn
+from typing import Any, Awaitable, Callable, NoReturn, cast
 
 import uvicorn
 from fastapi import Depends, FastAPI, HTTPException, Request, UploadFile
@@ -325,6 +325,8 @@ async def _preflight_generate_context(
     **kwargs,
 ) -> int:
     """Validate raw generation input before constructing an HTTP response."""
+    if inspect.getattr_static(engine, "validate_generate_context", None) is None:
+        return 0
     validator = getattr(engine, "validate_generate_context", None)
     if validator is None or (
         isinstance(engine, BaseEngine)
@@ -354,6 +356,8 @@ async def _preflight_chat_context(
     **kwargs,
 ) -> int:
     """Validate rendered chat input before constructing an HTTP response."""
+    if inspect.getattr_static(engine, "validate_chat_context", None) is None:
+        return 0
     validator = getattr(engine, "validate_chat_context", None)
     if validator is None or (
         isinstance(engine, BaseEngine)
@@ -2722,20 +2726,29 @@ async def _run_responses_request(
     raw_request: Request,
 ) -> tuple[ResponseObject | None, list[dict]]:
     """Execute a Responses API request against the backend chat engine."""
+    total_timeout, deadline = _start_request_budget(None)
     engine, chat_request, messages, chat_kwargs = _prepare_responses_request(request)
-    await _preflight_chat_context(
-        engine,
-        messages,
-        streaming=False,
-        **chat_kwargs,
+    prompt_tokens = await _wait_for_context_preflight(
+        lambda: _preflight_chat_context(
+            engine,
+            messages,
+            streaming=False,
+            **chat_kwargs,
+        ),
+        raw_request,
+        total_timeout=total_timeout,
+        deadline=deadline,
     )
+    if prompt_tokens is None:
+        return None, []
     chat_kwargs["_context_validated"] = True
 
-    timeout = _default_timeout
+    timeout = _remaining_request_timeout(total_timeout, deadline)
     output = await _wait_with_disconnect(
         engine.chat(messages=messages, **chat_kwargs),
         raw_request,
         timeout=timeout,
+        timeout_detail_seconds=total_timeout,
     )
     if output is None:
         return None, []
@@ -3726,7 +3739,6 @@ def load_model(
     stream_interval: int = 1,
     max_tokens: int = 32768,
     max_request_tokens: int = 32768,
-    max_model_len: int = DEFAULT_MAX_MODEL_LEN,
     force_mllm: bool = False,
     gpu_memory_utilization: float = 0.90,
     served_model_name: str | None = None,
@@ -3748,6 +3760,7 @@ def load_model(
     auto_unload_idle_seconds: float = 0.0,
     lazy_load_model: bool = False,
     default_mllm_draft: bool = False,
+    max_model_len: int = DEFAULT_MAX_MODEL_LEN,
 ):
     """
     Load a model (auto-detects MLLM vs LLM).
@@ -5334,6 +5347,26 @@ def _remaining_request_timeout(total_timeout: float, deadline: float) -> float:
     return remaining
 
 
+async def _wait_for_context_preflight(
+    preflight_factory: Callable[[], Awaitable[int]],
+    raw_request: Request,
+    *,
+    total_timeout: float,
+    deadline: float,
+) -> int | None:
+    """Run admission within the request budget and disconnect lifecycle."""
+    timeout = _remaining_request_timeout(total_timeout, deadline)
+    return cast(
+        int | None,
+        await _wait_with_disconnect(
+            preflight_factory(),
+            raw_request,
+            timeout=timeout,
+            timeout_detail_seconds=total_timeout,
+        ),
+    )
+
+
 _active_request_contexts: dict[int, RequestModelContext] = {}
 
 
@@ -5479,11 +5512,19 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
         try:
             prompts_to_validate = prompts[:1] if request.stream else prompts
             for prompt in prompts_to_validate:
-                await _preflight_generate_context(
-                    engine,
-                    prompt,
-                    max_tokens=effective_max_tokens,
+                prompt_tokens = await _wait_for_context_preflight(
+                    lambda: _preflight_generate_context(
+                        engine,
+                        prompt,
+                        max_tokens=effective_max_tokens,
+                    ),
+                    raw_request,
+                    total_timeout=total_timeout,
+                    deadline=deadline,
                 )
+                if prompt_tokens is None:
+                    tracker.finish(result="client_closed")
+                    return Response(status_code=499)
         except HTTPException as exc:
             tracker.finish(result=_metrics_result_from_status(exc.status_code))
             raise
@@ -5704,12 +5745,20 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
             _raise_remote_media_http_error(exc)
 
         try:
-            await _preflight_chat_context(
-                engine,
-                prepared.messages,
-                streaming=request.stream,
-                **prepared.chat_kwargs,
+            prompt_tokens = await _wait_for_context_preflight(
+                lambda: _preflight_chat_context(
+                    engine,
+                    prepared.messages,
+                    streaming=request.stream,
+                    **prepared.chat_kwargs,
+                ),
+                raw_request,
+                total_timeout=total_timeout,
+                deadline=deadline,
             )
+            if prompt_tokens is None:
+                tracker.finish(result="client_closed")
+                return Response(status_code=499)
         except HTTPException as exc:
             tracker.finish(result=_metrics_result_from_status(exc.status_code))
             raise
@@ -5899,16 +5948,24 @@ async def create_response(request: ResponsesRequest, raw_request: Request):
     """Create a Responses API response."""
     try:
         if request.stream:
+            total_timeout, deadline = _start_request_budget(None)
             chat_request = _responses_request_to_chat_request(request)
             _validate_remote_media_urls(chat_request.messages)
             prepared = _prepare_streaming_responses_request(request)
             engine, _chat_request, messages, chat_kwargs = prepared
-            await _preflight_chat_context(
-                engine,
-                messages,
-                streaming=True,
-                **chat_kwargs,
+            prompt_tokens = await _wait_for_context_preflight(
+                lambda: _preflight_chat_context(
+                    engine,
+                    messages,
+                    streaming=True,
+                    **chat_kwargs,
+                ),
+                raw_request,
+                total_timeout=total_timeout,
+                deadline=deadline,
             )
+            if prompt_tokens is None:
+                return Response(status_code=499)
             chat_kwargs["_context_validated"] = True
             return StreamingResponse(
                 _disconnect_guard(
@@ -6141,12 +6198,20 @@ async def create_anthropic_message(
             effective_max_tokens,
         )
         try:
-            await _preflight_chat_context(
-                engine,
-                prepared.messages,
-                streaming=anthropic_request.stream,
-                **prepared.chat_kwargs,
+            prompt_tokens = await _wait_for_context_preflight(
+                lambda: _preflight_chat_context(
+                    engine,
+                    prepared.messages,
+                    streaming=anthropic_request.stream,
+                    **prepared.chat_kwargs,
+                ),
+                request,
+                total_timeout=total_timeout,
+                deadline=deadline,
             )
+            if prompt_tokens is None:
+                tracker.finish(result="client_closed")
+                return Response(status_code=499)
         except HTTPException as exc:
             tracker.finish(result=_metrics_result_from_status(exc.status_code))
             raise

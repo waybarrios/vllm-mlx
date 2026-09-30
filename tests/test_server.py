@@ -3735,7 +3735,7 @@ class TestStreamChatCompletion:
         )
         prepared = PreparedChatInvocation(
             messages=[{"role": "user", "content": "return scores"}],
-            chat_kwargs={},
+            chat_kwargs={"max_tokens": 128},
             response_format=response_format,
             json_logits_processor=object(),
         )
@@ -4530,6 +4530,9 @@ class TestChatCompletionStreamingModeSwitching:
         from vllm_mlx.engine.simple import SimpleEngine
 
         class FakeMllmModel:
+            def count_chat_prompt_tokens(self, _messages, **_kwargs):
+                return 3
+
             def chat(self, **kwargs):
                 raise RuntimeError("MLLM non-stream chat path must not be used")
 
@@ -4545,7 +4548,10 @@ class TestChatCompletionStreamingModeSwitching:
         engine._text_model = None
         engine._model = FakeMllmModel()
 
-        async def fail_if_called(*args, **kwargs):
+        async def fail_if_called(func, *args, **kwargs):
+            if getattr(func, "__name__", "") == "count_chat_prompt_tokens":
+                kwargs.pop("request_id", None)
+                return func(*args, **kwargs)
             raise RuntimeError("There is no Stream(gpu, 3) in current thread.")
 
         # If this gets called, code regressed to the old broken thread path.

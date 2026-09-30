@@ -167,7 +167,6 @@ class SimpleEngine(BaseEngine):
         specprefill_backbone_pct: float = 0.0,
         specprefill_draft_model: str | None = None,
         max_kv_size: int = 0,
-        max_model_len: int = DEFAULT_MAX_MODEL_LEN,
         mllm_draft_model: str | None = None,
         mllm_draft_kind: str | None = None,
         mllm_draft_block_size: int | None = None,
@@ -175,6 +174,7 @@ class SimpleEngine(BaseEngine):
         prefix_trie_cache_size: int = 32,
         prefix_trie_cache_memory_mb: int | None = None,
         default_mllm_draft: bool = False,
+        max_model_len: int = DEFAULT_MAX_MODEL_LEN,
     ):
         """
         Initialize the simple engine.

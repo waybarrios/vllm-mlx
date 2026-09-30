@@ -205,7 +205,8 @@ class BatchedEngine(BaseEngine):
         if not self._loaded:
             await self.start()
         if self._is_mllm and self._mllm_scheduler is not None:
-            return self._mllm_scheduler.validate_context(
+            return await asyncio.to_thread(
+                self._mllm_scheduler.validate_context,
                 prompt=prompt,
                 images=images,
                 videos=videos,

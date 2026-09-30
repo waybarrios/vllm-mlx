@@ -88,13 +88,13 @@ class MLLMSchedulerConfig:
     chunked_prefill_tokens: int = 0
     # Maximum KV cache size per sequence (0 = unbounded; >0 enables RotatingKVCache)
     max_kv_size: int = 0
-    # Maximum combined prompt and requested output tokens per request
-    max_model_len: int = DEFAULT_MAX_MODEL_LEN
     # SSD cold tier for the prefix cache (mirrors SchedulerConfig).
     # None = disabled.  When set, the MLLM MemoryAwarePrefixCache spills
     # evicted entries to disk and promotes them back on hit.
     ssd_cache_dir: Optional[str] = None
     ssd_cache_max_gb: float = 10.0
+    # Maximum combined prompt and requested output tokens per request
+    max_model_len: int = DEFAULT_MAX_MODEL_LEN
 
 
 @dataclass
@@ -486,9 +486,15 @@ class MLLMScheduler:
             audio=audio,
             max_tokens=max_tokens,
         )
-        self.batch_generator._preprocess_request(request)
-        self.batch_generator._validate_context_length(request)
-        return request.input_ids.size if request.input_ids is not None else 0
+        from .models.mllm import _temp_manager
+
+        with _temp_manager.cleanup_scope():
+            self.batch_generator._preprocess_request(
+                request,
+                populate_vision_cache=False,
+            )
+            self.batch_generator._validate_context_length(request)
+            return request.input_ids.size if request.input_ids is not None else 0
 
     def abort_request(self, request_id: str) -> bool:
         """

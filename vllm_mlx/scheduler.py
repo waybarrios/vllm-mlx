@@ -134,14 +134,14 @@ class SchedulerConfig:
     # Maximum KV cache size per sequence (0 = unbounded; >0 enables RotatingKVCache)
     max_kv_size: int = 0
 
-    # Maximum combined prompt and requested output tokens per request
-    max_model_len: int = DEFAULT_MAX_MODEL_LEN
-
     # MTP (Multi-Token Prediction) settings
     # Uses the model's built-in MTP head to predict multiple tokens per step
     enable_mtp: bool = False
     mtp_num_draft_tokens: int = 1  # Number of draft tokens from MTP head
     mtp_optimistic: bool = False  # Skip acceptance check for max speed
+
+    # Maximum combined prompt and requested output tokens per request
+    max_model_len: int = DEFAULT_MAX_MODEL_LEN
 
     def __post_init__(self) -> None:
         if self.prefill_step_size <= 0:

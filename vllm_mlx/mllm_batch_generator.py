@@ -885,7 +885,12 @@ class MLLMBatchGenerator:
         draft_requested = reference.mllm_draft
         return [r for r in requests if r.mllm_draft == draft_requested][:limit]
 
-    def _preprocess_request(self, request: MLLMBatchRequest) -> None:
+    def _preprocess_request(
+        self,
+        request: MLLMBatchRequest,
+        *,
+        populate_vision_cache: bool = True,
+    ) -> None:
         """
         Preprocess a single MLLM request (vision encoding).
 
@@ -899,6 +904,8 @@ class MLLMBatchGenerator:
 
         Args:
             request: Request to preprocess
+            populate_vision_cache: Store processed media for later requests.
+                Context-only preflight disables this to avoid mutating cache state.
         """
         # Already preprocessed (e.g. by early executor offloading in
         # _process_loop or chunked prefill interleaving).  Only skip for
@@ -1002,7 +1009,12 @@ class MLLMBatchGenerator:
         processing_time = time.perf_counter() - tic
 
         # Store in pixel cache for future reuse
-        if all_images and not all_audio and request.pixel_values is not None:
+        if (
+            populate_vision_cache
+            and all_images
+            and not all_audio
+            and request.pixel_values is not None
+        ):
             self.vision_cache.set_pixel_cache(
                 images=all_images,
                 prompt=request.prompt,
@@ -1035,7 +1047,7 @@ class MLLMBatchGenerator:
         validate_context_length(
             prompt_tokens=prompt_tokens,
             max_tokens=request.max_tokens,
-            max_model_len=self.max_model_len,
+            max_model_len=getattr(self, "max_model_len", DEFAULT_MAX_MODEL_LEN),
         )
 
     @staticmethod

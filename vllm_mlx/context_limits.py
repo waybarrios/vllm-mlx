@@ -8,13 +8,20 @@ DEFAULT_MAX_MODEL_LEN = 65_536
 
 def encode_prompt(tokenizer: Any, prompt: str) -> Any:
     """Encode a prompt through the same tokenizer seam used by admission."""
-    encode = getattr(tokenizer, "encode", None)
+    target = tokenizer
+    encode = getattr(target, "encode", None)
+    if not callable(encode):
+        target = getattr(tokenizer, "tokenizer", None)
+        encode = getattr(target, "encode", None)
     if callable(encode):
-        return encode(prompt)
-    nested = getattr(tokenizer, "tokenizer", None)
-    nested_encode = getattr(nested, "encode", None)
-    if callable(nested_encode):
-        return nested_encode(prompt)
+        bos_token = getattr(target, "bos_token", None)
+        add_special_tokens = bos_token is None or not (
+            isinstance(bos_token, str) and prompt.startswith(bos_token)
+        )
+        try:
+            return encode(prompt, add_special_tokens=add_special_tokens)
+        except TypeError:
+            return encode(prompt)
     raise RuntimeError("Engine tokenizer is unavailable for context admission")
 
 

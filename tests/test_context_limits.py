@@ -2,9 +2,13 @@
 
 import asyncio
 import importlib.util
+import inspect
 import sys
+import time
 from collections import deque
+from contextlib import contextmanager
 from types import ModuleType, SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -52,6 +56,19 @@ def test_total_context_rejects_one_token_over_limit():
     assert error.max_tokens == 16_384
     assert error.max_model_len == 65_536
     assert error.total_tokens == 65_537
+
+
+def test_prompt_encoding_does_not_duplicate_existing_bos_token():
+    """Admission must count the BOS-prefixed tokens generation actually uses."""
+    from vllm_mlx.context_limits import encode_prompt
+
+    class Tokenizer:
+        bos_token = "<s>"
+
+        def encode(self, _prompt, add_special_tokens=True):
+            return [0, 1, 2] if add_special_tokens else [1, 2]
+
+    assert encode_prompt(Tokenizer(), "<s>hello") == [1, 2]
 
 
 def test_scheduler_configs_share_the_context_limit_default():
@@ -129,6 +146,23 @@ def test_mllm_generator_counts_media_expanded_input_ids():
 
     with pytest.raises(ContextLengthExceeded):
         generator._validate_context_length(request)
+
+
+def test_partially_initialized_mllm_generator_uses_default_context_limit():
+    """Lightweight generator construction must keep the production default."""
+    from vllm_mlx.mllm_batch_generator import MLLMBatchGenerator
+    from vllm_mlx.mllm_batch_generator import MLLMBatchRequest
+
+    generator = MLLMBatchGenerator.__new__(MLLMBatchGenerator)
+    request = MLLMBatchRequest(
+        uid=1,
+        request_id="within-default-limit",
+        prompt="x",
+        max_tokens=1,
+        input_ids=SimpleNamespace(size=1),
+    )
+
+    generator._validate_context_length(request)
 
 
 def test_mllm_generator_rejects_before_prefix_or_kv_work():
@@ -224,7 +258,6 @@ def test_simple_mllm_rejects_before_generation(monkeypatch):
 def test_batched_preflight_matches_scheduler_bos_tokenization(monkeypatch):
     """A BOS-prefixed prompt must have the same count before and during admission."""
     import vllm_mlx.engine.batched as batched_module
-    from vllm_mlx.context_limits import ContextLengthExceeded
 
     class Tokenizer:
         bos_token = "<s>"
@@ -237,8 +270,7 @@ def test_batched_preflight_matches_scheduler_bos_tokenization(monkeypatch):
     engine._tokenizer = Tokenizer()
     engine._loaded = True
 
-    with pytest.raises(ContextLengthExceeded):
-        asyncio.run(engine.validate_generate_context("<s>x", max_tokens=2))
+    assert asyncio.run(engine.validate_generate_context("<s>x", max_tokens=2)) == 2
 
 
 def test_simple_streaming_preflight_uses_harmony_rendering(monkeypatch):
@@ -312,6 +344,122 @@ def test_engines_and_lifecycle_spec_keep_context_limit_override(monkeypatch):
     assert simple.max_model_len == 131_072
     assert batched.max_model_len == 131_072
     assert spec.max_model_len == 131_072
+
+
+def test_new_context_limit_preserves_existing_positional_arguments(monkeypatch):
+    """Adding max_model_len must not reinterpret existing Python calls."""
+    import vllm_mlx.engine.simple as simple_module
+    from vllm_mlx.engine.simple import SimpleEngine
+    from vllm_mlx.lifecycle import ModelSpec
+    from vllm_mlx.mllm_scheduler import MLLMSchedulerConfig
+    from vllm_mlx.scheduler import SchedulerConfig
+
+    server = _server_module_or_skip()
+    monkeypatch.setattr(simple_module, "is_mllm_model", lambda _model: False)
+
+    bound = inspect.signature(server.load_model).bind(
+        "test-model", False, None, 1, 8, 8, True
+    )
+    spec = ModelSpec("key", "test-model", False, None, 1, 8, True)
+    engine = SimpleEngine(
+        "test-model",
+        False,
+        True,
+        False,
+        False,
+        1,
+        2048,
+        False,
+        8192,
+        0.3,
+        0.0,
+        None,
+        0,
+        "assistant-model",
+    )
+
+    assert bound.arguments.get("force_mllm") is True
+    assert "max_model_len" not in bound.arguments
+    assert spec.force_mllm is True
+    assert spec.max_model_len == 65_536
+    assert engine._mllm_draft_model_path == "assistant-model"
+    assert engine.max_model_len == 65_536
+    assert list(inspect.signature(SchedulerConfig).parameters)[-1] == "max_model_len"
+    assert (
+        list(inspect.signature(MLLMSchedulerConfig).parameters)[-1] == "max_model_len"
+    )
+
+
+def test_batched_mllm_preflight_does_not_block_event_loop():
+    """CPU-heavy MLLM token counting must not freeze unrelated requests."""
+    from vllm_mlx.engine.batched import BatchedEngine
+
+    events = []
+
+    class Scheduler:
+        def validate_context(self, **_kwargs):
+            events.append("preflight-start")
+            time.sleep(0.05)
+            events.append("preflight-end")
+            return 1
+
+    engine = BatchedEngine("test-model", force_mllm=True)
+    engine._loaded = True
+    engine._mllm_scheduler = Scheduler()
+
+    async def tick():
+        await asyncio.sleep(0.01)
+        events.append("event-loop-tick")
+
+    async def run():
+        await asyncio.gather(
+            engine.validate_generate_context("hello", max_tokens=1),
+            tick(),
+        )
+
+    asyncio.run(run())
+
+    assert events.index("event-loop-tick") < events.index("preflight-end")
+
+
+def test_batched_mllm_preflight_cleans_media_without_caching(monkeypatch):
+    """Count-only MLLM preprocessing must leave no temp or vision-cache state."""
+    import vllm_mlx.models.mllm as mllm_module
+    from vllm_mlx.mllm_scheduler import MLLMScheduler
+
+    events = []
+    captured = {}
+
+    @contextmanager
+    def cleanup_scope():
+        events.append("cleanup-enter")
+        try:
+            yield
+        finally:
+            events.append("cleanup-exit")
+
+    class BatchGenerator:
+        def _preprocess_request(self, request, *, populate_vision_cache=True):
+            captured["populate_vision_cache"] = populate_vision_cache
+            request.input_ids = SimpleNamespace(size=3)
+
+        def _validate_context_length(self, _request):
+            events.append("validated")
+
+    scheduler = MLLMScheduler.__new__(MLLMScheduler)
+    scheduler.batch_generator = BatchGenerator()
+    scheduler._ensure_batch_generator = lambda: None
+    monkeypatch.setattr(mllm_module._temp_manager, "cleanup_scope", cleanup_scope)
+
+    prompt_tokens = scheduler.validate_context(
+        prompt="describe",
+        images=["image"],
+        max_tokens=2,
+    )
+
+    assert prompt_tokens == 3
+    assert captured["populate_vision_cache"] is False
+    assert events == ["cleanup-enter", "validated", "cleanup-exit"]
 
 
 @pytest.mark.parametrize("engine_kind", ["simple", "batched"])
@@ -403,6 +551,66 @@ def test_server_preflight_maps_context_error_to_http_400():
     assert error.detail["prompt_tokens"] == 3
     assert error.detail["max_tokens"] == 2
     assert error.detail["max_model_len"] == 4
+
+
+def test_server_preflight_ignores_dynamic_non_async_mock_hook():
+    """Duck-typed engines without a real validator must retain old behavior."""
+    server = _server_module_or_skip()
+
+    result = asyncio.run(server._preflight_chat_context(MagicMock(), [], max_tokens=1))
+
+    assert result == 0
+
+
+def test_chat_preflight_obeys_request_timeout(monkeypatch):
+    """Slow admission must consume the same timeout budget as generation."""
+    from fastapi import HTTPException
+
+    server = _server_module_or_skip()
+    released = []
+
+    class SlowEngine:
+        model_name = "test-model"
+        is_mllm = False
+        preserve_native_tool_format = False
+        use_harmony_rendering = False
+        tokenizer = None
+
+        async def validate_chat_context(self, *_args, **_kwargs):
+            await asyncio.sleep(0.2)
+            return 1
+
+        async def chat(self, *_args, **_kwargs):
+            raise AssertionError("generation entered after the request deadline")
+
+    async def acquire(*_args, **_kwargs):
+        return SlowEngine()
+
+    async def release(*_args, **_kwargs):
+        released.append(True)
+
+    monkeypatch.setattr(server, "_model_name", "test-model")
+    monkeypatch.setattr(server, "_model_manager", None)
+    monkeypatch.setattr(server, "_acquire_default_engine_for_request", acquire)
+    monkeypatch.setattr(server, "_release_engine_for_request", release)
+    monkeypatch.setattr(server, "_reasoning_parser", None)
+    monkeypatch.setattr(server, "_enable_auto_tool_choice", False)
+    monkeypatch.setattr(server, "_tool_call_parser", None)
+
+    request = server.ChatCompletionRequest(
+        model="test-model",
+        messages=[{"role": "user", "content": "hello"}],
+        max_tokens=1,
+        timeout=0.01,
+    )
+    started = time.monotonic()
+
+    with pytest.raises(HTTPException) as exc_info:
+        asyncio.run(server.create_chat_completion(request, SimpleNamespace()))
+
+    assert exc_info.value.status_code == 504
+    assert time.monotonic() - started < 0.1
+    assert released == [True]
 
 
 def test_standalone_server_parser_matches_primary_cli():
