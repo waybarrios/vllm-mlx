@@ -15,6 +15,7 @@ import asyncio
 import inspect
 import logging
 import os
+import threading
 import time
 from collections.abc import AsyncIterator
 from concurrent.futures import ThreadPoolExecutor
@@ -64,80 +65,6 @@ def _resolve_metal_buffer_cache_limit(
 def _normalize_tool_call_arguments_for_template(messages: list[dict]) -> list[dict]:
     """Normalize OpenAI tool-call replay for templates expecting mappings."""
     return normalize_messages_for_chat_template(messages)
-
-
-def _extract_media_from_messages(messages: list[dict[str, Any]]) -> tuple:
-    """
-    Extract images, videos, and audio from OpenAI-format messages.
-
-    Returns:
-        Tuple of (has_media, images_list, videos_list, audios_list)
-    """
-    images = []
-    videos = []
-    audios = []
-
-    for msg in messages:
-        content = msg.get("content")
-        if not isinstance(content, list):
-            continue
-
-        for item in content:
-            # Handle Pydantic models
-            if hasattr(item, "model_dump"):
-                item = item.model_dump(exclude_none=True)
-            elif hasattr(item, "dict"):
-                item = {k: v for k, v in item.dict().items() if v is not None}
-
-            if not isinstance(item, dict):
-                continue
-
-            item_type = item.get("type", "")
-
-            if item_type == "image_url":
-                img_url = item.get("image_url", {})
-                if isinstance(img_url, str):
-                    images.append(img_url)
-                elif isinstance(img_url, dict):
-                    url = img_url.get("url", "")
-                    if url:
-                        images.append(url)
-
-            elif item_type == "image":
-                img = item.get("image") or item.get("url", "")
-                if img:
-                    images.append(img)
-
-            elif item_type == "video_url":
-                vid_url = item.get("video_url", {})
-                if isinstance(vid_url, str):
-                    videos.append(vid_url)
-                elif isinstance(vid_url, dict):
-                    url = vid_url.get("url", "")
-                    if url:
-                        videos.append(url)
-
-            elif item_type == "video":
-                vid = item.get("video") or item.get("url", "")
-                if vid:
-                    videos.append(vid)
-
-            elif item_type == "audio_url":
-                audio_url = item.get("audio_url", {})
-                if isinstance(audio_url, str):
-                    audios.append(audio_url)
-                elif isinstance(audio_url, dict):
-                    url = audio_url.get("url", "")
-                    if url:
-                        audios.append(url)
-
-            elif item_type == "audio":
-                audio = item.get("audio") or item.get("url", "")
-                if audio:
-                    audios.append(audio)
-
-    has_media = bool(images or videos or audios)
-    return has_media, images, videos, audios
 
 
 class MLLMModelWrapper:
@@ -253,6 +180,7 @@ class BatchedEngine(BaseEngine):
         self._loaded = False
         # Single thread that owns the model; see _generation_worker.
         self._generation_executor: ThreadPoolExecutor | None = None
+        self._generation_thread_id: int | None = None
 
     @property
     def model_name(self) -> str:
@@ -357,10 +285,29 @@ class BatchedEngine(BaseEngine):
         engine loop.
         """
         if self._generation_executor is None:
+            self._generation_thread_id = None
             self._generation_executor = ThreadPoolExecutor(
-                max_workers=1, thread_name_prefix="engine-core"
+                max_workers=1,
+                thread_name_prefix="engine-core",
+                initializer=self._record_generation_thread,
             )
         return self._generation_executor
+
+    def _record_generation_thread(self) -> None:
+        """Record the sole worker thread so synchronous calls cannot deadlock."""
+        self._generation_thread_id = threading.get_ident()
+
+    def _run_on_generation_worker_sync(self, operation):
+        """Run an MLX operation on its owner while preserving a sync API."""
+        if threading.get_ident() == getattr(self, "_generation_thread_id", None):
+            return operation()
+        return self._generation_worker().submit(operation).result()
+
+    async def _run_on_generation_worker(self, operation):
+        """Run an MLX operation on the thread that owns the text model."""
+        return await run_blocking_startup_work(
+            operation, executor=self._generation_worker()
+        )
 
     def _prepare_mllm_model(self) -> None:
         """Load the MLLM model before scheduler startup."""
@@ -471,6 +418,9 @@ class BatchedEngine(BaseEngine):
         prefix_cache_memory_mb = getattr(
             self._scheduler_config, "cache_memory_mb", None
         )
+        prefix_cache_memory_percent = getattr(
+            self._scheduler_config, "cache_memory_percent", 0.20
+        )
         enable_mtp = (
             self._scheduler_config.enable_mtp if self._scheduler_config else False
         )
@@ -509,6 +459,7 @@ class BatchedEngine(BaseEngine):
             enable_prefix_cache=enable_prefix_cache,
             use_memory_aware_cache=use_memory_aware_cache,
             prefix_cache_memory_mb=prefix_cache_memory_mb,
+            prefix_cache_memory_percent=prefix_cache_memory_percent,
             enable_mtp=enable_mtp,
             mtp_num_draft_tokens=mtp_num_draft,
             kv_cache_quantization=kv_quant,
@@ -705,26 +656,36 @@ class BatchedEngine(BaseEngine):
 
     async def stop(self) -> None:
         """Stop the engine and cleanup resources."""
-        if self._mllm_scheduler:
-            await self._mllm_scheduler.stop()
-            self._mllm_scheduler = None
+        mllm_scheduler = self._mllm_scheduler
+        if mllm_scheduler is not None:
+            await mllm_scheduler.stop()
 
-        if self._engine:
-            await self._engine.stop()
-            self._engine.engine.close()
-            self._engine = None
+        engine = self._engine
+        if engine is not None:
+            await engine.stop()
+            await self._run_on_generation_worker(engine.engine.close)
 
+        generation_executor = self._generation_executor
+        if generation_executor is not None:
+            # Flush thread-local MLX state before retiring the thread that owns
+            # the text model and its streams. The dispatch drains before
+            # propagating cancellation, so skipped cleanup remains retryable.
+            await self._run_on_generation_worker(mx.clear_cache)
+            generation_executor.shutdown(wait=True)
+            self._generation_executor = None
+            self._generation_thread_id = None
+        else:
+            # MLLM owns its model on the event-loop thread.
+            mx.clear_cache()
+
+        self._mllm_scheduler = None
+        self._engine = None
         self._model = None
         self._tokenizer = None
         self._processor = None
         self._mllm_instance = None
         self._specprefill_draft_model = None
         self._loaded = False
-        if self._generation_executor is not None:
-            # The model and its streams lived on this thread; both go with it.
-            self._generation_executor.shutdown(wait=True)
-            self._generation_executor = None
-        mx.clear_cache()
         logger.info("BatchedEngine stopped")
 
     def _apply_chat_template(
@@ -1289,6 +1250,7 @@ class BatchedEngine(BaseEngine):
                 "num_requests_processed",
                 "total_prompt_tokens",
                 "total_completion_tokens",
+                "steps_executed",
                 "metal_active_memory_gb",
                 "metal_peak_memory_gb",
                 "metal_cache_memory_gb",
@@ -1339,7 +1301,19 @@ class BatchedEngine(BaseEngine):
         if self._mllm_scheduler is not None:
             return self._mllm_scheduler.clear_runtime_caches()
         if self._engine is not None:
-            return self._engine.clear_runtime_caches()
+            return self._run_on_generation_worker_sync(
+                self._engine.clear_runtime_caches
+            )
+        return None
+
+    async def _clear_runtime_caches_on_owner(self) -> dict[str, Any] | None:
+        """Clear runtime caches on the thread that owns their MLX arrays."""
+        if self._mllm_scheduler is not None:
+            return self.clear_runtime_caches()
+        if self._engine is not None:
+            return await self._run_on_generation_worker(
+                self._engine.clear_runtime_caches
+            )
         return None
 
     async def abort_request(self, request_id: str) -> bool:
@@ -1360,7 +1334,19 @@ class BatchedEngine(BaseEngine):
             if pc is not None:
                 return pc.save_to_disk(cache_dir)
         if self._engine:
-            return self._engine.save_cache_to_disk(cache_dir)
+            return self._run_on_generation_worker_sync(
+                lambda: self._engine.save_cache_to_disk(cache_dir)
+            )
+        return False
+
+    async def _save_cache_to_disk_on_owner(self, cache_dir: str) -> bool:
+        """Persist cache data on the model-owner thread."""
+        if self._mllm_scheduler is not None:
+            return self.save_cache_to_disk(cache_dir)
+        if self._engine is not None:
+            return await self._run_on_generation_worker(
+                lambda: self._engine.save_cache_to_disk(cache_dir)
+            )
         return False
 
     def load_cache_from_disk(self, cache_dir: str) -> int:
@@ -1371,7 +1357,19 @@ class BatchedEngine(BaseEngine):
             if pc is not None:
                 return pc.load_from_disk(cache_dir)
         if self._engine:
-            return self._engine.load_cache_from_disk(cache_dir)
+            return self._run_on_generation_worker_sync(
+                lambda: self._engine.load_cache_from_disk(cache_dir)
+            )
+        return 0
+
+    async def _load_cache_from_disk_on_owner(self, cache_dir: str) -> int:
+        """Restore cache data on the model-owner thread."""
+        if self._mllm_scheduler is not None:
+            return self.load_cache_from_disk(cache_dir)
+        if self._engine is not None:
+            return await self._run_on_generation_worker(
+                lambda: self._engine.load_cache_from_disk(cache_dir)
+            )
         return 0
 
     def clear_prefix_cache(self) -> None:
@@ -1383,4 +1381,12 @@ class BatchedEngine(BaseEngine):
                 pc.clear()
                 return
         if self._engine and hasattr(self._engine, "clear_prefix_cache"):
-            self._engine.clear_prefix_cache()
+            self._run_on_generation_worker_sync(self._engine.clear_prefix_cache)
+
+    async def _clear_prefix_cache_on_owner(self) -> None:
+        """Clear the prefix cache on the thread that owns its MLX arrays."""
+        if self._mllm_scheduler is not None:
+            self.clear_prefix_cache()
+            return
+        if self._engine is not None and hasattr(self._engine, "clear_prefix_cache"):
+            await self._run_on_generation_worker(self._engine.clear_prefix_cache)

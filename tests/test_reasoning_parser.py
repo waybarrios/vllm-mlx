@@ -1643,3 +1643,55 @@ class TestStreamingCostIsFlat:
             f"{small:.2f}ms at 250 tokens, {large:.2f}ms at 5000 — "
             "per-token cost is growing with output length"
         )
+
+
+class TestForcedThinkingStreaming:
+    """GLM-5.3's template injects an open <think>, so the model output begins
+    INSIDE the reasoning block and only ever emits the closing </think>.
+
+    The glm4 streaming parser assumed GLM-4.6-style autonomous thinking and
+    defaulted pre-</think> output to content, so the whole chain-of-thought
+    landed in ``content`` glued to the answer. Live capture on GLM-5.3:
+
+        streaming:     content='84 * 3 = 252\\n252 / 2 = 126**126**'
+                       reasoning_content=''
+        non-streaming: content='**126**'
+                       reasoning_content='84 * 3 / 2 = 252 / 2 = 126'
+    """
+
+    DELTAS = ["84 * 3 = 252\n", "252 / 2 = 126", "</think>", "**126**"]
+
+    def _run(self, parser):
+        reasoning, content = [], []
+        prev = ""
+        for d in self.DELTAS:
+            cur = prev + d
+            msg = parser.extract_reasoning_streaming(prev, cur, d)
+            if msg is not None:
+                if getattr(msg, "reasoning", None):
+                    reasoning.append(msg.reasoning)
+                if getattr(msg, "content", None):
+                    content.append(msg.content)
+            prev = cur
+        return "".join(reasoning), "".join(content)
+
+    def test_implicit_mode_routes_pre_close_text_to_reasoning(self):
+        from vllm_mlx.reasoning import get_parser
+
+        parser = get_parser("glm4")(None)
+        parser.reset_state(implicit_mode=True)
+        reasoning, content = self._run(parser)
+
+        assert reasoning == "84 * 3 = 252\n252 / 2 = 126"
+        assert content == "**126**"
+
+    def test_autonomous_mode_still_defaults_to_content(self):
+        """Without a forced <think>, GLM-4.6-style output is plain content."""
+        from vllm_mlx.reasoning import get_parser
+
+        parser = get_parser("glm4")(None)
+        parser.reset_state()
+        reasoning, content = self._run(parser)
+
+        assert reasoning == ""
+        assert content == "84 * 3 = 252\n252 / 2 = 126**126**"

@@ -333,10 +333,17 @@ class QwenToolParser(ToolParser):
             # Tool call complete, parse the whole thing
             result = self.extract_tool_calls(current_text)
             if result.tools_called:
+                # Trailing whitespace and the final engine delta still contain
+                # every completed call. Emit only newly completed invocations.
+                first_new = self.current_tool_id + 1
+                new_calls = result.tool_calls[first_new:]
+                if not new_calls:
+                    return None
+                self.current_tool_id = len(result.tool_calls) - 1
                 return {
                     "tool_calls": [
                         {
-                            "index": i,
+                            "index": first_new + i,
                             "id": tc["id"],
                             "type": "function",
                             "function": {
@@ -344,7 +351,7 @@ class QwenToolParser(ToolParser):
                                 "arguments": tc["arguments"],
                             },
                         }
-                        for i, tc in enumerate(result.tool_calls)
+                        for i, tc in enumerate(new_calls)
                     ]
                 }
 

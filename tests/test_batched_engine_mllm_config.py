@@ -426,48 +426,11 @@ def test_start_mllm_forwards_ssd_cache_fields(monkeypatch):
     assert captured["config_kwargs"]["ssd_cache_max_gb"] == 42.0
 
 
-def test_start_mllm_forwards_specprefill_configuration(monkeypatch):
+def test_start_mllm_forwards_prefix_cache_memory_percent(monkeypatch):
+    """The MLLM prefix cache must receive the configured percentage limit."""
     captured = _run_start_mllm(
         monkeypatch,
-        _base_scheduler_config(),
-        specprefill_enabled=True,
-        specprefill_threshold=4096,
-        specprefill_keep_pct=0.25,
-        specprefill_backbone_pct=0.1,
+        _base_scheduler_config(cache_memory_percent=0.35),
     )
 
-    assert captured["config_kwargs"]["specprefill_enabled"] is True
-    assert captured["config_kwargs"]["specprefill_threshold"] == 4096
-    assert captured["config_kwargs"]["specprefill_keep_pct"] == 0.25
-    assert captured["config_kwargs"]["specprefill_backbone_pct"] == 0.1
-    assert captured["scheduler_kwargs"]["specprefill_draft_model"] is None
-
-
-def test_prepare_mllm_loads_specprefill_draft_after_target_is_prepared(monkeypatch):
-    from vllm_mlx.engine.batched import BatchedEngine
-
-    import vllm_mlx.engine.batched as batched_mod
-
-    draft = object()
-    fake_mlx_lm = types.ModuleType("mlx_lm")
-    fake_mlx_lm.load = lambda path: (draft, object())
-    monkeypatch.setitem(sys.modules, "mlx_lm", fake_mlx_lm)
-    fake_mllm_model = types.ModuleType("vllm_mlx.models.mllm")
-    fake_mllm_model.MLXMultimodalLM = object
-    monkeypatch.setitem(sys.modules, "vllm_mlx.models.mllm", fake_mllm_model)
-
-    engine = BatchedEngine(
-        model_name="fake-qwen",
-        force_mllm=True,
-        specprefill_enabled=True,
-        specprefill_draft_model="draft-model",
-    )
-    engine._model = object()
-    engine._processor = object()
-    monkeypatch.setattr(
-        batched_mod.BatchedEngine, "_inject_mtp_mllm", lambda self: None
-    )
-
-    engine._prepare_mllm_model()
-
-    assert engine._specprefill_draft_model is draft
+    assert captured["config_kwargs"]["prefix_cache_memory_percent"] == 0.35

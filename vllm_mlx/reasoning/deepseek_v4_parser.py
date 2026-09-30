@@ -45,7 +45,7 @@ class DeepSeekV4ReasoningParser(DeepSeekR1ReasoningParser):
         self._in_tool_markup: bool = False
         self._current_text: str = ""
 
-    def reset_state(self):
+    def reset_state(self, implicit_mode: bool = False):  # noqa: ARG002
         """Reset state machine for a new streaming request."""
         super().reset_state()
         self._emitted_len = 0

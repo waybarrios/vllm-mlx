@@ -10,6 +10,7 @@ import re
 import time
 from pathlib import Path
 from typing import Any
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -339,6 +340,65 @@ def test_preempt_policy_cancels_active_request_and_loads_waiting_model(tmp_path)
     asyncio.run(_run())
 
 
+def test_get_metrics_engine_returns_none_when_idle(tmp_path):
+    registry = _registry(tmp_path, {"alpha": 4})
+    manager = ModelManager(
+        _manager_config(budget_gb=8),
+        registry,
+        _defaults(),
+        engine_factory=lambda config: FakeEngine(config),
+    )
+
+    assert manager.get_metrics_engine() is None
+
+
+def test_get_metrics_engine_returns_sole_loaded_engine(tmp_path):
+    async def _run():
+        registry = _registry(tmp_path, {"alpha": 4})
+        manager = ModelManager(
+            _manager_config(budget_gb=8),
+            registry,
+            _defaults(),
+            engine_factory=lambda config: FakeEngine(config),
+        )
+
+        lease = await manager.acquire("alpha")
+
+        assert manager.get_metrics_engine() is manager._loaded["alpha"].engine
+
+        await lease.release()
+
+    asyncio.run(_run())
+
+
+def test_get_metrics_engine_returns_most_recently_used_when_multiple_loaded(tmp_path):
+    async def _run():
+        registry = _registry(tmp_path, {"alpha": 4, "beta": 4})
+        manager = ModelManager(
+            _manager_config(budget_gb=9),
+            registry,
+            _defaults(),
+            engine_factory=lambda config: FakeEngine(config),
+        )
+
+        lease_a = await manager.acquire("alpha")
+        await lease_a.release()
+        await asyncio.sleep(0.01)  # ensure last_used_at ordering is unambiguous
+        lease_b = await manager.acquire("beta")
+        await lease_b.release()
+
+        assert manager.get_metrics_engine() is manager._loaded["beta"].engine
+
+        # Touching alpha again makes it the most recently used.
+        await asyncio.sleep(0.01)
+        lease_a = await manager.acquire("alpha")
+        await lease_a.release()
+
+        assert manager.get_metrics_engine() is manager._loaded["alpha"].engine
+
+    asyncio.run(_run())
+
+
 def test_non_local_registry_entry_requires_explicit_memory_estimate():
     async def _run():
         registry = {
@@ -456,6 +516,73 @@ def _defaults_with(**overrides: Any) -> RegistryServeDefaults:
     return dataclasses.replace(base, **overrides)
 
 
+@pytest.mark.parametrize("override", [None, 1, 2048])
+def test_batched_engine_receives_resolved_prefill_step_size(
+    tmp_path, monkeypatch, override
+):
+    from vllm_mlx.scheduler import SchedulerConfig
+
+    registry = _registry(tmp_path, {"alpha": 1, "beta": 1})
+    registry["alpha"] = dataclasses.replace(
+        registry["alpha"], prefill_step_size=override
+    )
+    shared = SchedulerConfig(prefill_step_size=512, mllm_prefill_step_size=256)
+    manager = ModelManager(
+        _manager_config(budget_gb=8),
+        registry,
+        _defaults_with(
+            continuous_batching=True, prefill_step_size=512, scheduler_config=shared
+        ),
+    )
+    engine = MagicMock()
+    engine.start = AsyncMock()
+    constructor = MagicMock(return_value=engine)
+    monkeypatch.setattr("vllm_mlx.model_registry.BatchedEngine", constructor)
+
+    async def _run():
+        for entry in registry.values():
+            await manager._instantiate_model(entry, entry.source)
+
+    asyncio.run(_run())
+    alpha, beta = [
+        call.kwargs["scheduler_config"] for call in constructor.call_args_list
+    ]
+    assert alpha.prefill_step_size == (512 if override is None else override)
+    assert beta.prefill_step_size == 512
+    assert alpha is not beta and alpha is not shared and beta is not shared
+    assert shared.prefill_step_size == 512
+    assert alpha.mllm_prefill_step_size == beta.mllm_prefill_step_size == 256
+
+
+@pytest.mark.parametrize("value", [0, -1])
+def test_registry_rejects_nonpositive_prefill_override(tmp_path, value):
+    from vllm_mlx.scheduler import SchedulerConfig
+
+    registry = _registry(tmp_path, {"alpha": 1})
+    entry = dataclasses.replace(registry["alpha"], prefill_step_size=value)
+    manager = ModelManager(
+        _manager_config(budget_gb=8),
+        registry,
+        _defaults_with(
+            continuous_batching=True,
+            prefill_step_size=512,
+            scheduler_config=SchedulerConfig(prefill_step_size=512),
+        ),
+    )
+    with pytest.raises(ValueError, match="prefill_step_size must be > 0"):
+        manager._resolve_model_config(entry, entry.source)
+
+
+def test_registry_prefill_override_preserves_absent_scheduler_config(tmp_path):
+    registry = _registry(tmp_path, {"alpha": 1})
+    entry = dataclasses.replace(registry["alpha"], prefill_step_size=512)
+    manager = ModelManager(_manager_config(budget_gb=8), registry, _defaults())
+
+    resolved = manager._resolve_model_config(entry, entry.source)
+    assert resolved.prefill_step_size == 512
+    assert resolved.scheduler_config is None
+
+
 def test_budget_report_flags_budget_above_allocation_ceiling(tmp_path):
     """A weights budget larger than gpu_memory_utilization x device RAM is a conflict."""
     report = build_memory_budget_report(
@@ -539,6 +666,7 @@ def test_cache_limit_ignored_for_simple_mode_entries(tmp_path):
 
     assert report.continuous_batching_entries == 0
     assert report.total_entries == 1
+    assert report.memory_aware_prefix_cache_entries == 0
     assert report.per_engine_cache_limit_bytes is None
     assert report.per_engine_cache_percent is None
 
@@ -560,7 +688,172 @@ def test_cache_limit_ignored_when_paged_cache_supersedes_it(tmp_path):
     )
 
     assert report.continuous_batching_entries == 1
+    assert report.memory_aware_prefix_cache_entries == 0
     assert report.per_engine_cache_limit_bytes is None
+
+
+def test_cache_limit_applies_to_auto_detected_mllm_with_paged_cache(tmp_path, caplog):
+    """MLLM still constructs MemoryAwarePrefixCache under --use-paged-cache."""
+    from vllm_mlx.scheduler import SchedulerConfig
+
+    registry = _registry(tmp_path, {"text": 8, "vision": 8})
+    vision_path = Path(registry["vision"].source)
+    (vision_path / "config.json").write_text('{"vision_config": {}}')
+
+    report = build_memory_budget_report(
+        _manager_config(budget_gb=10),
+        registry,
+        _defaults_with(
+            continuous_batching=True,
+            scheduler_config=SchedulerConfig(
+                cache_memory_mb=20480, use_paged_cache=True
+            ),
+        ),
+        device_working_set_bytes=128 * GB,
+    )
+
+    assert report.continuous_batching_entries == 2
+    assert report.memory_aware_prefix_cache_entries == 1
+    assert report.per_engine_cache_limit_bytes == 20 * GB
+
+    with caplog.at_level(logging.INFO, logger="vllm_mlx.model_registry"):
+        log_memory_budget_report(report)
+
+    assert "20.0 GB per memory-aware prefix-cache engine" in caplog.text
+    assert "1 of 2 entries" in caplog.text
+
+
+def test_cache_percent_applies_to_mllm_with_paged_cache(tmp_path):
+    """The report uses the percentage forwarded to the MLLM prefix cache."""
+    from vllm_mlx.scheduler import SchedulerConfig
+
+    registry = _registry(tmp_path, {"vision": 8})
+    vision_path = Path(registry["vision"].source)
+    (vision_path / "config.json").write_text('{"vision_config": {}}')
+
+    report = build_memory_budget_report(
+        _manager_config(budget_gb=10),
+        registry,
+        _defaults_with(
+            continuous_batching=True,
+            scheduler_config=SchedulerConfig(
+                cache_memory_percent=0.35, use_paged_cache=True
+            ),
+        ),
+        device_working_set_bytes=128 * GB,
+    )
+
+    assert report.memory_aware_prefix_cache_entries == 1
+    assert report.per_engine_cache_limit_bytes is None
+    assert report.per_engine_cache_percent == pytest.approx(0.35)
+
+
+def test_entry_batching_override_reports_default_scheduler_cache(tmp_path):
+    """Entry-level batching uses SchedulerConfig defaults when CLI batching is off."""
+    registry = _registry(tmp_path, {"vision": 8})
+    registry["vision"] = dataclasses.replace(
+        registry["vision"], continuous_batching=True
+    )
+    vision_path = Path(registry["vision"].source)
+    (vision_path / "config.json").write_text('{"vision_config": {}}')
+
+    report = build_memory_budget_report(
+        _manager_config(budget_gb=10),
+        registry,
+        _defaults(),
+        device_working_set_bytes=128 * GB,
+    )
+
+    assert report.continuous_batching_entries == 1
+    assert report.memory_aware_prefix_cache_entries == 1
+    assert report.per_engine_cache_limit_bytes is None
+    assert report.per_engine_cache_percent == pytest.approx(0.20)
+
+
+@pytest.mark.parametrize("force_source", ["entry", "serve_default"])
+def test_cache_limit_applies_to_forced_mllm_with_paged_cache(tmp_path, force_source):
+    """Both MLLM override sources select the same cache path as BatchedEngine."""
+    from vllm_mlx.scheduler import SchedulerConfig
+
+    registry = _registry(tmp_path, {"alpha": 8})
+    defaults = _defaults_with(
+        continuous_batching=True,
+        force_mllm=force_source == "serve_default",
+        scheduler_config=SchedulerConfig(cache_memory_mb=20480, use_paged_cache=True),
+    )
+    if force_source == "entry":
+        registry["alpha"] = dataclasses.replace(registry["alpha"], force_mllm=True)
+
+    report = build_memory_budget_report(
+        _manager_config(budget_gb=10),
+        registry,
+        defaults,
+        device_working_set_bytes=128 * GB,
+    )
+
+    assert report.memory_aware_prefix_cache_entries == 1
+    assert report.per_engine_cache_limit_bytes == 20 * GB
+
+
+def test_entry_mllm_false_overrides_serve_default_for_cache_report(tmp_path):
+    """The report must use the same per-entry override precedence as loading."""
+    from vllm_mlx.scheduler import SchedulerConfig
+
+    registry = _registry(tmp_path, {"alpha": 8})
+    registry["alpha"] = dataclasses.replace(registry["alpha"], force_mllm=False)
+
+    report = build_memory_budget_report(
+        _manager_config(budget_gb=10),
+        registry,
+        _defaults_with(
+            continuous_batching=True,
+            force_mllm=True,
+            scheduler_config=SchedulerConfig(
+                cache_memory_mb=20480, use_paged_cache=True
+            ),
+        ),
+        device_working_set_bytes=128 * GB,
+    )
+
+    assert report.memory_aware_prefix_cache_entries == 0
+    assert report.per_engine_cache_limit_bytes is None
+
+
+@pytest.mark.parametrize(
+    ("force_mllm", "expected_entries"),
+    [(None, 0), (True, 1)],
+)
+def test_unresolved_remote_mllm_requires_explicit_declaration(
+    tmp_path, monkeypatch, force_mllm, expected_entries
+):
+    """Remote name heuristics are not authoritative for capacity warnings."""
+    from vllm_mlx.scheduler import SchedulerConfig
+
+    monkeypatch.chdir(tmp_path)
+    registry = {
+        "remote": RegisteredModel(
+            name="remote",
+            source="example/VL-text-model",
+            force_mllm=force_mllm,
+            estimated_memory_bytes=8 * GB,
+        )
+    }
+
+    report = build_memory_budget_report(
+        _manager_config(budget_gb=10),
+        registry,
+        _defaults_with(
+            continuous_batching=True,
+            scheduler_config=SchedulerConfig(
+                cache_memory_mb=20480, use_paged_cache=True
+            ),
+        ),
+        device_working_set_bytes=128 * GB,
+    )
+
+    assert report.memory_aware_prefix_cache_entries == expected_entries
+    expected_limit = 20 * GB if force_mllm else None
+    assert report.per_engine_cache_limit_bytes == expected_limit
 
 
 def test_cache_limit_above_ceiling_warns_without_negative_numbers(tmp_path, caplog):
@@ -788,7 +1081,7 @@ def test_log_memory_budget_report_reports_ceiling_and_cache(tmp_path, caplog):
 
     assert "Registry memory budget: 40.0 GB" in caplog.text
     assert "Metal allocation ceiling 64.0 GB" in caplog.text
-    assert "20.0 GB per continuous-batching engine" in caplog.text
+    assert "20.0 GB per memory-aware prefix-cache engine" in caplog.text
     assert "2 of 2 entries" in caplog.text
 
 

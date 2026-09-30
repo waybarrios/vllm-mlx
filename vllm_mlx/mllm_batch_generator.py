@@ -978,11 +978,7 @@ class MLLMBatchGenerator:
             from .models.mllm import process_image_input
 
             for img in request.images:
-                try:
-                    path = process_image_input(img)
-                    all_images.append(path)
-                except Exception as e:
-                    logger.warning(f"Failed to process image: {e}")
+                all_images.append(process_image_input(img))
 
         if request.videos:
             from .models.mllm import (
@@ -994,27 +990,20 @@ class MLLMBatchGenerator:
             )
 
             for video in request.videos:
-                try:
-                    video_path = process_video_input(video)
-                    frames = extract_video_frames_smart(
-                        video_path,
-                        fps=DEFAULT_FPS,
-                        max_frames=MAX_FRAMES,
-                    )
-                    frame_paths = save_frames_to_temp(frames)
-                    all_images.extend(frame_paths)
-                except Exception as e:
-                    logger.warning(f"Failed to process video: {e}")
+                video_path = process_video_input(video)
+                frames = extract_video_frames_smart(
+                    video_path,
+                    fps=DEFAULT_FPS,
+                    max_frames=MAX_FRAMES,
+                )
+                frame_paths = save_frames_to_temp(frames)
+                all_images.extend(frame_paths)
 
         if request.audio:
             from .models.mllm import process_audio_input
 
             for audio in request.audio:
-                try:
-                    path = process_audio_input(audio)
-                    all_audio.append(path)
-                except Exception as e:
-                    logger.warning(f"Failed to process audio: {e}")
+                all_audio.append(process_audio_input(audio))
 
         # Check pixel cache first
         cached_pixels = None
@@ -3363,7 +3352,27 @@ def install_chunked_prefill_mllm(
                         if r.input_ids is None:
                             try:
                                 batch_gen._preprocess_request(r)
-                            except Exception:
+                            except Exception as e:
+                                logger.error(
+                                    "Failed to preprocess request %s: %s",
+                                    r.request_id,
+                                    type(e).__name__,
+                                )
+                                # Keep the iteration stable for other requests.
+                                batch_gen.unprocessed_requests = [
+                                    pending
+                                    for pending in batch_gen.unprocessed_requests
+                                    if pending.uid != r.uid
+                                ]
+                                batch_gen._pending_error_responses.append(
+                                    MLLMBatchResponse(
+                                        uid=r.uid,
+                                        request_id=r.request_id,
+                                        token=0,
+                                        logprobs=mx.zeros(1),
+                                        finish_reason="error",
+                                    )
+                                )
                                 continue
                         if r.input_ids is not None and r.input_ids.size <= _budget:
                             short_reqs.append(r)
@@ -3381,11 +3390,8 @@ def install_chunked_prefill_mllm(
                                 f"inline short requests: {e}"
                             )
 
-                if batch_gen.active_batch is not None:
-                    return _generation_step()
-                else:
-                    # Idle server — yield to event loop between chunks
-                    return []
+                # Deliver preprocessing errors even with no active decode batch.
+                return _generation_step()
             else:
                 # Last chunk — finalize prefill
                 tic = time.perf_counter()

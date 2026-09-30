@@ -414,6 +414,116 @@ class TestAnthropicRequest:
             )
 
 
+class TestWhisperTranscriptionEndpoint:
+    """Exercise processor recovery through the real HTTP route and STT engine."""
+
+    @pytest.mark.parametrize(
+        "fail_first_download",
+        [False, True],
+        ids=["missing-processor", "download-retry"],
+    )
+    def test_transcription_recovers_processor(self, monkeypatch, fail_first_download):
+        import io
+        import wave
+        from pathlib import Path
+        from types import ModuleType
+
+        import vllm_mlx.server as srv
+        from vllm_mlx.audio.stt import STTEngine
+        from vllm_mlx.metrics import MetricsCollector
+
+        wav_buffer = io.BytesIO()
+        with wave.open(wav_buffer, "wb") as wav:
+            wav.setnchannels(1)
+            wav.setsampwidth(2)
+            wav.setframerate(16000)
+            wav.writeframes(b"\x00\x00" * 20000)
+        audio_bytes = wav_buffer.getvalue()
+        processor = object()
+        models = []
+        processor_calls = []
+        generated_paths = []
+
+        def load_model(model_name):
+            assert model_name == "mlx-community/whisper-small-mlx"
+            model = SimpleNamespace(_processor=None)
+
+            def generate(audio_path, *, verbose, language, task):
+                assert model._processor is processor
+                assert verbose is False
+                assert language == "en"
+                assert task == "transcribe"
+                assert Path(audio_path).read_bytes() == audio_bytes
+                generated_paths.append(Path(audio_path))
+                return SimpleNamespace(
+                    text=" hello ",
+                    language="en",
+                    segments=[{"start": 0.0, "end": 1.25, "text": "hello"}],
+                )
+
+            model.generate = generate
+            models.append(model)
+            return model
+
+        def load_processor(processor_repo):
+            processor_calls.append(processor_repo)
+            if fail_first_download and len(processor_calls) == 1:
+                raise OSError("processor download failed")
+            return processor
+
+        utils_module = ModuleType("mlx_audio.stt.utils")
+        utils_module.load_model = load_model
+        stt_module = ModuleType("mlx_audio.stt")
+        stt_module.utils = utils_module
+        mlx_audio_module = ModuleType("mlx_audio")
+        mlx_audio_module.stt = stt_module
+        monkeypatch.setitem(sys.modules, "mlx_audio", mlx_audio_module)
+        monkeypatch.setitem(sys.modules, "mlx_audio.stt", stt_module)
+        monkeypatch.setitem(sys.modules, "mlx_audio.stt.utils", utils_module)
+        monkeypatch.setattr(
+            "transformers.WhisperProcessor.from_pretrained", load_processor
+        )
+        monkeypatch.setattr(srv, "_stt_engine", None)
+        monkeypatch.setattr(srv, "_api_key", "test-api-key")
+        monkeypatch.setattr(srv, "_metrics", MetricsCollector())
+
+        client = TestClient(srv.app, headers={"Authorization": "Bearer test-api-key"})
+        try:
+            if fail_first_download:
+                failed = client.post(
+                    "/v1/audio/transcriptions",
+                    params={"model": "whisper-small", "language": "en"},
+                    files={"file": ("speech.wav", audio_bytes, "audio/wav")},
+                )
+                assert failed.status_code == 500
+                assert failed.json() == {"detail": "Transcription failed"}
+                assert srv._stt_engine.model is None
+                assert srv._stt_engine._loaded is False
+                assert generated_paths == []
+
+            for _ in range(2):
+                response = client.post(
+                    "/v1/audio/transcriptions",
+                    params={"model": "whisper-small", "language": "en"},
+                    files={"file": ("speech.wav", audio_bytes, "audio/wav")},
+                )
+                assert response.status_code == 200, response.text
+                assert response.json() == {
+                    "text": "hello",
+                    "language": "en",
+                    "duration": 1.25,
+                }
+        finally:
+            client.close()
+
+        assert isinstance(srv._stt_engine, STTEngine)
+        assert len(models) == (2 if fail_first_download else 1)
+        assert srv._stt_engine.model is models[-1]
+        assert processor_calls == ["openai/whisper-small"] * len(models)
+        assert len(generated_paths) == 2
+        assert all(not path.exists() for path in generated_paths)
+
+
 class TestMCPExecuteEndpoint:
     """Test MCP execute endpoint sandbox routing."""
 
@@ -2225,7 +2335,7 @@ class TestStreamChatCompletion:
             def __init__(self, tokenizer=None):
                 self.in_think = False
 
-            def reset_state(self):
+            def reset_state(self, implicit_mode: bool = False):
                 self.in_think = False
 
             def extract_reasoning_streaming(
@@ -3053,7 +3163,7 @@ class TestStreamChatCompletion:
                     yield chunk
 
         class FakeReasoningParser:
-            def reset_state(self):
+            def reset_state(self, implicit_mode: bool = False):
                 self._in_reasoning = False
 
             def extract_reasoning_streaming(
@@ -3290,7 +3400,7 @@ class TestStreamChatCompletion:
                     yield chunk
 
         class FakeReasoningParser:
-            def reset_state(self):
+            def reset_state(self, implicit_mode: bool = False):
                 pass
 
             def extract_reasoning_streaming(
@@ -3454,7 +3564,7 @@ class TestStreamChatCompletion:
                 )
 
         class FakeReasoningParser:
-            def reset_state(self):
+            def reset_state(self, implicit_mode: bool = False):
                 pass
 
             def extract_reasoning_streaming(
@@ -3533,7 +3643,7 @@ class TestStreamChatCompletion:
                     yield chunk
 
         class FakeReasoningParser:
-            def reset_state(self):
+            def reset_state(self, implicit_mode: bool = False):
                 pass
 
             def extract_reasoning_streaming(
@@ -3648,7 +3758,7 @@ class TestStreamChatCompletion:
                     yield chunk
 
         class FakeReasoningParser:
-            def reset_state(self):
+            def reset_state(self, implicit_mode: bool = False):
                 self._in_reasoning = False
 
             def extract_reasoning_streaming(
@@ -3738,7 +3848,7 @@ class TestStreamChatCompletion:
                 )
 
         class ReasoningOnlyParser:
-            def reset_state(self):
+            def reset_state(self, implicit_mode: bool = False):
                 pass
 
             def extract_reasoning_streaming(
@@ -5208,11 +5318,9 @@ class TestServerIntegration:
         """Test /v1/chat/completions endpoint."""
         import requests
 
-        payload = {
-            "model": "default",
-            "messages": [{"role": "user", "content": "Say hello"}],
-            "max_tokens": 10,
-        }
+        from tests.server_integration_helpers import get_chat_completion_payload
+
+        payload = get_chat_completion_payload(requests, server_url)
 
         response = requests.post(
             f"{server_url}/v1/chat/completions",
@@ -5450,3 +5558,366 @@ def pytest_addoption(parser):
         default="http://localhost:8000",
         help="URL of the vllm-mlx server for integration tests",
     )
+
+
+class TestDetectImplicitThinking:
+    """The probe that tells the streaming parser a <think> was injected."""
+
+    class _Tokenizer:
+        """Stands in for the HF tokenizer the probe reads its template from.
+
+        Real engines always expose one (verified on GLM-5.3: a 10.6KB
+        ``chat_template`` string on both tokenizer and processor), so the
+        default harness must too -- otherwise every test here would silently
+        exercise the uncacheable path. See ``_NoTemplateEngine`` for that case.
+        """
+
+        def __init__(self, chat_template="{{ messages }}<|assistant|><think>"):
+            self.chat_template = chat_template
+
+    class _Engine:
+        model_name = "glm-5.3-flash"
+
+        def __init__(self, rendered, chat_template=None):
+            self._rendered = rendered
+            self.calls = 0
+            self.seen_kwargs = []
+            self.tokenizer = TestDetectImplicitThinking._Tokenizer(
+                *([chat_template] if chat_template is not None else [])
+            )
+
+        def _apply_chat_template(self, messages, **kwargs):
+            self.calls += 1
+            self.seen_kwargs.append(kwargs)
+            if callable(self._rendered):
+                return self._rendered(kwargs)
+            return self._rendered
+
+    def _detect(self, engine, chat_kwargs=None):
+        import vllm_mlx.server as server
+
+        server._implicit_thinking_cache.clear()
+        return server._detect_implicit_thinking(engine, chat_kwargs)
+
+    def test_trailing_think_tag_is_implicit(self):
+        assert self._detect(self._Engine("<|user|>hi<|assistant|>\n<think>")) is True
+
+    def test_trailing_whitespace_after_tag_still_counts(self):
+        assert self._detect(self._Engine("<|assistant|>\n<think>\n  ")) is True
+
+    def test_template_without_injected_tag_is_not_implicit(self):
+        assert self._detect(self._Engine("<|user|>hi<|assistant|>\n")) is False
+
+    def test_think_elsewhere_in_prompt_does_not_count(self):
+        """Only a TRAILING <think> means generation starts inside the block."""
+        engine = self._Engine("<|user|>what is <think> for?<|assistant|>\n")
+        assert self._detect(engine) is False
+
+    def test_result_is_cached_per_model(self):
+        import vllm_mlx.server as server
+
+        engine = self._Engine("<|assistant|>\n<think>")
+        server._implicit_thinking_cache.clear()
+        assert server._detect_implicit_thinking(engine, None) is True
+        assert server._detect_implicit_thinking(engine, None) is True
+        assert engine.calls == 1, "template should be rendered once, not per request"
+
+    def test_render_failure_is_not_cached_and_defaults_false(self):
+        import vllm_mlx.server as server
+
+        class Boom:
+            model_name = "boom"
+
+            def _apply_chat_template(self, messages, **kwargs):
+                raise RuntimeError("no template")
+
+        server._implicit_thinking_cache.clear()
+        assert server._detect_implicit_thinking(Boom(), None) is False
+        assert server._implicit_thinking_cache == {}
+
+    def test_engine_without_template_hook_defaults_false(self):
+        import vllm_mlx.server as server
+
+        server._implicit_thinking_cache.clear()
+        assert server._detect_implicit_thinking(object(), None) is False
+
+    def test_cache_is_bounded_against_client_supplied_template_kwargs(
+        self, monkeypatch
+    ):
+        """chat_template_kwargs is request-controlled, so the key space is too."""
+        import vllm_mlx.server as server
+
+        monkeypatch.setattr(server, "_IMPLICIT_THINKING_CACHE_MAX_SIZE", 8)
+        server._implicit_thinking_cache.clear()
+        engine = self._Engine("<|assistant|>\n<think>")
+        for n in range(50):
+            assert (
+                server._detect_implicit_thinking(
+                    engine, {"chat_template_kwargs": {"junk": n}}
+                )
+                is True
+            )
+        assert len(server._implicit_thinking_cache) == 8
+        server._implicit_thinking_cache.clear()
+
+    def test_probe_renders_with_the_resolved_enable_thinking(self):
+        """The probe must see the same flag the real prompt render will get."""
+        import vllm_mlx.server as server
+
+        server._implicit_thinking_cache.clear()
+        engine = self._Engine("<|assistant|>\n<think>")
+        server._detect_implicit_thinking(engine, {"enable_thinking": False})
+        assert engine.seen_kwargs[-1].get("enable_thinking") is False
+        server._implicit_thinking_cache.clear()
+
+    def test_enable_thinking_omitted_when_request_does_not_set_it(self):
+        """Absent means 'let the engine default decide', not False."""
+        import vllm_mlx.server as server
+
+        server._implicit_thinking_cache.clear()
+        engine = self._Engine("<|assistant|>\n<think>")
+        server._detect_implicit_thinking(engine, {})
+        assert "enable_thinking" not in engine.seen_kwargs[-1]
+        server._implicit_thinking_cache.clear()
+
+    def test_enable_thinking_is_part_of_the_cache_key(self):
+        """A template that honours the flag must not reuse the other verdict.
+
+        _apply_forced_tool_choice sets chat_kwargs["enable_thinking"] = False
+        without touching chat_template_kwargs, so keying on the latter alone
+        would serve a forced-tool request the thinking-enabled verdict.
+        """
+        import vllm_mlx.server as server
+
+        def render(kwargs):
+            if kwargs.get("enable_thinking") is False:
+                return "<|assistant|>\n"
+            return "<|assistant|>\n<think>"
+
+        server._implicit_thinking_cache.clear()
+        engine = self._Engine(render)
+        assert server._detect_implicit_thinking(engine, None) is True
+        forced = {"enable_thinking": False}
+        assert server._detect_implicit_thinking(engine, forced) is False
+        assert engine.calls == 2, "the two flags must not share a cache entry"
+        assert server._detect_implicit_thinking(engine, forced) is False
+        assert engine.calls == 2, "each flag is still cached"
+        server._implicit_thinking_cache.clear()
+
+    def test_template_ignoring_the_flag_stays_implicit(self):
+        """GLM-5.3 opens <think> unconditionally, so forced tools stay implicit.
+
+        Its chat template has no enable_thinking variable at all, so disabling
+        thinking must NOT flip the verdict -- the prompt still starts inside
+        the reasoning block and the parser still has to route accordingly.
+        """
+        import vllm_mlx.server as server
+
+        server._implicit_thinking_cache.clear()
+        engine = self._Engine("<|assistant|>\n<think>")
+        assert server._detect_implicit_thinking(engine, {"enable_thinking": False})
+        server._implicit_thinking_cache.clear()
+
+    # --- tools ------------------------------------------------------------
+    #
+    # The probe used to render without `tools` while the real prompt render
+    # gets them from chat_kwargs["tools"], and the cache key ignored them --
+    # so a template whose <think> injection is tool-conditional could cache
+    # the no-tool verdict and serve it to a tool request.
+
+    _TOOL_A = {
+        "type": "function",
+        "function": {"name": "get_weather", "parameters": {"type": "object"}},
+    }
+    _TOOL_B = {
+        "type": "function",
+        "function": {"name": "send_email", "parameters": {"type": "object"}},
+    }
+
+    def test_probe_forwards_tools_to_the_template(self):
+        import vllm_mlx.server as server
+
+        server._implicit_thinking_cache.clear()
+        engine = self._Engine("<|assistant|>\n<think>")
+        server._detect_implicit_thinking(engine, {"tools": [self._TOOL_A]})
+        assert engine.seen_kwargs[-1].get("tools") == [self._TOOL_A]
+        server._implicit_thinking_cache.clear()
+
+    def test_no_tools_leaves_the_kwarg_out(self):
+        import vllm_mlx.server as server
+
+        server._implicit_thinking_cache.clear()
+        engine = self._Engine("<|assistant|>\n<think>")
+        server._detect_implicit_thinking(engine, {})
+        assert "tools" not in engine.seen_kwargs[-1]
+        server._implicit_thinking_cache.clear()
+
+    def test_tool_conditional_template_is_not_served_the_no_tool_verdict(self):
+        """The reviewer's scenario: <think> only opens when tools are absent."""
+        import vllm_mlx.server as server
+
+        def render(kwargs):
+            if kwargs.get("tools"):
+                return "<|assistant|>\n"
+            return "<|assistant|>\n<think>"
+
+        server._implicit_thinking_cache.clear()
+        engine = self._Engine(render)
+        assert server._detect_implicit_thinking(engine, None) is True
+        assert server._detect_implicit_thinking(engine, {"tools": [self._TOOL_A]}) is (
+            False
+        )
+        assert engine.calls == 2, "tools must not share the no-tool cache entry"
+        server._implicit_thinking_cache.clear()
+
+    def test_verdict_is_cached_per_tool_set(self):
+        """Same tool names reuse the entry; a different set re-probes."""
+        import vllm_mlx.server as server
+
+        server._implicit_thinking_cache.clear()
+        engine = self._Engine("<|assistant|>\n<think>")
+        server._detect_implicit_thinking(engine, {"tools": [self._TOOL_A]})
+        server._detect_implicit_thinking(engine, {"tools": [self._TOOL_A]})
+        assert engine.calls == 1, "identical tool sets must hit the cache"
+        server._detect_implicit_thinking(engine, {"tools": [self._TOOL_B]})
+        assert engine.calls == 2, "a different tool set must re-probe"
+        server._implicit_thinking_cache.clear()
+
+    def test_tool_order_does_not_split_the_cache_entry(self):
+        import vllm_mlx.server as server
+
+        server._implicit_thinking_cache.clear()
+        engine = self._Engine("<|assistant|>\n<think>")
+        server._detect_implicit_thinking(
+            engine, {"tools": [self._TOOL_A, self._TOOL_B]}
+        )
+        server._detect_implicit_thinking(
+            engine, {"tools": [self._TOOL_B, self._TOOL_A]}
+        )
+        assert engine.calls == 1
+        server._implicit_thinking_cache.clear()
+
+    def test_forced_tool_choice_context_stays_implicit_on_glm53(self):
+        """Forced tool choice: tools filtered to one AND enable_thinking=False.
+
+        GLM-5.3 opens <think> regardless, so the verdict must stay True --
+        this is the exact combination _apply_forced_tool_choice produces.
+        """
+        import vllm_mlx.server as server
+
+        server._implicit_thinking_cache.clear()
+        engine = self._Engine("<|assistant|>\n<think>")
+        forced = {"tools": [self._TOOL_A], "enable_thinking": False}
+        assert server._detect_implicit_thinking(engine, forced) is True
+        assert engine.seen_kwargs[-1].get("tools") == [self._TOOL_A]
+        assert engine.seen_kwargs[-1].get("enable_thinking") is False
+        server._implicit_thinking_cache.clear()
+
+    def test_cache_bound_holds_as_tool_sets_vary(self, monkeypatch):
+        """tools are request-controlled too, so they must not evade the bound."""
+        import vllm_mlx.server as server
+
+        monkeypatch.setattr(server, "_IMPLICIT_THINKING_CACHE_MAX_SIZE", 8)
+        server._implicit_thinking_cache.clear()
+        engine = self._Engine("<|assistant|>\n<think>")
+        for n in range(50):
+            tool = {"type": "function", "function": {"name": f"tool_{n}"}}
+            assert server._detect_implicit_thinking(engine, {"tools": [tool]}) is True
+        assert len(server._implicit_thinking_cache) == 8
+        server._implicit_thinking_cache.clear()
+
+    def test_malformed_tool_entries_do_not_break_the_probe(self):
+        """tools come from a client-shaped list; a stray non-dict must not 500."""
+        import vllm_mlx.server as server
+
+        server._implicit_thinking_cache.clear()
+        engine = self._Engine("<|assistant|>\n<think>")
+        assert server._detect_implicit_thinking(engine, {"tools": ["nonsense", None]})
+        server._implicit_thinking_cache.clear()
+
+    # --- template identity --------------------------------------------------
+    #
+    # model_name is only a proxy for the template. Two engines can share a
+    # name and render differently (a local override, a re-pull, a swapped
+    # tokenizer), and the cached verdict would follow the name, not the
+    # template that actually produced it.
+
+    class _NoTemplateEngine:
+        """An engine whose template can't be identified (no tokenizer)."""
+
+        model_name = "opaque"
+
+        def __init__(self, rendered):
+            self._rendered = rendered
+            self.calls = 0
+
+        def _apply_chat_template(self, messages, **kwargs):
+            self.calls += 1
+            return self._rendered
+
+    def test_changed_template_cannot_reuse_the_previous_verdict(self):
+        """The reviewer's regression: same engine, template swapped underneath."""
+        import vllm_mlx.server as server
+
+        server._implicit_thinking_cache.clear()
+        engine = self._Engine("<|assistant|>\n<think>", chat_template="TEMPLATE A")
+        assert server._detect_implicit_thinking(engine, None) is True
+
+        # Swap in a template that does NOT open <think>.
+        engine.tokenizer.chat_template = "TEMPLATE B"
+        engine._rendered = "<|assistant|>\n"
+        assert server._detect_implicit_thinking(engine, None) is False
+        assert engine.calls == 2, "changed template must force a re-probe"
+        server._implicit_thinking_cache.clear()
+
+    def test_same_model_name_different_templates_do_not_collide(self):
+        """Two engines, one model_name, different templates -> two verdicts."""
+        import vllm_mlx.server as server
+
+        server._implicit_thinking_cache.clear()
+        implicit = self._Engine("<|assistant|>\n<think>", chat_template="A")
+        explicit = self._Engine("<|assistant|>\n", chat_template="B")
+        assert implicit.model_name == explicit.model_name
+        assert server._detect_implicit_thinking(implicit, None) is True
+        assert server._detect_implicit_thinking(explicit, None) is False
+        assert explicit.calls == 1, "second engine must probe, not reuse"
+        server._implicit_thinking_cache.clear()
+
+    def test_identical_template_still_shares_one_entry(self):
+        """The signature must not defeat caching for the common case."""
+        import vllm_mlx.server as server
+
+        server._implicit_thinking_cache.clear()
+        first = self._Engine("<|assistant|>\n<think>", chat_template="SAME")
+        second = self._Engine("<|assistant|>\n<think>", chat_template="SAME")
+        assert server._detect_implicit_thinking(first, None) is True
+        assert server._detect_implicit_thinking(second, None) is True
+        assert second.calls == 0, "identical template should hit the cache"
+        server._implicit_thinking_cache.clear()
+
+    def test_processor_template_is_part_of_the_identity(self):
+        """MLLM engines render via the processor, so its template counts too."""
+        import vllm_mlx.server as server
+
+        server._implicit_thinking_cache.clear()
+        engine = self._Engine("<|assistant|>\n<think>", chat_template="SHARED")
+        engine._processor = self._Tokenizer("PROCESSOR A")
+        assert server._detect_implicit_thinking(engine, None) is True
+
+        engine._processor.chat_template = "PROCESSOR B"
+        engine._rendered = "<|assistant|>\n"
+        assert server._detect_implicit_thinking(engine, None) is False
+        assert engine.calls == 2
+        server._implicit_thinking_cache.clear()
+
+    def test_unidentifiable_template_is_probed_every_time(self):
+        """No signature means no way to invalidate -- so cache nothing."""
+        import vllm_mlx.server as server
+
+        server._implicit_thinking_cache.clear()
+        engine = self._NoTemplateEngine("<|assistant|>\n<think>")
+        assert server._detect_implicit_thinking(engine, None) is True
+        assert server._detect_implicit_thinking(engine, None) is True
+        assert engine.calls == 2, "unidentifiable template must not be cached"
+        assert server._implicit_thinking_cache == {}
+        server._implicit_thinking_cache.clear()

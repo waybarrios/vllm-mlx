@@ -582,6 +582,19 @@ class TestMultimodalProcessorBatch:
         result = processor.batch_pixel_values([None, None])
         assert result is None
 
+    def test_process_rejects_invalid_image_atomically(self, monkeypatch):
+        from vllm_mlx import multimodal_processor
+
+        processor = multimodal_processor.MultimodalProcessor(MagicMock(), MagicMock())
+        monkeypatch.setattr(
+            multimodal_processor,
+            "process_image_input",
+            lambda image: (_ for _ in ()).throw(ValueError("invalid image")),
+        )
+
+        with pytest.raises(ValueError, match="invalid image"):
+            processor.process("Describe", images=["bad-image"])
+
     def test_batch_pixel_values_single(self):
         """Test batching single pixel value."""
         from vllm_mlx.multimodal_processor import MultimodalProcessor
@@ -2067,6 +2080,29 @@ class TestPreprocessIdempotent:
             gen._preprocess_request(req)
         assert req.is_text_only is False
 
+    def test_invalid_media_fails_batched_preprocessing(self, monkeypatch):
+        from vllm_mlx.mllm_batch_generator import (
+            MLLMBatchGenerator,
+            MLLMBatchRequest,
+        )
+        from vllm_mlx.models import mllm
+
+        req = MLLMBatchRequest(
+            uid=0,
+            prompt="Describe",
+            request_id="bad-media",
+            images=["bad-image"],
+        )
+        gen = MLLMBatchGenerator.__new__(MLLMBatchGenerator)
+        monkeypatch.setattr(
+            mllm,
+            "process_image_input",
+            lambda image: (_ for _ in ()).throw(ValueError("invalid image")),
+        )
+
+        with pytest.raises(ValueError, match="invalid image"):
+            gen._preprocess_request(req)
+
 
 class TestChunkedPrefillCacheHandling:
     """Tests for chunked prefill prefix cache handling paths."""
@@ -2284,6 +2320,97 @@ class TestChunkedPrefillCacheHandling:
         abort_responses = [r for r in responses if r.finish_reason == "abort"]
         assert len(abort_responses) == 1
         assert abort_responses[0].request_id == "req-abort"
+
+    @pytest.mark.parametrize("active_decode", [False, True])
+    def test_inline_audio_failure_is_reported_once_during_prefill(
+        self, monkeypatch, active_decode
+    ):
+        from mlx_vlm import utils
+
+        from vllm_mlx.mllm_batch_generator import (
+            MLLMBatch,
+            MLLMBatchRequest,
+            install_chunked_prefill_mllm,
+        )
+        from vllm_mlx.models import mllm
+
+        gen = self._make_fake_batch_gen()
+        gen.language_model = MagicMock()
+        gen.model = SimpleNamespace(config=None)
+        gen.processor = MagicMock()
+        gen.vision_cache = MagicMock()
+        gen.vision_cache.get_pixel_cache.return_value = None
+        gen._process_prompts = MagicMock()
+
+        # These prompts exceed the inline budget, reproducing the path where
+        # a failed resolver used to leave input_ids unset and retry each chunk.
+        prepare_inputs = MagicMock(return_value={"input_ids": mx.array([[1] * 8])})
+        monkeypatch.setattr(utils, "prepare_inputs", prepare_inputs)
+        resolve_audio = MagicMock(side_effect=TimeoutError("audio download timed out"))
+        monkeypatch.setattr(mllm, "process_audio_input", resolve_audio)
+        failed = [
+            MLLMBatchRequest(
+                uid=uid,
+                request_id=f"bad-audio-{uid}",
+                prompt="long audio prompt",
+                audio=[f"https://example.com/audio-{uid}.wav"],
+            )
+            for uid in (1, 2)
+        ]
+        healthy = MLLMBatchRequest(uid=3, request_id="healthy", prompt="long text")
+        gen.unprocessed_requests = [*failed, healthy]
+
+        install_chunked_prefill_mllm(gen, budget=4)
+        prefill = MLLMBatchRequest(uid=0, request_id="prefill", prompt="long text")
+        gen._partial = {
+            "request": prefill,
+            "cache": [],
+            "remaining_ids": mx.array([[1] * 20]),
+            "processed": 0,
+            "total": 20,
+            "cached_count": 0,
+            "chunk_count": 0,
+        }
+
+        if active_decode:
+            decoding = MLLMBatchRequest(uid=4, request_id="decoding", prompt="hi")
+            gen.active_batch = MLLMBatch(
+                uids=[decoding.uid],
+                request_ids=[decoding.request_id],
+                y=mx.array([7]),
+                logprobs=[mx.zeros(8)],
+                max_tokens=[10],
+                num_tokens=[0],
+                cache=[],
+                requests=[decoding],
+            )
+            gen._step = MagicMock(return_value=(mx.array([7]), [mx.zeros(8)]))
+            gen._maybe_store_prefix_cache = MagicMock()
+
+        first = gen._next()
+        errors = [response for response in first if response.finish_reason == "error"]
+        assert [response.request_id for response in errors] == [
+            request.request_id for request in failed
+        ]
+        assert [request.uid for request in gen.unprocessed_requests] == [healthy.uid]
+        assert gen._pending_error_responses == []
+        assert healthy.input_ids is not None
+        assert gen._partial["processed"] == 4
+
+        following = [*gen._next(), *gen._next()]
+        assert all(response.finish_reason != "error" for response in following)
+        assert resolve_audio.call_count == 2
+        prepare_inputs.assert_called_once()
+        gen._process_prompts.assert_not_called()
+        assert gen._partial["processed"] == 12
+        assert gen.language_model.call_count == 3
+        if active_decode:
+            assert decoding.output_tokens == [7, 7, 7]
+            assert [r.request_id for r in first if r.finish_reason is None] == [
+                "decoding"
+            ]
+        else:
+            assert following == []
 
     def test_short_prompt_falls_through_to_orig_next(self):
         """Short prompts (< budget) with no prefix cache must fall through

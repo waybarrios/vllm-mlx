@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import importlib.machinery
 import sys
 import types
 from types import SimpleNamespace
@@ -562,3 +564,164 @@ def test_sparse_media_prefill_rejects_nonmedia_token_outside_draft_vocab(
         )
 
     assert runtime_calls["score"] == []
+
+
+def _ensure_mlx_stubs_for_media_specprefill(monkeypatch) -> bool:
+    """Make the MLLM configuration bridge importable on non-Apple CI."""
+    try:  # pragma: no cover - depends on the environment
+        import mlx.core  # noqa: F401
+
+        return False
+    except Exception:
+        pass
+
+    core = types.ModuleType("mlx.core")
+    core.__spec__ = importlib.machinery.ModuleSpec("mlx.core", loader=None)
+
+    class _Array:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+    class _Stream:
+        def __init__(self, idx: int = 0) -> None:
+            self.idx = idx
+
+    core.array = _Array
+    core.Stream = _Stream
+    core.clear_cache = lambda: None
+    core.default_device = lambda: "gpu"
+    core.new_stream = lambda *args, **kwargs: _Stream()
+    core.set_default_stream = lambda *args, **kwargs: None
+    core.metal = SimpleNamespace(
+        is_available=lambda: False,
+        get_active_memory=lambda: 0,
+        get_peak_memory=lambda: 0,
+        get_cache_memory=lambda: 0,
+    )
+    mlx = types.ModuleType("mlx")
+    mlx.__spec__ = importlib.machinery.ModuleSpec("mlx", loader=None, is_package=True)
+    mlx.__path__ = []
+    mlx.core = core
+    monkeypatch.setitem(sys.modules, "mlx", mlx)
+    monkeypatch.setitem(sys.modules, "mlx.core", core)
+    return True
+
+
+def _media_specprefill_base_scheduler_config(**overrides):
+    cfg = dict(
+        max_num_seqs=16,
+        prefill_batch_size=4,
+        completion_batch_size=8,
+        prefill_step_size=256,
+        mllm_prefill_step_size=None,
+        enable_prefix_cache=True,
+        use_memory_aware_cache=True,
+        cache_memory_mb=None,
+        enable_mtp=False,
+        mtp_num_draft_tokens=1,
+        kv_cache_quantization=False,
+        kv_cache_quantization_bits=8,
+        kv_cache_quantization_group_size=64,
+        chunked_prefill_tokens=0,
+        max_kv_size=0,
+    )
+    cfg.update(overrides)
+    return SimpleNamespace(**cfg)
+
+
+def _media_specprefill_run_start_mllm(monkeypatch, scheduler_config, **engine_kwargs):
+    """Run BatchedEngine._start_mllm with fakes, return captured kwargs."""
+    _ensure_mlx_stubs_for_media_specprefill(monkeypatch)
+    from vllm_mlx.engine.batched import BatchedEngine
+
+    captured = {}
+
+    class FakeMLXMultimodalLM:
+        def __init__(self, model_name, trust_remote_code=True, **kwargs):
+            self.model = object()
+            self.processor = object()
+
+        def load(self):
+            return None
+
+    class FakeMLLMSchedulerConfig:
+        def __init__(self, **kwargs):
+            captured["config_kwargs"] = kwargs
+            self.__dict__.update(kwargs)
+
+    class FakeMLLMScheduler:
+        def __init__(self, model, processor, config, **kwargs):
+            captured["scheduler_kwargs"] = kwargs
+
+        async def start(self):
+            return None
+
+    import vllm_mlx.engine.batched as batched_mod
+
+    fake_mllm_scheduler = types.ModuleType("vllm_mlx.mllm_scheduler")
+    fake_mllm_scheduler.MLLMScheduler = FakeMLLMScheduler
+    fake_mllm_scheduler.MLLMSchedulerConfig = FakeMLLMSchedulerConfig
+    fake_mllm_model = types.ModuleType("vllm_mlx.models.mllm")
+    fake_mllm_model.MLXMultimodalLM = FakeMLXMultimodalLM
+    monkeypatch.setitem(sys.modules, "vllm_mlx.mllm_scheduler", fake_mllm_scheduler)
+    monkeypatch.setitem(sys.modules, "vllm_mlx.models.mllm", fake_mllm_model)
+    monkeypatch.setattr(
+        batched_mod.BatchedEngine, "_inject_mtp_mllm", lambda self: None
+    )
+
+    engine = BatchedEngine(
+        model_name="fake-qwen",
+        scheduler_config=scheduler_config,
+        force_mllm=True,
+        **engine_kwargs,
+    )
+    asyncio.run(engine._start_mllm())
+    return captured
+
+
+def test_start_mllm_forwards_specprefill_configuration(monkeypatch):
+    captured = _media_specprefill_run_start_mllm(
+        monkeypatch,
+        _media_specprefill_base_scheduler_config(),
+        specprefill_enabled=True,
+        specprefill_threshold=4096,
+        specprefill_keep_pct=0.25,
+        specprefill_backbone_pct=0.1,
+    )
+
+    assert captured["config_kwargs"]["specprefill_enabled"] is True
+    assert captured["config_kwargs"]["specprefill_threshold"] == 4096
+    assert captured["config_kwargs"]["specprefill_keep_pct"] == 0.25
+    assert captured["config_kwargs"]["specprefill_backbone_pct"] == 0.1
+    assert captured["scheduler_kwargs"]["specprefill_draft_model"] is None
+
+
+def test_prepare_mllm_loads_specprefill_draft_after_target_is_prepared(monkeypatch):
+    _ensure_mlx_stubs_for_media_specprefill(monkeypatch)
+    from vllm_mlx.engine.batched import BatchedEngine
+
+    import vllm_mlx.engine.batched as batched_mod
+
+    draft = object()
+    fake_mlx_lm = types.ModuleType("mlx_lm")
+    fake_mlx_lm.load = lambda path: (draft, object())
+    monkeypatch.setitem(sys.modules, "mlx_lm", fake_mlx_lm)
+    fake_mllm_model = types.ModuleType("vllm_mlx.models.mllm")
+    fake_mllm_model.MLXMultimodalLM = object
+    monkeypatch.setitem(sys.modules, "vllm_mlx.models.mllm", fake_mllm_model)
+
+    engine = BatchedEngine(
+        model_name="fake-qwen",
+        force_mllm=True,
+        specprefill_enabled=True,
+        specprefill_draft_model="draft-model",
+    )
+    engine._model = object()
+    engine._processor = object()
+    monkeypatch.setattr(
+        batched_mod.BatchedEngine, "_inject_mtp_mllm", lambda self: None
+    )
+
+    engine._prepare_mllm_model()
+
+    assert engine._specprefill_draft_model is draft

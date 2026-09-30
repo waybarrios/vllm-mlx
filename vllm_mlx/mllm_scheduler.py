@@ -80,6 +80,8 @@ class MLLMSchedulerConfig:
     use_memory_aware_cache: bool = True
     # Memory limit for prefix cache (None = auto-detect)
     prefix_cache_memory_mb: Optional[int] = None
+    # Fraction of available memory used when no explicit MB limit is configured
+    prefix_cache_memory_percent: float = 0.20
     # KV cache quantization for prefix cache store/fetch
     kv_cache_quantization: bool = False
     kv_cache_quantization_bits: int = 8
@@ -266,52 +268,29 @@ class MLLMScheduler:
         self.num_requests_processed = 0
         self.total_prompt_tokens = 0
         self.total_completion_tokens = 0
+        # Count of step() calls, mirroring AsyncEngineCore._steps_executed
+        # (engine_core.py) for the plain-LLM path -- surfaced via get_stats()
+        # as vllm_mlx_engine_steps_executed (see #746).
+        self._steps_executed = 0
 
         # Memory management: periodic mx.clear_cache() to free Metal buffers
         self._step_count = 0
         self._clear_cache_interval = 32
 
     def _get_stop_tokens(self) -> Set[int]:
-        """Get stop token IDs from tokenizer and generation_config.json."""
-        stop_tokens = set()
+        """Get stop token IDs from tokenizer and config/generation_config.
+
+        (e.g., Gemma 4 has <turn|>=106, <|tool_response>=50 as EOS, declared
+        only in the config EOS list — never as ``tokenizer.eos_token``.)
+        """
+        from .utils.tokenizer import collect_eos_token_ids
+
         tokenizer = (
             self.processor.tokenizer
             if hasattr(self.processor, "tokenizer")
             else self.processor
         )
-
-        if hasattr(tokenizer, "eos_token_id") and tokenizer.eos_token_id is not None:
-            if isinstance(tokenizer.eos_token_id, list):
-                stop_tokens.update(tokenizer.eos_token_id)
-            else:
-                stop_tokens.add(tokenizer.eos_token_id)
-
-        if hasattr(tokenizer, "eos_token_ids") and tokenizer.eos_token_ids is not None:
-            if isinstance(tokenizer.eos_token_ids, (list, set, tuple)):
-                stop_tokens.update(tokenizer.eos_token_ids)
-            else:
-                stop_tokens.add(tokenizer.eos_token_ids)
-
-        # Also read generation_config.json which may have additional EOS tokens
-        # (e.g., Gemma 4 has <turn|>=106, <|tool_response>=50 as EOS)
-        model_path = getattr(tokenizer, "name_or_path", None)
-        if model_path:
-            import json
-            from pathlib import Path
-
-            gc_path = Path(model_path) / "generation_config.json"
-            if gc_path.exists():
-                try:
-                    gc = json.loads(gc_path.read_text())
-                    gc_eos = gc.get("eos_token_id")
-                    if isinstance(gc_eos, list):
-                        stop_tokens.update(gc_eos)
-                    elif gc_eos is not None:
-                        stop_tokens.add(gc_eos)
-                except Exception:
-                    pass
-
-        return stop_tokens
+        return collect_eos_token_ids(tokenizer)
 
     def _ensure_batch_generator(self) -> None:
         """Ensure batch generator exists."""
@@ -331,6 +310,7 @@ class MLLMScheduler:
             if self.config.enable_prefix_cache and self.config.use_memory_aware_cache:
                 prefix_cache_config = MemoryCacheConfig(
                     max_memory_mb=self.config.prefix_cache_memory_mb,
+                    max_memory_percent=self.config.prefix_cache_memory_percent,
                     kv_quantize=self.config.kv_cache_quantization,
                     kv_bits=self.config.kv_cache_quantization_bits,
                     kv_group_size=self.config.kv_cache_quantization_group_size,
@@ -882,6 +862,16 @@ class MLLMScheduler:
         # Clear finished tracking for next step
         self.finished_req_ids = set()
 
+        # Count only steps that complete without raising, mirroring
+        # AsyncEngineCore._steps_executed (engine_core.py), which increments
+        # after self.scheduler.step() returns successfully rather than
+        # before calling it. A step that raises partway through (e.g. an
+        # unrecoverable forward-pass error -- see
+        # _fail_requests_after_step_error) never did the scheduling/
+        # generation work "steps_executed" is meant to count, so it must
+        # not be counted.
+        self._steps_executed += 1
+
         return output
 
     def _fail_requests_after_step_error(self, error: Exception) -> None:
@@ -1284,6 +1274,7 @@ class MLLMScheduler:
             "num_requests_processed": self.num_requests_processed,
             "total_prompt_tokens": self.total_prompt_tokens,
             "total_completion_tokens": self.total_completion_tokens,
+            "steps_executed": self._steps_executed,
             "requests": self.get_running_requests_info(),
         }
 
@@ -1335,8 +1326,11 @@ class MLLMScheduler:
             "vision_cache": False,
             "prefix_cache": False,
         }
-        if self.vision_cache:
-            self.vision_cache.clear()
+        if (
+            self.batch_generator is not None
+            and self.batch_generator.vision_cache is not None
+        ):
+            self.batch_generator.vision_cache.clear()
             cleared["vision_cache"] = True
         if (
             self.batch_generator is not None
@@ -1361,8 +1355,7 @@ class MLLMScheduler:
         self._detokenizer_pool.clear()
 
         if self.batch_generator is not None:
+            if self.batch_generator.vision_cache is not None:
+                self.batch_generator.vision_cache.clear()
             self.batch_generator.close()
             self.batch_generator = None
-
-        if self.vision_cache:
-            self.vision_cache.clear()

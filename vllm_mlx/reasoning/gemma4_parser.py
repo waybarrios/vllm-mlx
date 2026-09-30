@@ -128,7 +128,7 @@ class Gemma4ReasoningParser(BaseThinkingReasoningParser):
         # <|channel>response transition — used to strip the leading newline.
         self._content_seen: bool = False
 
-    def reset_state(self):
+    def reset_state(self, implicit_mode: bool = False):  # noqa: ARG002
         super().reset_state()
         self._pending = ""
         self._content_seen = False

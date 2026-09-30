@@ -200,6 +200,15 @@ class TestRequestOutput:
 class TestSchedulerConfig:
     """Tests for SchedulerConfig."""
 
+    @pytest.mark.parametrize("value", [0, -1])
+    def test_rejects_nonpositive_prefill_step_size(self, value):
+        with pytest.raises(ValueError, match="prefill_step_size must be > 0"):
+            SchedulerConfig(prefill_step_size=value)
+
+    @pytest.mark.parametrize("value", [1, 512, 2048])
+    def test_accepts_positive_prefill_step_size(self, value):
+        assert SchedulerConfig(prefill_step_size=value).prefill_step_size == value
+
     def test_default_config(self):
         """Test default scheduler config."""
         config = SchedulerConfig()
@@ -208,6 +217,7 @@ class TestSchedulerConfig:
         assert config.policy == SchedulingPolicy.FCFS
         assert config.prefill_batch_size == 8
         assert config.completion_batch_size == 32
+        assert config.prefill_step_size == 2048
 
     def test_custom_config(self):
         """Test custom scheduler config."""

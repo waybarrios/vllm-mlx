@@ -145,8 +145,19 @@ together with the prefix-cache setting:
 ```
 Registry memory budget: 68.0 GB of model weights; Metal allocation ceiling
 64.0 GB (50% of 128.0 GB, from serve default); prefix-cache maximum
-20.0 GB per continuous-batching engine (--cache-memory-mb, 2 of 3 entries)
+20.0 GB per memory-aware prefix-cache engine (--cache-memory-mb, 2 of 3 entries)
 ```
+
+The entry count follows the cache path each model will use. With
+`--use-paged-cache`, text engines use the paged cache and are excluded from this
+count. MLLM engines still construct a memory-aware prefix cache, so their
+per-engine `--cache-memory-mb` maximum remains included. For an unresolved
+remote model ID, set `mllm: true` on the registry entry so the startup report
+can include its cache without relying on a model-name heuristic.
+
+If an entry enables continuous batching while the global serve default leaves
+it disabled, the report uses the same scheduler defaults as the engine,
+including the default 20% memory-aware cache limit.
 
 When the weights budget alone does not fit below the ceiling, startup warns:
 
@@ -182,9 +193,10 @@ Notes on how the check is computed:
   allocated lazily, and simple-mode entries never receive it at all. Subtracting
   it once would understate capacity with one resident model and overstate it
   with several, so it is reported next to the ceiling rather than folded into
-  it. It is reported only when it can actually bind — that is, for
-  continuous-batching entries using the memory-aware prefix cache (not
-  `--use-paged-cache`).
+  it. It is reported only when it can actually bind: for continuous-batching
+  entries using the memory-aware prefix cache. Text entries using
+  `--use-paged-cache` are excluded, while MLLM entries remain included because
+  they still construct the memory-aware prefix cache.
 - A separate warning fires when `--cache-memory-mb` alone is at or above the
   ceiling, which is a configuration error in its own right.
 - On hosts where MLX cannot report a Metal working-set size, the check reports

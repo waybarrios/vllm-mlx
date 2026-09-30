@@ -86,9 +86,12 @@ class BaseThinkingReasoningParser(ReasoningParser):
         self._tool_call_buffer = ""
         # Trailing text withheld because it might be the start of a tag.
         self._pending = ""
+        # Template injected an open <think>: untagged output is reasoning.
+        self._implicit_mode = False
 
-    def reset_state(self):
+    def reset_state(self, implicit_mode: bool = False):
         """Reset state machine for a new streaming request."""
+        self._implicit_mode = implicit_mode
         self._phase = "pre_think"
         self._content_started = False
         self._content_buffer = ""
