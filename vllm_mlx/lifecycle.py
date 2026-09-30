@@ -11,6 +11,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 
+from .context_limits import DEFAULT_MAX_MODEL_LEN
 from .engine.base import BaseEngine, shield_task, suspend_cancellation
 
 
@@ -34,6 +35,7 @@ class ModelSpec:
     scheduler_config: Any | None = None
     stream_interval: int = 1
     max_tokens: int = 32768
+    max_model_len: int = DEFAULT_MAX_MODEL_LEN
     force_mllm: bool = False
     mtp: bool = False
     prefill_step_size: int = 2048

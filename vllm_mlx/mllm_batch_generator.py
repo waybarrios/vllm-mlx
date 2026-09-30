@@ -27,6 +27,11 @@ from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 import mlx.core as mx
 import mlx.nn as nn
 
+from .context_limits import (
+    DEFAULT_MAX_MODEL_LEN,
+    ContextLengthExceeded,
+    validate_context_length,
+)
 from .memory_cache import MemoryAwarePrefixCache, MemoryCacheConfig
 from .multimodal_processor import MultimodalProcessor
 from .vision_embedding_cache import VisionEmbeddingCache
@@ -484,6 +489,7 @@ class MLLMBatchGenerator:
         vision_cache_size: int = 100,
         prefix_cache_config: Optional[MemoryCacheConfig] = None,
         max_kv_size: int = 0,
+        max_model_len: int = DEFAULT_MAX_MODEL_LEN,
     ):
         """
         Initialize MLLM batch generator.
@@ -502,11 +508,13 @@ class MLLMBatchGenerator:
             vision_cache_size: Max entries in vision cache
             prefix_cache_config: Config for KV prefix cache (text-only requests)
             max_kv_size: Maximum KV cache size per sequence (0 = unbounded)
+            max_model_len: Maximum combined prompt and requested output tokens
         """
         self.model = model
         self.processor = processor
         self.mm_processor = mm_processor
         self.max_kv_size = max_kv_size
+        self.max_model_len = max_model_len
 
         # Get language model for text generation
         self.language_model = getattr(model, "language_model", model)
@@ -1019,6 +1027,17 @@ class MLLMBatchGenerator:
             f"({processing_time:.2f}s)"
         )
 
+    def _validate_context_length(self, request: MLLMBatchRequest) -> None:
+        """Validate the media-expanded prompt before allocating KV cache."""
+        if request.input_ids is None:
+            raise RuntimeError("MLLM input IDs are unavailable for context admission")
+        prompt_tokens = request.input_ids.size
+        validate_context_length(
+            prompt_tokens=prompt_tokens,
+            max_tokens=request.max_tokens,
+            max_model_len=self.max_model_len,
+        )
+
     @staticmethod
     def _copy_cache_state(value):
         """Copy mutable state containers while sharing immutable MLX arrays."""
@@ -1365,6 +1384,14 @@ class MLLMBatchGenerator:
         for req in requests:
             try:
                 self._preprocess_request(req)
+                self._validate_context_length(req)
+            except ContextLengthExceeded as e:
+                logger.warning(
+                    "Rejected request %s during context admission: %s",
+                    req.request_id,
+                    e,
+                )
+                failed_requests.append(req)
             except Exception as e:
                 logger.error(
                     f"Failed to preprocess request {req.request_id}: "

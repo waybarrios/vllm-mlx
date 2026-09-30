@@ -46,6 +46,7 @@ vllm-mlx serve --models-config <yaml> [options]
 | `--prefix-trie-cache-memory-mb` | Optional SimpleEngine prompt-trie memory cap in MB | None |
 | `--max-tokens` | Default max tokens | 32768 |
 | `--max-request-tokens` | Maximum `max_tokens` accepted from API clients | 32768 |
+| `--max-model-len` | Maximum prompt plus requested output tokens per request | 65536 |
 | `--stream-interval` | Tokens per stream chunk | 1 |
 | `--mcp-config` | Path to MCP config file | None |
 | `--paged-cache-block-size` | Tokens per cache block | 64 |

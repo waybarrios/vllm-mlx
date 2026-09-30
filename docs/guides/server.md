@@ -77,6 +77,7 @@ vllm-mlx serve mlx-community/Qwen3-8B-4bit \
 | `--cache-memory-percent` | Fraction of RAM for cache | 0.20 |
 | `--max-tokens` | Default max tokens | 32768 |
 | `--max-request-tokens` | Maximum `max_tokens` accepted from API clients | 32768 |
+| `--max-model-len` | Maximum prompt plus requested output tokens per request | 65536 |
 | `--default-temperature` | Default temperature when not specified | None |
 | `--default-top-p` | Default top_p when not specified | None |
 | `--default-chat-template-kwargs` | Default chat template kwargs used when request `chat_template_kwargs` is omitted (JSON object) | None |

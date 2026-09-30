@@ -23,6 +23,11 @@ from mlx_lm.generate import BatchGenerator
 from mlx_lm.sample_utils import make_logits_processors, make_sampler
 from mlx_lm.tokenizer_utils import NaiveStreamingDetokenizer
 
+from .context_limits import (
+    DEFAULT_MAX_MODEL_LEN,
+    encode_prompt,
+    validate_context_length,
+)
 from .memory_cache import MemoryAwarePrefixCache, MemoryCacheConfig
 from .paged_cache import PagedCacheManager
 from .ssd_cache import SSDCacheConfig, SSDCacheTier
@@ -128,6 +133,9 @@ class SchedulerConfig:
 
     # Maximum KV cache size per sequence (0 = unbounded; >0 enables RotatingKVCache)
     max_kv_size: int = 0
+
+    # Maximum combined prompt and requested output tokens per request
+    max_model_len: int = DEFAULT_MAX_MODEL_LEN
 
     # MTP (Multi-Token Prediction) settings
     # Uses the model's built-in MTP head to predict multiple tokens per step
@@ -2042,24 +2050,15 @@ class Scheduler:
         # Tokenize if needed
         if request.prompt_token_ids is None:
             if isinstance(request.prompt, str):
-                # Handle both tokenizers and processors (for MLLM models)
-                if hasattr(self.tokenizer, "encode"):
-                    request.prompt_token_ids = self.tokenizer.encode(request.prompt)
-                elif hasattr(self.tokenizer, "tokenizer") and hasattr(
-                    self.tokenizer.tokenizer, "encode"
-                ):
-                    # Processor wraps tokenizer (e.g., Qwen3VLProcessor)
-                    request.prompt_token_ids = self.tokenizer.tokenizer.encode(
-                        request.prompt
-                    )
-                else:
-                    raise AttributeError(
-                        f"Tokenizer {type(self.tokenizer)} has no 'encode' method. "
-                        "Continuous batching requires a tokenizer with encode support."
-                    )
+                request.prompt_token_ids = encode_prompt(self.tokenizer, request.prompt)
             else:
                 request.prompt_token_ids = list(request.prompt)
-            request.num_prompt_tokens = len(request.prompt_token_ids)
+        request.num_prompt_tokens = len(request.prompt_token_ids)
+        validate_context_length(
+            prompt_tokens=request.num_prompt_tokens,
+            max_tokens=request.max_tokens,
+            max_model_len=self.config.max_model_len,
+        )
 
         # Check prefix cache for cached KV state
         if self.block_aware_cache is not None:

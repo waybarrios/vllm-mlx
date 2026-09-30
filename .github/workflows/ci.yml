@@ -149,6 +149,7 @@ jobs:
         run: |
           pytest \
             tests/test_mllm_steps_executed_stat.py \
+            tests/test_context_limits.py \
             -v --tb=short
 
   test-python-3-14:
@@ -222,6 +223,7 @@ jobs:
             tests/test_text_model_dispatch.py \
             tests/test_cli.py \
             tests/test_model_registry.py \
+            tests/test_context_limits.py \
             tests/test_chat_template_kwargs.py \
             tests/test_collect_eos_token_ids.py \
             tests/test_batching.py \

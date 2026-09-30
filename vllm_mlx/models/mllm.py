@@ -25,8 +25,10 @@ import socket
 import tempfile
 import threading
 from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any, cast
 from urllib.parse import urljoin, urlparse
 
 import numpy as np
@@ -44,13 +46,35 @@ class TempFileManager:
     def __init__(self):
         self._files: set[str] = set()
         self._lock = threading.Lock()
+        self._local = threading.local()
         atexit.register(self.cleanup_all)
 
     def register(self, path: str) -> str:
         """Register a temp file for tracking. Returns the path for convenience."""
         with self._lock:
             self._files.add(path)
+        scopes = getattr(self._local, "cleanup_scopes", None)
+        if scopes:
+            scopes[-1].add(path)
         return path
+
+    @contextmanager
+    def cleanup_scope(self):
+        """Clean files registered by this thread while the scope is active."""
+        scopes = getattr(self._local, "cleanup_scopes", None)
+        if scopes is None:
+            scopes = []
+            self._local.cleanup_scopes = scopes
+        paths: set[str] = set()
+        scopes.append(paths)
+        try:
+            yield
+        finally:
+            scopes.pop()
+            for path in paths:
+                self.cleanup(path)
+            if not scopes:
+                del self._local.cleanup_scopes
 
     def cleanup(self, path: str) -> bool:
         """Clean up a specific temp file. Returns True if successful."""
@@ -1490,6 +1514,240 @@ class MLXMultimodalLM:
     def _prepare_audio(self, audio_inputs: list) -> list[str]:
         """Process audio inputs and return local file paths."""
         return [process_audio_input(audio_input) for audio_input in audio_inputs]
+
+    def _count_formatted_prompt_tokens(
+        self,
+        formatted_prompt: str,
+        *,
+        images: list[str] | None = None,
+        audio: list[str] | None = None,
+    ) -> int:
+        """Return the processor-expanded token count without allocating KV."""
+        from mlx_vlm.utils import prepare_inputs
+
+        image_token_index = getattr(
+            getattr(self.model, "config", None),
+            "image_token_index",
+            None,
+        )
+        inputs = prepare_inputs(
+            self.processor,
+            images=images or None,
+            audio=audio or None,
+            prompts=formatted_prompt,
+            image_token_index=image_token_index,
+        )
+        input_ids = inputs.get("input_ids")
+        if input_ids is None:
+            raise RuntimeError("MLLM processor did not return input_ids")
+        size = input_ids.size
+        return int(size() if callable(size) else size)
+
+    def count_prompt_tokens(
+        self,
+        prompt: str,
+        *,
+        images: list | None = None,
+        videos: list | None = None,
+        audio: list | None = None,
+        video_fps: float = DEFAULT_FPS,
+        video_max_frames: int = MAX_FRAMES,
+    ) -> int:
+        """Count processor-expanded input and remove preflight-only media."""
+        with _temp_manager.cleanup_scope():
+            return self._count_prompt_tokens_unscoped(
+                prompt,
+                images=images,
+                videos=videos,
+                audio=audio,
+                video_fps=video_fps,
+                video_max_frames=video_max_frames,
+            )
+
+    def _count_prompt_tokens_unscoped(
+        self,
+        prompt: str,
+        *,
+        images: list | None = None,
+        videos: list | None = None,
+        audio: list | None = None,
+        video_fps: float = DEFAULT_FPS,
+        video_max_frames: int = MAX_FRAMES,
+    ) -> int:
+        """Count raw generation input exactly as the MLLM processor expands it."""
+        from mlx_vlm.prompt_utils import apply_chat_template
+
+        all_images = self._prepare_images(images or [])
+        for video in videos or []:
+            all_images.extend(
+                self._prepare_video(
+                    video,
+                    fps=video_fps,
+                    max_frames=video_max_frames,
+                )
+            )
+        all_audio = self._prepare_audio(audio or [])
+
+        formatted_prompt = prompt
+        if (all_images or all_audio) and hasattr(self.processor, "apply_chat_template"):
+            try:
+                formatted_prompt = cast(
+                    str,
+                    apply_chat_template(
+                        self.processor,
+                        self.config,
+                        prompt,
+                        num_images=len(all_images),
+                        num_audios=len(all_audio),
+                    ),
+                )
+            except Exception:
+                formatted_prompt = prompt
+        return self._count_formatted_prompt_tokens(
+            formatted_prompt,
+            images=all_images,
+            audio=all_audio,
+        )
+
+    def count_chat_prompt_tokens(
+        self,
+        messages: list[dict],
+        *,
+        tools: list | None = None,
+        video_fps: float = DEFAULT_FPS,
+        video_max_frames: int = MAX_FRAMES,
+        enable_thinking: bool = True,
+        chat_template_kwargs: dict | None = None,
+    ) -> int:
+        """Count chat input and remove media created only for preflight."""
+        with _temp_manager.cleanup_scope():
+            return self._count_chat_prompt_tokens_unscoped(
+                messages,
+                tools=tools,
+                video_fps=video_fps,
+                video_max_frames=video_max_frames,
+                enable_thinking=enable_thinking,
+                chat_template_kwargs=chat_template_kwargs,
+            )
+
+    def _count_chat_prompt_tokens_unscoped(
+        self,
+        messages: list[dict],
+        *,
+        tools: list | None = None,
+        video_fps: float = DEFAULT_FPS,
+        video_max_frames: int = MAX_FRAMES,
+        enable_thinking: bool = True,
+        chat_template_kwargs: dict | None = None,
+    ) -> int:
+        """Count a chat prompt after the same media and template expansion."""
+        from mlx_vlm.prompt_utils import get_chat_template
+
+        video_inputs = self._collect_video_inputs(messages)
+        audio_inputs = self._collect_audio_inputs(messages)
+        if self._video_native and video_inputs:
+            _, native_inputs = self._prepare_native_video_inputs(
+                messages,
+                video_fps=video_fps,
+                video_max_frames=video_max_frames,
+                tools=tools,
+            )
+            return int(native_inputs["input_ids"].size)
+
+        video_frame_counts: dict[int, int] = {}
+        extra_audio: dict[int, list[str]] = {}
+        all_video_frames: list[str] = []
+        all_audio_inputs: list[str] = []
+        for msg_idx, per_message_videos in video_inputs.items():
+            total_frames = 0
+            has_explicit_audio = bool(audio_inputs.get(msg_idx))
+            for video in per_message_videos:
+                try:
+                    resolved_path = process_video_input(video)
+                except Exception as exc:
+                    logger.warning("Could not resolve video during preflight: %s", exc)
+                    resolved_path = None
+                if (
+                    resolved_path
+                    and self._video_native_with_audio
+                    and not has_explicit_audio
+                ):
+                    extracted_audio = extract_audio_from_video(resolved_path)
+                    if extracted_audio:
+                        extra_audio.setdefault(msg_idx, []).append(extracted_audio)
+                frames = self._prepare_video(
+                    video,
+                    fps=video_fps,
+                    max_frames=video_max_frames,
+                    resolved_path=resolved_path,
+                )
+                all_video_frames.extend(frames)
+                total_frames += len(frames)
+            video_frame_counts[msg_idx] = total_frames
+
+        for msg_idx, per_message_audio in extra_audio.items():
+            audio_inputs.setdefault(msg_idx, []).extend(per_message_audio)
+        for per_message_audio in audio_inputs.values():
+            all_audio_inputs.extend(per_message_audio)
+
+        all_image_urls: list[str] = []
+        chat_messages = _build_mllm_chat_messages(
+            messages,
+            all_image_urls=all_image_urls,
+            video_frame_counts=video_frame_counts,
+        )
+        all_images = self._prepare_images(all_image_urls)
+        all_images.extend(all_video_frames)
+        all_audio = self._prepare_audio(all_audio_inputs)
+
+        template_kwargs = dict(chat_template_kwargs or {})
+        if "enable_thinking" in template_kwargs:
+            enable_thinking = bool(template_kwargs.pop("enable_thinking"))
+        if tools:
+            template_kwargs["tools"] = tools
+        get_template = cast(Any, get_chat_template)
+        try:
+            formatted_prompt = cast(
+                str,
+                get_template(
+                    self.processor,
+                    chat_messages,
+                    add_generation_prompt=True,
+                    enable_thinking=enable_thinking,
+                    **template_kwargs,
+                ),
+            )
+        except TypeError:
+            formatted_prompt = cast(
+                str,
+                get_template(
+                    self.processor,
+                    chat_messages,
+                    add_generation_prompt=True,
+                    enable_thinking=enable_thinking,
+                    **({"tools": tools} if tools else {}),
+                ),
+            )
+        except Exception:
+            formatted_prompt = ""
+            for message in reversed(chat_messages):
+                if message.get("role") == "user":
+                    content = message.get("content", "")
+                    if isinstance(content, list):
+                        formatted_prompt = "".join(
+                            part.get("text", "")
+                            for part in content
+                            if isinstance(part, dict) and part.get("type") == "text"
+                        )
+                    else:
+                        formatted_prompt = str(content)
+                    break
+
+        return self._count_formatted_prompt_tokens(
+            formatted_prompt,
+            images=all_images,
+            audio=all_audio,
+        )
 
     def _prepare_video(
         self,

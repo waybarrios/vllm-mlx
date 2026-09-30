@@ -259,6 +259,81 @@ class BaseEngine(ABC):
         pass
 
     @property
+    def max_model_len(self) -> int:
+        """Maximum combined prompt and requested output tokens."""
+        from ..context_limits import DEFAULT_MAX_MODEL_LEN
+
+        return getattr(self, "_max_model_len", DEFAULT_MAX_MODEL_LEN)
+
+    async def validate_generate_context(
+        self,
+        prompt: str,
+        *,
+        max_tokens: int,
+        **_kwargs,
+    ) -> int:
+        """Validate a raw prompt and return its token count."""
+        from ..context_limits import encode_prompt, validate_context_length
+
+        if not getattr(self, "_loaded", False):
+            await self.start()
+        prompt_tokens = len(encode_prompt(self.tokenizer, prompt))
+        validate_context_length(
+            prompt_tokens=prompt_tokens,
+            max_tokens=max_tokens,
+            max_model_len=self.max_model_len,
+        )
+        return prompt_tokens
+
+    async def validate_chat_context(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        max_tokens: int,
+        tools: list[dict] | None = None,
+        **kwargs,
+    ) -> int:
+        """Validate a rendered chat prompt and return its token count."""
+        tokenizer = self.tokenizer
+        if hasattr(tokenizer, "tokenizer"):
+            tokenizer = tokenizer.tokenizer
+        if tokenizer is None:
+            if not getattr(self, "_loaded", False):
+                await self.start()
+            tokenizer = self.tokenizer
+            if hasattr(tokenizer, "tokenizer"):
+                tokenizer = tokenizer.tokenizer
+
+        template_kwargs: dict[str, Any] = {
+            "tokenize": False,
+            "add_generation_prompt": True,
+        }
+        chat_template_kwargs = kwargs.get("chat_template_kwargs") or {}
+        template_kwargs.update(chat_template_kwargs)
+        if tools:
+            template_kwargs["tools"] = tools
+        if kwargs.get("enable_thinking") is not None:
+            template_kwargs["enable_thinking"] = kwargs["enable_thinking"]
+        if tokenizer is not None and hasattr(tokenizer, "apply_chat_template"):
+            try:
+                prompt = tokenizer.apply_chat_template(messages, **template_kwargs)
+            except TypeError:
+                for key in (
+                    "enable_thinking",
+                    "tools",
+                    *chat_template_kwargs.keys(),
+                ):
+                    template_kwargs.pop(key, None)
+                prompt = tokenizer.apply_chat_template(messages, **template_kwargs)
+        else:
+            prompt = "\n".join(f"{m['role']}: {m['content']}" for m in messages)
+            prompt += "\nassistant:"
+        return await self.validate_generate_context(
+            prompt,
+            max_tokens=max_tokens,
+        )
+
+    @property
     def preserve_native_tool_format(self) -> bool:
         """
         Whether to preserve native tool message format.

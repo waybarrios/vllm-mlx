@@ -9,7 +9,7 @@ integrating with vLLM's model execution system.
 import logging
 from collections.abc import Iterator
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Union
+from typing import TYPE_CHECKING, Any, Union, cast
 
 if TYPE_CHECKING:
     import mlx.core as mx
@@ -324,6 +324,43 @@ class MLXLanguageModel:
             if finished:
                 break
 
+    def render_chat_prompt(
+        self,
+        messages: list[dict],
+        *,
+        tools: list | None = None,
+        chat_template_kwargs: dict | None = None,
+    ) -> str:
+        """Render the exact prompt consumed by the blocking chat path."""
+        tokenizer = self.tokenizer
+        if tokenizer is None or not hasattr(tokenizer, "apply_chat_template"):
+            prompt = "\n".join(
+                f"{message['role']}: {message['content']}" for message in messages
+            )
+            return prompt + "\nassistant:"
+
+        template_kwargs: dict[str, Any] = {
+            "tokenize": False,
+            "add_generation_prompt": True,
+        }
+        if tools:
+            template_kwargs["tools"] = tools
+        if chat_template_kwargs:
+            template_kwargs.update(chat_template_kwargs)
+        try:
+            return cast(
+                str,
+                tokenizer.apply_chat_template(messages, **template_kwargs),
+            )
+        except TypeError:
+            template_kwargs.pop("tools", None)
+            for key in chat_template_kwargs or {}:
+                template_kwargs.pop(key, None)
+            return cast(
+                str,
+                tokenizer.apply_chat_template(messages, **template_kwargs),
+            )
+
     def chat(
         self,
         messages: list[dict],
@@ -351,38 +388,11 @@ class MLXLanguageModel:
         if not self._loaded:
             self.load()
 
-        # Apply chat template
-        if hasattr(self.tokenizer, "apply_chat_template"):
-            # Build kwargs for apply_chat_template
-            template_kwargs = {
-                "tokenize": False,
-                "add_generation_prompt": True,
-            }
-
-            # Add tools if provided and supported
-            if tools:
-                template_kwargs["tools"] = tools
-            if chat_template_kwargs:
-                template_kwargs.update(chat_template_kwargs)
-
-            try:
-                prompt = self.tokenizer.apply_chat_template(
-                    messages,
-                    **template_kwargs,
-                )
-            except TypeError:
-                # Tokenizer doesn't support all requested template kwargs
-                template_kwargs.pop("tools", None)
-                for key in (chat_template_kwargs or {}).keys():
-                    template_kwargs.pop(key, None)
-                prompt = self.tokenizer.apply_chat_template(
-                    messages,
-                    **template_kwargs,
-                )
-        else:
-            # Fallback: simple concatenation
-            prompt = "\n".join(f"{msg['role']}: {msg['content']}" for msg in messages)
-            prompt += "\nassistant:"
+        prompt = self.render_chat_prompt(
+            messages,
+            tools=tools,
+            chat_template_kwargs=chat_template_kwargs,
+        )
 
         return self.generate(
             prompt=prompt,

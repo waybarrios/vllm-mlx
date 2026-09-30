@@ -167,6 +167,8 @@ def _batched_mllm_engine(scheduler, *, default_mllm_draft=False):
         default_mllm_draft=default_mllm_draft,
     )
     engine._loaded = True
+    if not hasattr(scheduler, "validate_context"):
+        scheduler.validate_context = lambda **_kwargs: 1
     engine._mllm_scheduler = scheduler
     return engine
 

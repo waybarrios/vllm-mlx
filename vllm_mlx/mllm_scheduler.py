@@ -30,6 +30,7 @@ from typing import Any, AsyncIterator, Dict, List, Optional, Set, Tuple
 
 from mlx_lm.tokenizer_utils import NaiveStreamingDetokenizer
 
+from .context_limits import DEFAULT_MAX_MODEL_LEN
 from .mllm_batch_generator import (
     MLLMBatchGenerator,
     MLLMBatchRequest,
@@ -87,6 +88,8 @@ class MLLMSchedulerConfig:
     chunked_prefill_tokens: int = 0
     # Maximum KV cache size per sequence (0 = unbounded; >0 enables RotatingKVCache)
     max_kv_size: int = 0
+    # Maximum combined prompt and requested output tokens per request
+    max_model_len: int = DEFAULT_MAX_MODEL_LEN
     # SSD cold tier for the prefix cache (mirrors SchedulerConfig).
     # None = disabled.  When set, the MLLM MemoryAwarePrefixCache spills
     # evicted entries to disk and promotes them back on hit.
@@ -315,6 +318,7 @@ class MLLMScheduler:
                 prefill_step_size=self.config.prefill_step_size,
                 prefix_cache_config=prefix_cache_config,
                 max_kv_size=self.config.max_kv_size,
+                max_model_len=self.config.max_model_len,
             )
 
             # Wire the SSD cold tier onto the MLLM prefix cache, mirroring the
@@ -460,6 +464,31 @@ class MLLMScheduler:
         )
 
         return request_id
+
+    def validate_context(
+        self,
+        *,
+        prompt: str,
+        images: Optional[List[str]] = None,
+        videos: Optional[List[str]] = None,
+        audio: Optional[List[str]] = None,
+        max_tokens: int = 256,
+    ) -> int:
+        """Preprocess and validate a request without allocating KV cache."""
+        self._ensure_batch_generator()
+        assert self.batch_generator is not None
+        request = MLLMBatchRequest(
+            uid=-1,
+            request_id="context-preflight",
+            prompt=prompt,
+            images=images,
+            videos=videos,
+            audio=audio,
+            max_tokens=max_tokens,
+        )
+        self.batch_generator._preprocess_request(request)
+        self.batch_generator._validate_context_length(request)
+        return request.input_ids.size if request.input_ids is not None else 0
 
     def abort_request(self, request_id: str) -> bool:
         """

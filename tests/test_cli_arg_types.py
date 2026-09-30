@@ -140,3 +140,29 @@ class TestMemoryBudgetGbCliWiring:
             create_parser().parse_args(["serve", "--memory-budget-gb", bad_value])
 
         assert "--memory-budget-gb" in capsys.readouterr().err
+
+
+class TestMaxModelLenCliWiring:
+    def test_defaults_to_65536_and_accepts_override(self):
+        """Dropping or mis-defaulting the limit would leave KV admission unbounded."""
+        from vllm_mlx.cli import create_parser
+
+        parser = create_parser()
+        default_args = parser.parse_args(["serve", "test-model"])
+        override_args = parser.parse_args(
+            ["serve", "test-model", "--max-model-len", "131072"]
+        )
+
+        assert default_args.max_model_len == 65_536
+        assert override_args.max_model_len == 131_072
+
+    def test_rejects_non_positive_values(self, capsys):
+        """Replacing the positive parser with ``int`` would admit a disabled cap."""
+        from vllm_mlx.cli import create_parser
+
+        with pytest.raises(SystemExit):
+            create_parser().parse_args(["serve", "test-model", "--max-model-len", "0"])
+
+        error = capsys.readouterr().err
+        assert "--max-model-len" in error
+        assert "positive integer" in error
