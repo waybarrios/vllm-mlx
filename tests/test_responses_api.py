@@ -656,6 +656,41 @@ class TestResponsesEndpoint:
         assert len(engine._stream_calls) == 1
         engine.chat.assert_not_awaited()
 
+    def test_streaming_reasoning_flushes_partial_marker(self, client, monkeypatch):
+        import vllm_mlx.server as srv
+
+        engine = _mock_engine(_output("unused"))
+        engine.chat = AsyncMock(
+            side_effect=AssertionError("stream path should not call chat")
+        )
+        engine._stream_outputs = [
+            _stream_output("thinking</thi", completion_tokens=2, finish_reason="stop")
+        ]
+        srv._engine = engine
+        monkeypatch.setattr(srv, "_reasoning_parser_name", "qwen3")
+        monkeypatch.setattr(srv, "_reasoning_parser", None)
+
+        with client.stream(
+            "POST",
+            "/v1/responses",
+            json={"model": "test-model", "input": "Think", "stream": True},
+        ) as resp:
+            body = "".join(resp.iter_text())
+
+        assert resp.status_code == 200
+        events = _parse_sse_events(body)
+        reasoning = "".join(
+            payload["delta"]
+            for event_type, payload in events
+            if event_type == "response.reasoning_text.delta"
+        )
+        event_types = [event_type for event_type, _ in events]
+
+        assert reasoning == "thinking</thi"
+        assert event_types.index("response.reasoning_text.delta") < event_types.index(
+            "response.completed"
+        )
+
     def test_streaming_response_sequence_metadata_is_monotonic(self, client):
         import vllm_mlx.server as srv
 
@@ -754,6 +789,110 @@ class TestResponsesEndpoint:
         assert not any("[Calling tool:" in delta for delta in output_text_deltas)
         assert len(function_call_deltas) == 1
         assert function_call_deltas[0]["delta"] == '{"a": 1, "b": 2}'
+
+    def test_deepseek_v4_reasoning_routes_dsml_through_tool_parser(
+        self, client, monkeypatch
+    ):
+        import vllm_mlx.server as srv
+
+        d = "｜DSML｜"
+        engine = _mock_engine(_output("unused"))
+        engine._stream_outputs = [
+            _stream_output("thinking</think>Checking.\n\n"),
+            _stream_output("<"),
+            _stream_output(d),
+            _stream_output("tool_calls>\n"),
+            _stream_output(f'<{d}invoke name="get_weather">\n'),
+            _stream_output(
+                f'<{d}parameter name="city" string="true">Prague' f"</{d}parameter>\n"
+            ),
+            _stream_output(f"</{d}invoke>\n"),
+            _stream_output(f"</{d}tool_calls>", finish_reason="stop"),
+        ]
+        srv._engine = engine
+        monkeypatch.setattr(srv, "_enable_auto_tool_choice", True)
+        monkeypatch.setattr(srv, "_tool_call_parser", "deepseek_v4")
+        monkeypatch.setattr(srv, "_tool_parser_instance", None)
+        monkeypatch.setattr(srv, "_reasoning_parser_name", "deepseek_v4")
+        monkeypatch.setattr(srv, "_reasoning_parser", None)
+
+        with client.stream(
+            "POST",
+            "/v1/responses",
+            json={
+                "model": "test-model",
+                "input": "Check the weather",
+                "stream": True,
+                "tools": [
+                    {
+                        "type": "function",
+                        "name": "get_weather",
+                        "parameters": {"type": "object"},
+                    }
+                ],
+            },
+        ) as resp:
+            body = "".join(resp.iter_text())
+
+        events = _parse_sse_events(body)
+        text_deltas = [
+            payload["delta"]
+            for event_type, payload in events
+            if event_type == "response.output_text.delta"
+        ]
+        function_items = [
+            payload["item"]
+            for event_type, payload in events
+            if event_type == "response.output_item.added"
+            and payload["item"]["type"] == "function_call"
+        ]
+        completed = next(
+            payload["response"]
+            for event_type, payload in events
+            if event_type == "response.completed"
+        )
+
+        assert resp.status_code == 200
+        assert "".join(text_deltas).strip() == "Checking."
+        assert d not in "".join(text_deltas)
+        assert d not in completed["output_text"]
+        assert len(function_items) == 1
+        assert function_items[0]["name"] == "get_weather"
+
+    def test_streaming_response_without_tools_keeps_llama_shaped_json(
+        self, client, monkeypatch
+    ):
+        """Configured parsing must not suppress JSON when no tools are declared."""
+        import vllm_mlx.server as srv
+
+        text = '{"name":"Alice","parameters":{"age":42}}'
+        engine = _mock_engine(_output("unused"))
+        engine._stream_outputs = [_stream_output(text, finish_reason="stop")]
+        srv._engine = engine
+        monkeypatch.setattr(srv, "_enable_auto_tool_choice", True)
+        monkeypatch.setattr(srv, "_tool_call_parser", "llama")
+        monkeypatch.setattr(srv, "_tool_parser_instance", None)
+        monkeypatch.setattr(srv, "_reasoning_parser", None)
+
+        with client.stream(
+            "POST",
+            "/v1/responses",
+            json={"model": "test-model", "input": "Describe Alice", "stream": True},
+        ) as resp:
+            body = "".join(resp.iter_text())
+
+        events = _parse_sse_events(body)
+        text_deltas = [
+            payload["delta"]
+            for event_type, payload in events
+            if event_type == "response.output_text.delta"
+        ]
+
+        assert resp.status_code == 200
+        assert text_deltas == [text]
+        assert not any(
+            event_type.startswith("response.function_call") for event_type, _ in events
+        )
 
     def test_json_object_response_format_is_rejected(self, client):
         import vllm_mlx.server as srv

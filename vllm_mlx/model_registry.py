@@ -21,7 +21,8 @@ from pathlib import Path
 from typing import Any, Literal
 
 from .api.utils import is_mllm_model
-from .engine.base import BaseEngine
+from .cli_arg_types import parse_positive_finite_float
+from .engine.base import BaseEngine, suspend_cancellation
 from .engine.batched import BatchedEngine
 from .engine.simple import SimpleEngine
 from .scheduler import SchedulerConfig
@@ -118,11 +119,15 @@ class RegistryServeDefaults:
     specprefill_keep_pct: float
     specprefill_backbone_pct: float
     specprefill_draft_model: str | None
+    prefix_trie_cache: bool
+    prefix_trie_cache_size: int
+    prefix_trie_cache_memory_mb: int | None
     stream_interval: int
     gpu_memory_utilization: float
     scheduler_config: SchedulerConfig | None
     max_tokens: int
     download_config: DownloadConfig
+    auto_unload_idle_seconds: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -140,6 +145,7 @@ class RegistryManagerConfig:
 
     memory_budget_bytes: int
     policy: ContentionPolicy
+    idle_unload_seconds: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -158,6 +164,9 @@ class RegisteredModel:
     specprefill_keep_pct: float | None = None
     specprefill_backbone_pct: float | None = None
     specprefill_draft_model: str | None = None
+    prefix_trie_cache: bool | None = None
+    prefix_trie_cache_size: int | None = None
+    prefix_trie_cache_memory_mb: int | None = None
     stream_interval: int | None = None
     gpu_memory_utilization: float | None = None
     estimated_memory_bytes: int | None = None
@@ -178,6 +187,9 @@ class ResolvedModelConfig:
     specprefill_keep_pct: float
     specprefill_backbone_pct: float
     specprefill_draft_model: str | None
+    prefix_trie_cache: bool
+    prefix_trie_cache_size: int
+    prefix_trie_cache_memory_mb: int | None
     stream_interval: int
     gpu_memory_utilization: float
     scheduler_config: SchedulerConfig | None
@@ -229,29 +241,47 @@ class ModelLease:
         await self.release()
 
 
-def _clone_scheduler_config(config: SchedulerConfig | None) -> SchedulerConfig | None:
+def _clone_scheduler_config(
+    config: SchedulerConfig | None, *, prefill_step_size: int
+) -> SchedulerConfig | None:
     """Clone a SchedulerConfig so per-model overrides do not mutate globals."""
     if config is None:
         return None
-    return SchedulerConfig(**vars(config))
+    values = vars(config).copy()
+    values["prefill_step_size"] = prefill_step_size
+    return SchedulerConfig(**values)
 
 
 def _parse_memory_budget_bytes(value: Any) -> int:
     """Parse a memory budget from bytes, MB, or GB."""
     if value is None:
         raise ValueError("models-config manager.memory_budget_gb is required")
+    multiplier = 1024**3
+    amount: str | int | float
     if isinstance(value, (int, float)):
-        return int(float(value) * (1024**3))
-    if isinstance(value, str):
+        amount = value
+    elif isinstance(value, str):
         raw = value.strip().lower()
         if raw.endswith("gb"):
-            return int(float(raw[:-2]) * (1024**3))
-        if raw.endswith("mb"):
-            return int(float(raw[:-2]) * (1024**2))
-        if raw.endswith("b"):
-            return int(float(raw[:-1]))
-        return int(float(raw) * (1024**3))
-    raise TypeError(f"Unsupported memory budget value: {value!r}")
+            amount = raw[:-2]
+        elif raw.endswith("mb"):
+            amount = raw[:-2]
+            multiplier = 1024**2
+        elif raw.endswith("b"):
+            amount = raw[:-1]
+            multiplier = 1
+        else:
+            amount = raw
+    else:
+        raise TypeError(f"Unsupported memory budget value: {value!r}")
+
+    value_name = "models-config manager memory budget"
+    parsed = parse_positive_finite_float(amount, value_name)
+    bytes_value = parse_positive_finite_float(parsed * multiplier, value_name)
+    memory_budget_bytes = int(bytes_value)
+    if memory_budget_bytes == 0:
+        raise ValueError(f"{value_name} must be at least 1 byte")
+    return memory_budget_bytes
 
 
 def _safe_available_memory_bytes() -> int:
@@ -292,10 +322,10 @@ class MemoryBudgetReport:
 
     The prefix-cache limit is deliberately *not* folded into that comparison.
     ``cache_memory_mb`` is a per-engine maximum — it is cloned into each
-    resident continuous-batching engine and allocated lazily, and simple-mode
-    entries never receive it at all — so it is neither a single process-wide
-    reservation nor a bound that can be subtracted once. It is reported
-    alongside the ceiling instead, with its own conflict check.
+    applicable resident continuous-batching engine and allocated lazily, and
+    simple-mode entries never receive it at all — so it is neither a single
+    process-wide reservation nor a bound that can be subtracted once. It is
+    reported alongside the ceiling instead, with its own conflict check.
     """
 
     budget_bytes: int
@@ -304,6 +334,7 @@ class MemoryBudgetReport:
     gpu_memory_utilization_source: str | None
     per_engine_cache_limit_bytes: int | None
     per_engine_cache_percent: float | None
+    memory_aware_prefix_cache_entries: int
     continuous_batching_entries: int
     total_entries: int
 
@@ -337,6 +368,26 @@ class MemoryBudgetReport:
         return self.per_engine_cache_limit_bytes >= ceiling
 
 
+def _registry_entry_uses_mllm_path(
+    entry: RegisteredModel, defaults: RegistryServeDefaults
+) -> bool:
+    """Classify explicit or locally verifiable MLLM registry entries."""
+    force_mllm = (
+        entry.force_mllm if entry.force_mllm is not None else defaults.force_mllm
+    )
+    if force_mllm:
+        return True
+
+    # Remote IDs are unresolved when this startup report is built. Their names
+    # are only a heuristic and can disagree with the downloaded config that the
+    # engine later treats as authoritative. Require an explicit declaration for
+    # remote entries so capacity warnings cannot be false positives.
+    if not Path(entry.source).exists():
+        return False
+
+    return is_mllm_model(entry.source)
+
+
 def build_memory_budget_report(
     manager_config: RegistryManagerConfig,
     registry: dict[str, RegisteredModel],
@@ -361,6 +412,13 @@ def build_memory_budget_report(
     # even constructed with a gpu_memory_utilization — so a simple-mode entry's
     # override is inert and must not be treated as a ceiling candidate.
     candidates: list[tuple[float, int, str]] = []
+    memory_aware_prefix_cache_entries = 0
+    scheduler_config = defaults.scheduler_config
+    if scheduler_config is None:
+        # A registry entry can enable continuous batching while the global CLI
+        # flag is off. BatchedEngine supplies SchedulerConfig defaults in that
+        # case, so the startup report must account for the same default cache.
+        scheduler_config = SchedulerConfig()
     for name in sorted(registry):
         entry = registry[name]
         entry_continuous_batching = (
@@ -370,6 +428,18 @@ def build_memory_budget_report(
         )
         if not entry_continuous_batching:
             continue
+
+        if (
+            scheduler_config is not None
+            and getattr(scheduler_config, "enable_prefix_cache", False)
+            and getattr(scheduler_config, "use_memory_aware_cache", False)
+        ):
+            uses_mllm_path = _registry_entry_uses_mllm_path(entry, defaults)
+            if uses_mllm_path or not getattr(
+                scheduler_config, "use_paged_cache", False
+            ):
+                memory_aware_prefix_cache_entries += 1
+
         if entry.gpu_memory_utilization is not None:
             # Rank 1: an override is only attributable to the entry declaring it.
             candidates.append(
@@ -386,17 +456,14 @@ def build_memory_budget_report(
     if candidates:
         utilization, _, utilization_source = min(candidates)
 
-    # cache_memory_mb only binds for continuous-batching engines, and only when
-    # the memory-aware prefix cache is the one actually in use.
-    scheduler_config = defaults.scheduler_config
+    # cache_memory_mb only binds for continuous-batching engines that actually
+    # construct the memory-aware prefix cache. Text engines select the paged
+    # cache when requested, but MLLM engines do not implement that cache and
+    # continue to construct MemoryAwarePrefixCache.
     per_engine_cache_limit_bytes: int | None = None
     per_engine_cache_percent: float | None = None
     cache_applies = (
-        scheduler_config is not None
-        and continuous_batching_entries > 0
-        and getattr(scheduler_config, "enable_prefix_cache", False)
-        and not getattr(scheduler_config, "use_paged_cache", False)
-        and getattr(scheduler_config, "use_memory_aware_cache", False)
+        scheduler_config is not None and memory_aware_prefix_cache_entries > 0
     )
     if cache_applies:
         cache_memory_mb = getattr(scheduler_config, "cache_memory_mb", None)
@@ -414,6 +481,7 @@ def build_memory_budget_report(
         gpu_memory_utilization_source=utilization_source,
         per_engine_cache_limit_bytes=per_engine_cache_limit_bytes,
         per_engine_cache_percent=per_engine_cache_percent,
+        memory_aware_prefix_cache_entries=memory_aware_prefix_cache_entries,
         continuous_batching_entries=continuous_batching_entries,
         total_entries=len(registry),
     )
@@ -440,16 +508,19 @@ def log_memory_budget_report(report: MemoryBudgetReport) -> None:
         )
         return
 
-    engines = f"{report.continuous_batching_entries} of {report.total_entries} entries"
+    engines = (
+        f"{report.memory_aware_prefix_cache_entries} of "
+        f"{report.total_entries} entries"
+    )
     if report.per_engine_cache_limit_bytes is not None:
         cache_desc = (
             f"{report.per_engine_cache_limit_bytes / gb:.1f} GB per "
-            f"continuous-batching engine (--cache-memory-mb, {engines})"
+            f"memory-aware prefix-cache engine (--cache-memory-mb, {engines})"
         )
     elif report.per_engine_cache_percent is not None:
         cache_desc = (
             f"~{report.per_engine_cache_percent * 100:.0f}% of available RAM per "
-            f"continuous-batching engine (--cache-memory-percent, {engines}); "
+            f"memory-aware prefix-cache engine (--cache-memory-percent, {engines}); "
             "scales at runtime"
         )
     else:
@@ -483,10 +554,11 @@ def log_memory_budget_report(report: MemoryBudgetReport) -> None:
 
     if report.cache_limit_exceeds_ceiling:
         logger.warning(
-            "--cache-memory-mb (%.1f GB per continuous-batching engine) is at or "
+            "--cache-memory-mb (%.1f GB per memory-aware prefix-cache engine) is "
+            "at or "
             "above the Metal allocation ceiling (%.1f GB) on its own, leaving no "
             "room for model weights. Note this is a per-engine maximum: it is "
-            "cloned into every resident continuous-batching engine, so the "
+            "cloned into every applicable resident continuous-batching engine, so the "
             "aggregate grows with the number of resident models.",
             (report.per_engine_cache_limit_bytes or 0) / gb,
             ceiling / gb,
@@ -522,6 +594,8 @@ def _estimate_model_bytes_from_source(source: str) -> int:
 def load_registry_config(
     config_path: str | os.PathLike[str],
     defaults: RegistryServeDefaults,
+    *,
+    memory_budget_gb: float | None = None,
 ) -> tuple[RegistryManagerConfig, dict[str, RegisteredModel]]:
     """Load and validate the models registry YAML file."""
     import yaml  # lazy: only needed when a registry config is provided
@@ -555,11 +629,19 @@ def load_registry_config(
     }:
         raise ValueError(f"Unsupported contention strategy: {policy.strategy}")
 
+    idle_unload_seconds = manager_raw.get("idle_unload_seconds")
     manager = RegistryManagerConfig(
         memory_budget_bytes=_parse_memory_budget_bytes(
-            manager_raw.get("memory_budget_gb", manager_raw.get("memory_budget"))
+            memory_budget_gb
+            if memory_budget_gb is not None
+            else manager_raw.get("memory_budget_gb", manager_raw.get("memory_budget"))
         ),
         policy=policy,
+        idle_unload_seconds=(
+            float(idle_unload_seconds)
+            if idle_unload_seconds is not None
+            else defaults.auto_unload_idle_seconds
+        ),
     )
 
     registry: dict[str, RegisteredModel] = {}
@@ -611,6 +693,9 @@ def load_registry_config(
             specprefill_keep_pct=item.get("specprefill_keep_pct"),
             specprefill_backbone_pct=item.get("specprefill_backbone_pct"),
             specprefill_draft_model=item.get("specprefill_draft_model"),
+            prefix_trie_cache=item.get("prefix_trie_cache"),
+            prefix_trie_cache_size=item.get("prefix_trie_cache_size"),
+            prefix_trie_cache_memory_mb=item.get("prefix_trie_cache_memory_mb"),
             stream_interval=item.get("stream_interval"),
             gpu_memory_utilization=gpu_memory_utilization,
             estimated_memory_bytes=estimated_bytes,
@@ -643,6 +728,10 @@ class ModelManager:
     @property
     def memory_budget_bytes(self) -> int:
         return self._config.memory_budget_bytes
+
+    @property
+    def idle_unload_seconds(self) -> float:
+        return self._config.idle_unload_seconds
 
     @property
     def registered_model_names(self) -> list[str]:
@@ -688,9 +777,25 @@ class ModelManager:
                     "owned_by": "vllm-mlx",
                     "source": entry.source,
                     "memory_gb": round(estimated / (1024**3), 2) if estimated else None,
+                    "last_used_at": loaded.last_used_at if loaded is not None else None,
                 }
             )
         return data
+
+    def get_metrics_engine(self) -> BaseEngine | None:
+        """Return the engine to source Prometheus gauges from, or None if idle.
+
+        The gauges this feeds (``/metrics``) are unlabeled scalars with no
+        ``model=`` dimension, so they can only ever describe one engine at a
+        time. With a single resident model that engine is the obvious and
+        exact choice. With more than one resident, there is no way to report
+        all of them without a schema change, so this reports the most
+        recently used one as a representative sample rather than reporting
+        nothing.
+        """
+        if not self._loaded:
+            return None
+        return max(self._loaded.values(), key=lambda loaded: loaded.last_used_at).engine
 
     async def preload(self) -> None:
         """Preload any entries marked preload=true."""
@@ -835,6 +940,55 @@ class ModelManager:
         if unload is not None:
             await self._run_unloads([unload])
 
+    async def unload_idle(self) -> list[str]:
+        """Unload every loaded model idle past ``idle_unload_seconds``.
+
+        No-op (returns an empty list) if idle-unload is disabled
+        (``idle_unload_seconds <= 0``). Unlike memory-budget eviction, this
+        proactively frees models even when no other model is being requested.
+        Returns the names of models that were unloaded.
+        """
+        idle_seconds = self._config.idle_unload_seconds
+        if idle_seconds <= 0:
+            return []
+
+        now = time.time()
+        async with self._condition:
+            stale = [
+                loaded
+                for loaded in self._idle_candidates_locked()
+                if now - loaded.last_used_at >= idle_seconds
+            ]
+            unloads = [
+                self._begin_unload_locked(loaded.config.entry.name) for loaded in stale
+            ]
+            self._condition.notify_all()
+
+        if unloads:
+            await self._run_unloads(unloads)
+
+        return [loaded.config.entry.name for loaded in unloads]
+
+    async def run_idle_reaper(self) -> None:
+        """Background loop that proactively unloads idle models.
+
+        Mirrors the single-model residency lifecycle loop: sleeps at half the
+        configured idle timeout (bounded to 5s) so short timeouts stay
+        responsive, and a failed pass is logged rather than killing the loop.
+        """
+        idle_seconds = self._config.idle_unload_seconds
+        if idle_seconds <= 0:
+            return
+
+        while True:
+            await asyncio.sleep(min(idle_seconds / 2, 5.0))
+            try:
+                await self.unload_idle()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("Idle unload pass failed")
+
     def _claim_loaded_locked(
         self,
         model_name: str,
@@ -916,13 +1070,22 @@ class ModelManager:
             await asyncio.wait_for(self._condition.wait(), timeout=timeout)
 
     async def _run_unloads(self, unloads: list[LoadedModel]) -> None:
-        for loaded in unloads:
-            try:
-                await loaded.engine.stop()
-            finally:
-                async with self._condition:
-                    self._unloading.pop(loaded.config.entry.name, None)
-                    self._condition.notify_all()
+        async def _stop_engines() -> None:
+            for loaded in unloads:
+                try:
+                    await loaded.engine.stop()
+                finally:
+                    async with self._condition:
+                        self._unloading.pop(loaded.config.entry.name, None)
+                        self._condition.notify_all()
+
+        unload_task = asyncio.create_task(_stop_engines())
+        try:
+            await asyncio.shield(unload_task)
+        except asyncio.CancelledError:
+            with suspend_cancellation():
+                await unload_task
+            raise
 
     def _reserve_load_locked(self, model_name: str, required_bytes: int) -> PendingLoad:
         future: asyncio.Future[LoadedModel] = asyncio.get_running_loop().create_future()
@@ -939,19 +1102,25 @@ class ModelManager:
         self._unloading[model_name] = loaded
         return loaded
 
+    def _idle_candidates_locked(
+        self, *, exclude: str | None = None
+    ) -> list[LoadedModel]:
+        """Loaded, non-busy models eligible for eviction, oldest-used first."""
+        return sorted(
+            (
+                loaded
+                for name, loaded in self._loaded.items()
+                if name != exclude and loaded.active_requests == 0
+            ),
+            key=lambda item: item.last_used_at,
+        )
+
     def _collect_idle_unloads_locked(
         self, requested_model: str, required_bytes: int
     ) -> list[LoadedModel]:
         selected: list[LoadedModel] = []
         projected_bytes = self._committed_bytes_locked()
-        candidates = sorted(
-            (
-                loaded
-                for name, loaded in self._loaded.items()
-                if name != requested_model and loaded.active_requests == 0
-            ),
-            key=lambda item: item.last_used_at,
-        )
+        candidates = self._idle_candidates_locked(exclude=requested_model)
 
         for loaded in candidates:
             if projected_bytes + required_bytes <= self._config.memory_budget_bytes:
@@ -1049,6 +1218,11 @@ class ModelManager:
                 stream_interval=config.stream_interval,
                 force_mllm=config.force_mllm,
                 gpu_memory_utilization=config.gpu_memory_utilization,
+                specprefill_enabled=config.specprefill_enabled,
+                specprefill_threshold=config.specprefill_threshold,
+                specprefill_keep_pct=config.specprefill_keep_pct,
+                specprefill_backbone_pct=config.specprefill_backbone_pct,
+                specprefill_draft_model=config.specprefill_draft_model,
             )
         else:
             engine = SimpleEngine(
@@ -1061,6 +1235,9 @@ class ModelManager:
                 specprefill_keep_pct=config.specprefill_keep_pct,
                 specprefill_backbone_pct=config.specprefill_backbone_pct,
                 specprefill_draft_model=config.specprefill_draft_model,
+                prefix_trie_cache=config.prefix_trie_cache,
+                prefix_trie_cache_size=config.prefix_trie_cache_size,
+                prefix_trie_cache_memory_mb=config.prefix_trie_cache_memory_mb,
             )
 
         await engine.start()
@@ -1117,8 +1294,6 @@ class ModelManager:
     def _resolve_model_config(
         self, entry: RegisteredModel, resolved_source: str
     ) -> ResolvedModelConfig:
-        scheduler_config = _clone_scheduler_config(self._defaults.scheduler_config)
-
         continuous_batching = (
             entry.continuous_batching
             if entry.continuous_batching is not None
@@ -1138,6 +1313,9 @@ class ModelManager:
             entry.prefill_step_size
             if entry.prefill_step_size is not None
             else self._defaults.prefill_step_size
+        )
+        scheduler_config = _clone_scheduler_config(
+            self._defaults.scheduler_config, prefill_step_size=prefill_step_size
         )
         specprefill_enabled = (
             entry.specprefill_enabled
@@ -1164,6 +1342,21 @@ class ModelManager:
             if entry.specprefill_draft_model is not None
             else self._defaults.specprefill_draft_model
         )
+        prefix_trie_cache = (
+            entry.prefix_trie_cache
+            if entry.prefix_trie_cache is not None
+            else self._defaults.prefix_trie_cache
+        )
+        prefix_trie_cache_size = (
+            entry.prefix_trie_cache_size
+            if entry.prefix_trie_cache_size is not None
+            else self._defaults.prefix_trie_cache_size
+        )
+        prefix_trie_cache_memory_mb = (
+            entry.prefix_trie_cache_memory_mb
+            if entry.prefix_trie_cache_memory_mb is not None
+            else self._defaults.prefix_trie_cache_memory_mb
+        )
         stream_interval = (
             entry.stream_interval
             if entry.stream_interval is not None
@@ -1188,6 +1381,9 @@ class ModelManager:
             specprefill_keep_pct=specprefill_keep_pct,
             specprefill_backbone_pct=specprefill_backbone_pct,
             specprefill_draft_model=specprefill_draft_model,
+            prefix_trie_cache=prefix_trie_cache,
+            prefix_trie_cache_size=prefix_trie_cache_size,
+            prefix_trie_cache_memory_mb=prefix_trie_cache_memory_mb,
             stream_interval=stream_interval,
             gpu_memory_utilization=gpu_memory_utilization,
             scheduler_config=scheduler_config,

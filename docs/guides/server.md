@@ -45,6 +45,13 @@ Clients route requests by setting the OpenAI `model` field to one of the configu
 Set server defaults for chat template kwargs. Request-level `chat_template_kwargs`
 values still win per key.
 
+For chat requests, top-level `reasoning_effort` is forwarded verbatim to the
+model's chat template. It overrides the server default; an explicit
+`chat_template_kwargs.reasoning_effort` overrides both. Accepted values and
+fallback behavior are template-specific: OpenAI's `low`/`medium`/`high` values
+are not portable across models. Check the selected model's template before
+choosing a value; a template may ignore the field or use its own fallback.
+
 ```bash
 vllm-mlx serve mlx-community/Qwen3-8B-4bit \
   --reasoning-parser qwen3 \
@@ -63,6 +70,9 @@ vllm-mlx serve mlx-community/Qwen3-8B-4bit \
 | `--enable-metrics` | Expose Prometheus metrics on `/metrics` | False |
 | `--continuous-batching` | Enable batching for multi-user | False |
 | `--use-paged-cache` | Enable paged KV cache | False |
+| `--prefix-trie-cache` | Enable conversation-prefix reuse in pure-LLM SimpleEngine mode | False |
+| `--prefix-trie-cache-size` | Maximum SimpleEngine prompt-trie entries | 32 |
+| `--prefix-trie-cache-memory-mb` | Optional SimpleEngine prompt-trie memory cap in MB | None |
 | `--cache-memory-mb` | Cache memory limit in MB | Auto |
 | `--cache-memory-percent` | Fraction of RAM for cache | 0.20 |
 | `--max-tokens` | Default max tokens | 32768 |

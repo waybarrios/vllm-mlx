@@ -28,6 +28,60 @@ def _needs_tokenizer_fallback(model_name: str) -> bool:
     return any(pattern.lower() in model_lower for pattern in FALLBACK_MODELS)
 
 
+def collect_eos_token_ids(tokenizer, model_path=None) -> set:
+    """Collect the full EOS/stop token-id set for a model.
+
+    Unions every place an EOS id can be declared:
+    - ``tokenizer.eos_token_id`` (int or list)
+    - ``tokenizer.eos_token_ids`` (mlx_lm TokenizerWrapper attribute)
+    - ``config.json`` / ``generation_config.json`` ``eos_token_id``
+
+    Chat models routinely declare turn terminators only in the config EOS
+    list, not as the tokenizer's single ``eos_token`` (e.g. Gemma 4 ends
+    chat turns with ``<turn|>``=106 and tool responses with
+    ``<|tool_response>``=50 while ``tokenizer.eos_token`` stays ``<eos>``=1).
+    Generating with only ``{tokenizer.eos_token_id}`` makes such models run
+    straight through end-of-turn until max_tokens.
+
+    Args:
+        tokenizer: HF tokenizer (or processor.tokenizer) to read attributes
+            from.
+        model_path: Model directory containing the config files. Falls back
+            to ``tokenizer.name_or_path`` when omitted.
+
+    Returns:
+        Set of EOS token ids; may be empty if nothing is declared anywhere.
+    """
+    eos_ids = set()
+
+    for attr in ("eos_token_id", "eos_token_ids"):
+        value = getattr(tokenizer, attr, None)
+        if value is None:
+            continue
+        if isinstance(value, (list, set, tuple)):
+            eos_ids.update(int(v) for v in value)
+        else:
+            eos_ids.add(int(value))
+
+    if model_path is None:
+        model_path = getattr(tokenizer, "name_or_path", None)
+    if model_path:
+        for config_name in ("config.json", "generation_config.json"):
+            config_path = Path(model_path) / config_name
+            if not config_path.exists():
+                continue
+            try:
+                config_eos = json.loads(config_path.read_text()).get("eos_token_id")
+            except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+                continue
+            if isinstance(config_eos, list):
+                eos_ids.update(int(v) for v in config_eos)
+            elif config_eos is not None:
+                eos_ids.add(int(config_eos))
+
+    return eos_ids
+
+
 def _needs_strict_false(model_name: str) -> bool:
     """Check if model needs strict=False loading (VLM models with extra weights).
 
@@ -49,6 +103,32 @@ def _needs_strict_false(model_name: str) -> bool:
     return False
 
 
+def _model_type(model_name: str) -> str:
+    """Read model_type from config.json, empty string if unavailable."""
+    from mlx_lm.utils import _download, load_config
+
+    try:
+        config = load_config(_download(model_name))
+    except Exception:
+        return ""
+    return config.get("text_config", config).get("model_type", "") or ""
+
+
+def _install_custom_chat_template(model_name: str, tokenizer):
+    """Give models without a Jinja chat template a programmatic encoder.
+
+    DeepSeek-V4 ships no ``chat_template``, so the stock path would either raise
+    or fall back to naive ``"role: content"`` concatenation. Patching the
+    tokenizer covers every caller at once.
+    """
+    if tokenizer is None or _model_type(model_name) != "deepseek_v4":
+        return tokenizer
+
+    from .deepseek_v4_encoding import install as install_deepseek_v4
+
+    return install_deepseek_v4(tokenizer, model_name=model_name)
+
+
 def load_model_with_fallback(model_name: str, tokenizer_config: dict = None):
     """
     Load model and tokenizer with fallback for non-standard tokenizers.
@@ -60,6 +140,11 @@ def load_model_with_fallback(model_name: str, tokenizer_config: dict = None):
     Returns:
         Tuple of (model, tokenizer)
     """
+    model, tokenizer = _load_model_with_fallback(model_name, tokenizer_config)
+    return model, _install_custom_chat_template(model_name, tokenizer)
+
+
+def _load_model_with_fallback(model_name: str, tokenizer_config: dict = None):
     from mlx_lm import load
 
     tokenizer_config = tokenizer_config or {}

@@ -4,6 +4,7 @@
 import base64
 import platform
 import sys
+from types import ModuleType
 from pathlib import Path
 
 import pytest
@@ -120,6 +121,56 @@ class TestMLLMHelperFunctions:
         assert not is_base64_image("https://example.com/image.jpg")
         assert not is_base64_image("/path/to/image.jpg")
 
+    def test_remote_media_log_does_not_expose_signed_url(self, monkeypatch, caplog):
+        import logging
+        import requests
+
+        from vllm_mlx.models import mllm
+
+        signed_url = "https://example.com/media.png?token=super-secret"
+
+        def fail_request(*args, **kwargs):
+            raise requests.Timeout("offline")
+
+        monkeypatch.setattr(mllm, "_request_with_safe_redirects", fail_request)
+        with caplog.at_level(logging.INFO), pytest.raises(requests.Timeout):
+            mllm._download_media(signed_url, "image", {"png": ".png"}, ".png", 1, 1024)
+
+        assert "super-secret" not in caplog.text
+        assert signed_url not in caplog.text
+
+
+class TestMLLMMediaAndHelperFunctions:
+    def test_invalid_image_fails_request_instead_of_becoming_text_only(
+        self, monkeypatch
+    ):
+        from vllm_mlx.models import mllm
+
+        model = mllm.MLXMultimodalLM.__new__(mllm.MLXMultimodalLM)
+        monkeypatch.setattr(
+            mllm,
+            "process_image_input",
+            lambda image: (_ for _ in ()).throw(ValueError("invalid image")),
+        )
+
+        with pytest.raises(ValueError, match="invalid image"):
+            model._prepare_images(["bad-image"])
+
+    def test_invalid_audio_fails_request_instead_of_becoming_text_only(
+        self, monkeypatch
+    ):
+        from vllm_mlx.models import mllm
+
+        model = mllm.MLXMultimodalLM.__new__(mllm.MLXMultimodalLM)
+        monkeypatch.setattr(
+            mllm,
+            "process_audio_input",
+            lambda audio: (_ for _ in ()).throw(ValueError("invalid audio")),
+        )
+
+        with pytest.raises(ValueError, match="invalid audio"):
+            model._prepare_audio(["bad-audio"])
+
     def test_is_base64_video(self):
         """Test base64 video detection."""
         from vllm_mlx.models.mllm import is_base64_video
@@ -180,6 +231,58 @@ class TestMLLMHelperFunctions:
         assert "169.254.169.254" in str(exc_info.value)
         assert exc_info.value.public_message == "Remote media URL is not allowed"
         assert "169.254.169.254" not in exc_info.value.public_message
+
+    def test_stream_chat_passes_stop_and_stops_on_stop_sequence(self, monkeypatch):
+        """Parser stop tokens must reach mlx-vlm streaming for MLLM text routes."""
+        from vllm_mlx.models import mllm
+        from vllm_mlx.models.mllm import MLXMultimodalLM
+
+        model = MLXMultimodalLM(model_name="local-test-model")
+        model._loaded = True
+        model.model = object()
+        model.processor = object()
+        model._cache_manager = None
+
+        monkeypatch.setattr(
+            mllm,
+            "_build_mllm_chat_messages",
+            lambda messages, all_image_urls, video_frame_counts: messages,
+        )
+        seen = {}
+
+        class Chunk:
+            def __init__(self, text):
+                self.text = text
+                self.prompt_tokens = 1
+
+        def fake_stream_generate(*args, **kwargs):
+            seen["stop"] = kwargs.get("stop")
+            yield Chunk("call")
+            yield Chunk("</tool_call>")
+            yield Chunk("leak")
+
+        fake_mlx_vlm = ModuleType("mlx_vlm")
+        fake_mlx_vlm.stream_generate = fake_stream_generate
+        fake_prompt_utils = ModuleType("mlx_vlm.prompt_utils")
+        fake_prompt_utils.get_chat_template = lambda *args, **kwargs: "prompt"
+        fake_models = ModuleType("mlx_vlm.models")
+        fake_cache = ModuleType("mlx_vlm.models.cache")
+        fake_cache.make_prompt_cache = lambda *args, **kwargs: None
+        monkeypatch.setitem(sys.modules, "mlx_vlm", fake_mlx_vlm)
+        monkeypatch.setitem(sys.modules, "mlx_vlm.prompt_utils", fake_prompt_utils)
+        monkeypatch.setitem(sys.modules, "mlx_vlm.models", fake_models)
+        monkeypatch.setitem(sys.modules, "mlx_vlm.models.cache", fake_cache)
+
+        chunks = list(
+            model.stream_chat(
+                messages=[{"role": "user", "content": "call tool"}],
+                max_tokens=16,
+                stop=["</tool_call>"],
+            )
+        )
+
+        assert seen["stop"] == ["</tool_call>"]
+        assert [chunk.text for chunk in chunks] == ["call", "</tool_call>", ""]
 
     def test_request_with_safe_redirects_blocks_unsafe_redirect(self, monkeypatch):
         """Test that redirect hops are validated before a second request."""

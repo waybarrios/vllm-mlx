@@ -335,6 +335,17 @@ class TestParseJsonOutput:
         assert is_valid is False
         assert "Failed to extract" in error
 
+    def test_json_object_rejects_array_root(self):
+        """OpenAI json_object requires an object at the root, not any JSON value."""
+        text = '[{"ok": true}]'
+        response_format = {"type": "json_object"}
+
+        _cleaned, parsed, is_valid, error = parse_json_output(text, response_format)
+
+        assert parsed == [{"ok": True}]
+        assert is_valid is False
+        assert "root" in error.lower()
+
     def test_json_schema_valid(self):
         """Test json_schema mode validates against schema."""
         text = '{"name": "Alice", "age": 30}'
@@ -374,6 +385,68 @@ class TestParseJsonOutput:
         assert parsed == {"name": 123}
         assert is_valid is False
         assert "validation failed" in error.lower()
+
+    def test_jobs_compact_schema_rejects_non_integer_scores(self):
+        """Regression for Jobs work item 1167's exact compact score contract."""
+        score = {"type": "integer", "minimum": 1, "maximum": 5}
+        schema = {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["p", "s", "sc", "i"],
+            "properties": {
+                "p": {"type": "boolean"},
+                "s": {"type": "string", "maxLength": 240},
+                "sc": {
+                    "type": "array",
+                    "minItems": 9,
+                    "maxItems": 9,
+                    "prefixItems": [score] * 9,
+                },
+                "i": {
+                    "type": "array",
+                    "maxItems": 3,
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "required": ["a", "v", "c", "m", "e", "r"],
+                        "properties": {
+                            "a": {"type": "string", "enum": ["r", "c", "p"]},
+                            "v": {"type": "string", "enum": ["b", "w", "i"]},
+                            "c": {"type": "string", "maxLength": 48},
+                            "m": {"type": "string", "maxLength": 280},
+                            "e": {
+                                "type": "array",
+                                "maxItems": 4,
+                                "items": {"type": "string", "maxLength": 80},
+                            },
+                            "r": {
+                                "type": "array",
+                                "maxItems": 4,
+                                "items": {"type": "string", "maxLength": 80},
+                            },
+                        },
+                    },
+                },
+            },
+        }
+        response_format = {
+            "type": "json_schema",
+            "json_schema": {"name": "qa", "schema": schema, "strict": True},
+        }
+        raw = json.dumps(
+            {
+                "p": False,
+                "s": "review",
+                "sc": [4, "p", "s", "sc", "i", "p", "s", "sc", "i"],
+                "i": [],
+            }
+        )
+
+        _cleaned, parsed, is_valid, error = parse_json_output(raw, response_format)
+
+        assert parsed is not None
+        assert is_valid is False
+        assert "not of type 'integer'" in error
 
     def test_response_format_model(self):
         """Test with ResponseFormat Pydantic model."""

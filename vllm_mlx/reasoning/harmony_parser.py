@@ -151,7 +151,7 @@ class HarmonyReasoningParser(ReasoningParser):
         # In commentary or unknown channel, suppress
         return None
 
-    def reset_state(self):
+    def reset_state(self, implicit_mode: bool = False):  # noqa: ARG002
         """Reset streaming state for a new request."""
         self._current_channel = None
         self._in_message = False

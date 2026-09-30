@@ -7,7 +7,6 @@ The model may sometimes start outputting reasoning without the explicit
 <think> tag, so this parser is more lenient than Qwen3.
 """
 
-from .base import DeltaMessage
 from .think_parser import BaseThinkingReasoningParser
 
 
@@ -26,6 +25,11 @@ class DeepSeekR1ReasoningParser(BaseThinkingReasoningParser):
 
         Input: "reasoning content</think>final answer"  # No opening tag
         Output: reasoning="reasoning content", content="final answer"
+
+    Only the complete-output path is overridden. Streaming used to be overridden
+    too, to catch an end token arriving without a start token, but the base
+    class handles that case itself now; the override only duplicated it while
+    scanning the accumulated text for the start token on every delta.
     """
 
     @property
@@ -61,50 +65,3 @@ class DeepSeekR1ReasoningParser(BaseThinkingReasoningParser):
 
         # Use base class for standard case
         return super().extract_reasoning(model_output)
-
-    def extract_reasoning_streaming(
-        self,
-        previous_text: str,
-        current_text: str,
-        delta_text: str,
-    ) -> DeltaMessage | None:
-        """
-        Extract reasoning from streaming delta.
-
-        Handles DeepSeek-R1's pattern where <think> may be implicit.
-
-        Args:
-            previous_text: Text accumulated before this delta.
-            current_text: Text including this delta.
-            delta_text: Just the new text.
-
-        Returns:
-            DeltaMessage with reasoning/content, or None to skip.
-        """
-        # First try base class logic
-        result = super().extract_reasoning_streaming(
-            previous_text, current_text, delta_text
-        )
-
-        # Handle DeepSeek-R1 special case: no start token seen but end token appears
-        if result is not None:
-            start_in_prev = self.start_token in previous_text
-            start_in_delta = self.start_token in delta_text
-            end_in_delta = self.end_token in delta_text
-
-            # If end token in delta but we never saw start token
-            if not start_in_prev and not start_in_delta and end_in_delta:
-                # Everything before end token is reasoning
-                idx = delta_text.find(self.end_token)
-                reasoning_part = delta_text[:idx]
-                content_part = delta_text[idx + len(self.end_token) :]
-                return DeltaMessage(
-                    reasoning=reasoning_part if reasoning_part else None,
-                    content=content_part if content_part else None,
-                )
-
-            # Note: DeepSeek-R1 may omit <think> but still be in reasoning mode.
-            # However, we can't reliably detect implicit reasoning without context,
-            # so we default to treating unmarked content as regular content.
-
-        return result

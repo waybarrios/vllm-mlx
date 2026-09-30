@@ -1,0 +1,85 @@
+name: Client acceptance
+
+on:
+  workflow_dispatch:
+    inputs:
+      model:
+        description: Exact model ID advertised by the prepared local server
+        required: true
+        type: string
+      model_revision:
+        description: Immutable model revision or sha256 digest
+        required: true
+        type: string
+      server_revision:
+        description: Commit of the prepared vllm-mlx server
+        required: true
+        type: string
+      clients:
+        description: Space-separated installed clients
+        default: opencode pi codex claude copilot cline openclaw
+        type: string
+      versions:
+        description: Space-separated CLIENT=VERSION pins, one per selected client
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: client-acceptance
+  cancel-in-progress: false
+
+jobs:
+  acceptance:
+    # Never dispatch arbitrary PR code onto the prepared model host.
+    if: github.ref == 'refs/heads/main'
+    runs-on: [self-hosted, macOS, ARM64, client-acceptance]
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Verify Apple Silicon host
+        run: |
+          python3 -c "import platform; assert platform.system() == 'Darwin' and platform.machine() == 'arm64'"
+
+      - name: Run installed clients against the prepared local server
+        env:
+          ACCEPTANCE_MODEL: ${{ inputs.model }}
+          ACCEPTANCE_MODEL_REVISION: ${{ inputs.model_revision }}
+          ACCEPTANCE_SERVER_REVISION: ${{ inputs.server_revision }}
+          ACCEPTANCE_CLIENTS: ${{ inputs.clients }}
+          ACCEPTANCE_VERSIONS: ${{ inputs.versions }}
+        run: |
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+          from scripts.client_acceptance.runner import main
+
+          clients = os.environ['ACCEPTANCE_CLIENTS'].split()
+          versions = os.environ['ACCEPTANCE_VERSIONS'].split()
+          if not clients or {item.partition('=')[0] for item in versions} != set(clients):
+              raise SystemExit('Provide one version pin for every selected client')
+          args = [
+              '--clients', *clients,
+              '--model', os.environ['ACCEPTANCE_MODEL'],
+              '--model-revision', os.environ['ACCEPTANCE_MODEL_REVISION'],
+              '--server-revision', os.environ['ACCEPTANCE_SERVER_REVISION'],
+              '--report', str(Path(os.environ['RUNNER_TEMP']) / 'client-acceptance.json'),
+          ]
+          for version in versions:
+              args.extend(['--expect-version', version])
+          raise SystemExit(main(args))
+          PY
+
+      - name: Upload acceptance results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: client-acceptance
+          path: ${{ runner.temp }}/client-acceptance.json
+          if-no-files-found: error
+          retention-days: 14

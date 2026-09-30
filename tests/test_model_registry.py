@@ -7,8 +7,10 @@ import asyncio
 import dataclasses
 import logging
 import re
+import time
 from pathlib import Path
 from typing import Any
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -82,6 +84,9 @@ def _defaults() -> RegistryServeDefaults:
         specprefill_keep_pct=0.3,
         specprefill_backbone_pct=0.0,
         specprefill_draft_model=None,
+        prefix_trie_cache=False,
+        prefix_trie_cache_size=32,
+        prefix_trie_cache_memory_mb=None,
         stream_interval=1,
         gpu_memory_utilization=0.9,
         scheduler_config=None,
@@ -96,9 +101,11 @@ def _manager_config(
     strategy: str = "wait_then_fail",
     wait_timeout_s: float | None = 1.0,
     preempt_after_s: float | None = None,
+    idle_unload_seconds: float = 0.0,
 ) -> RegistryManagerConfig:
     return RegistryManagerConfig(
         memory_budget_bytes=int(budget_gb * (1024**3)),
+        idle_unload_seconds=idle_unload_seconds,
         policy=ContentionPolicy(
             strategy=strategy,
             wait_timeout_s=wait_timeout_s,
@@ -118,6 +125,70 @@ def _registry(tmp_path: Path, sizes_gb: dict[str, float]) -> dict[str, Registere
             estimated_memory_bytes=int(size_gb * (1024**3)),
         )
     return registry
+
+
+def _write_registry_config(tmp_path: Path, manager_yaml: str) -> Path:
+    config_path = tmp_path / "models.yaml"
+    config_path.write_text(f"""
+manager:
+{manager_yaml}
+models:
+  - name: test
+    path: /tmp/test-model
+""".strip())
+    return config_path
+
+
+def test_cli_memory_budget_overrides_yaml_value(tmp_path):
+    config_path = _write_registry_config(tmp_path, "  memory_budget_gb: 4")
+
+    manager, _ = load_registry_config(
+        config_path,
+        _defaults(),
+        memory_budget_gb=7.5,
+    )
+
+    assert manager.memory_budget_bytes == int(7.5 * (1024**3))
+
+
+def test_omitting_cli_memory_budget_preserves_yaml_value(tmp_path):
+    config_path = _write_registry_config(tmp_path, "  memory_budget: 2048mb")
+
+    manager, _ = load_registry_config(config_path, _defaults())
+
+    assert manager.memory_budget_bytes == 2048 * (1024**2)
+
+
+def test_cli_memory_budget_works_without_yaml_manager_budget(tmp_path):
+    config_path = _write_registry_config(tmp_path, "  contention_policy: {}")
+
+    manager, _ = load_registry_config(
+        config_path,
+        _defaults(),
+        memory_budget_gb=3.25,
+    )
+
+    assert manager.memory_budget_bytes == int(3.25 * (1024**3))
+
+
+def test_cli_memory_budget_takes_precedence_over_invalid_yaml_value(tmp_path):
+    config_path = _write_registry_config(tmp_path, "  memory_budget_gb: invalid")
+
+    manager, _ = load_registry_config(
+        config_path,
+        _defaults(),
+        memory_budget_gb=2.5,
+    )
+
+    assert manager.memory_budget_bytes == int(2.5 * (1024**3))
+
+
+@pytest.mark.parametrize("raw_value", [".nan", ".inf", "0", "-0.1"])
+def test_registry_rejects_invalid_manager_memory_budget(tmp_path, raw_value):
+    config_path = _write_registry_config(tmp_path, f"  memory_budget_gb: {raw_value}")
+
+    with pytest.raises(ValueError, match="must be a positive finite number"):
+        load_registry_config(config_path, _defaults())
 
 
 @pytest.mark.parametrize("raw_value", [".nan", ".inf", "0", "-0.1", "1.1"])
@@ -269,6 +340,65 @@ def test_preempt_policy_cancels_active_request_and_loads_waiting_model(tmp_path)
     asyncio.run(_run())
 
 
+def test_get_metrics_engine_returns_none_when_idle(tmp_path):
+    registry = _registry(tmp_path, {"alpha": 4})
+    manager = ModelManager(
+        _manager_config(budget_gb=8),
+        registry,
+        _defaults(),
+        engine_factory=lambda config: FakeEngine(config),
+    )
+
+    assert manager.get_metrics_engine() is None
+
+
+def test_get_metrics_engine_returns_sole_loaded_engine(tmp_path):
+    async def _run():
+        registry = _registry(tmp_path, {"alpha": 4})
+        manager = ModelManager(
+            _manager_config(budget_gb=8),
+            registry,
+            _defaults(),
+            engine_factory=lambda config: FakeEngine(config),
+        )
+
+        lease = await manager.acquire("alpha")
+
+        assert manager.get_metrics_engine() is manager._loaded["alpha"].engine
+
+        await lease.release()
+
+    asyncio.run(_run())
+
+
+def test_get_metrics_engine_returns_most_recently_used_when_multiple_loaded(tmp_path):
+    async def _run():
+        registry = _registry(tmp_path, {"alpha": 4, "beta": 4})
+        manager = ModelManager(
+            _manager_config(budget_gb=9),
+            registry,
+            _defaults(),
+            engine_factory=lambda config: FakeEngine(config),
+        )
+
+        lease_a = await manager.acquire("alpha")
+        await lease_a.release()
+        await asyncio.sleep(0.01)  # ensure last_used_at ordering is unambiguous
+        lease_b = await manager.acquire("beta")
+        await lease_b.release()
+
+        assert manager.get_metrics_engine() is manager._loaded["beta"].engine
+
+        # Touching alpha again makes it the most recently used.
+        await asyncio.sleep(0.01)
+        lease_a = await manager.acquire("alpha")
+        await lease_a.release()
+
+        assert manager.get_metrics_engine() is manager._loaded["alpha"].engine
+
+    asyncio.run(_run())
+
+
 def test_non_local_registry_entry_requires_explicit_memory_estimate():
     async def _run():
         registry = {
@@ -287,6 +417,89 @@ def test_non_local_registry_entry_requires_explicit_memory_estimate():
         with pytest.raises(ValueError, match="estimated_memory_gb"):
             await manager.acquire("remote")
 
+
+def test_unload_idle_unloads_stale_models_and_skips_busy_ones(tmp_path):
+    """Idle-timeout unload must fire without any competing model ever being
+    requested, unlike memory-budget eviction which only triggers on acquire().
+    """
+
+    async def _run():
+        registry = _registry(tmp_path, {"alpha": 4, "beta": 4})
+        created: dict[str, FakeEngine] = {}
+
+        def engine_factory(config: ResolvedModelConfig) -> FakeEngine:
+            engine = FakeEngine(config)
+            created[config.entry.name] = engine
+            return engine
+
+        manager = ModelManager(
+            _manager_config(budget_gb=16, idle_unload_seconds=999),
+            registry,
+            _defaults(),
+            engine_factory=engine_factory,
+        )
+
+        alpha_lease = await manager.acquire("alpha")
+        await alpha_lease.release()
+
+        # beta stays busy (never released) so it must survive the sweep.
+        await manager.acquire("beta")
+
+        manager._loaded["alpha"].last_used_at = time.time() - 1000
+        manager._loaded["beta"].last_used_at = time.time() - 1000
+
+        unloaded = await manager.unload_idle()
+
+        assert unloaded == ["alpha"]
+        assert "alpha" not in manager._loaded
+        assert "beta" in manager._loaded
+        assert created["alpha"].stopped == 1
+        assert created["beta"].stopped == 0
+
+    asyncio.run(_run())
+
+
+def test_unload_idle_completes_engine_stop_when_cancelled(tmp_path):
+    """Cancelling an idle sweep must not orphan a half-stopped engine."""
+
+    async def _run():
+        stop_started = asyncio.Event()
+        stop_gate = asyncio.Event()
+        stop_completed = False
+
+        class BlockingStopEngine(FakeEngine):
+            async def stop(self) -> None:
+                nonlocal stop_completed
+                stop_started.set()
+                await stop_gate.wait()
+                stop_completed = True
+                self.stopped += 1
+
+        registry = _registry(tmp_path, {"alpha": 4})
+        manager = ModelManager(
+            _manager_config(budget_gb=16, idle_unload_seconds=1),
+            registry,
+            _defaults(),
+            engine_factory=lambda config: BlockingStopEngine(config),
+        )
+
+        lease = await manager.acquire("alpha")
+        await lease.release()
+        manager._loaded["alpha"].last_used_at = time.time() - 2
+
+        unload_task = asyncio.create_task(manager.unload_idle())
+        await stop_started.wait()
+        unload_task.cancel()
+        await asyncio.sleep(0)
+
+        stop_gate.set()
+        with pytest.raises(asyncio.CancelledError):
+            await unload_task
+
+        assert stop_completed
+        assert manager.list_models()[0]["status"] == "unloaded"
+        assert manager._unloading == {}
+
     asyncio.run(_run())
 
 
@@ -301,6 +514,73 @@ GB = 1024**3
 def _defaults_with(**overrides: Any) -> RegistryServeDefaults:
     base = _defaults()
     return dataclasses.replace(base, **overrides)
+
+
+@pytest.mark.parametrize("override", [None, 1, 2048])
+def test_batched_engine_receives_resolved_prefill_step_size(
+    tmp_path, monkeypatch, override
+):
+    from vllm_mlx.scheduler import SchedulerConfig
+
+    registry = _registry(tmp_path, {"alpha": 1, "beta": 1})
+    registry["alpha"] = dataclasses.replace(
+        registry["alpha"], prefill_step_size=override
+    )
+    shared = SchedulerConfig(prefill_step_size=512, mllm_prefill_step_size=256)
+    manager = ModelManager(
+        _manager_config(budget_gb=8),
+        registry,
+        _defaults_with(
+            continuous_batching=True, prefill_step_size=512, scheduler_config=shared
+        ),
+    )
+    engine = MagicMock()
+    engine.start = AsyncMock()
+    constructor = MagicMock(return_value=engine)
+    monkeypatch.setattr("vllm_mlx.model_registry.BatchedEngine", constructor)
+
+    async def _run():
+        for entry in registry.values():
+            await manager._instantiate_model(entry, entry.source)
+
+    asyncio.run(_run())
+    alpha, beta = [
+        call.kwargs["scheduler_config"] for call in constructor.call_args_list
+    ]
+    assert alpha.prefill_step_size == (512 if override is None else override)
+    assert beta.prefill_step_size == 512
+    assert alpha is not beta and alpha is not shared and beta is not shared
+    assert shared.prefill_step_size == 512
+    assert alpha.mllm_prefill_step_size == beta.mllm_prefill_step_size == 256
+
+
+@pytest.mark.parametrize("value", [0, -1])
+def test_registry_rejects_nonpositive_prefill_override(tmp_path, value):
+    from vllm_mlx.scheduler import SchedulerConfig
+
+    registry = _registry(tmp_path, {"alpha": 1})
+    entry = dataclasses.replace(registry["alpha"], prefill_step_size=value)
+    manager = ModelManager(
+        _manager_config(budget_gb=8),
+        registry,
+        _defaults_with(
+            continuous_batching=True,
+            prefill_step_size=512,
+            scheduler_config=SchedulerConfig(prefill_step_size=512),
+        ),
+    )
+    with pytest.raises(ValueError, match="prefill_step_size must be > 0"):
+        manager._resolve_model_config(entry, entry.source)
+
+
+def test_registry_prefill_override_preserves_absent_scheduler_config(tmp_path):
+    registry = _registry(tmp_path, {"alpha": 1})
+    entry = dataclasses.replace(registry["alpha"], prefill_step_size=512)
+    manager = ModelManager(_manager_config(budget_gb=8), registry, _defaults())
+
+    resolved = manager._resolve_model_config(entry, entry.source)
+    assert resolved.prefill_step_size == 512
+    assert resolved.scheduler_config is None
 
 
 def test_budget_report_flags_budget_above_allocation_ceiling(tmp_path):
@@ -386,6 +666,7 @@ def test_cache_limit_ignored_for_simple_mode_entries(tmp_path):
 
     assert report.continuous_batching_entries == 0
     assert report.total_entries == 1
+    assert report.memory_aware_prefix_cache_entries == 0
     assert report.per_engine_cache_limit_bytes is None
     assert report.per_engine_cache_percent is None
 
@@ -407,7 +688,172 @@ def test_cache_limit_ignored_when_paged_cache_supersedes_it(tmp_path):
     )
 
     assert report.continuous_batching_entries == 1
+    assert report.memory_aware_prefix_cache_entries == 0
     assert report.per_engine_cache_limit_bytes is None
+
+
+def test_cache_limit_applies_to_auto_detected_mllm_with_paged_cache(tmp_path, caplog):
+    """MLLM still constructs MemoryAwarePrefixCache under --use-paged-cache."""
+    from vllm_mlx.scheduler import SchedulerConfig
+
+    registry = _registry(tmp_path, {"text": 8, "vision": 8})
+    vision_path = Path(registry["vision"].source)
+    (vision_path / "config.json").write_text('{"vision_config": {}}')
+
+    report = build_memory_budget_report(
+        _manager_config(budget_gb=10),
+        registry,
+        _defaults_with(
+            continuous_batching=True,
+            scheduler_config=SchedulerConfig(
+                cache_memory_mb=20480, use_paged_cache=True
+            ),
+        ),
+        device_working_set_bytes=128 * GB,
+    )
+
+    assert report.continuous_batching_entries == 2
+    assert report.memory_aware_prefix_cache_entries == 1
+    assert report.per_engine_cache_limit_bytes == 20 * GB
+
+    with caplog.at_level(logging.INFO, logger="vllm_mlx.model_registry"):
+        log_memory_budget_report(report)
+
+    assert "20.0 GB per memory-aware prefix-cache engine" in caplog.text
+    assert "1 of 2 entries" in caplog.text
+
+
+def test_cache_percent_applies_to_mllm_with_paged_cache(tmp_path):
+    """The report uses the percentage forwarded to the MLLM prefix cache."""
+    from vllm_mlx.scheduler import SchedulerConfig
+
+    registry = _registry(tmp_path, {"vision": 8})
+    vision_path = Path(registry["vision"].source)
+    (vision_path / "config.json").write_text('{"vision_config": {}}')
+
+    report = build_memory_budget_report(
+        _manager_config(budget_gb=10),
+        registry,
+        _defaults_with(
+            continuous_batching=True,
+            scheduler_config=SchedulerConfig(
+                cache_memory_percent=0.35, use_paged_cache=True
+            ),
+        ),
+        device_working_set_bytes=128 * GB,
+    )
+
+    assert report.memory_aware_prefix_cache_entries == 1
+    assert report.per_engine_cache_limit_bytes is None
+    assert report.per_engine_cache_percent == pytest.approx(0.35)
+
+
+def test_entry_batching_override_reports_default_scheduler_cache(tmp_path):
+    """Entry-level batching uses SchedulerConfig defaults when CLI batching is off."""
+    registry = _registry(tmp_path, {"vision": 8})
+    registry["vision"] = dataclasses.replace(
+        registry["vision"], continuous_batching=True
+    )
+    vision_path = Path(registry["vision"].source)
+    (vision_path / "config.json").write_text('{"vision_config": {}}')
+
+    report = build_memory_budget_report(
+        _manager_config(budget_gb=10),
+        registry,
+        _defaults(),
+        device_working_set_bytes=128 * GB,
+    )
+
+    assert report.continuous_batching_entries == 1
+    assert report.memory_aware_prefix_cache_entries == 1
+    assert report.per_engine_cache_limit_bytes is None
+    assert report.per_engine_cache_percent == pytest.approx(0.20)
+
+
+@pytest.mark.parametrize("force_source", ["entry", "serve_default"])
+def test_cache_limit_applies_to_forced_mllm_with_paged_cache(tmp_path, force_source):
+    """Both MLLM override sources select the same cache path as BatchedEngine."""
+    from vllm_mlx.scheduler import SchedulerConfig
+
+    registry = _registry(tmp_path, {"alpha": 8})
+    defaults = _defaults_with(
+        continuous_batching=True,
+        force_mllm=force_source == "serve_default",
+        scheduler_config=SchedulerConfig(cache_memory_mb=20480, use_paged_cache=True),
+    )
+    if force_source == "entry":
+        registry["alpha"] = dataclasses.replace(registry["alpha"], force_mllm=True)
+
+    report = build_memory_budget_report(
+        _manager_config(budget_gb=10),
+        registry,
+        defaults,
+        device_working_set_bytes=128 * GB,
+    )
+
+    assert report.memory_aware_prefix_cache_entries == 1
+    assert report.per_engine_cache_limit_bytes == 20 * GB
+
+
+def test_entry_mllm_false_overrides_serve_default_for_cache_report(tmp_path):
+    """The report must use the same per-entry override precedence as loading."""
+    from vllm_mlx.scheduler import SchedulerConfig
+
+    registry = _registry(tmp_path, {"alpha": 8})
+    registry["alpha"] = dataclasses.replace(registry["alpha"], force_mllm=False)
+
+    report = build_memory_budget_report(
+        _manager_config(budget_gb=10),
+        registry,
+        _defaults_with(
+            continuous_batching=True,
+            force_mllm=True,
+            scheduler_config=SchedulerConfig(
+                cache_memory_mb=20480, use_paged_cache=True
+            ),
+        ),
+        device_working_set_bytes=128 * GB,
+    )
+
+    assert report.memory_aware_prefix_cache_entries == 0
+    assert report.per_engine_cache_limit_bytes is None
+
+
+@pytest.mark.parametrize(
+    ("force_mllm", "expected_entries"),
+    [(None, 0), (True, 1)],
+)
+def test_unresolved_remote_mllm_requires_explicit_declaration(
+    tmp_path, monkeypatch, force_mllm, expected_entries
+):
+    """Remote name heuristics are not authoritative for capacity warnings."""
+    from vllm_mlx.scheduler import SchedulerConfig
+
+    monkeypatch.chdir(tmp_path)
+    registry = {
+        "remote": RegisteredModel(
+            name="remote",
+            source="example/VL-text-model",
+            force_mllm=force_mllm,
+            estimated_memory_bytes=8 * GB,
+        )
+    }
+
+    report = build_memory_budget_report(
+        _manager_config(budget_gb=10),
+        registry,
+        _defaults_with(
+            continuous_batching=True,
+            scheduler_config=SchedulerConfig(
+                cache_memory_mb=20480, use_paged_cache=True
+            ),
+        ),
+        device_working_set_bytes=128 * GB,
+    )
+
+    assert report.memory_aware_prefix_cache_entries == expected_entries
+    expected_limit = 20 * GB if force_mllm else None
+    assert report.per_engine_cache_limit_bytes == expected_limit
 
 
 def test_cache_limit_above_ceiling_warns_without_negative_numbers(tmp_path, caplog):
@@ -635,7 +1081,7 @@ def test_log_memory_budget_report_reports_ceiling_and_cache(tmp_path, caplog):
 
     assert "Registry memory budget: 40.0 GB" in caplog.text
     assert "Metal allocation ceiling 64.0 GB" in caplog.text
-    assert "20.0 GB per continuous-batching engine" in caplog.text
+    assert "20.0 GB per memory-aware prefix-cache engine" in caplog.text
     assert "2 of 2 entries" in caplog.text
 
 
@@ -659,3 +1105,152 @@ def test_log_memory_budget_report_says_so_when_ceiling_unknown(
     assert not [
         record for record in caplog.records if record.levelno >= logging.WARNING
     ]
+
+
+def test_unload_idle_noop_when_disabled(tmp_path):
+    async def _run():
+        registry = _registry(tmp_path, {"alpha": 4})
+        manager = ModelManager(
+            _manager_config(budget_gb=16, idle_unload_seconds=0.0),
+            registry,
+            _defaults(),
+            engine_factory=lambda config: FakeEngine(config),
+        )
+
+        lease = await manager.acquire("alpha")
+        await lease.release()
+        manager._loaded["alpha"].last_used_at = time.time() - 100000
+
+        unloaded = await manager.unload_idle()
+
+        assert unloaded == []
+        assert "alpha" in manager._loaded
+
+    asyncio.run(_run())
+
+
+def test_unload_idle_leaves_fresh_models_alone(tmp_path):
+    async def _run():
+        registry = _registry(tmp_path, {"alpha": 4})
+        manager = ModelManager(
+            _manager_config(budget_gb=16, idle_unload_seconds=999),
+            registry,
+            _defaults(),
+            engine_factory=lambda config: FakeEngine(config),
+        )
+
+        lease = await manager.acquire("alpha")
+        await lease.release()
+
+        unloaded = await manager.unload_idle()
+
+        assert unloaded == []
+        assert "alpha" in manager._loaded
+
+    asyncio.run(_run())
+
+
+def test_run_idle_reaper_unloads_after_timeout(tmp_path):
+    async def _run():
+        registry = _registry(tmp_path, {"alpha": 4})
+        created: dict[str, FakeEngine] = {}
+
+        def engine_factory(config: ResolvedModelConfig) -> FakeEngine:
+            engine = FakeEngine(config)
+            created[config.entry.name] = engine
+            return engine
+
+        manager = ModelManager(
+            _manager_config(budget_gb=16, idle_unload_seconds=0.2),
+            registry,
+            _defaults(),
+            engine_factory=engine_factory,
+        )
+
+        lease = await manager.acquire("alpha")
+        await lease.release()
+
+        reaper = asyncio.create_task(manager.run_idle_reaper())
+        try:
+            for _ in range(50):
+                if "alpha" not in manager._loaded:
+                    break
+                await asyncio.sleep(0.05)
+        finally:
+            reaper.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await reaper
+
+        assert "alpha" not in manager._loaded
+        assert created["alpha"].stopped == 1
+
+    asyncio.run(_run())
+
+
+def test_run_idle_reaper_returns_immediately_when_disabled(tmp_path):
+    async def _run():
+        registry = _registry(tmp_path, {"alpha": 4})
+        manager = ModelManager(
+            _manager_config(budget_gb=16, idle_unload_seconds=0.0),
+            registry,
+            _defaults(),
+            engine_factory=lambda config: FakeEngine(config),
+        )
+
+        await asyncio.wait_for(manager.run_idle_reaper(), timeout=1.0)
+
+    asyncio.run(_run())
+
+
+class TestLoadRegistryConfigIdleUnload:
+    """YAML-level wiring for the manager.idle_unload_seconds knob."""
+
+    def _write_config(self, tmp_path: Path, manager_extra: str = "") -> Path:
+        model_dir = tmp_path / "alpha"
+        model_dir.mkdir()
+        config_path = tmp_path / "models.yaml"
+        config_path.write_text(f"""
+manager:
+  memory_budget_gb: 16
+{manager_extra}
+models:
+  - name: alpha
+    path: {model_dir}
+    estimated_memory_gb: 4
+""")
+        return config_path
+
+    def test_explicit_yaml_value_wins(self, tmp_path):
+        from vllm_mlx.model_registry import load_registry_config
+
+        config_path = self._write_config(tmp_path, "  idle_unload_seconds: 120\n")
+        defaults = _defaults()
+        defaults = type(defaults)(
+            **{**defaults.__dict__, "auto_unload_idle_seconds": 300.0}
+        )
+
+        manager_config, _ = load_registry_config(config_path, defaults)
+
+        assert manager_config.idle_unload_seconds == 120.0
+
+    def test_falls_back_to_cli_default_when_unset(self, tmp_path):
+        from vllm_mlx.model_registry import load_registry_config
+
+        config_path = self._write_config(tmp_path)
+        defaults = _defaults()
+        defaults = type(defaults)(
+            **{**defaults.__dict__, "auto_unload_idle_seconds": 300.0}
+        )
+
+        manager_config, _ = load_registry_config(config_path, defaults)
+
+        assert manager_config.idle_unload_seconds == 300.0
+
+    def test_defaults_to_disabled(self, tmp_path):
+        from vllm_mlx.model_registry import load_registry_config
+
+        config_path = self._write_config(tmp_path)
+
+        manager_config, _ = load_registry_config(config_path, _defaults())
+
+        assert manager_config.idle_unload_seconds == 0.0

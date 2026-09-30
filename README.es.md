@@ -46,7 +46,7 @@ claude
 ### APIs
 - **Compatible con OpenAI**: `/v1/chat/completions`, `/v1/completions`, `/v1/embeddings`, `/v1/rerank`, `/v1/responses`
 - **Compatible con Anthropic**: `/v1/messages` (streaming, tool use, system prompts)
-- **MCP Tool Calling**: 12 parsers (OpenAI, Anthropic, Gemini, Qwen, DeepSeek, Gemma y más)
+- **MCP Tool Calling**: 19 parsers (OpenAI, Anthropic, Gemini, Qwen, DeepSeek, Gemma y más)
 - **Salida estructurada**: JSON Schema vía `response_format` (lm-format-enforcer)
 
 ### Throughput y memoria
@@ -64,7 +64,7 @@ claude
 - **STT**: familia Whisper con RTF hasta 197x en M4 Max
 
 ### Razonamiento y avanzado
-- **Extracción de razonamiento**: Qwen3, DeepSeek-R1 (`--reasoning-parser`)
+- **Extracción de razonamiento**: Qwen3, DeepSeek-R1, DeepSeek-V4 (`--reasoning-parser`)
 - **Reducción de expertos MoE**: `--moe-top-k` para +7-16% en Qwen3-30B-A3B
 - **Decodificación especulativa**: `--mtp` para Qwen3-Next
 - **Prefill disperso**: `--spec-prefill` basado en atención para reducir TTFT
@@ -301,7 +301,7 @@ Apache 2.0. Ver [LICENSE](LICENSE).
 
 ## Historia de stars
 
-[![Star History Chart](https://api.star-history.com/svg?repos=waybarrios/vllm-mlx&type=Date)](https://star-history.com/#waybarrios/vllm-mlx&Date)
+[![Star History Chart](https://star-history.dera.page/svg?repos=waybarrios/vllm-mlx&type=Date)](https://star-history.dera.page/#waybarrios/vllm-mlx&Date)
 
 ---
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import sys
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -29,11 +30,14 @@ def restore_server_globals():
         "_lazy_load_model",
         "_residency_manager",
         "_lifecycle_task",
+        "_registry_idle_reaper_task",
         "_lifespan_active",
         "_mcp_manager",
         "_mcp_executor",
         "_embedding_engine",
         "_embedding_model_locked",
+        "_embedding_max_length",
+        "_embedding_overflow_policy",
         "_api_key",
         "_auth_warning_logged",
         "_rate_limiter",
@@ -56,6 +60,16 @@ def restore_server_globals():
         and not leaked_task.done()
     ):
         leaked_task.cancel()
+
+    leaked_reaper = getattr(srv, "_registry_idle_reaper_task", None)
+    original_reaper = snapshot["_registry_idle_reaper_task"]
+    if (
+        leaked_reaper is not sentinel
+        and leaked_reaper is not None
+        and leaked_reaper is not original_reaper
+        and not leaked_reaper.done()
+    ):
+        leaked_reaper.cancel()
 
     for name, value in snapshot.items():
         if value is sentinel:
@@ -158,6 +172,7 @@ class TestLifecycleCli:
             captured["mllm_draft_model"] = args.mllm_draft_model
             captured["mllm_draft_kind"] = args.mllm_draft_kind
             captured["mllm_draft_block_size"] = args.mllm_draft_block_size
+            captured["default_mllm_draft"] = args.default_mllm_draft
 
         monkeypatch.setattr(cli, "serve_command", fake_serve_command)
         monkeypatch.setattr(
@@ -174,6 +189,7 @@ class TestLifecycleCli:
                 "mtp",
                 "--mllm-draft-block-size",
                 "4",
+                "--default-mllm-draft",
             ],
         )
 
@@ -183,6 +199,7 @@ class TestLifecycleCli:
             "mllm_draft_model": "google/gemma-4-E2B-it-assistant",
             "mllm_draft_kind": "mtp",
             "mllm_draft_block_size": 4,
+            "default_mllm_draft": True,
         }
 
     def test_main_rejects_nonpositive_mllm_draft_block_size(self, monkeypatch, capsys):
@@ -210,6 +227,84 @@ class TestLifecycleCli:
             cli.main()
 
         assert "--mllm-draft-block-size" in capsys.readouterr().err
+
+    def test_serve_command_allows_mllm_draft_with_continuous_batching(
+        self, monkeypatch
+    ):
+        """Assistant MTP can use the MLLM continuous-batching scheduler."""
+        import vllm_mlx.cli as cli
+
+        captured = {}
+        import uvicorn
+        import vllm_mlx.server as server
+        import vllm_mlx.utils.download as download
+
+        monkeypatch.setattr(server, "load_model", lambda *a, **k: captured.update(k))
+        monkeypatch.setattr(download, "ensure_model_downloaded", lambda *a, **k: None)
+        monkeypatch.setattr(uvicorn, "run", lambda *a, **k: None)
+
+        args = SimpleNamespace(
+            model="gemma4",
+            models_config=None,
+            served_model_name=None,
+            enable_auto_tool_choice=False,
+            tool_call_parser=None,
+            gpu_memory_utilization=0.90,
+            max_tokens=32768,
+            max_request_tokens=32768,
+            max_kv_size=131072,
+            mllm_draft_model="assistant",
+            mllm_draft_kind="mtp",
+            mllm_draft_block_size=6,
+            continuous_batching=True,
+            auto_unload_idle_seconds=0.0,
+            lazy_load_model=False,
+            mllm=True,
+        )
+        for name, value in vars(
+            cli.build_parser().parse_args(["serve", "gemma4"])
+        ).items():
+            if not hasattr(args, name):
+                setattr(args, name, value)
+
+        cli.serve_command(args)
+
+        assert captured["use_batching"] is True
+        assert captured["mllm_draft_model"] == "assistant"
+
+    def test_serve_command_rejects_batched_mllm_draft_without_mtp_kind(
+        self, monkeypatch, capsys
+    ):
+        """Invalid assistant batching must fail before downloading models."""
+        import vllm_mlx.cli as cli
+        import vllm_mlx.utils.download as download
+
+        download_model = MagicMock()
+        monkeypatch.setattr(download, "ensure_model_downloaded", download_model)
+
+        args = SimpleNamespace(
+            model="gemma4",
+            models_config=None,
+            served_model_name=None,
+            enable_auto_tool_choice=False,
+            tool_call_parser=None,
+            gpu_memory_utilization=0.90,
+            max_tokens=32768,
+            max_request_tokens=32768,
+            mllm_draft_model="assistant",
+            mllm_draft_kind=None,
+            mllm_draft_block_size=6,
+            continuous_batching=True,
+            auto_unload_idle_seconds=0.0,
+            lazy_load_model=False,
+            mllm=True,
+        )
+
+        with pytest.raises(SystemExit):
+            cli.serve_command(args)
+
+        download_model.assert_not_called()
+        assert "requires --mllm-draft-kind mtp" in capsys.readouterr().out
 
     def test_serve_command_rejects_mllm_draft_without_mllm(self, capsys):
         """Drafter flags should not be silently ignored on text-only models."""
@@ -323,6 +418,101 @@ class TestLifecycleCli:
             specprefill_threshold=8192,
             specprefill_keep_pct=0.3,
             specprefill_draft_model=None,
+            prefix_trie_cache=False,
+            prefix_trie_cache_size=32,
+            prefix_trie_cache_memory_mb=None,
+            mcp_config=None,
+            api_key=None,
+            rate_limit=0,
+            timeout=300.0,
+            enable_auto_tool_choice=False,
+            tool_call_parser=None,
+            reasoning_parser=None,
+            mllm=False,
+            default_temperature=None,
+            default_top_p=None,
+            default_top_k=None,
+            default_min_p=None,
+            default_presence_penalty=None,
+            default_repetition_penalty=None,
+            default_chat_template_kwargs=None,
+            served_model_name=None,
+            embedding_model=None,
+            embedding_max_length=None,
+            embedding_overflow_policy="truncate",
+            gpu_memory_utilization=0.90,
+            enable_metrics=False,
+            download_timeout=120,
+            download_retries=3,
+            mllm_prefill_step_size=None,
+            lazy_load_model=True,
+            auto_unload_idle_seconds=300,
+            models_config=None,
+            default_thinking_token_budget=None,
+            max_kv_size=0,
+        )
+
+        cli.serve_command(args)
+
+        assert captured["kwargs"]["stream_interval"] == 1
+        assert captured["kwargs"]["auto_unload_idle_seconds"] == 300
+        assert captured["kwargs"]["lazy_load_model"] is True
+
+    def test_serve_command_wires_auto_unload_idle_seconds_into_load_model_registry(
+        self, monkeypatch
+    ):
+        """--auto-unload-idle-seconds must not be silently dropped in
+        --models-config mode: it should reach RegistryServeDefaults so the
+        registry's idle reaper can fall back to it.
+        """
+        import uvicorn
+
+        import vllm_mlx.cli as cli
+        import vllm_mlx.server as srv
+
+        captured = {}
+
+        def fake_load_model_registry(config_path, *, defaults, memory_budget_gb=None):
+            captured["config_path"] = config_path
+            captured["defaults"] = defaults
+            captured["memory_budget_gb"] = memory_budget_gb
+
+        monkeypatch.setattr(srv, "load_model_registry", fake_load_model_registry)
+        monkeypatch.setattr(uvicorn, "run", lambda *args, **kwargs: None)
+
+        args = SimpleNamespace(
+            model=None,
+            models_config="/tmp/models.yaml",
+            host="127.0.0.1",
+            port=8000,
+            max_num_seqs=256,
+            prefill_batch_size=8,
+            completion_batch_size=32,
+            enable_prefix_cache=True,
+            disable_prefix_cache=False,
+            prefix_cache_size=100,
+            cache_memory_mb=None,
+            cache_memory_percent=0.20,
+            no_memory_aware_cache=False,
+            kv_cache_quantization=False,
+            kv_cache_quantization_bits=8,
+            kv_cache_quantization_group_size=64,
+            kv_cache_min_quantize_tokens=256,
+            stream_interval=7,
+            max_tokens=32768,
+            continuous_batching=False,
+            use_paged_cache=False,
+            paged_cache_block_size=64,
+            max_cache_blocks=1000,
+            chunked_prefill_tokens=0,
+            enable_mtp=False,
+            mtp_num_draft_tokens=1,
+            mtp_optimistic=False,
+            prefill_step_size=2048,
+            specprefill=False,
+            specprefill_threshold=8192,
+            specprefill_keep_pct=0.3,
+            specprefill_draft_model=None,
             mcp_config=None,
             api_key=None,
             rate_limit=0,
@@ -345,18 +535,22 @@ class TestLifecycleCli:
             download_timeout=120,
             download_retries=3,
             mllm_prefill_step_size=None,
-            lazy_load_model=True,
+            lazy_load_model=False,
             auto_unload_idle_seconds=300,
-            models_config=None,
             default_thinking_token_budget=None,
             max_kv_size=0,
+            embedding_max_length=None,
+            embedding_overflow_policy="truncate",
+            prefix_trie_cache=False,
+            prefix_trie_cache_size=32,
+            prefix_trie_cache_memory_mb=None,
         )
 
         cli.serve_command(args)
 
-        assert captured["kwargs"]["stream_interval"] == 1
-        assert captured["kwargs"]["auto_unload_idle_seconds"] == 300
-        assert captured["kwargs"]["lazy_load_model"] is True
+        assert captured["config_path"] == "/tmp/models.yaml"
+        assert captured["defaults"].auto_unload_idle_seconds == 300
+        assert captured["memory_budget_gb"] is None
 
     def test_serve_command_preserves_mtp_scheduler_config_with_residency(
         self, monkeypatch
@@ -417,6 +611,9 @@ class TestLifecycleCli:
             specprefill_threshold=8192,
             specprefill_keep_pct=0.3,
             specprefill_draft_model=None,
+            prefix_trie_cache=False,
+            prefix_trie_cache_size=32,
+            prefix_trie_cache_memory_mb=None,
             mcp_config=None,
             api_key=None,
             rate_limit=0,
@@ -434,6 +631,8 @@ class TestLifecycleCli:
             default_chat_template_kwargs=None,
             served_model_name=None,
             embedding_model=None,
+            embedding_max_length=None,
+            embedding_overflow_policy="truncate",
             gpu_memory_utilization=0.90,
             enable_metrics=False,
             download_timeout=120,
@@ -490,6 +689,42 @@ class TestLifecycleCli:
         assert captured["kwargs"]["auto_unload_idle_seconds"] == 300.0
         assert captured["kwargs"]["lazy_load_model"] is True
 
+    def test_server_main_wires_embedding_length_options(self, monkeypatch):
+        """Standalone server should configure the embedding engine before load."""
+        import vllm_mlx.server as srv
+
+        captured = {}
+
+        def fake_load_embedding_model(*args, **kwargs):
+            captured["args"] = args
+            captured["kwargs"] = kwargs
+            captured["max_length"] = srv._embedding_max_length
+            captured["overflow_policy"] = srv._embedding_overflow_policy
+
+        monkeypatch.setattr(srv, "load_embedding_model", fake_load_embedding_model)
+        monkeypatch.setattr(srv, "load_model", lambda *args, **kwargs: None)
+        monkeypatch.setattr(srv.uvicorn, "run", lambda *args, **kwargs: None)
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            [
+                "vllm_mlx.server",
+                "--embedding-model",
+                "mlx-community/Qwen3-Embedding-4B-4bit",
+                "--embedding-max-length",
+                "1024",
+                "--embedding-overflow-policy",
+                "error",
+            ],
+        )
+
+        srv.main()
+
+        assert captured["args"] == ("mlx-community/Qwen3-Embedding-4B-4bit",)
+        assert captured["kwargs"] == {"lock": True}
+        assert captured["max_length"] == 1024
+        assert captured["overflow_policy"] == "error"
+
     def test_serve_command_describes_lazy_startup_without_claiming_model_is_loaded(
         self, monkeypatch, capsys
     ):
@@ -534,6 +769,9 @@ class TestLifecycleCli:
             specprefill_threshold=8192,
             specprefill_keep_pct=0.3,
             specprefill_draft_model=None,
+            prefix_trie_cache=False,
+            prefix_trie_cache_size=32,
+            prefix_trie_cache_memory_mb=None,
             mcp_config=None,
             api_key=None,
             rate_limit=0,
@@ -551,6 +789,8 @@ class TestLifecycleCli:
             default_chat_template_kwargs=None,
             served_model_name=None,
             embedding_model=None,
+            embedding_max_length=None,
+            embedding_overflow_policy="truncate",
             gpu_memory_utilization=0.90,
             enable_metrics=False,
             download_timeout=120,

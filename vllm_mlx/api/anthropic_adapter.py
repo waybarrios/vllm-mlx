@@ -9,7 +9,6 @@ Handles translation of:
 """
 
 import json
-import re
 import uuid
 
 from .anthropic_models import (
@@ -26,6 +25,45 @@ from .models import (
     Message,
     ToolDefinition,
 )
+from .prompt_canonicalize import canonicalize_system_prompt
+
+
+def _merge_system_messages(messages: list[Message]) -> list[Message]:
+    """Collapse all system messages into one at index 0.
+
+    Claude Code can send a top-level ``system`` field plus additional
+    ``role="system"`` items inside ``messages``. Qwen, Llama, and Gemma
+    templates require at most one leading system message and otherwise raise
+    ``System message must be at the beginning.``
+    """
+
+    def _to_text(value) -> str:
+        if isinstance(value, str):
+            return value
+        if hasattr(value, "model_dump"):
+            value = value.model_dump(exclude_none=True)
+        if isinstance(value, dict):
+            return value.get("text") or ""
+        if isinstance(value, list):
+            return "\n".join(_to_text(item) for item in value)
+        return ""
+
+    if not any(message.role == "system" for message in messages):
+        return messages
+
+    system_texts = [
+        text
+        for text in (
+            _to_text(message.content)
+            for message in messages
+            if message.role == "system"
+        )
+        if text
+    ]
+    non_system = [message for message in messages if message.role != "system"]
+
+    # Preserve an explicit system message even if canonicalization emptied it.
+    return [Message(role="system", content="\n\n".join(system_texts)), *non_system]
 
 
 def anthropic_to_openai(request: AnthropicRequest) -> ChatCompletionRequest:
@@ -64,13 +102,24 @@ def anthropic_to_openai(request: AnthropicRequest) -> ChatCompletionRequest:
         # Strip per-request billing/tracking headers injected by some
         # clients (e.g. Claude Code).  These contain a per-request hash
         # that prevents prefix-cache reuse across turn boundaries.
-        system_text = re.sub(r"x-anthropic-billing-header:[^\n]*\n?", "", system_text)
+        #
+        # Use the shared canonicalizer rather than an inline pattern. The
+        # local one was unanchored, so it deleted the header text wherever
+        # it appeared -- including mid-sentence in a user's own prompt --
+        # and this pass runs before canonicalize_system_messages(), which
+        # cannot restore what was already removed.
+        system_text = canonicalize_system_prompt(system_text) or ""
         messages.append(Message(role="system", content=system_text))
 
     # Convert each message
     for msg in request.messages:
         converted = _convert_message(msg)
         messages.extend(converted)
+
+    # Claude Code may inject system-role items after the initial user turn,
+    # notably around agent metadata and compacted conversation continuations.
+    # Normalize them before model chat templates enforce system-at-index-zero.
+    messages = _merge_system_messages(messages)
 
     # Convert tools
     tools = None
@@ -186,8 +235,8 @@ def _convert_message(msg: AnthropicMessage) -> list[Message]:
     tool_results = []
 
     for block in msg.content:
-        if block.type == "text":
-            text_parts.append(block.text or "")
+        if block.type == "text" and block.text:
+            text_parts.append(block.text)
 
         elif block.type == "tool_use":
             # Assistant message with tool calls

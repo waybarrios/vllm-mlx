@@ -54,12 +54,19 @@ Use `--tool-call-parser` to select a parser for your model family:
 | `auto` | | Any model | Auto-detects format (tries all parsers) |
 | `mistral` | | Mistral, Devstral | `[TOOL_CALLS]` JSON array |
 | `qwen` | `qwen3` | Qwen, Qwen3 | `<tool_call>` XML or `[Calling tool:]` |
-| `llama` | `llama3`, `llama4` | Llama 3.x, 4.x | `<function=name>` tags |
+| `qwen3_xml` | `qwen3.5`, `qwen3_coder` | Qwen 3.5, Qwen3 Coder | Typed streaming XML |
+| `llama` | `llama3`, `llama4` | Llama 3.x, 4.x | `<\|python_tag\|>` JSON, bare JSON, or `<function=name>` tags |
 | `hermes` | `nous` | Hermes, NousResearch | `<tool_call>` JSON in XML |
 | `deepseek` | `deepseek_v3`, `deepseek_r1` | DeepSeek V3, R1 | Unicode delimiters |
+| `deepseek_v4` | `dsml` | DeepSeek V4 Flash / Flash-0731 | DSML typed parameters |
+| `gemma4` | | Gemma 4 | `<\|tool_call>` call blocks |
 | `kimi` | `kimi_k2`, `moonshot` | Kimi K2, Moonshot | `<\|tool_call_begin\|>` tokens |
 | `granite` | `granite3` | IBM Granite 3.x, 4.x | `<\|tool_call\|>` or `<tool_call>` |
 | `nemotron` | `nemotron3` | NVIDIA Nemotron | `<tool_call><function=...><parameter=...>` |
+| `minimax` | `minimax_m2` | MiniMax M2 | `<minimax:tool_call>` XML |
+| `harmony` | `gpt-oss` | GPT-OSS | Harmony commentary control tokens |
+| `poolside_v1` | | Poolside v1 / Laguna | Typed `<arg_key>`/`<arg_value>` XML |
+| `step3p5` | `step` | Step 3.5 | `<tool_call><function=...>` XML |
 | `xlam` | | Salesforce xLAM | JSON with `tool_calls` array |
 | `functionary` | `meetkai` | MeetKai Functionary | Multiple function blocks |
 | `glm47` | `glm4` | GLM-4.7, GLM-4.7-Flash | `<tool_call>` with `<arg_key>`/`<arg_value>` XML |
@@ -100,6 +107,48 @@ vllm-mlx serve mlx-community/Llama-3.2-3B-Instruct-4bit \
 # DeepSeek V3
 vllm-mlx serve mlx-community/DeepSeek-V3-0324-4bit \
   --enable-auto-tool-choice --tool-call-parser deepseek
+```
+
+DeepSeek V4 uses a different wire format and must use both V4 parsers. The
+programmatic encoder supports the published `DeepSeek-V4-Flash` preview and
+the `DeepSeek-V4-Flash-0731` profile:
+
+```bash
+vllm-mlx serve deepseek-ai/DeepSeek-V4-Flash-0731 \
+  --reasoning-parser deepseek_v4 \
+  --enable-auto-tool-choice \
+  --tool-call-parser deepseek_v4
+```
+
+The preview profile accepts `high` and `max`; the 0731 profile accepts `low`,
+`high`, and `max`. OpenAI `reasoning_effort` values are normalized as follows:
+unspecified → `high`, `minimal`/`low`/`medium` → `low`, `high`/`xhigh` →
+`high`, and `max` → `max`. On the preview checkpoint, `low` normalizes to
+`high`. Streaming buffers partial DSML markers and emits exactly one structured
+tool call after the block is complete; truncated markup is returned as text.
+
+```python
+from openai import OpenAI
+
+client = OpenAI(base_url="http://localhost:8000/v1", api_key="unused")
+response = client.chat.completions.create(
+    model="deepseek-ai/DeepSeek-V4-Flash-0731",
+    messages=[{"role": "user", "content": "What is the weather in Prague?"}],
+    reasoning_effort="high",
+    tools=[{
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "description": "Get the current weather",
+            "parameters": {
+                "type": "object",
+                "properties": {"city": {"type": "string"}},
+                "required": ["city"],
+            },
+        },
+    }],
+)
+print(response.choices[0].message.tool_calls[0].function.arguments)
 ```
 
 ### IBM Granite
@@ -152,12 +201,14 @@ vllm-mlx serve mlx-community/Qwen3-4B-4bit \
 ```
 
 The auto parser tries formats in this order:
-1. Mistral (`[TOOL_CALLS]`)
-2. Qwen bracket (`[Calling tool:]`)
-3. Nemotron (`<tool_call><function=...><parameter=...>`)
-4. Qwen/Hermes XML (`<tool_call>{...}</tool_call>`)
-5. Llama (`<function=name>{...}</function>`)
-6. Raw JSON
+1. Gemma 4 (`<|tool_call>call:name...<tool_call|>`)
+2. DeepSeek V4 DSML (`<｜DSML｜tool_calls>`)
+3. Mistral (`[TOOL_CALLS]`)
+4. Qwen bracket (`[Calling tool:]`)
+5. Nemotron (`<tool_call><function=...><parameter=...>`)
+6. Qwen/Hermes XML (`<tool_call>{...}</tool_call>`)
+7. Llama (`<function=name>{...}</function>`)
+8. Raw JSON
 
 ## Streaming Tool Calls
 

@@ -228,7 +228,7 @@ python examples/mcp_chat.py
 
 ## Supported Tool Formats
 
-vllm-mlx supports 12 tool call parsers covering all major model families. See [Tool Calling](tool-calling.md) for the full list of parsers, aliases, and examples.
+vllm-mlx supports 19 tool call parsers covering all major model families. See [Tool Calling](tool-calling.md) for the full list of parsers, aliases, and examples.
 
 ## Security
 

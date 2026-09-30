@@ -37,6 +37,12 @@ _TEXT_MODEL_FAMILIES: tuple[tuple[str, str, tuple[str, str]], ...] = (
 # that names neither the model nor the class. Hence the logging either side.
 _DEFAULT_TEXT_MODEL = ("mlx_lm.models.qwen3_5", ("TextModel", "TextModelArgs"))
 
+# These architectures are not compatible with the generic Qwen3.5 text
+# skeleton. Returning no extracted TextModel keeps SimpleEngine on the loaded
+# mlx-vlm path for text as well as media instead of silently serving incorrect
+# logits from a mechanically compatible but architecturally different model.
+_VLM_ONLY_TEXT_MODEL_PREFIXES = ("qwen4_exp",)
+
 
 def _import_text_model_classes(model_type: str):
     """Return ``(Model, ModelArgs)`` for a text config's ``model_type``."""
@@ -66,12 +72,15 @@ def _import_text_model_classes(model_type: str):
     return getattr(module, model_attr), getattr(module, args_attr)
 
 
-def build_text_model(vlm_model: Any, model_path: str | Path) -> Any | None:
+def build_text_model(
+    vlm_model: Any, model_path: str | Path, *, enable_mtp: bool = True
+) -> Any | None:
     """Build an mlx_lm TextModel from a vlm-loaded model's weights.
 
     Args:
         vlm_model: The mlx_vlm-loaded model (has .language_model attribute)
         model_path: Path to the model directory (contains config.json + safetensors)
+        enable_mtp: Whether the serving engine requested speculative MTP decoding.
 
     Returns:
         mlx_lm TextModel with MTP support, or None on failure.
@@ -89,6 +98,13 @@ def build_text_model(vlm_model: Any, model_path: str | Path) -> Any | None:
         config = json.loads((model_path / "config.json").read_text())
         text_config = config.get("text_config", config)
         model_type = text_config.get("model_type") or config.get("model_type", "")
+        if model_type.startswith(_VLM_ONLY_TEXT_MODEL_PREFIXES):
+            logger.info(
+                "Keeping model_type=%r on the mlx-vlm text path; no compatible "
+                "mlx-lm TextModel is registered",
+                model_type,
+            )
+            return None
         TextModel, TextModelArgs = _import_text_model_classes(model_type)
         text_model_cls = f"{TextModel.__module__}.{TextModel.__qualname__}"
         logger.debug(
@@ -100,10 +116,11 @@ def build_text_model(vlm_model: Any, model_path: str | Path) -> Any | None:
         args = TextModelArgs.from_dict(text_config)
         text_model = TextModel(args)
 
-        # Collect all weights first: backbone from vlm + MTP from safetensors
+        # Keep the ordinary text route independent from draft tensors unless
+        # the serving engine explicitly enabled speculative MTP decoding.
         vlm_lm = vlm_model.language_model
         vlm_weights = mlx.utils.tree_flatten(vlm_lm.parameters())
-        mtp_weights = _load_mtp_weights(model_path)
+        mtp_weights = _load_mtp_weights(model_path) if enable_mtp else []
 
         all_weight_names = set(name for name, _ in vlm_weights)
         all_weight_names.update(name for name, _ in mtp_weights)
@@ -151,17 +168,17 @@ def build_text_model(vlm_model: Any, model_path: str | Path) -> Any | None:
             "Transferred %d weight arrays from vlm language_model", len(vlm_weights)
         )
 
-        # Load MTP weights from safetensors
-        if mtp_weights:
+        # Load and inject draft weights only when the engine requested MTP.
+        if enable_mtp and mtp_weights:
             text_model.load_weights(mtp_weights, strict=False)
             logger.info("Loaded %d MTP weights from safetensors", len(mtp_weights))
-        else:
+        elif enable_mtp:
             logger.warning("No MTP weights found in %s", model_path.name)
 
         # Inject MTP if TextModel doesn't have native MTP support.
         # mlx_lm's qwen3_5.TextModel strips MTP weights in sanitize(),
         # so we inject MTP module + methods at runtime.
-        if not hasattr(text_model, "mtp") or text_model.mtp is None:
+        if enable_mtp and (not hasattr(text_model, "mtp") or text_model.mtp is None):
             num_mtp = text_config.get("mtp_num_hidden_layers", 0)
             if num_mtp == 0:
                 num_mtp = text_config.get("num_nextn_predict_layers", 0)

@@ -9,10 +9,11 @@ Available parsers:
 - auto: Auto-detecting parser that tries all formats (default)
 - mistral: Mistral models ([TOOL_CALLS] format)
 - qwen/qwen3: Qwen models (<tool_call> and [Calling tool:] formats)
-- llama/llama3/llama4: Llama models (<function=name> format)
+- llama/llama3/llama4: Llama models (python-tag JSON, bare JSON, and legacy XML)
 - gemma4/gemma_4: Google Gemma 4 models (<|tool_call>call:name{} format)
 - hermes/nous: Hermes/NousResearch models
 - deepseek/deepseek_v3/deepseek_r1: DeepSeek models (unicode tokens)
+- deepseek_v4/dsml: DeepSeek-V4 models (<｜DSML｜invoke name="..."> markup)
 - kimi/kimi_k2/moonshot: Kimi/Moonshot models
 - granite/granite3: IBM Granite models
 - nemotron/nemotron3: NVIDIA Nemotron models
@@ -21,6 +22,7 @@ Available parsers:
 - glm47/glm4: GLM-4.7 and GLM-4.7-Flash models
 - harmony/gpt-oss: GPT-OSS models (Harmony format with channels)
 - minimax: MiniMax-M2 models
+- step3p5/step: Step3p5/Step 3.7 Flash XML function calls
 
 Usage:
     from vllm_mlx.tool_parsers import ToolParserManager
@@ -48,6 +50,7 @@ from .abstract_tool_parser import (
 # Import parsers to register them
 from .auto_tool_parser import AutoToolParser
 from .deepseek_tool_parser import DeepSeekToolParser
+from .deepseek_v4_tool_parser import DeepSeekV4ToolParser
 from .functionary_tool_parser import FunctionaryToolParser
 from .gemma4_tool_parser import Gemma4ToolParser
 from .granite_tool_parser import GraniteToolParser
@@ -63,6 +66,7 @@ from .glm47_tool_parser import Glm47ToolParser
 from .harmony_tool_parser import HarmonyToolParser
 from .minimax_tool_parser import MiniMaxToolParser
 from .qwen3_xml_tool_parser import Qwen3XMLToolParser
+from .step3p5_tool_parser import Step3p5ToolParser
 
 
 def get_parser_stop_tokens(
@@ -105,6 +109,7 @@ __all__ = [
     "LlamaToolParser",
     "HermesToolParser",
     "DeepSeekToolParser",
+    "DeepSeekV4ToolParser",
     "KimiToolParser",
     "GraniteToolParser",
     "NemotronToolParser",
@@ -113,4 +118,5 @@ __all__ = [
     "Glm47ToolParser",
     "HarmonyToolParser",
     "MiniMaxToolParser",
+    "Step3p5ToolParser",
 ]

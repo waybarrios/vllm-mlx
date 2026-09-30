@@ -88,3 +88,51 @@ def normalize_messages_for_chat_template(messages: list[Any]) -> list[dict]:
                 parsed = {"value": parsed}
             function["arguments"] = parsed
     return normalized
+
+
+def build_system_prompt_cache_prefix(
+    tokenizer: Any,
+    messages: list[Any],
+    *,
+    template_kwargs: dict[str, Any],
+    normalized_messages: list[dict] | None = None,
+) -> str | None:
+    """Render the stable system prefix used by the SimpleEngine KV cache."""
+    normalized = (
+        normalized_messages
+        if normalized_messages is not None
+        else normalize_messages_for_chat_template(messages)
+    )
+    system_messages = [
+        dict(message)
+        for message in normalized
+        if isinstance(message, dict) and message.get("role") == "system"
+    ]
+    if not system_messages:
+        return None
+
+    def _render(user_content: str) -> Any:
+        probe_messages = [
+            *system_messages,
+            {"role": "user", "content": user_content},
+        ]
+        return tokenizer.apply_chat_template(probe_messages, **template_kwargs)
+
+    try:
+        rendered_a = _render("Alpha")
+        rendered_b = _render("Bravo")
+    except Exception:
+        return None
+
+    if not isinstance(rendered_a, str) or not isinstance(rendered_b, str):
+        return None
+
+    for boundary, (char_a, char_b) in enumerate(zip(rendered_a, rendered_b)):
+        if char_a != char_b:
+            break
+    else:
+        return None
+
+    if boundary < 16:
+        return None
+    return rendered_a[:boundary]

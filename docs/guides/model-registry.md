@@ -25,6 +25,10 @@ Keep single-model serving when you want the smallest operational surface and the
 vllm-mlx serve --models-config /etc/vllm-mlx/models.yaml --host 0.0.0.0 --port 8000
 ```
 
+Use `--memory-budget-gb` to override `manager.memory_budget_gb` (or the legacy
+`manager.memory_budget`) for a particular launch. The CLI value takes precedence
+over the YAML value and can supply the budget when the YAML field is absent.
+
 You can still use global serve flags such as:
 
 - `--api-key`
@@ -53,6 +57,7 @@ Example:
 ```yaml
 manager:
   memory_budget_gb: 100
+  idle_unload_seconds: 300
   contention_policy:
     strategy: wait_then_preempt
     wait_timeout_s: 45
@@ -95,6 +100,20 @@ It does not include, and does not reserve room for:
 
 On a 128 GB machine, a practical starting point is often `80-100 GB`.
 
+For different host or launch profiles, pass `--memory-budget-gb` instead of
+maintaining duplicate registry files. The override remains a weights-only
+budget and does not change the Metal allocation ceiling described below.
+
+### `idle_unload_seconds`
+
+Automatically unload a model after it has had no active requests for this many
+seconds. Values less than or equal to `0` disable idle unloading.
+
+If this setting is omitted, registry mode inherits
+`--auto-unload-idle-seconds`; that flag defaults to `0`. A value in the YAML
+file takes precedence over the CLI fallback. Preloaded models are also eligible
+for idle unloading after their preload lease is released.
+
 ### Budget vs. the Metal allocation ceiling
 
 The manager budget and the MLX allocation ceiling are two separate numbers, and
@@ -126,8 +145,19 @@ together with the prefix-cache setting:
 ```
 Registry memory budget: 68.0 GB of model weights; Metal allocation ceiling
 64.0 GB (50% of 128.0 GB, from serve default); prefix-cache maximum
-20.0 GB per continuous-batching engine (--cache-memory-mb, 2 of 3 entries)
+20.0 GB per memory-aware prefix-cache engine (--cache-memory-mb, 2 of 3 entries)
 ```
+
+The entry count follows the cache path each model will use. With
+`--use-paged-cache`, text engines use the paged cache and are excluded from this
+count. MLLM engines still construct a memory-aware prefix cache, so their
+per-engine `--cache-memory-mb` maximum remains included. For an unresolved
+remote model ID, set `mllm: true` on the registry entry so the startup report
+can include its cache without relying on a model-name heuristic.
+
+If an entry enables continuous batching while the global serve default leaves
+it disabled, the report uses the same scheduler defaults as the engine,
+including the default 20% memory-aware cache limit.
 
 When the weights budget alone does not fit below the ceiling, startup warns:
 
@@ -163,9 +193,10 @@ Notes on how the check is computed:
   allocated lazily, and simple-mode entries never receive it at all. Subtracting
   it once would understate capacity with one resident model and overstate it
   with several, so it is reported next to the ceiling rather than folded into
-  it. It is reported only when it can actually bind — that is, for
-  continuous-batching entries using the memory-aware prefix cache (not
-  `--use-paged-cache`).
+  it. It is reported only when it can actually bind: for continuous-batching
+  entries using the memory-aware prefix cache. Text entries using
+  `--use-paged-cache` are excluded, while MLLM entries remain included because
+  they still construct the memory-aware prefix cache.
 - A separate warning fires when `--cache-memory-mb` alone is at or above the
   ceiling, which is a configuration error in its own right.
 - On hosts where MLX cannot report a Metal working-set size, the check reports
@@ -206,10 +237,22 @@ Optional:
 - `specprefill`
 - `specprefill_threshold`
 - `specprefill_keep_pct`
+- `specprefill_backbone_pct`
 - `specprefill_draft_model`
 - `stream_interval`
 - `gpu_memory_utilization`
 - `estimated_memory_gb`
+
+For continuous-batching multimodal routes, SpecPrefill is opt-in and currently
+supports exact Qwen3-VL and Qwen3.5 dense and MoE runtime modules. It preserves
+visual placeholders, fused media embeddings, deep-stack visual state, and
+request-local MRoPE positions. Media requests use fresh request-local caches:
+token-only prefix keys cannot identify the media or restore its MRoPE delta.
+Unsupported models, installed native MTP, request-enabled external assistants,
+interleaved chunked prefill, rotating caches, audio, and unavailable drafts use
+normal dense media prefill. When SpecPrefill is requested, the final OpenAI chat
+response reports the decision in `generation_metadata.specprefill_engaged` and
+`generation_metadata.specprefill_reason`.
 
 ## Sizing Rules
 
@@ -263,6 +306,13 @@ Registry-backed responses include the configured model ids and current state suc
 - `loading`
 - `unloaded`
 - `preempting`
+
+Each model entry also includes `last_used_at` when it is loaded. For the
+effective idle timeout together with all model states, inspect `/v1/status`:
+
+```bash
+curl http://localhost:8000/v1/status
+```
 
 ### Verify a cold-load path
 

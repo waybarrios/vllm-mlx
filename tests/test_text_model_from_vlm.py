@@ -3,6 +3,7 @@
 
 import json
 import os
+import inspect
 import sys
 import types
 from pathlib import Path
@@ -38,6 +39,75 @@ def test_build_text_model_none_vlm():
     """Returns None when vlm_model is None."""
     result = build_text_model(None, TEXT_MTP_MODEL)
     assert result is None
+
+
+def test_build_text_model_accepts_engine_mtp_decision():
+    parameter = inspect.signature(build_text_model).parameters["enable_mtp"]
+
+    assert parameter.default is True
+
+
+def test_build_text_model_disabled_mtp_skips_draft_loading_and_injection(
+    tmp_path, monkeypatch
+):
+    """The non-speculative SimpleEngine path must not touch MTP state."""
+
+    model_path = tmp_path / "qwen"
+    model_path.mkdir()
+    (model_path / "config.json").write_text(
+        json.dumps(
+            {
+                "model_type": "qwen3_5",
+                "mtp_num_hidden_layers": 1,
+            }
+        )
+    )
+
+    class FakeLanguageModel:
+        def parameters(self):
+            return {}
+
+    class FakeVlmModel:
+        language_model = FakeLanguageModel()
+
+    class FakeTextModelArgs:
+        @classmethod
+        def from_dict(cls, config):
+            return config
+
+    class FakeTextModel:
+        def __init__(self, args):
+            self.args = args
+            self.mtp = None
+            self.loaded_weights = []
+
+        def load_weights(self, weights, strict=False):
+            self.loaded_weights.append((weights, strict))
+
+        def train(self, mode=True):
+            self.training = mode
+            return self
+
+    qwen_module = types.ModuleType("mlx_lm.models.qwen3_5")
+    qwen_module.TextModel = FakeTextModel
+    qwen_module.TextModelArgs = FakeTextModelArgs
+
+    mtp_loads = []
+
+    def record_mtp_load(path):
+        mtp_loads.append(path)
+        return [("mtp.layers.0.weight", object())]
+
+    monkeypatch.setitem(sys.modules, "mlx_lm.models.qwen3_5", qwen_module)
+    monkeypatch.setattr(text_model_from_vlm.mlx.utils, "tree_flatten", lambda _p: [])
+    monkeypatch.setattr(text_model_from_vlm, "_load_mtp_weights", record_mtp_load)
+
+    text_model = build_text_model(FakeVlmModel(), model_path, enable_mtp=False)
+
+    assert isinstance(text_model, FakeTextModel)
+    assert mtp_loads == []
+    assert text_model.mtp is None
+    assert text_model.loaded_weights == [([], False)]
 
 
 def test_build_text_model_dispatches_gemma4_text_model(tmp_path, monkeypatch):

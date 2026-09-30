@@ -664,7 +664,7 @@ class PagedCacheManager:
 
             return False
 
-    def free_blocks(self, blocks: Iterable[CacheBlock]) -> None:
+    def free_block_batch(self, blocks: Iterable[CacheBlock]) -> None:
         """
         Free multiple blocks (vLLM style).
 

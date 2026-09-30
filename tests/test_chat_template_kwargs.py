@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for chat template kwargs forwarding."""
 
+import json
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -104,6 +105,7 @@ def test_chat_completion_endpoint_forwards_chat_template_kwargs():
                 "model": "test-model",
                 "messages": [{"role": "user", "content": "Reply with ORBIT."}],
                 "max_tokens": 8,
+                "reasoning_effort": "medium",
                 "chat_template_kwargs": {"enable_thinking": False},
             },
         )
@@ -112,8 +114,44 @@ def test_chat_completion_endpoint_forwards_chat_template_kwargs():
         srv._model_name = original_model_name
 
     assert response.status_code == 200
-    assert captured["kwargs"]["chat_template_kwargs"] == {"enable_thinking": False}
+    assert captured["kwargs"]["chat_template_kwargs"] == {
+        "enable_thinking": False,
+        "reasoning_effort": "medium",
+    }
     assert response.json()["choices"][0]["message"]["content"] == "ORBIT"
+
+
+@pytest.mark.parametrize(
+    ("request_effort", "request_kwargs", "expected_effort"),
+    [
+        (None, None, "low"),
+        ("medium", None, "medium"),
+        ("medium", {"reasoning_effort": "high"}, "high"),
+    ],
+)
+def test_chat_completion_preparation_resolves_reasoning_effort_precedence(
+    monkeypatch, request_effort, request_kwargs, expected_effort
+):
+    monkeypatch.setattr(
+        srv,
+        "_default_chat_template_kwargs",
+        {"reasoning_effort": "low", "server_only": True},
+    )
+    request = srv.ChatCompletionRequest(
+        model="test-model",
+        messages=[srv.Message(role="user", content="Hello")],
+        reasoning_effort=request_effort,
+        chat_template_kwargs=request_kwargs,
+    )
+    engine = SimpleNamespace(is_mllm=False, preserve_native_tool_format=False)
+
+    prepared = srv._prepare_chat_completion_invocation(engine, request, 8)
+
+    assert prepared.chat_kwargs["chat_template_kwargs"] == {
+        "reasoning_effort": expected_effort,
+        "server_only": True,
+        **({} if request_kwargs is None else request_kwargs),
+    }
 
 
 def test_chat_completion_endpoint_applies_server_default_chat_template_kwargs():
@@ -282,6 +320,10 @@ async def test_simple_engine_stream_generate_text_applies_chat_template_kwargs()
         engine._is_mllm = True
         engine._text_tokenizer = MagicMock()
         engine._text_tokenizer.apply_chat_template.return_value = "prompt"
+        # Realistic tokenizer attrs: the up-front usage tokenization reads
+        # bos_token and encode() on every request.
+        engine._text_tokenizer.bos_token = None
+        engine._text_tokenizer.encode.return_value = [1, 2, 3]
         engine._text_model = MagicMock()
         engine._text_model.model = MagicMock()
 
@@ -341,7 +383,7 @@ async def test_stream_chat_does_not_add_nemotron_prefix_when_thinking_disabled(
         def __init__(self, tokenizer=None):
             self.tokenizer = tokenizer
 
-        def reset_state(self):
+        def reset_state(self, implicit_mode=False):
             pass
 
         def extract_reasoning_streaming(self, previous_text, current_text, delta_text):
@@ -392,7 +434,7 @@ async def test_stream_anthropic_skips_reasoning_parser_when_thinking_disabled():
 
     class _EatsEverythingAsReasoning:
         # Mimics BaseThinkingReasoningParser's implicit-mode default.
-        def reset_state(self):
+        def reset_state(self, implicit_mode=False):
             pass
 
         def extract_reasoning_streaming(self, prev, cur, delta):
@@ -435,3 +477,330 @@ async def test_stream_anthropic_skips_reasoning_parser_when_thinking_disabled():
     assert '"type": "thinking"' not in body
     assert "HEL" in body and "LO" in body
     assert '"type": "text_delta"' in body
+
+
+# Explicit-marker guard: thinking disabled must not leak raw reasoning
+# markers (Gemma 4 opens <|channel>thought regardless of the template
+# kwarg). Non-streaming parses iff explicit markers are present; the
+# streaming paths latch the parser on when a marker appears and emit only
+# the parsed content (reasoning is suppressed — the request disabled it).
+
+_GEMMA_OUTPUT = "<|channel>thought\nLet me think.<channel|>The answer is 42."
+_GEMMA_DELTAS = (
+    "<|channel>thought\n",
+    "Let me think.",
+    "<channel|>",
+    "The answer is 42.",
+)
+
+
+def _gemma_parser():
+    from vllm_mlx.reasoning.gemma4_parser import Gemma4ReasoningParser
+
+    return Gemma4ReasoningParser()
+
+
+def test_extract_reasoning_parses_explicit_markers_when_thinking_disabled():
+    saved = srv._reasoning_parser
+    srv._reasoning_parser = _gemma_parser()
+    try:
+        reasoning, content, tool_calls = srv._extract_reasoning_and_tool_calls(
+            _GEMMA_OUTPUT, None, allow_reasoning=False
+        )
+    finally:
+        srv._reasoning_parser = saved
+
+    assert tool_calls is None
+    assert content == "The answer is 42."
+    assert reasoning is None
+    assert "<|channel>" not in content and "<channel|>" not in content
+
+
+def test_extract_reasoning_stays_disabled_without_markers():
+    # No explicit markers: the parser must remain skipped so implicit-mode
+    # parsers can't swallow plain content into reasoning (PR #537 hazard).
+    saved = srv._reasoning_parser
+    srv._reasoning_parser = _gemma_parser()
+    try:
+        reasoning, content, _ = srv._extract_reasoning_and_tool_calls(
+            "Plain answer.", None, allow_reasoning=False
+        )
+    finally:
+        srv._reasoning_parser = saved
+
+    assert reasoning is None
+    assert content == "Plain answer."
+
+
+def test_extract_reasoning_stays_disabled_for_lone_end_marker():
+    saved = srv._reasoning_parser
+    srv._reasoning_parser = _gemma_parser()
+    try:
+        reasoning, content, _ = srv._extract_reasoning_and_tool_calls(
+            "Before <channel|> after", None, allow_reasoning=False
+        )
+    finally:
+        srv._reasoning_parser = saved
+
+    assert reasoning is None
+    assert content == "Before <channel|> after"
+
+
+def test_extract_reasoning_strips_end_only_think_marker_when_disabled():
+    from vllm_mlx.reasoning.deepseek_r1_parser import DeepSeekR1ReasoningParser
+
+    saved = srv._reasoning_parser
+    srv._reasoning_parser = DeepSeekR1ReasoningParser()
+    try:
+        reasoning, content, _ = srv._extract_reasoning_and_tool_calls(
+            "Private reasoning</think>Visible answer", None, allow_reasoning=False
+        )
+    finally:
+        srv._reasoning_parser = saved
+
+    assert reasoning is None
+    assert content == "Visible answer"
+
+
+@pytest.mark.anyio
+async def test_stream_anthropic_strips_markers_when_thinking_disabled():
+    async def fake_stream_chat(messages, **kwargs):
+        for piece in _GEMMA_DELTAS:
+            yield SimpleNamespace(new_text=piece, prompt_tokens=4, completion_tokens=1)
+
+    engine = MagicMock(stream_chat=fake_stream_chat)
+    msgs = [{"role": "user", "content": "What is the answer?"}]
+    openai_request = srv.ChatCompletionRequest(
+        model="test-model", messages=[srv.Message(**msgs[0])], max_tokens=8
+    )
+    anthropic_request = srv.AnthropicRequest(
+        model="test-model", max_tokens=8, messages=msgs
+    )
+    prepared = srv.PreparedChatInvocation(
+        messages=msgs,
+        chat_kwargs={"chat_template_kwargs": {"enable_thinking": False}},
+        response_format=None,
+        json_logits_processor=None,
+    )
+
+    saved = (srv._reasoning_parser, srv._model_name)
+    srv._reasoning_parser, srv._model_name = _gemma_parser(), "test-model"
+    try:
+        body = "".join(
+            [
+                c
+                async for c in srv._stream_anthropic_messages(
+                    engine, openai_request, anthropic_request, prepared
+                )
+            ]
+        )
+    finally:
+        srv._reasoning_parser, srv._model_name = saved
+
+    # Raw markers and the thought text must not reach the text block.
+    assert "<|channel>" not in body and "<channel|>" not in body
+    assert "Let me think." not in body
+    # Thinking was disabled — no thinking block, only cleaned content.
+    assert "thinking_delta" not in body
+    assert "The answer is 42." in body
+    assert '"type": "text_delta"' in body
+
+
+@pytest.mark.anyio
+async def test_stream_chat_completion_strips_markers_when_thinking_disabled():
+    import json as _json
+
+    async def fake_stream_chat(messages, **kwargs):
+        for i, piece in enumerate(_GEMMA_DELTAS):
+            yield SimpleNamespace(
+                new_text=piece,
+                prompt_tokens=4,
+                completion_tokens=i + 1,
+                finished=i == len(_GEMMA_DELTAS) - 1,
+                finish_reason="stop" if i == len(_GEMMA_DELTAS) - 1 else None,
+            )
+
+    engine = MagicMock(stream_chat=fake_stream_chat)
+    request = srv.ChatCompletionRequest(
+        model="test-model",
+        messages=[srv.Message(role="user", content="What is the answer?")],
+        max_tokens=8,
+    )
+
+    saved = (srv._reasoning_parser, srv._model_name)
+    srv._reasoning_parser, srv._model_name = _gemma_parser(), "test-model"
+    try:
+        chunks = [
+            c
+            async for c in srv.stream_chat_completion(
+                engine,
+                request.messages,
+                request,
+                chat_template_kwargs={"enable_thinking": False},
+            )
+        ]
+    finally:
+        srv._reasoning_parser, srv._model_name = saved
+
+    body = "".join(chunks)
+    assert "<|channel>" not in body and "<channel|>" not in body
+
+    contents, reasonings = [], []
+    for line in body.splitlines():
+        if not line.startswith("data: ") or line == "data: [DONE]":
+            continue
+        delta = _json.loads(line[len("data: ") :])["choices"][0]["delta"]
+        if delta.get("content"):
+            contents.append(delta["content"])
+        if delta.get("reasoning"):
+            reasonings.append(delta["reasoning"])
+
+    assert "".join(contents) == "The answer is 42."
+    assert reasonings == []  # reasoning suppressed when thinking disabled
+
+
+@pytest.mark.anyio
+async def test_stream_anthropic_flushes_partial_reasoning_marker(monkeypatch):
+    async def fake_stream_chat(messages, **kwargs):
+        yield SimpleNamespace(
+            new_text="thinking</thi",
+            prompt_tokens=3,
+            completion_tokens=2,
+            finished=True,
+            finish_reason="stop",
+        )
+
+    engine = MagicMock(stream_chat=fake_stream_chat, tokenizer=None)
+    messages = [{"role": "user", "content": "Think"}]
+    openai_request = srv.ChatCompletionRequest(
+        model="test-model",
+        messages=[srv.Message(**messages[0])],
+        max_tokens=8,
+    )
+    anthropic_request = srv.AnthropicRequest(
+        model="test-model",
+        max_tokens=8,
+        messages=messages,
+    )
+    prepared = srv.PreparedChatInvocation(
+        messages=messages,
+        chat_kwargs={},
+        response_format=None,
+        json_logits_processor=None,
+    )
+    monkeypatch.setattr(srv, "_reasoning_parser_name", "qwen3")
+    monkeypatch.setattr(srv, "_reasoning_parser", None)
+    monkeypatch.setattr(srv, "_model_name", "test-model")
+
+    body = "".join(
+        [
+            chunk
+            async for chunk in srv._stream_anthropic_messages(
+                engine, openai_request, anthropic_request, prepared
+            )
+        ]
+    )
+    events = [
+        json.loads(line.removeprefix("data: "))
+        for line in body.splitlines()
+        if line.startswith("data: ")
+    ]
+    thinking = "".join(
+        event["delta"]["thinking"]
+        for event in events
+        if event["type"] == "content_block_delta"
+        and event["delta"]["type"] == "thinking_delta"
+    )
+
+    assert thinking == "thinking</thi"
+    assert body.index("thinking</thi") < body.index("message_stop")
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("use_reasoning", [False, True])
+async def test_stream_anthropic_flushes_truncated_deepseek_v4_dsml(
+    monkeypatch, use_reasoning
+):
+    d = "｜DSML｜"
+    truncated = f'Before <{d}tool_calls>\n<{d}invoke name="f'
+
+    async def fake_stream_chat(messages, **kwargs):
+        yield GenerationOutput(
+            text="",
+            new_text=("thinking</think>" if use_reasoning else "") + truncated,
+            finished=False,
+        )
+        yield GenerationOutput(
+            text="",
+            new_text="",
+            finished=True,
+            finish_reason="length",
+            prompt_tokens=3,
+            completion_tokens=2,
+        )
+
+    engine = MagicMock(stream_chat=fake_stream_chat, tokenizer=None)
+    messages = [{"role": "user", "content": "Think"}]
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "f",
+                "parameters": {"type": "object"},
+            },
+        }
+    ]
+    openai_request = srv.ChatCompletionRequest(
+        model="test-model",
+        messages=[srv.Message(**messages[0])],
+        max_tokens=8,
+        tools=tools,
+    )
+    anthropic_request = srv.AnthropicRequest(
+        model="test-model",
+        max_tokens=8,
+        messages=messages,
+        tools=[
+            {
+                "name": "f",
+                "input_schema": {"type": "object"},
+            }
+        ],
+    )
+    prepared = srv.PreparedChatInvocation(
+        messages=messages,
+        chat_kwargs={},
+        response_format=None,
+        json_logits_processor=None,
+    )
+    monkeypatch.setattr(
+        srv, "_reasoning_parser_name", "deepseek_v4" if use_reasoning else None
+    )
+    monkeypatch.setattr(srv, "_reasoning_parser", None)
+    monkeypatch.setattr(srv, "_enable_auto_tool_choice", True)
+    monkeypatch.setattr(srv, "_tool_call_parser", "deepseek_v4")
+    monkeypatch.setattr(srv, "_tool_parser_instance", None)
+    monkeypatch.setattr(srv, "_model_name", "test-model")
+
+    body = "".join(
+        [
+            chunk
+            async for chunk in srv._stream_anthropic_messages(
+                engine, openai_request, anthropic_request, prepared
+            )
+        ]
+    )
+    events = [
+        json.loads(line.removeprefix("data: "))
+        for line in body.splitlines()
+        if line.startswith("data: ")
+    ]
+    text = "".join(
+        event["delta"]["text"]
+        for event in events
+        if event["type"] == "content_block_delta"
+        and event["delta"]["type"] == "text_delta"
+    )
+
+    assert text == truncated
+    assert events[-1]["type"] == "message_stop"

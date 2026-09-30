@@ -54,7 +54,7 @@ if response.choices[0].message.tool_calls:
 | `auto` | | 任意模型 | 自动检测格式（依次尝试所有 parser） |
 | `mistral` | | Mistral、Devstral | `[TOOL_CALLS]` JSON 数组 |
 | `qwen` | `qwen3` | Qwen、Qwen3 | `<tool_call>` XML 或 `[Calling tool:]` |
-| `llama` | `llama3`、`llama4` | Llama 3.x、4.x | `<function=name>` 标签 |
+| `llama` | `llama3`、`llama4` | Llama 3.x、4.x | `<\|python_tag\|>` JSON、原始 JSON 或 `<function=name>` 标签 |
 | `hermes` | `nous` | Hermes、NousResearch | `<tool_call>` XML 包裹的 JSON |
 | `deepseek` | `deepseek_v3`、`deepseek_r1` | DeepSeek V3、R1 | Unicode 分隔符 |
 | `kimi` | `kimi_k2`、`moonshot` | Kimi K2、Moonshot | `<\|tool_call_begin\|>` 标记 |

@@ -95,6 +95,27 @@ def test_resolve_honors_default_override():
     assert resolve_max_length(None, _Tok(), default=256) == 256
 
 
+def test_resolve_ceiling_clamps_config_value():
+    """A ceiling below the model-derived value clamps it down."""
+    cfg = {"max_position_embeddings": 8192}
+    assert resolve_max_length(cfg, _Tok(), ceiling=1024) == 1024
+
+
+def test_resolve_ceiling_is_noop_when_above_resolved_value():
+    """A ceiling above (or equal to) the resolved value changes nothing."""
+    cfg = {"max_position_embeddings": 512}
+    assert resolve_max_length(cfg, _Tok(), ceiling=4096) == 512
+    assert resolve_max_length(cfg, _Tok(), ceiling=512) == 512
+
+
+def test_resolve_ceiling_none_is_unchanged():
+    """ceiling=None (the default) preserves pre-existing behavior exactly."""
+    cfg = {"max_position_embeddings": 8192}
+    assert resolve_max_length(cfg, _Tok(), ceiling=None) == resolve_max_length(
+        cfg, _Tok()
+    )
+
+
 def test_inner_tokenizer_unwraps_and_passes_through():
     """inner_tokenizer returns the wrapped tokenizer, else the object itself."""
     inner = _Tok()

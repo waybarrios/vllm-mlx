@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Union
 
 if TYPE_CHECKING:
+    from .mllm_specprefill import SpecPrefillOutcome
     from .paged_cache import BlockTable
 
 
@@ -114,6 +115,7 @@ class Request:
 
     # Prefix cache fields
     prompt_cache: Optional[List[Any]] = None  # Cached KV state from prefix cache
+    prompt_cache_key: Optional[List[int]] = None  # Actual shared-cache entry key
     cached_tokens: int = 0  # Number of tokens retrieved from cache
     remaining_tokens: Optional[List[int]] = None  # Tokens still needing processing
     prefix_boundary: int = 0  # Token count for shared prefix (messages[:-1])
@@ -216,6 +218,8 @@ class RequestOutput:
     # MTP speculative decoding counters. Zero means no MTP attempt occurred.
     mtp_drafts: int = 0
     mtp_accepted: int = 0
+    # Request-level sparse-prefill decision and diagnostics.
+    specprefill_outcome: Optional["SpecPrefillOutcome"] = None
 
     @property
     def usage(self) -> Dict[str, int]:

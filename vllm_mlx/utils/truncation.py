@@ -48,6 +48,7 @@ def resolve_max_length(
     *,
     default: int = MAX_LENGTH_DEFAULT,
     sentinel_threshold: int = TOKENIZER_SENTINEL_THRESHOLD,
+    ceiling: int | None = None,
 ) -> int:
     """
     Resolve the tokenizer truncation length for a model.
@@ -59,6 +60,9 @@ def resolve_max_length(
          architecture value. This matters for RoBERTa-family models, whose
          position table includes reserved padding positions.
       3. ``default``, when neither source yields a usable value.
+      4. ``ceiling`` — when set, clamps the resolved value down (never up),
+         letting an operator impose a lower deployment-wide limit than a
+         model's own declared context window.
 
     Args:
         config: Model config as a dict (reranker) or object (embeddings).
@@ -66,6 +70,8 @@ def resolve_max_length(
         default: Fallback when no usable value is found.
         sentinel_threshold: Tokenizer-derived values at or above this are
             treated as an unset HuggingFace sentinel, not a real length.
+        ceiling: Optional operator-configured upper bound. ``None`` (the
+            default) leaves the model-derived value uncapped.
 
     Returns:
         The truncation length to pass as ``max_length``.
@@ -80,4 +86,6 @@ def resolve_max_length(
         resolved = config_val
     if resolved is None:
         resolved = default
+    if ceiling is not None:
+        resolved = min(resolved, ceiling)
     return resolved

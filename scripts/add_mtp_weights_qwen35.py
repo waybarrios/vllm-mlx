@@ -98,6 +98,18 @@ def identify_mtp_shards(index: dict) -> tuple[dict[str, str], set[str]]:
     return mtp_keys, shards_needed
 
 
+def quantization_companion_key(key: str, suffix: str) -> str:
+    """Return a scale/bias key without overwriting fused Qwen tensors.
+
+    Qwen 3.6 names fused expert tensors ``gate_up_proj`` and ``down_proj``
+    rather than appending ``.weight``.  Quantized artifacts must keep their
+    companion tensors under distinct names for the runtime to dequantize them.
+    """
+    if key.endswith(".weight"):
+        return f"{key[:-len('.weight')]}.{suffix}"
+    return f"{key}.{suffix}"
+
+
 def download_shards(
     shards: set[str], source_model: str, download_dir: Path
 ) -> dict[str, Path]:
@@ -176,6 +188,9 @@ def extract_and_quantize_mtp_weights(
         del shard_data
 
     print(f"Loaded {len(all_mtp_weights)} MTP weight tensors")
+    missing = sorted(set(mtp_keys) - set(all_mtp_weights))
+    if missing:
+        raise RuntimeError(f"MTP source shards omitted tensors: {missing}")
 
     # Norm keys that need +1.0 shift (HF centered ~0 → MLX centered ~1)
     norm_suffixes = (
@@ -221,8 +236,8 @@ def extract_and_quantize_mtp_weights(
             print(f"  Quantize {bits}-bit: {key} {q_w.shape}")
             return {
                 key: q_w,
-                key.replace(".weight", ".scales"): q_s,
-                key.replace(".weight", ".biases"): q_b,
+                quantization_companion_key(key, "scales"): q_s,
+                quantization_companion_key(key, "biases"): q_b,
             }
         else:
             print(f"  Keep FP (small): {key} {weight.shape}")
@@ -320,6 +335,30 @@ def update_config(snapshot_dir: Path):
         print(f"Updated config: num_nextn_predict_layers={num_mtp}")
     else:
         print("WARNING: mtp_num_hidden_layers not found in config")
+
+
+def write_mtp_artifact_manifest(
+    snapshot_dir: Path, source_model: str, mtp_weight_keys: list[str]
+) -> Path:
+    """Record the conversion contract consumed by the runtime injector.
+
+    Qwen source checkpoints store RMSNorm weights as offsets, while this
+    converter writes MLX-ready gamma weights after applying the offset.  The
+    sidecar removes the need for the runtime to infer that state from tensor
+    values, which is unsafe for valid low-mean gamma tensors.
+    """
+    manifest_path = snapshot_dir / "mtp" / "manifest.json"
+    manifest = {
+        "artifact_schema_version": 1,
+        "source_model": source_model,
+        "rmsnorm_weight_format": "mlx_gamma",
+        "weight_keys": sorted(mtp_weight_keys),
+    }
+    with open(manifest_path, "w") as f:
+        json.dump(manifest, f, indent=2, sort_keys=True)
+        f.write("\n")
+    print(f"Wrote MTP artifact manifest: {manifest_path}")
+    return manifest_path
 
 
 def main():
@@ -449,6 +488,9 @@ def main():
 
     # Update config
     update_config(snapshot_dir)
+    manifest_path = write_mtp_artifact_manifest(
+        snapshot_dir, args.source_model, mtp_weight_keys
+    )
 
     # Cleanup downloaded shards
     if not args.keep_shards and not args.skip_download:
@@ -461,6 +503,7 @@ def main():
     print("SUCCESS! MTP weights added to MLX model.")
     print("=" * 60)
     print(f"\nMTP weight file: {mtp_file}")
+    print(f"MTP artifact manifest: {manifest_path}")
     print(f"Total MTP keys: {len(mtp_weight_keys)}")
     print("\nTo use MTP, start the server with --enable-mtp:")
     print(f"  vllm-mlx serve {args.mlx_model_path} --enable-mtp")

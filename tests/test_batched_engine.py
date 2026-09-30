@@ -320,3 +320,36 @@ class TestToolCallReplayNormalization:
         normalized = _normalize_tool_call_arguments_for_template([MessageLike()])
 
         assert normalized == [{"role": "assistant", "content": "plain response"}]
+
+
+class TestBatchedEngineStop:
+    """stop() must actually release MLX's Metal buffer cache, not just drop
+    Python references — otherwise idle-unload frees objects but not memory.
+    """
+
+    def _make_engine(self):
+        from vllm_mlx.engine.batched import BatchedEngine
+
+        with patch("vllm_mlx.engine.batched.is_mllm_model", return_value=False):
+            engine = BatchedEngine("test-model")
+        engine._loaded = True
+        return engine
+
+    @pytest.mark.anyio
+    async def test_stop_calls_mx_clear_cache(self, monkeypatch):
+        from vllm_mlx.engine import batched as batched_mod
+
+        calls = {"count": 0}
+        monkeypatch.setattr(
+            batched_mod.mx,
+            "clear_cache",
+            lambda: calls.__setitem__("count", calls["count"] + 1),
+        )
+
+        engine = self._make_engine()
+
+        await engine.stop()
+
+        assert calls["count"] == 1
+        assert engine._model is None
+        assert engine._loaded is False

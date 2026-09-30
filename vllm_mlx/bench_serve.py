@@ -979,11 +979,10 @@ async def stream_chat_completion(
 
     try:
         if timeout_s and timeout_s > 0:
-            async with asyncio.timeout(timeout_s):
-                await _consume_stream()
+            await asyncio.wait_for(_consume_stream(), timeout=timeout_s)
         else:
             await _consume_stream()
-    except TimeoutError:
+    except (asyncio.TimeoutError, TimeoutError):
         await _cancel_server_request(client, base_url, request_id)
         raise TimeoutError(
             f"stream_chat_completion timed out after {timeout_s:.3f}s"
