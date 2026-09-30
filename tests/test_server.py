@@ -2156,7 +2156,7 @@ class TestStreamChatCompletion:
             def __init__(self, tokenizer=None):
                 pass
 
-            def reset_state(self):
+            def reset_state(self, implicit_mode: bool = False):
                 pass
 
             def extract_reasoning_streaming(
