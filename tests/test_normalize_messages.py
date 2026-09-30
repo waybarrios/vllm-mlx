@@ -7,6 +7,8 @@ consecutive same-role messages before chat template application. This prevents
 crashes from Qwen 3.5 and Llama templates that require alternating roles.
 """
 
+import pytest
+
 
 class TestNormalizeMessages:
     """Test _normalize_messages() for handling real-world client formats."""
@@ -172,3 +174,34 @@ class TestNormalizeMessages:
         assert len(result) == 2
         assert "Part 1" in result[0]["content"]
         assert "Part 3" in result[0]["content"]
+
+    def test_consecutive_tool_results_preserve_call_ids_and_contents(self):
+        from vllm_mlx.server import _normalize_messages
+
+        messages = [
+            {"role": "tool", "tool_call_id": "read-input", "content": "token\n"},
+            {"role": "tool", "tool_call_id": "read-output", "content": "pending\n"},
+        ]
+        result = _normalize_messages(messages)
+        assert result == messages
+        assert [item["tool_call_id"] for item in result] == [
+            "read-input",
+            "read-output",
+        ]
+
+    @pytest.mark.parametrize("call_index", [0, 1])
+    def test_assistant_tool_calls_are_not_merged_into_text(self, call_index):
+        from vllm_mlx.server import _normalize_messages
+
+        messages = [
+            {"role": "assistant", "content": "First"},
+            {"role": "assistant", "content": "Second"},
+        ]
+        messages[call_index]["tool_calls"] = [
+            {
+                "id": "read-input",
+                "type": "function",
+                "function": {"name": "read", "arguments": '{"path":"input.txt"}'},
+            }
+        ]
+        assert _normalize_messages(messages) == messages

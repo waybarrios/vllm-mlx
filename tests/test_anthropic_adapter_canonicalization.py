@@ -55,8 +55,14 @@ class TestStandaloneHeaderIsRemoved:
         assert "You are helpful." in text
         assert "Be concise." in text
 
-    def test_header_as_the_entire_prompt(self):
-        assert _system_text(HEADER).strip() == ""
+    @pytest.mark.parametrize(
+        "system",
+        [HEADER, [{"type": "text", "text": HEADER}]],
+        ids=["string", "blocks"],
+    )
+    def test_header_as_the_entire_prompt(self, system):
+        assert _system_text(system) == ""
+        assert _two_stage(system) == ""
 
     def test_trailing_header_without_newline(self):
         text = _system_text(f"{BODY}\n{HEADER}")

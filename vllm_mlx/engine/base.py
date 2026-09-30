@@ -10,7 +10,10 @@ from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from ..mllm_specprefill import SpecPrefillOutcome
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +39,8 @@ class GenerationOutput:
     # MTP speculative decoding counters. Zero means no MTP attempt occurred.
     mtp_drafts: int = 0
     mtp_accepted: int = 0
+    # Request-level sparse-prefill decision and diagnostics.
+    specprefill_outcome: "SpecPrefillOutcome | None" = None
 
 
 class EngineBusy(RuntimeError):
@@ -189,7 +194,7 @@ async def shield_task(task: asyncio.Task) -> Any:
 
 async def run_blocking_startup_work(
     work: Callable[[], Any], executor: Any | None = None
-) -> None:
+) -> Any:
     """Run blocking startup work off-loop without leaking cancellation races.
 
     Pass ``executor`` to pin the work to a specific thread. MLX buffers carry
@@ -200,19 +205,21 @@ async def run_blocking_startup_work(
     loop = asyncio.get_running_loop()
     task = asyncio.ensure_future(loop.run_in_executor(executor, work))
     try:
-        await shield_task(task)
+        return await shield_task(task)
     except asyncio.CancelledError:
         # `task` (e.g. an in-progress model load) must run to completion even
         # though our own caller gave up -- keep re-shielding it, ignoring
-        # further cancels of *this* coroutine, until it's actually done.
-        with suspend_cancellation():
-            while not task.done():
-                try:
-                    await shield_task(task)
-                except asyncio.CancelledError:
-                    continue
-                except Exception:
-                    break  # task's own exception -- already retrieved above
+        # further cancels of *this* coroutine, until it's actually done. Do not
+        # suspend and restore cancellation here: this function re-raises the
+        # original CancelledError below, and restoring it first queues a second
+        # cancellation that can interrupt the caller's cleanup on Python 3.11.
+        while not task.done():
+            try:
+                await shield_task(task)
+            except asyncio.CancelledError:
+                continue
+            except Exception:
+                break  # task's own exception -- already retrieved above
         raise
 
 

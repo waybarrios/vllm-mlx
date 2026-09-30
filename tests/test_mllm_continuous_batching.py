@@ -553,6 +553,7 @@ class TestMLLMBatch:
             num_tokens=[0, 0, 0, 0],
             cache=[],
             requests=requests,
+            decode_rope_deltas=mx.array([[10], [20], [30], [40]]),
         )
 
         # Keep only indices 1 and 3
@@ -561,6 +562,7 @@ class TestMLLMBatch:
         assert len(batch) == 2
         assert batch.uids == [1, 3]
         assert batch.request_ids == ["req-1", "req-3"]
+        assert batch.decode_rope_deltas.tolist() == [[20], [40]]
 
     def test_batch_extend_handles_empty_protocol_caches_without_keys(self):
         """Caches with empty()/extend() but no .keys still need batch extension."""
@@ -589,6 +591,7 @@ class TestMLLMBatch:
             num_tokens=[0],
             cache=[primary_cache],
             requests=[MLLMBatchRequest(uid=1, request_id="req-1", prompt="one")],
+            decode_rope_deltas=mx.array([[7]]),
         )
         other = MLLMBatch(
             uids=[2],
@@ -604,8 +607,50 @@ class TestMLLMBatch:
         primary.extend(other)
 
         assert primary.y.shape == (2,)
+        assert primary.decode_rope_deltas.tolist() == [[7], [0]]
         assert primary_cache.extend_calls == 1
         assert primary_cache.extended_with is other_cache
+
+    def test_specprefill_gating_uses_installed_mtp_state(self, monkeypatch):
+        from vllm_mlx import mllm_batch_generator as batch_module
+        from vllm_mlx.mllm_batch_generator import (
+            MLLMBatchGenerator,
+            MLLMBatchRequest,
+        )
+        from vllm_mlx.mllm_specprefill import SpecPrefillRequestConfig
+
+        generator = MLLMBatchGenerator.__new__(MLLMBatchGenerator)
+        generator.model = object()
+        generator.specprefill_draft_model = object()
+        generator.specprefill_threshold = 10
+        generator.specprefill_runtime_reason = None
+        generator._mtp_runtime_implementation = None
+        request = MLLMBatchRequest(
+            uid=1,
+            request_id="media",
+            prompt="prompt",
+            mllm_draft=False,
+        )
+        config = SpecPrefillRequestConfig(enabled=True, keep_pct=0.3)
+        monkeypatch.setattr(
+            batch_module, "request_eligibility_reason", lambda *a, **k: None
+        )
+
+        assert generator._specprefill_eligibility_reason(request, config, True) is None
+
+        generator._mtp_runtime_implementation = "native_target_head"
+        assert (
+            generator._specprefill_eligibility_reason(request, config, True)
+            == "mtp_incompatible"
+        )
+
+        generator._mtp_runtime_implementation = "external_assistant"
+        assert generator._specprefill_eligibility_reason(request, config, True) is None
+        request.mllm_draft = True
+        assert (
+            generator._specprefill_eligibility_reason(request, config, True)
+            == "mtp_incompatible"
+        )
 
 
 class TestMLLMBatchStats:
@@ -732,6 +777,19 @@ class TestMultimodalProcessorBatch:
 
         result = processor.batch_pixel_values([None, None])
         assert result is None
+
+    def test_process_rejects_invalid_image_atomically(self, monkeypatch):
+        from vllm_mlx import multimodal_processor
+
+        processor = multimodal_processor.MultimodalProcessor(MagicMock(), MagicMock())
+        monkeypatch.setattr(
+            multimodal_processor,
+            "process_image_input",
+            lambda image: (_ for _ in ()).throw(ValueError("invalid image")),
+        )
+
+        with pytest.raises(ValueError, match="invalid image"):
+            processor.process("Describe", images=["bad-image"])
 
     def test_batch_pixel_values_single(self):
         """Test batching single pixel value."""
@@ -1270,6 +1328,7 @@ class TestMLLMBatchGeneratorMTPGuards:
 
         install_mtp_mllm(batch_gen, language_model, num_draft_tokens=4)
 
+        assert batch_gen._mtp_runtime_implementation == "native_target_head"
         stats = batch_gen.get_mtp_stats()
         assert stats["enabled"] is True
         assert stats["requested_draft_tokens"] == 4
@@ -1332,6 +1391,7 @@ class TestMLLMBatchGeneratorMTPGuards:
         language_model = MagicMock()
         install_mtp_mllm(batch_gen, language_model, draft_model=draft_model)
 
+        assert batch_gen._mtp_runtime_implementation == "external_assistant"
         assert batch_gen._allow_mid_batch_extend is False
 
         tokens, logprobs = batch_gen._step(
@@ -2112,8 +2172,9 @@ class TestBatchedMLLMConfigWiring:
                 self.__dict__.update(kwargs)
 
         class FakeMLLMScheduler:
-            def __init__(self, model, processor, config):
+            def __init__(self, model, processor, config, **kwargs):
                 captured["scheduler_config"] = config
+                captured["scheduler_kwargs"] = kwargs
 
             async def start(self):
                 return None
@@ -2153,6 +2214,7 @@ class TestBatchedMLLMConfigWiring:
         assert captured["config_kwargs"]["use_memory_aware_cache"] is False
         assert captured["config_kwargs"]["cache_memory_mb"] == 123
         assert captured["config_kwargs"]["prefix_cache_memory_mb"] == 123
+        assert captured["scheduler_kwargs"]["specprefill_draft_model"] is None
 
 
 class TestPreprocessIdempotent:
@@ -2187,6 +2249,7 @@ class TestPreprocessIdempotent:
         # Must return immediately without touching prepare_inputs
         gen._preprocess_request(req)
         assert req.input_ids.shape == (1, 3)
+        assert req.is_text_only is True
 
     def test_vision_request_not_skipped(self):
         """Vision requests should NOT be skipped even with input_ids set."""
@@ -2210,6 +2273,30 @@ class TestPreprocessIdempotent:
 
         # Should NOT return early — will try to import prepare_inputs
         with pytest.raises(Exception):
+            gen._preprocess_request(req)
+        assert req.is_text_only is False
+
+    def test_invalid_media_fails_batched_preprocessing(self, monkeypatch):
+        from vllm_mlx.mllm_batch_generator import (
+            MLLMBatchGenerator,
+            MLLMBatchRequest,
+        )
+        from vllm_mlx.models import mllm
+
+        req = MLLMBatchRequest(
+            uid=0,
+            prompt="Describe",
+            request_id="bad-media",
+            images=["bad-image"],
+        )
+        gen = MLLMBatchGenerator.__new__(MLLMBatchGenerator)
+        monkeypatch.setattr(
+            mllm,
+            "process_image_input",
+            lambda image: (_ for _ in ()).throw(ValueError("invalid image")),
+        )
+
+        with pytest.raises(ValueError, match="invalid image"):
             gen._preprocess_request(req)
 
 
@@ -2430,6 +2517,97 @@ class TestChunkedPrefillCacheHandling:
         assert len(abort_responses) == 1
         assert abort_responses[0].request_id == "req-abort"
 
+    @pytest.mark.parametrize("active_decode", [False, True])
+    def test_inline_audio_failure_is_reported_once_during_prefill(
+        self, monkeypatch, active_decode
+    ):
+        from mlx_vlm import utils
+
+        from vllm_mlx.mllm_batch_generator import (
+            MLLMBatch,
+            MLLMBatchRequest,
+            install_chunked_prefill_mllm,
+        )
+        from vllm_mlx.models import mllm
+
+        gen = self._make_fake_batch_gen()
+        gen.language_model = MagicMock()
+        gen.model = SimpleNamespace(config=None)
+        gen.processor = MagicMock()
+        gen.vision_cache = MagicMock()
+        gen.vision_cache.get_pixel_cache.return_value = None
+        gen._process_prompts = MagicMock()
+
+        # These prompts exceed the inline budget, reproducing the path where
+        # a failed resolver used to leave input_ids unset and retry each chunk.
+        prepare_inputs = MagicMock(return_value={"input_ids": mx.array([[1] * 8])})
+        monkeypatch.setattr(utils, "prepare_inputs", prepare_inputs)
+        resolve_audio = MagicMock(side_effect=TimeoutError("audio download timed out"))
+        monkeypatch.setattr(mllm, "process_audio_input", resolve_audio)
+        failed = [
+            MLLMBatchRequest(
+                uid=uid,
+                request_id=f"bad-audio-{uid}",
+                prompt="long audio prompt",
+                audio=[f"https://example.com/audio-{uid}.wav"],
+            )
+            for uid in (1, 2)
+        ]
+        healthy = MLLMBatchRequest(uid=3, request_id="healthy", prompt="long text")
+        gen.unprocessed_requests = [*failed, healthy]
+
+        install_chunked_prefill_mllm(gen, budget=4)
+        prefill = MLLMBatchRequest(uid=0, request_id="prefill", prompt="long text")
+        gen._partial = {
+            "request": prefill,
+            "cache": [],
+            "remaining_ids": mx.array([[1] * 20]),
+            "processed": 0,
+            "total": 20,
+            "cached_count": 0,
+            "chunk_count": 0,
+        }
+
+        if active_decode:
+            decoding = MLLMBatchRequest(uid=4, request_id="decoding", prompt="hi")
+            gen.active_batch = MLLMBatch(
+                uids=[decoding.uid],
+                request_ids=[decoding.request_id],
+                y=mx.array([7]),
+                logprobs=[mx.zeros(8)],
+                max_tokens=[10],
+                num_tokens=[0],
+                cache=[],
+                requests=[decoding],
+            )
+            gen._step = MagicMock(return_value=(mx.array([7]), [mx.zeros(8)]))
+            gen._maybe_store_prefix_cache = MagicMock()
+
+        first = gen._next()
+        errors = [response for response in first if response.finish_reason == "error"]
+        assert [response.request_id for response in errors] == [
+            request.request_id for request in failed
+        ]
+        assert [request.uid for request in gen.unprocessed_requests] == [healthy.uid]
+        assert gen._pending_error_responses == []
+        assert healthy.input_ids is not None
+        assert gen._partial["processed"] == 4
+
+        following = [*gen._next(), *gen._next()]
+        assert all(response.finish_reason != "error" for response in following)
+        assert resolve_audio.call_count == 2
+        prepare_inputs.assert_called_once()
+        gen._process_prompts.assert_not_called()
+        assert gen._partial["processed"] == 12
+        assert gen.language_model.call_count == 3
+        if active_decode:
+            assert decoding.output_tokens == [7, 7, 7]
+            assert [r.request_id for r in first if r.finish_reason is None] == [
+                "decoding"
+            ]
+        else:
+            assert following == []
+
     def test_short_prompt_falls_through_to_orig_next(self):
         """Short prompts (< budget) with no prefix cache must fall through
         to _orig_next, not be handled by the chunked prefill path."""
@@ -2461,6 +2639,37 @@ class TestChunkedPrefillCacheHandling:
         assert orig_next_called == [
             1
         ], f"Short prompt should fall through to _orig_next, got {orig_next_called}"
+
+    def test_audio_request_bypasses_interleaved_text_prefill(self):
+        """Audio requests must remain on the multimodal prefill path."""
+        from vllm_mlx.mllm_batch_generator import (
+            MLLMBatchRequest,
+            install_chunked_prefill_mllm,
+        )
+
+        gen = self._make_fake_batch_gen()
+        gen.prefix_cache = MagicMock()
+        gen.language_model = MagicMock()
+        original_next = MagicMock(return_value=[])
+        gen._next = original_next
+
+        install_chunked_prefill_mllm(gen, budget=1)
+
+        request = MLLMBatchRequest(
+            uid=5,
+            request_id="req-audio",
+            prompt="transcribe",
+            audio=["fake.wav"],
+        )
+        request.input_ids = mx.array([[10, 20, 30]])
+        gen.unprocessed_requests.append(request)
+        gen._preprocess_request = MagicMock()
+
+        gen._next()
+
+        gen._preprocess_request.assert_not_called()
+        gen.prefix_cache.fetch.assert_not_called()
+        original_next.assert_called_once()
 
 
 def test_external_mtp_drafts_mixed_position_rows_independently():

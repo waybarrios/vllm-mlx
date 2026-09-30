@@ -17,19 +17,34 @@
 
 A vLLM-style inference server for Apple Silicon Macs. Unlike `Ollama` or `mlx-lm` used directly, it ships **continuous batching, paged KV cache, prefix caching, and SSD-tiered cache**, and exposes **both OpenAI `/v1/*` and Anthropic `/v1/messages`** from a single process. Run LLMs, vision models, audio, and embeddings on Metal with unified memory, no conversion step.
 
-## Quick start (30 seconds)
+## Quick start
+
+New users: follow the [isolated release install](docs/getting-started/installation.md#install-a-release)
+and [first-response check](docs/getting-started/quickstart.md#first-response).
+The example below assumes that environment is activated. Initial model
+download/loading time depends on the machine and connection.
+
+The version below is this walkthrough's pinned reference release, not an
+automatically updated latest version.
 
 ```bash
-pip install vllm-mlx
-vllm-mlx serve mlx-community/Llama-3.2-3B-Instruct-4bit --port 8000 --continuous-batching
+python -m pip install 'vllm-mlx==0.4.1'
+vllm-mlx serve mlx-community/Llama-3.2-3B-Instruct-4bit --host 127.0.0.1 --port 8000
 ```
 
+After the first response, restart with `--continuous-batching` to try
+[continuous batching and its cache options](docs/guides/continuous-batching.md).
+The minimal command above uses the default engine without that flag.
+
 **OpenAI SDK:**
+
+Install `openai` in your Python client environment first; it is not installed
+by the server package. See the [client setup](docs/getting-started/quickstart.md#option-1-openai-compatible-server).
 
 ```python
 from openai import OpenAI
 client = OpenAI(base_url="http://localhost:8000/v1", api_key="not-needed")
-r = client.chat.completions.create(model="default", messages=[{"role": "user", "content": "Hi!"}])
+r = client.chat.completions.create(model="mlx-community/Llama-3.2-3B-Instruct-4bit", messages=[{"role": "user", "content": "Hi!"}])
 print(r.choices[0].message.content)
 ```
 
@@ -40,6 +55,16 @@ export ANTHROPIC_BASE_URL=http://localhost:8000
 export ANTHROPIC_API_KEY=not-needed
 claude
 ```
+
+## Coding CLI compatibility
+
+**Validated with OpenCode, pi, Codex, Claude Code, GitHub Copilot CLI, Cline CLI,
+and OpenClaw's embedded agent.** All seven completed a streamed tool interaction
+and an exact file edit in one local run with Qwen3.8-27B-4bit on September 19,
+2026. Results apply to the tested client versions and settings.
+
+See the [validated CLI matrix and setup guide](docs/guides/client-acceptance.md#validated-cli-versions)
+for versions, API transports, reproduction commands, and coverage limits.
 
 ## Features
 
@@ -64,13 +89,13 @@ claude
 - **STT**: Whisper family with RTF up to 197x on M4 Max
 
 ### Reasoning & advanced
-- **Reasoning extraction**: Qwen3, DeepSeek-R1, DeepSeek-V4 (`--reasoning-parser`)
+- **Reasoning extraction**: Qwen3 and DeepSeek-R1 parsers (`--reasoning-parser`)
 - **MoE expert reduction**: `--moe-top-k` for +7-16% on Qwen3-30B-A3B
-- **Speculative decoding**: `--mtp` for Qwen3-Next
-- **Sparse prefill**: attention-based `--spec-prefill` for TTFT reduction
+- **Speculative decoding**: `--enable-mtp` for supported models
+- **Sparse prefill**: attention-based `--specprefill` for supported model/draft combinations
 
 ### Observability
-- **Prometheus metrics**: `/metrics` endpoint with `--metrics`
+- **Prometheus metrics**: `/metrics` endpoint with `--enable-metrics`
 - **Built-in benchmarker**: `vllm-mlx bench-serve` for prompt sweeps with CSV/JSON output
 
 ### Native GPU acceleration
@@ -116,7 +141,7 @@ vllm-mlx serve mlx-community/Qwen3-8B-4bit --reasoning-parser qwen3
 
 ```python
 r = client.chat.completions.create(
-    model="default",
+    model="mlx-community/Qwen3-8B-4bit",
     messages=[{"role": "user", "content": "What is 17 * 23?"}],
 )
 print("Thinking:", r.choices[0].message.reasoning)
@@ -131,7 +156,7 @@ vllm-mlx serve mlx-community/Qwen3-VL-4B-Instruct-3bit --port 8000
 
 ```python
 r = client.chat.completions.create(
-    model="default",
+    model="mlx-community/Qwen3-VL-4B-Instruct-3bit",
     messages=[{"role": "user", "content": [
         {"type": "text", "text": "What is in this image?"},
         {"type": "image_url", "image_url": {"url": "https://example.com/cat.jpg"}},
@@ -141,9 +166,11 @@ r = client.chat.completions.create(
 
 ### Structured output (JSON Schema)
 
+With the text server from the quick start:
+
 ```python
 r = client.chat.completions.create(
-    model="default",
+    model="mlx-community/Llama-3.2-3B-Instruct-4bit",
     messages=[{"role": "user", "content": "List 3 colors."}],
     response_format={
         "type": "json_schema",
@@ -218,40 +245,23 @@ vllm-mlx model convert meta-llama/Llama-3.2-3B-Instruct --output ./models/llama-
 ### Prometheus metrics
 
 ```bash
-vllm-mlx serve <model> --metrics
+vllm-mlx serve <model> --enable-metrics
 curl http://localhost:8000/metrics
 ```
 
 ## Installation
 
-**Using uv (recommended):**
+Use the [release walkthrough](docs/getting-started/installation.md#install-a-release)
+for an isolated environment and a pinned server version. If you already manage
+CLI tools with uv, its isolated equivalent is:
 
 ```bash
-uv tool install vllm-mlx                 # CLI, system-wide
-# or in a project
-uv pip install vllm-mlx
+uv tool install 'vllm-mlx==0.4.1'
 ```
 
-**Using pip:**
-
-```bash
-pip install vllm-mlx
-
-# Audio extras
-pip install vllm-mlx[audio]
-brew install espeak-ng
-python -m spacy download en_core_web_sm
-```
-
-**From source:**
-
-```bash
-git clone https://github.com/waybarrios/vllm-mlx.git
-cd vllm-mlx
-pip install -e .
-```
-
-See [Installation Guide](docs/getting-started/installation.md) for full options.
+Keep [development checkouts](docs/getting-started/installation.md#development-checkout)
+separate. See the [Installation Guide](docs/getting-started/installation.md) for
+optional extras and [Audio Guide](docs/guides/audio.md) for audio setup.
 
 ## Documentation
 
@@ -259,6 +269,7 @@ Browse the complete documentation at [vllm-mlx.is-a.dev](https://vllm-mlx.is-a.d
 
 - **Getting started**: [Installation](docs/getting-started/installation.md) · [Quick Start](docs/getting-started/quickstart.md)
 - **Servers & APIs**: [OpenAI server](docs/guides/server.md) · [Anthropic Messages API](docs/guides/server.md#anthropic-messages-api) · [Python API](docs/guides/python-api.md)
+- **Client compatibility**: [Run coding-client acceptance checks](docs/guides/client-acceptance.md)
 - **Features**: [Multimodal](docs/guides/multimodal.md) · [Audio](docs/guides/audio.md) · [Embeddings](docs/guides/embeddings.md) · [Reasoning](docs/guides/reasoning.md) · [MCP & Tool Calling](docs/guides/mcp-tools.md) · [Tool Parsers](docs/guides/tool-calling.md)
 - **Performance**: [Continuous Batching](docs/guides/continuous-batching.md) · [Multi-Model Serving](docs/guides/model-registry.md) · [Warm Prompts](docs/guides/warm-prompts.md) · [MoE Top-K](docs/guides/moe-top-k.md)
 - **Reference**: [CLI](docs/reference/cli.md) · [Models](docs/reference/models.md) · [Configuration](docs/reference/configuration.md)

@@ -33,6 +33,15 @@ from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Any
 
+
+def is_text_only_prefix_cache_request(request: Any) -> bool:
+    """Return whether a request can safely use the token-only prefix cache."""
+    return (
+        bool(getattr(request, "is_text_only", False))
+        and getattr(request, "input_ids", None) is not None
+    )
+
+
 logger = logging.getLogger(__name__)
 
 # Constants

@@ -1060,7 +1060,7 @@ def download_video(url: str, timeout: int = 120) -> str:
     """Download video from URL and return local path."""
     headers = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)"}
 
-    print(f"  Downloading video from: {url[:60]}...")
+    print("  Downloading remote video...")
     response = requests.get(url, timeout=timeout, headers=headers, stream=True)
     response.raise_for_status()
 

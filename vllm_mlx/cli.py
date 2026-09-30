@@ -1301,7 +1301,8 @@ Examples:
         default=False,
         help="Enable SpecPrefill: use a small draft model to score token importance, "
         "then sparse-prefill only the important tokens on the target model. "
-        "Reduces TTFT on long prompts. Requires --specprefill-draft-model.",
+        "Reduces TTFT on long prompts. Supported Qwen media routes preserve "
+        "visual embeddings and MRoPE state. Requires --specprefill-draft-model.",
     )
     serve_parser.add_argument(
         "--specprefill-threshold",
@@ -1357,7 +1358,8 @@ Examples:
         "--mllm-draft-model",
         type=str,
         default=None,
-        help="Path to an mlx-vlm MLLM draft/assistant model. "
+        help="Local path or Hugging Face repo ID for an mlx-vlm MLLM "
+        "draft/assistant model. "
         "For Gemma 4 assistant drafters, use with --mllm-draft-kind mtp.",
     )
     serve_parser.add_argument(

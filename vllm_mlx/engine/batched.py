@@ -15,6 +15,7 @@ import asyncio
 import inspect
 import logging
 import os
+import threading
 import time
 from collections.abc import AsyncIterator
 from concurrent.futures import ThreadPoolExecutor
@@ -127,6 +128,11 @@ class BatchedEngine(BaseEngine):
         mllm_draft_kind: str | None = None,
         mllm_draft_block_size: int | None = None,
         default_mllm_draft: bool = False,
+        specprefill_enabled: bool = False,
+        specprefill_threshold: int = 8192,
+        specprefill_keep_pct: float = 0.3,
+        specprefill_backbone_pct: float = 0.0,
+        specprefill_draft_model: str | None = None,
     ):
         """
         Initialize the batched engine.
@@ -141,6 +147,11 @@ class BatchedEngine(BaseEngine):
                 limit and emergency threshold (0.0-1.0, default 0.90)
             default_mllm_draft: Enable the configured assistant drafter unless a
                 request explicitly sets ``mllm_draft`` to false.
+            specprefill_enabled: Enable media-aware SpecPrefill for supported VLMs
+            specprefill_threshold: Minimum media prompt tokens before engagement
+            specprefill_keep_pct: Fraction of prompt chunks to retain
+            specprefill_backbone_pct: Fraction reserved for uniform coverage
+            specprefill_draft_model: Small text model used to score prompt tokens
         """
         self._model_name = model_name
         self._created_at = time.time()
@@ -152,6 +163,12 @@ class BatchedEngine(BaseEngine):
         self._mllm_draft_kind = mllm_draft_kind
         self._mllm_draft_block_size = mllm_draft_block_size
         self._default_mllm_draft = default_mllm_draft
+        self._specprefill_enabled = specprefill_enabled
+        self._specprefill_threshold = specprefill_threshold
+        self._specprefill_keep_pct = specprefill_keep_pct
+        self._specprefill_backbone_pct = specprefill_backbone_pct
+        self._specprefill_draft_model_path = specprefill_draft_model
+        self._specprefill_draft_model = None
         self._is_mllm = force_mllm or is_mllm_model(model_name)
 
         self._model = None
@@ -163,6 +180,7 @@ class BatchedEngine(BaseEngine):
         self._loaded = False
         # Single thread that owns the model; see _generation_worker.
         self._generation_executor: ThreadPoolExecutor | None = None
+        self._generation_thread_id: int | None = None
 
     @property
     def model_name(self) -> str:
@@ -267,27 +285,71 @@ class BatchedEngine(BaseEngine):
         engine loop.
         """
         if self._generation_executor is None:
+            self._generation_thread_id = None
             self._generation_executor = ThreadPoolExecutor(
-                max_workers=1, thread_name_prefix="engine-core"
+                max_workers=1,
+                thread_name_prefix="engine-core",
+                initializer=self._record_generation_thread,
             )
         return self._generation_executor
+
+    def _record_generation_thread(self) -> None:
+        """Record the sole worker thread so synchronous calls cannot deadlock."""
+        self._generation_thread_id = threading.get_ident()
+
+    def _run_on_generation_worker_sync(self, operation):
+        """Run an MLX operation on its owner while preserving a sync API."""
+        if threading.get_ident() == getattr(self, "_generation_thread_id", None):
+            return operation()
+        return self._generation_worker().submit(operation).result()
+
+    async def _run_on_generation_worker(self, operation):
+        """Run an MLX operation on the thread that owns the text model."""
+        return await run_blocking_startup_work(
+            operation, executor=self._generation_worker()
+        )
 
     def _prepare_mllm_model(self) -> None:
         """Load the MLLM model before scheduler startup."""
         from ..models.mllm import MLXMultimodalLM
 
-        max_kv_size = getattr(self._scheduler_config, "max_kv_size", 0)
-        self._mllm_instance = MLXMultimodalLM(
-            self._model_name,
-            trust_remote_code=self._trust_remote_code,
-            max_kv_size=max_kv_size,
-            draft_model=self._mllm_draft_model,
-            draft_kind=self._mllm_draft_kind,
-            draft_block_size=self._mllm_draft_block_size,
-        )
-        self._mllm_instance.load()
-        self._model = self._mllm_instance.model
-        self._processor = self._mllm_instance.processor
+        if self._model is None or self._processor is None:
+            max_kv_size = getattr(self._scheduler_config, "max_kv_size", 0)
+            self._mllm_instance = MLXMultimodalLM(
+                self._model_name,
+                trust_remote_code=self._trust_remote_code,
+                max_kv_size=max_kv_size,
+                draft_model=self._mllm_draft_model,
+                draft_kind=self._mllm_draft_kind,
+                draft_block_size=self._mllm_draft_block_size,
+            )
+            self._mllm_instance.load()
+            self._model = self._mllm_instance.model
+            self._processor = self._mllm_instance.processor
+
+        if (
+            self._specprefill_enabled
+            and self._specprefill_draft_model_path
+            and self._specprefill_draft_model is None
+        ):
+            try:
+                from mlx_lm import load as mlx_lm_load
+
+                self._specprefill_draft_model, _ = mlx_lm_load(
+                    self._specprefill_draft_model_path
+                )
+                logger.info(
+                    "Media SpecPrefill draft loaded: model=%s threshold=%d keep=%.0f%%",
+                    self._specprefill_draft_model_path,
+                    self._specprefill_threshold,
+                    self._specprefill_keep_pct * 100,
+                )
+            except Exception:
+                self._specprefill_draft_model = None
+                logger.exception(
+                    "Media SpecPrefill draft load failed; media requests will "
+                    "use dense prefill"
+                )
 
         # Set Metal memory limits (same as LLM path)
         try:
@@ -407,17 +469,25 @@ class BatchedEngine(BaseEngine):
             max_kv_size=max_kv_size,
             ssd_cache_dir=ssd_cache_dir,
             ssd_cache_max_gb=ssd_cache_max_gb,
+            specprefill_enabled=self._specprefill_enabled,
+            specprefill_threshold=self._specprefill_threshold,
+            specprefill_keep_pct=self._specprefill_keep_pct,
+            specprefill_backbone_pct=self._specprefill_backbone_pct,
             **mllm_extra,
         )
 
         # Create and start MLLM scheduler
-        scheduler_kwargs = {}
+        scheduler_kwargs = {
+            "specprefill_draft_model": self._specprefill_draft_model,
+        }
         if self._mllm_draft_model is not None:
-            scheduler_kwargs = {
-                "draft_model": getattr(self._mllm_instance, "_draft_model", None),
-                "draft_kind": self._mllm_draft_kind,
-                "draft_block_size": self._mllm_draft_block_size,
-            }
+            scheduler_kwargs.update(
+                {
+                    "draft_model": getattr(self._mllm_instance, "_draft_model", None),
+                    "draft_kind": self._mllm_draft_kind,
+                    "draft_block_size": self._mllm_draft_block_size,
+                }
+            )
         self._mllm_scheduler = MLLMScheduler(
             model=self._model,
             processor=self._processor,
@@ -586,25 +656,36 @@ class BatchedEngine(BaseEngine):
 
     async def stop(self) -> None:
         """Stop the engine and cleanup resources."""
-        if self._mllm_scheduler:
-            await self._mllm_scheduler.stop()
-            self._mllm_scheduler = None
+        mllm_scheduler = self._mllm_scheduler
+        if mllm_scheduler is not None:
+            await mllm_scheduler.stop()
 
-        if self._engine:
-            await self._engine.stop()
-            self._engine.engine.close()
-            self._engine = None
+        engine = self._engine
+        if engine is not None:
+            await engine.stop()
+            await self._run_on_generation_worker(engine.engine.close)
 
+        generation_executor = self._generation_executor
+        if generation_executor is not None:
+            # Flush thread-local MLX state before retiring the thread that owns
+            # the text model and its streams. The dispatch drains before
+            # propagating cancellation, so skipped cleanup remains retryable.
+            await self._run_on_generation_worker(mx.clear_cache)
+            generation_executor.shutdown(wait=True)
+            self._generation_executor = None
+            self._generation_thread_id = None
+        else:
+            # MLLM owns its model on the event-loop thread.
+            mx.clear_cache()
+
+        self._mllm_scheduler = None
+        self._engine = None
         self._model = None
         self._tokenizer = None
         self._processor = None
         self._mllm_instance = None
+        self._specprefill_draft_model = None
         self._loaded = False
-        if self._generation_executor is not None:
-            # The model and its streams lived on this thread; both go with it.
-            self._generation_executor.shutdown(wait=True)
-            self._generation_executor = None
-        mx.clear_cache()
         logger.info("BatchedEngine stopped")
 
     def _apply_chat_template(
@@ -786,6 +867,9 @@ class BatchedEngine(BaseEngine):
                 repetition_penalty=kwargs.pop("repetition_penalty", 1.0),
                 logits_processors=kwargs.pop("logits_processors", None),
                 mllm_draft=bool(kwargs.pop("mllm_draft", self._default_mllm_draft)),
+                specprefill=kwargs.pop("specprefill", None),
+                specprefill_keep_pct=kwargs.pop("specprefill_keep_pct", None),
+                specprefill_backbone_pct=kwargs.pop("specprefill_backbone_pct", None),
             )
 
             return GenerationOutput(
@@ -796,6 +880,7 @@ class BatchedEngine(BaseEngine):
                 finish_reason=output.finish_reason,
                 mtp_drafts=output.mtp_drafts,
                 mtp_accepted=output.mtp_accepted,
+                specprefill_outcome=getattr(output, "specprefill_outcome", None),
             )
 
         # Use LLM engine for text-only (non-MLLM models)
@@ -876,6 +961,9 @@ class BatchedEngine(BaseEngine):
                 repetition_penalty=kwargs.pop("repetition_penalty", 1.0),
                 logits_processors=kwargs.pop("logits_processors", None),
                 mllm_draft=bool(kwargs.pop("mllm_draft", self._default_mllm_draft)),
+                specprefill=kwargs.pop("specprefill", None),
+                specprefill_keep_pct=kwargs.pop("specprefill_keep_pct", None),
+                specprefill_backbone_pct=kwargs.pop("specprefill_backbone_pct", None),
             )
 
             async for output in self._mllm_scheduler.stream_outputs(request_id):
@@ -888,6 +976,7 @@ class BatchedEngine(BaseEngine):
                     finish_reason=output.finish_reason,
                     mtp_drafts=output.mtp_drafts,
                     mtp_accepted=output.mtp_accepted,
+                    specprefill_outcome=getattr(output, "specprefill_outcome", None),
                 )
             return
 
@@ -1161,6 +1250,7 @@ class BatchedEngine(BaseEngine):
                 "num_requests_processed",
                 "total_prompt_tokens",
                 "total_completion_tokens",
+                "steps_executed",
                 "metal_active_memory_gb",
                 "metal_peak_memory_gb",
                 "metal_cache_memory_gb",
@@ -1169,6 +1259,7 @@ class BatchedEngine(BaseEngine):
                 "prefix_cache",
                 "batch_generator",
                 "mtp",
+                "specprefill",
                 "requests",
             ):
                 if key in mllm_stats:
@@ -1210,7 +1301,19 @@ class BatchedEngine(BaseEngine):
         if self._mllm_scheduler is not None:
             return self._mllm_scheduler.clear_runtime_caches()
         if self._engine is not None:
-            return self._engine.clear_runtime_caches()
+            return self._run_on_generation_worker_sync(
+                self._engine.clear_runtime_caches
+            )
+        return None
+
+    async def _clear_runtime_caches_on_owner(self) -> dict[str, Any] | None:
+        """Clear runtime caches on the thread that owns their MLX arrays."""
+        if self._mllm_scheduler is not None:
+            return self.clear_runtime_caches()
+        if self._engine is not None:
+            return await self._run_on_generation_worker(
+                self._engine.clear_runtime_caches
+            )
         return None
 
     async def abort_request(self, request_id: str) -> bool:
@@ -1231,7 +1334,19 @@ class BatchedEngine(BaseEngine):
             if pc is not None:
                 return pc.save_to_disk(cache_dir)
         if self._engine:
-            return self._engine.save_cache_to_disk(cache_dir)
+            return self._run_on_generation_worker_sync(
+                lambda: self._engine.save_cache_to_disk(cache_dir)
+            )
+        return False
+
+    async def _save_cache_to_disk_on_owner(self, cache_dir: str) -> bool:
+        """Persist cache data on the model-owner thread."""
+        if self._mllm_scheduler is not None:
+            return self.save_cache_to_disk(cache_dir)
+        if self._engine is not None:
+            return await self._run_on_generation_worker(
+                lambda: self._engine.save_cache_to_disk(cache_dir)
+            )
         return False
 
     def load_cache_from_disk(self, cache_dir: str) -> int:
@@ -1242,7 +1357,19 @@ class BatchedEngine(BaseEngine):
             if pc is not None:
                 return pc.load_from_disk(cache_dir)
         if self._engine:
-            return self._engine.load_cache_from_disk(cache_dir)
+            return self._run_on_generation_worker_sync(
+                lambda: self._engine.load_cache_from_disk(cache_dir)
+            )
+        return 0
+
+    async def _load_cache_from_disk_on_owner(self, cache_dir: str) -> int:
+        """Restore cache data on the model-owner thread."""
+        if self._mllm_scheduler is not None:
+            return self.load_cache_from_disk(cache_dir)
+        if self._engine is not None:
+            return await self._run_on_generation_worker(
+                lambda: self._engine.load_cache_from_disk(cache_dir)
+            )
         return 0
 
     def clear_prefix_cache(self) -> None:
@@ -1254,4 +1381,12 @@ class BatchedEngine(BaseEngine):
                 pc.clear()
                 return
         if self._engine and hasattr(self._engine, "clear_prefix_cache"):
-            self._engine.clear_prefix_cache()
+            self._run_on_generation_worker_sync(self._engine.clear_prefix_cache)
+
+    async def _clear_prefix_cache_on_owner(self) -> None:
+        """Clear the prefix cache on the thread that owns its MLX arrays."""
+        if self._mllm_scheduler is not None:
+            self.clear_prefix_cache()
+            return
+        if self._engine is not None and hasattr(self._engine, "clear_prefix_cache"):
+            await self._run_on_generation_worker(self._engine.clear_prefix_cache)

@@ -78,6 +78,11 @@ class Message(BaseModel):
 
     role: str
     content: str | list[ContentPart] | list[dict] | None = None
+    # Preserve returned reasoning when assistant history is replayed to a template.
+    reasoning_content: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("reasoning_content", "reasoning"),
+    )
     # For assistant messages with tool calls
     tool_calls: list[dict] | None = None
     # For tool response messages (role="tool")
@@ -188,6 +193,8 @@ class ChatCompletionRequest(BaseModel):
     response_format: ResponseFormat | dict | None = None
     # OpenAI-compatible token bias map: token id string -> bias value
     logit_bias: dict[str, float] | None = None
+    # Per-request reasoning effort forwarded through chat template kwargs
+    reasoning_effort: str | None = None
     # Extra kwargs forwarded to tokenizer.apply_chat_template
     chat_template_kwargs: dict[str, Any] | None = None
     # MLLM-specific parameters
@@ -267,6 +274,15 @@ class GenerationMetadata(BaseModel):
     no_final_content_watchdog_enforced: bool = False
     mtp_drafts: int | None = None
     mtp_accepted: int | None = None
+    specprefill_requested: bool | None = None
+    specprefill_engaged: bool | None = None
+    specprefill_reason: str | None = None
+    specprefill_route: str | None = None
+    specprefill_model_module: str | None = None
+    specprefill_language_module: str | None = None
+    specprefill_model_type: str | None = None
+    specprefill_original_tokens: int | None = None
+    specprefill_selected_tokens: int | None = None
 
 
 class ChatCompletionResponse(BaseModel):
@@ -577,3 +593,4 @@ class ChatCompletionChunk(BaseModel):
     model: str
     choices: list[ChatCompletionChunkChoice]
     usage: Usage | None = None  # Included when stream_options.include_usage=true
+    generation_metadata: GenerationMetadata | None = None

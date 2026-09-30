@@ -32,6 +32,7 @@ from vllm_mlx.api.models import (
     EmbeddingResponse,
     EmbeddingUsage,
     FunctionCall,
+    GenerationMetadata,
     ImageUrl,
     MCPExecuteRequest,
     MCPExecuteResponse,
@@ -158,6 +159,35 @@ class TestMessage:
     def test_none_content(self):
         msg = Message(role="assistant", content=None)
         assert msg.content is None
+
+    @pytest.mark.parametrize("field", ["reasoning_content", "reasoning"])
+    def test_assistant_reasoning_survives_request_validation(self, field):
+        request = ChatCompletionRequest(
+            model="test-model",
+            messages=[
+                {"role": "user", "content": "Question"},
+                {"role": "assistant", "content": "Answer", field: "Exact thought\n"},
+                {"role": "user", "content": "Continue"},
+            ],
+        )
+        history = request.messages[1].model_dump(exclude_none=True)
+        assert history == {
+            "role": "assistant",
+            "content": "Answer",
+            "reasoning_content": "Exact thought\n",
+        }
+
+    def test_returned_assistant_message_can_be_replayed(self):
+        returned = AssistantMessage(content="Answer", reasoning_content="Thought")
+        replayed = Message.model_validate(returned.model_dump())
+        assert replayed.model_dump(exclude_none=True) == returned.model_dump()
+
+    def test_absent_reasoning_does_not_add_template_history(self):
+        msg = Message(role="assistant", content="Answer")
+        assert msg.model_dump(exclude_none=True) == {
+            "role": "assistant",
+            "content": "Answer",
+        }
 
 
 class TestToolCalling:
@@ -669,6 +699,24 @@ class TestStreamingModels:
             usage=Usage(prompt_tokens=10, completion_tokens=5, total_tokens=15),
         )
         assert chunk.usage.total_tokens == 15
+
+    def test_chat_completion_chunk_with_specprefill_metadata(self):
+        chunk = ChatCompletionChunk(
+            model="test-model",
+            choices=[],
+            generation_metadata=GenerationMetadata(
+                specprefill_requested=True,
+                specprefill_engaged=True,
+                specprefill_reason="engaged",
+                specprefill_route="mllm_media",
+                specprefill_original_tokens=100,
+                specprefill_selected_tokens=40,
+            ),
+        )
+
+        data = chunk.model_dump()
+        assert data["generation_metadata"]["specprefill_engaged"] is True
+        assert data["generation_metadata"]["specprefill_selected_tokens"] == 40
 
 
 class TestModelSerialization:

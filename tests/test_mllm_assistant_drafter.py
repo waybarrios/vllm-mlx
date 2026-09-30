@@ -1,10 +1,189 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for MLLM assistant-drafter speculative wiring."""
 
+import json
 import sys
 from types import SimpleNamespace
 
 import pytest
+
+
+def _write_drafter_config(tmp_path, config):
+    text = config if isinstance(config, str) else json.dumps(config)
+    (tmp_path / "config.json").write_text(text, encoding="utf-8")
+    return str(tmp_path)
+
+
+def _drafter_module(load_result, validate=lambda *args: None):
+    return SimpleNamespace(
+        load_drafter=lambda *args, **kwargs: load_result,
+        validate_drafter_compatibility=validate,
+    )
+
+
+def _install_fake_mlx_vlm(monkeypatch, drafter_module):
+    target = SimpleNamespace(config=SimpleNamespace())
+    monkeypatch.setitem(
+        sys.modules, "mlx_vlm", SimpleNamespace(load=lambda path: (target, object()))
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "mlx_vlm.utils",
+        SimpleNamespace(load_config=lambda path: {"model_type": "qwen4_exp"}),
+    )
+    monkeypatch.setitem(sys.modules, "mlx_vlm.speculative.drafters", drafter_module)
+    return target
+
+
+def test_registered_mtp_drafter_resolves_repo_id_without_network(monkeypatch, tmp_path):
+    from vllm_mlx.models.mllm import load_mtp_drafter
+
+    _write_drafter_config(tmp_path, {"model_type": "qwen4_exp_mtp"})
+    captured = {}
+
+    def resolve(repo_id):
+        captured["repo_id"] = repo_id
+        return tmp_path
+
+    monkeypatch.setitem(
+        sys.modules, "mlx_vlm.utils", SimpleNamespace(get_model_path=resolve)
+    )
+    drafter = object()
+    monkeypatch.setitem(
+        sys.modules,
+        "mlx_vlm.speculative.drafters",
+        _drafter_module((drafter, "mtp")),
+    )
+
+    assert load_mtp_drafter("owner/qwen4-exp-mtp") is drafter
+    assert captured["repo_id"] == "owner/qwen4-exp-mtp"
+
+
+@pytest.mark.parametrize(
+    "config",
+    [
+        {"model_type": "gemma4_assistant"},
+        {"model_type": "GEMMA4_UNIFIED_ASSISTANT"},
+        {"model_type": "gemma4", "text_config": {"model_type": "gemma4_assistant"}},
+    ],
+)
+def test_mtp_drafter_preserves_supported_gemma_loader_shapes(
+    monkeypatch, tmp_path, config
+):
+    from vllm_mlx.models import mllm
+
+    path = _write_drafter_config(tmp_path, config)
+    expected = object()
+    monkeypatch.setattr(mllm, "load_gemma4_assistant_drafter", lambda path: expected)
+
+    assert mllm.load_mtp_drafter(path) is expected
+
+
+@pytest.mark.parametrize(
+    ("config", "message"),
+    [
+        (None, "must be a JSON object"),
+        ([], "must be a JSON object"),
+        ({}, "has no valid model_type"),
+        ("{not-json", "Invalid MTP drafter config JSON"),
+        (
+            {
+                "model_type": "qwen4_exp_mtp",
+                "text_config": {"model_type": "gemma4_assistant"},
+            },
+            "conflicting model types",
+        ),
+    ],
+)
+def test_mtp_drafter_rejects_invalid_config(tmp_path, config, message):
+    from vllm_mlx.models.mllm import load_mtp_drafter
+
+    path = _write_drafter_config(tmp_path, config)
+    with pytest.raises(ValueError, match=message):
+        load_mtp_drafter(path)
+
+
+@pytest.mark.parametrize("source", ["text_config", "speculators_model_type"])
+def test_mtp_drafter_prefers_nested_drafter_model_type(tmp_path, source):
+    from vllm_mlx.models.mllm import _read_mtp_drafter_model_type
+
+    config = {"model_type": "qwen4_exp"}
+    config[source] = (
+        {"model_type": "qwen4_exp_mtp"} if source == "text_config" else "qwen4_exp_mtp"
+    )
+    _write_drafter_config(tmp_path, config)
+
+    assert _read_mtp_drafter_model_type(tmp_path / "config.json") == "qwen4_exp_mtp"
+
+
+@pytest.mark.parametrize(
+    ("loaded", "message"),
+    [
+        (None, "must return"),
+        ((None, "mtp"), "returned no model"),
+        ((object(), "dflash"), "unsupported kind"),
+        ((object(), "mtp", "extra"), "must return"),
+    ],
+)
+def test_mtp_drafter_rejects_invalid_loader_return(
+    monkeypatch, tmp_path, loaded, message
+):
+    from vllm_mlx.models.mllm import load_mtp_drafter
+
+    path = _write_drafter_config(tmp_path, {"model_type": "qwen4_exp_mtp"})
+    monkeypatch.setitem(
+        sys.modules, "mlx_vlm.speculative.drafters", _drafter_module(loaded)
+    )
+
+    with pytest.raises(ValueError, match=message):
+        load_mtp_drafter(path)
+
+
+def test_mllm_load_binds_registered_drafter_and_validates_target(monkeypatch, tmp_path):
+    from vllm_mlx.models.mllm import MLXMultimodalLM
+
+    path = _write_drafter_config(tmp_path, {"model_type": "qwen4_exp_mtp"})
+    drafter = SimpleNamespace()
+    captured = {}
+
+    def validate(target_model, draft_model, draft_kind):
+        captured.update(target=target_model, draft=draft_model, kind=draft_kind)
+
+    target = _install_fake_mlx_vlm(
+        monkeypatch, _drafter_module((drafter, "mtp"), validate)
+    )
+    model = MLXMultimodalLM("target", draft_model=path, draft_kind="mtp")
+    model.load()
+
+    assert model._draft_model is drafter
+    assert captured == {"target": target, "draft": drafter, "kind": "mtp"}
+
+
+def test_mllm_load_preserves_registered_drafter_error(monkeypatch, tmp_path):
+    from vllm_mlx.models.mllm import MLXMultimodalLM, MTPDrafterLoadError
+
+    path = _write_drafter_config(tmp_path, {"model_type": "qwen4_exp_mtp"})
+    _install_fake_mlx_vlm(monkeypatch, SimpleNamespace())
+    model = MLXMultimodalLM("target", draft_model=path, draft_kind="mtp")
+
+    with pytest.raises(MTPDrafterLoadError, match="registered 'qwen4_exp_mtp'"):
+        model.load()
+
+
+def test_registered_mtp_drafter_requires_validator_for_target(monkeypatch, tmp_path):
+    from vllm_mlx.models.mllm import MTPDrafterLoadError, load_mtp_drafter
+
+    (tmp_path / "config.json").write_text(
+        json.dumps({"model_type": "qwen4_exp_mtp"}), encoding="utf-8"
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "mlx_vlm.speculative.drafters",
+        SimpleNamespace(load_drafter=lambda *args, **kwargs: (object(), "mtp")),
+    )
+
+    with pytest.raises(MTPDrafterLoadError, match="registered 'qwen4_exp_mtp'"):
+        load_mtp_drafter(str(tmp_path), target_model=object())
 
 
 def test_mllm_chat_forwards_configured_assistant_drafter(monkeypatch):
