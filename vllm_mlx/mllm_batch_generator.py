@@ -27,6 +27,11 @@ from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 import mlx.core as mx
 import mlx.nn as nn
 
+from .context_limits import (
+    DEFAULT_MAX_MODEL_LEN,
+    ContextLengthExceeded,
+    validate_context_length,
+)
 from .memory_cache import MemoryAwarePrefixCache, MemoryCacheConfig
 from .multimodal_processor import MultimodalProcessor
 from .vision_embedding_cache import VisionEmbeddingCache
@@ -484,6 +489,7 @@ class MLLMBatchGenerator:
         vision_cache_size: int = 100,
         prefix_cache_config: Optional[MemoryCacheConfig] = None,
         max_kv_size: int = 0,
+        max_model_len: int = DEFAULT_MAX_MODEL_LEN,
     ):
         """
         Initialize MLLM batch generator.
@@ -502,11 +508,13 @@ class MLLMBatchGenerator:
             vision_cache_size: Max entries in vision cache
             prefix_cache_config: Config for KV prefix cache (text-only requests)
             max_kv_size: Maximum KV cache size per sequence (0 = unbounded)
+            max_model_len: Maximum combined prompt and requested output tokens
         """
         self.model = model
         self.processor = processor
         self.mm_processor = mm_processor
         self.max_kv_size = max_kv_size
+        self.max_model_len = max_model_len
 
         # Get language model for text generation
         self.language_model = getattr(model, "language_model", model)
@@ -877,7 +885,12 @@ class MLLMBatchGenerator:
         draft_requested = reference.mllm_draft
         return [r for r in requests if r.mllm_draft == draft_requested][:limit]
 
-    def _preprocess_request(self, request: MLLMBatchRequest) -> None:
+    def _preprocess_request(
+        self,
+        request: MLLMBatchRequest,
+        *,
+        populate_vision_cache: bool = True,
+    ) -> None:
         """
         Preprocess a single MLLM request (vision encoding).
 
@@ -891,6 +904,8 @@ class MLLMBatchGenerator:
 
         Args:
             request: Request to preprocess
+            populate_vision_cache: Store processed media for later requests.
+                Context-only preflight disables this to avoid mutating cache state.
         """
         # Already preprocessed (e.g. by early executor offloading in
         # _process_loop or chunked prefill interleaving).  Only skip for
@@ -994,7 +1009,12 @@ class MLLMBatchGenerator:
         processing_time = time.perf_counter() - tic
 
         # Store in pixel cache for future reuse
-        if all_images and not all_audio and request.pixel_values is not None:
+        if (
+            populate_vision_cache
+            and all_images
+            and not all_audio
+            and request.pixel_values is not None
+        ):
             self.vision_cache.set_pixel_cache(
                 images=all_images,
                 prompt=request.prompt,
@@ -1017,6 +1037,17 @@ class MLLMBatchGenerator:
             f"{len(all_images)} images, {len(all_audio)} audio clips, "
             f"{request.input_ids.size if request.input_ids is not None else 0} tokens "
             f"({processing_time:.2f}s)"
+        )
+
+    def _validate_context_length(self, request: MLLMBatchRequest) -> None:
+        """Validate the media-expanded prompt before allocating KV cache."""
+        if request.input_ids is None:
+            raise RuntimeError("MLLM input IDs are unavailable for context admission")
+        prompt_tokens = request.input_ids.size
+        validate_context_length(
+            prompt_tokens=prompt_tokens,
+            max_tokens=request.max_tokens,
+            max_model_len=getattr(self, "max_model_len", DEFAULT_MAX_MODEL_LEN),
         )
 
     @staticmethod
@@ -1365,6 +1396,14 @@ class MLLMBatchGenerator:
         for req in requests:
             try:
                 self._preprocess_request(req)
+                self._validate_context_length(req)
+            except ContextLengthExceeded as e:
+                logger.warning(
+                    "Rejected request %s during context admission: %s",
+                    req.request_id,
+                    e,
+                )
+                failed_requests.append(req)
             except Exception as e:
                 logger.error(
                     f"Failed to preprocess request {req.request_id}: "

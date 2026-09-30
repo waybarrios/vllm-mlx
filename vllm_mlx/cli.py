@@ -22,6 +22,7 @@ from .cli_arg_types import (
     make_positive_int_arg_parser,
     memory_budget_gb_arg,
 )
+from .context_limits import DEFAULT_MAX_MODEL_LEN
 from .tool_parsers import ToolParserManager
 
 _TOOL_PARSER_CHOICES = ToolParserManager.list_registered()
@@ -93,6 +94,7 @@ def serve_command(args):
         print("Error: --max-tokens must be at least 1")
         sys.exit(1)
     max_request_tokens = getattr(args, "max_request_tokens", args.max_tokens)
+    max_model_len = getattr(args, "max_model_len", DEFAULT_MAX_MODEL_LEN)
     max_kv_size = getattr(args, "max_kv_size", None)
     trust_remote_code = getattr(args, "trust_remote_code", False)
     if max_request_tokens < 1:
@@ -100,6 +102,9 @@ def serve_command(args):
         sys.exit(1)
     if args.max_tokens > max_request_tokens:
         print("Error: --max-tokens cannot exceed --max-request-tokens")
+        sys.exit(1)
+    if args.max_tokens > max_model_len:
+        print("Error: --max-tokens cannot exceed --max-model-len")
         sys.exit(1)
     mllm_draft_model = getattr(args, "mllm_draft_model", None)
     mllm_draft_kind = getattr(args, "mllm_draft_kind", None)
@@ -133,6 +138,7 @@ def serve_command(args):
     server._metrics_enabled = args.enable_metrics
     server._metrics.configure(enabled=args.enable_metrics)
     server._max_request_tokens = max_request_tokens
+    server._max_model_len = max_model_len
     server._embedding_max_length = args.embedding_max_length
     server._embedding_overflow_policy = args.embedding_overflow_policy
     if args.rate_limit > 0:
@@ -264,6 +270,7 @@ def serve_command(args):
         print(f"Loading models config: {models_config}")
     print(f"Default max tokens: {args.max_tokens}")
     print(f"Max request tokens: {max_request_tokens}")
+    print(f"Max model length: {max_model_len}")
     if max_kv_size is not None:
         print(f"Max KV size: {max_kv_size} (RotatingKVCache)")
 
@@ -330,6 +337,7 @@ def serve_command(args):
             ssd_cache_max_gb=getattr(args, "ssd_cache_max_gb", 10.0),
             # KV cache size limit
             max_kv_size=max_kv_size or 0,
+            max_model_len=max_model_len,
         )
 
         print("Mode: Continuous batching (for multiple concurrent users)")
@@ -412,6 +420,7 @@ def serve_command(args):
             max_tokens=args.max_tokens,
             download_config=download_config,
             auto_unload_idle_seconds=args.auto_unload_idle_seconds,
+            max_model_len=max_model_len,
         )
         load_model_registry(
             models_config,
@@ -427,6 +436,7 @@ def serve_command(args):
             stream_interval=args.stream_interval if args.continuous_batching else 1,
             max_tokens=args.max_tokens,
             max_request_tokens=max_request_tokens,
+            max_model_len=max_model_len,
             force_mllm=getattr(args, "mllm", False),
             gpu_memory_utilization=args.gpu_memory_utilization,
             served_model_name=args.served_model_name,
@@ -1227,6 +1237,15 @@ Examples:
         help="Maximum max_tokens accepted from API clients (default: 32768)",
     )
     serve_parser.add_argument(
+        "--max-model-len",
+        type=make_positive_int_arg_parser("--max-model-len"),
+        default=DEFAULT_MAX_MODEL_LEN,
+        help=(
+            "Maximum combined prompt and requested output tokens per request "
+            f"(default: {DEFAULT_MAX_MODEL_LEN})"
+        ),
+    )
+    serve_parser.add_argument(
         "--continuous-batching",
         action="store_true",
         help="Enable continuous batching for multiple concurrent users (slower for single user)",
@@ -1235,9 +1254,9 @@ Examples:
         "--gpu-memory-utilization",
         type=float,
         default=0.90,
-        help="Fraction of device memory for Metal allocation limit and emergency "
-        "cache clear threshold (0.0-1.0, default: 0.90). Increase to 0.95 for "
-        "large models (200GB+) that need more memory headroom.",
+        help="Fraction of device memory for the soft Metal memory guideline and "
+        "emergency cache clear threshold (0.0-1.0, default: 0.90). This is not "
+        "a hard allocation ceiling; use --max-model-len to bound each request.",
     )
     # Paged cache options (experimental)
     serve_parser.add_argument(

@@ -25,6 +25,7 @@ import mlx.core as mx
 
 from ..api.tool_calling import convert_tools_for_template
 from ..api.utils import clean_output_text, extract_multimodal_content, is_mllm_model
+from ..context_limits import DEFAULT_MAX_MODEL_LEN
 from .base import (
     BaseEngine,
     GenerationOutput,
@@ -128,6 +129,7 @@ class BatchedEngine(BaseEngine):
         mllm_draft_kind: str | None = None,
         mllm_draft_block_size: int | None = None,
         default_mllm_draft: bool = False,
+        max_model_len: int | None = None,
     ):
         """
         Initialize the batched engine.
@@ -142,11 +144,17 @@ class BatchedEngine(BaseEngine):
                 limit and emergency threshold (0.0-1.0, default 0.90)
             default_mllm_draft: Enable the configured assistant drafter unless a
                 request explicitly sets ``mllm_draft`` to false.
+            max_model_len: Maximum combined prompt and requested output tokens.
         """
         self._model_name = model_name
         self._created_at = time.time()
         self._trust_remote_code = trust_remote_code
         self._scheduler_config = scheduler_config
+        self._max_model_len = (
+            max_model_len
+            if max_model_len is not None
+            else getattr(scheduler_config, "max_model_len", DEFAULT_MAX_MODEL_LEN)
+        )
         self._stream_interval = stream_interval
         self._gpu_memory_utilization = gpu_memory_utilization
         self._mllm_draft_model = mllm_draft_model
@@ -182,6 +190,69 @@ class BatchedEngine(BaseEngine):
         if self._is_mllm and self._processor:
             return getattr(self._processor, "tokenizer", self._processor)
         return self._tokenizer
+
+    async def validate_generate_context(
+        self,
+        prompt: str,
+        *,
+        max_tokens: int,
+        images: list[str] | None = None,
+        videos: list[str] | None = None,
+        audio: list[str] | None = None,
+        **kwargs,
+    ) -> int:
+        """Validate raw input, including media-expanded MLLM tokens."""
+        if not self._loaded:
+            await self.start()
+        if self._is_mllm and self._mllm_scheduler is not None:
+            return await asyncio.to_thread(
+                self._mllm_scheduler.validate_context,
+                prompt=prompt,
+                images=images,
+                videos=videos,
+                audio=audio,
+                max_tokens=max_tokens,
+            )
+        return await super().validate_generate_context(
+            prompt,
+            max_tokens=max_tokens,
+            **kwargs,
+        )
+
+    async def validate_chat_context(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        max_tokens: int,
+        tools: list[dict] | None = None,
+        images: list[str] | None = None,
+        videos: list[str] | None = None,
+        **kwargs,
+    ) -> int:
+        """Render chat exactly as generation does, then validate its context."""
+        if not self._loaded:
+            await self.start()
+        _, extracted_images, extracted_videos, extracted_audios = (
+            extract_multimodal_content(messages)
+        )
+        all_images = (images or []) + extracted_images
+        all_videos = (videos or []) + extracted_videos
+        template_tools = convert_tools_for_template(tools) if tools else None
+        prompt = self._apply_chat_template(
+            messages,
+            template_tools,
+            num_images=len(all_images),
+            num_audios=len(extracted_audios),
+            chat_template_kwargs=dict(kwargs.get("chat_template_kwargs", {}) or {}),
+            enable_thinking=kwargs.get("enable_thinking"),
+        )
+        return await self.validate_generate_context(
+            prompt,
+            max_tokens=max_tokens,
+            images=all_images or None,
+            videos=all_videos or None,
+            audio=extracted_audios or None,
+        )
 
     def prepare_for_start(self) -> None:
         """Load heavyweight model state off the serving event loop."""
@@ -331,7 +402,7 @@ class BatchedEngine(BaseEngine):
                     pct = self._gpu_memory_utilization * 100
                     logger.info(
                         f"Metal memory limits set: "
-                        f"allocation_limit={soft_limit / 1e9:.1f}GB "
+                        f"soft_limit={soft_limit / 1e9:.1f}GB "
                         f"({pct:.0f}% of {max_recommended / 1e9:.1f}GB), "
                         f"buffer_cache_limit={cache_limit / 1e9:.1f}GB "
                         f"({cache_limit_source})"
@@ -426,6 +497,7 @@ class BatchedEngine(BaseEngine):
             kv_cache_quantization_group_size=kv_group_size,
             chunked_prefill_tokens=chunked_prefill_tokens,
             max_kv_size=max_kv_size,
+            max_model_len=self._max_model_len,
             ssd_cache_dir=ssd_cache_dir,
             ssd_cache_max_gb=ssd_cache_max_gb,
             **mllm_extra,
@@ -558,7 +630,7 @@ class BatchedEngine(BaseEngine):
                     pct = self._gpu_memory_utilization * 100
                     logger.info(
                         f"Metal memory limits set: "
-                        f"allocation_limit={soft_limit / 1e9:.1f}GB "
+                        f"soft_limit={soft_limit / 1e9:.1f}GB "
                         f"({pct:.0f}% of {max_recommended / 1e9:.1f}GB), "
                         f"buffer_cache_limit={cache_limit / 1e9:.1f}GB "
                         f"({cache_limit_source})"
@@ -587,7 +659,10 @@ class BatchedEngine(BaseEngine):
                 )
 
         # Create engine config
-        scheduler_config = self._scheduler_config or SchedulerConfig()
+        scheduler_config = self._scheduler_config or SchedulerConfig(
+            max_model_len=self._max_model_len
+        )
+        scheduler_config.max_model_len = self._max_model_len
         engine_config = EngineConfig(
             model_name=self._model_name,
             scheduler_config=scheduler_config,
@@ -799,6 +874,15 @@ class BatchedEngine(BaseEngine):
         if not self._loaded:
             await self.start()
 
+        if not kwargs.pop("_context_validated", False):
+            await self.validate_generate_context(
+                prompt,
+                max_tokens=max_tokens,
+                images=images,
+                videos=videos,
+                audio=audio,
+            )
+
         if self._is_mllm and self._mllm_scheduler:
             # Use MLLM scheduler for all requests when model is multimodal.
             # MLLM models only initialise the _mllm_scheduler (not _engine),
@@ -890,6 +974,15 @@ class BatchedEngine(BaseEngine):
         """
         if not self._loaded:
             await self.start()
+
+        if not kwargs.pop("_context_validated", False):
+            await self.validate_generate_context(
+                prompt,
+                max_tokens=max_tokens,
+                images=images,
+                videos=videos,
+                audio=audio,
+            )
 
         if self._is_mllm and self._mllm_scheduler:
             # Use MLLM scheduler for all streaming when model is multimodal

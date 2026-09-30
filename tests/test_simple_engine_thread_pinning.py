@@ -277,6 +277,9 @@ def test_mllm_chat_sampling_reaches_generation_worker(
     class SamplingModel:
         _video_native = route == "native_video"
 
+        def count_chat_prompt_tokens(self, messages, **kwargs):
+            return 3
+
         def _collect_video_inputs(self, messages):
             return ["test-video"] if self._video_native else []
 

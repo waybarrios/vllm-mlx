@@ -55,6 +55,7 @@ import uuid
 from collections import OrderedDict, defaultdict
 from collections.abc import AsyncIterator
 from contextlib import suppress
+from typing import Any, Awaitable, Callable, NoReturn, cast
 
 import uvicorn
 from fastapi import Depends, FastAPI, HTTPException, Request, UploadFile
@@ -161,6 +162,7 @@ from .cli_arg_types import (
     make_json_object_arg_parser,
     make_positive_int_arg_parser,
 )
+from .context_limits import DEFAULT_MAX_MODEL_LEN, ContextLengthExceeded
 from .engine import BaseEngine, BatchedEngine, GenerationOutput, SimpleEngine
 from .endpoint_model_policies import (
     resolve_embedding_model_name,
@@ -198,6 +200,7 @@ _warm_prompts_path: str | None = None  # Path to JSON of prompts to pre-warm at 
 _default_model_key: str | None = None
 _default_max_tokens: int = 32768
 _max_request_tokens: int = 32768
+_max_model_len: int = DEFAULT_MAX_MODEL_LEN
 _embedding_max_length: int | None = (
     None  # Set via --embedding-max-length ('auto' = None)
 )
@@ -298,6 +301,83 @@ def _resolve_request_max_tokens(requested_value: int | None) -> int:
     return requested_value
 
 
+def _raise_context_length_http_error(exc: ContextLengthExceeded) -> NoReturn:
+    """Convert engine admission failures to an OpenAI-style client error."""
+    raise HTTPException(
+        status_code=400,
+        detail={
+            "message": str(exc),
+            "type": "invalid_request_error",
+            "param": "max_tokens",
+            "code": exc.code,
+            "prompt_tokens": exc.prompt_tokens,
+            "max_tokens": exc.max_tokens,
+            "max_model_len": exc.max_model_len,
+        },
+    ) from exc
+
+
+async def _preflight_generate_context(
+    engine: BaseEngine,
+    prompt: str,
+    *,
+    max_tokens: int,
+    **kwargs,
+) -> int:
+    """Validate raw generation input before constructing an HTTP response."""
+    if inspect.getattr_static(engine, "validate_generate_context", None) is None:
+        return 0
+    validator = getattr(engine, "validate_generate_context", None)
+    if validator is None or (
+        isinstance(engine, BaseEngine)
+        and type(engine).validate_generate_context
+        is BaseEngine.validate_generate_context
+    ):
+        return 0
+    try:
+        return int(
+            await validator(
+                prompt,
+                max_tokens=max_tokens,
+                **kwargs,
+            )
+        )
+    except ContextLengthExceeded as exc:
+        _raise_context_length_http_error(exc)
+    except EngineBusy as exc:
+        _raise_engine_busy(exc)
+
+
+async def _preflight_chat_context(
+    engine: BaseEngine,
+    messages: list[dict],
+    *,
+    max_tokens: int,
+    **kwargs,
+) -> int:
+    """Validate rendered chat input before constructing an HTTP response."""
+    if inspect.getattr_static(engine, "validate_chat_context", None) is None:
+        return 0
+    validator = getattr(engine, "validate_chat_context", None)
+    if validator is None or (
+        isinstance(engine, BaseEngine)
+        and type(engine).validate_chat_context is BaseEngine.validate_chat_context
+    ):
+        return 0
+    try:
+        return int(
+            await validator(
+                messages,
+                max_tokens=max_tokens,
+                **kwargs,
+            )
+        )
+    except ContextLengthExceeded as exc:
+        _raise_context_length_http_error(exc)
+    except EngineBusy as exc:
+        _raise_engine_busy(exc)
+
+
 def _resolve_chat_template_kwargs(
     request_value: dict[str, object] | None,
     request_reasoning_effort: str | None = None,
@@ -318,7 +398,7 @@ class PreparedChatInvocation:
     """Fully prepared inputs for a single engine.chat/stream_chat call."""
 
     messages: list[dict]
-    chat_kwargs: dict[str, object]
+    chat_kwargs: dict[str, Any]
     response_format: object | None
     json_logits_processor: object | None
     thinking_processor: object | None = None
@@ -1063,7 +1143,7 @@ def _log_and_raise_internal_error(log_prefix: str, exc: Exception, detail: str) 
     raise HTTPException(status_code=500, detail=detail)
 
 
-def _raise_engine_busy(exc: EngineBusy) -> None:
+def _raise_engine_busy(exc: EngineBusy) -> NoReturn:
     """Translate serialized-engine admission failures into retryable HTTP 503."""
     raise HTTPException(
         status_code=503,
@@ -1499,6 +1579,7 @@ def _build_engine(spec: ModelSpec) -> BaseEngine:
             scheduler_config=spec.scheduler_config,
             stream_interval=spec.stream_interval,
             force_mllm=spec.force_mllm,
+            max_model_len=spec.max_model_len,
         )
 
     from .engine.simple import SimpleEngine
@@ -1518,6 +1599,7 @@ def _build_engine(spec: ModelSpec) -> BaseEngine:
         specprefill_backbone_pct=spec.specprefill_backbone_pct,
         specprefill_draft_model=spec.specprefill_draft_model,
         max_kv_size=max_kv_size,
+        max_model_len=spec.max_model_len,
         prefix_trie_cache=spec.prefix_trie_cache,
         prefix_trie_cache_size=spec.prefix_trie_cache_size,
         prefix_trie_cache_memory_mb=spec.prefix_trie_cache_memory_mb,
@@ -2613,7 +2695,7 @@ def _prepare_responses_request(
     messages = canonicalize_system_messages(messages)
 
     chat_kwargs = {
-        "max_tokens": chat_request.max_tokens or _default_max_tokens,
+        "max_tokens": _resolve_request_max_tokens(chat_request.max_tokens),
         "temperature": _resolve_temperature(chat_request.temperature),
         "top_p": _resolve_top_p(chat_request.top_p),
     }
@@ -2644,13 +2726,29 @@ async def _run_responses_request(
     raw_request: Request,
 ) -> tuple[ResponseObject | None, list[dict]]:
     """Execute a Responses API request against the backend chat engine."""
+    total_timeout, deadline = _start_request_budget(None)
     engine, chat_request, messages, chat_kwargs = _prepare_responses_request(request)
+    prompt_tokens = await _wait_for_context_preflight(
+        lambda: _preflight_chat_context(
+            engine,
+            messages,
+            streaming=False,
+            **chat_kwargs,
+        ),
+        raw_request,
+        total_timeout=total_timeout,
+        deadline=deadline,
+    )
+    if prompt_tokens is None:
+        return None, []
+    chat_kwargs["_context_validated"] = True
 
-    timeout = _default_timeout
+    timeout = _remaining_request_timeout(total_timeout, deadline)
     output = await _wait_with_disconnect(
         engine.chat(messages=messages, **chat_kwargs),
         raw_request,
         timeout=timeout,
+        timeout_detail_seconds=total_timeout,
     )
     if output is None:
         return None, []
@@ -2695,11 +2793,14 @@ async def _run_responses_request(
     return response_object, persisted_messages
 
 
-async def _stream_responses_request(request: ResponsesRequest) -> AsyncIterator[str]:
+async def _stream_responses_request(
+    request: ResponsesRequest,
+    prepared: tuple[BaseEngine, ChatCompletionRequest, list[dict], dict] | None = None,
+) -> AsyncIterator[str]:
     """Execute a Responses API request and stream SSE events incrementally."""
-    engine, chat_request, messages, chat_kwargs = _prepare_streaming_responses_request(
-        request
-    )
+    if prepared is None:
+        prepared = _prepare_streaming_responses_request(request)
+    engine, chat_request, messages, chat_kwargs = prepared
     tool_request_context = chat_request.model_dump()
 
     response_id = _new_response_item_id("resp")
@@ -3659,6 +3760,7 @@ def load_model(
     auto_unload_idle_seconds: float = 0.0,
     lazy_load_model: bool = False,
     default_mllm_draft: bool = False,
+    max_model_len: int = DEFAULT_MAX_MODEL_LEN,
 ):
     """
     Load a model (auto-detects MLLM vs LLM).
@@ -3670,6 +3772,7 @@ def load_model(
         stream_interval: Tokens to batch before streaming (batched mode only)
         max_tokens: Default max tokens for generation
         max_request_tokens: Maximum max_tokens accepted from API clients
+        max_model_len: Maximum combined prompt and requested output tokens
         force_mllm: Force loading as MLLM even if not auto-detected
         trust_remote_code: Allow HuggingFace remote code execution during model/tokenizer loading
         mtp: Enable native MTP speculative decoding (SimpleEngine only)
@@ -3695,7 +3798,8 @@ def load_model(
             request explicitly opts out.
     """
     global _engine, _model_manager, _model_name, _model_path, _default_max_tokens
-    global _max_request_tokens, _tool_parser_instance, _warm_prompts_path
+    global _max_request_tokens, _max_model_len, _tool_parser_instance
+    global _warm_prompts_path
     global _default_model_key, _auto_unload_idle_seconds, _residency_manager
     global _force_mllm_model, _lazy_load_model, _lifespan_active
 
@@ -3705,8 +3809,12 @@ def load_model(
         raise ValueError("Default max tokens must be at least 1")
     if max_request_tokens < 1:
         raise ValueError("Max request tokens must be at least 1")
+    if max_model_len < 1:
+        raise ValueError("Max model length must be at least 1")
     if max_tokens > max_request_tokens:
         raise ValueError("Default max tokens cannot exceed max request tokens")
+    if max_tokens > max_model_len:
+        raise ValueError("Default max tokens cannot exceed max model length")
     if mllm_draft_model and not force_mllm:
         raise ValueError("MLLM draft models require force_mllm/--mllm")
     if default_mllm_draft and not mllm_draft_model:
@@ -3756,6 +3864,9 @@ def load_model(
 
     _default_max_tokens = max_tokens
     _max_request_tokens = max_request_tokens
+    _max_model_len = max_model_len
+    if scheduler_config is not None:
+        scheduler_config.max_model_len = max_model_len
     _model_manager = None
     _model_path = model_name
     _model_name = served_model_name or model_name
@@ -3777,6 +3888,7 @@ def load_model(
             scheduler_config=scheduler_config,
             stream_interval=stream_interval if use_batching else 1,
             max_tokens=max_tokens,
+            max_model_len=max_model_len,
             force_mllm=force_mllm,
             mtp=mtp,
             prefill_step_size=prefill_step_size,
@@ -3820,6 +3932,7 @@ def load_model(
             mllm_draft_kind=mllm_draft_kind,
             mllm_draft_block_size=mllm_draft_block_size,
             default_mllm_draft=default_mllm_draft,
+            max_model_len=max_model_len,
         )
         # BatchedEngine will be started in lifespan (uvicorn's event loop)
         # Just log for now
@@ -3845,6 +3958,7 @@ def load_model(
             specprefill_backbone_pct=specprefill_backbone_pct,
             specprefill_draft_model=specprefill_draft_model,
             max_kv_size=_max_kv,
+            max_model_len=max_model_len,
             mllm_draft_model=mllm_draft_model,
             mllm_draft_kind=mllm_draft_kind,
             mllm_draft_block_size=mllm_draft_block_size,
@@ -3885,6 +3999,7 @@ def load_model(
 
     logger.info(f"Default max tokens: {_default_max_tokens}")
     logger.info(f"Max request tokens: {_max_request_tokens}")
+    logger.info(f"Max model length: {_max_model_len}")
 
 
 def load_model_registry(
@@ -5232,6 +5347,26 @@ def _remaining_request_timeout(total_timeout: float, deadline: float) -> float:
     return remaining
 
 
+async def _wait_for_context_preflight(
+    preflight_factory: Callable[[], Awaitable[int]],
+    raw_request: Request,
+    *,
+    total_timeout: float,
+    deadline: float,
+) -> int | None:
+    """Run admission within the request budget and disconnect lifecycle."""
+    timeout = _remaining_request_timeout(total_timeout, deadline)
+    return cast(
+        int | None,
+        await _wait_with_disconnect(
+            preflight_factory(),
+            raw_request,
+            timeout=timeout,
+            timeout_detail_seconds=total_timeout,
+        ),
+    )
+
+
 _active_request_contexts: dict[int, RequestModelContext] = {}
 
 
@@ -5374,6 +5509,26 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
     release_on_exit = True
 
     try:
+        try:
+            prompts_to_validate = prompts[:1] if request.stream else prompts
+            for prompt in prompts_to_validate:
+                prompt_tokens = await _wait_for_context_preflight(
+                    lambda: _preflight_generate_context(
+                        engine,
+                        prompt,
+                        max_tokens=effective_max_tokens,
+                    ),
+                    raw_request,
+                    total_timeout=total_timeout,
+                    deadline=deadline,
+                )
+                if prompt_tokens is None:
+                    tracker.finish(result="client_closed")
+                    return Response(status_code=499)
+        except HTTPException as exc:
+            tracker.finish(result=_metrics_result_from_status(exc.status_code))
+            raise
+
         if request.stream:
             response = StreamingResponse(
                 _disconnect_guard(
@@ -5412,6 +5567,7 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
                 "min_p": _resolve_min_p(request.min_p),
                 "presence_penalty": _resolve_presence_penalty(request.presence_penalty),
                 "stop": request.stop,
+                "_context_validated": True,
             }
             generate_kwargs["repetition_penalty"] = _resolve_repetition_penalty(
                 comp_rep_penalty
@@ -5587,6 +5743,26 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
         except UnsafeRemoteURLError as exc:
             tracker.finish(result="client_error")
             _raise_remote_media_http_error(exc)
+
+        try:
+            prompt_tokens = await _wait_for_context_preflight(
+                lambda: _preflight_chat_context(
+                    engine,
+                    prepared.messages,
+                    streaming=request.stream,
+                    **prepared.chat_kwargs,
+                ),
+                raw_request,
+                total_timeout=total_timeout,
+                deadline=deadline,
+            )
+            if prompt_tokens is None:
+                tracker.finish(result="client_closed")
+                return Response(status_code=499)
+        except HTTPException as exc:
+            tracker.finish(result=_metrics_result_from_status(exc.status_code))
+            raise
+        prepared.chat_kwargs["_context_validated"] = True
 
         if request.stream:
             response, release_on_exit = await _build_chat_streaming_response(
@@ -5772,10 +5948,29 @@ async def create_response(request: ResponsesRequest, raw_request: Request):
     """Create a Responses API response."""
     try:
         if request.stream:
+            total_timeout, deadline = _start_request_budget(None)
             chat_request = _responses_request_to_chat_request(request)
             _validate_remote_media_urls(chat_request.messages)
+            prepared = _prepare_streaming_responses_request(request)
+            engine, _chat_request, messages, chat_kwargs = prepared
+            prompt_tokens = await _wait_for_context_preflight(
+                lambda: _preflight_chat_context(
+                    engine,
+                    messages,
+                    streaming=True,
+                    **chat_kwargs,
+                ),
+                raw_request,
+                total_timeout=total_timeout,
+                deadline=deadline,
+            )
+            if prompt_tokens is None:
+                return Response(status_code=499)
+            chat_kwargs["_context_validated"] = True
             return StreamingResponse(
-                _disconnect_guard(_stream_responses_request(request), raw_request),
+                _disconnect_guard(
+                    _stream_responses_request(request, prepared), raw_request
+                ),
                 media_type="text/event-stream",
             )
 
@@ -5996,13 +6191,32 @@ async def create_anthropic_message(
     if engine is None:
         return Response(status_code=499)
     release_on_exit = True
-    prepared = _prepare_anthropic_endpoint_invocation(
-        engine,
-        openai_request,
-        effective_max_tokens,
-    )
-
     try:
+        prepared = _prepare_anthropic_endpoint_invocation(
+            engine,
+            openai_request,
+            effective_max_tokens,
+        )
+        try:
+            prompt_tokens = await _wait_for_context_preflight(
+                lambda: _preflight_chat_context(
+                    engine,
+                    prepared.messages,
+                    streaming=anthropic_request.stream,
+                    **prepared.chat_kwargs,
+                ),
+                request,
+                total_timeout=total_timeout,
+                deadline=deadline,
+            )
+            if prompt_tokens is None:
+                tracker.finish(result="client_closed")
+                return Response(status_code=499)
+        except HTTPException as exc:
+            tracker.finish(result=_metrics_result_from_status(exc.status_code))
+            raise
+        prepared.chat_kwargs["_context_validated"] = True
+
         if anthropic_request.stream:
             anthropic_terminal = (
                 f"event: message_stop\ndata: {json.dumps({'type': 'message_stop'})}\n\n"
@@ -6653,6 +6867,7 @@ async def stream_completion(
         "min_p": _resolve_min_p(request.min_p),
         "presence_penalty": _resolve_presence_penalty(request.presence_penalty),
         "stop": request.stop,
+        "_context_validated": True,
     }
     generate_kwargs["repetition_penalty"] = _resolve_repetition_penalty(
         repetition_penalty
@@ -7492,6 +7707,7 @@ def main():
         use_batching=args.continuous_batching,
         max_tokens=args.max_tokens,
         max_request_tokens=args.max_request_tokens,
+        max_model_len=args.max_model_len,
         force_mllm=args.mllm,
         trust_remote_code=args.trust_remote_code,
         mllm_draft_model=args.mllm_draft_model,
@@ -7631,6 +7847,15 @@ Examples:
         type=int,
         default=32768,
         help="Maximum max_tokens accepted from API clients (default: 32768)",
+    )
+    parser.add_argument(
+        "--max-model-len",
+        type=make_positive_int_arg_parser("--max-model-len"),
+        default=DEFAULT_MAX_MODEL_LEN,
+        help=(
+            "Maximum combined prompt and requested output tokens per request "
+            f"(default: {DEFAULT_MAX_MODEL_LEN})"
+        ),
     )
     parser.add_argument(
         "--api-key",

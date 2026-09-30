@@ -2,6 +2,7 @@
 """Tests for BatchedEngine generate() output."""
 
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -21,6 +22,7 @@ class TestBatchedEngineGenerate:
 
         engine._loaded = True
         engine._is_mllm = False
+        engine._tokenizer = SimpleNamespace(encode=lambda _prompt: [1])
         return engine
 
     def _make_mock_request_output(

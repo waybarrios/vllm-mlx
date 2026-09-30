@@ -11,6 +11,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 
+from .context_limits import DEFAULT_MAX_MODEL_LEN
 from .engine.base import BaseEngine, shield_task, suspend_cancellation
 
 
@@ -45,6 +46,7 @@ class ModelSpec:
     prefix_trie_cache: bool = False
     prefix_trie_cache_size: int = 32
     prefix_trie_cache_memory_mb: int | None = None
+    max_model_len: int = DEFAULT_MAX_MODEL_LEN
 
 
 @dataclass

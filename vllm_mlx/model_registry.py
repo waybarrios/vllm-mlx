@@ -22,6 +22,7 @@ from typing import Any, Literal
 
 from .api.utils import is_mllm_model
 from .cli_arg_types import parse_positive_finite_float
+from .context_limits import DEFAULT_MAX_MODEL_LEN
 from .engine.base import BaseEngine, suspend_cancellation
 from .engine.batched import BatchedEngine
 from .engine.simple import SimpleEngine
@@ -128,6 +129,7 @@ class RegistryServeDefaults:
     max_tokens: int
     download_config: DownloadConfig
     auto_unload_idle_seconds: float = 0.0
+    max_model_len: int = DEFAULT_MAX_MODEL_LEN
 
 
 @dataclass(frozen=True)
@@ -194,6 +196,7 @@ class ResolvedModelConfig:
     gpu_memory_utilization: float
     scheduler_config: SchedulerConfig | None
     estimated_memory_bytes: int
+    max_model_len: int = DEFAULT_MAX_MODEL_LEN
 
 
 @dataclass
@@ -1218,6 +1221,7 @@ class ModelManager:
                 stream_interval=config.stream_interval,
                 force_mllm=config.force_mllm,
                 gpu_memory_utilization=config.gpu_memory_utilization,
+                max_model_len=config.max_model_len,
             )
         else:
             engine = SimpleEngine(
@@ -1233,6 +1237,7 @@ class ModelManager:
                 prefix_trie_cache=config.prefix_trie_cache,
                 prefix_trie_cache_size=config.prefix_trie_cache_size,
                 prefix_trie_cache_memory_mb=config.prefix_trie_cache_memory_mb,
+                max_model_len=config.max_model_len,
             )
 
         await engine.start()
@@ -1383,4 +1388,5 @@ class ModelManager:
             gpu_memory_utilization=gpu_memory_utilization,
             scheduler_config=scheduler_config,
             estimated_memory_bytes=estimated_memory_bytes,
+            max_model_len=self._defaults.max_model_len,
         )

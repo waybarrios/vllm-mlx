@@ -12,6 +12,13 @@ import pytest
 pytestmark = pytest.mark.anyio
 
 
+class _ContextCountedMllmFake:
+    """Give focused engine fakes the context-counting adapter contract."""
+
+    def count_chat_prompt_tokens(self, _messages, **_kwargs):
+        return 1
+
+
 class TestSimpleEngineConcurrency:
     """Test SimpleEngine lock behavior with concurrent requests."""
 
@@ -386,6 +393,7 @@ class TestSimpleEngineConcurrency:
                 c
                 async for c in engine.stream_chat(
                     messages=[{"role": "user", "content": "hello"}],
+                    _context_validated=True,
                 )
             ]
 
@@ -550,6 +558,7 @@ class TestSimpleEngineConcurrency:
                     ],
                     stop=["<|im_end|>"],
                     logits_processors=[sentinel_processor],
+                    _context_validated=True,
                 )
             ]
 
@@ -629,6 +638,7 @@ class TestSimpleEngineConcurrency:
                     min_p=0.0,
                     presence_penalty=0.0,
                     repetition_penalty=1.0,
+                    _context_validated=True,
                 )
             ]
 
@@ -687,6 +697,7 @@ class TestSimpleEngineConcurrency:
                         {"role": "system", "content": "You are helpful."},
                         {"role": "user", "content": "hello"},
                     ],
+                    _context_validated=True,
                 )
             ]
 
@@ -750,6 +761,7 @@ class TestSimpleEngineConcurrency:
                         {"role": "system", "content": "You are helpful."},
                         {"role": "user", "content": "hello"},
                     ],
+                    _context_validated=True,
                 )
             ]
 
@@ -805,6 +817,7 @@ class TestSimpleEngineConcurrency:
                         {"role": "system", "content": "You are helpful."},
                         {"role": "user", "content": "hello"},
                     ],
+                    _context_validated=True,
                 )
             ]
 
@@ -865,6 +878,7 @@ class TestSimpleEngineConcurrency:
                         {"role": "system", "content": "You are helpful."},
                         {"role": "user", "content": "hello"},
                     ],
+                    _context_validated=True,
                 )
             ]
 
@@ -1159,6 +1173,7 @@ class TestSimpleEngineConcurrency:
                             {"role": "system", "content": "You are helpful."},
                             {"role": "user", "content": "hello"},
                         ],
+                        _context_validated=True,
                     )
                 ]
 
@@ -1297,6 +1312,7 @@ class TestSimpleEngineConcurrency:
                             {"role": "system", "content": "You are helpful."},
                             {"role": "user", "content": "hello"},
                         ],
+                        _context_validated=True,
                     )
                 ]
 
@@ -1574,7 +1590,7 @@ class TestSimpleEngineConcurrency:
         """Media requests must not move mlx_vlm generation to a worker thread."""
         from vllm_mlx.engine.simple import SimpleEngine
 
-        class FakeMllmModel:
+        class FakeMllmModel(_ContextCountedMllmFake):
             def __init__(self):
                 self._owner_thread = threading.get_ident()
 
@@ -1616,6 +1632,7 @@ class TestSimpleEngineConcurrency:
                     }
                 ],
                 max_tokens=16,
+                _context_validated=True,
             )
         ]
 
@@ -1629,7 +1646,7 @@ class TestSimpleEngineConcurrency:
 
         captured = {}
 
-        class FakeMllmModel:
+        class FakeMllmModel(_ContextCountedMllmFake):
             def __init__(self):
                 self._owner_thread = threading.get_ident()
 
@@ -1673,7 +1690,7 @@ class TestSimpleEngineConcurrency:
         from vllm_mlx.engine.base import EngineBusy
         from vllm_mlx.engine.simple import SimpleEngine
 
-        class FakeMllmModel:
+        class FakeMllmModel(_ContextCountedMllmFake):
             def stream_chat(self, **_kwargs):
                 yield SimpleNamespace(
                     text="first",
@@ -1752,7 +1769,7 @@ class TestSimpleEngineConcurrency:
         release = threading.Event()
         worker_thread = None
 
-        class FakeMllmModel:
+        class FakeMllmModel(_ContextCountedMllmFake):
             _video_native = True
 
             def _collect_video_inputs(self, _messages):
@@ -1814,7 +1831,7 @@ class TestSimpleEngineConcurrency:
         """Draft-backed MLLM startup must not build an unused TextModel."""
         from vllm_mlx.engine.simple import SimpleEngine
 
-        class FakeMllmModel:
+        class FakeMllmModel(_ContextCountedMllmFake):
             def __init__(self):
                 self.model = object()
                 self.loaded = False
@@ -1921,7 +1938,7 @@ class TestSimpleEngineConcurrency:
 
         from vllm_mlx.engine.simple import SimpleEngine
 
-        class FakeMllmModel:
+        class FakeMllmModel(_ContextCountedMllmFake):
             def chat(self, **kwargs):
                 raise RuntimeError("There is no Stream(gpu, 3) in current thread.")
 
@@ -1960,7 +1977,7 @@ class TestSimpleEngineConcurrency:
 
         from vllm_mlx.engine.simple import SimpleEngine
 
-        class FakeMllmModel:
+        class FakeMllmModel(_ContextCountedMllmFake):
             def __init__(self):
                 self._owner_thread = threading.get_ident()
 
