@@ -175,9 +175,10 @@ def test_generate_forwards_mllm_draft_opt_in():
     scheduler = SimpleNamespace(generate=AsyncMock(return_value=_generation_output()))
     engine = _batched_mllm_engine(scheduler)
 
-    asyncio.run(engine.generate("hello", mllm_draft=True))
+    output = asyncio.run(engine.generate("hello", mllm_draft=True))
 
     assert scheduler.generate.await_args.kwargs["mllm_draft"] is True
+    assert output.cached_tokens is None
 
 
 def test_generate_uses_configured_mllm_draft_default():
@@ -232,6 +233,7 @@ def test_stream_generate_uses_configured_mllm_draft_default():
     outputs = asyncio.run(consume_stream())
 
     assert outputs[0].text == "ok"
+    assert outputs[0].cached_tokens is None
     assert scheduler.add_request_async.await_args.kwargs["mllm_draft"] is True
 
 

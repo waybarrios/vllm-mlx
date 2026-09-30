@@ -160,6 +160,7 @@ class RequestOutputCollector:
             finish_reason=new.finish_reason,
             prompt_tokens=new.prompt_tokens,
             completion_tokens=new.completion_tokens,
+            cached_tokens=new.cached_tokens,
         )
 
     def clear(self) -> None:
