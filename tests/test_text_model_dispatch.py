@@ -126,3 +126,116 @@ def test_qwen4_exp_stays_on_mlx_vlm_text_path(tmp_path, caplog, model_type):
 
     assert "mlx-vlm text path" in caplog.records[-1].getMessage()
     assert not [record for record in caplog.records if record.levelno >= logging.ERROR]
+
+
+def _install_recording_qwen3_5(monkeypatch):
+    """Swap in a qwen3_5 module that records which configs reach it."""
+    import sys
+    import types
+
+    from vllm_mlx import text_model_from_vlm
+
+    seen: list[dict] = []
+
+    class TextModelArgs:
+        @classmethod
+        def from_dict(cls, config):
+            seen.append(config)
+            return config
+
+    class TextModel:
+        def __init__(self, args):
+            self.args = args
+            self.mtp = None
+
+        def load_weights(self, weights, strict=False):
+            pass
+
+        def train(self, mode=True):
+            return self
+
+    module = types.ModuleType("mlx_lm.models.qwen3_5")
+    module.TextModel = TextModel
+    module.TextModelArgs = TextModelArgs
+    monkeypatch.setitem(sys.modules, "mlx_lm.models.qwen3_5", module)
+    monkeypatch.setattr(text_model_from_vlm.mlx.utils, "tree_flatten", lambda _p: [])
+    return seen, TextModel
+
+
+# Text-relevant fields of mlx-community/Qwen2-VL-2B-Instruct-4bit's real
+# config.json (flat, no text_config): dense mrope attention, 12 heads over 1536,
+# no hybrid linear-attention layout -- not something the Qwen3.5 skeleton fits.
+_QWEN2_VL_CONFIG = {
+    "architectures": ["Qwen2VLForConditionalGeneration"],
+    "model_type": "qwen2_vl",
+    "hidden_size": 1536,
+    "num_attention_heads": 12,
+    "num_key_value_heads": 2,
+    "num_hidden_layers": 28,
+    "rope_scaling": {"type": "mrope", "mrope_section": [16, 24, 24]},
+    "vision_config": {"depth": 32, "embed_dim": 1280},
+}
+
+
+@pytest.mark.parametrize(
+    "config",
+    [
+        _QWEN2_VL_CONFIG,
+        {**_QWEN2_VL_CONFIG, "model_type": "qwen2_5_vl"},
+        {"model_type": "qwen3_vl", "text_config": {"model_type": "qwen3_vl_text"}},
+    ],
+    ids=["qwen2_vl", "qwen2_5_vl", "qwen3_vl"],
+)
+def test_vlm_families_without_an_extractor_stay_on_mlx_vlm(
+    tmp_path, monkeypatch, caplog, config
+):
+    """A resolved snapshot must not make an incompatible VLM extractable.
+
+    Regression for #780 review: once the CLI passed the resolved snapshot into
+    SimpleEngine, build_text_model could read Qwen2-VL's config.json and fed it
+    to the generic Qwen3.5 TextModel. Text-only chat has to stay on the
+    loaded mlx-vlm model instead.
+    """
+    import json
+
+    seen, _ = _install_recording_qwen3_5(monkeypatch)
+    (tmp_path / "config.json").write_text(json.dumps(config))
+
+    class _Vlm:
+        language_model = object()
+
+    with caplog.at_level(logging.INFO, logger="vllm_mlx.text_model_from_vlm"):
+        assert build_text_model(_Vlm(), tmp_path) is None
+
+    assert seen == [], "the Qwen3.5 skeleton must not be built for this family"
+    assert "mlx-vlm text path" in caplog.records[-1].getMessage()
+
+
+@pytest.mark.parametrize(
+    "config",
+    [
+        {"model_type": "qwen3_5", "text_config": {"model_type": "qwen3_5_text"}},
+        {
+            "model_type": "qwen3_5_moe",
+            "text_config": {"model_type": "qwen3_5_moe_text", "num_experts": 256},
+        },
+    ],
+    ids=["qwen3_5", "qwen3_5_moe"],
+)
+def test_qwen3_5_family_still_uses_the_extractor(tmp_path, monkeypatch, config):
+    """Qwen3.5 / 3.6 / 3.8 snapshots keep the mlx-lm text route."""
+    import json
+
+    seen, TextModel = _install_recording_qwen3_5(monkeypatch)
+    (tmp_path / "config.json").write_text(json.dumps(config))
+
+    class _Vlm:
+        class language_model:
+            @staticmethod
+            def parameters():
+                return {}
+
+    text_model = build_text_model(_Vlm(), tmp_path, enable_mtp=False)
+
+    assert isinstance(text_model, TextModel)
+    assert seen == [config["text_config"]]

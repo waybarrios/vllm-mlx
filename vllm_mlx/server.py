@@ -1604,6 +1604,7 @@ def _build_engine(spec: ModelSpec) -> BaseEngine:
             specprefill_keep_pct=spec.specprefill_keep_pct,
             specprefill_backbone_pct=spec.specprefill_backbone_pct,
             specprefill_draft_model=spec.specprefill_draft_model,
+            model_path=spec.model_path,
         )
 
     from .engine.simple import SimpleEngine
@@ -1626,6 +1627,7 @@ def _build_engine(spec: ModelSpec) -> BaseEngine:
         prefix_trie_cache=spec.prefix_trie_cache,
         prefix_trie_cache_size=spec.prefix_trie_cache_size,
         prefix_trie_cache_memory_mb=spec.prefix_trie_cache_memory_mb,
+        model_path=spec.model_path,
     )
 
 
@@ -3952,12 +3954,14 @@ def load_model(
     auto_unload_idle_seconds: float = 0.0,
     lazy_load_model: bool = False,
     default_mllm_draft: bool = False,
+    model_path: str | None = None,
 ):
     """
     Load a model (auto-detects MLLM vs LLM).
 
     Args:
-        model_name: HuggingFace model name or local path
+        model_name: HuggingFace model name or local path; the model's identity
+            for name-based defaults and the default served name
         use_batching: Use continuous batching (BatchedEngine) vs simple mode (SimpleEngine)
         scheduler_config: Scheduler config for batched mode
         stream_interval: Tokens to batch before streaming (batched mode only)
@@ -3986,6 +3990,9 @@ def load_model(
             startup.
         default_mllm_draft: Enable a configured assistant drafter unless a
             request explicitly opts out.
+        model_path: Already-resolved local snapshot to load ``model_name``
+            from (e.g. from ``ensure_model_downloaded()``). Loading only;
+            identity stays ``model_name``.
     """
     global _engine, _model_manager, _model_name, _model_path, _default_max_tokens
     global _max_request_tokens, _tool_parser_instance, _warm_prompts_path
@@ -4081,6 +4088,7 @@ def load_model(
             prefix_trie_cache=prefix_trie_cache,
             prefix_trie_cache_size=prefix_trie_cache_size,
             prefix_trie_cache_memory_mb=prefix_trie_cache_memory_mb,
+            model_path=model_path,
         )
         _residency_manager = ResidencyManager(
             _engine_factory,
@@ -4118,6 +4126,7 @@ def load_model(
             specprefill_keep_pct=specprefill_keep_pct,
             specprefill_backbone_pct=specprefill_backbone_pct,
             specprefill_draft_model=specprefill_draft_model,
+            model_path=model_path,
         )
         # BatchedEngine will be started in lifespan (uvicorn's event loop)
         # Just log for now
@@ -4150,6 +4159,7 @@ def load_model(
             prefix_trie_cache_size=prefix_trie_cache_size,
             prefix_trie_cache_memory_mb=prefix_trie_cache_memory_mb,
             default_mllm_draft=default_mllm_draft,
+            model_path=model_path,
         )
         # Start SimpleEngine synchronously (no background loop)
         # Use new_event_loop() for Python 3.10+ compatibility (get_event_loop() is deprecated)

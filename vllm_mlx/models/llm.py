@@ -57,6 +57,7 @@ class MLXLanguageModel:
         trust_remote_code: bool = False,
         mtp: bool = False,
         mtp_num_draft_tokens: int = 1,
+        model_id: str | None = None,
     ):
         """
         Initialize the MLX language model.
@@ -67,8 +68,12 @@ class MLXLanguageModel:
             trust_remote_code: Whether to trust remote code
             mtp: Enable native MTP speculative decoding (model must have MTP head)
             mtp_num_draft_tokens: Draft tokens per speculative MTP step
+            model_id: The model's identity when ``model_name`` is a resolved
+                local snapshot; name-based fixes key on it. Defaults to
+                ``model_name``.
         """
         self.model_name = model_name
+        self.model_id = model_id or model_name
         self.tokenizer_name = tokenizer_name or model_name
         self.trust_remote_code = trust_remote_code
         self._mtp = mtp
@@ -93,13 +98,14 @@ class MLXLanguageModel:
 
             # Qwen3 fix: eos_token changed from <|im_end|> to <|endoftext|>
             # but chat template still uses <|im_end|>, so we need to set it explicitly
-            if "qwen3" in self.model_name.lower() or "Qwen3" in self.model_name:
+            if "qwen3" in self.model_id.lower():
                 tokenizer_config["eos_token"] = "<|im_end|>"
                 logger.info("Qwen3 detected: setting eos_token to <|im_end|>")
 
             self.model, self.tokenizer = load_model_with_fallback(
                 self.model_name,
                 tokenizer_config=tokenizer_config,
+                model_id=self.model_id,
             )
 
             self._loaded = True

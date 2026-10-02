@@ -45,6 +45,8 @@ class ModelSpec:
     prefix_trie_cache: bool = False
     prefix_trie_cache_size: int = 32
     prefix_trie_cache_memory_mb: int | None = None
+    # Resolved local snapshot for ``model_name``; loading only, not identity.
+    model_path: str | None = None
 
 
 @dataclass

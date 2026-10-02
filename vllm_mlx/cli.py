@@ -240,8 +240,12 @@ def serve_command(args):
     )
     print("=" * 60)
 
-    # Pre-download model with retry/timeout
-    from .api.utils import is_mllm_model
+    # Pre-download model with retry/timeout, and resolve the MLLM/LLM
+    # routing decision from that same resolved snapshot's config.json
+    # (rather than filename heuristics) before engine construction. This
+    # reuses the download's own resolution, so a bare HF repo id gets an
+    # authoritative check with no second network lookup.
+    from .api.utils import MllmRouteUndetermined, is_mllm_model, resolve_mllm_route
     from .utils.download import DownloadConfig, ensure_model_downloaded
 
     download_config = DownloadConfig(
@@ -249,11 +253,30 @@ def serve_command(args):
         max_retries=args.download_retries,
         offline=getattr(args, "offline", False),
     )
+    resolved_model_path = None
+    mllm_route = None
     if model_arg:
-        ensure_model_downloaded(
+        resolved = ensure_model_downloaded(
             model_arg,
             config=download_config,
+            # This guess only selects which files to fetch; the actual
+            # MLLM/LLM routing decision is made below from the resolved
+            # snapshot's config.json.
             is_mllm=is_mllm_model(model_arg),
+        )
+        resolved_model_path = str(resolved) if resolved is not None else None
+        try:
+            mllm_route = resolve_mllm_route(
+                model_arg,
+                resolved_model_path,
+                force_mllm=getattr(args, "mllm", False),
+            )
+        except MllmRouteUndetermined as e:
+            print(f"Error: {e}")
+            sys.exit(1)
+        logger.info(
+            f"Model route: {'MLLM' if mllm_route.is_mllm else 'LLM'} "
+            f"(source={mllm_route.source})"
         )
         if args.lazy_load_model:
             print(f"Registering model for lazy load: {model_arg}")
@@ -419,15 +442,22 @@ def serve_command(args):
             memory_budget_gb=memory_budget_gb,
         )
     else:
-        # Load model with unified server
+        # Load model with unified server. The repo id stays the model's
+        # identity (served name, thinking/Qwen3/Nemotron name defaults); the
+        # already-resolved snapshot is passed separately as the load path so
+        # loaders don't re-resolve it. force_mllm carries the routing
+        # decision made above so it can't disagree with a second check.
         load_model(
             model_arg,
+            model_path=resolved_model_path,
             use_batching=args.continuous_batching,
             scheduler_config=scheduler_config,
             stream_interval=args.stream_interval if args.continuous_batching else 1,
             max_tokens=args.max_tokens,
             max_request_tokens=max_request_tokens,
-            force_mllm=getattr(args, "mllm", False),
+            force_mllm=(
+                mllm_route.is_mllm if mllm_route else getattr(args, "mllm", False)
+            ),
             gpu_memory_utilization=args.gpu_memory_utilization,
             served_model_name=args.served_model_name,
             trust_remote_code=trust_remote_code,

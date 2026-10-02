@@ -173,12 +173,15 @@ class SimpleEngine(BaseEngine):
         prefix_trie_cache_size: int = 32,
         prefix_trie_cache_memory_mb: int | None = None,
         default_mllm_draft: bool = False,
+        model_path: str | None = None,
     ):
         """
         Initialize the simple engine.
 
         Args:
-            model_name: HuggingFace model name or local path
+            model_name: HuggingFace model name or local path. This is the
+                model's identity: name-based defaults (thinking, Qwen3 EOS)
+                key on it.
             trust_remote_code: Whether to trust remote code
             enable_cache: Enable VLM cache for multimodal models
             force_mllm: Force loading as MLLM even if not auto-detected
@@ -200,12 +203,16 @@ class SimpleEngine(BaseEngine):
             prefix_trie_cache_memory_mb: Optional prompt-cache trie memory cap in MB
             default_mllm_draft: Enable the configured assistant drafter unless a
                 request explicitly sets ``mllm_draft`` to false.
+            model_path: Already-resolved local snapshot to load ``model_name``
+                from. Used only for loading and config.json inspection, never
+                for name heuristics. Defaults to ``model_name``.
         """
         self._model_name = model_name
+        self._model_path = model_path or model_name
         self._created_at = time.time()
         self._trust_remote_code = trust_remote_code
         self._enable_cache = enable_cache
-        self._is_mllm = force_mllm or is_mllm_model(model_name)
+        self._is_mllm = force_mllm or is_mllm_model(self._model_path)
         self._mtp = mtp
         self._mtp_num_draft_tokens = mtp_num_draft_tokens
         self._prefill_step_size = prefill_step_size
@@ -776,7 +783,7 @@ class SimpleEngine(BaseEngine):
             from ..models.mllm import MLXMultimodalLM
 
             self._model = MLXMultimodalLM(
-                self._model_name,
+                self._model_path,
                 trust_remote_code=self._trust_remote_code,
                 enable_cache=self._enable_cache,
                 max_kv_size=self._max_kv_size,
@@ -789,7 +796,8 @@ class SimpleEngine(BaseEngine):
             from ..models.llm import MLXLanguageModel
 
             self._model = MLXLanguageModel(
-                self._model_name,
+                self._model_path,
+                model_id=self._model_name,
                 trust_remote_code=self._trust_remote_code,
                 mtp=self._mtp,
                 mtp_num_draft_tokens=self._mtp_num_draft_tokens,
@@ -990,7 +998,7 @@ class SimpleEngine(BaseEngine):
 
             self._text_model = build_text_model(
                 self._model.model,
-                self._model_name,
+                self._model_path,
                 enable_mtp=self._mtp,
             )
 

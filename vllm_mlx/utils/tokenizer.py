@@ -129,28 +129,37 @@ def _install_custom_chat_template(model_name: str, tokenizer):
     return install_deepseek_v4(tokenizer, model_name=model_name)
 
 
-def load_model_with_fallback(model_name: str, tokenizer_config: dict = None):
+def load_model_with_fallback(
+    model_name: str, tokenizer_config: dict = None, *, model_id: str | None = None
+):
     """
     Load model and tokenizer with fallback for non-standard tokenizers.
 
     Args:
         model_name: HuggingFace model name or local path
         tokenizer_config: Optional tokenizer configuration
+        model_id: The model's identity when ``model_name`` is a resolved local
+            snapshot; the name-based Nemotron check keys on it. Defaults to
+            ``model_name``.
 
     Returns:
         Tuple of (model, tokenizer)
     """
-    model, tokenizer = _load_model_with_fallback(model_name, tokenizer_config)
+    model, tokenizer = _load_model_with_fallback(
+        model_name, tokenizer_config, model_id=model_id
+    )
     return model, _install_custom_chat_template(model_name, tokenizer)
 
 
-def _load_model_with_fallback(model_name: str, tokenizer_config: dict = None):
+def _load_model_with_fallback(
+    model_name: str, tokenizer_config: dict = None, *, model_id: str | None = None
+):
     from mlx_lm import load
 
     tokenizer_config = tokenizer_config or {}
 
     # Check if model needs fallback (e.g., Nemotron)
-    if _needs_tokenizer_fallback(model_name):
+    if _needs_tokenizer_fallback(model_id or model_name):
         logger.info(
             f"Model {model_name} requires tokenizer fallback, loading directly..."
         )

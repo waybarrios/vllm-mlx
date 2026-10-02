@@ -133,12 +133,15 @@ class BatchedEngine(BaseEngine):
         specprefill_keep_pct: float = 0.3,
         specprefill_backbone_pct: float = 0.0,
         specprefill_draft_model: str | None = None,
+        model_path: str | None = None,
     ):
         """
         Initialize the batched engine.
 
         Args:
-            model_name: HuggingFace model name or local path
+            model_name: HuggingFace model name or local path. This is the
+                model's identity: name-based defaults (thinking, Qwen3 EOS)
+                key on it.
             trust_remote_code: Whether to trust remote code
             scheduler_config: Optional scheduler configuration
             stream_interval: Tokens to batch before streaming (1=every token)
@@ -152,8 +155,12 @@ class BatchedEngine(BaseEngine):
             specprefill_keep_pct: Fraction of prompt chunks to retain
             specprefill_backbone_pct: Fraction reserved for uniform coverage
             specprefill_draft_model: Small text model used to score prompt tokens
+            model_path: Already-resolved local snapshot to load ``model_name``
+                from. Used only for loading and config.json inspection, never
+                for name heuristics. Defaults to ``model_name``.
         """
         self._model_name = model_name
+        self._model_path = model_path or model_name
         self._created_at = time.time()
         self._trust_remote_code = trust_remote_code
         self._scheduler_config = scheduler_config
@@ -169,7 +176,7 @@ class BatchedEngine(BaseEngine):
         self._specprefill_backbone_pct = specprefill_backbone_pct
         self._specprefill_draft_model_path = specprefill_draft_model
         self._specprefill_draft_model = None
-        self._is_mllm = force_mllm or is_mllm_model(model_name)
+        self._is_mllm = force_mllm or is_mllm_model(self._model_path)
 
         self._model = None
         self._processor = None  # For MLLM
@@ -316,7 +323,7 @@ class BatchedEngine(BaseEngine):
         if self._model is None or self._processor is None:
             max_kv_size = getattr(self._scheduler_config, "max_kv_size", 0)
             self._mllm_instance = MLXMultimodalLM(
-                self._model_name,
+                self._model_path,
                 trust_remote_code=self._trust_remote_code,
                 max_kv_size=max_kv_size,
                 draft_model=self._mllm_draft_model,
@@ -511,7 +518,7 @@ class BatchedEngine(BaseEngine):
         from mlx_lm.utils import _download
 
         model = self._model
-        model_path = Path(_download(self._model_name))
+        model_path = Path(_download(self._model_path))
         config_path = model_path / "config.json"
         if not config_path.exists():
             logger.warning("[MTP-MLLM] No config.json found, skipping MTP")
@@ -566,8 +573,9 @@ class BatchedEngine(BaseEngine):
             tokenizer_config["eos_token"] = "<|im_end|>"
 
         self._model, self._tokenizer = load_model_with_fallback(
-            self._model_name,
+            self._model_path,
             tokenizer_config=tokenizer_config,
+            model_id=self._model_name,
         )
 
         # Validate MTP support if enabled

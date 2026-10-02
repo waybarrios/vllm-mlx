@@ -3377,3 +3377,127 @@ class TestSimpleEngineStop:
         assert calls["count"] == 1
         assert engine._model is None
         assert engine._loaded is False
+
+
+class TestModelIdentityVsLoadPath:
+    """The CLI hands engines a repo id (identity) and a resolved snapshot
+    (load path). Loading and config.json reads use the snapshot; nothing
+    about the model's identity may be read off the filesystem path."""
+
+    def test_qwen2_vl_snapshot_keeps_text_on_the_mlx_vlm_model(
+        self, tmp_path, monkeypatch
+    ):
+        """#780 review: a resolved Qwen2-VL snapshot must not enable the
+        generic Qwen3.5 text extractor for text-only chat."""
+        import json
+        import sys
+        import types
+
+        snapshot = tmp_path / "snapshots" / "abc123"
+        snapshot.mkdir(parents=True)
+        (snapshot / "config.json").write_text(
+            json.dumps(
+                {
+                    "model_type": "qwen2_vl",
+                    "hidden_size": 1536,
+                    "num_attention_heads": 12,
+                    "num_key_value_heads": 2,
+                    "vision_config": {"depth": 32},
+                }
+            )
+        )
+
+        built = []
+
+        class TextModelArgs:
+            @classmethod
+            def from_dict(cls, config):
+                built.append(config)
+                return config
+
+        qwen_module = types.ModuleType("mlx_lm.models.qwen3_5")
+        qwen_module.TextModel = MagicMock()
+        qwen_module.TextModelArgs = TextModelArgs
+        monkeypatch.setitem(sys.modules, "mlx_lm.models.qwen3_5", qwen_module)
+
+        from vllm_mlx.engine.simple import SimpleEngine
+
+        engine = SimpleEngine(
+            "mlx-community/Qwen2-VL-2B-Instruct-4bit",
+            model_path=str(snapshot),
+            force_mllm=True,
+        )
+        engine._model = MagicMock()
+        engine._initialize_text_model()
+
+        assert built == []
+        assert engine._text_model is None
+        assert engine._text_tokenizer is None
+
+    def test_compatible_snapshot_is_handed_to_the_extractor(self, tmp_path):
+        """The extractor reads config.json from the snapshot, not the repo id."""
+        from vllm_mlx.engine.simple import SimpleEngine
+
+        engine = SimpleEngine(
+            "mlx-community/Qwen3.8-27B-8bit",
+            model_path=str(tmp_path),
+            force_mllm=True,
+            mtp=False,
+        )
+        engine._model = MagicMock()
+        with patch(
+            "vllm_mlx.text_model_from_vlm.build_text_model", return_value=None
+        ) as build:
+            engine._initialize_text_model()
+
+        assert build.call_args.args[1] == str(tmp_path)
+        assert engine.model_name == "mlx-community/Qwen3.8-27B-8bit"
+
+    def test_llm_loader_gets_snapshot_and_identity(self):
+        """MLXLanguageModel loads the snapshot but keys name fixes on the id."""
+        from vllm_mlx.engine.simple import SimpleEngine
+
+        snapshot = "/Users/coder/.cache/huggingface/hub/snapshots/abc123"
+        engine = SimpleEngine("mlx-community/Qwen3-8B-4bit", model_path=snapshot)
+        with patch("vllm_mlx.models.llm.MLXLanguageModel") as llm_cls:
+            engine.prepare_for_start()
+
+        assert llm_cls.call_args.args[0] == snapshot
+        assert llm_cls.call_args.kwargs["model_id"] == "mlx-community/Qwen3-8B-4bit"
+
+
+@pytest.mark.parametrize("use_batching", [False, True])
+def test_lazy_residency_spec_carries_load_path_separately(use_batching):
+    """--lazy-load-model / idle unload rebuild engines from a ModelSpec."""
+    from vllm_mlx.lifecycle import ModelSpec
+    from vllm_mlx.server import _build_engine
+
+    engine = _build_engine(
+        ModelSpec(
+            model_key="default",
+            model_name="mlx-community/Qwen3-8B-4bit",
+            model_path="/Users/coder/snapshots/abc123",
+            use_batching=use_batching,
+        )
+    )
+
+    assert engine.model_name == "mlx-community/Qwen3-8B-4bit"
+    assert engine._model_path == "/Users/coder/snapshots/abc123"
+
+
+def test_mlx_language_model_name_fixes_use_identity_not_path():
+    """A snapshot directory name says nothing about the model family."""
+    from vllm_mlx.models.llm import MLXLanguageModel
+
+    model = MLXLanguageModel(
+        "/models/snapshots/abc123", model_id="mlx-community/Qwen3-8B-4bit"
+    )
+    with patch(
+        "vllm_mlx.utils.tokenizer.load_model_with_fallback",
+        return_value=(MagicMock(), MagicMock()),
+    ) as load:
+        model.load()
+
+    assert load.call_args.args[0] == "/models/snapshots/abc123"
+    assert load.call_args.kwargs["tokenizer_config"]["eos_token"] == "<|im_end|>"
+    assert load.call_args.kwargs["model_id"] == "mlx-community/Qwen3-8B-4bit"
