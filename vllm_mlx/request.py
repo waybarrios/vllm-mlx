@@ -215,6 +215,8 @@ class RequestOutput:
     # Timing
     prompt_tokens: int = 0
     completion_tokens: int = 0
+    # Request-owned prompt positions supplied by a validated cache.
+    cached_tokens: int | None = None
     # MTP speculative decoding counters. Zero means no MTP attempt occurred.
     mtp_drafts: int = 0
     mtp_accepted: int = 0
@@ -222,10 +224,13 @@ class RequestOutput:
     specprefill_outcome: Optional["SpecPrefillOutcome"] = None
 
     @property
-    def usage(self) -> Dict[str, int]:
+    def usage(self) -> Dict[str, Any]:
         """Return usage statistics compatible with OpenAI API."""
-        return {
+        usage: Dict[str, Any] = {
             "prompt_tokens": self.prompt_tokens,
             "completion_tokens": self.completion_tokens,
             "total_tokens": self.prompt_tokens + self.completion_tokens,
         }
+        if self.cached_tokens is not None:
+            usage["prompt_tokens_details"] = {"cached_tokens": self.cached_tokens}
+        return usage
