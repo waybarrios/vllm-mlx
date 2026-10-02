@@ -797,6 +797,54 @@ class ModelManager:
             return None
         return max(self._loaded.values(), key=lambda loaded: loaded.last_used_at).engine
 
+    async def clear_caches(
+        self,
+        clear: Callable[[BaseEngine], Awaitable[Any]],
+        *,
+        model_name: str | None = None,
+    ) -> dict[str, Any]:
+        """Run ``clear`` on every loaded engine, or only on ``model_name``.
+
+        This is the mutating counterpart to ``get_metrics_engine()``, which
+        deliberately picks one representative and so must not be used to clear
+        caches. Each target is pinned via ``active_requests`` under the manager
+        lock so eviction, preemption and idle unload cannot stop it mid-clear.
+        Pinning does not touch ``last_used_at``, so a clear neither resets idle
+        timers nor reorders MRU. Models that are loading, unloading or being
+        preempted are skipped.
+
+        Returns ``{model_name: clear_result}`` sorted by name; empty if no
+        target engine is loaded.
+        """
+        async with self._condition:
+            targets = [
+                (name, loaded)
+                for name, loaded in sorted(self._loaded.items())
+                if not loaded.preempting and model_name in (None, name)
+            ]
+            for _, loaded in targets:
+                loaded.active_requests += 1
+
+        results: dict[str, Any] = {}
+        try:
+            for name, loaded in targets:
+                results[name] = await clear(loaded.engine)
+        finally:
+            unloads: list[LoadedModel] = []
+            async with self._condition:
+                for name, loaded in targets:
+                    loaded.active_requests = max(0, loaded.active_requests - 1)
+                    if (
+                        loaded.preempting
+                        and loaded.active_requests == 0
+                        and self._loaded.get(name) is loaded
+                    ):
+                        unloads.append(self._begin_unload_locked(name))
+                self._condition.notify_all()
+            if unloads:
+                await self._run_unloads(unloads)
+        return results
+
     async def preload(self) -> None:
         """Preload any entries marked preload=true."""
         for entry in self._registry.values():
