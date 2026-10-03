@@ -701,7 +701,8 @@ class SimpleEngine(BaseEngine):
         if not self._loaded or self._model is None:
             return None
         if self._is_mllm:
-            return getattr(self._model, "processor", None)
+            processor = getattr(self._model, "processor", None)
+            return getattr(processor, "tokenizer", processor)
         return self._model.tokenizer
 
     def _generation_lock_holder_summary(self) -> str:
