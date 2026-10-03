@@ -1292,12 +1292,46 @@ class TestGlm4Parser:
     # Streaming tests
 
     def test_streaming_no_tags_emits_content(self, parser):
-        """GLM-4 streaming without tags should emit content (not reasoning)."""
+        """Autonomous GLM output without tags stays in the content channel."""
         parser.reset_state()
         result = parser.extract_reasoning_streaming("", "Hello", "Hello")
         assert result is not None
         assert result.content == "Hello"
         assert result.reasoning is None
+
+    def test_streaming_implicit_mode_no_tags_emits_reasoning(self, parser):
+        """An injected opening tag puts initial output in the reasoning channel."""
+        parser.reset_state(implicit_mode=True)
+        result = parser.extract_reasoning_streaming("", "Hello", "Hello")
+        assert result is not None
+        assert result.reasoning == "Hello"
+        assert result.content is None
+
+    @pytest.mark.parametrize("chunk_size", [1, 5, 7])
+    def test_streaming_implicit_close_splits_reasoning_and_content(
+        self, parser, chunk_size
+    ):
+        """Prompt-seeded reasoning ends cleanly even when the closing tag splits."""
+        parser.reset_state(implicit_mode=True)
+        output = "thinking about it</think>the answer"
+        tokens = [output[i : i + chunk_size] for i in range(0, len(output), chunk_size)]
+        accumulated = ""
+        reasoning_parts, content_parts = [], []
+        for token in tokens:
+            prev = accumulated
+            accumulated += token
+            result = parser.extract_reasoning_streaming(prev, accumulated, token)
+            if result:
+                if result.reasoning:
+                    reasoning_parts.append(result.reasoning)
+                if result.content:
+                    content_parts.append(result.content)
+        assert "".join(reasoning_parts) == "thinking about it"
+        assert "".join(content_parts) == "the answer"
+        assert parser.extract_reasoning(output) == (
+            "".join(reasoning_parts),
+            "".join(content_parts),
+        )
 
     def test_streaming_with_thinking(self, parser):
         """Test streaming with think tags."""
@@ -1333,11 +1367,13 @@ class TestGlm4Parser:
             prev = accumulated
             accumulated += token
             result = parser.extract_reasoning_streaming(prev, accumulated, token)
-            if result and result.content:
-                content_parts.append(result.content)
+            if result:
+                assert result.reasoning is None
+                if result.content:
+                    content_parts.append(result.content)
 
         full = "".join(content_parts)
-        assert "Paris" in full
+        assert full == "Paris"
         assert "<|begin_of_box|>" not in full
         assert "<|end_of_box|>" not in full
 
