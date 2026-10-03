@@ -53,7 +53,7 @@ import threading
 import time
 import uuid
 from collections import OrderedDict, defaultdict
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from contextlib import suppress
 
 import uvicorn
@@ -1161,6 +1161,71 @@ def _log_and_raise_internal_error(log_prefix: str, exc: Exception, detail: str) 
     """Log a sanitized exception string and raise a generic 500 response."""
     logger.error("%s: %s", log_prefix, _sanitize_log_text(exc, limit=500))
     raise HTTPException(status_code=500, detail=detail)
+
+
+class GenerationError(HTTPException):
+    """The engine finished a request with ``finish_reason="error"``.
+
+    The schedulers report a request that failed inside the engine (for example
+    a Metal out-of-memory error during prefill) as a finished output with
+    ``finish_reason="error"`` and no tokens. That value is internal: it is not
+    an OpenAI finish reason, and clients read a stream ending with it as a
+    successful, empty completion. Raising this turns it into HTTP 500 for
+    non-streaming requests and an SSE error event for streaming ones, the same
+    way vLLM handles its ``GenerationError``.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(
+            status_code=500, detail="Internal server error during generation"
+        )
+
+
+def _raise_if_generation_error(output) -> None:
+    """Raise :class:`GenerationError` if the engine reported a failed request."""
+    if output is not None and getattr(output, "finish_reason", None) == "error":
+        logger.error("Request failed with an internal error during generation")
+        raise GenerationError()
+
+
+def _stream_error_payload(exc: Exception) -> dict:
+    """Status and message to expose for an exception raised mid-stream.
+
+    ``HTTPException`` details are written for clients; anything else may carry
+    internal state, so it is reported generically (the server log has it).
+    """
+    if isinstance(exc, HTTPException) and isinstance(exc.detail, str):
+        return {"code": exc.status_code, "message": exc.detail}
+    return {"code": 500, "message": "Internal server error"}
+
+
+def _openai_sse_error_frame(exc: Exception) -> str:
+    """OpenAI-style SSE error event (``data: {"error": {...}}``).
+
+    Not part of the chunk schema, but it is what vLLM and llama.cpp send and
+    what the OpenAI Python SDK raises ``APIError`` on.
+    """
+    payload = _stream_error_payload(exc)
+    error = {
+        "message": payload["message"],
+        "type": (
+            "InternalServerError" if payload["code"] >= 500 else "BadRequestError"
+        ),
+        "param": None,
+        "code": payload["code"],
+    }
+    return f"data: {json.dumps({'error': error})}\n\n"
+
+
+def _anthropic_sse_error_frame(exc: Exception) -> str:
+    """Anthropic Messages streaming ``error`` event."""
+    payload = _stream_error_payload(exc)
+    error_type = "api_error" if payload["code"] >= 500 else "invalid_request_error"
+    data = {
+        "type": "error",
+        "error": {"type": error_type, "message": payload["message"]},
+    }
+    return f"event: error\ndata: {json.dumps(data)}\n\n"
 
 
 def _raise_engine_busy(exc: EngineBusy) -> None:
@@ -2947,6 +3012,7 @@ async def _run_responses_request(
     )
     if output is None:
         return None, []
+    _raise_if_generation_error(output)
 
     cleaned_text, tool_calls = _parse_tool_calls_with_parser(output.text, chat_request)
     reasoning_text = None
@@ -5085,13 +5151,16 @@ async def list_voices(model: str = "kokoro"):
 async def _ensure_sse_terminal(
     generator: AsyncIterator[str],
     terminal_frame: str,
+    error_frame: Callable[[Exception], str] = _openai_sse_error_frame,
 ) -> AsyncIterator[str]:
     """Guarantee that *terminal_frame* is emitted exactly once at the end of
     *generator*, even if the generator raises mid-stream.
 
     If the inner generator already yields the terminal frame on its happy path,
     the wrapper detects it and avoids double-emission.  If the generator raises
-    before reaching the terminal, the wrapper emits it in the ``finally`` block.
+    before reaching the terminal, the wrapper first emits ``error_frame(exc)``
+    so the client can tell the failure from a normal end of stream (the HTTP
+    status is already 200 by then), then the terminal frame in ``finally``.
     """
     emitted = False
     try:
@@ -5101,6 +5170,8 @@ async def _ensure_sse_terminal(
             yield chunk
     except Exception as e:
         logger.error(f"Streaming error, ensuring terminal frame: {e}")
+        if not emitted:
+            yield error_frame(e)
     finally:
         if not emitted:
             yield terminal_frame
@@ -5739,6 +5810,7 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
                         timeout=_remaining_request_timeout(total_timeout, deadline),
                         timeout_detail_seconds=total_timeout,
                     )
+                _raise_if_generation_error(output)
             except HTTPException as exc:
                 tracker.finish(result=_metrics_result_from_status(exc.status_code))
                 raise
@@ -5914,6 +5986,7 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
                 timeout=_remaining_request_timeout(total_timeout, deadline),
                 timeout_detail_seconds=total_timeout,
             )
+            _raise_if_generation_error(output)
         except HTTPException as exc:
             tracker.finish(result=_metrics_result_from_status(exc.status_code))
             raise
@@ -6336,6 +6409,7 @@ async def create_anthropic_message(
                             metrics_tracker=tracker,
                         ),
                         anthropic_terminal,
+                        _anthropic_sse_error_frame,
                     ),
                     request,
                     cleanup=_make_release_cleanup(request),
@@ -6358,6 +6432,7 @@ async def create_anthropic_message(
                 timeout=_remaining_request_timeout(total_timeout, deadline),
                 timeout_detail_seconds=total_timeout,
             )
+            _raise_if_generation_error(output)
         except HTTPException as exc:
             tracker.finish(result=_metrics_result_from_status(exc.status_code))
             raise
@@ -6703,6 +6778,7 @@ async def _stream_anthropic_messages(
 
     try:
         async for output in engine.stream_chat(messages=messages, **chat_kwargs):
+            _raise_if_generation_error(output)
             if metrics_tracker is not None:
                 metrics_tracker.observe_ttft()
             delta_text = output.new_text or ""
@@ -6990,6 +7066,7 @@ async def stream_completion(
 
     try:
         async for output in engine.stream_generate(**generate_kwargs):
+            _raise_if_generation_error(output)
             if metrics_tracker is not None:
                 metrics_tracker.observe_ttft()
             prompt_tokens = (
@@ -7020,6 +7097,9 @@ async def stream_completion(
             if output.finished:
                 data["usage"] = get_usage(output).model_dump()
             yield f"data: {json.dumps(data)}\n\n"
+        # Only on success: on failure _ensure_sse_terminal emits the error
+        # event first and then [DONE] (clients stop reading at [DONE]).
+        yield "data: [DONE]\n\n"
     except HTTPException as exc:
         result = _metrics_result_from_status(exc.status_code)
         raise
@@ -7030,7 +7110,6 @@ async def stream_completion(
         result = "error"
         raise
     finally:
-        yield "data: [DONE]\n\n"
         if metrics_tracker is not None:
             metrics_tracker.finish(
                 result=result,
@@ -7133,6 +7212,7 @@ async def stream_chat_completion(
     try:
         # Stream content
         async for output in engine.stream_chat(messages=messages, **kwargs):
+            _raise_if_generation_error(output)
             if metrics_tracker is not None:
                 metrics_tracker.observe_ttft()
             delta_text = output.new_text or ""
