@@ -2065,6 +2065,63 @@ class TestQwenFunctionFormat:
         assert result.tools_called
         assert result.tool_calls[0]["name"] == "get_weather"
 
+    @pytest.mark.parametrize(
+        ("raw_value", "expected"),
+        [
+            ("DIRECT_OK\n", "DIRECT_OK\n"),
+            ("  padded  ", "  padded  "),
+            ("a\nb", "a\nb"),
+            ("\nDIRECT_OK\n\n", "DIRECT_OK\n"),
+            ("\n  padded  \n", "  padded  "),
+        ],
+    )
+    def test_parameter_preserves_significant_whitespace(
+        self, parser, raw_value, expected
+    ):
+        """Function-style argument bytes survive except paired framing newlines (#808)."""
+        output = (
+            f"<function=write><parameter=content>{raw_value}</parameter></function>"
+        )
+
+        result = parser.extract_tool_calls(output)
+
+        assert result.tools_called
+        assert json.loads(result.tool_calls[0]["arguments"]) == {"content": expected}
+
+    @pytest.mark.parametrize(
+        ("raw_value", "expected"),
+        [("\n42\n", 42), ("\ntrue\n", True), ("\nnull\n", None)],
+    )
+    def test_parameter_keeps_json_literals(self, parser, raw_value, expected):
+        """Removing framing newlines retains scalar JSON argument types."""
+        output = f"<function=write><parameter=value>{raw_value}</parameter></function>"
+
+        result = parser.extract_tool_calls(output)
+
+        assert result.tools_called
+        assert json.loads(result.tool_calls[0]["arguments"]) == {"value": expected}
+
+    def test_streaming_parameter_preserves_trailing_newline(self, parser):
+        """Chunking a function call must not discard the final value newline."""
+        chunks = [
+            "<function=write>",
+            "<parameter=content>DIRECT_OK",
+            "\n</parameter>",
+            "</function>",
+        ]
+        text = ""
+        calls = []
+        for chunk in chunks:
+            previous = text
+            text += chunk
+            event = parser.extract_tool_calls_streaming(previous, text, chunk)
+            calls.extend((event or {}).get("tool_calls", []))
+
+        assert len(calls) == 1
+        assert json.loads(calls[0]["function"]["arguments"]) == {
+            "content": "DIRECT_OK\n"
+        }
+
 
 class TestQwenMixedFormatAndTruncation:
     """Regression tests for multi-format extraction and truncated output.

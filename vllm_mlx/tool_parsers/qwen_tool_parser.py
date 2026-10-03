@@ -70,7 +70,7 @@ class QwenToolParser(ToolParser):
     FUNCTION_PATTERN = re.compile(r"<function=([^>]+)>(.*?)</function>", re.DOTALL)
 
     # Pattern for parameter extraction: <parameter=key>value</parameter>
-    PARAM_PATTERN = re.compile(r"<parameter=([^>]+)>\s*(.*?)\s*</parameter>", re.DOTALL)
+    PARAM_PATTERN = re.compile(r"<parameter=([^>]+)>(.*?)</parameter>", re.DOTALL)
 
     # Pattern for empty <tool_call> wrappers left after function extraction
     EMPTY_TOOL_CALL = re.compile(r"<tool_call>\s*</tool_call>", re.DOTALL)
@@ -160,7 +160,11 @@ class QwenToolParser(ToolParser):
             params = self.PARAM_PATTERN.findall(params_block)
             arguments = {}
             for p_name, p_value in params:
-                arguments[p_name.strip()] = _parse_param_value(p_value.strip())
+                # Multiline function calls frame values with one newline on
+                # each side. Preserve all other whitespace as argument data.
+                if p_value.startswith("\n") and p_value.endswith("\n"):
+                    p_value = p_value[1:-1]
+                arguments[p_name.strip()] = _parse_param_value(p_value)
             tool_calls.append(
                 {
                     "id": generate_tool_id(),
