@@ -307,6 +307,202 @@ class TestMLLMBatchResponse:
         assert "req-err" not in scheduler._detokenizer_pool
         assert len(outputs) == 1
         assert outputs[0].new_text == ""
+        assert outputs[0].prompt_tokens == 0
+
+    def test_process_batch_responses_propagates_authoritative_prompt_tokens(self):
+        """Authoritative prompt_tokens from MLLMBatchResponse must propagate to request and output."""
+        from unittest.mock import MagicMock
+
+        from vllm_mlx.mllm_batch_generator import MLLMBatchResponse
+        from vllm_mlx.mllm_scheduler import MLLMScheduler
+        from vllm_mlx.request import RequestStatus
+
+        scheduler = MLLMScheduler.__new__(MLLMScheduler)
+        scheduler._detokenizer_pool = {}
+        scheduler.uid_to_request_id = {0: "req-1"}
+        scheduler.total_prompt_tokens = 0
+        scheduler.total_completion_tokens = 0
+        scheduler.num_requests_processed = 0
+
+        mock_tokenizer = MagicMock()
+        mock_tokenizer.decode.return_value = "hello"
+        mock_processor = MagicMock()
+        mock_processor.tokenizer = mock_tokenizer
+        scheduler.processor = mock_processor
+
+        mock_request = MagicMock()
+        mock_request.request_id = "req-1"
+        mock_request.output_tokens = []
+        mock_request.num_output_tokens = 0
+        mock_request.num_prompt_tokens = 0  # Initial estimate was 0
+        mock_request.status = RequestStatus.RUNNING
+        mock_request.first_token_time = None
+        mock_request.mtp_drafts = 0
+        mock_request.mtp_accepted = 0
+        scheduler.running = {"req-1": mock_request}
+
+        # Step 1: Generator yields first token with authoritative prompt_tokens=42
+        resp1 = MLLMBatchResponse(
+            uid=0,
+            request_id="req-1",
+            token=100,
+            logprobs=mx.array([0.0]),
+            finish_reason=None,
+            prompt_tokens=42,
+        )
+
+        outputs, finished = scheduler._process_batch_responses([resp1])
+        assert len(outputs) == 1
+        assert outputs[0].prompt_tokens == 42
+        assert mock_request.num_prompt_tokens == 42
+        assert scheduler.total_prompt_tokens == 42
+
+        # Step 2: Next token step should not double-count total_prompt_tokens
+        resp2 = MLLMBatchResponse(
+            uid=0,
+            request_id="req-1",
+            token=101,
+            logprobs=mx.array([0.0]),
+            finish_reason="stop",
+            prompt_tokens=42,
+        )
+
+        outputs, finished = scheduler._process_batch_responses([resp2])
+        assert len(outputs) == 1
+        assert outputs[0].prompt_tokens == 42
+        assert mock_request.num_prompt_tokens == 42
+        assert scheduler.total_prompt_tokens == 42
+
+    def test_add_request_logs_diagnostic_on_tokenizer_failure(self, caplog):
+        """Tokenizer failure in add_request should log diagnostic rather than fail silently."""
+        import logging
+        from unittest.mock import MagicMock
+
+        from vllm_mlx.mllm_scheduler import MLLMScheduler
+        from vllm_mlx.request import SamplingParams
+
+        scheduler = MLLMScheduler.__new__(MLLMScheduler)
+        scheduler.requests = {}
+        scheduler.waiting = []
+
+        mock_tokenizer = MagicMock()
+        mock_tokenizer.encode.side_effect = RuntimeError("VLM tokenizer contract mismatch")
+        mock_processor = MagicMock()
+        mock_processor.tokenizer = mock_tokenizer
+        scheduler.processor = mock_processor
+
+        with caplog.at_level(logging.DEBUG):
+            req_id = scheduler.add_request(
+                prompt="Say OK",
+                sampling_params=SamplingParams(),
+            )
+
+        assert scheduler.requests[req_id].num_prompt_tokens == 0
+        assert any(
+            "Could not pre-estimate prompt tokens for request" in record.message
+            for record in caplog.records
+        )
+
+    def test_end_to_end_prompt_tokens_for_text_and_media_requests(self):
+        """Assert usage.prompt_tokens == processed input_ids.size for text and media requests."""
+        from unittest.mock import MagicMock
+
+        from vllm_mlx.mllm_batch_generator import (
+            MLLMBatch,
+            MLLMBatchGenerator,
+            MLLMBatchRequest,
+            MLLMBatchStats,
+        )
+        from vllm_mlx.mllm_scheduler import MLLMScheduler
+        from vllm_mlx.request import RequestStatus
+
+        # Setup generator
+        generator = MLLMBatchGenerator.__new__(MLLMBatchGenerator)
+        generator.max_kv_size = 0
+        generator._stats = MLLMBatchStats()
+        generator.stop_tokens = set()
+        generator.unprocessed_requests = []
+        generator._pending_error_responses = []
+        generator._prefill_progress = {}
+        generator.prefix_cache = None
+        generator._maybe_store_prefix_cache = lambda batch, end_idx: None
+        generator._step = lambda *args: (mx.array([10, 20]), [mx.array([0.5]), mx.array([0.5])])
+
+        # Request 1: Text-only request (e.g. 20 tokens)
+        req_text = MLLMBatchRequest(uid=1, request_id="req-text", prompt="Say OK")
+        req_text.input_ids = mx.zeros((1, 20), dtype=mx.uint32)
+
+        # Request 2: Media-expanded request (e.g. 615 tokens with vision tokens)
+        req_media = MLLMBatchRequest(
+            uid=2, request_id="req-media", prompt="Describe image", images=["fake.jpg"]
+        )
+        req_media.input_ids = mx.zeros((1, 615), dtype=mx.uint32)
+
+        generator.active_batch = MLLMBatch(
+            uids=[1, 2],
+            request_ids=["req-text", "req-media"],
+            y=mx.array([1, 2]),
+            logprobs=[mx.array([0.1]), mx.array([0.2])],
+            max_tokens=[10, 10],
+            num_tokens=[1, 1],
+            cache=[],
+            requests=[req_text, req_media],
+            logits_processors=None,
+            samplers=None,
+        )
+
+        responses = MLLMBatchGenerator._next(generator)
+        assert len(responses) == 2
+        assert responses[0].prompt_tokens == 20
+        assert responses[1].prompt_tokens == 615
+
+        # Now verify scheduler propagates to RequestOutput and total_prompt_tokens
+        scheduler = MLLMScheduler.__new__(MLLMScheduler)
+        scheduler._detokenizer_pool = {}
+        scheduler.uid_to_request_id = {1: "req-text", 2: "req-media"}
+        scheduler.total_prompt_tokens = 0
+        scheduler.total_completion_tokens = 0
+        scheduler.num_requests_processed = 0
+
+        mock_tokenizer = MagicMock()
+        mock_tokenizer.decode.return_value = "token"
+        mock_processor = MagicMock()
+        mock_processor.tokenizer = mock_tokenizer
+        scheduler.processor = mock_processor
+
+        mock_req_text = MagicMock()
+        mock_req_text.request_id = "req-text"
+        mock_req_text.output_tokens = []
+        mock_req_text.num_output_tokens = 0
+        mock_req_text.num_prompt_tokens = 0  # Initial 0 from failed/skipped estimate
+        mock_req_text.status = RequestStatus.RUNNING
+        mock_req_text.first_token_time = None
+        mock_req_text.mtp_drafts = 0
+        mock_req_text.mtp_accepted = 0
+
+        mock_req_media = MagicMock()
+        mock_req_media.request_id = "req-media"
+        mock_req_media.output_tokens = []
+        mock_req_media.num_output_tokens = 0
+        mock_req_media.num_prompt_tokens = 0
+        mock_req_media.status = RequestStatus.RUNNING
+        mock_req_media.first_token_time = None
+        mock_req_media.mtp_drafts = 0
+        mock_req_media.mtp_accepted = 0
+
+        scheduler.running = {
+            "req-text": mock_req_text,
+            "req-media": mock_req_media,
+        }
+
+        outputs, finished = scheduler._process_batch_responses(responses)
+
+        assert len(outputs) == 2
+        assert outputs[0].prompt_tokens == req_text.input_ids.size == 20
+        assert outputs[1].prompt_tokens == req_media.input_ids.size == 615
+        assert mock_req_text.num_prompt_tokens == 20
+        assert mock_req_media.num_prompt_tokens == 615
+        assert scheduler.total_prompt_tokens == 20 + 615 == 635
 
 
 class TestMLLMBatch:
