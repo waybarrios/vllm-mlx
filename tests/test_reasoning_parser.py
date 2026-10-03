@@ -10,6 +10,8 @@ Tests cover:
 - Edge cases (no tags, partial tags, etc.)
 """
 
+import re
+
 import pytest
 
 from vllm_mlx.reasoning import (
@@ -1431,6 +1433,68 @@ class TestReasoningStrippedFromToolCallContent:
         assert reasoning == "Thinking..."
         assert content == "Some residual text"
 
+    @staticmethod
+    def _muse_glimmer_responses_path(output):
+        """Tool parser first, then reasoning parser (server.py /v1/responses)."""
+        from vllm_mlx.tool_parsers import MuseGlimmerToolParser
+
+        parser = get_parser("muse_glimmer")()
+        result = MuseGlimmerToolParser().extract_tool_calls(output)
+        reasoning, _ = parser.extract_reasoning(output)
+        _, content = parser.extract_reasoning(result.content or "")
+        return reasoning, content, [c["name"] for c in result.tool_calls]
+
+    @staticmethod
+    def _muse_glimmer_call(name):
+        return (
+            f"assistant to={name}<atem:function_calls>\n"
+            f'<atem:invoke name="{name}">\n'
+            '<atem:parameter name="city">Paris</atem:parameter>\n'
+            "</atem:invoke>\n</atem:function_calls>"
+        )
+
+    @pytest.mark.parametrize(
+        "name", ["get_weather", "weather.get", "my-tool", "user_lookup", "self_check"]
+    )
+    def test_muse_glimmer_channel_header_stripped_after_tool_parse(self, name):
+        """
+        The tool channel header must not leak after the tool parser runs first.
+
+        /v1/responses strips <atem:function_calls>...</atem:function_calls> with
+        the tool parser, then runs the reasoning parser on the leftover text. A
+        header left behind (e.g. "assistant to=get_weather", or "_lookup" from
+        a misread "to=user_lookup") would reach the client as a message.
+        """
+        output = "to=selfCheck the weather.<|eom|>" + self._muse_glimmer_call(name)
+        reasoning, content, calls = self._muse_glimmer_responses_path(output)
+        assert reasoning == "Check the weather."
+        assert content is None
+        assert calls == [name]
+
+    def test_muse_glimmer_multiple_tool_channels_leave_nothing_after_tool_parse(self):
+        """
+        The chat template joins several tool_calls from one message with
+        <|eom|>, e.g. when replaying a history entry; live generation is
+        constrained to one call per turn, but the parser must handle both.
+        """
+        output = (
+            "to=selfTwo cities.<|eom|>"
+            + self._muse_glimmer_call("get_weather")
+            + "<|eom|>"
+            + self._muse_glimmer_call("get_weather")
+        )
+        reasoning, content, calls = self._muse_glimmer_responses_path(output)
+        assert reasoning == "Two cities."
+        assert content is None
+        assert calls == ["get_weather", "get_weather"]
+
+    def test_muse_glimmer_plain_content_unaffected(self):
+        """Plain content with no channel header at all passes through untouched."""
+        parser = get_parser("muse_glimmer")()
+        reasoning, content = parser.extract_reasoning("Hello there")
+        assert reasoning is None
+        assert content == "Hello there"
+
 
 class TestGemma4DegenerateCycling:
     """
@@ -1695,3 +1759,144 @@ class TestForcedThinkingStreaming:
 
         assert reasoning == ""
         assert content == "84 * 3 = 252\n252 / 2 = 126**126**"
+
+
+class TestMuseGlimmerParser:
+    """Tests for the Muse Glimmer (ATEM channel) reasoning parser.
+
+    Streamed text keeps ``<|start|>``/``<|message|>``; complete MLLM output has
+    them stripped by ``clean_output_text``. Both must split identically.
+    """
+
+    RAW = " to=self<|message|>Wants a greeting.<|eom|><|start|>assistant to=user<|message|>Hello"
+    # Real engine output (clean_output_text applied), mlx-community/Muse-Glimmer-30B-OptiQ-4bit
+    CLEANED = (
+        " to=selfsay hello in one word\n\nOutput: Hello\n\nLet's do that."
+        "<|eom|>assistant to=userHello"
+    )
+    TOOL = (
+        " to=self<|message|>Check the weather.<|eom|><|start|>assistant to=weather.get"
+        '<|message|><atem:function_calls>\n<atem:invoke name="weather.get">\n'
+        '<atem:parameter name="city">Paris</atem:parameter>\n</atem:invoke>\n'
+        "</atem:function_calls>"
+    )
+
+    @pytest.fixture
+    def parser(self):
+        return get_parser("muse_glimmer")()
+
+    @staticmethod
+    def _stream(parser, text, chunk):
+        """Stream ``text`` in chunks of ``chunk`` tokens; special tokens stay whole."""
+        tokens = re.findall(r"<\|[a-z]+\|>|.", text, re.DOTALL)
+        parser.reset_state()
+        accumulated, reasoning, content = "", [], []
+        for i in range(0, len(tokens), chunk):
+            delta = "".join(tokens[i : i + chunk])
+            previous, accumulated = accumulated, accumulated + delta
+            message = parser.extract_reasoning_streaming(previous, accumulated, delta)
+            if message is not None:
+                reasoning.append(message.reasoning or "")
+                content.append(message.content or "")
+        message = parser.finalize_stream()
+        if message is not None:
+            reasoning.append(message.reasoning or "")
+            content.append(message.content or "")
+        return "".join(reasoning).strip() or None, "".join(content).strip() or None
+
+    def test_registry_includes_muse_glimmer(self):
+        assert "muse_glimmer" in list_parsers()
+
+    # Non-streaming tests
+
+    def test_raw_channels(self, parser):
+        assert parser.extract_reasoning(self.RAW) == ("Wants a greeting.", "Hello")
+
+    def test_cleaned_channels(self, parser):
+        reasoning, content = parser.extract_reasoning(self.CLEANED)
+        assert reasoning.startswith("say hello in one word")
+        assert reasoning.endswith("Let's do that.")
+        assert content == "Hello"
+
+    def test_tool_channel_is_left_for_tool_parser(self, parser):
+        reasoning, content = parser.extract_reasoning(self.TOOL)
+        assert reasoning == "Check the weather."
+        assert content.startswith("<atem:function_calls>")
+        assert "to=" not in content
+
+    # Streaming tests
+
+    @pytest.mark.parametrize("chunk", [1, 3])
+    @pytest.mark.parametrize(
+        "text",
+        [
+            RAW,
+            CLEANED,
+            TOOL,
+            TOOL.replace("weather.get", "user_lookup"),
+            TOOL.replace("<|message|><atem:", "<|message|>\n\n<atem:"),
+            " to=selfR<|eom|>assistant to=userHello",
+            " to=selfR<|eom|>assistant to=user_name is alice",
+            " to=selfR<|eom|>assistant to=use",
+            " to=selfR<|eom|>assistant to=get_weather",
+        ],
+    )
+    def test_streaming_matches_non_streaming(self, parser, text, chunk):
+        """
+        Every split of to=self, <|eom|> and the channel header must agree,
+        including user-prefixed tools, whitespace, one-word replies and
+        truncation.
+        """
+        expected = get_parser("muse_glimmer")().extract_reasoning(text)
+        assert self._stream(parser, text, chunk) == expected
+
+    def test_user_prefixed_tool_is_not_the_user_channel(self, parser):
+        """to=user_lookup<atem:...> is a tool channel, not to=user + "_lookup"."""
+        text = self.TOOL.replace("weather.get", "user_lookup")
+        reasoning, content = parser.extract_reasoning(text)
+        assert reasoning == "Check the weather."
+        assert content.startswith("<atem:function_calls>")
+
+    def test_whitespace_before_tool_block(self, parser):
+        """Whitespace after <|message|> does not stop the header being removed."""
+        text = self.TOOL.replace("<|message|><atem:", "<|message|>\n\n<atem:")
+        _, content = parser.extract_reasoning(text)
+        assert content.startswith("<atem:function_calls>")
+
+    @pytest.mark.parametrize("tail", ["assistant to=use", "assistant to=x<atem"])
+    def test_held_header_is_flushed_at_stream_end(self, parser, tail):
+        """A partial header withheld at stream end is delivered, not dropped."""
+        _, content = self._stream(parser, " to=selfR<|eom|>" + tail, 1)
+        assert content == tail
+
+    # Bare-header tests: the model sometimes skips the ``to=self`` reasoning
+    # block entirely on 2nd+ turns and opens straight with a bare
+    # ``to=user``/``to=<tool>`` header (no ``assistant `` prefix, since it's
+    # the first channel of the turn). The literal header must not leak into
+    # reasoning or content.
+
+    BARE_USER = "to=user<|message|>Good morning"
+    BARE_TOOL = (
+        "to=some_tool<|message|><atem:function_calls>\n"
+        '<atem:invoke name="some_tool">\n'
+        '<atem:parameter name="x">1</atem:parameter>\n</atem:invoke>\n'
+        "</atem:function_calls>"
+    )
+
+    @pytest.mark.parametrize("chunk", [1, 2, 3, 4, 5, 7, 16])
+    def test_streaming_bare_user_header_split_across_deltas(self, parser, chunk):
+        """The header must resolve correctly regardless of delta boundaries,
+        including splits mid-header (e.g. ``to=us`` then ``er...``)."""
+        reasoning, content = self._stream(parser, self.BARE_USER, chunk)
+        assert not reasoning
+        assert content == "Good morning"
+
+    def test_streaming_bare_tool_header_without_self_block(self, parser):
+        """A turn opening straight into a tool call, no reasoning block at all."""
+        reasoning, content = self._stream(parser, self.BARE_TOOL, 1)
+        assert not reasoning
+        assert content.startswith("<atem:function_calls>")
+        assert "to=" not in content
+
+    def test_non_streaming_bare_user_header(self, parser):
+        assert parser.extract_reasoning("to=userGood morning") == (None, "Good morning")
