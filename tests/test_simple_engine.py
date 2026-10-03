@@ -74,25 +74,31 @@ class TestSimpleEngineConcurrency:
         model = MagicMock()
         model.tokenizer = MagicMock()
         model.tokenizer.encode = MagicMock(return_value=[1, 2, 3])
+        model.tokenizer.apply_chat_template = MagicMock(return_value="prompt")
 
         # Track concurrent executions
         model._concurrent_count = 0
         model._max_concurrent = 0
 
-        def chat_side_effect(**kwargs):
+        # chat() aggregates over stream_generate for text models, so the
+        # concurrency tracking lives there.
+        def stream_generate_side_effect(**kwargs):
             model._concurrent_count += 1
             model._max_concurrent = max(model._max_concurrent, model._concurrent_count)
             import time
 
             time.sleep(0.05)
             model._concurrent_count -= 1
-            result = MagicMock()
-            result.text = "test response"
-            result.tokens = [1, 2, 3]
-            result.finish_reason = "stop"
-            return result
+            chunk = MagicMock()
+            chunk.text = "test response"
+            chunk.tokens = [1, 2, 3]
+            chunk.finished = True
+            chunk.finish_reason = "stop"
+            chunk.prompt_tokens = 3
+            chunk.completion_tokens = 3
+            yield chunk
 
-        model.chat = MagicMock(side_effect=chat_side_effect)
+        model.stream_generate = MagicMock(side_effect=stream_generate_side_effect)
         return model
 
     @pytest.mark.anyio
@@ -2779,7 +2785,7 @@ class TestSimpleEngineConcurrency:
         call_count = 0
         call_lock = Lock()
 
-        def chat_side_effect(**kwargs):
+        def stream_generate_side_effect(**kwargs):
             nonlocal call_count
             with call_lock:
                 call_count += 1
@@ -2794,16 +2800,21 @@ class TestSimpleEngineConcurrency:
 
             try:
                 release_workers.wait(timeout=1.0)
-                result = MagicMock()
-                result.text = f"response-{current_call}"
-                result.tokens = [1, 2, 3]
-                result.finish_reason = "stop"
-                return result
+                chunk = MagicMock()
+                chunk.text = f"response-{current_call}"
+                chunk.tokens = [1, 2, 3]
+                chunk.finished = True
+                chunk.finish_reason = "stop"
+                chunk.prompt_tokens = 3
+                chunk.completion_tokens = 3
+                yield chunk
             finally:
                 with call_lock:
                     mock_llm_model._concurrent_count -= 1
 
-        mock_llm_model.chat = MagicMock(side_effect=chat_side_effect)
+        mock_llm_model.stream_generate = MagicMock(
+            side_effect=stream_generate_side_effect
+        )
 
         with patch("vllm_mlx.engine.simple.is_mllm_model", return_value=False):
             engine = SimpleEngine("test-model")
@@ -2834,6 +2845,63 @@ class TestSimpleEngineConcurrency:
 
             assert result2.text == "response-2"
             assert mock_llm_model._max_concurrent == 1
+
+    @pytest.mark.anyio
+    async def test_cancelled_chat_stops_decoding(self, mock_llm_model):
+        """A cancelled non-streaming chat (client disconnect) stops decoding."""
+        import time
+
+        from vllm_mlx.engine.simple import SimpleEngine
+
+        total = 100
+        produced = 0
+        first_token = threading.Event()
+
+        def chunk(i):
+            out = MagicMock()
+            out.text = "x"
+            out.tokens = [1]
+            out.finished = False
+            out.finish_reason = None
+            out.prompt_tokens = 3
+            out.completion_tokens = i + 1
+            return out
+
+        def stream_generate_side_effect(**kwargs):
+            nonlocal produced
+            for i in range(total):
+                produced += 1
+                first_token.set()
+                time.sleep(0.01)
+                yield chunk(i)
+
+        def blocking_chat_side_effect(**kwargs):
+            for _ in stream_generate_side_effect():
+                pass
+            return MagicMock(text="x", tokens=[1] * total, finish_reason="length")
+
+        mock_llm_model.stream_generate = MagicMock(
+            side_effect=stream_generate_side_effect
+        )
+        mock_llm_model.chat = MagicMock(side_effect=blocking_chat_side_effect)
+
+        with patch("vllm_mlx.engine.simple.is_mllm_model", return_value=False):
+            engine = SimpleEngine("test-model")
+            engine._model = mock_llm_model
+            engine._loaded = True
+
+            task = asyncio.create_task(
+                engine.chat(
+                    messages=[{"role": "user", "content": "hi"}], max_tokens=total
+                )
+            )
+            await asyncio.to_thread(first_token.wait, 1.0)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            await asyncio.sleep(0.3)
+
+            assert produced < total
 
     @pytest.mark.anyio
     async def test_specprefill_path_does_not_prelock_serialized_runner(self):
