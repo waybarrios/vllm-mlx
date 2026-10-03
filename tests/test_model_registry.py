@@ -39,6 +39,7 @@ class FakeEngine(BaseEngine):
         self._start_gate = start_gate
         self.started = 0
         self.stopped = 0
+        self.healthy = True
 
     @property
     def model_name(self) -> str:
@@ -59,6 +60,9 @@ class FakeEngine(BaseEngine):
 
     async def stop(self) -> None:
         self.stopped += 1
+
+    def is_healthy(self) -> bool:
+        return self.healthy
 
     async def generate(self, *args, **kwargs) -> GenerationOutput:
         return GenerationOutput(text="ok")
@@ -1254,3 +1258,149 @@ models:
         manager_config, _ = load_registry_config(config_path, _defaults())
 
         assert manager_config.idle_unload_seconds == 0.0
+
+
+def test_list_models_reports_dead_engine_truthfully(tmp_path):
+    async def _run():
+        registry = _registry(tmp_path, {"alpha": 4})
+        manager = ModelManager(
+            _manager_config(budget_gb=8),
+            registry,
+            _defaults(),
+            engine_factory=lambda config: FakeEngine(config),
+        )
+
+        lease = await manager.acquire("alpha")
+
+        entry = manager._loaded["alpha"]
+        assert entry.engine.is_healthy()
+        before = next(m for m in manager.list_models() if m["id"] == "alpha")
+        assert before["loaded"] is True
+        assert before["status"] == "loaded"
+
+        entry.engine.healthy = False
+        after = next(m for m in manager.list_models() if m["id"] == "alpha")
+        assert after["loaded"] is False
+        assert after["status"] == "dead"
+
+        # The dead entry is still present in _loaded until something
+        # (acquire()) reaps it -- list_models() must not mutate state.
+        assert "alpha" in manager._loaded
+
+        await lease.release()
+
+    asyncio.run(_run())
+
+
+def test_acquire_reaps_dead_engine_and_reloads(tmp_path):
+    async def _run():
+        registry = _registry(tmp_path, {"alpha": 4})
+        created: list[FakeEngine] = []
+
+        def engine_factory(config: ResolvedModelConfig) -> FakeEngine:
+            engine = FakeEngine(config)
+            created.append(engine)
+            return engine
+
+        manager = ModelManager(
+            _manager_config(budget_gb=8),
+            registry,
+            _defaults(),
+            engine_factory=engine_factory,
+        )
+
+        lease = await manager.acquire("alpha")
+        await lease.release()
+        assert len(created) == 1
+
+        # Simulate the engine dying on its own, with no active requests.
+        created[0].healthy = False
+
+        new_lease = await manager.acquire("alpha")
+
+        assert len(created) == 2
+        assert created[0].stopped == 1
+        assert new_lease.engine is created[1]
+        assert "alpha" in manager._loaded
+        assert manager._loaded["alpha"].engine is created[1]
+
+        await new_lease.release()
+
+    asyncio.run(_run())
+
+
+def test_acquire_does_not_reap_dead_engine_with_active_requests(tmp_path):
+    async def _run():
+        registry = _registry(tmp_path, {"alpha": 4})
+        created: list[FakeEngine] = []
+
+        def engine_factory(config: ResolvedModelConfig) -> FakeEngine:
+            engine = FakeEngine(config)
+            created.append(engine)
+            return engine
+
+        manager = ModelManager(
+            _manager_config(budget_gb=8),
+            registry,
+            _defaults(),
+            engine_factory=engine_factory,
+        )
+
+        alpha_lease = await manager.acquire("alpha")
+        first_engine = created[0]
+        first_engine.healthy = False
+
+        # A second acquire() for the same, still-leased model must not
+        # yank the entry out from under the first caller.
+        second_lease = await manager.acquire("alpha")
+        assert second_lease.engine is alpha_lease.engine
+        assert first_engine.stopped == 0
+        assert len(created) == 1
+        assert "alpha" in manager._loaded
+
+        await alpha_lease.release()
+        await second_lease.release()
+
+        # Now idle: the next acquire() reaps and reloads it.
+        third_lease = await manager.acquire("alpha")
+        assert first_engine.stopped == 1
+        assert len(created) == 2
+        assert third_lease.engine is created[1]
+        await third_lease.release()
+
+    asyncio.run(_run())
+
+
+def test_healthy_engine_is_untouched(tmp_path):
+    async def _run():
+        registry = _registry(tmp_path, {"alpha": 4})
+        created: list[FakeEngine] = []
+
+        def engine_factory(config: ResolvedModelConfig) -> FakeEngine:
+            engine = FakeEngine(config)
+            created.append(engine)
+            return engine
+
+        manager = ModelManager(
+            _manager_config(budget_gb=8),
+            registry,
+            _defaults(),
+            engine_factory=engine_factory,
+        )
+
+        lease = await manager.acquire("alpha")
+        await lease.release()
+
+        second_lease = await manager.acquire("alpha")
+
+        assert len(created) == 1
+        assert created[0].stopped == 0
+        assert second_lease.engine is created[0]
+
+        info = next(m for m in manager.list_models() if m["id"] == "alpha")
+        assert info["loaded"] is True
+        assert info["status"] == "loaded"
+
+        await second_lease.release()
+
+    asyncio.run(_run())
