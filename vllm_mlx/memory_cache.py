@@ -374,7 +374,19 @@ def _trim_cache_offset(cache: list[Any], trim_by: int) -> list[Any]:
     alone breaks ``size()`` / ``_temporal_order`` invariants.
 
     Supports KVCache, RotatingKVCache, and _QuantizedCacheWrapper.
+
+    Fail-closed hardening (issue #678): whole-stack fail-closed — if any
+    layer is not trimmable per ``_is_cache_layer_trimmable``, the entire
+    stack is returned unchanged (no partial trim).
     """
+    if trim_by <= 0:
+        return list(cache)
+    if any(not _is_cache_layer_trimmable(lc) for lc in cache):
+        logger.debug(
+            "Trim skipped: non-trimmable cache layer in stack: %s",
+            [type(lc).__name__ for lc in cache],
+        )
+        return list(cache)
     import mlx.core as mx
     from mlx_lm.models.cache import RotatingKVCache
 

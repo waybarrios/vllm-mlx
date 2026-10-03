@@ -208,9 +208,14 @@ class TestTrimCacheOffset:
             assert tc.keys.dtype == dtype, f"dtype={dtype}"
 
     def test_plain_kv_cache_rotating_layers_unchanged_behavior(self):
-        """RotatingKVCache was already trimming correctly before this fix.
-        The plain-KVCache branch is the only one that changed; the rotating
-        branch is exercised here to catch regressions.
+        """Saturated RotatingKVCache layers are fail-closed, not trimmed (#678).
+
+        A rotated layer (``offset >= max_size``) is not trimmable
+        (``is_trimmable()`` is ``offset < max_size``), so the whole-stack
+        fail-closed veto returns the stack unchanged. Rewinding the offset
+        or slicing the ring buffer would break ``size()`` / ``_temporal_order``
+        invariants. The previous expectation that trim reduces the offset
+        encoded the bug, not behavior to preserve.
         """
         import mlx.core as mx
         from mlx_lm.models.cache import RotatingKVCache
@@ -226,16 +231,37 @@ class TestTrimCacheOffset:
 
         tc = _trim_cache_offset([layer], 100)[0]
 
-        # Offset dropped by trim_by, clamped at >= 0.
-        assert tc.offset == 100
-        # Rotating path materialises a buffer whose shape matches new_offset
-        # (padding with zeros if needed).  It must not come back as None.
-        assert tc.keys is not None
-        assert tc.values is not None
-        # Dtype preserved through trim.
+        # Saturated layer vetoes the trim: whole stack returned unchanged.
+        assert tc is layer
+        assert tc.offset == 200
+        assert tc.keys.shape[-2] == 128
+        assert tc._idx == 128
+        assert tc.max_size == 128
+
+    def test_rotating_kv_cache_unrotated_still_trims(self):
+        """Non-saturated RotatingKVCache layers remain trimmable.
+
+        Sibling of the saturated case above: with ``offset < max_size``
+        the layer is trimmable, so trim reduces the offset and slices
+        the buffer down to the new offset.
+        """
+        import mlx.core as mx
+        from mlx_lm.models.cache import RotatingKVCache
+
+        from vllm_mlx.memory_cache import _trim_cache_offset
+
+        layer = RotatingKVCache(max_size=128, keep=0)
+        layer.keys = mx.ones((1, 4, 100, 8), dtype=mx.float32)
+        layer.values = mx.ones((1, 4, 100, 8), dtype=mx.float32)
+        layer.offset = 100
+        layer._idx = 100
+
+        tc = _trim_cache_offset([layer], 40)[0]
+
+        assert tc.offset == 60
+        assert tc.keys.shape[-2] == 60
+        assert tc.values.shape[-2] == 60
         assert tc.keys.dtype == mx.float32
-        # Type-specific attrs preserved.
-        assert hasattr(tc, "max_size")
         assert tc.max_size == 128
 
     def test_fetch_returns_sliced_cache_on_lcp_match(self):
