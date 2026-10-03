@@ -245,6 +245,115 @@ class TestBatchedEngineMetalCacheLimit:
         assert limit == 8 * 1024**3
         assert source == "device-scaled"
 
+    def test_accepts_gigabyte_suffix(self, monkeypatch):
+        from vllm_mlx.engine.batched import _resolve_metal_buffer_cache_limit
+
+        monkeypatch.setenv("MLX_BUFFER_CACHE_LIMIT", "8GB")
+
+        limit, source = _resolve_metal_buffer_cache_limit(
+            max_recommended=16 * 1024**3,
+            gpu_memory_utilization=0.5,
+        )
+
+        assert limit == 8 * 1024**3
+        assert source == "MLX_BUFFER_CACHE_LIMIT"
+
+    def test_accepts_megabyte_suffix(self, monkeypatch):
+        from vllm_mlx.engine.batched import _resolve_metal_buffer_cache_limit
+
+        monkeypatch.setenv("MLX_BUFFER_CACHE_LIMIT", "8192MB")
+
+        limit, source = _resolve_metal_buffer_cache_limit(
+            max_recommended=16 * 1024**3,
+            gpu_memory_utilization=0.5,
+        )
+
+        assert limit == 8 * 1024**3
+        assert source == "MLX_BUFFER_CACHE_LIMIT"
+
+    def test_accepts_suffix_case_insensitive_and_whitespace(self, monkeypatch):
+        from vllm_mlx.engine.batched import _resolve_metal_buffer_cache_limit
+
+        monkeypatch.setenv("MLX_BUFFER_CACHE_LIMIT", " 1.5 GB ")
+
+        limit, source = _resolve_metal_buffer_cache_limit(
+            max_recommended=16 * 1024**3,
+            gpu_memory_utilization=0.5,
+        )
+
+        assert limit == int(1.5 * 1024**3)
+        assert source == "MLX_BUFFER_CACHE_LIMIT"
+
+    @pytest.mark.parametrize(
+        "raw,expected",
+        [
+            ("256B", 256),
+            ("1024kb", 1024 * 1024),
+            ("512mb", 512 * 1024**2),
+            ("2gb", 2 * 1024**3),
+            ("1TB", 1024**4),
+        ],
+    )
+    def test_accepts_all_supported_suffixes(self, monkeypatch, raw, expected):
+        from vllm_mlx.engine.batched import _resolve_metal_buffer_cache_limit
+
+        monkeypatch.setenv("MLX_BUFFER_CACHE_LIMIT", raw)
+
+        limit, source = _resolve_metal_buffer_cache_limit(
+            max_recommended=16 * 1024**3,
+            gpu_memory_utilization=0.5,
+        )
+
+        assert limit == expected
+        assert source == "MLX_BUFFER_CACHE_LIMIT"
+
+    def test_rejects_unknown_suffix_with_fallback(self, monkeypatch):
+        from vllm_mlx.engine.batched import _resolve_metal_buffer_cache_limit
+
+        monkeypatch.setenv("MLX_BUFFER_CACHE_LIMIT", "8XB")
+
+        limit, source = _resolve_metal_buffer_cache_limit(
+            max_recommended=16 * 1024**3,
+            gpu_memory_utilization=0.5,
+        )
+
+        assert limit == 8 * 1024**3
+        assert source == "device-scaled"
+
+    @pytest.mark.parametrize("raw", ["0", "0GB", "-1GB", "", "  "])
+    def test_rejects_non_positive_and_empty_with_fallback(self, monkeypatch, raw):
+        from vllm_mlx.engine.batched import _resolve_metal_buffer_cache_limit
+
+        monkeypatch.setenv("MLX_BUFFER_CACHE_LIMIT", raw)
+
+        limit, source = _resolve_metal_buffer_cache_limit(
+            max_recommended=16 * 1024**3,
+            gpu_memory_utilization=0.5,
+        )
+
+        assert limit == 8 * 1024**3
+        assert source == "device-scaled"
+
+    def test_huge_digit_string_suffix_overflow_falls_back(self, monkeypatch):
+        from vllm_mlx.engine.batched import _resolve_metal_buffer_cache_limit
+
+        huge = "9" * 400
+        monkeypatch.setenv("MLX_BUFFER_CACHE_LIMIT", huge)
+        limit, source = _resolve_metal_buffer_cache_limit(
+            max_recommended=16 * 1024**3,
+            gpu_memory_utilization=0.5,
+        )
+        assert limit == int(huge)
+        assert source == "MLX_BUFFER_CACHE_LIMIT"
+
+        monkeypatch.setenv("MLX_BUFFER_CACHE_LIMIT", huge + "GB")
+        limit, source = _resolve_metal_buffer_cache_limit(
+            max_recommended=16 * 1024**3,
+            gpu_memory_utilization=0.5,
+        )
+        assert limit == 8 * 1024**3
+        assert source == "device-scaled"
+
     def test_batched_engine_does_not_hardcode_32gb_cache_limit(self):
         source = Path(__file__).parents[1] / "vllm_mlx" / "engine" / "batched.py"
         content = source.read_text()
