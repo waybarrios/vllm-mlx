@@ -96,3 +96,85 @@ def test_scheduler_enable_mtp_survives_modern_batch_generator(caplog):
     )
     assert scheduler.has_requests()
     assert scheduler.get_num_waiting() == 1
+
+
+def _make_simple_scheduler(**config_kwargs):
+    from types import SimpleNamespace
+
+    from vllm_mlx.scheduler import Scheduler, SchedulerConfig
+
+    model = config_kwargs.pop("_model", SimpleNamespace(mtp=None))
+    tokenizer = SimpleNamespace(
+        encode=lambda text: list(range(len(text.split()))),
+        decode=lambda ids: " ".join(str(i) for i in ids),
+        eos_token_id=0,
+        eos_token_ids={0},
+    )
+    scheduler = Scheduler(
+        model=model,
+        tokenizer=tokenizer,
+        config=SchedulerConfig(**config_kwargs),
+    )
+    return scheduler
+
+
+def _has_prompt_cache_save_warning(records):
+    return any(
+        "prompt-cache-save" in rec.message
+        and "modern mlx-lm" in rec.message
+        and "unavailable" in rec.message
+        for rec in records
+    )
+
+
+def test_prompt_cache_save_warns_and_skips_on_modern_generator(caplog):
+    """Fail-closed: prompt-cache-save warns + skips when _process_prompts missing (#736)."""
+    from vllm_mlx.scheduler import SamplingParams
+
+    scheduler = _make_simple_scheduler(enable_prefix_cache=True)
+    assert scheduler.memory_aware_cache is not None
+
+    with caplog.at_level(logging.WARNING, logger="vllm_mlx.scheduler"):
+        bg = scheduler._create_batch_generator(SamplingParams())
+
+    assert bg is not None
+    assert not hasattr(bg, "_process_prompts")
+    assert _has_prompt_cache_save_warning(caplog.records)
+
+
+def test_chunked_prefill_native_step_size_with_save_warning(caplog):
+    """Chunked prefill stays on native prefill_step_size==N + warns on dropped saves (#736)."""
+    from vllm_mlx.scheduler import SamplingParams
+
+    budget = 512
+    scheduler = _make_simple_scheduler(
+        enable_prefix_cache=True, chunked_prefill_tokens=budget
+    )
+    assert scheduler.memory_aware_cache is not None
+
+    with caplog.at_level(logging.WARNING, logger="vllm_mlx.scheduler"):
+        bg = scheduler._create_batch_generator(SamplingParams())
+
+    assert bg.prefill_step_size == budget
+    assert _has_prompt_cache_save_warning(caplog.records)
+
+
+def test_mtp_enable_warns_no_crash_with_prompt_cache(caplog):
+    """MTP enable warns + no AttributeError incl. get_mtp_stats with cache active (#736)."""
+    from types import SimpleNamespace
+
+    from vllm_mlx.scheduler import SamplingParams
+
+    scheduler = _make_simple_scheduler(
+        enable_prefix_cache=True,
+        enable_mtp=True,
+        _model=SimpleNamespace(mtp=object()),
+    )
+
+    with caplog.at_level(logging.WARNING, logger="vllm_mlx.scheduler"):
+        bg = scheduler._create_batch_generator(SamplingParams())
+
+    assert bg is not None
+    assert not hasattr(bg, "get_mtp_stats")
+    assert any("[MTP] disabled" in rec.message for rec in caplog.records)
+    assert _has_prompt_cache_save_warning(caplog.records)
