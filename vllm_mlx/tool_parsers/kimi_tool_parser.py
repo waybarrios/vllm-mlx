@@ -142,19 +142,6 @@ class KimiToolParser(ToolParser):
         if self.TOOL_CALL_END in delta_text:
             result = self.extract_tool_calls(current_text)
             if result.tools_called:
-                return {
-                    "tool_calls": [
-                        {
-                            "index": i,
-                            "id": tc["id"],
-                            "type": "function",
-                            "function": {
-                                "name": tc["name"],
-                                "arguments": tc["arguments"],
-                            },
-                        }
-                        for i, tc in enumerate(result.tool_calls)
-                    ]
-                }
+                return self._new_streaming_tool_calls(result.tool_calls)
 
         return None

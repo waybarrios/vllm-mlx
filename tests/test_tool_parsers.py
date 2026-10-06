@@ -2,6 +2,7 @@
 """Comprehensive tests for tool call parsers."""
 
 import json
+import re
 
 import pytest
 
@@ -2423,3 +2424,88 @@ class TestGLM47ToolParser:
                 assert args == {}
 
         assert tool_calls_found, "Zero-argument tool call should have been detected"
+
+
+class TestStreamingTwoToolCalls:
+    """Two tool calls in one streamed response come out as two calls (#833)."""
+
+    CALLS = [("get_weather", "city", "Paris"), ("Bash", "command", "ls")]
+
+    # (prefix, per-call template, suffix); the template gets name, key, value, index.
+    FORMATS = {
+        "auto": (
+            AutoToolParser,
+            "",
+            '<tool_call>{{"name": "{0}", "arguments": {{"{1}": "{2}"}}}}</tool_call>',
+            "",
+        ),
+        "hermes": (
+            HermesToolParser,
+            "",
+            '<tool_call>{{"name": "{0}", "arguments": {{"{1}": "{2}"}}}}</tool_call>',
+            "",
+        ),
+        "glm47": (
+            Glm47ToolParser,
+            "",
+            "<tool_call>{0}\n<arg_key>{1}</arg_key><arg_value>{2}</arg_value>\n</tool_call>",
+            "",
+        ),
+        "nemotron": (
+            NemotronToolParser,
+            "",
+            "<tool_call><function={0}><parameter={1}>{2}</parameter></function></tool_call>",
+            "",
+        ),
+        "functionary": (
+            FunctionaryToolParser,
+            "",
+            '<function={0}>{{"{1}": "{2}"}}</function>',
+            "",
+        ),
+        "kimi": (
+            KimiToolParser,
+            "<|tool_calls_section_begin|>",
+            "<|tool_call_begin|>functions.{0}:{3}<|tool_call_argument_begin|>"
+            '{{"{1}": "{2}"}}<|tool_call_end|>',
+            "<|tool_calls_section_end|>",
+        ),
+        "deepseek": (
+            DeepSeekToolParser,
+            "<｜tool▁calls▁begin｜>",
+            "<｜tool▁call▁begin｜>function<｜tool▁sep｜>{0}\n```json\n"
+            '{{"{1}": "{2}"}}\n```<｜tool▁call▁end｜>',
+            "<｜tool▁calls▁end｜>",
+        ),
+    }
+
+    @pytest.mark.parametrize("name", list(FORMATS))
+    def test_each_call_streamed_once(self, name):
+        parser_cls, prefix, template, suffix = self.FORMATS[name]
+        parser = parser_cls()
+        text = (
+            prefix
+            + "".join(template.format(*call, i) for i, call in enumerate(self.CALLS))
+            + suffix
+        )
+
+        # Tags are special tokens, so each arrives as one whole delta.
+        streamed = []
+        accumulated = ""
+        for delta in filter(None, re.split(r"(<[^>]*>)", text)):
+            prev = accumulated
+            accumulated += delta
+            r = parser.extract_tool_calls_streaming(
+                previous_text=prev,
+                current_text=accumulated,
+                delta_text=delta,
+            )
+            if r is not None:
+                streamed.extend(r.get("tool_calls") or [])
+
+        assert [tc["index"] for tc in streamed] == [0, 1]
+        assert [tc["function"]["name"] for tc in streamed] == ["get_weather", "Bash"]
+        assert [json.loads(tc["function"]["arguments"]) for tc in streamed] == [
+            {"city": "Paris"},
+            {"command": "ls"},
+        ]
