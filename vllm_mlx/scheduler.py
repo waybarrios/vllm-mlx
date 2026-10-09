@@ -23,6 +23,10 @@ from mlx_lm.generate import BatchGenerator
 from mlx_lm.sample_utils import make_logits_processors, make_sampler
 from mlx_lm.tokenizer_utils import NaiveStreamingDetokenizer
 
+from .batch_compat import (
+    _normalize_logits_processors,
+    _sanitize_batch_generator_logits_processors,
+)
 from .memory_cache import MemoryAwarePrefixCache, MemoryCacheConfig
 from .paged_cache import PagedCacheManager
 from .ssd_cache import SSDCacheConfig, SSDCacheTier
@@ -41,28 +45,6 @@ CACHE_CORRUPTION_PATTERNS = [
     "cache",
     "BatchKVCache",
 ]
-
-
-def _normalize_logits_processors(logits_processors):
-    """Normalize empty per-sequence processor slots to lists."""
-    if logits_processors is None:
-        return None
-    return [processors or [] for processors in logits_processors]
-
-
-def _sanitize_batch_generator_logits_processors(batch_generator) -> None:
-    """Sanitize stale BatchGenerator processor state before decode."""
-    active_batch = getattr(batch_generator, "active_batch", None)
-    if active_batch is not None and hasattr(active_batch, "logits_processors"):
-        active_batch.logits_processors = _normalize_logits_processors(
-            active_batch.logits_processors
-        )
-
-    partial = getattr(batch_generator, "_partial", None)
-    if isinstance(partial, dict) and "logits_processors" in partial:
-        partial["logits_processors"] = _normalize_logits_processors(
-            partial["logits_processors"]
-        )
 
 
 class SchedulingPolicy(Enum):
@@ -2444,8 +2426,9 @@ class Scheduler:
             insert_kwargs = {
                 "max_tokens": [request.sampling_params.max_tokens],
                 "caches": [cache_to_use] if cache_to_use else None,
-                # Always pass logits_processors (even empty list) so that
-                # mlx_lm BatchGenerator never stores None per-sequence.
+                # Keep queued per-sequence state explicit. mlx-lm 0.31.3 can
+                # still turn this empty list into None while extending a
+                # prompt batch; batch_compat normalizes that transition.
                 "logits_processors": [lp] if lp else [[]],
             }
             try:
