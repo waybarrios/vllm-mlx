@@ -15,6 +15,7 @@ import asyncio
 import inspect
 import logging
 import os
+import re
 import threading
 import time
 from collections.abc import AsyncIterator
@@ -36,6 +37,53 @@ from .chat_template_safety import normalize_messages_for_chat_template
 logger = logging.getLogger(__name__)
 
 
+_MLX_CACHE_SUFFIX_MULTIPLIERS = {
+    "b": 1,
+    "kb": 1024,
+    "mb": 1024**2,
+    "gb": 1024**3,
+    "tb": 1024**4,
+}
+
+
+class _NonPositiveLimitError(ValueError):
+    """Non-positive MLX_BUFFER_CACHE_LIMIT value."""
+
+    pass
+
+
+def _parse_mlx_buffer_cache_limit(raw: str) -> int:
+    """Parse MLX_BUFFER_CACHE_LIMIT; bare values integer-only, suffixed may be float."""
+    if not isinstance(raw, str):
+        raise ValueError(f"invalid MLX_BUFFER_CACHE_LIMIT={raw!r}")
+    text = raw.strip()
+    if not text:
+        raise ValueError(f"invalid MLX_BUFFER_CACHE_LIMIT={raw!r}")
+    match = re.fullmatch(r"([+-]?(?:\d+(?:\.\d*)?|\.\d+))\s*([A-Za-z]*)", text)
+    if match is None:
+        raise ValueError(f"invalid MLX_BUFFER_CACHE_LIMIT={raw!r}")
+    number_text, suffix = match.groups()
+    suffix = suffix.lower()
+    if not suffix:
+        try:
+            limit = int(number_text)
+        except ValueError:
+            raise ValueError(f"invalid MLX_BUFFER_CACHE_LIMIT={raw!r}") from None
+        if limit <= 0:
+            raise _NonPositiveLimitError(f"non-positive MLX_BUFFER_CACHE_LIMIT={raw!r}")
+        return limit
+    if suffix not in _MLX_CACHE_SUFFIX_MULTIPLIERS:
+        raise ValueError(f"invalid MLX_BUFFER_CACHE_LIMIT={raw!r}")
+    number = float(number_text)
+    try:
+        limit = int(number * _MLX_CACHE_SUFFIX_MULTIPLIERS[suffix])
+    except OverflowError:
+        raise ValueError(f"invalid MLX_BUFFER_CACHE_LIMIT={raw!r}") from None
+    if limit <= 0:
+        raise _NonPositiveLimitError(f"non-positive MLX_BUFFER_CACHE_LIMIT={raw!r}")
+    return limit
+
+
 def _resolve_metal_buffer_cache_limit(
     max_recommended: int,
     gpu_memory_utilization: float,
@@ -44,20 +92,21 @@ def _resolve_metal_buffer_cache_limit(
     env_limit = os.environ.get("MLX_BUFFER_CACHE_LIMIT")
     if env_limit:
         try:
-            limit = int(env_limit)
-        except ValueError:
-            logger.warning(
-                "Ignoring invalid MLX_BUFFER_CACHE_LIMIT=%r; using device-scaled cap",
-                env_limit,
-            )
-        else:
-            if limit > 0:
-                return limit, "MLX_BUFFER_CACHE_LIMIT"
+            limit = _parse_mlx_buffer_cache_limit(env_limit)
+        except _NonPositiveLimitError:
             logger.warning(
                 "Ignoring non-positive MLX_BUFFER_CACHE_LIMIT=%r; "
                 "using device-scaled cap",
                 env_limit,
             )
+        except ValueError:
+            logger.warning(
+                "Ignoring invalid MLX_BUFFER_CACHE_LIMIT=%r; "
+                "using device-scaled cap",
+                env_limit,
+            )
+        else:
+            return limit, "MLX_BUFFER_CACHE_LIMIT"
 
     return int(max_recommended * gpu_memory_utilization), "device-scaled"
 
