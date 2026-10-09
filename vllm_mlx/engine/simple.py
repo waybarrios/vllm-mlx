@@ -1622,81 +1622,11 @@ class SimpleEngine(BaseEngine):
                 mtp_accepted=final_output.mtp_accepted,
             )
 
-        # mlx-lm non-streaming chat with tools can stall indefinitely on some
-        # local models, while the streaming path completes normally. Reuse the
-        # streaming implementation and aggregate its final state so both chat
-        # APIs share the same tool-capable execution path.
-        if tools and not self._is_mllm:
-            return await aggregate_stream_chat()
-
-        # Request-local logits processors (response_format / constrained JSON)
-        # need token-boundary progress and cancellation.  The blocking
-        # model.chat() call below only returns after the whole completion, so a
-        # slow constrained decode can look like a no-progress non-stream wedge
-        # and hold the serialized generation lock until max_tokens/timeout.
-        if kwargs.get("logits_processors") and not self._is_mllm:
-            return await aggregate_stream_chat()
-
-        # Text-only requests on MLLM models should always aggregate the
-        # streaming path for non-streaming chat. This keeps one execution seam
-        # and avoids mlx_vlm non-stream thread/stream ownership mismatches.
-        if self._is_mllm and not has_media_content(messages):
-            return await aggregate_stream_chat()
-
-        # Convert tools for template if provided
-        template_tools = convert_tools_for_template(tools) if tools else None
-
-        if self._is_mllm:
-            if chat_template_kwargs:
-                kwargs["chat_template_kwargs"] = chat_template_kwargs
-            output = await self._run_blocking_serialized(
-                self._model.chat,
-                messages=messages,
-                max_tokens=max_tokens,
-                temperature=temperature,
-                top_p=top_p,
-                tools=template_tools,
-                **kwargs,
-            )
-            text = clean_output_text(output.text)
-            return GenerationOutput(
-                text=text,
-                prompt_tokens=output.prompt_tokens,
-                completion_tokens=output.completion_tokens,
-                finish_reason=output.finish_reason,
-                mtp_drafts=getattr(output, "mtp_drafts", 0),
-                mtp_accepted=getattr(output, "mtp_accepted", 0),
-            )
-        else:
-            output = await self._run_blocking_serialized(
-                self._model.chat,
-                messages=messages,
-                max_tokens=max_tokens,
-                temperature=temperature,
-                top_p=top_p,
-                tools=template_tools,
-                chat_template_kwargs=chat_template_kwargs,
-                **kwargs,
-            )
-            text = clean_output_text(output.text)
-            # Preserve upstream prompt accounting while routing the blocking
-            # chat call through the cancellation-safe serialized runner.
-            tokenizer = self._model.tokenizer
-            template_kwargs = {
-                "tokenize": True,
-                "add_generation_prompt": True,
-            }
-            if template_tools:
-                template_kwargs["tools"] = template_tools
-            prompt_ids = tokenizer.apply_chat_template(messages, **template_kwargs)
-            prompt_token_count = len(prompt_ids)
-            return GenerationOutput(
-                text=text,
-                tokens=output.tokens,
-                prompt_tokens=prompt_token_count,
-                completion_tokens=len(output.tokens),
-                finish_reason=output.finish_reason,
-            )
+        # Always aggregate the streaming path. The blocking model.chat() call
+        # only returns after the whole completion, so it cannot be cancelled:
+        # a client disconnect would leave it decoding until max_tokens while
+        # holding the serialized generation lock.
+        return await aggregate_stream_chat()
 
     async def stream_chat(
         self,
