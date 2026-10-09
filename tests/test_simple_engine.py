@@ -3377,3 +3377,43 @@ class TestSimpleEngineStop:
         assert calls["count"] == 1
         assert engine._model is None
         assert engine._loaded is False
+
+
+class TestSimpleEngineTokenizer:
+    """``tokenizer`` must hand out the text tokenizer for MLLM models too.
+
+    Callers (constrained decoding, the thinking budget, Anthropic token
+    counting) call ``encode()`` on it, which multimodal processors lack.
+    """
+
+    def _engine(self, model, *, is_mllm):
+        from vllm_mlx.engine.simple import SimpleEngine
+
+        engine = SimpleEngine("test-model")
+        engine._model = model
+        engine._loaded = True
+        engine._is_mllm = is_mllm
+        return engine
+
+    def test_mllm_returns_processor_tokenizer(self):
+        tokenizer = SimpleNamespace(encode=lambda text: [1])
+        model = SimpleNamespace(processor=SimpleNamespace(tokenizer=tokenizer))
+
+        assert self._engine(model, is_mllm=True).tokenizer is tokenizer
+
+    def test_mllm_processor_without_tokenizer_is_returned_as_is(self):
+        processor = SimpleNamespace(encode=lambda text: [1])
+        model = SimpleNamespace(processor=processor)
+
+        assert self._engine(model, is_mllm=True).tokenizer is processor
+
+    def test_text_model_returns_model_tokenizer(self):
+        tokenizer = SimpleNamespace(encode=lambda text: [1])
+        model = SimpleNamespace(tokenizer=tokenizer)
+
+        assert self._engine(model, is_mllm=False).tokenizer is tokenizer
+
+    def test_not_loaded_returns_none(self):
+        from vllm_mlx.engine.simple import SimpleEngine
+
+        assert SimpleEngine("test-model").tokenizer is None
