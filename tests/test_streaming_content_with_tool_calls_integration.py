@@ -107,6 +107,33 @@ def both_in_one_delta(monkeypatch):
     return parser
 
 
+def _engine_for_deltas(deltas):
+    """Engine whose stream_chat yields real GenerationOutputs for ``deltas``."""
+    from vllm_mlx.engine.base import GenerationOutput
+
+    async def stream_chat(**kwargs):
+        text = ""
+        for delta in deltas:
+            text += delta
+            yield GenerationOutput(
+                text=text,
+                new_text=delta,
+                finished=False,
+                finish_reason=None,
+                prompt_tokens=7,
+                completion_tokens=1,
+            )
+        yield GenerationOutput(
+            text=text, prompt_tokens=7, completion_tokens=len(deltas)
+        )
+
+    return SimpleNamespace(
+        model_name="test-model",
+        preserve_native_tool_format=False,
+        stream_chat=stream_chat,
+    )
+
+
 async def _collect(generator):
     return [chunk async for chunk in generator]
 
@@ -502,31 +529,6 @@ class TestRealPoolsideParserParity:
             srv, "_reasoning_parser_name", "poolside_v1" if reasoning else None
         )
 
-    def _engine_for_deltas(self, deltas):
-        from vllm_mlx.engine.base import GenerationOutput
-
-        async def stream_chat(**kwargs):
-            text = ""
-            for delta in deltas:
-                text += delta
-                yield GenerationOutput(
-                    text=text,
-                    new_text=delta,
-                    finished=False,
-                    finish_reason=None,
-                    prompt_tokens=7,
-                    completion_tokens=1,
-                )
-            yield GenerationOutput(
-                text=text, prompt_tokens=7, completion_tokens=len(deltas)
-            )
-
-        return SimpleNamespace(
-            model_name="test-model",
-            preserve_native_tool_format=False,
-            stream_chat=stream_chat,
-        )
-
     @pytest.mark.parametrize("reasoning", [False, True])
     @pytest.mark.parametrize("separator", [" ", "\n\n", "\n    "])
     @pytest.mark.anyio
@@ -538,7 +540,7 @@ class TestRealPoolsideParserParity:
         self._configure_parsers(monkeypatch, reasoning)
         call = self.OUTPUT.removeprefix("Before").removesuffix("After")
         prefix = "<think>Plan</think>" if reasoning else ""
-        engine = self._engine_for_deltas([prefix + "Hello", separator + "world" + call])
+        engine = _engine_for_deltas([prefix + "Hello", separator + "world" + call])
         request = ChatCompletionRequest(
             model="test-model",
             messages=[{"role": "user", "content": "write it"}],
@@ -586,7 +588,7 @@ class TestRealPoolsideParserParity:
         }[chunking]
         if reasoning:
             chunks_in[0] = "<think>Plan</think>" + chunks_in[0]
-        engine = self._engine_for_deltas(chunks_in)
+        engine = _engine_for_deltas(chunks_in)
         request = ChatCompletionRequest(
             model="test-model",
             messages=[{"role": "user", "content": "write it"}],
@@ -641,3 +643,96 @@ class TestRealPoolsideParserParity:
                 )
                 == "Plan"
             )
+
+
+class TestRealMuseGlimmerParsers:
+    """Muse Glimmer's ATEM framing must never reach streamed content.
+
+    The tool-call marker is plain text spread over several tokens, so it arrives
+    split; the channel header ahead of it is split too.
+    """
+
+    ANSWER = [
+        " to=self",
+        "<|message|>",
+        "Greet",
+        ".",
+        "<|eom|>",
+        "<|start|>",
+        "assistant",
+        " to",
+        "=user",
+        "<|message|>",
+        "Hel",
+        "lo",
+    ]
+    CALL = [
+        " to=self",
+        "<|message|>",
+        "Look it up.",
+        "<|eom|>",
+        "<|start|>",
+        "assistant",
+        " to=get",
+        "_weather",
+        "<|message|>",
+        "<atem:",
+        "function",
+        '_calls>\n<atem:invoke name="get_weather">\n<atem:parameter name="city">',
+        "Paris</atem:parameter>\n</atem:invoke>\n</atem:",
+        "function_calls>",
+    ]
+    REQUEST_TOOLS = [
+        {
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"city": {"type": "string"}},
+                },
+            },
+        }
+    ]
+
+    async def _stream(self, monkeypatch, deltas):
+        from vllm_mlx.api.models import ChatCompletionRequest
+        from vllm_mlx.tool_parsers import ToolParserManager
+
+        parser = ToolParserManager.get_tool_parser("muse_glimmer")()
+        monkeypatch.setattr(srv, "_enable_auto_tool_choice", True)
+        monkeypatch.setattr(srv, "_tool_call_parser", "muse_glimmer")
+        monkeypatch.setattr(srv, "_tool_parser_instance", parser)
+        monkeypatch.setattr(srv, "_reasoning_parser", None)
+        monkeypatch.setattr(srv, "_reasoning_parser_name", "muse_glimmer")
+        engine = _engine_for_deltas(deltas)
+        request = ChatCompletionRequest(
+            model="test-model",
+            messages=[{"role": "user", "content": "weather?"}],
+            stream=True,
+            tools=self.REQUEST_TOOLS,
+        )
+        payloads = _data_payloads(
+            await _collect(
+                srv.stream_chat_completion(engine, request.messages, request)
+            )
+        )
+        return [p["choices"][0]["delta"] for p in payloads if p.get("choices")]
+
+    @pytest.mark.anyio
+    async def test_answer_channel(self, monkeypatch):
+        deltas = await self._stream(monkeypatch, self.ANSWER)
+        assert "".join(d.get("content") or "" for d in deltas) == "Hello"
+        assert "".join(d.get("reasoning_content") or "" for d in deltas) == "Greet."
+
+    @pytest.mark.anyio
+    async def test_tool_channel(self, monkeypatch):
+        deltas = await self._stream(monkeypatch, self.CALL)
+        assert "".join(d.get("content") or "" for d in deltas) == ""
+        assert (
+            "".join(d.get("reasoning_content") or "" for d in deltas) == "Look it up."
+        )
+        calls = [call for d in deltas for call in (d.get("tool_calls") or [])]
+        assert len(calls) == 1
+        assert calls[0]["function"]["name"] == "get_weather"
+        assert json.loads(calls[0]["function"]["arguments"]) == {"city": "Paris"}

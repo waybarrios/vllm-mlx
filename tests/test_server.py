@@ -1073,6 +1073,68 @@ class TestHelperFunctions:
         assert exc_info.value.status_code == 404
         assert "fast" in exc_info.value.detail
 
+    def test_validate_muse_glimmer_tool_names_rejects_reserved_recipients(
+        self, monkeypatch
+    ):
+        """
+        A tool named "self" or "user" collides with Muse Glimmer's ATEM
+        channel recipients (self=reasoning, user=answer) and must be
+        rejected up front rather than left for the parser to disambiguate.
+        """
+        from fastapi import HTTPException
+        import vllm_mlx.server as server
+        from vllm_mlx.api.models import ToolDefinition
+
+        monkeypatch.setattr(server, "_tool_call_parser", "muse_glimmer")
+
+        reserved = ToolDefinition(
+            type="function", function={"name": "self", "parameters": {}}
+        )
+        with pytest.raises(HTTPException) as exc_info:
+            server._validate_muse_glimmer_tool_names([reserved])
+        assert exc_info.value.status_code == 400
+        assert "self" in exc_info.value.detail
+
+        ok = ToolDefinition(
+            type="function", function={"name": "get_weather", "parameters": {}}
+        )
+        server._validate_muse_glimmer_tool_names([ok])  # should not raise
+
+    def test_validate_muse_glimmer_tool_names_covers_anthropic_and_responses_shapes(
+        self, monkeypatch
+    ):
+        """The reserved-name check must work for every tool schema shape."""
+        from fastapi import HTTPException
+        import vllm_mlx.server as server
+
+        monkeypatch.setattr(server, "_tool_call_parser", "muse_glimmer")
+
+        class FakeNamedTool:
+            def __init__(self, name):
+                self.name = name
+
+        with pytest.raises(HTTPException):
+            server._validate_muse_glimmer_tool_names([FakeNamedTool("user")])
+
+        with pytest.raises(HTTPException):
+            server._validate_muse_glimmer_tool_names(
+                [{"type": "function", "name": "user"}]
+            )
+
+    def test_validate_muse_glimmer_tool_names_only_applies_to_muse_glimmer(
+        self, monkeypatch
+    ):
+        """Other tool-call parsers have no channel-recipient collision to guard."""
+        import vllm_mlx.server as server
+        from vllm_mlx.api.models import ToolDefinition
+
+        monkeypatch.setattr(server, "_tool_call_parser", "gemma4")
+
+        reserved = ToolDefinition(
+            type="function", function={"name": "self", "parameters": {}}
+        )
+        server._validate_muse_glimmer_tool_names([reserved])  # should not raise
+
     def test_build_reasoning_parser_uses_configured_name_and_engine_tokenizer(
         self, monkeypatch
     ):
