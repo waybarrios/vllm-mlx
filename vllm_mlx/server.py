@@ -298,16 +298,29 @@ def _resolve_request_max_tokens(requested_value: int | None) -> int:
     return requested_value
 
 
+#: ``reasoning_effort`` values that mean "produce no reasoning at all".
+_DISABLE_REASONING_EFFORTS = frozenset({"none"})
+
+
 def _resolve_chat_template_kwargs(
     request_value: dict[str, object] | None,
     request_reasoning_effort: str | None = None,
 ) -> dict[str, object]:
-    """Resolve chat kwargs: server default < effort < explicit request kwargs."""
+    """Resolve chat kwargs: server default < effort < explicit request kwargs.
+
+    A disable effort (``reasoning_effort="none"``) becomes ``enable_thinking=False``
+    rather than forwarding the sentinel to the chat template: effort-ladder templates
+    (Qwen3-style) validate the value and reject ``"none"`` outright, and the server's
+    own thinking-state checks key off ``enable_thinking``.
+    """
     resolved: dict[str, object] = {}
     if _default_chat_template_kwargs:
         resolved.update(_default_chat_template_kwargs)
     if request_reasoning_effort is not None:
-        resolved["reasoning_effort"] = request_reasoning_effort
+        if request_reasoning_effort.strip().lower() in _DISABLE_REASONING_EFFORTS:
+            resolved["enable_thinking"] = False
+        else:
+            resolved["reasoning_effort"] = request_reasoning_effort
     if request_value:
         resolved.update(request_value)
     return resolved
@@ -924,6 +937,11 @@ def _prepare_chat_completion_invocation(
     )
     if resolved_chat_template_kwargs:
         chat_kwargs["chat_template_kwargs"] = resolved_chat_template_kwargs
+        # Mirror a resolved disable to the top level so every downstream
+        # thinking-state check (budget processor included) sees it; an explicit
+        # request-level ``enable_thinking`` below still overrides.
+        if resolved_chat_template_kwargs.get("enable_thinking") is False:
+            chat_kwargs.setdefault("enable_thinking", False)
 
     if request.enable_thinking is not None:
         chat_kwargs["enable_thinking"] = request.enable_thinking
