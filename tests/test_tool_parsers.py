@@ -999,6 +999,80 @@ class TestAutoToolParser:
         args = json.loads(result.tool_calls[0]["arguments"])
         assert args["file_path"] == "/tmp/test.py"
 
+    def test_detects_glm47_with_args(self, parser):
+        """GLM-4.7's native <tool_call>name\\n<arg_key> format (captured from
+        a real GLM-4.7-Flash response) must be recognized via delegation to
+        Glm47ToolParser."""
+        text = (
+            "I'll run the `ls` command in the current directory and count "
+            "the files for you.\n<tool_call>Bash\n<arg_key>command</arg_key>"
+            "<arg_value>ls</arg_value>\n</tool_call>"
+        )
+        result = parser.extract_tool_calls(text)
+
+        assert result.tools_called
+        assert len(result.tool_calls) == 1
+        assert result.tool_calls[0]["name"] == "Bash"
+        args = json.loads(result.tool_calls[0]["arguments"])
+        assert args["command"] == "ls"
+
+    def test_detects_glm47_zero_args(self, parser):
+        """GLM-4.7 no-arg native form: <tool_call>name</tool_call>."""
+        text = "<tool_call>get_current_time</tool_call>"
+        result = parser.extract_tool_calls(text)
+
+        assert result.tools_called
+        assert result.tool_calls[0]["name"] == "get_current_time"
+
+    def test_qwen_xml_blob_not_misrouted_to_glm47(self, parser):
+        """Regression: Qwen/Hermes's JSON-blob
+        <tool_call>{...}</tool_call> format must NOT be swallowed by the
+        GLM detour — it opens with '{', not a bare identifier, so the GLM
+        native-pattern gate must not match it, and it must still resolve
+        via the existing Qwen/Hermes XML pattern."""
+        text = '<tool_call>\n{"name": "Bash", "arguments": {"command": "ls"}}\n</tool_call>'
+        result = parser.extract_tool_calls(text)
+
+        assert result.tools_called
+        assert len(result.tool_calls) == 1
+        assert result.tool_calls[0]["name"] == "Bash"
+        args = json.loads(result.tool_calls[0]["arguments"])
+        assert args["command"] == "ls"
+
+    @pytest.mark.parametrize("streaming", [False, True])
+    def test_qwen_argument_glm_markup_is_not_a_tool_call(self, parser, streaming):
+        """Native markup inside a JSON argument must remain literal text."""
+        arguments = {
+            "path": "example.txt",
+            "content": "<tool_call>Bash</tool_call>",
+        }
+        text = (
+            "<tool_call>"
+            + json.dumps({"name": "write_file", "arguments": arguments})
+            + "</tool_call>"
+        )
+        request = {
+            "tools": [
+                {"type": "function", "function": {"name": name}}
+                for name in ("write_file", "Bash")
+            ]
+        }
+
+        if streaming:
+            result = parser.extract_tool_calls_streaming(
+                "", text, text, request=request
+            )
+            assert result is not None
+            calls = [call["function"] for call in result["tool_calls"]]
+        else:
+            result = parser.extract_tool_calls(text, request)
+            assert result.tools_called
+            calls = result.tool_calls
+
+        assert len(calls) == 1
+        assert calls[0]["name"] == "write_file"
+        assert json.loads(calls[0]["arguments"]) == arguments
+
     def test_detects_llama(self, parser):
         """Test auto detection of Llama format."""
         text = '<function=multiply>{"x": 2}</function>'
