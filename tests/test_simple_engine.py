@@ -3377,3 +3377,28 @@ class TestSimpleEngineStop:
         assert calls["count"] == 1
         assert engine._model is None
         assert engine._loaded is False
+
+
+class TestSimpleEngineImplicitThinking:
+    """The server's injected-<think> probe must see SimpleEngine's prompt (#834)."""
+
+    def _detect(self, rendered):
+        import vllm_mlx.server as server
+        from vllm_mlx.engine.simple import SimpleEngine
+
+        with patch("vllm_mlx.engine.simple.is_mllm_model", return_value=False):
+            engine = SimpleEngine("glm-4.7-flash")
+        tokenizer = MagicMock()
+        tokenizer.chat_template = "{{ messages }}"
+        tokenizer.apply_chat_template.return_value = rendered
+        engine._model = SimpleNamespace(tokenizer=tokenizer)
+        engine._loaded = True
+
+        server._implicit_thinking_cache.clear()
+        return server._detect_implicit_thinking(engine, None)
+
+    def test_template_that_opens_think_is_implicit(self):
+        assert self._detect("[gMASK]<sop><|user|>hi<|assistant|><think>") is True
+
+    def test_template_without_think_is_not_implicit(self):
+        assert self._detect("[gMASK]<sop><|user|>hi<|assistant|>") is False
