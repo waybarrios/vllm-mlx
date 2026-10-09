@@ -8,6 +8,9 @@ from vllm_mlx/request.py. No MLX dependency.
 
 import time
 
+import pytest
+
+from vllm_mlx.output_collector import RequestOutputCollector
 from vllm_mlx.request import Request, RequestOutput, RequestStatus, SamplingParams
 
 
@@ -473,3 +476,33 @@ class TestRequestOutput:
         assert usage["prompt_tokens"] == 0
         assert usage["completion_tokens"] == 0
         assert usage["total_tokens"] == 0
+
+    @pytest.mark.parametrize(
+        ("earlier", "latest"),
+        [((1, 1), (3, 2)), ((2, 1), (2, 1)), ((1, 0), (2, 0)), ((0, 0), (0, 0))],
+    )
+    def test_collector_preserves_latest_cumulative_mtp_counters(self, earlier, latest):
+        collector = RequestOutputCollector(aggregate=True)
+        collector.put(
+            RequestOutput(
+                request_id="test-1",
+                new_token_ids=[10],
+                mtp_drafts=earlier[0],
+                mtp_accepted=earlier[1],
+            )
+        )
+        collector.put(
+            RequestOutput(
+                request_id="test-1",
+                new_token_ids=[11],
+                finished=True,
+                mtp_drafts=latest[0],
+                mtp_accepted=latest[1],
+            )
+        )
+
+        output = collector.get_nowait()
+
+        assert output.new_token_ids == [10, 11]
+        assert output.finished is True
+        assert (output.mtp_drafts, output.mtp_accepted) == latest

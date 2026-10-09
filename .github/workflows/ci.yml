@@ -215,9 +215,11 @@ jobs:
             tests/test_server.py \
             tests/test_metrics.py \
             tests/test_paged_cache.py \
+            tests/test_prefix_cache.py \
             tests/test_prefix_cache_untrimmable.py \
             tests/test_scheduler_max_kv_size.py \
             tests/test_qwen35_mtp_patch.py \
+            tests/test_llm_mtp_per_request_counters.py \
             tests/test_batched_engine_mllm_config.py \
             tests/test_mllm_continuous_batching.py \
             tests/test_mllm_cache.py \
@@ -248,6 +250,7 @@ jobs:
             tests/test_normalize_messages.py \
             tests/test_responses_api.py \
             tests/test_thinking_aware_processor.py \
+            tests/test_tool_argument_coercion.py \
             tests/test_tool_choice_forced.py \
             tests/test_tool_choice_none.py \
             tests/test_harmony_render.py \

@@ -1,8 +1,11 @@
-"""Dependency floor contracts for upstream model support."""
+"""Dependency compatibility contracts for upstream model support."""
 
 from __future__ import annotations
 
 from pathlib import Path
+
+import pytest
+from packaging.requirements import Requirement
 
 try:
     import tomllib
@@ -42,3 +45,21 @@ def test_mlx_lm_floor_matches_current_mlx_vlm_runtime_requirement():
     dependencies = _project_dependencies()
 
     assert _has_minimum(dependencies["mlx-lm"], "0.31.3")
+
+
+@pytest.mark.parametrize(
+    ("version", "supported"),
+    [
+        ("0.31.2", False),
+        ("0.31.3", True),
+        ("0.31.4", True),
+        ("0.32.0", False),
+        ("0.32.1", False),
+    ],
+)
+def test_mlx_lm_version_range_preserves_legacy_cache_api(
+    version: str, supported: bool
+) -> None:
+    requirement = Requirement(_project_dependencies()["mlx-lm"])
+
+    assert requirement.specifier.contains(version) is supported

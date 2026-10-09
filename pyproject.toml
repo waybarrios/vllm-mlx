@@ -40,7 +40,7 @@ classifiers = [
 
 dependencies = [
     "mlx>=0.29.0",
-    "mlx-lm>=0.31.3",  # 0.31.3+ required by current mlx-vlm runtime support
+    "mlx-lm>=0.31.3,<0.32.0",  # mlx-vlm needs 0.31.3; 0.32 breaks cache/batch APIs
     "mlx-vlm>=0.6.5",  # 0.6.5+ fixes Qwen3.5 sanitize double-run (#674)
     "transformers>=5.0.0",  # mlx-lm 0.30.5+ requires transformers 5.0 (rc3 bug fixed in stable)
     "tokenizers>=0.19.0",

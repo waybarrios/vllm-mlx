@@ -14,7 +14,7 @@ Includes low-level optimizations:
 import logging
 import time
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any
 
 import mlx.core as mx
 
@@ -313,53 +313,6 @@ class MLXModelRunner:
             num_tokens_generated=total_tokens,
             generation_time_s=generation_time,
         )
-
-    def _prefill_with_chunking(
-        self,
-        input_ids: mx.array,
-        cache: Optional[Any] = None,
-    ) -> tuple[mx.array, Any]:
-        """
-        Process prompt with optimal chunking for L2 cache efficiency.
-
-        Long prompts are broken into chunks that fit in L2 cache,
-        maximizing memory bandwidth utilization during prefill.
-
-        Args:
-            input_ids: Input token IDs [1, seq_len]
-            cache: Optional existing KV cache
-
-        Returns:
-            Tuple of (logits, updated_cache)
-        """
-        try:
-            from vllm_mlx.optimizations import get_optimal_prefill_size
-        except ImportError:
-            # Fallback if optimizations module not available
-            def get_optimal_prefill_size(seq_len):
-                return min(512, seq_len)
-
-        seq_len = input_ids.shape[-1] if len(input_ids.shape) > 1 else len(input_ids)
-        chunk_size = get_optimal_prefill_size(seq_len)
-
-        # Reshape if needed
-        if len(input_ids.shape) == 1:
-            input_ids = input_ids.reshape(1, -1)
-
-        # Use compiled forward if available, otherwise use model directly
-        forward_fn = self._compiled_forward if self._compiled_forward else self.model
-
-        if seq_len <= chunk_size:
-            # Process entire sequence at once
-            return forward_fn(input_ids, cache=cache)
-
-        # Process in chunks for large prompts
-        for i in range(0, seq_len, chunk_size):
-            chunk = input_ids[:, i : i + chunk_size]
-            logits, cache = forward_fn(chunk, cache=cache)
-            mx.eval(cache)  # Force evaluation to free intermediate memory
-
-        return logits, cache
 
     def _generate_for_request(
         self,

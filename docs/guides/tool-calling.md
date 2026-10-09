@@ -45,6 +45,25 @@ if response.choices[0].message.tool_calls:
         print(f"Arguments: {tc.function.arguments}")
 ```
 
+## Streaming argument recovery
+
+Chat Completions streams parser-produced tool argument fragments unchanged by
+default, including when tools declare arrays or other non-string parameters.
+To opt into schema-aware recovery, send the request extension
+`"tool_argument_recovery": "buffered"` (with the OpenAI Python client, use
+`extra_body={"tool_argument_recovery": "buffered"}`). The default is `"none"`;
+other values are rejected by request validation.
+
+Buffered mode emits each call's ID/name when established and continues emitting
+independent content/reasoning. Only argument bytes wait until the entire
+generation finishes, including for already-valid arguments. This does not
+provide early per-call completion. Complete arguments can then recover, for
+example, a JSON-encoded array string into a schema-declared array. Already-correct
+strings are preserved; actual objects/lists targeting strings use compact UTF-8
+JSON without sorting keys. Nonfinite or incompatible values are not repaired.
+This option does not enforce the full tool schema or change non-streaming
+recovery behavior.
+
 ## Supported Parsers
 
 Use `--tool-call-parser` to select a parser for your model family:
