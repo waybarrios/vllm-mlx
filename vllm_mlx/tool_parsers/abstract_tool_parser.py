@@ -165,6 +165,30 @@ class ToolParser(ABC):
         """
         return None
 
+    def _new_streaming_tool_calls(
+        self, tool_calls: list[dict[str, Any]]
+    ) -> dict[str, Any] | None:
+        """Build a streaming delta with only the tool calls not sent yet."""
+        start = len(self.prev_tool_call_arr)
+        new_calls = tool_calls[start:]
+        if not new_calls:
+            return None
+        self.prev_tool_call_arr.extend(new_calls)
+        return {
+            "tool_calls": [
+                {
+                    "index": start + i,
+                    "id": tc["id"],
+                    "type": "function",
+                    "function": {
+                        "name": tc["name"],
+                        "arguments": tc["arguments"],
+                    },
+                }
+                for i, tc in enumerate(new_calls)
+            ]
+        }
+
     def reset(self) -> None:
         """Reset parser state for a new request."""
         self.current_tool_id = -1
