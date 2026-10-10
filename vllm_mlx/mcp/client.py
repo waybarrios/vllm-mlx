@@ -19,6 +19,21 @@ from .types import (
 
 logger = logging.getLogger(__name__)
 
+_MISSING = object()
+
+
+def _field(obj: Any, snake_name: str, camel_name: str, default: Any = _MISSING):
+    """Read an MCP SDK field across v1 camelCase and v2 snake_case models."""
+    value = getattr(obj, snake_name, _MISSING)
+    if value is not _MISSING:
+        return value
+    value = getattr(obj, camel_name, _MISSING)
+    if value is not _MISSING:
+        return value
+    if default is not _MISSING:
+        return default
+    raise AttributeError(f"MCP result has neither {snake_name!r} nor {camel_name!r}")
+
 
 class MCPClient:
     """
@@ -116,6 +131,8 @@ class MCPClient:
                 return True
 
             except Exception as e:
+                await self._close_connection()
+                self._tools = []
                 self._state = MCPServerState.ERROR
                 self._error = str(e)
                 logger.error(f"Failed to connect to MCP server '{self.name}': {e}")
@@ -176,10 +193,12 @@ class MCPClient:
 
         # Initialize with capabilities
         result = await self._session.initialize()
+        protocol_version = _field(result, "protocol_version", "protocolVersion")
+        server_info = _field(result, "server_info", "serverInfo", None)
         logger.debug(
             f"MCP server '{self.name}' initialized: "
-            f"protocol={result.protocolVersion}, "
-            f"server={result.serverInfo.name if result.serverInfo else 'unknown'}"
+            f"protocol={protocol_version}, "
+            f"server={server_info.name if server_info else 'unknown'}"
         )
 
     async def _discover_tools(self):
@@ -196,9 +215,7 @@ class MCPClient:
                     server_name=self.name,
                     name=tool.name,
                     description=tool.description or "",
-                    input_schema=(
-                        tool.inputSchema if hasattr(tool, "inputSchema") else {}
-                    ),
+                    input_schema=_field(tool, "input_schema", "inputSchema", {}),
                 )
                 self._tools.append(mcp_tool)
                 logger.debug(f"Discovered tool: {mcp_tool.full_name}")
@@ -213,26 +230,24 @@ class MCPClient:
             if self._state == MCPServerState.DISCONNECTED:
                 return
 
+            await self._close_connection()
+            self._state = MCPServerState.DISCONNECTED
+            self._tools = []
+            logger.info(f"Disconnected from MCP server '{self.name}'")
+
+    async def _close_connection(self):
+        """Close opened SDK contexts without acquiring the client lock."""
+        for attr in ("_session", "_stdio_client", "_sse_client"):
+            context = getattr(self, attr, None)
+            setattr(self, attr, None)
+            if context is None:
+                continue
             try:
-                if self._session:
-                    await self._session.__aexit__(None, None, None)
-                    self._session = None
-
-                if hasattr(self, "_stdio_client") and self._stdio_client:
-                    await self._stdio_client.__aexit__(None, None, None)
-                    self._stdio_client = None
-
-                if hasattr(self, "_sse_client") and self._sse_client:
-                    await self._sse_client.__aexit__(None, None, None)
-                    self._sse_client = None
-
+                await context.__aexit__(None, None, None)
             except Exception as e:
-                logger.warning(f"Error disconnecting from '{self.name}': {e}")
-
-            finally:
-                self._state = MCPServerState.DISCONNECTED
-                self._tools = []
-                logger.info(f"Disconnected from MCP server '{self.name}'")
+                logger.warning(
+                    f"Error closing MCP connection context for '{self.name}': {e}"
+                )
 
     async def call_tool(
         self,
@@ -282,7 +297,7 @@ class MCPClient:
             return MCPToolResult(
                 tool_name=tool_name,
                 content=content,
-                is_error=result.isError if hasattr(result, "isError") else False,
+                is_error=_field(result, "is_error", "isError", False),
             )
 
         except asyncio.TimeoutError:
