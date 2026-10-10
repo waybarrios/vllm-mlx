@@ -654,6 +654,16 @@ class BatchedEngine(BaseEngine):
 
         await self._engine.engine.start()
 
+    def is_healthy(self) -> bool:
+        """Check whether the underlying scheduler/engine loop is still alive."""
+        if not self._loaded:
+            return True
+        if self._mllm_scheduler is not None and not self._mllm_scheduler.is_healthy():
+            return False
+        if self._engine is not None and not self._engine.engine.is_healthy():
+            return False
+        return True
+
     async def stop(self) -> None:
         """Stop the engine and cleanup resources."""
         mllm_scheduler = self._mllm_scheduler
