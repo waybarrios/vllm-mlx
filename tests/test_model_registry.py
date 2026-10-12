@@ -399,6 +399,88 @@ def test_get_metrics_engine_returns_most_recently_used_when_multiple_loaded(tmp_
     asyncio.run(_run())
 
 
+def test_clear_caches_runs_on_every_loaded_engine_without_touching_mru(tmp_path):
+    async def _run():
+        registry = _registry(tmp_path, {"alpha": 4, "beta": 4, "gamma": 4})
+        manager = ModelManager(
+            _manager_config(budget_gb=13),
+            registry,
+            _defaults(),
+            engine_factory=lambda config: FakeEngine(config),
+        )
+        for name in ("alpha", "beta"):
+            lease = await manager.acquire(name)
+            await lease.release()
+        last_used = {
+            name: loaded.last_used_at for name, loaded in manager._loaded.items()
+        }
+        seen = []
+
+        async def _clear(engine):
+            seen.append(engine)
+            return engine.model_name
+
+        results = await manager.clear_caches(_clear)
+
+        assert seen == [manager._loaded["alpha"].engine, manager._loaded["beta"].engine]
+        assert results == {
+            "alpha": str(tmp_path / "alpha"),
+            "beta": str(tmp_path / "beta"),
+        }
+        assert {
+            name: loaded.last_used_at for name, loaded in manager._loaded.items()
+        } == last_used
+        assert all(loaded.active_requests == 0 for loaded in manager._loaded.values())
+
+        seen.clear()
+        assert await manager.clear_caches(_clear, model_name="beta") == {
+            "beta": str(tmp_path / "beta")
+        }
+        assert seen == [manager._loaded["beta"].engine]
+        # Registered but not loaded: nothing to clear, nothing loaded.
+        assert await manager.clear_caches(_clear, model_name="gamma") == {}
+        assert "gamma" not in manager._loaded
+
+    asyncio.run(_run())
+
+
+def test_clear_caches_pins_engine_against_idle_unload(tmp_path):
+    async def _run():
+        registry = _registry(tmp_path, {"alpha": 4})
+        manager = ModelManager(
+            _manager_config(budget_gb=8, idle_unload_seconds=0.001),
+            registry,
+            _defaults(),
+            engine_factory=lambda config: FakeEngine(config),
+        )
+        lease = await manager.acquire("alpha")
+        await lease.release()
+        engine = manager._loaded["alpha"].engine
+        await asyncio.sleep(0.01)
+
+        entered = asyncio.Event()
+        finish = asyncio.Event()
+
+        async def _clear(_engine):
+            entered.set()
+            await finish.wait()
+            return True
+
+        clear_task = asyncio.create_task(manager.clear_caches(_clear))
+        await entered.wait()
+
+        # Idle past the timeout, but pinned by the in-flight clear.
+        assert await manager.unload_idle() == []
+        assert engine.stopped == 0
+
+        finish.set()
+        assert await clear_task == {"alpha": True}
+        assert await manager.unload_idle() == ["alpha"]
+        assert engine.stopped == 1
+
+    asyncio.run(_run())
+
+
 def test_non_local_registry_entry_requires_explicit_memory_estimate():
     async def _run():
         registry = {

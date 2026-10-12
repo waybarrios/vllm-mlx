@@ -53,8 +53,9 @@ import threading
 import time
 import uuid
 from collections import OrderedDict, defaultdict
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import suppress
+from typing import Any
 
 import uvicorn
 from fastapi import Depends, FastAPI, HTTPException, Request, UploadFile
@@ -4411,22 +4412,87 @@ async def cache_stats():
         }
 
 
+async def _clear_engine_runtime_caches(engine: BaseEngine) -> dict[str, Any] | None:
+    """Clear one engine's runtime caches; failures are reported, not raised."""
+    if not hasattr(engine, "clear_runtime_caches"):
+        return None
+    try:
+        owned_clear = getattr(engine, "_clear_runtime_caches_on_owner", None)
+        if owned_clear is not None:
+            return await owned_clear()
+        cleared = engine.clear_runtime_caches()
+        if inspect.isawaitable(cleared):
+            cleared = await cleared
+        return cleared
+    except Exception as exc:
+        logger.warning("Failed to clear engine caches: %s", exc, exc_info=True)
+        return {"error": str(exc)}
+
+
+async def _clear_engine_prefix_cache(engine: BaseEngine) -> bool:
+    """Clear one engine's prefix cache; returns whether it was cleared."""
+    if not hasattr(engine, "clear_prefix_cache"):
+        return False
+    try:
+        owned_clear = getattr(engine, "_clear_prefix_cache_on_owner", None)
+        if owned_clear is not None:
+            await owned_clear()
+        else:
+            clear_result = engine.clear_prefix_cache()
+            if inspect.isawaitable(clear_result):
+                await clear_result
+        return True
+    except Exception as e:
+        logger.warning(
+            "[clear_prefix_cache] engine.clear_prefix_cache failed: %s",
+            _sanitize_log_text(e, limit=500),
+        )
+        return False
+
+
+async def _clear_registry_caches(
+    clear: Callable[[BaseEngine], Awaitable[Any]], model: str | None
+) -> dict[str, Any]:
+    """Run ``clear`` on every loaded registry engine, or only on ``model``.
+
+    Raises 404 if ``model`` is not registered or not currently loaded, so a
+    targeted clear never reports success without touching anything.
+    """
+    if model is not None:
+        _validate_model_name(model)
+    results = await _model_manager.clear_caches(clear, model_name=model)
+    if model is not None and not results:
+        raise HTTPException(
+            status_code=404,
+            detail=f"The model `{model}` is not loaded; there is no cache to clear.",
+        )
+    return results
+
+
 @app.delete("/v1/cache", dependencies=[Depends(verify_api_key)])
-async def clear_cache():
-    """Clear all caches."""
-    cleared_engine = None
-    if _engine is not None and hasattr(_engine, "clear_runtime_caches"):
-        try:
-            owned_clear = getattr(_engine, "_clear_runtime_caches_on_owner", None)
-            if owned_clear is not None:
-                cleared_engine = await owned_clear()
-            else:
-                cleared_engine = _engine.clear_runtime_caches()
-                if inspect.isawaitable(cleared_engine):
-                    cleared_engine = await cleared_engine
-        except Exception as exc:
-            logger.warning("Failed to clear engine caches: %s", exc, exc_info=True)
-            cleared_engine = {"error": str(exc)}
+async def clear_cache(model: str | None = None):
+    """Clear all caches.
+
+    In registry mode (``--models-config``) every loaded engine is cleared and
+    reported under ``engine_caches``; ``?model=<name>`` limits the clear to that
+    engine and leaves the process-wide mlx-vlm caches alone.
+    """
+    if _model_manager is not None:
+        response: dict[str, Any] = {
+            "status": "cleared",
+            "engine_caches": await _clear_registry_caches(
+                _clear_engine_runtime_caches, model
+            ),
+        }
+        if model is not None:
+            return response
+    else:
+        if model is not None:
+            _validate_model_name(model)
+        cleared_engine = None
+        if _engine is not None:
+            cleared_engine = await _clear_engine_runtime_caches(_engine)
+        response = {"status": "cleared", "engine_cache": cleared_engine}
 
     try:
         from mlx_vlm.utils import (
@@ -4436,50 +4502,56 @@ async def clear_cache():
 
         clear_multimodal_kv_cache()
         clear_pixel_values_cache()
-        return {
-            "status": "cleared",
-            "engine_cache": cleared_engine,
-            "caches": ["multimodal_kv", "pixel_values", "pil_image"],
-        }
+        response["caches"] = ["multimodal_kv", "pixel_values", "pil_image"]
     except ImportError:
-        return {
-            "status": "cleared",
-            "engine_cache": cleared_engine,
-            "error": "Cache clear not available (mlx_vlm not loaded)",
-        }
+        response["error"] = "Cache clear not available (mlx_vlm not loaded)"
+    return response
 
 
 @app.delete("/v1/cache/prefix", dependencies=[Depends(verify_api_key)])
-async def clear_prefix_cache():
+async def clear_prefix_cache(model: str | None = None):
     """Clear the text prefix cache used for KV reuse in continuous batching.
 
     If the server was started with ``--warm-prompts``, the warm-up is
     re-run in the background after clear so the next real request still
     hits the cache. Response returns immediately without waiting for
     the re-warm to finish.
+
+    In registry mode (``--models-config``) every loaded engine is cleared and
+    reported per model under ``models``; ``?model=<name>`` limits the clear to
+    that engine. ``--warm-prompts`` is not wired into registry mode, so no
+    re-warm is scheduled there.
     """
+    if _model_manager is not None:
+        results = await _clear_registry_caches(_clear_engine_prefix_cache, model)
+        if not results:
+            return {"status": "no_engine", "rewarm_scheduled": False, "models": {}}
+        cleared_count = sum(results.values())
+        if cleared_count == len(results):
+            status = "cleared"
+        elif cleared_count == 0:
+            status = "not_supported"
+        else:
+            status = "partial"
+        return {
+            "status": status,
+            "rewarm_scheduled": False,
+            "models": {
+                name: {"status": "cleared" if cleared else "not_supported"}
+                for name, cleared in results.items()
+            },
+        }
+
+    if model is not None:
+        _validate_model_name(model)
     if _engine is None:
         return {"status": "no_engine"}
-    cleared = False
-    if hasattr(_engine, "clear_prefix_cache"):
-        try:
-            owned_clear = getattr(_engine, "_clear_prefix_cache_on_owner", None)
-            if owned_clear is not None:
-                await owned_clear()
-            else:
-                clear_result = _engine.clear_prefix_cache()
-                if inspect.isawaitable(clear_result):
-                    await clear_result
-            cleared = True
-        except Exception as e:
-            logger.warning(
-                "[clear_prefix_cache] engine.clear_prefix_cache failed: %s",
-                _sanitize_log_text(e, limit=500),
-            )
+    engine = _engine
+    cleared = await _clear_engine_prefix_cache(engine)
 
     # Auto re-warm in background if warm-prompts was configured.
     rewarm_scheduled = False
-    if cleared and _warm_prompts_path and hasattr(_engine, "stream_chat"):
+    if cleared and _warm_prompts_path and hasattr(engine, "stream_chat"):
 
         async def _rewarm():
             try:
@@ -4489,7 +4561,7 @@ async def clear_prefix_cache():
                 )
 
                 prompts = load_warmup_file(_warm_prompts_path)
-                result = await warm_prefix_cache(_engine, prompts)
+                result = await warm_prefix_cache(engine, prompts)
                 logger.info(
                     "[clear_prefix_cache] re-warm done: %d completed, %d skipped, %.1fs",
                     result["count"],
