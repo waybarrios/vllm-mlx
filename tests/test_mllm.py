@@ -246,7 +246,7 @@ class TestMLLMMediaAndHelperFunctions:
         monkeypatch.setattr(
             mllm,
             "_build_mllm_chat_messages",
-            lambda messages, all_image_urls, video_frame_counts: messages,
+            lambda messages, all_image_urls, video_frame_counts, **_: messages,
         )
         seen = {}
 
