@@ -520,8 +520,9 @@ def log_memory_budget_report(report: MemoryBudgetReport) -> None:
     elif report.per_engine_cache_percent is not None:
         cache_desc = (
             f"~{report.per_engine_cache_percent * 100:.0f}% of available RAM per "
-            f"memory-aware prefix-cache engine (--cache-memory-percent, {engines}); "
-            "scales at runtime"
+            f"memory-aware prefix-cache engine (effective --cache-memory-percent, "
+            f"{engines}); computed once at each cache's initialization, "
+            "not dynamically resized; limits apply independently per engine"
         )
     else:
         cache_desc = "none configured"
