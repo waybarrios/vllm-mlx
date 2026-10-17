@@ -12,6 +12,7 @@ LLM engine), so text-only requests must also be routed through it.
 """
 
 import asyncio
+import gc
 import inspect
 import logging
 import os
@@ -741,9 +742,6 @@ class BatchedEngine(BaseEngine):
             generation_executor.shutdown(wait=True)
             self._generation_executor = None
             self._generation_thread_id = None
-        else:
-            # MLLM owns its model on the event-loop thread.
-            mx.clear_cache()
 
         self._mllm_scheduler = None
         self._engine = None
@@ -753,6 +751,16 @@ class BatchedEngine(BaseEngine):
         self._mllm_instance = None
         self._specprefill_draft_model = None
         self._loaded = False
+
+        # Chunked prefill and MTP patch closures over the batch generator onto
+        # the generator itself, so it (and the model it reaches) sits in a
+        # reference cycle that dropping the attributes above cannot free. An
+        # idle server can go a long time without a full collection, so collect
+        # now (with the locals above released, or they keep the cycle
+        # reachable), then hand the freed buffers back to the OS.
+        mllm_scheduler = engine = generation_executor = None
+        gc.collect()
+        mx.clear_cache()
         logger.info("BatchedEngine stopped")
 
     def _apply_chat_template(

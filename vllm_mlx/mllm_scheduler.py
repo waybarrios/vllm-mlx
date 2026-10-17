@@ -948,10 +948,17 @@ class MLLMScheduler:
     async def stop(self) -> None:
         """Stop the scheduler."""
         self._running = False
-        if self._processing_task:
-            self._processing_task.cancel()
+        task = self._processing_task
+        if task:
+            self._processing_task = None
+            task.cancel()
             try:
-                await self._processing_task
+                # Wait without re-raising the loop's CancelledError here:
+                # asyncio keeps a raised exception alive past this step, and
+                # its traceback would pin this frame and _process_loop's (and
+                # through them the batch generator and the model) until after
+                # BatchedEngine.stop() has tried to free them.
+                await asyncio.wait([task])
             except asyncio.CancelledError:
                 pass
 

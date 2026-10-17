@@ -159,6 +159,7 @@ jobs:
         run: |
           pytest \
             tests/test_mllm_steps_executed_stat.py \
+            tests/test_mllm_scheduler_stop_release.py \
             -v --tb=short
 
   test-python-3-14:
@@ -229,6 +230,7 @@ jobs:
             tests/test_mllm_sampling.py \
             tests/test_mllm_assistant_images.py \
             tests/test_mllm_steps_executed_stat.py \
+            tests/test_mllm_scheduler_stop_release.py \
             tests/test_metrics.py \
             tests/test_optimizations.py \
             tests/test_batched_engine.py \

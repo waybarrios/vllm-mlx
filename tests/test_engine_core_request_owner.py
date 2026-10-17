@@ -2,10 +2,12 @@
 """Portable coverage for request admission on the MLX owner thread."""
 
 import asyncio
+import gc
 import importlib
 import sys
 import threading
 import types
+import weakref
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
@@ -225,7 +227,61 @@ async def test_stop_clears_mlx_cache_on_model_owner_thread(batched_module):
 
     await engine.stop()
 
-    assert clear_threads == [owner_thread]
+    # The owner thread flushes before it exits; the final flush, after the
+    # model references are gone, runs on the caller.
+    assert clear_threads == [owner_thread, threading.get_ident()]
+
+
+@pytest.mark.anyio
+async def test_stop_collects_self_referencing_scheduler_before_clearing_cache(
+    batched_module,
+):
+    """Chunked prefill/MTP make the MLLM batch generator self-referential, so
+    dropping BatchedEngine's references alone frees nothing until a cyclic GC
+    pass, which an idle server may never run. stop() must collect before its
+    final clear_cache(), or the weights stay resident after an idle unload."""
+    module, fake_mx = batched_module
+
+    class FakeModel:
+        pass
+
+    class FakeBatchGenerator:
+        def __init__(self, model):
+            self.model = model
+            self._next = lambda: self
+
+    class FakeMLLMScheduler:
+        def __init__(self, model):
+            self.batch_generator = FakeBatchGenerator(model)
+
+        async def stop(self):
+            pass
+
+    model = FakeModel()
+    model_ref = weakref.ref(model)
+    model_alive_at_clear = []
+    fake_mx.clear_cache = lambda: model_alive_at_clear.append(model_ref() is not None)
+
+    engine = object.__new__(module.BatchedEngine)
+    engine._generation_executor = None
+    engine._engine = None
+    engine._mllm_scheduler = FakeMLLMScheduler(model)
+    engine._model = model
+    engine._tokenizer = None
+    engine._processor = object()
+    engine._mllm_instance = None
+    engine._loaded = True
+    del model
+
+    gc_was_enabled = gc.isenabled()
+    gc.disable()
+    try:
+        await engine.stop()
+    finally:
+        if gc_was_enabled:
+            gc.enable()
+
+    assert model_alive_at_clear == [False]
 
 
 @pytest.mark.anyio
