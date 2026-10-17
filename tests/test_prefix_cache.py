@@ -775,7 +775,11 @@ class TestMLLMHybridPrefillCheckpoint:
             MemoryCacheConfig(max_memory_mb=1, min_prefix_tokens=1),
         )
         generator.prefill_step_size = 32
+        # The prompt does not end with the think suffix (thinking disabled),
+        # so no conversation-boundary checkpoint is planned; see
+        # tests/test_mllm_boundary_checkpoint.py for the suffix case.
         generator._think_suffix_len = 2
+        generator._think_suffixes = ((98, 99),)
         generator._aborted_request_ids = set()
         generator._prefill_progress = {}
         generator._prefix_checkpoint_lock = threading.Lock()
@@ -884,7 +888,11 @@ class TestMLLMHybridPrefillCheckpoint:
         generator = MLLMBatchGenerator.__new__(MLLMBatchGenerator)
         generator.prefix_cache = prefix_cache
         generator.prefill_step_size = 32
+        # The prompt does not end with the think suffix (thinking disabled),
+        # so no conversation-boundary checkpoint is planned; see
+        # tests/test_mllm_boundary_checkpoint.py for the suffix case.
         generator._think_suffix_len = 2
+        generator._think_suffixes = ((98, 99),)
         generator._aborted_request_ids = set()
         generator._prefill_progress = {}
         generator._prefix_checkpoint_lock = threading.Lock()
@@ -924,7 +932,11 @@ class TestMLLMHybridPrefillCheckpoint:
         generator = MLLMBatchGenerator.__new__(MLLMBatchGenerator)
         generator.prefix_cache = MagicMock()
         generator.prefill_step_size = 32
+        # The prompt does not end with the think suffix (thinking disabled),
+        # so no conversation-boundary checkpoint is planned; see
+        # tests/test_mllm_boundary_checkpoint.py for the suffix case.
         generator._think_suffix_len = 2
+        generator._think_suffixes = ((98, 99),)
         generator._aborted_request_ids = set()
         generator._prefill_progress = {}
         generator._prefix_checkpoint_lock = threading.Lock()

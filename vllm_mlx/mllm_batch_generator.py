@@ -801,7 +801,14 @@ class MLLMBatchGenerator:
         (typically ``<think>\\n`` = 2 tokens for Qwen3/Qwen3.5).
 
         Returns 0 if the template doesn't support ``enable_thinking``.
+
+        Also records ``_think_suffixes``: the token ids of the think block a
+        generation prompt ends with when thinking is enabled (``<think>\n``)
+        and, if the template appends one, when it is disabled (e.g.
+        ``<think>\n\n</think>\n\n``). Empty when unknown. Hybrid prefill
+        uses them to find a prompt's conversation boundary.
         """
+        self._think_suffixes = ()
         try:
             # Find something with apply_chat_template
             applicator = None
@@ -843,6 +850,27 @@ class MLLMBatchGenerator:
                     suffix_tokens = tokenizer.encode(tag)
                     base_tokens = tokenizer.encode("")
                     suffix_len = len(suffix_tokens) - len(base_tokens)
+                    # The disabled think block is the tail of the disabled
+                    # prompt from its last think opener, when it follows the
+                    # same assistant header (earlier text can differ, e.g. a
+                    # thinking system preamble). Only a short block qualifies.
+                    header = text_with[: -len(tag)]
+                    pos = text_without.rfind(tag.strip())
+                    disabled = text_without[pos:] if pos >= 0 else ""
+                    tail = min(8, len(header))
+                    if len(disabled) > 64 or (
+                        text_without[:pos][-tail:] != header[-tail:]
+                    ):
+                        disabled = ""
+                    self._think_suffixes = tuple(
+                        ids
+                        for ids in (
+                            self._suffix_token_ids(tokenizer, text, base_tokens)
+                            for text in (tag, disabled)
+                            if text
+                        )
+                        if ids
+                    )
                     if suffix_len > 0:
                         logger.info(
                             f"[think_suffix] Detected think tag "
@@ -853,6 +881,15 @@ class MLLMBatchGenerator:
             return 0
         except Exception:
             return 0
+
+    @staticmethod
+    def _suffix_token_ids(tokenizer, text: str, base_tokens) -> Tuple[int, ...]:
+        """Token ids of ``text`` without the tokenizer's ``encode("")`` prefix."""
+        ids = list(tokenizer.encode(text))
+        base = list(base_tokens)
+        if len(ids) <= len(base) or ids[: len(base)] != base:
+            return ()
+        return tuple(int(t) for t in ids[len(base) :])
 
     def close(self) -> None:
         """Release resources and reset wired limit."""
@@ -1410,20 +1447,57 @@ class MLLMBatchGenerator:
             raise RuntimeError("Cannot batch mixed mRoPE and non-mRoPE requests")
         return mx.concatenate(deltas, axis=0)
 
-    def _prefill_checkpoint_plan(self, input_ids, cache_list):
-        """Return ``(token_count, key)`` for a non-rewindable prompt cache."""
+    def _conversation_boundary(self, token_ids: List[int]) -> Optional[int]:
+        """Return the token count before a trailing think suffix, else None.
+
+        A generation prompt ends with the template's think block: ``<think>\\n``
+        with thinking enabled and, for templates such as Qwen3.5's,
+        ``<think>\\n\\n</think>\\n\\n`` with it disabled. Once the turn is
+        replayed as history the template renders that position differently
+        (or drops it), so the full prompt is not a token prefix of the next
+        turn, but the prompt up to the think block is. Prompts that end with
+        neither (no think template) have no boundary.
+        """
+        suffixes = sorted(getattr(self, "_think_suffixes", ()) or (), key=len)
+        for suffix in reversed(suffixes):
+            if 0 < len(suffix) < len(token_ids) and (
+                tuple(token_ids[-len(suffix) :]) == tuple(suffix)
+            ):
+                return len(token_ids) - len(suffix)
+        return None
+
+    def _prefill_checkpoint_plan(self, input_ids, cache_list, start: int = 0):
+        """Return ``(token_count, key)`` for a non-rewindable prompt cache.
+
+        Hybrid recurrent state cannot be rewound, so the only reusable states
+        are those captured exactly at a cache key boundary. When the prompt
+        ends with the think suffix, checkpoint at the conversation boundary
+        (see :meth:`_conversation_boundary`); that entry replaces the
+        full-prompt entry, so the next turn hits it without any rewind and an
+        exact repeat replays only the suffix. Otherwise the full prompt state
+        and its final logits are stored after prefill, as before.
+
+        ``start`` is the number of prompt tokens already restored from the
+        prefix cache; a boundary at or before it is already stored.
+        """
         if self.prefix_cache is None or not self._needs_prefill_checkpoint(cache_list):
             return None, None
-        # Hybrid recurrent state cannot be replayed from a numerically exact
-        # mid-prompt split on every backend. Store the full prompt state and
-        # its final logits instead; exact hits can then start generation
-        # without replaying or rewinding recurrent state.
-        return None, None
+        token_ids = input_ids.reshape(-1).tolist()
+        boundary = self._conversation_boundary(token_ids)
+        if boundary is None or boundary <= start:
+            return None, None
+        return boundary, token_ids[:boundary]
 
     def _publish_prefill_checkpoint(
-        self, request_id: str, checkpoint_entry: Any
+        self, request_id: str, checkpoint_entry: Any, *, evict_prefixes: bool = False
     ) -> bool:
-        """Publish one checkpoint without racing cancellation ownership."""
+        """Publish one checkpoint without racing cancellation ownership.
+
+        ``evict_prefixes`` drops stored entries whose key is a strict prefix
+        of this one. Prefill that started from a prefix-cache hit passes True:
+        its entry extends the one it was restored from and supersedes it, so a
+        growing conversation holds one entry instead of one per turn.
+        """
         if checkpoint_entry is None:
             return False
         checkpoint_key = list(checkpoint_entry.tokens)
@@ -1445,7 +1519,7 @@ class MLLMBatchGenerator:
 
         stored = self.prefix_cache.commit_prepared(
             checkpoint_entry,
-            evict_prefixes=False,
+            evict_prefixes=evict_prefixes,
             commit_lock=self._prefix_checkpoint_lock,
             commit_guard=_commit_allowed,
         )
@@ -1459,8 +1533,43 @@ class MLLMBatchGenerator:
             raise PrefillAbortedError(request_id)
         return stored
 
+    def _publish_prompt_state(
+        self,
+        req: MLLMBatchRequest,
+        cache: List[Any],
+        last_logits: Any,
+        *,
+        extends_cached: bool,
+    ) -> None:
+        """Publish a hybrid prompt's full state and final logits after prefill.
+
+        Only for non-rewindable (hybrid) caches: ordinary KV caches are stored
+        on completion instead. Skipped when the prompt ends with the think
+        suffix, because prefill already published its conversation-boundary
+        checkpoint, which replaces this entry (see _prefill_checkpoint_plan).
+        ``extends_cached`` marks prefill that resumed from a prefix-cache hit;
+        the new entry then supersedes the one it was restored from.
+        """
+        if (
+            self.prefix_cache is None
+            or not is_text_only_prefix_cache_request(req)
+            or not self._needs_prefill_checkpoint(cache)
+            or not callable(getattr(self.prefix_cache, "prepare_store", None))
+        ):
+            return
+        token_ids = req.input_ids.reshape(-1).tolist()
+        if self._conversation_boundary(token_ids) is not None:
+            return
+        entry = self.prefix_cache.prepare_store(
+            token_ids, cache, auxiliary={"last_logits": last_logits}
+        )
+        if entry is not None:
+            self._publish_prefill_checkpoint(
+                req.request_id, entry, evict_prefixes=extends_cached
+            )
+
     def _run_chunked_text_prefill(
-        self, request: MLLMBatchRequest, cache: List[Any]
+        self, request: MLLMBatchRequest, cache: List[Any], start: int = 0
     ) -> mx.array:
         """
         Run prefill in chunks for text-only requests, reporting real progress.
@@ -1468,6 +1577,10 @@ class MLLMBatchGenerator:
         Processes input_ids in prefill_step_size chunks through the language
         model, updating ``_prefill_progress`` after each chunk so the status
         endpoint can report accurate prefill percentage.
+
+        ``start`` is the number of leading prompt tokens already held by
+        ``cache`` (a prefix-cache hit); prefill resumes there. Positions and
+        the hybrid checkpoint plan stay absolute.
 
         Returns:
             Logits from the last chunk (same contract as _run_vision_encoding).
@@ -1479,16 +1592,18 @@ class MLLMBatchGenerator:
         total = input_ids.shape[1]
         step = self.prefill_step_size
 
-        checkpoint_at, checkpoint_key = self._prefill_checkpoint_plan(input_ids, cache)
+        checkpoint_at, checkpoint_key = self._prefill_checkpoint_plan(
+            input_ids, cache, start
+        )
 
         # Short prompts without a required hybrid checkpoint can avoid the
         # chunk loop while retaining request-local mRoPE inputs.
-        if total <= step and checkpoint_at is None:
+        if total - start <= step and checkpoint_at is None:
             self._prefill_progress[request.request_id] = (total, total)
             output = self.language_model(
-                input_ids,
+                input_ids[:, start:],
                 cache=cache,
-                **self._language_model_kwargs(request, 0, total),
+                **self._language_model_kwargs(request, start, total),
             )
             if request.request_id in self._aborted_request_ids:
                 self._aborted_request_ids.discard(request.request_id)
@@ -1500,13 +1615,13 @@ class MLLMBatchGenerator:
                 return output.logits
             return output
 
-        if total > step or checkpoint_at is not None:
+        if total - start > step or checkpoint_at is not None:
             logger.info(
                 f"[chunked_prefill] Starting {request.request_id[:12]}: "
-                f"{total} tokens, step={step}"
+                f"{total - start} tokens (cached={start}), step={step}"
             )
 
-        processed = 0
+        processed = start
         chunk_count = 0
         output = None
         checkpoint_entry = None
@@ -1594,7 +1709,9 @@ class MLLMBatchGenerator:
             # existing lazy sampling path.
             _eval_prompt_cache(cache)
             mx.eval(final_output)
-            self._publish_prefill_checkpoint(request.request_id, checkpoint_entry)
+            self._publish_prefill_checkpoint(
+                request.request_id, checkpoint_entry, evict_prefixes=start > 0
+            )
         elif request.request_id in self._aborted_request_ids:
             self._aborted_request_ids.discard(request.request_id)
             raise PrefillAbortedError(request.request_id)
@@ -2092,86 +2209,25 @@ class MLLMBatchGenerator:
                     # Prefix/LCP match — run language model on remaining tokens.
                     # The prepared cache is an isolated recursive copy.
                     request_cache = prepared_cache
-                    remaining = mx.array(remaining_ids)[None, :]
                     cached_count = len(input_ids_list) - len(remaining_ids)
-                    total_tokens = len(input_ids_list)
                     remaining_count = len(remaining_ids)
 
                     with mx.stream(MLLMBatchGenerator._stream):
-                        step = self.prefill_step_size
-                        if remaining_count <= step:
-                            # Short remaining — process in one shot
-                            self._prefill_progress[req.request_id] = (
-                                total_tokens,
-                                total_tokens,
-                            )
-                            logits = self.language_model(
-                                remaining,
-                                cache=request_cache,
-                                **self._language_model_kwargs(
-                                    req, cached_count, total_tokens
-                                ),
-                            )
-                        else:
-                            # Chunked prefill on remaining tokens
-                            self._prefill_progress[req.request_id] = (
-                                cached_count,
-                                total_tokens,
-                            )
-                            processed = 0
-                            chunk_count = 0
-                            while processed + step < remaining_count:
-                                # Check for abort between chunks
-                                if req.request_id in self._aborted_request_ids:
-                                    self._aborted_request_ids.discard(req.request_id)
-                                    logger.info(
-                                        f"[chunked_prefill] Aborted {req.request_id} "
-                                        f"at {cached_count + processed}/{total_tokens} tokens"
-                                    )
-                                    raise PrefillAbortedError(req.request_id)
-
-                                chunk = remaining[:, processed : processed + step]
-                                self.language_model(
-                                    chunk,
-                                    cache=request_cache,
-                                    **self._language_model_kwargs(
-                                        req,
-                                        cached_count + processed,
-                                        cached_count + processed + chunk.shape[1],
-                                    ),
-                                )
-                                # Eval ALL cache types (see _run_chunked_text_prefill)
-                                _eval_prompt_cache(request_cache)
-                                processed += step
-                                chunk_count += 1
-                                self._prefill_progress[req.request_id] = (
-                                    cached_count + processed,
-                                    total_tokens,
-                                )
-                                if chunk_count % 4 == 0:
-                                    mx.clear_cache()
-                            # Last chunk — return logits
-                            remaining = remaining[:, processed:]
-                            logits = self.language_model(
-                                remaining,
-                                cache=request_cache,
-                                **self._language_model_kwargs(
-                                    req,
-                                    cached_count + processed,
-                                    total_tokens,
-                                ),
-                            )
-                            self._prefill_progress[req.request_id] = (
-                                total_tokens,
-                                total_tokens,
-                            )
-
+                        # Same chunked prefill as a miss, resumed at the restored
+                        # prefix, so a hit can publish its own (longer) reusable
+                        # state for the next turn.
+                        logits = self._run_chunked_text_prefill(
+                            req, request_cache, start=cached_count
+                        )
                         if hasattr(logits, "logits"):
                             logits = logits.logits
 
                         last_logits = logits[:, -1, :]
 
                         sampled, logprobs = _sample_first_token(req, last_logits)
+                        self._publish_prompt_state(
+                            req, request_cache, last_logits, extends_cached=True
+                        )
 
                         first_tokens.append(sampled.item())
                         all_logprobs.append(logprobs.squeeze(0))
@@ -2270,21 +2326,9 @@ class MLLMBatchGenerator:
                         # copy, so sampling must complete before that barrier.
                         sampled, logprobs = _sample_first_token(req, last_logits)
 
-                        if (
-                            self.prefix_cache is not None
-                            and is_text_only_prefix_cache_request(req)
-                            and self._needs_prefill_checkpoint(request_cache)
-                            and callable(
-                                getattr(self.prefix_cache, "prepare_store", None)
-                            )
-                        ):
-                            entry = self.prefix_cache.prepare_store(
-                                req.input_ids.reshape(-1).tolist(),
-                                request_cache,
-                                auxiliary={"last_logits": last_logits},
-                            )
-                            if entry is not None:
-                                self._publish_prefill_checkpoint(req.request_id, entry)
+                        self._publish_prompt_state(
+                            req, request_cache, last_logits, extends_cached=False
+                        )
 
                         first_tokens.append(sampled.item())
                         all_logprobs.append(logprobs.squeeze(0))
@@ -3890,10 +3934,17 @@ def install_chunked_prefill_mllm(
                 # Snapshot only after first-token sampling has materialized.
                 # The stored auxiliary remains the raw prompt logits, before
                 # request-local processors are applied.
+                # A prompt ending with the think suffix already holds its
+                # conversation-boundary checkpoint, which replaces this entry.
+                extends_cached = partial["cached_count"] > 0
                 if (
                     getattr(batch_gen, "prefix_cache", None) is not None
                     and is_text_only_prefix_cache_request(req)
                     and batch_gen._needs_prefill_checkpoint(partial["cache"])
+                    and batch_gen._conversation_boundary(
+                        req.input_ids.reshape(-1).tolist()
+                    )
+                    is None
                 ):
                     full_prompt_entry = batch_gen.prefix_cache.prepare_store(
                         req.input_ids.reshape(-1).tolist(),
@@ -3903,7 +3954,9 @@ def install_chunked_prefill_mllm(
                     if full_prompt_entry is not None:
                         try:
                             batch_gen._publish_prefill_checkpoint(
-                                req.request_id, full_prompt_entry
+                                req.request_id,
+                                full_prompt_entry,
+                                evict_prefixes=extends_cached,
                             )
                         except PrefillAbortedError:
                             batch_gen._partial = None
@@ -3924,7 +3977,9 @@ def install_chunked_prefill_mllm(
                 if checkpoint_entry is not None:
                     try:
                         batch_gen._publish_prefill_checkpoint(
-                            req.request_id, checkpoint_entry
+                            req.request_id,
+                            checkpoint_entry,
+                            evict_prefixes=extends_cached,
                         )
                     except PrefillAbortedError:
                         batch_gen._partial = None
@@ -4181,12 +4236,11 @@ def install_chunked_prefill_mllm(
                     cached_count = 0
                     remaining_count = total_tokens
 
-                checkpoint_at = None
-                checkpoint_key = None
-                if cached_count == 0:
-                    checkpoint_at, checkpoint_key = batch_gen._prefill_checkpoint_plan(
-                        input_ids, request_cache
-                    )
+                # Absolute token position; also planned after a prefix hit so
+                # each turn leaves a reusable state for the next one.
+                checkpoint_at, checkpoint_key = batch_gen._prefill_checkpoint_plan(
+                    input_ids, request_cache, cached_count
+                )
 
                 # Decide: interleave or immediate
                 if remaining_count > batch_gen._chunked_prefill_budget:
@@ -4215,8 +4269,11 @@ def install_chunked_prefill_mllm(
                     # Process first chunk immediately
                     step = batch_gen._chunked_prefill_budget
                     take = min(step, remaining_count)
-                    if checkpoint_at is not None and checkpoint_at < take:
-                        take = checkpoint_at
+                    if (
+                        checkpoint_at is not None
+                        and cached_count < checkpoint_at < cached_count + take
+                    ):
+                        take = checkpoint_at - cached_count
                     tic = time.perf_counter()
                     batch_gen.language_model(
                         remaining[:, :take],
@@ -4229,7 +4286,10 @@ def install_chunked_prefill_mllm(
                     batch_gen._partial["remaining_ids"] = remaining[:, take:]
                     batch_gen._partial["processed"] = take
                     batch_gen._partial["chunk_count"] = 1
-                    if checkpoint_at is not None and take == checkpoint_at:
+                    if (
+                        checkpoint_at is not None
+                        and cached_count + take == checkpoint_at
+                    ):
                         checkpoint_snapshot = batch_gen._rewind_prefix_cache(
                             request_cache, 0
                         )
