@@ -115,7 +115,9 @@ def _sampling_logprobs(logits: mx.array, request: Any) -> mx.array:
     if temperature in (0, 0.0):
         token = mx.argmax(logprobs, axis=-1)
         result = mx.full(logprobs.shape, -float("inf"))
-        return mx.put_along_axis(result, token[:, None], 0.0, axis=-1)
+        # put_along_axis requires an array for values, not a Python scalar.
+        zero = mx.zeros(token[:, None].shape, dtype=result.dtype)
+        return mx.put_along_axis(result, token[:, None], zero, axis=-1)
 
     if 0.0 < top_p < 1.0:
         logprobs = apply_top_p(logprobs, top_p)

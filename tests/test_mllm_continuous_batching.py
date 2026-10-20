@@ -2001,6 +2001,110 @@ class TestMLLMBatchGeneratorMTPGuards:
         assert not _accept_sampled_draft(-2.1, -0.1, 0.99)
         assert _accept_sampled_draft(-2.1, -0.1, 0.01)
 
+    def test_greedy_sampling_logprobs_is_one_hot_distribution(self):
+        """temperature=0 must not raise and must select only the argmax.
+
+        Regression: the greedy branch passed a float to ``mx.put_along_axis``,
+        so a greedy request in a stochastic batch failed every MTP verify and
+        degenerated into repeating output, corrupting every row of the batch.
+        """
+        from vllm_mlx.mllm_batch_generator import _sampling_logprobs
+
+        request = SimpleNamespace(temperature=0.0, top_p=1.0, top_k=0, min_p=0.0)
+        logits = mx.array([[1.0, 3.0, 2.0, 0.0], [5.0, 1.0, 1.0, 2.0]])
+        logprobs = _sampling_logprobs(logits, request)
+        probs = mx.exp(logprobs)
+        mx.eval(logprobs, probs)
+
+        assert float(logprobs[0, 1]) == 0.0
+        assert bool(mx.all(mx.isinf(logprobs[0][mx.array([0, 2, 3])])))
+        assert float(logprobs[1, 0]) == 0.0
+        assert bool(mx.all(mx.isinf(logprobs[1][mx.array([1, 2, 3])])))
+        assert probs.sum(axis=-1).tolist() == pytest.approx([1.0, 1.0])
+        # Row 1 picks index 0, not a higher column.
+        assert mx.argmax(logprobs, axis=-1).tolist() == [1, 0]
+
+    def test_greedy_mixed_into_stochastic_batch_verifies(self):
+        """A greedy request in a stochastic batch must verify without errors.
+
+        ``uses_stochastic_sampling`` is batch-wide, so one stochastic row
+        routes the greedy row through ``_sampling_logprobs`` too.
+        """
+        from vllm_mlx.mllm_batch_generator import install_mtp_mllm
+
+        greedy = SimpleNamespace(
+            uid=10,
+            request_id="greedy",
+            temperature=0.0,
+            top_p=1.0,
+            top_k=0,
+            min_p=0.0,
+            mllm_draft=True,
+        )
+        stochastic = SimpleNamespace(
+            uid=20,
+            request_id="stochastic",
+            temperature=0.7,
+            top_p=0.9,
+            top_k=0,
+            min_p=0.0,
+            mllm_draft=True,
+        )
+
+        class Batch:
+            def __init__(self):
+                self.uids = [10, 20]
+                self.requests = [greedy, stochastic]
+
+            def __len__(self):
+                return 2
+
+        class Generator:
+            def __init__(self):
+                self.active_batch = Batch()
+                self._step = self._original_step
+                self._next = lambda: []
+                self.sampler = lambda logprobs: mx.argmax(logprobs, axis=-1)
+
+            @staticmethod
+            def _original_step(*_args, **_kwargs):
+                raise AssertionError("mixed MTP batch must not take the bypass path")
+
+        class LanguageModel:
+            def __init__(self):
+                self.mtp_calls = 0
+
+            def mtp_forward(self, hidden_states, next_token_ids, mtp_cache=None):
+                self.mtp_calls += 1
+                del hidden_states, next_token_ids, mtp_cache
+                return mx.array([[[1.0, 2.0, 0.5]], [[1.0, 2.0, 0.5]]])
+
+            def __call__(self, input_tokens, cache=None, return_hidden=False):
+                del cache, return_hidden
+                batch_size, seq_len = input_tokens.shape
+                logits = mx.full((batch_size, seq_len, 3), -3.0)
+                logits[:, :, 1] = 4.0
+                return logits, mx.zeros((batch_size, seq_len, 2))
+
+        generator = Generator()
+        model = LanguageModel()
+        install_mtp_mllm(generator, model)
+
+        tokens, _ = generator._step(
+            mx.array([[0], [0]], dtype=mx.uint32),
+            cache=[],
+            logits_processors=None,
+            output_tokens=None,
+            samplers=None,
+        )
+
+        assert model.mtp_calls == 1
+        stats = generator.get_mtp_stats()
+        assert stats["attempted"] == 1
+        assert stats["errors"] == 0
+        assert stats["accepted"] + stats["rejected"] == 1
+        assert tokens.shape == (2,)
+
     def test_sampled_mtp_attempts_request_with_normal_sampling(self):
         from vllm_mlx.mllm_batch_generator import install_mtp_mllm
 
