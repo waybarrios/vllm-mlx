@@ -2392,6 +2392,54 @@ def _validate_model_name(request_model: str) -> None:
         )
 
 
+# Muse Glimmer's ATEM protocol routes each assistant turn by an unprefixed
+# recipient name: "self" is the reasoning channel, "user" is the final-answer
+# channel, and any other value addresses a tool. A tool named "self" or
+# "user" would authorize a channel open a constrained decoder can't tell
+# apart from those two reserved channels; reject the name at request time
+# instead of relying on the parser to guess correctly afterwards (matching
+# upstream vLLM's muse_glimmer tool-name validation).
+_MUSE_GLIMMER_RESERVED_TOOL_NAMES = frozenset({"self", "user"})
+
+
+def _tool_names_from_request_tools(tools) -> list[str]:
+    """Extract tool names from OpenAI-, Responses-, or Anthropic-shaped tools."""
+    names = []
+    for tool in tools or []:
+        if isinstance(tool, dict):
+            function = tool.get("function")
+            name = tool.get("name") or (
+                function.get("name") if isinstance(function, dict) else None
+            )
+        else:
+            name = getattr(tool, "name", None)
+            if name is None:
+                function = getattr(tool, "function", None)
+                if isinstance(function, dict):
+                    name = function.get("name")
+        if name:
+            names.append(name)
+    return names
+
+
+def _validate_muse_glimmer_tool_names(tools) -> None:
+    """Reject tool names that collide with Muse Glimmer's reserved recipients."""
+    if _tool_call_parser != "muse_glimmer":
+        return
+    collisions = sorted(
+        set(_tool_names_from_request_tools(tools)) & _MUSE_GLIMMER_RESERVED_TOOL_NAMES
+    )
+    if collisions:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Tool name(s) {collisions} are reserved by the muse_glimmer "
+                "ATEM protocol ('self' is the reasoning channel, 'user' is "
+                "the answer channel) and cannot be used as tool names."
+            ),
+        )
+
+
 def _get_engine_tokenizer(engine: BaseEngine | None) -> object | None:
     """Return tokenizer-like parser state from the active engine."""
     if engine is None:
@@ -2952,6 +3000,7 @@ def _prepare_responses_request(
 ) -> tuple[BaseEngine, ChatCompletionRequest, list[dict], dict]:
     """Prepare a Responses request for execution on the chat engine."""
     _validate_model_name(request.model)
+    _validate_muse_glimmer_tool_names(request.tools)
     engine = get_engine()
     chat_request = _responses_request_to_chat_request(request)
 
@@ -5919,6 +5968,7 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
     ```
     """
     _validate_model_name(request.model)
+    _validate_muse_glimmer_tool_names(request.tools)
     effective_max_tokens = _resolve_request_max_tokens(request.max_tokens)
     _raise_if_outlines_response_format_requested(request.response_format)
     await _preflight_response_format_backend(raw_request)
@@ -6353,6 +6403,7 @@ async def create_anthropic_message(
     anthropic_request = AnthropicRequest(**body)
 
     _validate_model_name(anthropic_request.model)
+    _validate_muse_glimmer_tool_names(anthropic_request.tools)
     effective_max_tokens = _resolve_request_max_tokens(anthropic_request.max_tokens)
 
     # --- Detailed request logging ---
@@ -7284,7 +7335,12 @@ async def stream_chat_completion(
                 # blocks, so reasoning parser captures tool call XML as
                 # reasoning while content stays None.  Redirect reasoning
                 # to the content stream so the tool parser can handle it.
-                if tool_parser and reasoning and not content:
+                if (
+                    tool_parser
+                    and reasoning
+                    and not content
+                    and tool_parser.TOOL_MARKUP_IN_REASONING
+                ):
                     _check = tool_accumulated_text + reasoning
                     if _streaming_tool_markup_possible(_check, tool_parser):
                         content = reasoning
