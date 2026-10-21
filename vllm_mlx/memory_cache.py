@@ -822,48 +822,58 @@ def _detach_cache_for_storage(
         return layer
 
     detached: list[Any] = []
-    for layer in cache:
-        try:
-            detached.append(_detach_layer(layer))
-        except UndetachableCacheError:
-            raise
-        except Exception as e:
-            raise UndetachableCacheError(
-                f"failed to snapshot {type(layer).__name__}: "
-                f"{type(e).__name__}: {e}"
-            ) from e
-
-    if is_root and mx is not None:
-        # Verified postcondition, not assumed branch coverage: no MLX array
-        # in the snapshot may be the same object as one in the live input.
-        # Branch dispatch above is heuristic (every mlx_lm ``_BaseCache``
-        # subclass inherits a default ``state`` property returning ``[]``,
-        # so the state branch matches layers whose arrays live elsewhere
-        # and would "detach" an empty state, aliasing the rest).  Checking
-        # object identity after the fact closes that hole for any layer
-        # shape, present or future.
-        live_ids: set[int] = set()
-        snap_ids: set[int] = set()
+    try:
         for layer in cache:
-            _collect_mx_array_ids(layer, mx, live_ids)
-        for layer in detached:
-            _collect_mx_array_ids(layer, mx, snap_ids)
-        if live_ids & snap_ids:
-            raise UndetachableCacheError(
-                "snapshot still aliases live cache arrays (layer carries "
-                "arrays its state/keys view does not expose)"
-            )
+            try:
+                detached.append(_detach_layer(layer))
+            except UndetachableCacheError:
+                raise
+            except Exception as e:
+                raise UndetachableCacheError(
+                    f"failed to snapshot {type(layer).__name__}: "
+                    f"{type(e).__name__}: {e}"
+                ) from e
 
-    if is_root and eval_targets:
-        try:
-            mx.eval(*eval_targets)
-        except Exception as e:
-            # e.g. stream-affinity RuntimeError when arrays belong to a
-            # stream whose thread has exited.  store() must reject, not
-            # raise — several call sites have no enclosing try.
-            raise UndetachableCacheError(
-                f"failed to materialize snapshot: {type(e).__name__}: {e}"
-            ) from e
+        if is_root and mx is not None:
+            # Verified postcondition, not assumed branch coverage: no MLX array
+            # in the snapshot may be the same object as one in the live input.
+            # Branch dispatch above is heuristic (every mlx_lm ``_BaseCache``
+            # subclass inherits a default ``state`` property returning ``[]``,
+            # so the state branch matches layers whose arrays live elsewhere
+            # and would "detach" an empty state, aliasing the rest).  Checking
+            # object identity after the fact closes that hole for any layer
+            # shape, present or future.
+            live_ids: set[int] = set()
+            snap_ids: set[int] = set()
+            for layer in cache:
+                _collect_mx_array_ids(layer, mx, live_ids)
+            for layer in detached:
+                _collect_mx_array_ids(layer, mx, snap_ids)
+            if live_ids & snap_ids:
+                raise UndetachableCacheError(
+                    "snapshot still aliases live cache arrays (layer carries "
+                    "arrays its state/keys view does not expose)"
+                )
+
+        if is_root and eval_targets:
+            try:
+                mx.eval(*eval_targets)
+            except Exception as e:
+                # e.g. stream-affinity RuntimeError when arrays belong to a
+                # stream whose thread has exited.  store() must reject, not
+                # raise — several call sites have no enclosing try.
+                raise UndetachableCacheError(
+                    f"failed to materialize snapshot: {type(e).__name__}: {e}"
+                ) from e
+    finally:
+        if is_root:
+            # The nested helpers form a reference cycle (_detach_container
+            # recurses through its own closure cell) that also reaches
+            # eval_targets. Empty it so that garbage cannot pin every
+            # detached array, i.e. a full copy of the snapshot, after the
+            # entry is evicted or the replay clone is dropped, until the
+            # next cyclic GC pass.
+            eval_targets.clear()
 
     return detached
 

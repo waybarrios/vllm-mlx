@@ -3123,7 +3123,10 @@ class TestChunkedPrefillCacheHandling:
         )
 
         gen = self._make_fake_batch_gen()
+        # Prompt [1..10] does not end with the think suffix, so the full
+        # prompt state and its logits are published (no boundary split).
         gen._think_suffix_len = 2
+        gen._think_suffixes = ((98, 99),)
         gen.prefix_cache = MemoryAwarePrefixCache(
             MagicMock(),
             MemoryCacheConfig(max_memory_mb=1, min_prefix_tokens=1),
@@ -3238,6 +3241,97 @@ class TestChunkedPrefillCacheHandling:
         assert stored[1].keys.shape[2] == 10
         assert stored[1].keys.reshape(-1).tolist() == list(range(1, 11))
 
+    def _run_interleaved(self, gen, request_id, tokens, max_steps=20):
+        from vllm_mlx.mllm_batch_generator import MLLMBatchRequest
+
+        req = MLLMBatchRequest(uid=len(request_id), request_id=request_id, prompt="x")
+        req.input_ids = mx.array([tokens])
+        req.is_text_only = True
+        req.temperature = 0.0
+        req.top_p = 1.0
+        gen.active_batch = None
+        gen.unprocessed_requests.append(req)
+        for _ in range(max_steps):
+            gen._next()
+            if gen._partial is None and req not in gen.unprocessed_requests:
+                return req
+        raise AssertionError("interleaved prefill did not finish")
+
+    def _interleaved_hybrid_gen(self, monkeypatch):
+        from mlx_lm.models.cache import ArraysCache, KVCache
+
+        from vllm_mlx.memory_cache import MemoryAwarePrefixCache, MemoryCacheConfig
+        from vllm_mlx.mllm_batch_generator import install_chunked_prefill_mllm
+
+        gen = self._make_fake_batch_gen()
+        gen._think_suffix_len = 2
+        gen._think_suffixes = ((98, 99),)
+        gen.prefix_cache = MemoryAwarePrefixCache(
+            MagicMock(),
+            MemoryCacheConfig(max_memory_mb=1, min_prefix_tokens=1),
+        )
+        monkeypatch.setattr(
+            "mlx_lm.models.cache.make_prompt_cache",
+            lambda *_args, **_kwargs: [ArraysCache(size=1), KVCache()],
+        )
+        chunks = []
+
+        class LanguageModel:
+            def __call__(self, tokens, cache, **_kwargs):
+                chunks.append(tokens.reshape(-1).tolist())
+                previous = 0 if cache[0][0] is None else int(cache[0][0].item())
+                cache[0][0] = mx.array([[previous + tokens.shape[1]]])
+                start = int(cache[1].offset)
+                values = mx.arange(start + 1, start + 1 + tokens.shape[1]).reshape(
+                    1, 1, -1, 1
+                )
+                cache[1].update_and_fetch(values, values + 100)
+                return mx.zeros((1, tokens.shape[1], 4))
+
+        gen.language_model = LanguageModel()
+        gen.stop_tokens = {1}
+        gen._next = lambda: []
+        gen._preprocess_request = lambda _: None
+        install_chunked_prefill_mllm(gen, budget=4)
+        return gen, chunks
+
+    def test_interleaved_hybrid_checkpoints_at_think_suffix_boundary(self, monkeypatch):
+        gen, chunks = self._interleaved_hybrid_gen(monkeypatch)
+        turn1 = [1, 2, 3, 4, 5, 6, 7, 8, 9, 98, 99]
+
+        self._run_interleaved(gen, "turn1", turn1)
+
+        # Chunks stop exactly at the boundary (9), then run the suffix; any
+        # later single-token calls are decode steps.
+        assert chunks[:4] == [[1, 2, 3, 4], [5, 6, 7, 8], [9], [98, 99]]
+        assert all(len(chunk) == 1 for chunk in chunks[4:])
+        assert sorted(gen.prefix_cache._entries) == [tuple(turn1[:9])]
+        assert gen.prefix_cache.fetch_exact_auxiliary(turn1) is None
+        stored, remaining = gen.prefix_cache.fetch(turn1[:9])
+        assert remaining == []
+        assert int(stored[0][0].item()) == 9
+        assert stored[1].offset == 9
+
+    def test_interleaved_hybrid_hit_checkpoints_next_boundary(self, monkeypatch):
+        gen, chunks = self._interleaved_hybrid_gen(monkeypatch)
+        turn1 = [1, 2, 3, 4, 5, 6, 7, 8, 9, 98, 99]
+        self._run_interleaved(gen, "turn1", turn1)
+        chunks.clear()
+
+        turn2 = [*turn1[:9], 50, 51, 52, 53, 54, 55, 98, 99]
+        self._run_interleaved(gen, "turn2", turn2)
+
+        # Resumes at 9; the boundary (15) splits the second chunk. Positions
+        # are absolute even though prefill started from a cache hit.
+        assert chunks[:3] == [[50, 51, 52, 53], [54, 55], [98, 99]]
+        assert all(len(chunk) == 1 for chunk in chunks[3:])
+        # Turn 2's boundary supersedes the turn-1 entry it was restored from.
+        assert sorted(gen.prefix_cache._entries) == [tuple(turn2[:15])]
+        stored, remaining = gen.prefix_cache.fetch(turn2[:15])
+        assert remaining == []
+        assert int(stored[0][0].item()) == 15
+        assert stored[1].offset == 15
+
     def test_interleaved_abort_during_checkpoint_commit_is_request_local(self):
         from types import SimpleNamespace
 
@@ -3315,8 +3409,9 @@ class TestChunkedPrefillCacheHandling:
             "checkpoint_entry": None,
         }
 
-        def publish(_request_id, entry):
+        def publish(_request_id, entry, *, evict_prefixes=False):
             assert entry is full_prompt_entry
+            assert evict_prefixes is False  # cold prefill evicts nothing
             raise PrefillAbortedError(req.request_id)
 
         gen._publish_prefill_checkpoint = publish
