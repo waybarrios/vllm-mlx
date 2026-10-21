@@ -1164,3 +1164,41 @@ def test_quant_signature_differs_on_threshold():
         "kv_min_quantize_tokens": 256,
     }
     assert _quant_signature_from_config(first) != _quant_signature_from_config(second)
+
+
+def test_detached_snapshot_is_freed_without_a_gc_pass():
+    """Dropping a detached snapshot must free its arrays immediately.
+
+    The detach helpers are nested closures that form a reference cycle; if
+    that cycle still reached the list of freshly detached arrays, every
+    evicted entry or dropped replay clone would stay allocated until the next
+    cyclic GC pass, which an idle server may not run for a long time.
+    """
+    import gc
+
+    mx = pytest.importorskip("mlx.core")
+    pytest.importorskip("mlx.nn")
+    from mlx_lm.models.cache import KVCache
+
+    from vllm_mlx.memory_cache import _detach_cache_for_storage
+
+    cache = KVCache()
+    keys = mx.ones((1, 2, 2048, 64))
+    cache.update_and_fetch(keys, keys)
+    mx.eval(cache.keys, cache.values)
+
+    gc.collect()
+    gc.disable()
+    try:
+        # Command buffers release their arrays on completion, so synchronize
+        # before each reading.
+        mx.synchronize()
+        before = mx.get_active_memory()
+        snapshot = _detach_cache_for_storage([cache])
+        mx.synchronize()
+        assert mx.get_active_memory() > before
+        del snapshot
+        mx.synchronize()
+        assert mx.get_active_memory() <= before
+    finally:
+        gc.enable()
