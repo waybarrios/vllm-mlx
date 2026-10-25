@@ -3552,13 +3552,19 @@ def _explicit_reasoning_markers_present(text: str, parser=None) -> bool:
     active_parser = parser if parser is not None else _reasoning_parser
     if not active_parser:
         return False
+    # A parser may know model-specific shapes of a reasoning block written
+    # without its opener (Gemma 4), which the check below cannot see.
+    own_check = getattr(active_parser, "thinking_off_markers_present", None)
+    if callable(own_check) and own_check(text):
+        return True
     start = getattr(active_parser, "start_token", None)
     if start and start in text:
         return True
     end = getattr(active_parser, "end_token", None)
     # Think-tag parsers accept a closing tag without an opening tag when the
-    # prompt seeded reasoning. Gemma's <channel|> can also be ordinary text,
-    # so require a channel opener before activating that parser.
+    # prompt seeded reasoning. <channel|> can also be ordinary text, so it
+    # does not activate a parser here; Gemma 4 decides through
+    # thinking_off_markers_present() above.
     return bool(end and end != "<channel|>" and end in text)
 
 
