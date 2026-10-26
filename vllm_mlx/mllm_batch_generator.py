@@ -115,7 +115,9 @@ def _sampling_logprobs(logits: mx.array, request: Any) -> mx.array:
     if temperature in (0, 0.0):
         token = mx.argmax(logprobs, axis=-1)
         result = mx.full(logprobs.shape, -float("inf"))
-        return mx.put_along_axis(result, token[:, None], 0.0, axis=-1)
+        # put_along_axis requires an array for values, not a Python scalar.
+        zero = mx.zeros(token[:, None].shape, dtype=result.dtype)
+        return mx.put_along_axis(result, token[:, None], zero, axis=-1)
 
     if 0.0 < top_p < 1.0:
         logprobs = apply_top_p(logprobs, top_p)
@@ -3254,8 +3256,10 @@ def install_mtp_mllm(
             # check was valid only for greedy decoding and silently bypassed
             # Qwen's normal temperature/top-p/top-k requests.
             draft_list = draft_tokens.tolist()
-            residual_tokens_by_uid: Dict[int, int] = {}
-            residual_logprobs_by_uid: Dict[int, mx.array] = {}
+            # Per-row emitted suffix for the drafted position: (token, logprob
+            # source, accepted). Empty for the all-greedy batch path, where the
+            # next step's argmax already reproduces greedy decoding.
+            emitted_by_uid: Dict[int, tuple] = {}
             if uses_stochastic_sampling and external_drafter:
                 verify_distribution = mx.concatenate(
                     [
@@ -3273,8 +3277,11 @@ def install_mtp_mllm(
                 if not all_accepted:
                     sampled_target_list = sampled_target.tolist()
                     for row, uid in enumerate(current_uids):
-                        residual_tokens_by_uid[uid] = int(sampled_target_list[row])
-                        residual_logprobs_by_uid[uid] = verify_distribution[row]
+                        emitted_by_uid[uid] = (
+                            int(sampled_target_list[row]),
+                            verify_distribution[row],
+                            False,
+                        )
             elif uses_stochastic_sampling:
                 verify_distribution = mx.concatenate(
                     [
@@ -3288,21 +3295,44 @@ def install_mtp_mllm(
                 all_accepted = True
                 for row, uid in enumerate(current_uids):
                     draft_token = int(draft_list[row])
-                    accepted = _accept_sampled_draft(
-                        float(verify_distribution[row, draft_token].item()),
-                        float(draft_distribution[row, draft_token].item()),
-                        float(draws[row].item()),
-                    )
-                    all_accepted = all_accepted and accepted
-                    if not accepted and batch_size == 1:
-                        residual = _residual_logprobs(
-                            verify_distribution[row : row + 1],
-                            draft_distribution[row : row + 1],
+                    if sampled_rows[row]:
+                        accepted = _accept_sampled_draft(
+                            float(verify_distribution[row, draft_token].item()),
+                            float(draft_distribution[row, draft_token].item()),
+                            float(draws[row].item()),
                         )
-                        residual_token = mx.random.categorical(residual)
-                        mx.eval(residual_token)
-                        residual_tokens_by_uid[uid] = int(residual_token.item())
-                        residual_logprobs_by_uid[uid] = residual[0]
+                        if accepted:
+                            emitted_by_uid[uid] = (
+                                draft_token,
+                                verify_distribution[row],
+                                True,
+                            )
+                        else:
+                            residual = _residual_logprobs(
+                                verify_distribution[row : row + 1],
+                                draft_distribution[row : row + 1],
+                            )
+                            residual_token = mx.random.categorical(residual)
+                            mx.eval(residual_token)
+                            emitted_by_uid[uid] = (
+                                int(residual_token.item()),
+                                residual[0],
+                                False,
+                            )
+                    else:
+                        # Greedy row inside a stochastic batch: argmax equality
+                        # keeps temperature=0 deterministic. The one-hot draft
+                        # distribution would otherwise make this row sample
+                        # through the stochastic rule and emit a draft that the
+                        # target model disagrees with.
+                        target_token = int(mx.argmax(verify_logits[row, 0, :]).item())
+                        accepted = target_token == draft_token
+                        emitted_by_uid[uid] = (
+                            draft_token if accepted else target_token,
+                            verify_distribution[row],
+                            accepted,
+                        )
+                    all_accepted = all_accepted and accepted
             else:
                 verify_pred = mx.argmax(verify_logits[:, 0, :], axis=-1)
                 mx.eval(verify_pred, draft_tokens)
@@ -3335,27 +3365,29 @@ def install_mtp_mllm(
                     draft_model.draft_lens.append(1)
 
             else:
-                # A batch cache cannot roll back an individual row. On a mixed
-                # concurrent rejection, replay the same suffix for every row.
-                # External assistant verification retains the already sampled
-                # target token instead of sampling it twice. Native sampled MTP
-                # only retains a residual for a single-row rejection.
-                sampled_reject = uses_stochastic_sampling and bool(
-                    residual_tokens_by_uid
-                )
+                # A batch cache cannot roll back an individual row, so every row
+                # replays its own emitted suffix in one batched forward: the
+                # accepted draft for rows that passed verification, the residual
+                # draw for rows that failed. Re-drawing a rejected row from the
+                # full target distribution instead of its residual biases sampled
+                # output away from p, and coupling every row to one batch-wide
+                # accept/reject decision does the same, so the single-row guard
+                # cannot stay. External assistant verification keeps its already
+                # sampled target token.
+                replay_suffix = bool(emitted_by_uid)
                 replay_tokens = primary_tokens
-                if sampled_reject:
-                    residual_tokens = mx.array(
-                        [residual_tokens_by_uid[uid] for uid in current_uids]
+                if replay_suffix:
+                    emitted_tokens = mx.array(
+                        [emitted_by_uid[uid][0] for uid in current_uids]
                     )
                     replay_tokens = mx.concatenate(
-                        [primary_tokens[:, None], residual_tokens[:, None]],
+                        [primary_tokens[:, None], emitted_tokens[:, None]],
                         axis=1,
                     )
 
                 if _rnn_snapshots:
                     # Hybrid model: undo verify then replay the actual emitted
-                    # suffix (primary only, or primary + sampled residual).
+                    # suffix (primary only, or primary + the per-row emitted token).
                     for c in cache:
                         if (
                             hasattr(c, "is_trimmable")
@@ -3366,7 +3398,7 @@ def install_mtp_mllm(
                     for _ci, _snap in _rnn_snapshots.items():
                         cache[_ci].state = _snap
                     rerun_out = language_model(
-                        (replay_tokens if sampled_reject else primary_tokens[:, None]),
+                        (replay_tokens if replay_suffix else primary_tokens[:, None]),
                         cache=cache,
                         return_hidden=True,
                         **model_kwargs,
@@ -3383,8 +3415,8 @@ def install_mtp_mllm(
                         _skip_state_by_uid.clear()
                 else:
                     # Pure attention caches retain primary after trimming the
-                    # speculative draft. A sampled residual is then advanced
-                    # explicitly; greedy and concurrent fallbacks reuse the
+                    # speculative draft. The emitted suffix is then advanced
+                    # explicitly per row; the all-greedy fallback reuses the
                     # verified primary state.
                     for c in cache:
                         if (
@@ -3393,12 +3425,9 @@ def install_mtp_mllm(
                             and hasattr(c, "trim")
                         ):
                             c.trim(1)
-                    if sampled_reject:
-                        residual_tokens = mx.array(
-                            [residual_tokens_by_uid[uid] for uid in current_uids]
-                        )
+                    if replay_suffix:
                         rerun_out = language_model(
-                            residual_tokens[:, None],
+                            emitted_tokens[:, None],
                             cache=cache,
                             return_hidden=True,
                             **model_kwargs,
@@ -3431,14 +3460,16 @@ def install_mtp_mllm(
                         _skip_state_by_uid.clear()
                 for row, uid in enumerate(current_uids):
                     _deferred_drafts.pop(uid, None)
-                    if sampled_reject:
-                        # Report the logprob from the residual distribution the
-                        # token was actually drawn from, not the raw unfiltered
-                        # target distribution at this position.
+                    if replay_suffix:
+                        # Report the logprob from the distribution the token was
+                        # actually drawn from: the accepted draft keeps the
+                        # verified target distribution, the residual draw reports
+                        # the residual it came from.
+                        token, logprobs, from_draft = emitted_by_uid[uid]
                         _deferred_drafts[uid] = {
-                            "token": residual_tokens_by_uid[uid],
-                            "logprobs": residual_logprobs_by_uid[uid],
-                            "from_draft": False,
+                            "token": token,
+                            "logprobs": logprobs,
+                            "from_draft": from_draft,
                         }
                 with _mtp_stats_lock:
                     _mtp_stats["rejected"] += 1
