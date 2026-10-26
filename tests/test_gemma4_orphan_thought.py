@@ -186,26 +186,32 @@ def test_thinking_off_latch_for_gemma4(text, expected):
 
 
 def _server_stream(pieces):
-    """Mimic the chat streaming loop with thinking off (server.py latch + parser)."""
+    """Mimic the chat streaming loop with thinking off (server.py latch + parser).
+
+    The stream ends with an empty finished chunk, as the engine sends it, so the
+    parser's buffer is flushed through srv._extract_streaming_reasoning_delta.
+    Reasoning is dropped, as the server does with thinking off.
+    """
     parser = Gemma4ReasoningParser()
     parser.reset_state(implicit_mode=False)
     raw, accumulated, latched = "", "", False
     content = []
-    for piece in pieces:
-        raw += piece
-        if not latched and srv._explicit_reasoning_markers_present(raw, parser):
-            latched = True
+    chunks = [(piece, False) for piece in pieces] + [("", True)]
+    for piece, finished in chunks:
+        if piece:
+            raw += piece
+            if not latched and srv._explicit_reasoning_markers_present(raw, parser):
+                latched = True
         if not latched:
             content.append(piece)
             continue
         prev = accumulated
         accumulated += piece
-        msg = parser.extract_reasoning_streaming(prev, accumulated, piece)
+        msg = srv._extract_streaming_reasoning_delta(
+            parser, prev, accumulated, piece, finished=finished
+        )
         if msg is not None and msg.content:
             content.append(msg.content)
-    final = parser.finalize_stream() if latched else None
-    if final is not None and final.content:
-        content.append(final.content)
     return "".join(content)
 
 
@@ -223,6 +229,11 @@ def test_server_loop_thinking_off_does_not_leak(name):
         (["Before ", "<channel|>", " after"], "Before <channel|> after"),
         (["My ", "thought"], "My thought"),
         (["afterthought", "s matter"], "afterthoughts matter"),
+        # Held back as a possible marker prefix, then the stream ends: still content
+        (["The comparison is 2 ", "<"], "The comparison is 2 <"),
+        (["Use ", "<chan"], "Use <chan"),
+        (["Use ", "<|chan"], "Use <|chan"),
+        (["a ", "<", " b"], "a < b"),
     ],
 )
 def test_server_loop_thinking_off_plain_text_unchanged(pieces, expected):

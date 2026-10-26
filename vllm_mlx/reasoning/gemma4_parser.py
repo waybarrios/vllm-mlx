@@ -206,7 +206,9 @@ class Gemma4ReasoningParser(BaseThinkingReasoningParser):
         If the stream ends while we have a partial marker buffered (e.g.
         model emitted "<|channel>" as its last token and got truncated by
         max_tokens), emit it as reasoning so the client doesn't lose the
-        text. Content phase flushes as content.
+        text. Content phase flushes as content, and so does held-back text
+        before any channel opened (a literal "<", a truncated "<chan", or
+        "thought"): thinking-off clients drop reasoning, so it would be lost.
         """
         if self._orphan_open:
             # Orphan thought never closed: it was the answer after all.
@@ -220,9 +222,9 @@ class Gemma4ReasoningParser(BaseThinkingReasoningParser):
         pending = self._pending
         self._pending = ""
         if self._phase == "content" or (
-            self._phase == "pre_think" and pending in _ORPHAN_HOLD
+            self._phase == "pre_think" and self.start_token not in pending
         ):
-            # A held-back "thought" that turned out not to be a label is content
+            # No channel opened: the held-back text was ordinary content
             return DeltaMessage(content=pending)
         return DeltaMessage(reasoning=pending)
 
