@@ -1073,6 +1073,68 @@ class TestHelperFunctions:
         assert exc_info.value.status_code == 404
         assert "fast" in exc_info.value.detail
 
+    def test_validate_muse_glimmer_tool_names_rejects_reserved_recipients(
+        self, monkeypatch
+    ):
+        """
+        A tool named "self" or "user" collides with Muse Glimmer's ATEM
+        channel recipients (self=reasoning, user=answer) and must be
+        rejected up front rather than left for the parser to disambiguate.
+        """
+        from fastapi import HTTPException
+        import vllm_mlx.server as server
+        from vllm_mlx.api.models import ToolDefinition
+
+        monkeypatch.setattr(server, "_tool_call_parser", "muse_glimmer")
+
+        reserved = ToolDefinition(
+            type="function", function={"name": "self", "parameters": {}}
+        )
+        with pytest.raises(HTTPException) as exc_info:
+            server._validate_muse_glimmer_tool_names([reserved])
+        assert exc_info.value.status_code == 400
+        assert "self" in exc_info.value.detail
+
+        ok = ToolDefinition(
+            type="function", function={"name": "get_weather", "parameters": {}}
+        )
+        server._validate_muse_glimmer_tool_names([ok])  # should not raise
+
+    def test_validate_muse_glimmer_tool_names_covers_anthropic_and_responses_shapes(
+        self, monkeypatch
+    ):
+        """The reserved-name check must work for every tool schema shape."""
+        from fastapi import HTTPException
+        import vllm_mlx.server as server
+
+        monkeypatch.setattr(server, "_tool_call_parser", "muse_glimmer")
+
+        class FakeNamedTool:
+            def __init__(self, name):
+                self.name = name
+
+        with pytest.raises(HTTPException):
+            server._validate_muse_glimmer_tool_names([FakeNamedTool("user")])
+
+        with pytest.raises(HTTPException):
+            server._validate_muse_glimmer_tool_names(
+                [{"type": "function", "name": "user"}]
+            )
+
+    def test_validate_muse_glimmer_tool_names_only_applies_to_muse_glimmer(
+        self, monkeypatch
+    ):
+        """Other tool-call parsers have no channel-recipient collision to guard."""
+        import vllm_mlx.server as server
+        from vllm_mlx.api.models import ToolDefinition
+
+        monkeypatch.setattr(server, "_tool_call_parser", "gemma4")
+
+        reserved = ToolDefinition(
+            type="function", function={"name": "self", "parameters": {}}
+        )
+        server._validate_muse_glimmer_tool_names([reserved])  # should not raise
+
     def test_build_reasoning_parser_uses_configured_name_and_engine_tokenizer(
         self, monkeypatch
     ):
@@ -3180,6 +3242,8 @@ class TestStreamChatCompletion:
                 return DeltaMessage(content=delta_text)
 
         class FakeToolParser:
+            TOOL_MARKUP_IN_REASONING = True
+
             def reset(self):
                 pass
 
@@ -3652,6 +3716,8 @@ class TestStreamChatCompletion:
                 return DeltaMessage(reasoning=delta_text)
 
         class FakeToolParser:
+            TOOL_MARKUP_IN_REASONING = True
+
             def reset(self):
                 pass
 
@@ -3724,6 +3790,145 @@ class TestStreamChatCompletion:
             == "read_file"
         )
         assert tool_payloads[0]["choices"][0]["finish_reason"] == "tool_calls"
+
+    @pytest.mark.anyio
+    async def test_muse_no_reasoning_redirect_into_tool_stream(self, monkeypatch):
+        """TOOL_MARKUP_IN_REASONING=False: reasoning markup is never redirected."""
+        from vllm_mlx.engine.base import GenerationOutput
+        from vllm_mlx.reasoning import DeltaMessage
+        from vllm_mlx.server import (
+            ChatCompletionRequest,
+            Message,
+            stream_chat_completion,
+        )
+        import vllm_mlx.server as server
+
+        received: list[str] = []
+
+        class FakeReasoningParser:
+            def reset_state(self, implicit_mode=False):
+                pass
+
+            def extract_reasoning_streaming(self, previous_text, current_text, delta):
+                # Mirrors Muse Glimmer: a call example inside the reasoning
+                # channel stays reasoning.
+                return DeltaMessage(reasoning=delta)
+
+        class FakeToolParser:
+            TOOL_MARKUP_IN_REASONING = False
+            STREAMING_MARKERS = ("<atem:function_calls>",)
+
+            def reset(self):
+                pass
+
+            def extract_tool_calls_streaming(
+                self, previous_text, current_text, delta_text, request=None
+            ):
+                received.append(delta_text)
+                return None
+
+        class FakeEngine:
+            model_name = "fake-engine"
+
+            async def stream_chat(self, **kwargs):
+                yield GenerationOutput(
+                    text="I could call <atem:function_calls>",
+                    new_text="I could call <atem:function_calls>",
+                    finished=True,
+                    finish_reason="stop",
+                    prompt_tokens=1,
+                    completion_tokens=1,
+                )
+
+        monkeypatch.setattr(server, "_model_name", "served-model")
+        monkeypatch.setattr(server, "_reasoning_parser", FakeReasoningParser())
+        monkeypatch.setattr(server, "_enable_auto_tool_choice", True)
+        monkeypatch.setattr(server, "_tool_call_parser", "fake")
+        monkeypatch.setattr(server, "_tool_parser_instance", FakeToolParser())
+
+        request = ChatCompletionRequest(
+            model="request-model",
+            messages=[Message(role="user", content="hi")],
+            tools=[
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "get_weather",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"city": {"type": "string"}},
+                        },
+                    },
+                }
+            ],
+            stream=True,
+        )
+
+        chunks = [
+            chunk
+            async for chunk in stream_chat_completion(
+                FakeEngine(), request.messages, request
+            )
+        ]
+        # The tool parser never sees reasoning markup and never sees reasoning
+        # prose as content; the reasoning streams as reasoning instead.
+        assert received == []
+        payloads = [
+            json.loads(chunk.removeprefix("data: ").strip())
+            for chunk in chunks
+            if chunk != "data: [DONE]\n\n"
+        ]
+        assert (
+            "".join(
+                p["choices"][0]["delta"].get("reasoning_content") or ""
+                for p in payloads
+                if p.get("choices")
+            )
+            == "I could call <atem:function_calls>"
+        )
+
+    def test_muse_detects_native_tool_support(self, monkeypatch):
+        """muse_glimmer declares native role="tool"/tool_calls replay support."""
+        import vllm_mlx.server as server
+
+        monkeypatch.setattr(server, "_enable_auto_tool_choice", True)
+        monkeypatch.setattr(server, "_tool_call_parser", "muse_glimmer")
+        assert server._detect_native_tool_support() is True
+
+    @pytest.mark.anyio
+    async def test_muse_history_replay_preserves_native_tool_format(self, monkeypatch):
+        """Requests acquire an engine with preserve_native_tool_format=True."""
+        import vllm_mlx.server as server
+
+        monkeypatch.setattr(server, "_enable_auto_tool_choice", True)
+        monkeypatch.setattr(server, "_tool_call_parser", "muse_glimmer")
+        engine = SimpleNamespace(
+            model_name="served-model",
+            preserve_native_tool_format=False,
+            is_mllm=False,
+        )
+        captured = {}
+
+        class FakeLease:
+            pass
+
+        lease = FakeLease()
+        lease.engine = engine
+        lease.release = lambda: None
+
+        class FakeManager:
+            async def acquire(self, name):
+                captured["name"] = name
+                return lease
+
+        monkeypatch.setattr(server, "_model_name", "served-model")
+        monkeypatch.setattr(server, "_model_manager", FakeManager())
+        monkeypatch.setattr(server, "_validate_model_name", lambda name: None)
+
+        context = await server._acquire_request_model("served-model")
+        assert context.engine is engine
+        assert engine.preserve_native_tool_format is True
+        assert captured["name"] == "served-model"
 
     @pytest.mark.anyio
     async def test_reasoning_stream_skips_tool_parser_until_markup_appears(

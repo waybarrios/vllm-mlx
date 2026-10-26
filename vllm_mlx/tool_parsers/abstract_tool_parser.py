@@ -56,6 +56,12 @@ class ToolParser(ABC):
     # <|tool_response>) that are not part of the tokenizer's default eos set.
     extra_stop_tokens: list[str] = []
 
+    # Whether tool-call markup may legitimately appear inside the reasoning
+    # channel (MiniMax wraps calls in <tool_call> blocks). Channel-addressed formats
+    # (Muse Glimmer: every call is its own to=<tool> channel) declare False so
+    # an example call in reasoning is never redirected into the tool stream.
+    TOOL_MARKUP_IN_REASONING: bool = True
+
     @classmethod
     def supports_native_format(cls) -> bool:
         """

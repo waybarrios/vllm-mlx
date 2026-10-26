@@ -89,6 +89,7 @@ Use `--tool-call-parser` to select a parser for your model family:
 | `xlam` | | Salesforce xLAM | JSON with `tool_calls` array |
 | `functionary` | `meetkai` | MeetKai Functionary | Multiple function blocks |
 | `glm47` | `glm4` | GLM-4.7, GLM-4.7-Flash | `<tool_call>` with `<arg_key>`/`<arg_value>` XML |
+| `muse_glimmer` | | Muse Glimmer | ATEM `<atem:invoke name="...">` calls |
 
 ## Model Examples
 
