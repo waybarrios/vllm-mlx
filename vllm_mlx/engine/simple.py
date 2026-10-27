@@ -8,6 +8,7 @@ performance when serving a single user at a time.
 
 import asyncio
 import contextvars
+import gc
 import hashlib
 import logging
 import os
@@ -989,6 +990,11 @@ class SimpleEngine(BaseEngine):
                 executor.shutdown(wait=False, cancel_futures=True)
                 if pre_bind is not None:
                     restore_generation_streams(pre_bind)
+        # mlx-vlm's processor loader points tokenizer.stopping_criteria back
+        # at the tokenizer, so dropping _model above frees nothing until a
+        # cyclic GC pass, which an idle server may not run for a long time.
+        # Collect now, then hand the freed buffers back to the OS.
+        gc.collect()
         mx.clear_cache()
         logger.info("SimpleEngine stopped")
 
