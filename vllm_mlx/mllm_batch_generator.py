@@ -55,6 +55,10 @@ def _processors_can_retire(processors: Optional[List[Callable]]) -> bool:
     )
 
 
+def _request_has_media(request: "MLLMBatchRequest") -> bool:
+    return bool(request.images or request.videos or request.audio)
+
+
 def _mark_mtp_attempts_on_primary_responses(
     responses: List["MLLMBatchResponse"],
     attempted_drafts_by_uid: Dict[int, int],
@@ -2603,7 +2607,7 @@ class MLLMBatchGenerator:
             self, "_allow_mid_batch_extend", True
         ):
             text_only = self._compatible_pending_requests(
-                [r for r in self.unprocessed_requests if not r.images and not r.videos],
+                [r for r in self.unprocessed_requests if not _request_has_media(r)],
                 self.completion_batch_size,
             )
 
@@ -3875,6 +3879,10 @@ def install_chunked_prefill_mllm(
                                     )
                                 )
                                 continue
+                        # Resolve audio once (including terminal failures), but
+                        # never select it for the text-only inline path.
+                        if _request_has_media(r):
+                            continue
                         if r.input_ids is not None and r.input_ids.size <= _budget:
                             short_reqs.append(r)
                     if short_reqs:
@@ -4125,7 +4133,7 @@ def install_chunked_prefill_mllm(
                 len(batch_gen.unprocessed_requests),
             )
             for r in compatible_pending:
-                if not r.images and not r.videos and not r.audio:
+                if not _request_has_media(r):
                     text_only_req = r
                     break
 

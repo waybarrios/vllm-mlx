@@ -751,12 +751,12 @@ class TestGetAvailableMemory:
             pass
 
 
-def test_load_rejects_v3_cache_after_rewind_semantics_change(tmp_path, caplog):
-    """Caches written before safe MLLM rewind must not survive an upgrade."""
+def test_load_rejects_v4_cache_after_media_isolation_change(tmp_path, caplog):
+    """Caches potentially contaminated with media must not survive an upgrade."""
     import json
 
     (tmp_path / "index.json").write_text(
-        json.dumps({"version": 3, "model_fingerprint": "", "entries": []})
+        json.dumps({"version": 4, "model_fingerprint": "", "entries": []})
     )
     cache = MemoryAwarePrefixCache(MagicMock(), MemoryCacheConfig(max_memory_mb=1))
 
@@ -769,7 +769,7 @@ def test_load_rejects_v3_cache_after_rewind_semantics_change(tmp_path, caplog):
         },
     ):
         assert cache.load_from_disk(str(tmp_path)) == 0
-    assert "version mismatch: disk=3 current=4" in caplog.text
+    assert "version mismatch: disk=4 current=5" in caplog.text
 
 
 def test_load_rejects_same_arch_different_snapshot_or_quant(tmp_path):
