@@ -267,6 +267,22 @@ class TestIsMllmModelConfigPriority:
         )
         assert is_mllm_model(str(model_dir)) is True
 
+    def test_empty_vision_config_on_causal_lm_is_text_only(self, tmp_path):
+        model_dir = self._write_config(
+            tmp_path,
+            "lfm3-text",
+            {
+                "model_type": "lfm3",
+                "architectures": ["Lfm3ForCausalLM"],
+                "vision_config": {},
+            },
+        )
+        assert is_mllm_model(str(model_dir)) is False
+
+    def test_empty_vision_config_without_architecture_indicates_vlm(self, tmp_path):
+        model_dir = self._write_config(tmp_path, "bare", {"vision_config": {}})
+        assert is_mllm_model(str(model_dir)) is True
+
     def test_audio_config_key_indicates_vlm(self, tmp_path):
         model_dir = self._write_config(
             tmp_path,
