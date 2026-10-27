@@ -92,6 +92,9 @@ def test_continuous_batching_forwards_prefill_step_size_to_scheduler_config(
             captured["scheduler_config"] = self
 
     server = ModuleType("vllm_mlx.server")
+    server.configure_attention_backend = lambda selection: captured.update(
+        attention_backend=selection
+    )
     server._metrics = SimpleNamespace(configure=lambda **kwargs: None)
     server.RateLimiter = lambda **kwargs: SimpleNamespace(**kwargs)
     server.app = object()
@@ -149,6 +152,7 @@ def test_continuous_batching_forwards_prefill_step_size_to_scheduler_config(
 
     assert captured["scheduler_config"].prefill_step_size == 512
     assert captured["scheduler_config"].mllm_prefill_step_size == 256
+    assert captured["attention_backend"].requested == "mlx"
 
 
 def test_serve_command_propagates_all_sampling_defaults(monkeypatch):
