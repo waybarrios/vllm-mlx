@@ -240,6 +240,7 @@ jobs:
             tests/test_llm_mtp_per_request_counters.py \
             tests/test_batched_engine_mllm_config.py \
             tests/test_mllm_continuous_batching.py \
+            tests/test_mllm_generator_ownership.py \
             tests/test_mllm_cache.py \
             tests/test_mllm_sampling.py \
             tests/test_mllm_assistant_images.py \

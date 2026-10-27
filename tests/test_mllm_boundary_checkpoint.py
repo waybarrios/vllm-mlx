@@ -177,6 +177,39 @@ def test_next_turn_hits_boundary_across_think_suffix(generator):
     assert generator.calls == [[52, 53, 30], [*SUFFIX]]
 
 
+@pytest.mark.parametrize("aborted_uid,should_abort", [(7, True), (6, False)])
+def test_checkpoint_commit_honors_exact_uid_abort(
+    generator, monkeypatch, aborted_uid, should_abort
+):
+    from vllm_mlx.mllm_batch_generator import PrefillAbortedError
+
+    entry = generator.prefix_cache.prepare_store([1, 2], [_RecurrentLeaf(2)])
+    commit = generator.prefix_cache.commit_prepared
+
+    def abort_then_commit(*args, **kwargs):
+        generator.abort_prefill("same", aborted_uid)
+        return commit(*args, **kwargs)
+
+    monkeypatch.setattr(generator.prefix_cache, "commit_prepared", abort_then_commit)
+    if should_abort:
+        with pytest.raises(PrefillAbortedError):
+            generator._publish_prefill_checkpoint("same", entry, uid=7)
+        assert _keys(generator) == []
+    else:
+        assert generator._publish_prefill_checkpoint("same", entry, uid=7)
+        assert _keys(generator) == [(1, 2)]
+
+
+def test_uid_abort_before_checkpoint_prevents_publication(generator):
+    from vllm_mlx.mllm_batch_generator import PrefillAbortedError
+
+    entry = generator.prefix_cache.prepare_store([1, 2], [_RecurrentLeaf(2)])
+    generator.abort_prefill("same", 7)
+    with pytest.raises(PrefillAbortedError):
+        generator._publish_prefill_checkpoint("same", entry, uid=7)
+    assert _keys(generator) == []
+
+
 def test_exact_repeat_replays_only_the_suffix(generator):
     turn1 = [10, 11, 12, 13, *SUFFIX]
     _prefill(generator, turn1)

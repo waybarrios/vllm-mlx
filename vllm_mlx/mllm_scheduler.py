@@ -514,10 +514,12 @@ class MLLMScheduler:
             return False
 
         # Signal batch generator to abort any in-progress prefill for this
-        # request.  The prefill loop checks _aborted_request_ids between
-        # chunks and raises PrefillAbortedError to exit early.
-        if self.batch_generator is not None:
-            self.batch_generator.abort_prefill(request_id)
+        # exact generator UID before removing its mapping. Waiting requests
+        # have no generator work and must not leave an ID-only abort marker
+        # that a later request with the same external ID could inherit.
+        uid = self.request_id_to_uid.get(request_id)
+        if self.batch_generator is not None and uid is not None:
+            self.batch_generator.abort_prefill(request_id, uid)
 
         # Remove from waiting queue
         if request.status == RequestStatus.WAITING:

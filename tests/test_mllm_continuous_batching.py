@@ -3409,8 +3409,9 @@ class TestChunkedPrefillCacheHandling:
             "checkpoint_entry": None,
         }
 
-        def publish(_request_id, entry, *, evict_prefixes=False):
+        def publish(_request_id, entry, *, evict_prefixes=False, uid=None):
             assert entry is full_prompt_entry
+            assert uid == req.uid
             assert evict_prefixes is False  # cold prefill evicts nothing
             raise PrefillAbortedError(req.request_id)
 

@@ -22,6 +22,42 @@ distribution.
 import os
 import tempfile
 
+import pytest
+
+
+def test_filter_keeps_rope_rows_aligned_and_preserves_original_cache():
+    import mlx.core as mx
+
+    batch = _make_live_batch(3)
+    batch.decode_rope_deltas = mx.array([[10], [20], [30]])
+    original_cache = batch.cache
+    batch.filter([2, 0])
+    assert batch.uids == [2, 0]
+    assert batch.decode_rope_deltas.tolist() == [[30], [10]]
+    assert batch.cache[0].keys.shape[0] == 2
+    assert original_cache[0].keys.shape[0] == 3
+
+
+def test_filter_metadata_eval_failure_preserves_batch(monkeypatch):
+    import mlx.core as mx
+
+    batch = _make_live_batch(2)
+    batch.decode_rope_deltas = mx.array([[10], [20]])
+    original = (batch.uids, batch.y, batch.cache, batch.decode_rope_deltas)
+
+    def fail(*_args):
+        raise RuntimeError("metadata evaluation failed")
+
+    monkeypatch.setattr(mx, "eval", fail)
+    with pytest.raises(RuntimeError, match="metadata evaluation failed"):
+        batch.filter([1])
+    assert all(
+        actual is expected
+        for actual, expected in zip(
+            (batch.uids, batch.y, batch.cache, batch.decode_rope_deltas), original
+        )
+    )
+
 
 def _make_batch(cache):
     import mlx.core as mx
@@ -227,6 +263,8 @@ class TestReshuffleEvaluatesMetadata:
 
         captured = _install_eval_spy(monkeypatch)
         batch.filter([1])
+        inner_kv, recurrent = batch.cache[0].caches
+        plain = batch.cache[1]
         for layer in batch.cache:
             _assert_metadata_evaluated(layer, captured, "hybrid filter")
         mx.eval(batch.y, inner_kv.keys, plain.keys, recurrent.cache[0])
@@ -603,6 +641,9 @@ class TestReshuffleValueCorrectness:
             cache.append(c)
         batch = _make_batch(cache)
         batch.filter([1, 2])
+        original_cache = cache
+        cache = batch.cache
+        assert all(c.offset.tolist() == [0, -2, 1] for c in original_cache)
         self._assert_metadata_materialized(cache, "filter")
         mx.eval(batch.y, *(c.keys for c in cache), *(c.values for c in cache))
         for c in cache:
