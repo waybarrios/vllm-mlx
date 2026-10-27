@@ -955,6 +955,7 @@ class BatchedEngine(BaseEngine):
                 finish_reason=output.finish_reason,
                 mtp_drafts=output.mtp_drafts,
                 mtp_accepted=output.mtp_accepted,
+                cached_tokens=getattr(output, "cached_tokens", None),
                 specprefill_outcome=getattr(output, "specprefill_outcome", None),
             )
 
@@ -986,6 +987,7 @@ class BatchedEngine(BaseEngine):
             prompt_tokens=output.prompt_tokens,
             completion_tokens=output.completion_tokens,
             finish_reason=output.finish_reason,
+            cached_tokens=getattr(output, "cached_tokens", None),
             mtp_drafts=output.mtp_drafts,
             mtp_accepted=output.mtp_accepted,
         )
@@ -1053,6 +1055,7 @@ class BatchedEngine(BaseEngine):
                     finish_reason=output.finish_reason,
                     mtp_drafts=output.mtp_drafts,
                     mtp_accepted=output.mtp_accepted,
+                    cached_tokens=getattr(output, "cached_tokens", None),
                     specprefill_outcome=getattr(output, "specprefill_outcome", None),
                 )
             return
@@ -1089,6 +1092,7 @@ class BatchedEngine(BaseEngine):
                 completion_tokens=output.completion_tokens,
                 finished=output.finished,
                 finish_reason=output.finish_reason,
+                cached_tokens=getattr(output, "cached_tokens", None),
                 mtp_drafts=output.mtp_drafts,
                 mtp_accepted=output.mtp_accepted,
             )

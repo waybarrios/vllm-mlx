@@ -138,6 +138,8 @@ class MLLMRequest:
 
     # Timing
     first_token_time: Optional[float] = None
+    # Request-owned prompt positions supplied from a validated cache.
+    cached_tokens: int | None = 0
 
 
 @dataclass
@@ -513,6 +515,8 @@ class MLLMScheduler:
         if request is None:
             return False
 
+        request.cached_tokens = 0
+
         # Signal batch generator to abort any in-progress prefill for this
         # request.  The prefill loop checks _aborted_request_ids between
         # chunks and raises PrefillAbortedError to exit early.
@@ -680,6 +684,7 @@ class MLLMScheduler:
 
             # Handle error responses from failed preprocessing
             if response.finish_reason == "error":
+                request.cached_tokens = 0
                 output = RequestOutput(
                     request_id=request_id,
                     new_token_ids=[],
@@ -689,6 +694,7 @@ class MLLMScheduler:
                     completion_tokens=0,
                     finished=True,
                     finish_reason="error",
+                    cached_tokens=0,
                     specprefill_outcome=request.specprefill_outcome,
                 )
                 request.status = RequestStatus.FINISHED_ABORTED
@@ -708,6 +714,11 @@ class MLLMScheduler:
                     request.num_prompt_tokens = response.prompt_tokens
 
             # Append token to request
+            cached_tokens = getattr(response, "cached_tokens", None)
+            if type(cached_tokens) is not int:
+                cached_tokens = None
+            # Error responses continue above; normal token responses carry cache usage.
+            request.cached_tokens = cached_tokens
             request.output_tokens.append(response.token)
             request.num_output_tokens = len(request.output_tokens)
             if response.mtp_attempted:
@@ -740,6 +751,7 @@ class MLLMScheduler:
                 completion_tokens=request.num_output_tokens,
                 mtp_drafts=request.mtp_drafts,
                 mtp_accepted=request.mtp_accepted,
+                cached_tokens=request.cached_tokens,
                 specprefill_outcome=request.specprefill_outcome,
             )
 
@@ -912,6 +924,7 @@ class MLLMScheduler:
                             completion_tokens=request.num_output_tokens,
                             mtp_drafts=request.mtp_drafts,
                             mtp_accepted=request.mtp_accepted,
+                            cached_tokens=None,
                         )
                     )
                 except asyncio.QueueFull:
@@ -1242,7 +1255,7 @@ class MLLMScheduler:
                     "tokens_per_second": None,
                     "ttft_s": None,
                     "cache_hit_type": None,
-                    "cached_tokens": 0,
+                    "cached_tokens": req.cached_tokens,
                 }
             )
 
@@ -1287,7 +1300,7 @@ class MLLMScheduler:
                     "tokens_per_second": tok_s,
                     "ttft_s": ttft,
                     "cache_hit_type": None,
-                    "cached_tokens": 0,
+                    "cached_tokens": req.cached_tokens,
                 }
             )
 

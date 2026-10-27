@@ -30,6 +30,7 @@ class TestBatchedEngineGenerate:
         prompt_tokens=10,
         completion_tokens=3,
         finish_reason="stop",
+        cached_tokens=None,
     ):
         """Build a mock RequestOutput (as returned by AsyncEngineCore)."""
         mock = MagicMock()
@@ -40,6 +41,7 @@ class TestBatchedEngineGenerate:
         mock.prompt_tokens = prompt_tokens
         mock.completion_tokens = completion_tokens
         mock.finish_reason = finish_reason
+        mock.cached_tokens = cached_tokens
         return mock
 
     @pytest.mark.anyio
@@ -83,6 +85,7 @@ class TestBatchedEngineGenerate:
             prompt_tokens=7,
             completion_tokens=1,
             finish_reason="stop",
+            cached_tokens=4,
         )
 
         mock_engine = MagicMock()
@@ -95,6 +98,7 @@ class TestBatchedEngineGenerate:
         assert result.prompt_tokens == 7
         assert result.completion_tokens == 1
         assert result.finish_reason == "stop"
+        assert result.cached_tokens == 4
 
 
 class TestBatchedEngineCacheRestore:

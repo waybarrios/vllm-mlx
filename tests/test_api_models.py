@@ -42,6 +42,7 @@ from vllm_mlx.api.models import (
     Message,
     ModelInfo,
     ModelsResponse,
+    PromptTokensDetails,
     ResponseFormat,
     ResponseFormatJsonSchema,
     StreamOptions,
@@ -400,15 +401,26 @@ class TestChatCompletion:
         assert choice.finish_reason == "stop"
 
     def test_usage(self):
-        usage = Usage(prompt_tokens=10, completion_tokens=20, total_tokens=30)
+        usage = Usage(
+            prompt_tokens=10,
+            completion_tokens=20,
+            total_tokens=30,
+            prompt_tokens_details=PromptTokensDetails(cached_tokens=4),
+        )
         assert usage.prompt_tokens == 10
         assert usage.total_tokens == 30
+        assert usage.model_dump()["prompt_tokens_details"] == {"cached_tokens": 4}
+        assert usage.model_dump(include={"prompt_tokens"}) == {"prompt_tokens": 10}
+        assert "prompt_tokens_details" not in usage.model_dump(
+            exclude={"prompt_tokens_details"}
+        )
 
     def test_usage_defaults(self):
         usage = Usage()
         assert usage.prompt_tokens == 0
         assert usage.completion_tokens == 0
         assert usage.total_tokens == 0
+        assert "prompt_tokens_details" not in usage.model_dump()
 
     def test_chat_completion_response(self):
         resp = ChatCompletionResponse(
