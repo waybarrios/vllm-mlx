@@ -230,6 +230,7 @@ jobs:
             tests/test_mllm.py \
             tests/test_mllm_assistant_drafter.py \
             tests/test_server.py \
+            tests/test_server_logprobs.py \
             tests/test_metrics.py \
             tests/test_paged_cache.py \
             tests/test_prefix_cache.py \
@@ -257,6 +258,7 @@ jobs:
             tests/test_collect_eos_token_ids.py \
             tests/test_batching.py \
             tests/test_continuous_batching.py \
+            tests/test_logprobs.py \
             tests/test_memory_cache_mlx.py \
             tests/test_mllm_ssd_spill.py \
             tests/test_ssd_cache.py \

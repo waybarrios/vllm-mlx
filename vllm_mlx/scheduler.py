@@ -36,6 +36,7 @@ from .memory_cache import (
 from .paged_cache import PagedCacheManager
 from .ssd_cache import SSDCacheConfig, SSDCacheTier
 from .prefix_cache import BlockAwarePrefixCache, PrefixCacheManager
+from .logprobs import record_step_logprobs
 from .request import Request, RequestOutput, RequestStatus, SamplingParams
 from .utils.mamba_cache import ensure_mamba_support
 
@@ -2934,6 +2935,16 @@ class Scheduler:
                 detok.add_token(response.token)
                 new_text = detok.last_segment
 
+            # LLM-path MTP (``_install_mtp``) is inactive on mlx-lm >= 0.31.3, so no
+
+            # drafted tokens reach here; if it returns, requests with logprobs must
+
+            # bypass it as the MLLM path does.
+
+            new_logprobs = record_step_logprobs(
+                request, response, self._actual_tokenizer
+            )
+
             # Create output
             output = RequestOutput(
                 request_id=request_id,
@@ -2942,6 +2953,8 @@ class Scheduler:
                 output_token_ids=request.output_token_ids,
                 prompt_tokens=request.num_prompt_tokens,
                 completion_tokens=request.num_output_tokens,
+                new_logprobs=new_logprobs,
+                output_logprobs=request.output_logprobs,
                 mtp_drafts=request.mtp_drafts,
                 mtp_accepted=request.mtp_accepted,
             )

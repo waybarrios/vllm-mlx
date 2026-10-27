@@ -80,7 +80,9 @@ from .api.models import (
     ChatCompletionChunkDelta,  # noqa: F401
     ChatCompletionRequest,
     ChatCompletionResponse,
+    ChoiceLogprobs,
     CompletionChoice,  # noqa: F401
+    CompletionLogprobs,
     CompletionRequest,
     CompletionResponse,
     ContentPart,  # noqa: F401
@@ -168,6 +170,7 @@ from .endpoint_model_policies import (
     resolve_tts_model_name,
 )
 from .engine.base import EngineBusy, suspend_cancellation
+from .logprobs import TokenLogprob, to_chat_logprobs, to_completion_logprobs
 from .lifecycle import ModelSpec, ResidencyManager
 from .model_registry import (
     ModelLease,
@@ -871,6 +874,45 @@ def _attach_logit_bias_processor(
         chat_kwargs["logits_processors"] = list(existing) + list(processors)
 
 
+def _require_logprobs_support(engine: BaseEngine) -> None:
+    """Reject logprobs requests the active engine cannot serve."""
+    if not getattr(engine, "supports_logprobs", False):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "logprobs require the continuous-batching engine "
+                "(start the server with --continuous-batching)"
+            ),
+        )
+
+
+def _chat_choice_logprobs(
+    entries: list[TokenLogprob] | None,
+) -> ChoiceLogprobs | None:
+    """Format per-token logprobs for a chat choice, if they were requested."""
+    return to_chat_logprobs(entries) if entries is not None else None
+
+
+def _completion_choice_logprobs(
+    entries: list[TokenLogprob] | None, text_offset: int = 0
+) -> CompletionLogprobs | None:
+    """Format per-token logprobs for a completion choice, if requested."""
+    if entries is None:
+        return None
+    return to_completion_logprobs(entries, text_offset=text_offset)
+
+
+def _attach_pending_logprobs(chunk: ChatCompletionChunk, pending: list) -> None:
+    """Move buffered per-token logprobs onto a streaming chunk about to be sent.
+
+    Reasoning and tool parsers may consume tokens without emitting a chunk,
+    so logprobs are buffered until a chunk with choices actually goes out.
+    """
+    if pending and chunk.choices:
+        chunk.choices[0].logprobs = to_chat_logprobs(pending)
+        pending.clear()
+
+
 def _prepare_chat_completion_invocation(
     engine: BaseEngine,
     request: ChatCompletionRequest,
@@ -900,6 +942,9 @@ def _prepare_chat_completion_invocation(
         "repetition_penalty": _resolve_repetition_penalty(request.repetition_penalty),
     }
     _attach_logit_bias_processor(chat_kwargs, getattr(request, "logit_bias", None))
+    if getattr(request, "logprobs", None):
+        _require_logprobs_support(engine)
+        chat_kwargs["logprobs"] = getattr(request, "top_logprobs", None) or 0
 
     if has_media:
         chat_kwargs["images"] = images if images else None
@@ -5756,6 +5801,8 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
     release_on_exit = True
 
     try:
+        if getattr(request, "logprobs", None) is not None:
+            _require_logprobs_support(engine)
         if request.stream:
             response = StreamingResponse(
                 _disconnect_guard(
@@ -5810,6 +5857,8 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
             mllm_draft = getattr(request, "mllm_draft", None)
             if mllm_draft is not None:
                 generate_kwargs["mllm_draft"] = mllm_draft
+            if getattr(request, "logprobs", None) is not None:
+                generate_kwargs["logprobs"] = request.logprobs
             try:
                 if raw_request is None:
                     output = await engine.generate(**generate_kwargs)
@@ -5840,6 +5889,9 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
                     index=i,
                     text=output.text,
                     finish_reason=output.finish_reason,
+                    logprobs=_completion_choice_logprobs(
+                        getattr(output, "logprobs", None)
+                    ),
                 )
             )
             total_completion_tokens += output.completion_tokens
@@ -6058,6 +6110,7 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
                         tool_calls=tool_calls,
                     ),
                     finish_reason=finish_reason,
+                    logprobs=_chat_choice_logprobs(getattr(output, "logprobs", None)),
                 )
             ],
             usage=Usage(
@@ -7073,6 +7126,9 @@ async def stream_completion(
     mllm_draft = getattr(request, "mllm_draft", None)
     if mllm_draft is not None:
         generate_kwargs["mllm_draft"] = mllm_draft
+    if getattr(request, "logprobs", None) is not None:
+        generate_kwargs["logprobs"] = request.logprobs
+    text_offset = 0
 
     try:
         async for output in engine.stream_generate(**generate_kwargs):
@@ -7089,6 +7145,11 @@ async def stream_completion(
                 if hasattr(output, "completion_tokens")
                 else completion_tokens
             )
+            chunk_logprobs = _completion_choice_logprobs(
+                getattr(output, "new_logprobs", None), text_offset
+            )
+            if chunk_logprobs is not None:
+                text_offset += sum(len(token) for token in chunk_logprobs.tokens)
             data = {
                 "id": f"cmpl-{uuid.uuid4().hex[:8]}",
                 "object": "text_completion",
@@ -7100,6 +7161,11 @@ async def stream_completion(
                         "text": output.new_text,
                         "finish_reason": (
                             output.finish_reason if output.finished else None
+                        ),
+                        "logprobs": (
+                            chunk_logprobs.model_dump()
+                            if chunk_logprobs is not None
+                            else None
                         ),
                     }
                 ],
@@ -7158,6 +7224,7 @@ async def stream_chat_completion(
             chunk.generation_metadata = _generation_metadata(thinking_processor, output)
 
     # First chunk with role
+    pending_logprobs: list = []
     first_chunk = ChatCompletionChunk(
         id=response_id,
         model=_response_model_name(request.model),
@@ -7223,6 +7290,7 @@ async def stream_chat_completion(
         # Stream content
         async for output in engine.stream_chat(messages=messages, **kwargs):
             _raise_if_generation_error(output)
+            pending_logprobs.extend(getattr(output, "new_logprobs", None) or [])
             if metrics_tracker is not None:
                 metrics_tracker.observe_ttft()
             delta_text = output.new_text or ""
@@ -7357,6 +7425,7 @@ async def stream_chat_completion(
                                     ],
                                     usage=None,
                                 )
+                                _attach_pending_logprobs(chunk, pending_logprobs)
                                 yield f"data: {chunk.model_dump_json()}\n\n"
                             continue
 
@@ -7372,7 +7441,21 @@ async def stream_chat_completion(
                                 tool_result.get("content", ""),
                             )
                             if leading:
-                                yield f"data: {ChatCompletionChunk(id=response_id, model=_response_model_name(request.model), choices=[ChatCompletionChunkChoice(delta=ChatCompletionChunkDelta(content=leading))]).model_dump_json()}\n\n"
+                                leading_chunk = ChatCompletionChunk(
+                                    id=response_id,
+                                    model=_response_model_name(request.model),
+                                    choices=[
+                                        ChatCompletionChunkChoice(
+                                            delta=ChatCompletionChunkDelta(
+                                                content=leading
+                                            )
+                                        )
+                                    ],
+                                )
+                                _attach_pending_logprobs(
+                                    leading_chunk, pending_logprobs
+                                )
+                                yield f"data: {leading_chunk.model_dump_json()}\n\n"
 
                             # Emit structured tool calls
                             tool_calls_detected = True
@@ -7412,6 +7495,7 @@ async def stream_chat_completion(
                                 ],
                                 usage=get_usage(output) if output.finished else None,
                             )
+                            _attach_pending_logprobs(chunk, pending_logprobs)
                             attach_terminal_metadata(chunk, output)
                             yield f"data: {chunk.model_dump_json()}\n\n"
                             finish_reason_emitted = finish_reason_emitted or bool(
@@ -7474,6 +7558,7 @@ async def stream_chat_completion(
                         else None
                     ),
                 )
+                _attach_pending_logprobs(chunk, pending_logprobs)
                 attach_terminal_metadata(chunk, output)
                 yield f"data: {chunk.model_dump_json()}\n\n"
                 finish_reason_emitted = finish_reason_emitted or bool(
@@ -7552,7 +7637,21 @@ async def stream_chat_completion(
                                 tool_result.get("content", ""),
                             )
                             if leading:
-                                yield f"data: {ChatCompletionChunk(id=response_id, model=_response_model_name(request.model), choices=[ChatCompletionChunkChoice(delta=ChatCompletionChunkDelta(content=leading))]).model_dump_json()}\n\n"
+                                leading_chunk = ChatCompletionChunk(
+                                    id=response_id,
+                                    model=_response_model_name(request.model),
+                                    choices=[
+                                        ChatCompletionChunkChoice(
+                                            delta=ChatCompletionChunkDelta(
+                                                content=leading
+                                            )
+                                        )
+                                    ],
+                                )
+                                _attach_pending_logprobs(
+                                    leading_chunk, pending_logprobs
+                                )
+                                yield f"data: {leading_chunk.model_dump_json()}\n\n"
 
                             # Emit structured tool calls
                             tool_calls_detected = True
@@ -7591,6 +7690,7 @@ async def stream_chat_completion(
                                 ],
                                 usage=get_usage(output) if output.finished else None,
                             )
+                            _attach_pending_logprobs(chunk, pending_logprobs)
                             attach_terminal_metadata(chunk, output)
                             yield f"data: {chunk.model_dump_json()}\n\n"
                             finish_reason_emitted = finish_reason_emitted or bool(
@@ -7652,6 +7752,7 @@ async def stream_chat_completion(
                         else None
                     ),
                 )
+                _attach_pending_logprobs(chunk, pending_logprobs)
                 attach_terminal_metadata(chunk, output)
                 yield f"data: {chunk.model_dump_json()}\n\n"
                 finish_reason_emitted = finish_reason_emitted or bool(
@@ -7699,6 +7800,7 @@ async def stream_chat_completion(
                         )
                     ],
                 )
+                _attach_pending_logprobs(tool_chunk, pending_logprobs)
                 attach_terminal_metadata(tool_chunk, last_output)
                 yield f"data: {tool_chunk.model_dump_json()}\n\n"
                 finish_reason_emitted = True
@@ -7728,8 +7830,20 @@ async def stream_chat_completion(
                 ],
                 usage=get_usage(last_output),
             )
+            _attach_pending_logprobs(terminal_chunk, pending_logprobs)
             attach_terminal_metadata(terminal_chunk, last_output)
             yield f"data: {terminal_chunk.model_dump_json()}\n\n"
+
+        # Tokens a parser consumed after the last chunk still carry logprobs;
+        # send them on a chunk of their own rather than drop them.
+        if pending_logprobs:
+            logprobs_chunk = ChatCompletionChunk(
+                id=response_id,
+                model=_response_model_name(request.model),
+                choices=[ChatCompletionChunkChoice(delta=ChatCompletionChunkDelta())],
+            )
+            _attach_pending_logprobs(logprobs_chunk, pending_logprobs)
+            yield f"data: {logprobs_chunk.model_dump_json()}\n\n"
 
         # Structured streams are buffered by the endpoint until this independent
         # validation succeeds, so invalid content cannot be returned as a
