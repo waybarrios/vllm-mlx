@@ -49,6 +49,7 @@ import os
 import re
 import secrets
 import socket as _socket
+import sys
 import threading
 import time
 import uuid
@@ -1839,6 +1840,19 @@ async def _release_default_engine(*, count_activity: bool = True) -> None:
     _sync_engine_from_residency()
 
 
+# Set by the serve entry points. When true, the process exits at the end of
+# lifespan shutdown instead of returning into asyncio's loop teardown, which
+# joins threads that have touched MLX and crashes in its thread-local compile
+# cache destructor. Left false for library/embedded use, where exiting the
+# host process would be indefensible.
+_exit_process_after_shutdown: bool = False
+
+# The uvicorn.Server that run_uvicorn() is running, so lifespan shutdown can
+# tell a server that listened from one whose bind failed (see
+# shutdown.should_exit_without_finalizing).
+_uvicorn_server: uvicorn.Server | None = None
+
+
 async def lifespan(app: FastAPI):
     """FastAPI lifespan for startup/shutdown events."""
     global _engine, _mcp_manager, _model_manager, _lifecycle_task, _lifespan_active
@@ -1958,6 +1972,25 @@ async def lifespan(app: FastAPI):
     finally:
         _get_idle_unload_event().set()
         _lifespan_active = False
+        # Only a shutdown that raised nothing may skip finalization. If either
+        # the request-serving phase or the cleanup phase failed, fall through
+        # and let the exception propagate: the caller has to see it, and the
+        # process has to exit non-zero. Exiting here on a cleanup failure would
+        # report a failed shutdown as a success and make the raise below
+        # unreachable — reintroducing, in the fix, exactly the silent-failure
+        # class this change set exists to remove. The predicate lives in
+        # vllm_mlx.shutdown, which imports no engine code, so standard CI
+        # exercises it on every platform.
+        from .shutdown import exit_without_finalizing, should_exit_without_finalizing
+
+        if should_exit_without_finalizing(
+            primary_exc,
+            cleanup_exc,
+            _exit_process_after_shutdown,
+            listener_started=bool(_uvicorn_server and _uvicorn_server.started),
+        ):
+            logger.info("Shutdown complete")
+            exit_without_finalizing()
 
     if primary_exc is not None:
         if cleanup_exc is not None:
@@ -7979,12 +8012,44 @@ def main():
     # Start server with TCP keepalive for fast dead-client detection.
     # Without this, abrupt client disconnects (power-off, network loss) take
     # 2+ hours to detect via default TCP keepalive, wasting GPU cycles.
-    uvicorn.run(
+    run_uvicorn(
         app,
         host=args.host,
         port=args.port,
         http=_make_keepalive_http_protocol(),
     )
+
+
+def run_uvicorn(app_: FastAPI, **config_kwargs) -> None:
+    """Serve ``app_`` the way ``uvicorn.run`` does, for the serve entry points.
+
+    Same single-worker path as ``uvicorn.run`` - including its exit status 3
+    when the server never started - but the ``uvicorn.Server`` stays visible
+    to lifespan shutdown, which may end the process early only once that
+    server has started listening. Both entry points arm the process-wide exit
+    here (see ``_exit_process_after_shutdown``): ``uvicorn.run()`` joins the
+    asyncio default-executor threads inside itself, so a guard placed after it
+    runs too late to matter.
+    """
+    global _exit_process_after_shutdown, _uvicorn_server
+    from uvicorn.config import STARTUP_FAILURE
+
+    server = uvicorn.Server(uvicorn.Config(app_, **config_kwargs))
+    _uvicorn_server = server
+    _exit_process_after_shutdown = True
+    try:
+        server.run()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        # The opt-in is process-wide. When run() returns instead of exiting
+        # (tests; an embedding caller keeps going), leaving it set would make
+        # the next lifespan shutdown in this interpreter call os._exit(0) -
+        # under pytest, ending the run with status 0 and no summary.
+        _exit_process_after_shutdown = False
+        _uvicorn_server = None
+    if not server.started:
+        sys.exit(STARTUP_FAILURE)
 
 
 def create_parser() -> argparse.ArgumentParser:
