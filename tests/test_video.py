@@ -331,12 +331,17 @@ class TestToolForwarding:
         params = list(sig.parameters.keys())
         assert "tools" in params
 
-    def test_generate_imports_from_video_generate(self):
-        """Verify _generate_native_video uses mlx_vlm.video_generate.generate."""
+    def test_generate_imports_from_mlx_vlm_generate(self):
+        """_generate_native_video uses mlx_vlm.generate.generate.
+
+        mlx-vlm 0.6 removed ``mlx_vlm.video_generate``; video now goes through
+        ``generate(video=...)``.
+        """
         import inspect
 
         source = inspect.getsource(MLXMultimodalLM._generate_native_video)
-        assert "from mlx_vlm.video_generate import generate" in source
+        assert "from mlx_vlm.generate import generate" in source
+        assert "mlx_vlm.video_generate" not in source
 
 
 class TestIsBase64Video:

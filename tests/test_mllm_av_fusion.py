@@ -189,36 +189,20 @@ class TestNativeRoutingContract:
 
 
 class TestNativePrepareInputsForwardsAudio:
-    """`_prepare_native_video_inputs` must pipe processor audio outputs through."""
+    """`_prepare_native_video_inputs` must hand audio to mlx_vlm.generate.
 
-    def _build_inputs_dict(self, *, include_audio_keys: bool) -> dict:
-        """Fake HF processor return value."""
-        # Use simple lists; mx.array() will accept them.
-        d = {
-            "input_ids": [[1, 2, 3]],
-            "pixel_values_videos": [[0.0, 0.1]],
-            "attention_mask": [[1, 1, 1]],
-            "video_grid_thw": [[1, 1, 1]],
-        }
-        if include_audio_keys:
-            d.update(
-                {
-                    "sound_clips": "SENTINEL_SOUND_CLIPS",
-                    "input_features": "SENTINEL_INPUT_FEATURES",
-                    "feature_attention_mask": "SENTINEL_FAM",
-                }
-            )
-        return d
+    Since the mlx-vlm 0.6 port the native path decodes frames with
+    ``mlx_vlm.utils.load_video`` and passes media to ``generate()``, which runs
+    the processor itself. The audio contract is therefore on ``gen_kwargs``:
+    omni requests carry ``audio=[...]``, non-omni requests carry none.
+    """
 
     def _run(self, *, omni: bool, with_audio_block: bool):
+        import numpy as np
+
         model = _make_model(video_native_with_audio=omni, video_native=True)
-        # Stub processor: returns inputs dict and a benign apply_chat_template.
         processor = MagicMock()
         processor.apply_chat_template.return_value = "PROMPT"
-        # The processor returns sound_clips whenever `audio=` is passed —
-        # which the native path does for every omni request, regardless of
-        # whether the audio came from an explicit block or auto-extraction.
-        processor.return_value = self._build_inputs_dict(include_audio_keys=omni)
         model.processor = processor
 
         items = [_video_url()]
@@ -226,8 +210,10 @@ class TestNativePrepareInputsForwardsAudio:
             items.append(_audio_url())
         messages = [_user_msg(*items)]
 
-        # Patch mlx_vlm process_vision_info and the resolution helpers.
-        process_vision_info = MagicMock(return_value=(["frame1.jpg"], ["v.mp4"], {}))
+        # (T, C, H, W), as mlx_vlm.utils.load_video stacks frames; 0.6 returns
+        # the sampled fps as a float alongside them.
+        frames = np.zeros((4, 3, 64, 48), dtype=np.uint8)
+        utils = MagicMock(load_video=MagicMock(return_value=(frames, 2.0)))
         with (
             patch.object(
                 mllm_mod, "process_video_input", return_value="/tmp/local.mp4"
@@ -238,39 +224,25 @@ class TestNativePrepareInputsForwardsAudio:
             patch.object(
                 mllm_mod, "extract_audio_from_video", return_value="/tmp/local.wav"
             ),
-            patch.dict(
-                "sys.modules",
-                {
-                    "mlx_vlm.video_generate": MagicMock(
-                        process_vision_info=process_vision_info
-                    ),
-                },
-            ),
+            patch.dict("sys.modules", {"mlx_vlm.utils": utils}),
         ):
             text, gen_kwargs = model._prepare_native_video_inputs(messages)
 
-        return text, gen_kwargs, processor
+        return text, gen_kwargs, utils.load_video
 
-    def test_native_path_forwards_sound_clips_for_omni(self):
-        """omni → processor sees `audio=…`, gen_kwargs gets `sound_clips`."""
-        _, gen_kwargs, processor = self._run(omni=True, with_audio_block=False)
+    def test_native_path_forwards_extracted_audio_for_omni(self):
+        """omni -> the audio extracted from the video reaches generate()."""
+        _, gen_kwargs, load_video = self._run(omni=True, with_audio_block=False)
 
-        proc_call = processor.call_args
-        assert "audio" in proc_call.kwargs
-        assert proc_call.kwargs["audio"] == ["/tmp/local.wav"]
-
-        # The processor's audio-bearing outputs must be propagated.
-        assert gen_kwargs.get("sound_clips") == "SENTINEL_SOUND_CLIPS"
-        assert gen_kwargs.get("input_features") == "SENTINEL_INPUT_FEATURES"
-        assert gen_kwargs.get("feature_attention_mask") == "SENTINEL_FAM"
+        load_video.assert_called_once()
+        assert gen_kwargs.get("audio") == ["/tmp/local.wav"]
+        assert len(gen_kwargs["video"]) == 1
 
     def test_native_path_omits_audio_kwarg_for_non_omni(self):
-        """non-omni → no `audio=` passed; no sound_* keys leak into gen_kwargs."""
-        _, gen_kwargs, processor = self._run(omni=False, with_audio_block=False)
+        """non-omni -> no audio is extracted or forwarded to generate()."""
+        _, gen_kwargs, _ = self._run(omni=False, with_audio_block=False)
 
-        proc_call = processor.call_args
-        assert "audio" not in proc_call.kwargs
-
+        assert "audio" not in gen_kwargs
         for k in (
             "sound_clips",
             "input_features",

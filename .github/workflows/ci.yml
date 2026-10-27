@@ -63,7 +63,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install pytest anyio pytest-cov pydantic fastapi jsonschema httpx psutil transformers requests
+          pip install pytest anyio pytest-cov pydantic fastapi jsonschema httpx psutil transformers requests "gradio>=4.0.0"
 
       - name: Run unit tests (no MLX required)
         run: |
@@ -89,6 +89,7 @@ jobs:
             tests/test_api_models.py \
             tests/test_api_utils.py \
             tests/test_video_audio_extraction.py \
+            tests/test_video_pipeline.py \
             tests/test_request.py \
             tests/test_batch_compat.py \
             tests/test_anthropic_models.py \
@@ -99,6 +100,7 @@ jobs:
             tests/test_anthropic_adapter_canonicalization.py \
             tests/test_mllm_stream_usage.py \
             tests/test_constrained_cache.py \
+            tests/test_gradio_app.py \
             tests/test_dependency_floors.py \
             tests/test_ssd_cache_shutdown.py \
             tests/test_chat_template_safety.py \
@@ -297,6 +299,16 @@ jobs:
             tests/test_streaming_content_with_tool_calls_integration.py \
             -v --tb=short \
             -m "not slow"
+
+      - name: Check the installed mlx-vlm still exposes the pinned video API
+        run: |
+          # The no-MLX job collects this test too, but skips it there for lack
+          # of MLX; only here does it check the dependency CI actually
+          # installs. Require a pass, not a skip, so a missing mlx-vlm cannot
+          # quietly turn the check into a no-op again.
+          pytest tests/test_video_pipeline.py::test_real_mlx_vlm_still_exposes_the_pinned_api \
+            -q -rs | tee pinned-api.log
+          grep -q "1 passed" pinned-api.log
 
       - name: Run EngineCore stream-affinity regression tests
         run: |
