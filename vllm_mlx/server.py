@@ -6721,6 +6721,7 @@ async def _stream_anthropic_messages(
     start_time = time.perf_counter()
     result_label = "success"
     prompt_tokens = 0
+    finish_reason = None
 
     messages = prepared.messages
     chat_kwargs = dict(prepared.chat_kwargs)
@@ -6796,6 +6797,8 @@ async def _stream_anthropic_messages(
 
             if hasattr(output, "prompt_tokens") and output.prompt_tokens:
                 prompt_tokens = output.prompt_tokens
+
+            finish_reason = getattr(output, "finish_reason", None) or finish_reason
 
             # Track token counts
             if hasattr(output, "completion_tokens") and output.completion_tokens:
@@ -6996,13 +6999,18 @@ async def _stream_anthropic_messages(
                 yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': tool_index})}\n\n"
 
         # Determine stop reason
-        stop_reason = "tool_use" if tool_calls else "end_turn"
+        stop_reason = _convert_anthropic_stop_reason(
+            "tool_calls" if tool_calls else finish_reason
+        )
 
         # Emit message_delta with stop_reason and usage
         message_delta = {
             "type": "message_delta",
             "delta": {"stop_reason": stop_reason, "stop_sequence": None},
-            "usage": {"output_tokens": completion_tokens},
+            "usage": {
+                "input_tokens": prompt_tokens,
+                "output_tokens": completion_tokens,
+            },
         }
         yield f"event: message_delta\ndata: {json.dumps(message_delta)}\n\n"
 

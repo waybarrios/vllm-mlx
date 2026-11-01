@@ -5315,6 +5315,64 @@ class TestChatCompletionStreamingModeSwitching:
         assert response.status_code == 200
         assert extract_calls["count"] == 1
 
+    def test_anthropic_stream_reports_max_tokens_and_input_tokens(
+        self, client, monkeypatch
+    ):
+        """Anthropic streaming should surface finish_reason=length and prompt usage."""
+        import json
+
+        import vllm_mlx.server as server
+        from vllm_mlx.engine.base import GenerationOutput
+
+        class FakeEngine:
+            model_name = "fake-engine"
+            is_mllm = False
+            preserve_native_tool_format = False
+
+            async def stream_chat(self, messages, **kwargs):
+                yield GenerationOutput(
+                    text="a", new_text="a", prompt_tokens=7, completion_tokens=1
+                )
+                yield GenerationOutput(
+                    text="ab",
+                    new_text="b",
+                    prompt_tokens=7,
+                    completion_tokens=2,
+                    finished=True,
+                    finish_reason="length",
+                )
+
+        monkeypatch.setattr(server, "_engine", FakeEngine())
+        monkeypatch.setattr(server, "_model_name", "test-model")
+        monkeypatch.setattr(server, "_default_timeout", 30.0)
+        monkeypatch.setattr(server, "_default_max_tokens", 128)
+        monkeypatch.setattr(server, "_api_key", None)
+        monkeypatch.setattr(
+            server,
+            "_rate_limiter",
+            server.RateLimiter(requests_per_minute=60, enabled=False),
+        )
+        monkeypatch.setattr(server, "_reasoning_parser", None)
+
+        response = client.post(
+            "/v1/messages",
+            json={
+                "model": "test-model",
+                "max_tokens": 2,
+                "stream": True,
+                "messages": [{"role": "user", "content": "Hello"}],
+            },
+        )
+
+        assert response.status_code == 200
+        delta = next(
+            json.loads(line[len("data: ") :])
+            for line in response.text.splitlines()
+            if line.startswith("data: ") and '"message_delta"' in line
+        )
+        assert delta["delta"]["stop_reason"] == "max_tokens"
+        assert delta["usage"] == {"input_tokens": 7, "output_tokens": 2}
+
 
 # =============================================================================
 # Request Cancellation Tests
