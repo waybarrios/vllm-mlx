@@ -4543,11 +4543,29 @@ async def cache_stats():
         }
 
 
+def _release_unused_mlx_buffers() -> None:
+    """Release the process-wide unused pool, not live model/request arrays."""
+    try:
+        import mlx.core as mx
+    except ImportError:
+        return
+
+    try:
+        mx.clear_cache()
+    except Exception as exc:
+        logger.warning(
+            "Failed to release unused MLX buffers: %s",
+            _sanitize_log_text(exc, limit=500),
+        )
+
+
 @app.delete("/v1/cache", dependencies=[Depends(verify_api_key)])
 async def clear_cache():
     """Clear all caches."""
     cleared_engine = None
-    if _engine is not None and hasattr(_engine, "clear_runtime_caches"):
+    if _model_manager is not None:
+        cleared_engine = await _model_manager.clear_caches()
+    elif _engine is not None and hasattr(_engine, "clear_runtime_caches"):
         try:
             owned_clear = getattr(_engine, "_clear_runtime_caches_on_owner", None)
             if owned_clear is not None:
@@ -4579,6 +4597,9 @@ async def clear_cache():
             "engine_cache": cleared_engine,
             "error": "Cache clear not available (mlx_vlm not loaded)",
         }
+    finally:
+        # Global mlx-vlm caches can release additional buffers after the engine.
+        _release_unused_mlx_buffers()
 
 
 @app.delete("/v1/cache/prefix", dependencies=[Depends(verify_api_key)])
@@ -4590,6 +4611,20 @@ async def clear_prefix_cache():
     hits the cache. Response returns immediately without waiting for
     the re-warm to finish.
     """
+    if _model_manager is not None:
+        model_caches = await _model_manager.clear_caches(prefix_only=True)
+        cleared = any(item["status"] == "cleared" for item in model_caches.values())
+        if cleared:
+            _release_unused_mlx_buffers()
+        return {
+            "status": (
+                "cleared"
+                if cleared
+                else "not_supported" if model_caches else "no_engine"
+            ),
+            "rewarm_scheduled": False,
+            "model_caches": model_caches,
+        }
     if _engine is None:
         return {"status": "no_engine"}
     cleared = False
@@ -4608,6 +4643,9 @@ async def clear_prefix_cache():
                 "[clear_prefix_cache] engine.clear_prefix_cache failed: %s",
                 _sanitize_log_text(e, limit=500),
             )
+
+    if cleared:
+        _release_unused_mlx_buffers()
 
     # Auto re-warm in background if warm-prompts was configured.
     rewarm_scheduled = False

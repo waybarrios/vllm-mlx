@@ -11,6 +11,7 @@ behaviour.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import math
 import os
@@ -802,6 +803,38 @@ class ModelManager:
             return None
         return max(self._loaded.values(), key=lambda loaded: loaded.last_used_at).engine
 
+    async def clear_caches(
+        self, *, prefix_only: bool = False
+    ) -> dict[str, dict[str, Any]]:
+        """Clear resident engines without loading or unloading registry entries.
+
+        Keep residency protected until owner-side operations finish. In-flight
+        requests retain their own arrays; this drops only reusable cache owners.
+        The caller can then flush the process-wide allocator pool once, after
+        also dropping any global caches.
+        """
+        method = "clear_prefix_cache" if prefix_only else "clear_runtime_caches"
+        results: dict[str, dict[str, Any]] = {}
+        async with self._condition:
+            for name, loaded in self._loaded.items():
+                clear = getattr(loaded.engine, f"_{method}_on_owner", None)
+                if clear is None:
+                    clear = getattr(loaded.engine, method, None)
+                if clear is None:
+                    results[name] = {"status": "not_supported"}
+                    continue
+                try:
+                    result = clear()
+                    if inspect.isawaitable(result):
+                        result = await result
+                    results[name] = {"status": "cleared", "cache": result}
+                except Exception as exc:
+                    logger.warning(
+                        "Failed to clear caches for model %r", name, exc_info=True
+                    )
+                    results[name] = {"status": "error", "error": str(exc)}
+        return results
+
     async def preload(self) -> None:
         """Preload any entries marked preload=true."""
         for entry in self._registry.values():
@@ -934,25 +967,39 @@ class ModelManager:
     async def release(self, model_name: str) -> None:
         """Release a previously acquired model lease."""
         unload: LoadedModel | None = None
+        cancelled: asyncio.CancelledError | None = None
 
-        async with self._condition:
+        # ModelLease/RequestModelContext close their handles before awaiting us.
+        # A cache clear can hold this condition across owner work, so finish the
+        # decrement before propagating cancellation, including repeated cancels.
+        # Stay in the request task: active_tasks must discard its identity.
+        while True:
+            try:
+                await self._condition.acquire()
+                break
+            except asyncio.CancelledError as exc:
+                cancelled = exc
+
+        try:
             loaded = self._loaded.get(model_name)
-            if loaded is None:
-                return
+            if loaded is not None:
+                loaded.active_requests = max(0, loaded.active_requests - 1)
+                loaded.last_used_at = time.time()
+                task = asyncio.current_task()
+                if task is not None:
+                    loaded.active_tasks.discard(task)
 
-            loaded.active_requests = max(0, loaded.active_requests - 1)
-            loaded.last_used_at = time.time()
-            task = asyncio.current_task()
-            if task is not None:
-                loaded.active_tasks.discard(task)
+                if loaded.preempting and loaded.active_requests == 0:
+                    unload = self._begin_unload_locked(model_name)
 
-            if loaded.preempting and loaded.active_requests == 0:
-                unload = self._begin_unload_locked(model_name)
-
-            self._condition.notify_all()
+                self._condition.notify_all()
+        finally:
+            self._condition.release()
 
         if unload is not None:
             await self._run_unloads([unload])
+        if cancelled is not None:
+            raise cancelled
 
     async def unload_idle(self) -> list[str]:
         """Unload every loaded model idle past ``idle_unload_seconds``.

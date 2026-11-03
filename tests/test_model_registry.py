@@ -7,6 +7,7 @@ import asyncio
 import dataclasses
 import logging
 import re
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -14,7 +15,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from vllm_mlx.engine.base import BaseEngine, GenerationOutput
+from vllm_mlx.engine.base import BaseEngine, GenerationOutput, run_blocking_startup_work
 from vllm_mlx.model_registry import (
     ContentionPolicy,
     ModelManager,
@@ -75,6 +76,265 @@ class FakeEngine(BaseEngine):
 
     async def stream_chat(self, *args, **kwargs):
         yield GenerationOutput(text="ok", new_text="ok", finished=True)
+
+
+class _CacheEngine(FakeEngine):
+    """Keep cached and live references distinct across owner-dispatched clears."""
+
+    def __init__(self, config):
+        super().__init__(config)
+        self.cached = [object()]
+        self.live = object()
+        self.clear_started = asyncio.Event()
+        self.clear_gate = None
+        self.clear_error = None
+
+    async def _clear_prefix_cache_on_owner(self):
+        self.clear_started.set()
+        if self.clear_gate is not None:
+            await self.clear_gate.wait()
+        if self.clear_error is not None:
+            raise self.clear_error
+        self.cached.clear()
+
+    async def _clear_runtime_caches_on_owner(self):
+        await self._clear_prefix_cache_on_owner()
+        return {"prefix_cache": True}
+
+    def clear_prefix_cache(self):
+        raise AssertionError("owner helper must take precedence")
+
+    def clear_runtime_caches(self):
+        raise AssertionError("owner helper must take precedence")
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("prefix_only", [False, True])
+async def test_registry_cache_clear_keeps_resident_models_and_active_leases(
+    tmp_path, prefix_only
+):
+    manager = ModelManager(
+        _manager_config(budget_gb=4),
+        _registry(tmp_path, {"a": 1, "b": 1, "unloaded": 1}),
+        _defaults(),
+        engine_factory=_CacheEngine,
+    )
+    leases = [await manager.acquire(name) for name in ("a", "b")]
+    live = [lease.engine.live for lease in leases]
+
+    result = await manager.clear_caches(prefix_only=prefix_only)
+
+    assert set(result) == {"a", "b"}
+    assert all(item["status"] == "cleared" for item in result.values())
+    assert set(manager._loaded) == {"a", "b"}
+    for lease, live_reference in zip(leases, live):
+        assert lease.engine.cached == []
+        assert lease.engine.live is live_reference
+        assert lease.engine.started == 1
+        assert lease.engine.stopped == 0
+        assert manager._loaded[lease.model_name].active_requests == 1
+        await lease.release()
+    await manager.shutdown()
+
+
+@pytest.mark.anyio
+async def test_registry_cache_clear_blocks_eviction_until_owner_finishes(tmp_path):
+    manager = ModelManager(
+        _manager_config(budget_gb=1),
+        _registry(tmp_path, {"a": 1, "b": 1}),
+        _defaults(),
+        engine_factory=_CacheEngine,
+    )
+    lease = await manager.acquire("a")
+    engine = lease.engine
+    await lease.release()
+    engine.clear_gate = asyncio.Event()
+    clearing = asyncio.create_task(manager.clear_caches(prefix_only=True))
+    await engine.clear_started.wait()
+    # This acquire must evict a, but cannot stop it during its owner operation.
+    acquiring = asyncio.create_task(manager.acquire("b"))
+    await asyncio.sleep(0)
+    assert not acquiring.done()
+    assert engine.stopped == 0
+    engine.clear_gate.set()
+    assert (await clearing)["a"]["status"] == "cleared"
+    replacement = await acquiring
+    assert engine.stopped == 1
+    await replacement.release()
+    await manager.shutdown()
+
+
+@pytest.mark.anyio
+async def test_registry_cache_clear_waits_for_cancelled_owner_before_eviction(tmp_path):
+    manager = ModelManager(
+        _manager_config(budget_gb=1),
+        _registry(tmp_path, {"a": 1, "b": 1}),
+        _defaults(),
+        engine_factory=_CacheEngine,
+    )
+    lease = await manager.acquire("a")
+    engine = lease.engine
+    await lease.release()
+    started, finish = threading.Event(), threading.Event()
+
+    def blocking_clear():
+        started.set()
+        finish.wait()
+        engine.cached.clear()
+
+    async def owner_clear():
+        # The production BatchedEngine owner helper uses this cancellation guard.
+        await run_blocking_startup_work(blocking_clear)
+
+    engine._clear_prefix_cache_on_owner = owner_clear
+    clearing = asyncio.create_task(manager.clear_caches(prefix_only=True))
+    try:
+        assert await asyncio.to_thread(started.wait, 5)
+        clearing.cancel()
+        acquiring = asyncio.create_task(manager.acquire("b"))
+        await asyncio.sleep(0)
+        assert not clearing.done()
+        assert not acquiring.done()
+        assert engine.stopped == 0
+    finally:
+        finish.set()
+    with pytest.raises(asyncio.CancelledError):
+        await clearing
+    replacement = await acquiring
+    assert engine.cached == []
+    assert engine.stopped == 1
+    await replacement.release()
+    await manager.shutdown()
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("prefix_only", [True, False], ids=["prefix", "all"])
+@pytest.mark.parametrize("preempting", [False, True], ids=["resident", "preempting"])
+async def test_cancelled_request_release_during_registry_cache_clear(
+    tmp_path, prefix_only, preempting
+):
+    """Cancellation cannot lose the request lease while clear pins residency."""
+    from vllm_mlx.server import RequestModelContext
+
+    manager = ModelManager(
+        _manager_config(budget_gb=1, strategy="fail"),
+        _registry(tmp_path, {"a": 1, "b": 1}),
+        _defaults(),
+        engine_factory=_CacheEngine,
+    )
+    ready, release_now = asyncio.Event(), asyncio.Event()
+    holder = {}
+
+    async def request_owner():
+        lease = await manager.acquire("a")
+        context = RequestModelContext("a", lease.engine, lease)
+        holder.update(lease=lease, context=context)
+        ready.set()
+        await release_now.wait()
+        await context.release()
+
+    releasing = asyncio.create_task(request_owner())
+    await ready.wait()
+    lease, context = holder["lease"], holder["context"]
+    engine = lease.engine
+    loaded = manager._loaded["a"]
+    assert loaded.active_tasks == {releasing}
+    loaded.preempting = preempting
+    engine.clear_gate = asyncio.Event()
+    clearing = asyncio.create_task(manager.clear_caches(prefix_only=prefix_only))
+    try:
+        await engine.clear_started.wait()
+        release_now.set()
+        await asyncio.sleep(0)
+        assert not releasing.done()
+        for _ in range(3):
+            releasing.cancel()
+            await asyncio.sleep(0)
+            # Returning now would lose context.lease and lease.manager before
+            # the actual count/task removal can acquire the condition.
+            assert not releasing.done()
+            assert loaded.active_requests == 1
+            assert loaded.active_tasks == {releasing}
+            assert engine.stopped == 0
+    finally:
+        engine.clear_gate.set()
+        clear_result = await clearing
+        await asyncio.gather(releasing, return_exceptions=True)
+
+    assert clear_result["a"]["status"] == "cleared"
+    assert releasing.cancelled()
+    assert loaded.active_requests == 0
+    # A cleanup task using its own current_task() would leave releasing here.
+    assert loaded.active_tasks == set()
+    assert context.lease is None
+    assert lease.manager is None
+    await context.release()
+    await lease.release()
+    assert loaded.active_requests == 0
+    assert loaded.active_tasks == set()
+    replacement = await manager.acquire("b")
+    assert engine.stopped == 1
+    await replacement.release()
+    await manager.shutdown()
+    assert manager._loaded == {}
+    assert manager._unloading == {}
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("route", ["/v1/cache/prefix", "/v1/cache"])
+@pytest.mark.parametrize("failed_model", [None, "a"])
+async def test_registry_cache_routes_clear_all_resident_owners_before_pool_flush(
+    tmp_path, monkeypatch, route, failed_model
+):
+    import httpx
+    import mlx.core as mx
+    import sys
+    import types
+
+    import vllm_mlx.server as server
+
+    manager = ModelManager(
+        _manager_config(budget_gb=4),
+        _registry(tmp_path, {"a": 1, "b": 1, "unloaded": 1}),
+        _defaults(),
+        engine_factory=_CacheEngine,
+    )
+    leases = [await manager.acquire(name) for name in ("a", "b")]
+    if failed_model:
+        leases[0].engine.clear_error = RuntimeError("owner failed")
+    flushes = []
+
+    def flush():
+        # A premature flush would leave b's now-unused arrays in the pool.
+        assert leases[1].engine.cached == []
+        flushes.append(True)
+
+    utils = types.ModuleType("mlx_vlm.utils")
+    utils.clear_multimodal_kv_cache = lambda: None
+    utils.clear_pixel_values_cache = lambda: None
+    monkeypatch.setitem(sys.modules, "mlx_vlm.utils", utils)
+    monkeypatch.setattr(mx, "clear_cache", flush)
+    monkeypatch.setattr(server, "_engine", None)
+    monkeypatch.setattr(server, "_model_manager", manager)
+    monkeypatch.setattr(server, "_api_key", None)
+    monkeypatch.setattr(server, "_warm_prompts_path", None)
+    transport = httpx.ASGITransport(app=server.app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.delete(route)
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "cleared"
+    models = body["model_caches"] if route.endswith("prefix") else body["engine_cache"]
+    assert set(models) == {"a", "b"}
+    assert models["b"]["status"] == "cleared"
+    assert models["a"]["status"] == ("error" if failed_model else "cleared")
+    assert flushes == [True]
+    assert set(manager._loaded) == {"a", "b"}
+    for lease in leases:
+        assert lease.engine.stopped == 0
+        assert manager._loaded[lease.model_name].active_requests == 1
+        await lease.release()
+    await manager.shutdown()
 
 
 def _defaults() -> RegistryServeDefaults:

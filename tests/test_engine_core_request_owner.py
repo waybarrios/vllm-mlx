@@ -578,3 +578,55 @@ async def test_cache_mutations_run_on_model_owner_thread(
 
     assert result == expected
     assert mutation_threads == [owner_thread]
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("owner_async", [False, True])
+async def test_prefix_clear_reaches_scheduler_through_real_async_wrapper_on_owner(
+    engine_core_module, batched_module, owner_async
+):
+    """A real AsyncEngineCore must expose the clear, not silently skip it."""
+    module, _ = batched_module
+    mutation_threads = []
+    cached = {"prefix": object()}
+    requests = {"live": object()}
+
+    class RecordedScheduler:
+        def clear_prefix_cache(self):
+            mutation_threads.append(threading.get_ident())
+            cached.clear()
+
+    # Bypass model loading only: all three production clear/dispatch layers are
+    # actual classes, so a missing wrapper method cannot be supplied by a fake.
+    core = object.__new__(engine_core_module.EngineCore)
+    core.scheduler = RecordedScheduler()
+    core.model = object()
+    core._output_collectors = requests
+    wrapper = object.__new__(engine_core_module.AsyncEngineCore)
+    wrapper.engine = core
+    engine = object.__new__(module.BatchedEngine)
+    engine._generation_executor = None
+    engine._engine = wrapper
+    engine._mllm_scheduler = None
+    model = core.model
+    worker = engine._generation_worker()
+    owner_thread = worker.submit(threading.get_ident).result(timeout=5)
+
+    try:
+        if owner_async:
+            result = await engine._clear_prefix_cache_on_owner()
+        else:
+            result = engine.clear_prefix_cache()
+    finally:
+        worker.shutdown(wait=True)
+        engine._generation_executor = None
+
+    assert result is None
+    assert cached == {}
+    assert mutation_threads == [owner_thread]
+    assert owner_thread != threading.get_ident()
+    assert engine._engine is wrapper
+    assert wrapper.engine is core
+    assert core.model is model
+    assert core._output_collectors is requests
+    assert list(requests) == ["live"]

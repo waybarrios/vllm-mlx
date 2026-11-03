@@ -314,6 +314,39 @@ effective idle timeout together with all model states, inspect `/v1/status`:
 curl http://localhost:8000/v1/status
 ```
 
+### Clear resident-model caches
+
+Cache deletion applies to models that are already resident. It does not load
+inactive registry entries or unload resident models.
+
+```bash
+curl -X DELETE http://localhost:8000/v1/cache/prefix
+curl -X DELETE http://localhost:8000/v1/cache
+```
+
+The prefix route returns per-model results in `model_caches`; the all-cache
+route returns them in `engine_cache` and also clears shared caches. Each model
+reports `status` as `cleared`, `not_supported`, or `error`. Inspect these results
+even when the overall response reports `cleared`, since one model's failure
+does not prevent the other residents from being cleared.
+
+For example, a prefix response can include:
+
+```json
+{
+  "status": "cleared",
+  "rewarm_scheduled": false,
+  "model_caches": {
+    "fast": {"status": "cleared", "cache": null}
+  }
+}
+```
+
+Registry prefix deletion returns `rewarm_scheduled: false`. In-flight requests
+keep their live arrays; deletion drops reusable cache references and requests
+release of unused allocator buffers. It does not promise a specific decrease
+in process memory.
+
 ### Verify a cold-load path
 
 ```bash

@@ -4,10 +4,41 @@
 These tests use real ``mlx_lm.models.cache.KVCache`` / ``RotatingKVCache``
 objects backed by ``mlx.core`` arrays.  They run only on the apple-silicon
 CI matrix (and locally on M-series hardware); the Linux ``test-matrix``
-job excludes this file because MLX has no Linux distribution.
+job excludes this file. The memory-release cases explicitly require Metal.
 """
 
+import platform
+import subprocess
+import sys
+from pathlib import Path
 from unittest.mock import MagicMock
+
+import pytest
+
+
+@pytest.mark.skipif(
+    platform.system() != "Darwin" or platform.machine() != "arm64",
+    reason="requires actual Apple Silicon/Metal memory accounting",
+)
+@pytest.mark.parametrize("route", ["prefix", "all"])
+def test_explicit_cache_delete_releases_synthetic_kv_in_fresh_process(route):
+    """Synthetic KV only, not production model acceptance; never a CPU proxy."""
+    root = Path(__file__).resolve().parents[1]
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(root / "scripts" / "benchmark_cache_release.py"),
+            "--route",
+            route,
+            "--settle-seconds",
+            "10",
+        ],
+        cwd=root,
+        text=True,
+        capture_output=True,
+        timeout=180,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 class TestTrimCacheOffset:
