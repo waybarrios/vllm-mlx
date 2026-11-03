@@ -1,0 +1,1084 @@
+{
+  "issue": "793",
+  "common": {
+    "head": "3af7d7d61576606153f419816be2f4a1a9baab06",
+    "tracked_diff_sha256": "640c90519f49ed9bff9ea5bc8c4f38a1456fa9aaf6ee319f140b7aa258f165d2",
+    "tracked_diff_bytes": 412062,
+    "staged_diff_bytes": 0,
+    "files": {
+      ".github/workflows/ci.yml": {
+        "sha256": "d50c091e7a1bc582ebe6277f03e8a8e9b9f123cda03980430d1dcde26efe989e",
+        "mode": 33204,
+        "untracked": false
+      },
+      "tests/test_api_models.py": {
+        "sha256": "8c40870575bb91909194504a67ee0d941f5c581b544cbb3376317db0fcdaebb2",
+        "mode": 33204,
+        "untracked": false
+      },
+      "tests/test_batched_engine_mllm_config.py": {
+        "sha256": "9c94d17271b5cc206bc8579a45217fc5a153c284837f72225883876f85123d79",
+        "mode": 33204,
+        "untracked": false
+      },
+      "tests/test_batching.py": {
+        "sha256": "81adecba04df558228d7a41cb2c0b4b11bc1cedb2b05d1d99119d32e613bc88a",
+        "mode": 33204,
+        "untracked": false
+      },
+      "tests/test_bench_serve.py": {
+        "sha256": "38d16104ef7a3b21b05962e9994c87d8c6407d762af53e64546ca16c27a1cd5c",
+        "mode": 33204,
+        "untracked": false
+      },
+      "tests/test_chat_template_safety.py": {
+        "sha256": "1fca89079f595dcd71f1be1dcdd39cbf6acdcb9edc09218c6d6efa61a43aa908",
+        "mode": 33204,
+        "untracked": false
+      },
+      "tests/test_deepseek_v4_encoding.py": {
+        "sha256": "af0dc444f59f36ba1e1e9453986fe4d94e5283c993097b501a0fc76d28703e3e",
+        "mode": 33204,
+        "untracked": false
+      },
+      "tests/test_endpoint_model_policies.py": {
+        "sha256": "ad662c09acc9df3d9ae6ae7d25b8045aab6566566806d9471ecc8afdb2ced3f2",
+        "mode": 33204,
+        "untracked": false
+      },
+      "tests/test_engine_base.py": {
+        "sha256": "68548c975deb2b28734c8742e50e76c7eec91ad633ed6b3eae6105ef1e21abe6",
+        "mode": 33204,
+        "untracked": false
+      },
+      "tests/test_engine_core_request_owner.py": {
+        "sha256": "3289b50cc08165bbad5f03be7b441bb0a9f1481644322dac53e91254b9dd5baf",
+        "mode": 33204,
+        "untracked": false
+      },
+      "tests/test_manual_script_imports.py": {
+        "sha256": "abae6a5f8bd3d488281e621892ad2a2cb4e9019faccaf1fd757c808e69fb861e",
+        "mode": 33204,
+        "untracked": true
+      },
+      "tests/test_mcp_security.py": {
+        "sha256": "53fe7f0460e911bb53e6b1b06efc02ca692346abd3d65502c51fd3d0fe08b585",
+        "mode": 33204,
+        "untracked": false
+      },
+      "tests/test_memory_cache.py": {
+        "sha256": "5abf7dd9407eeeba4adfd463bf3885cd95864df4f557881b46f8193efef2706b",
+        "mode": 33204,
+        "untracked": false
+      },
+      "tests/test_mllm_boundary_checkpoint.py": {
+        "sha256": "abd51ceefc32e1ce62570a829a11e069d443009d04a180eefb08a17ce1739d50",
+        "mode": 33204,
+        "untracked": false
+      },
+      "tests/test_mllm_media_specprefill.py": {
+        "sha256": "e012866556fd2e5f025ad6198de38b871188bce3c0b7f9a91938de715fe6d218",
+        "mode": 33204,
+        "untracked": false
+      },
+      "tests/test_model_registry.py": {
+        "sha256": "2c7b32ba97dc4c66de5d08a470fb01df4ba52a8e5ac71fba652b47857e08a7de",
+        "mode": 33204,
+        "untracked": false
+      },
+      "tests/test_optimizations.py": {
+        "sha256": "06f08bda1c867c02f436ecbd949bec20018fe744bded8260e1137903de934695",
+        "mode": 33204,
+        "untracked": false
+      },
+      "tests/test_paged_cache_benefits.py": {
+        "sha256": "2bd05de7497166124e82f3ff239d6e9962c54d874c5031b81bb4c4464656216f",
+        "mode": 33204,
+        "untracked": false
+      },
+      "tests/test_paged_cache_real_inference.py": {
+        "sha256": "a2a20b72747a4879a6d8c500e18fe465f41d58ef71e0f5f921620166c1e99ea7",
+        "mode": 33204,
+        "untracked": false
+      },
+      "tests/test_paged_cache_real_model.py": {
+        "sha256": "fd2ee5ccfd81cab2e34a75b8fdc4d1fa7dce9883d76543908daa6b9805ba9226",
+        "mode": 33204,
+        "untracked": false
+      },
+      "tests/test_prefix_cache.py": {
+        "sha256": "bff5be0ef1a57a98c5c717e03cfdd5c0bdbdafed80c8985c906f5310204c27c1",
+        "mode": 33204,
+        "untracked": false
+      },
+      "tests/test_qwen3_xml_streaming_chunks.py": {
+        "sha256": "fd2b9ef3bc9bdc051c7413f6eac920fe59dadd9d1c685ae647824a40390e02c9",
+        "mode": 33204,
+        "untracked": false
+      },
+      "tests/test_registry_idle_unload_real_model.py": {
+        "sha256": "9e582319a72cf6c7bcef2e563267b1fefb69869c23f5eeea4b36ae877f0d190c",
+        "mode": 33204,
+        "untracked": false
+      },
+      "tests/test_scheduler_prompt_save_failclosed.py": {
+        "sha256": "a7fc71ac0e5c11646f1d378d1e5fda0bae2df35db24c11912d79b3e9a72ebb4b",
+        "mode": 33204,
+        "untracked": false
+      },
+      "tests/test_simple_engine.py": {
+        "sha256": "49637046c365813816de84b358fadf49ee7c225f574b5d83cd53734d991a3210",
+        "mode": 33204,
+        "untracked": false
+      },
+      "tests/test_ssd_cache_shutdown.py": {
+        "sha256": "177b048e66dc32979f2fde467d9555579825049d044a718d0e15c2ce89f81784",
+        "mode": 33204,
+        "untracked": false
+      },
+      "tests/test_structured_output.py": {
+        "sha256": "f794dfdb207a131874b3df8c72655233a497d5ea908258decb1d33742bb22baa",
+        "mode": 33204,
+        "untracked": false
+      },
+      "tests/test_text_model_dispatch.py": {
+        "sha256": "10d58410e81e24e6d88755865f75c8ef2f072a72608810f64e159e82cc4efa07",
+        "mode": 33204,
+        "untracked": false
+      },
+      "tests/test_tool_parsers.py": {
+        "sha256": "590993dfb3af53ba352328e6d2fb930b211513fd88506999ef6f37b390a71db7",
+        "mode": 33204,
+        "untracked": false
+      },
+      "vllm_mlx/api/responses_models.py": {
+        "sha256": "cf5d6392fdf21c7be659f92564269fbfcaccee96bfc285966ab8b86a68f2678a",
+        "mode": 33204,
+        "untracked": false
+      },
+      "vllm_mlx/api/tool_calling.py": {
+        "sha256": "fd14da35da5af280d01c1b55b98d4ecbbcfb7d9a4af48a00b5ff6b5aa8500986",
+        "mode": 33204,
+        "untracked": false
+      },
+      "vllm_mlx/api/utils.py": {
+        "sha256": "1e893b356abdca8996b69e057f3d31d3891daebb7cf452be434b831f7b191d07",
+        "mode": 33204,
+        "untracked": false
+      },
+      "vllm_mlx/audio/processor.py": {
+        "sha256": "16ff1784d870877baa6608b01fe3ccda6c6a4397ebc2e566bef4593566f9d535",
+        "mode": 33204,
+        "untracked": false
+      },
+      "vllm_mlx/audio/stt.py": {
+        "sha256": "8087d182e18e94a5a537d106eced2ef8db56fc4febdb30ce621b5a45b9c9ced3",
+        "mode": 33204,
+        "untracked": false
+      },
+      "vllm_mlx/audio/tts.py": {
+        "sha256": "b21df8e7c803ed60b9d8adecd48fb08176b2ffa7525e82101a84939e5866fe5a",
+        "mode": 33204,
+        "untracked": false
+      },
+      "vllm_mlx/bench_serve.py": {
+        "sha256": "4d9a5d18408d3fd39d4595b96f20d7e8eaa6596c50c772caa2466e3615c8f364",
+        "mode": 33204,
+        "untracked": false
+      },
+      "vllm_mlx/benchmark.py": {
+        "sha256": "34421b097af6e9aa91bb4662235c611828be8750a05e0c2d5b99182bbd5fa549",
+        "mode": 33204,
+        "untracked": false
+      },
+      "vllm_mlx/constrained/cache.py": {
+        "sha256": "c5ab6859c40421060eed98f2a5a6b86ae941a31ac3ac5a80bfcdd256dc085f52",
+        "mode": 33204,
+        "untracked": false
+      },
+      "vllm_mlx/constrained/json_schema_processor.py": {
+        "sha256": "9ae2bf337f5bd8e26883d34146c60bbe4f7aec56fd63155c37bd8313038b9bfe",
+        "mode": 33204,
+        "untracked": false
+      },
+      "vllm_mlx/constrained/llguidance_schema_processor.py": {
+        "sha256": "aa94075a4c750e04602e22199f79580def49a2be40e3ad04d33cdce1e48b1742",
+        "mode": 33204,
+        "untracked": false
+      },
+      "vllm_mlx/constrained/thinking_processor.py": {
+        "sha256": "b77f1af629f758cc46031d540bb3dc6ee646b2b4a960055bbb0528a099c8b22b",
+        "mode": 33204,
+        "untracked": false
+      },
+      "vllm_mlx/embedding.py": {
+        "sha256": "53b3fb4d96e8f874807d9a1ecedb2b12674e08d098c033013c5b272d74402864",
+        "mode": 33204,
+        "untracked": false
+      },
+      "vllm_mlx/endpoint_model_policies.py": {
+        "sha256": "f0611edf2cbd5b884c504a70415f638c198bdf0feccdfc0be1675cc493c1b757",
+        "mode": 33204,
+        "untracked": false
+      },
+      "vllm_mlx/engine/base.py": {
+        "sha256": "b01a2d8ccf37260b51b6b49baa103e16daa0c9c21db415db0cb780656a59ed81",
+        "mode": 33204,
+        "untracked": false
+      },
+      "vllm_mlx/engine/batched.py": {
+        "sha256": "4f2426a223d8ffad174a967ecfedf45372f283ecfb1dd36aee7b79b50c0fddbd",
+        "mode": 33204,
+        "untracked": false
+      },
+      "vllm_mlx/engine/chat_template_safety.py": {
+        "sha256": "28955f652c7bfe2c58f9c2998307d4943c2cb4a8383a773c443121ae27166702",
+        "mode": 33204,
+        "untracked": false
+      },
+      "vllm_mlx/engine/simple.py": {
+        "sha256": "849c8c4a7f34d47ed06ed32c61f40dcb1924e80f04528310c0f2f0b5ae0eacc4",
+        "mode": 33204,
+        "untracked": false
+      },
+      "vllm_mlx/engine_core.py": {
+        "sha256": "6f8e4aeb7d6ffc677f415c99dcbb0b653f78353c1ba320ce5a4a930dee563ae3",
+        "mode": 33204,
+        "untracked": false
+      },
+      "vllm_mlx/gradio_app.py": {
+        "sha256": "f9bacd1fca42465565b85e8c02b5dd171b21f9cd91a1bffe7939ac221fd35c42",
+        "mode": 33204,
+        "untracked": false
+      },
+      "vllm_mlx/gradio_text_app.py": {
+        "sha256": "395e31fc9ed4d793a9df45a93fad2f890e5c0b82b319f5afb2936f0d1bd15413",
+        "mode": 33204,
+        "untracked": false
+      },
+      "vllm_mlx/mcp/executor.py": {
+        "sha256": "7ba58043029f3ee15a10aca1d1714d1606848b89f7093056c6cba44c98cb186e",
+        "mode": 33204,
+        "untracked": false
+      },
+      "vllm_mlx/mcp/manager.py": {
+        "sha256": "ec28e3a8ef6e1658bddb46f3904bfadfb81c443b8c749885ffdadf71369b784a",
+        "mode": 33204,
+        "untracked": false
+      },
+      "vllm_mlx/mcp/security.py": {
+        "sha256": "03e9af8a9018a2124cd3e5d2ca061e0c02b955b3ed4ca16d4e7c3e762a5e1d52",
+        "mode": 33204,
+        "untracked": false
+      },
+      "vllm_mlx/mcp/tools.py": {
+        "sha256": "24f3159ccc8ef56e3c275f73b98b68732d8074aac027037c92e5ab33e48cdfec",
+        "mode": 33204,
+        "untracked": false
+      },
+      "vllm_mlx/memory_cache.py": {
+        "sha256": "a4126a75da5f298aa92bd2e1ed7024e53fb4b523eca04467aaea6363ad7b43bc",
+        "mode": 33204,
+        "untracked": false
+      },
+      "vllm_mlx/metrics.py": {
+        "sha256": "ed1f5a11add79e2629e76e7420287df6e4a71b9c66c2e9f1e726a3ee20693d4c",
+        "mode": 33204,
+        "untracked": false
+      },
+      "vllm_mlx/mllm_batch_generator.py": {
+        "sha256": "1f9eb0ad3d8bf04a3e17f16d81630ed46eb895fdfaf81b9b047233e61a3c5edd",
+        "mode": 33204,
+        "untracked": false
+      },
+      "vllm_mlx/mllm_specprefill.py": {
+        "sha256": "eecec86dc8bb18443540c83cf94a77dea834bf867be2790391f787ab889aefc4",
+        "mode": 33204,
+        "untracked": false
+      },
+      "vllm_mlx/mlx_streams.py": {
+        "sha256": "2af0f7e041b08d402b8949751febb2fc252b61dbd069f76b9e462d975067c359",
+        "mode": 33204,
+        "untracked": false
+      },
+      "vllm_mlx/model_registry.py": {
+        "sha256": "924ee9c524355e7bfcc9d3b0fb1612b1e63854186842ce8d7f71bd967f63f804",
+        "mode": 33204,
+        "untracked": false
+      },
+      "vllm_mlx/model_runner.py": {
+        "sha256": "b28e54cd8c0a045419a0975e7d6becb96740c1550a15dd8f8b1096382d3a1772",
+        "mode": 33204,
+        "untracked": false
+      },
+      "vllm_mlx/model_workflow.py": {
+        "sha256": "5aeff3c25610b309d65081090e07b226093fd580ef0f20566e8aa434899324af",
+        "mode": 33204,
+        "untracked": false
+      },
+      "vllm_mlx/models/llm.py": {
+        "sha256": "4aecb849afee6a570447b7c9044383c0a66fcda14f33e3342d0191d2ad91a3e0",
+        "mode": 33204,
+        "untracked": false
+      },
+      "vllm_mlx/models/mllm.py": {
+        "sha256": "fd4777f1f9c2ab51f2472b1b528865f7c7f3bb1d640e5677d5ff8b5f49ec1a7b",
+        "mode": 33204,
+        "untracked": false
+      },
+      "vllm_mlx/multimodal_processor.py": {
+        "sha256": "b3acd1c3216d126b2f359357c270944319b6d1e892cbc7df274125f68c6ac1e4",
+        "mode": 33204,
+        "untracked": false
+      },
+      "vllm_mlx/optimizations.py": {
+        "sha256": "9ceca6ac3523ef50c7eff26e695b13b0b734818c889403390271dc929e1eea92",
+        "mode": 33204,
+        "untracked": false
+      },
+      "vllm_mlx/paged_cache.py": {
+        "sha256": "36423514faf011ea0f0b63ced1f9765e1fb269d3ddf809ceb0bcce26338a23fe",
+        "mode": 33204,
+        "untracked": false
+      },
+      "vllm_mlx/patches/glm4v_moe_mllm.py": {
+        "sha256": "ef9668c443e17321b31751794d8c84e4978743941ee09b3ffec2ed13d2cad89a",
+        "mode": 33204,
+        "untracked": false
+      },
+      "vllm_mlx/patches/qwen3_5_mllm.py": {
+        "sha256": "cd12c2188f0884044da51997cfb9b4946a4ac323889fa1601324f3722737f635",
+        "mode": 33204,
+        "untracked": false
+      },
+      "vllm_mlx/patches/qwen3_5_mtp.py": {
+        "sha256": "1b57a7b4f236bad8e672ca378c2d17074dc5369f9f4c79b3ffea634b8f315415",
+        "mode": 33204,
+        "untracked": false
+      },
+      "vllm_mlx/patches/qwen3_next_mtp.py": {
+        "sha256": "4c9df376f168f76fa3db5e5fe82c04948eed29f43774000658dba0ef46ff146c",
+        "mode": 33204,
+        "untracked": false
+      },
+      "vllm_mlx/prefix_cache.py": {
+        "sha256": "45cc6a5625feab6add621ee8f2f466c7b1fae504c636f75a0d33172094946c2d",
+        "mode": 33204,
+        "untracked": false
+      },
+      "vllm_mlx/reasoning/step3p5_parser.py": {
+        "sha256": "0fb4324c26a141095816a3b0107c2cbd124f3649d88a59d9425949ed6e3dbf49",
+        "mode": 33204,
+        "untracked": false
+      },
+      "vllm_mlx/reasoning/think_parser.py": {
+        "sha256": "a646994d7731291b6d7b330a730b93e3e0bbff1d8e0e1b7478347e978adc43e4",
+        "mode": 33204,
+        "untracked": false
+      },
+      "vllm_mlx/request.py": {
+        "sha256": "15d8ce9ab7e4605ad5302af777aeef53745ca4026757774cf8d808a400f2a214",
+        "mode": 33204,
+        "untracked": false
+      },
+      "vllm_mlx/rerank.py": {
+        "sha256": "00677cc0483f0273d4c0222990877682de2871d1e8e70e50e9071c02bdcb3770",
+        "mode": 33204,
+        "untracked": false
+      },
+      "vllm_mlx/rerank_forward.py": {
+        "sha256": "f97e75b70c813592d36783bc9483c5ccef3269cd4c91ae070ff1d23db8aea63e",
+        "mode": 33204,
+        "untracked": false
+      },
+      "vllm_mlx/scheduler.py": {
+        "sha256": "8bdfe67cc4a18b3b5769f14acd4c4c52efad6a85ac05517cdae6402d9b395ffd",
+        "mode": 33204,
+        "untracked": false
+      },
+      "vllm_mlx/server.py": {
+        "sha256": "ec3ed1cde1bbaabfcfd4f5914aaa20b1a4219067d4d93cc97e420a6d7cd04ebe",
+        "mode": 33204,
+        "untracked": false
+      },
+      "vllm_mlx/ssd_cache.py": {
+        "sha256": "294ac4b6aa798bc2c02856936ff182320d7ccb85b5959c35ffb74d8df2289ecc",
+        "mode": 33204,
+        "untracked": false
+      },
+      "vllm_mlx/text_model_from_vlm.py": {
+        "sha256": "a44080f356ad6d05328f8d8cc55b40197e76118b588fc0878a745efb5285fc53",
+        "mode": 33204,
+        "untracked": false
+      },
+      "vllm_mlx/tool_parsers/abstract_tool_parser.py": {
+        "sha256": "6e79612faa46d8b335accb20753cdb51d3808da0052fdff1a768c5d45bf87968",
+        "mode": 33204,
+        "untracked": false
+      },
+      "vllm_mlx/tool_parsers/functionary_tool_parser.py": {
+        "sha256": "b9ce0c0e60c8e0b506819b3dfc817e6a0b02e02007145c1307d52282a51f8356",
+        "mode": 33204,
+        "untracked": false
+      },
+      "vllm_mlx/tool_parsers/gemma4_tool_parser.py": {
+        "sha256": "bb5a8b06bb3d3bfba52f5f7aa12a822e2e15c464362c40158f29dead5a4af991",
+        "mode": 33204,
+        "untracked": false
+      },
+      "vllm_mlx/tool_parsers/harmony_tool_parser.py": {
+        "sha256": "19cc0f3b2464009a716bcb91fb588be4705d131966de6dab15a6bf8da8358c45",
+        "mode": 33204,
+        "untracked": false
+      },
+      "vllm_mlx/tool_parsers/mistral_tool_parser.py": {
+        "sha256": "5f482c4f6a23f4899eb2194719aced25e9ce344356e400b61d6e3c7ed381d053",
+        "mode": 33204,
+        "untracked": false
+      },
+      "vllm_mlx/tool_parsers/poolside_v1_tool_parser.py": {
+        "sha256": "c523114e93d87375eed94b17ca9ba5e3c92780264bbe0f2923d2eb08ca4ba54d",
+        "mode": 33204,
+        "untracked": false
+      },
+      "vllm_mlx/tool_parsers/qwen3_xml_tool_parser.py": {
+        "sha256": "caae353e445c60c3856a60b63a0fe3ee61c5d61d8d6638c83cca709c98b91120",
+        "mode": 33204,
+        "untracked": false
+      },
+      "vllm_mlx/utils/deepseek_v4_encoding.py": {
+        "sha256": "e68da2c833b2b59b9034229fcfb8ca6bd381c8f4e5bbe7da37e7f548b9aa8239",
+        "mode": 33204,
+        "untracked": false
+      },
+      "vllm_mlx/utils/harmony_render.py": {
+        "sha256": "33b95b2343a9556b789ce5b472d10cefd4a71f1f10657aa27dff9c0633c3d3cf",
+        "mode": 33204,
+        "untracked": false
+      },
+      "vllm_mlx/utils/mamba_cache.py": {
+        "sha256": "912d9fe95767ff8cbd6f8030f74cb0e075b9cc80a9107d19068b535822e8dd2a",
+        "mode": 33204,
+        "untracked": false
+      },
+      "vllm_mlx/utils/tokenizer.py": {
+        "sha256": "1ead65e5bd1cac7a757cdbe187669f75e06de2d850d9ab4ef150e425c5c90222",
+        "mode": 33204,
+        "untracked": false
+      },
+      "vllm_mlx/utils/truncation.py": {
+        "sha256": "066c7397423f02e289a82f98e766a97c879ffba061775818cf7b3e7361df48bf",
+        "mode": 33204,
+        "untracked": false
+      },
+      "vllm_mlx/worker.py": {
+        "sha256": "6e408661f173291ba532d6cd71f90347765ae9b9c376b6cdee2d5c76e8c380b0",
+        "mode": 33204,
+        "untracked": false
+      }
+    }
+  },
+  "product": {
+    "source": "/code/vllm-mlx/.worktrees/goal-793-20261101",
+    "sealed_copy": "/code/vllm-mlx/.scratch/goal-three-fixes-20261101/types-integration/product-frozen-r1/793",
+    "head": "3af7d7d61576606153f419816be2f4a1a9baab06",
+    "tracked_diff_sha256": "b756cb8dadeaa880acc912286ddd5338868a386078ffc82b02cda34ef04f1bbb",
+    "owner_manifest": "/code/vllm-mlx/.scratch/goal-three-fixes-20261101/b793-r1/manifest.json",
+    "owner_patch_sha256": "408d17015ab04b8589e54aa428b77b29a2e71f6a85c2b769f26943accaf99bdf",
+    "owner_increment_sha256": "2dc97a9270d25bc94cfe109b8b2281334d582f2a6a4355c2edef7af27f206803",
+    "files": {
+      ".github/workflows/ci.yml": "e7eb89b6356c1a9678773f3c157a91cc74fe7a6b8257d31d568806f1a6b948e9",
+      "tests/test_api_models.py": "8c40870575bb91909194504a67ee0d941f5c581b544cbb3376317db0fcdaebb2",
+      "tests/test_endpoint_model_policies.py": "ad662c09acc9df3d9ae6ae7d25b8045aab6566566806d9471ecc8afdb2ced3f2",
+      "tests/test_engine_base.py": "68548c975deb2b28734c8742e50e76c7eec91ad633ed6b3eae6105ef1e21abe6",
+      "tests/test_engine_core_request_owner.py": "96a753936427a80e40c713f6ae6db5cb4d22ca8e1275da1c41fabbe5912bd2b0",
+      "tests/test_memory_cache_mlx.py": "d01d42d1007441da7f9a0328c9617dadd02f7f9c6087a1371d708757c0a8df6e",
+      "tests/test_mllm_boundary_checkpoint.py": "abd51ceefc32e1ce62570a829a11e069d443009d04a180eefb08a17ce1739d50",
+      "tests/test_model_registry.py": "65d351b091a41a9eed1941b1d7cf0f4f21ff71b88ecaadbeb933e55898ffbcd5",
+      "tests/test_paged_cache_benefits.py": "2bd05de7497166124e82f3ff239d6e9962c54d874c5031b81bb4c4464656216f",
+      "tests/test_paged_cache_real_inference.py": "a2a20b72747a4879a6d8c500e18fe465f41d58ef71e0f5f921620166c1e99ea7",
+      "tests/test_paged_cache_real_model.py": "fd2ee5ccfd81cab2e34a75b8fdc4d1fa7dce9883d76543908daa6b9805ba9226",
+      "tests/test_prefix_cache.py": "bff5be0ef1a57a98c5c717e03cfdd5c0bdbdafed80c8985c906f5310204c27c1",
+      "tests/test_qwen3_xml_streaming_chunks.py": "fd2b9ef3bc9bdc051c7413f6eac920fe59dadd9d1c685ae647824a40390e02c9",
+      "tests/test_registry_idle_unload_real_model.py": "9e582319a72cf6c7bcef2e563267b1fefb69869c23f5eeea4b36ae877f0d190c",
+      "tests/test_scheduler_prompt_save_failclosed.py": "a7fc71ac0e5c11646f1d378d1e5fda0bae2df35db24c11912d79b3e9a72ebb4b",
+      "tests/test_server_cache_controls.py": "5a1ad34507b4273ef44932fe00d943048dab3dc1dd0b02a7393a7c52c4f577b6",
+      "tests/test_ssd_cache_shutdown.py": "177b048e66dc32979f2fde467d9555579825049d044a718d0e15c2ce89f81784",
+      "tests/test_structured_output.py": "c10a1ac9d4a921c88a0190f961de130066e3fa6724c9184d4940abc38800a7f6",
+      "tests/test_text_model_dispatch.py": "10d58410e81e24e6d88755865f75c8ef2f072a72608810f64e159e82cc4efa07",
+      "tests/test_tool_parsers.py": "590993dfb3af53ba352328e6d2fb930b211513fd88506999ef6f37b390a71db7",
+      "vllm_mlx/api/tool_calling.py": "fd14da35da5af280d01c1b55b98d4ecbbcfb7d9a4af48a00b5ff6b5aa8500986",
+      "vllm_mlx/endpoint_model_policies.py": "f0611edf2cbd5b884c504a70415f638c198bdf0feccdfc0be1675cc493c1b757",
+      "vllm_mlx/engine/base.py": "cee50995efcf60c8d44a5341b178349fca8dcc02f23be41940a608b64de3a05b",
+      "vllm_mlx/engine_core.py": "74088fc8334b4731ae26c1a6d05b0fd7bb2307aa99b5b8a67605b160c58a4f12",
+      "vllm_mlx/model_registry.py": "cb679d69961eaa30feda420c9ba3d3cc49007eb4182946f21642b596336e8e9a",
+      "vllm_mlx/paged_cache.py": "36423514faf011ea0f0b63ced1f9765e1fb269d3ddf809ceb0bcce26338a23fe",
+      "vllm_mlx/prefix_cache.py": "45cc6a5625feab6add621ee8f2f466c7b1fae504c636f75a0d33172094946c2d",
+      "vllm_mlx/scheduler.py": "adcce59d066285806d84f1eafbc0c5a4d84402ac4b213e43f175f95a629f7550",
+      "vllm_mlx/server.py": "0dd96763947a901326d0ba67acf80516db95c9bd8c4266ca730cc588d4f98ecd",
+      "vllm_mlx/ssd_cache.py": "d70fc2100cc6cd75c2f0841a3ea339f23e040d5ce5d8b1a3de9bb5882233d43e",
+      "vllm_mlx/text_model_from_vlm.py": "a44080f356ad6d05328f8d8cc55b40197e76118b588fc0878a745efb5285fc53",
+      "vllm_mlx/tool_parsers/abstract_tool_parser.py": "69b7343bd8f4d0e980e7054a614705a84b04b974b970c77c5e92bfbe3640d8f0",
+      "vllm_mlx/tool_parsers/qwen3_xml_tool_parser.py": "3e8527b0312b6189486fe8a582200a29ccc12aef91f5d4327dfac2c59342c5e0",
+      "scripts/benchmark_cache_release.py": "af143faba86f1bcd52177efbf906d773d919943dbdf1c0ae0cce0494bbd4a969",
+      "tests/test_manual_script_imports.py": "abae6a5f8bd3d488281e621892ad2a2cb4e9019faccaf1fd757c808e69fb861e"
+    },
+    "modes": {
+      ".github/workflows/ci.yml": 33204,
+      "tests/test_api_models.py": 33204,
+      "tests/test_endpoint_model_policies.py": 33204,
+      "tests/test_engine_base.py": 33204,
+      "tests/test_engine_core_request_owner.py": 33204,
+      "tests/test_memory_cache_mlx.py": 33204,
+      "tests/test_mllm_boundary_checkpoint.py": 33204,
+      "tests/test_model_registry.py": 33204,
+      "tests/test_paged_cache_benefits.py": 33204,
+      "tests/test_paged_cache_real_inference.py": 33204,
+      "tests/test_paged_cache_real_model.py": 33204,
+      "tests/test_prefix_cache.py": 33204,
+      "tests/test_qwen3_xml_streaming_chunks.py": 33204,
+      "tests/test_registry_idle_unload_real_model.py": 33204,
+      "tests/test_scheduler_prompt_save_failclosed.py": 33204,
+      "tests/test_server_cache_controls.py": 33204,
+      "tests/test_ssd_cache_shutdown.py": 33204,
+      "tests/test_structured_output.py": 33204,
+      "tests/test_text_model_dispatch.py": 33204,
+      "tests/test_tool_parsers.py": 33204,
+      "vllm_mlx/api/tool_calling.py": 33204,
+      "vllm_mlx/endpoint_model_policies.py": 33204,
+      "vllm_mlx/engine/base.py": 33204,
+      "vllm_mlx/engine_core.py": 33204,
+      "vllm_mlx/model_registry.py": 33204,
+      "vllm_mlx/paged_cache.py": 33204,
+      "vllm_mlx/prefix_cache.py": 33204,
+      "vllm_mlx/scheduler.py": 33204,
+      "vllm_mlx/server.py": 33204,
+      "vllm_mlx/ssd_cache.py": 33204,
+      "vllm_mlx/text_model_from_vlm.py": 33204,
+      "vllm_mlx/tool_parsers/abstract_tool_parser.py": 33204,
+      "vllm_mlx/tool_parsers/qwen3_xml_tool_parser.py": 33204,
+      "scripts/benchmark_cache_release.py": 33204,
+      "tests/test_manual_script_imports.py": 33204
+    }
+  },
+  "conflicts": [],
+  "ancestor": "original common30; the five additional pure foundation paths use base commit bytes",
+  "worktree": "/code/vllm-mlx/.worktrees/goal-final-793-20261101",
+  "branch": "fix/goal-final-793-20261101",
+  "composed": {
+    "head": "3af7d7d61576606153f419816be2f4a1a9baab06",
+    "tracked_diff_sha256": "7ef744efa57f0beab67a883a7e88c72cb8c6d1da849f76e823fd2742574f5f49",
+    "tracked_diff_bytes": 448073,
+    "staged_diff_bytes": 0,
+    "files": {
+      ".github/workflows/ci.yml": {
+        "sha256": "e7eb89b6356c1a9678773f3c157a91cc74fe7a6b8257d31d568806f1a6b948e9",
+        "mode": 33204,
+        "untracked": false
+      },
+      "docs/guides/model-registry.md": {
+        "sha256": "1a5b5d927a7271814ceb2bcc089666f6d5b90d29344dc03b10a070414b05c322",
+        "mode": 33204,
+        "untracked": false
+      },
+      "scripts/benchmark_cache_release.py": {
+        "sha256": "af143faba86f1bcd52177efbf906d773d919943dbdf1c0ae0cce0494bbd4a969",
+        "mode": 33204,
+        "untracked": true
+      },
+      "tests/test_api_models.py": {
+        "sha256": "8c40870575bb91909194504a67ee0d941f5c581b544cbb3376317db0fcdaebb2",
+        "mode": 33204,
+        "untracked": false
+      },
+      "tests/test_batched_engine_mllm_config.py": {
+        "sha256": "9c94d17271b5cc206bc8579a45217fc5a153c284837f72225883876f85123d79",
+        "mode": 33204,
+        "untracked": false
+      },
+      "tests/test_batching.py": {
+        "sha256": "81adecba04df558228d7a41cb2c0b4b11bc1cedb2b05d1d99119d32e613bc88a",
+        "mode": 33204,
+        "untracked": false
+      },
+      "tests/test_bench_serve.py": {
+        "sha256": "38d16104ef7a3b21b05962e9994c87d8c6407d762af53e64546ca16c27a1cd5c",
+        "mode": 33204,
+        "untracked": false
+      },
+      "tests/test_chat_template_safety.py": {
+        "sha256": "1fca89079f595dcd71f1be1dcdd39cbf6acdcb9edc09218c6d6efa61a43aa908",
+        "mode": 33204,
+        "untracked": false
+      },
+      "tests/test_deepseek_v4_encoding.py": {
+        "sha256": "af0dc444f59f36ba1e1e9453986fe4d94e5283c993097b501a0fc76d28703e3e",
+        "mode": 33204,
+        "untracked": false
+      },
+      "tests/test_endpoint_model_policies.py": {
+        "sha256": "ad662c09acc9df3d9ae6ae7d25b8045aab6566566806d9471ecc8afdb2ced3f2",
+        "mode": 33204,
+        "untracked": false
+      },
+      "tests/test_engine_base.py": {
+        "sha256": "68548c975deb2b28734c8742e50e76c7eec91ad633ed6b3eae6105ef1e21abe6",
+        "mode": 33204,
+        "untracked": false
+      },
+      "tests/test_engine_core_request_owner.py": {
+        "sha256": "3b21c417ccdd42dfb7784034863e407d3e781a612bfcf7420c7edf42eea674a6",
+        "mode": 33204,
+        "untracked": false
+      },
+      "tests/test_manual_script_imports.py": {
+        "sha256": "abae6a5f8bd3d488281e621892ad2a2cb4e9019faccaf1fd757c808e69fb861e",
+        "mode": 33204,
+        "untracked": true
+      },
+      "tests/test_mcp_security.py": {
+        "sha256": "53fe7f0460e911bb53e6b1b06efc02ca692346abd3d65502c51fd3d0fe08b585",
+        "mode": 33204,
+        "untracked": false
+      },
+      "tests/test_memory_cache.py": {
+        "sha256": "5abf7dd9407eeeba4adfd463bf3885cd95864df4f557881b46f8193efef2706b",
+        "mode": 33204,
+        "untracked": false
+      },
+      "tests/test_memory_cache_mlx.py": {
+        "sha256": "d01d42d1007441da7f9a0328c9617dadd02f7f9c6087a1371d708757c0a8df6e",
+        "mode": 33204,
+        "untracked": false
+      },
+      "tests/test_mllm_boundary_checkpoint.py": {
+        "sha256": "abd51ceefc32e1ce62570a829a11e069d443009d04a180eefb08a17ce1739d50",
+        "mode": 33204,
+        "untracked": false
+      },
+      "tests/test_mllm_media_specprefill.py": {
+        "sha256": "e012866556fd2e5f025ad6198de38b871188bce3c0b7f9a91938de715fe6d218",
+        "mode": 33204,
+        "untracked": false
+      },
+      "tests/test_model_registry.py": {
+        "sha256": "65d351b091a41a9eed1941b1d7cf0f4f21ff71b88ecaadbeb933e55898ffbcd5",
+        "mode": 33204,
+        "untracked": false
+      },
+      "tests/test_optimizations.py": {
+        "sha256": "06f08bda1c867c02f436ecbd949bec20018fe744bded8260e1137903de934695",
+        "mode": 33204,
+        "untracked": false
+      },
+      "tests/test_paged_cache_benefits.py": {
+        "sha256": "2bd05de7497166124e82f3ff239d6e9962c54d874c5031b81bb4c4464656216f",
+        "mode": 33204,
+        "untracked": false
+      },
+      "tests/test_paged_cache_real_inference.py": {
+        "sha256": "a2a20b72747a4879a6d8c500e18fe465f41d58ef71e0f5f921620166c1e99ea7",
+        "mode": 33204,
+        "untracked": false
+      },
+      "tests/test_paged_cache_real_model.py": {
+        "sha256": "fd2ee5ccfd81cab2e34a75b8fdc4d1fa7dce9883d76543908daa6b9805ba9226",
+        "mode": 33204,
+        "untracked": false
+      },
+      "tests/test_prefix_cache.py": {
+        "sha256": "bff5be0ef1a57a98c5c717e03cfdd5c0bdbdafed80c8985c906f5310204c27c1",
+        "mode": 33204,
+        "untracked": false
+      },
+      "tests/test_qwen3_xml_streaming_chunks.py": {
+        "sha256": "fd2b9ef3bc9bdc051c7413f6eac920fe59dadd9d1c685ae647824a40390e02c9",
+        "mode": 33204,
+        "untracked": false
+      },
+      "tests/test_registry_idle_unload_real_model.py": {
+        "sha256": "9e582319a72cf6c7bcef2e563267b1fefb69869c23f5eeea4b36ae877f0d190c",
+        "mode": 33204,
+        "untracked": false
+      },
+      "tests/test_scheduler_prompt_save_failclosed.py": {
+        "sha256": "a7fc71ac0e5c11646f1d378d1e5fda0bae2df35db24c11912d79b3e9a72ebb4b",
+        "mode": 33204,
+        "untracked": false
+      },
+      "tests/test_server_cache_controls.py": {
+        "sha256": "5a1ad34507b4273ef44932fe00d943048dab3dc1dd0b02a7393a7c52c4f577b6",
+        "mode": 33204,
+        "untracked": false
+      },
+      "tests/test_simple_engine.py": {
+        "sha256": "49637046c365813816de84b358fadf49ee7c225f574b5d83cd53734d991a3210",
+        "mode": 33204,
+        "untracked": false
+      },
+      "tests/test_ssd_cache_shutdown.py": {
+        "sha256": "177b048e66dc32979f2fde467d9555579825049d044a718d0e15c2ce89f81784",
+        "mode": 33204,
+        "untracked": false
+      },
+      "tests/test_structured_output.py": {
+        "sha256": "f794dfdb207a131874b3df8c72655233a497d5ea908258decb1d33742bb22baa",
+        "mode": 33204,
+        "untracked": false
+      },
+      "tests/test_text_model_dispatch.py": {
+        "sha256": "10d58410e81e24e6d88755865f75c8ef2f072a72608810f64e159e82cc4efa07",
+        "mode": 33204,
+        "untracked": false
+      },
+      "tests/test_tool_parsers.py": {
+        "sha256": "590993dfb3af53ba352328e6d2fb930b211513fd88506999ef6f37b390a71db7",
+        "mode": 33204,
+        "untracked": false
+      },
+      "vllm_mlx/api/responses_models.py": {
+        "sha256": "cf5d6392fdf21c7be659f92564269fbfcaccee96bfc285966ab8b86a68f2678a",
+        "mode": 33204,
+        "untracked": false
+      },
+      "vllm_mlx/api/tool_calling.py": {
+        "sha256": "fd14da35da5af280d01c1b55b98d4ecbbcfb7d9a4af48a00b5ff6b5aa8500986",
+        "mode": 33204,
+        "untracked": false
+      },
+      "vllm_mlx/api/utils.py": {
+        "sha256": "1e893b356abdca8996b69e057f3d31d3891daebb7cf452be434b831f7b191d07",
+        "mode": 33204,
+        "untracked": false
+      },
+      "vllm_mlx/audio/processor.py": {
+        "sha256": "16ff1784d870877baa6608b01fe3ccda6c6a4397ebc2e566bef4593566f9d535",
+        "mode": 33204,
+        "untracked": false
+      },
+      "vllm_mlx/audio/stt.py": {
+        "sha256": "8087d182e18e94a5a537d106eced2ef8db56fc4febdb30ce621b5a45b9c9ced3",
+        "mode": 33204,
+        "untracked": false
+      },
+      "vllm_mlx/audio/tts.py": {
+        "sha256": "b21df8e7c803ed60b9d8adecd48fb08176b2ffa7525e82101a84939e5866fe5a",
+        "mode": 33204,
+        "untracked": false
+      },
+      "vllm_mlx/bench_serve.py": {
+        "sha256": "4d9a5d18408d3fd39d4595b96f20d7e8eaa6596c50c772caa2466e3615c8f364",
+        "mode": 33204,
+        "untracked": false
+      },
+      "vllm_mlx/benchmark.py": {
+        "sha256": "34421b097af6e9aa91bb4662235c611828be8750a05e0c2d5b99182bbd5fa549",
+        "mode": 33204,
+        "untracked": false
+      },
+      "vllm_mlx/constrained/cache.py": {
+        "sha256": "c5ab6859c40421060eed98f2a5a6b86ae941a31ac3ac5a80bfcdd256dc085f52",
+        "mode": 33204,
+        "untracked": false
+      },
+      "vllm_mlx/constrained/json_schema_processor.py": {
+        "sha256": "9ae2bf337f5bd8e26883d34146c60bbe4f7aec56fd63155c37bd8313038b9bfe",
+        "mode": 33204,
+        "untracked": false
+      },
+      "vllm_mlx/constrained/llguidance_schema_processor.py": {
+        "sha256": "aa94075a4c750e04602e22199f79580def49a2be40e3ad04d33cdce1e48b1742",
+        "mode": 33204,
+        "untracked": false
+      },
+      "vllm_mlx/constrained/thinking_processor.py": {
+        "sha256": "b77f1af629f758cc46031d540bb3dc6ee646b2b4a960055bbb0528a099c8b22b",
+        "mode": 33204,
+        "untracked": false
+      },
+      "vllm_mlx/embedding.py": {
+        "sha256": "53b3fb4d96e8f874807d9a1ecedb2b12674e08d098c033013c5b272d74402864",
+        "mode": 33204,
+        "untracked": false
+      },
+      "vllm_mlx/endpoint_model_policies.py": {
+        "sha256": "f0611edf2cbd5b884c504a70415f638c198bdf0feccdfc0be1675cc493c1b757",
+        "mode": 33204,
+        "untracked": false
+      },
+      "vllm_mlx/engine/base.py": {
+        "sha256": "b01a2d8ccf37260b51b6b49baa103e16daa0c9c21db415db0cb780656a59ed81",
+        "mode": 33204,
+        "untracked": false
+      },
+      "vllm_mlx/engine/batched.py": {
+        "sha256": "4f2426a223d8ffad174a967ecfedf45372f283ecfb1dd36aee7b79b50c0fddbd",
+        "mode": 33204,
+        "untracked": false
+      },
+      "vllm_mlx/engine/chat_template_safety.py": {
+        "sha256": "28955f652c7bfe2c58f9c2998307d4943c2cb4a8383a773c443121ae27166702",
+        "mode": 33204,
+        "untracked": false
+      },
+      "vllm_mlx/engine/simple.py": {
+        "sha256": "849c8c4a7f34d47ed06ed32c61f40dcb1924e80f04528310c0f2f0b5ae0eacc4",
+        "mode": 33204,
+        "untracked": false
+      },
+      "vllm_mlx/engine_core.py": {
+        "sha256": "a3039ecda56e591f1c00ae3ca8bcce46eb991d871c8f21ccc4fde0f711c0284d",
+        "mode": 33204,
+        "untracked": false
+      },
+      "vllm_mlx/gradio_app.py": {
+        "sha256": "f9bacd1fca42465565b85e8c02b5dd171b21f9cd91a1bffe7939ac221fd35c42",
+        "mode": 33204,
+        "untracked": false
+      },
+      "vllm_mlx/gradio_text_app.py": {
+        "sha256": "395e31fc9ed4d793a9df45a93fad2f890e5c0b82b319f5afb2936f0d1bd15413",
+        "mode": 33204,
+        "untracked": false
+      },
+      "vllm_mlx/mcp/executor.py": {
+        "sha256": "7ba58043029f3ee15a10aca1d1714d1606848b89f7093056c6cba44c98cb186e",
+        "mode": 33204,
+        "untracked": false
+      },
+      "vllm_mlx/mcp/manager.py": {
+        "sha256": "ec28e3a8ef6e1658bddb46f3904bfadfb81c443b8c749885ffdadf71369b784a",
+        "mode": 33204,
+        "untracked": false
+      },
+      "vllm_mlx/mcp/security.py": {
+        "sha256": "03e9af8a9018a2124cd3e5d2ca061e0c02b955b3ed4ca16d4e7c3e762a5e1d52",
+        "mode": 33204,
+        "untracked": false
+      },
+      "vllm_mlx/mcp/tools.py": {
+        "sha256": "24f3159ccc8ef56e3c275f73b98b68732d8074aac027037c92e5ab33e48cdfec",
+        "mode": 33204,
+        "untracked": false
+      },
+      "vllm_mlx/memory_cache.py": {
+        "sha256": "a4126a75da5f298aa92bd2e1ed7024e53fb4b523eca04467aaea6363ad7b43bc",
+        "mode": 33204,
+        "untracked": false
+      },
+      "vllm_mlx/metrics.py": {
+        "sha256": "ed1f5a11add79e2629e76e7420287df6e4a71b9c66c2e9f1e726a3ee20693d4c",
+        "mode": 33204,
+        "untracked": false
+      },
+      "vllm_mlx/mllm_batch_generator.py": {
+        "sha256": "1f9eb0ad3d8bf04a3e17f16d81630ed46eb895fdfaf81b9b047233e61a3c5edd",
+        "mode": 33204,
+        "untracked": false
+      },
+      "vllm_mlx/mllm_specprefill.py": {
+        "sha256": "eecec86dc8bb18443540c83cf94a77dea834bf867be2790391f787ab889aefc4",
+        "mode": 33204,
+        "untracked": false
+      },
+      "vllm_mlx/mlx_streams.py": {
+        "sha256": "2af0f7e041b08d402b8949751febb2fc252b61dbd069f76b9e462d975067c359",
+        "mode": 33204,
+        "untracked": false
+      },
+      "vllm_mlx/model_registry.py": {
+        "sha256": "cb679d69961eaa30feda420c9ba3d3cc49007eb4182946f21642b596336e8e9a",
+        "mode": 33204,
+        "untracked": false
+      },
+      "vllm_mlx/model_runner.py": {
+        "sha256": "b28e54cd8c0a045419a0975e7d6becb96740c1550a15dd8f8b1096382d3a1772",
+        "mode": 33204,
+        "untracked": false
+      },
+      "vllm_mlx/model_workflow.py": {
+        "sha256": "5aeff3c25610b309d65081090e07b226093fd580ef0f20566e8aa434899324af",
+        "mode": 33204,
+        "untracked": false
+      },
+      "vllm_mlx/models/llm.py": {
+        "sha256": "4aecb849afee6a570447b7c9044383c0a66fcda14f33e3342d0191d2ad91a3e0",
+        "mode": 33204,
+        "untracked": false
+      },
+      "vllm_mlx/models/mllm.py": {
+        "sha256": "fd4777f1f9c2ab51f2472b1b528865f7c7f3bb1d640e5677d5ff8b5f49ec1a7b",
+        "mode": 33204,
+        "untracked": false
+      },
+      "vllm_mlx/multimodal_processor.py": {
+        "sha256": "b3acd1c3216d126b2f359357c270944319b6d1e892cbc7df274125f68c6ac1e4",
+        "mode": 33204,
+        "untracked": false
+      },
+      "vllm_mlx/optimizations.py": {
+        "sha256": "9ceca6ac3523ef50c7eff26e695b13b0b734818c889403390271dc929e1eea92",
+        "mode": 33204,
+        "untracked": false
+      },
+      "vllm_mlx/paged_cache.py": {
+        "sha256": "36423514faf011ea0f0b63ced1f9765e1fb269d3ddf809ceb0bcce26338a23fe",
+        "mode": 33204,
+        "untracked": false
+      },
+      "vllm_mlx/patches/glm4v_moe_mllm.py": {
+        "sha256": "ef9668c443e17321b31751794d8c84e4978743941ee09b3ffec2ed13d2cad89a",
+        "mode": 33204,
+        "untracked": false
+      },
+      "vllm_mlx/patches/qwen3_5_mllm.py": {
+        "sha256": "cd12c2188f0884044da51997cfb9b4946a4ac323889fa1601324f3722737f635",
+        "mode": 33204,
+        "untracked": false
+      },
+      "vllm_mlx/patches/qwen3_5_mtp.py": {
+        "sha256": "1b57a7b4f236bad8e672ca378c2d17074dc5369f9f4c79b3ffea634b8f315415",
+        "mode": 33204,
+        "untracked": false
+      },
+      "vllm_mlx/patches/qwen3_next_mtp.py": {
+        "sha256": "4c9df376f168f76fa3db5e5fe82c04948eed29f43774000658dba0ef46ff146c",
+        "mode": 33204,
+        "untracked": false
+      },
+      "vllm_mlx/prefix_cache.py": {
+        "sha256": "45cc6a5625feab6add621ee8f2f466c7b1fae504c636f75a0d33172094946c2d",
+        "mode": 33204,
+        "untracked": false
+      },
+      "vllm_mlx/reasoning/step3p5_parser.py": {
+        "sha256": "0fb4324c26a141095816a3b0107c2cbd124f3649d88a59d9425949ed6e3dbf49",
+        "mode": 33204,
+        "untracked": false
+      },
+      "vllm_mlx/reasoning/think_parser.py": {
+        "sha256": "a646994d7731291b6d7b330a730b93e3e0bbff1d8e0e1b7478347e978adc43e4",
+        "mode": 33204,
+        "untracked": false
+      },
+      "vllm_mlx/request.py": {
+        "sha256": "15d8ce9ab7e4605ad5302af777aeef53745ca4026757774cf8d808a400f2a214",
+        "mode": 33204,
+        "untracked": false
+      },
+      "vllm_mlx/rerank.py": {
+        "sha256": "00677cc0483f0273d4c0222990877682de2871d1e8e70e50e9071c02bdcb3770",
+        "mode": 33204,
+        "untracked": false
+      },
+      "vllm_mlx/rerank_forward.py": {
+        "sha256": "f97e75b70c813592d36783bc9483c5ccef3269cd4c91ae070ff1d23db8aea63e",
+        "mode": 33204,
+        "untracked": false
+      },
+      "vllm_mlx/scheduler.py": {
+        "sha256": "8bdfe67cc4a18b3b5769f14acd4c4c52efad6a85ac05517cdae6402d9b395ffd",
+        "mode": 33204,
+        "untracked": false
+      },
+      "vllm_mlx/server.py": {
+        "sha256": "7f8d3941829a43932a84c4fc6353fe786c0654196642df0b79c3cc79f08bddec",
+        "mode": 33204,
+        "untracked": false
+      },
+      "vllm_mlx/ssd_cache.py": {
+        "sha256": "294ac4b6aa798bc2c02856936ff182320d7ccb85b5959c35ffb74d8df2289ecc",
+        "mode": 33204,
+        "untracked": false
+      },
+      "vllm_mlx/text_model_from_vlm.py": {
+        "sha256": "a44080f356ad6d05328f8d8cc55b40197e76118b588fc0878a745efb5285fc53",
+        "mode": 33204,
+        "untracked": false
+      },
+      "vllm_mlx/tool_parsers/abstract_tool_parser.py": {
+        "sha256": "6e79612faa46d8b335accb20753cdb51d3808da0052fdff1a768c5d45bf87968",
+        "mode": 33204,
+        "untracked": false
+      },
+      "vllm_mlx/tool_parsers/functionary_tool_parser.py": {
+        "sha256": "b9ce0c0e60c8e0b506819b3dfc817e6a0b02e02007145c1307d52282a51f8356",
+        "mode": 33204,
+        "untracked": false
+      },
+      "vllm_mlx/tool_parsers/gemma4_tool_parser.py": {
+        "sha256": "bb5a8b06bb3d3bfba52f5f7aa12a822e2e15c464362c40158f29dead5a4af991",
+        "mode": 33204,
+        "untracked": false
+      },
+      "vllm_mlx/tool_parsers/harmony_tool_parser.py": {
+        "sha256": "19cc0f3b2464009a716bcb91fb588be4705d131966de6dab15a6bf8da8358c45",
+        "mode": 33204,
+        "untracked": false
+      },
+      "vllm_mlx/tool_parsers/mistral_tool_parser.py": {
+        "sha256": "5f482c4f6a23f4899eb2194719aced25e9ce344356e400b61d6e3c7ed381d053",
+        "mode": 33204,
+        "untracked": false
+      },
+      "vllm_mlx/tool_parsers/poolside_v1_tool_parser.py": {
+        "sha256": "c523114e93d87375eed94b17ca9ba5e3c92780264bbe0f2923d2eb08ca4ba54d",
+        "mode": 33204,
+        "untracked": false
+      },
+      "vllm_mlx/tool_parsers/qwen3_xml_tool_parser.py": {
+        "sha256": "caae353e445c60c3856a60b63a0fe3ee61c5d61d8d6638c83cca709c98b91120",
+        "mode": 33204,
+        "untracked": false
+      },
+      "vllm_mlx/utils/deepseek_v4_encoding.py": {
+        "sha256": "e68da2c833b2b59b9034229fcfb8ca6bd381c8f4e5bbe7da37e7f548b9aa8239",
+        "mode": 33204,
+        "untracked": false
+      },
+      "vllm_mlx/utils/harmony_render.py": {
+        "sha256": "33b95b2343a9556b789ce5b472d10cefd4a71f1f10657aa27dff9c0633c3d3cf",
+        "mode": 33204,
+        "untracked": false
+      },
+      "vllm_mlx/utils/mamba_cache.py": {
+        "sha256": "912d9fe95767ff8cbd6f8030f74cb0e075b9cc80a9107d19068b535822e8dd2a",
+        "mode": 33204,
+        "untracked": false
+      },
+      "vllm_mlx/utils/tokenizer.py": {
+        "sha256": "1ead65e5bd1cac7a757cdbe187669f75e06de2d850d9ab4ef150e425c5c90222",
+        "mode": 33204,
+        "untracked": false
+      },
+      "vllm_mlx/utils/truncation.py": {
+        "sha256": "066c7397423f02e289a82f98e766a97c879ffba061775818cf7b3e7361df48bf",
+        "mode": 33204,
+        "untracked": false
+      },
+      "vllm_mlx/worker.py": {
+        "sha256": "6e408661f173291ba532d6cd71f90347765ae9b9c376b6cdee2d5c76e8c380b0",
+        "mode": 33204,
+        "untracked": false
+      }
+    }
+  },
+  "narrow_files": {
+    ".github/workflows/ci.yml": "e7eb89b6356c1a9678773f3c157a91cc74fe7a6b8257d31d568806f1a6b948e9",
+    "docs/guides/model-registry.md": "1a5b5d927a7271814ceb2bcc089666f6d5b90d29344dc03b10a070414b05c322",
+    "scripts/benchmark_cache_release.py": "af143faba86f1bcd52177efbf906d773d919943dbdf1c0ae0cce0494bbd4a969",
+    "tests/test_engine_core_request_owner.py": "3b21c417ccdd42dfb7784034863e407d3e781a612bfcf7420c7edf42eea674a6",
+    "tests/test_memory_cache_mlx.py": "d01d42d1007441da7f9a0328c9617dadd02f7f9c6087a1371d708757c0a8df6e",
+    "tests/test_model_registry.py": "65d351b091a41a9eed1941b1d7cf0f4f21ff71b88ecaadbeb933e55898ffbcd5",
+    "tests/test_server_cache_controls.py": "5a1ad34507b4273ef44932fe00d943048dab3dc1dd0b02a7393a7c52c4f577b6",
+    "vllm_mlx/engine_core.py": "a3039ecda56e591f1c00ae3ca8bcce46eb991d871c8f21ccc4fde0f711c0284d",
+    "vllm_mlx/model_registry.py": "cb679d69961eaa30feda420c9ba3d3cc49007eb4182946f21642b596336e8e9a",
+    "vllm_mlx/server.py": "7f8d3941829a43932a84c4fc6353fe786c0654196642df0b79c3cc79f08bddec"
+  },
+  "narrow_patch_sha256": "f5a99556ad2197c813ae165952b4e179437da7367ce446263a7d4c2352dd38c9",
+  "version": "v2",
+  "supersedes_manifest": "/code/vllm-mlx/.scratch/goal-three-fixes-20261101/types-integration/product-793-composed-manifest.json",
+  "supersedes_manifest_sha256": "db602306780b229c683122e7f081845973a0f0ab2e36536497494f61034e5b3e",
+  "shared_test_update": "/code/vllm-mlx/.scratch/goal-three-fixes-20261101/types-integration/runtime-fixture-cleanup/integration-manifest.json",
+  "package_source_unchanged_from_tested_v1": true
+}

@@ -1,0 +1,1570 @@
+diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+index d8d4435cf0aa4caa9b72b643f9d37c407fa6772c..b141a7e0c83178a87f34121307e6a3aa19a5146b 100644
+--- a/.github/workflows/ci.yml
++++ b/.github/workflows/ci.yml
+@@ -231,6 +231,7 @@ jobs:
+             tests/test_mllm.py \
+             tests/test_mllm_assistant_drafter.py \
+             tests/test_server.py \
++            tests/test_server_cache_controls.py \
+             tests/test_metrics.py \
+             tests/test_paged_cache.py \
+             tests/test_prefix_cache.py \
+diff --git a/docs/guides/model-registry.md b/docs/guides/model-registry.md
+index f8855858d54844117725e2365c723b86a43eb0ce..2871277c901de87b299d239c552e7e6b09084070 100644
+--- a/docs/guides/model-registry.md
++++ b/docs/guides/model-registry.md
+@@ -314,6 +314,39 @@ effective idle timeout together with all model states, inspect `/v1/status`:
+ curl http://localhost:8000/v1/status
+ ```
+ 
++### Clear resident-model caches
++
++Cache deletion applies to models that are already resident. It does not load
++inactive registry entries or unload resident models.
++
++```bash
++curl -X DELETE http://localhost:8000/v1/cache/prefix
++curl -X DELETE http://localhost:8000/v1/cache
++```
++
++The prefix route returns per-model results in `model_caches`; the all-cache
++route returns them in `engine_cache` and also clears shared caches. Each model
++reports `status` as `cleared`, `not_supported`, or `error`. Inspect these results
++even when the overall response reports `cleared`, since one model's failure
++does not prevent the other residents from being cleared.
++
++For example, a prefix response can include:
++
++```json
++{
++  "status": "cleared",
++  "rewarm_scheduled": false,
++  "model_caches": {
++    "fast": {"status": "cleared", "cache": null}
++  }
++}
++```
++
++Registry prefix deletion returns `rewarm_scheduled: false`. In-flight requests
++keep their live arrays; deletion drops reusable cache references and requests
++release of unused allocator buffers. It does not promise a specific decrease
++in process memory.
++
+ ### Verify a cold-load path
+ 
+ ```bash
+diff --git a/scripts/benchmark_cache_release.py b/scripts/benchmark_cache_release.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..e9f5c9d029e1501cd42ea9509995a087442da916
+--- /dev/null
++++ b/scripts/benchmark_cache_release.py
+@@ -0,0 +1,574 @@
++#!/usr/bin/env python3
++# SPDX-License-Identifier: Apache-2.0
++"""Apple-only, fresh-process explicit cache DELETE memory attribution harness.
++
++Run identically on base and candidate, e.g. from an editable project environment:
++  python scripts/benchmark_cache_release.py --route prefix > prefix.jsonl
++  python scripts/benchmark_cache_release.py --route all > all.jsonl
++  python scripts/benchmark_cache_release.py --model /existing/snapshot --route prefix
++  python scripts/benchmark_cache_release.py --synthetic-registry --route prefix
++  python scripts/benchmark_cache_release.py --models-config models.yaml \
++    --resident-model first --resident-model second --pre-delete-barrier none
++
++Default mode is SYNTHETIC KV in a real PrefixCacheManager, not production-model
++validation. --model uses a real BatchedEngine and generation from a LOCAL snapshot
++only, kept loaded through all measurements. Offline mode prevents downloads.
++Repeat each command three times in separate processes for median comparisons.
++No post-DELETE test-side clear/GC/synchronization can rescue the baseline.
++--pre-delete-barrier none waits for zero requests but adds no stream barrier;
++run it separately from the default synchronized allocator-attribution variant.
++Thresholds are attribution gates, not promises about macOS accounting latency.
++"""
++
++import argparse
++import asyncio
++import ctypes
++import hashlib
++import importlib.metadata
++import json
++import os
++import platform
++from pathlib import Path
++import sys
++import time
++
++MIB = 1024**2
++
++
++class _RusageInfoV0(ctypes.Structure):
++    # RUSAGE_INFO_V0, current (not lifetime-peak) resident/physical bytes.
++    # https://github.com/apple-oss-distributions/xnu/blob/main/bsd/sys/resource.h
++    _fields_ = [("uuid", ctypes.c_uint8 * 16)] + [
++        (name, ctypes.c_uint64)
++        for name in (
++            "user_time",
++            "system_time",
++            "pkg_idle_wkups",
++            "interrupt_wkups",
++            "pageins",
++            "wired_size",
++            "resident_size",
++            "phys_footprint",
++            "proc_start_abstime",
++            "proc_exit_abstime",
++        )
++    ]
++
++
++def _os_memory():
++    libproc = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
++    call = libproc.proc_pid_rusage
++    call.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_void_p]
++    call.restype = ctypes.c_int
++    info = _RusageInfoV0()
++    if call(os.getpid(), 0, ctypes.byref(info)) != 0:
++        raise OSError(ctypes.get_errno(), "proc_pid_rusage failed")
++    return {"rss_bytes": info.resident_size, "footprint_bytes": info.phys_footprint}
++
++
++def _emit(event, **data):
++    print(
++        json.dumps({"event": event, "monotonic_s": time.monotonic(), **data}),
++        flush=True,
++    )
++
++
++def _snapshot(mx, engine, phase, cycle=0):
++    active, cached = mx.get_active_memory(), mx.get_cache_memory()
++    sample = {
++        "phase": phase,
++        "cycle": cycle,
++        "active_bytes": active,
++        "cache_bytes": cached,
++        "active_plus_cache_bytes": active + cached,
++        **_os_memory(),
++    }
++    if engine is not None:
++        sample["engine"] = engine.get_stats()
++        sample["prefix_cache"] = engine.get_cache_stats()
++    _emit("sample", **sample)
++    return sample
++
++
++def _entry_count(stats):
++    """Read the existing cache stats schemas; unknown is not an empty cache."""
++    if not isinstance(stats, dict):
++        return None
++    for key in ("entry_count", "entries", "size"):
++        if isinstance(stats.get(key), int):
++            return stats[key]
++    return _entry_count(stats.get("prefix_cache"))
++
++
++def _model_entry_counts(stats):
++    if isinstance(stats, dict) and "models" in stats:
++        return [_entry_count(item) for item in stats["models"].values()]
++    return [_entry_count(stats)]
++
++
++class _SyntheticEngine:
++    """Single event-loop owner; NOT a production-engine/worker substitute."""
++
++    def __init__(self, mx):
++        from vllm_mlx.prefix_cache import PrefixCacheManager
++
++        self.model = mx.arange(4 * MIB, dtype=mx.float32)  # 16MiB persistent owner
++        mx.eval(self.model)
++        self.cache = PrefixCacheManager(self.model)
++
++    def fill(self, mx, size):
++        from mlx_lm.models.cache import KVCache
++
++        layer = KVCache()
++        shape = (1, 1, size // 8 // 128, 128)
++        layer.keys = mx.arange(size // 8, dtype=mx.float32).reshape(shape)
++        layer.values = (mx.arange(size // 8, dtype=mx.float32) + 1).reshape(shape)
++        mx.eval(layer.keys, layer.values)
++        layer.offset = shape[-2]
++        self.cache.store_cache([1, 2, 3], [layer])
++        # No layer/array aliases escape; cache is now the sole KV owner.
++
++    async def start(self):
++        pass
++
++    async def stop(self):
++        pass
++
++    def is_healthy(self):
++        return True
++
++    def clear_prefix_cache(self):
++        self.cache.clear()
++
++    async def _clear_prefix_cache_on_owner(self):
++        self.clear_prefix_cache()
++
++    def clear_runtime_caches(self):
++        self.clear_prefix_cache()
++        return {"prefix_cache": True}
++
++    async def _clear_runtime_caches_on_owner(self):
++        return self.clear_runtime_caches()
++
++    def get_stats(self):
++        return {"num_running": 0, "num_waiting": 0, "steps_executed": 0}
++
++    def get_cache_stats(self):
++        return {"prefix_cache": {"entry_count": len(self.cache._lru)}}
++
++
++class _RegistryEngines:
++    """Measurement view only; DELETE must use the real ModelManager."""
++
++    def __init__(self, engines):
++        self.engines = engines
++
++    def get_stats(self):
++        stats = {name: engine.get_stats() for name, engine in self.engines.items()}
++        return {
++            **{
++                key: (
++                    sum(item[key] for item in stats.values())
++                    if all(item.get(key) is not None for item in stats.values())
++                    else None
++                )
++                for key in ("num_running", "num_waiting", "steps_executed")
++            },
++            "models": stats,
++        }
++
++    def get_cache_stats(self):
++        stats = {
++            name: engine.get_cache_stats() for name, engine in self.engines.items()
++        }
++        counts = [_entry_count(item) for item in stats.values()]
++        return {
++            "prefix_cache": {
++                "entry_count": (
++                    sum(counts) if all(count is not None for count in counts) else None
++                )
++            },
++            "models": stats,
++        }
++
++
++def _engines(engine):
++    if isinstance(engine, _RegistryEngines):
++        return list(engine.engines.values())
++    return [engine]
++
++
++def _models(engine):
++    return [
++        item.model if isinstance(item, _SyntheticEngine) else item._model
++        for item in _engines(engine)
++    ]
++
++
++async def _quiesce(mx, engine, *, barrier=True):
++    """Benchmark only: finish cleanup and synchronize actual producing streams."""
++    if isinstance(engine, _RegistryEngines):
++        for item in engine.engines.values():
++            await _quiesce(mx, item, barrier=barrier)
++        return
++    deadline = time.monotonic() + 30
++    while True:
++        stats = engine.get_stats()
++        if not stats.get("num_running", 0) and not stats.get("num_waiting", 0):
++            break
++        if time.monotonic() >= deadline:
++            raise RuntimeError("engine did not become idle")
++        await asyncio.sleep(0.01)
++
++    if not barrier:
++        return
++
++    def synchronize():
++        streams = [mx.default_stream(mx.default_device())]
++        if not isinstance(engine, _SyntheticEngine):
++            scheduler = (
++                engine._mllm_scheduler
++                if engine.is_mllm
++                else engine._engine.engine.scheduler
++            )
++            batch = scheduler.batch_generator
++            if batch is not None and getattr(batch, "_stream", None) is not None:
++                streams.append(batch._stream)
++            for name in ("mlx_lm.generate", "mlx_vlm.generate"):
++                module = sys.modules.get(name)
++                if module is not None and hasattr(module, "generation_stream"):
++                    streams.append(module.generation_stream)
++        # Handles may coincide; repeated synchronization is harmless, not a flush.
++        for stream in streams:
++            mx.synchronize(stream)
++
++    if isinstance(engine, _SyntheticEngine) or engine.is_mllm:
++        synchronize()
++    else:
++        await engine._run_on_generation_worker(synchronize)
++
++
++async def _generate(engine, text):
++    output = None
++    async for output in engine.stream_chat(
++        [{"role": "user", "content": text}], max_tokens=16, temperature=0
++    ):
++        pass
++    if output is None or not output.finished:
++        raise RuntimeError("generation did not finish")
++    if output.finish_reason == "error":
++        raise RuntimeError("generation failed")
++    _emit(
++        "generation",
++        prompt_tokens=output.prompt_tokens,
++        completion_tokens=output.completion_tokens,
++        output_sha256=hashlib.sha256(output.text.encode()).hexdigest(),
++    )
++
++
++def _registry_defaults(args):
++    from vllm_mlx.model_registry import RegistryServeDefaults
++    from vllm_mlx.scheduler import SchedulerConfig
++    from vllm_mlx.utils.download import DownloadConfig
++
++    return RegistryServeDefaults(
++        continuous_batching=True,
++        force_mllm=False,
++        enable_mtp=False,
++        prefill_step_size=2048,
++        specprefill_enabled=False,
++        specprefill_threshold=8192,
++        specprefill_keep_pct=0.3,
++        specprefill_backbone_pct=0.0,
++        specprefill_draft_model=None,
++        prefix_trie_cache=False,
++        prefix_trie_cache_size=32,
++        prefix_trie_cache_memory_mb=None,
++        stream_interval=1,
++        gpu_memory_utilization=0.9,
++        scheduler_config=SchedulerConfig(cache_memory_mb=args.cache_limit_mib),
++        max_tokens=32768,
++        download_config=DownloadConfig(),
++    )
++
++
++async def _load_registry(args, mx):
++    from vllm_mlx.model_registry import (
++        ContentionPolicy,
++        ModelManager,
++        RegisteredModel,
++        RegistryManagerConfig,
++        load_registry_config,
++    )
++
++    defaults = _registry_defaults(args)
++    if args.synthetic_registry:
++        registry = {
++            name: RegisteredModel(
++                name=name, source=str(Path.cwd()), estimated_memory_bytes=1
++            )
++            for name in ("synthetic-a", "synthetic-b", "unloaded")
++        }
++        config = RegistryManagerConfig(
++            memory_budget_bytes=1024**3,
++            idle_unload_seconds=0,
++            policy=ContentionPolicy(strategy="fail"),
++        )
++        manager = ModelManager(
++            config, registry, defaults, engine_factory=lambda _: _SyntheticEngine(mx)
++        )
++        names = ["synthetic-a", "synthetic-b"]
++    else:
++        config, registry = load_registry_config(Path(args.models_config), defaults)
++        for entry in registry.values():
++            if not (
++                Path(entry.source).is_dir()
++                and (Path(entry.source) / "config.json").is_file()
++            ):
++                raise ValueError("Registry sources must be existing local snapshots")
++        manager = ModelManager(config, registry, defaults)
++        names = args.resident_model
++        if any(name not in registry for name in names):
++            raise ValueError("Unknown --resident-model")
++        if any(registry[name].continuous_batching is False for name in names):
++            raise ValueError(
++                "Registry benchmark requires continuous-batching residents"
++            )
++    engines = {}
++    try:
++        for name in names:
++            lease = await manager.acquire(name)
++            engines[name] = lease.engine
++            await lease.release()
++        if set(manager._loaded) != set(names):
++            raise RuntimeError(
++                "Registry memory budget cannot keep selected models resident"
++            )
++    except BaseException:
++        await manager.shutdown()
++        raise
++    return manager, _RegistryEngines(engines)
++
++
++async def _run(args):
++    import httpx
++    import mlx.core as mx
++
++    import vllm_mlx.server as server
++
++    if not mx.metal.is_available():
++        raise RuntimeError("BLOCKED: Metal backend unavailable")
++    mx.set_default_device(mx.gpu)
++    versions = {}
++    for name in ("mlx", "mlx-lm", "mlx-vlm", "vllm-mlx", "httpx"):
++        try:
++            versions[name] = importlib.metadata.version(name)
++        except importlib.metadata.PackageNotFoundError:
++            versions[name] = "not installed"
++    _emit(
++        "config",
++        platform=platform.platform(),
++        python=sys.version,
++        versions=versions,
++        device=getattr(mx, "device_info", mx.metal.device_info)(),
++        mode=(
++            "production-registry"
++            if args.models_config
++            else (
++                "synthetic-registry"
++                if args.synthetic_registry
++                else "production-model" if args.model else "synthetic-kv-only"
++            )
++        ),
++        arguments=vars(args),
++        command=sys.argv,
++        stream_policy=args.pre_delete_barrier,
++    )
++    _snapshot(mx, None, "before_load")
++    engine = None
++    manager = None
++    production = bool(args.model or args.models_config)
++    try:
++        if args.models_config or args.synthetic_registry:
++            manager, engine = await _load_registry(args, mx)
++        elif args.model:
++            from vllm_mlx.engine.batched import BatchedEngine
++            from vllm_mlx.scheduler import SchedulerConfig
++
++            engine = BatchedEngine(
++                str(Path(args.model).resolve()),
++                trust_remote_code=False,
++                scheduler_config=SchedulerConfig(cache_memory_mb=args.cache_limit_mib),
++            )
++            await engine.start()
++        else:
++            engine = _SyntheticEngine(mx)
++        server._model_manager = manager
++        server._engine = None if manager is not None else engine
++        server._warm_prompts_path = None
++        server._api_key = None
++        await _quiesce(mx, engine)
++        _snapshot(mx, engine, "after_load")
++        model_ids = [id(model) for model in _models(engine)]
++        # One setup-only drain before any fill. Never repeated between cycles.
++        old_cap = mx.set_cache_limit(args.cache_limit_mib * MIB)
++        _emit("allocator_policy", previous_cap_bytes=old_cap)
++        mx.clear_cache()
++        resident = _snapshot(mx, engine, "resident_baseline")
++        failures = []
++        transport = httpx.ASGITransport(app=server.app)
++        async with httpx.AsyncClient(
++            transport=transport, base_url="http://benchmark"
++        ) as client:
++            route = "/v1/cache/prefix" if args.route == "prefix" else "/v1/cache"
++            for cycle in range(1, args.cycles + 1):
++                for item in _engines(engine):
++                    if production:
++                        for request in range(args.requests):
++                            text = (
++                                f"Cycle {cycle} request {request}. "
++                                + "memory cache test " * args.prompt_repeats
++                            )
++                            await _generate(item, text)
++                    else:
++                        item.fill(mx, args.kv_mib * MIB)
++                await _quiesce(
++                    mx, engine, barrier=args.pre_delete_barrier == "owner-streams"
++                )
++                filled = _snapshot(mx, engine, "filled_idle", cycle)
++                size = (
++                    filled["active_bytes"] - resident["active_bytes"]
++                    if production
++                    else args.kv_mib * MIB * len(_engines(engine))
++                )
++                response = await client.delete(route)
++                response.raise_for_status()
++                if response.json().get("status") != "cleared":
++                    raise RuntimeError(f"DELETE did not clear caches: {response.text}")
++                _emit("delete", cycle=cycle, response=response.json())
++                start = time.monotonic()
++                # No GPU work, GC, allocator clear or synchronization in this window.
++                samples = [_snapshot(mx, engine, "after_clear_0s", cycle)]
++                for delay in (1, 5, 10, 60):
++                    if delay <= args.settle_seconds:
++                        await asyncio.sleep(max(0, start + delay - time.monotonic()))
++                        samples.append(
++                            _snapshot(mx, engine, f"after_clear_{delay}s", cycle)
++                        )
++                settled = samples[-1]
++                checks = {
++                    "sufficient_workload": size >= 16 * MIB,
++                    "cache_was_populated": all(
++                        count is not None and count > 0
++                        for count in _model_entry_counts(filled["prefix_cache"])
++                    ),
++                    "cache_entries_cleared": all(
++                        count == 0
++                        for count in _model_entry_counts(settled["prefix_cache"])
++                    ),
++                    "active_drop": filled["active_bytes"] - settled["active_bytes"]
++                    >= 0.8 * size,
++                    "pool_release": filled["active_plus_cache_bytes"]
++                    - settled["active_plus_cache_bytes"]
++                    >= 0.8 * size,
++                    "unused_pool_empty": samples[0]["cache_bytes"] == 0,
++                    "rss_drop": filled["rss_bytes"] - settled["rss_bytes"]
++                    >= 0.5 * size,
++                    "footprint_drop": filled["footprint_bytes"]
++                    - settled["footprint_bytes"]
++                    >= 0.5 * size,
++                    "rss_plateau": settled["rss_bytes"]
++                    <= resident["rss_bytes"] + 32 * MIB,
++                    "footprint_plateau": settled["footprint_bytes"]
++                    <= resident["footprint_bytes"] + 32 * MIB,
++                    "idle_steps_unchanged": filled["engine"].get("steps_executed")
++                    is not None
++                    and settled["engine"].get("steps_executed")
++                    == filled["engine"].get("steps_executed"),
++                    "model_resident": model_ids
++                    == [id(model) for model in _models(engine)],
++                    "registry_residents_unchanged": manager is None
++                    or set(manager._loaded) == set(engine.engines),
++                }
++                _emit("cycle_checks", cycle=cycle, attributed_bytes=size, checks=checks)
++                failures.extend(
++                    f"cycle {cycle}: {key}" for key, ok in checks.items() if not ok
++                )
++                # Idempotence is tested only AFTER the last accounting sample.
++                again = await client.delete(route)
++                again.raise_for_status()
++            for item in _engines(engine):
++                if production:
++                    await _generate(item, "Reply with OK.")
++                elif float(item.model[1].item()) != 1.0:
++                    failures.append("persistent synthetic owner corrupted")
++            _emit(
++                "summary", outcome="failed" if failures else "passed", failures=failures
++            )
++            return 1 if failures else 0
++    finally:
++        # Shutdown follows all measured samples; unload cannot explain a drop.
++        if manager is not None:
++            await manager.shutdown()
++        elif args.model and engine is not None:
++            await engine.stop()
++
++
++def main():
++    parser = argparse.ArgumentParser(description=__doc__)
++    modes = parser.add_mutually_exclusive_group()
++    modes.add_argument(
++        "--model", help="Already-present local model directory; never a Hub ID"
++    )
++    modes.add_argument(
++        "--models-config", help="Registry YAML with local snapshots only"
++    )
++    modes.add_argument("--synthetic-registry", action="store_true")
++    parser.add_argument("--resident-model", action="append", default=[])
++    parser.add_argument(
++        "--pre-delete-barrier",
++        choices=("owner-streams", "none"),
++        default="owner-streams",
++    )
++    parser.add_argument("--route", choices=("prefix", "all"), default="prefix")
++    parser.add_argument("--cycles", type=int, default=3)
++    parser.add_argument("--kv-mib", type=int, default=256)
++    parser.add_argument("--cache-limit-mib", type=int, default=1024)
++    parser.add_argument("--settle-seconds", type=int, choices=(10, 60), default=60)
++    parser.add_argument("--requests", type=int, default=3)
++    parser.add_argument("--prompt-repeats", type=int, default=1024)
++    args = parser.parse_args()
++    if platform.system() != "Darwin" or platform.machine() != "arm64":
++        _emit(
++            "blocked",
++            reason="requires actual Apple Silicon macOS/Metal",
++            platform=platform.platform(),
++        )
++        return 2
++    if args.cycles < 3 or args.kv_mib < 16 or args.kv_mib % 16:
++        parser.error("require >=3 cycles and KV MiB a positive multiple of 16")
++    if args.cache_limit_mib < max(1024, 2 * args.kv_mib):
++        parser.error("allocator cap must be >=1GiB and >=2x synthetic KV size")
++    if args.requests < 1 or args.prompt_repeats < 1:
++        parser.error("requests and prompt-repeats must be positive")
++    if args.models_config and len(set(args.resident_model)) < 2:
++        parser.error(
++            "registry production mode requires at least two --resident-model names"
++        )
++    if args.resident_model and not args.models_config:
++        parser.error("--resident-model requires --models-config")
++    if args.model and not (
++        Path(args.model).is_dir() and (Path(args.model) / "config.json").is_file()
++    ):
++        parser.error(
++            "--model must name an existing local snapshot containing config.json"
++        )
++    for key in ("HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE", "HF_DATASETS_OFFLINE"):
++        os.environ[key] = "1"
++    # Ensure a direct source-checkout invocation imports this checkout, not another.
++    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
++    return asyncio.run(_run(args))
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/tests/test_engine_core_request_owner.py b/tests/test_engine_core_request_owner.py
+index 7ec79a7d1d5ebe210e642b5c7c15ee7b4f311a22..457a0268590761819f72895e2814f6cc27c2dacf 100644
+--- a/tests/test_engine_core_request_owner.py
++++ b/tests/test_engine_core_request_owner.py
+@@ -578,3 +578,55 @@ async def test_cache_mutations_run_on_model_owner_thread(
+ 
+     assert result == expected
+     assert mutation_threads == [owner_thread]
++
++
++@pytest.mark.anyio
++@pytest.mark.parametrize("owner_async", [False, True])
++async def test_prefix_clear_reaches_scheduler_through_real_async_wrapper_on_owner(
++    engine_core_module, batched_module, owner_async
++):
++    """A real AsyncEngineCore must expose the clear, not silently skip it."""
++    module, _ = batched_module
++    mutation_threads = []
++    cached = {"prefix": object()}
++    requests = {"live": object()}
++
++    class RecordedScheduler:
++        def clear_prefix_cache(self):
++            mutation_threads.append(threading.get_ident())
++            cached.clear()
++
++    # Bypass model loading only: all three production clear/dispatch layers are
++    # actual classes, so a missing wrapper method cannot be supplied by a fake.
++    core = object.__new__(engine_core_module.EngineCore)
++    core.scheduler = RecordedScheduler()
++    core.model = object()
++    core._output_collectors = requests
++    wrapper = object.__new__(engine_core_module.AsyncEngineCore)
++    wrapper.engine = core
++    engine = object.__new__(module.BatchedEngine)
++    engine._generation_executor = None
++    engine._engine = wrapper
++    engine._mllm_scheduler = None
++    model = core.model
++    worker = engine._generation_worker()
++    owner_thread = worker.submit(threading.get_ident).result(timeout=5)
++
++    try:
++        if owner_async:
++            result = await engine._clear_prefix_cache_on_owner()
++        else:
++            result = engine.clear_prefix_cache()
++    finally:
++        worker.shutdown(wait=True)
++        engine._generation_executor = None
++
++    assert result is None
++    assert cached == {}
++    assert mutation_threads == [owner_thread]
++    assert owner_thread != threading.get_ident()
++    assert engine._engine is wrapper
++    assert wrapper.engine is core
++    assert core.model is model
++    assert core._output_collectors is requests
++    assert list(requests) == ["live"]
+diff --git a/tests/test_memory_cache_mlx.py b/tests/test_memory_cache_mlx.py
+index d9d3d0aa976e38ab8534d02013111ce5b3b3d3fb..802567cdae3f6fc3a144cff0b4e2f54912d1f0d9 100644
+--- a/tests/test_memory_cache_mlx.py
++++ b/tests/test_memory_cache_mlx.py
+@@ -4,11 +4,42 @@
+ These tests use real ``mlx_lm.models.cache.KVCache`` / ``RotatingKVCache``
+ objects backed by ``mlx.core`` arrays.  They run only on the apple-silicon
+ CI matrix (and locally on M-series hardware); the Linux ``test-matrix``
+-job excludes this file because MLX has no Linux distribution.
++job excludes this file. The memory-release cases explicitly require Metal.
+ """
+ 
++import platform
++import subprocess
++import sys
++from pathlib import Path
+ from unittest.mock import MagicMock
+ 
++import pytest
++
++
++@pytest.mark.skipif(
++    platform.system() != "Darwin" or platform.machine() != "arm64",
++    reason="requires actual Apple Silicon/Metal memory accounting",
++)
++@pytest.mark.parametrize("route", ["prefix", "all"])
++def test_explicit_cache_delete_releases_synthetic_kv_in_fresh_process(route):
++    """Synthetic KV only, not production model acceptance; never a CPU proxy."""
++    root = Path(__file__).resolve().parents[1]
++    result = subprocess.run(
++        [
++            sys.executable,
++            str(root / "scripts" / "benchmark_cache_release.py"),
++            "--route",
++            route,
++            "--settle-seconds",
++            "10",
++        ],
++        cwd=root,
++        text=True,
++        capture_output=True,
++        timeout=180,
++    )
++    assert result.returncode == 0, result.stdout + result.stderr
++
+ 
+ class TestTrimCacheOffset:
+     """Tests for ``_trim_cache_offset``, focused on the LCP contamination fix.
+diff --git a/tests/test_model_registry.py b/tests/test_model_registry.py
+index 33e74312e51a0a525e9fa8240e796b4c13dca6f4..95d5414910fcde78d51f90b25a3011c2b563c3a9 100644
+--- a/tests/test_model_registry.py
++++ b/tests/test_model_registry.py
+@@ -7,6 +7,7 @@ import asyncio
+ import dataclasses
+ import logging
+ import re
++import threading
+ import time
+ from pathlib import Path
+ from typing import Any
+@@ -14,7 +15,7 @@ from unittest.mock import AsyncMock, MagicMock
+ 
+ import pytest
+ 
+-from vllm_mlx.engine.base import BaseEngine, GenerationOutput
++from vllm_mlx.engine.base import BaseEngine, GenerationOutput, run_blocking_startup_work
+ from vllm_mlx.model_registry import (
+     ContentionPolicy,
+     ModelManager,
+@@ -77,6 +78,265 @@ class FakeEngine(BaseEngine):
+         yield GenerationOutput(text="ok", new_text="ok", finished=True)
+ 
+ 
++class _CacheEngine(FakeEngine):
++    """Keep cached and live references distinct across owner-dispatched clears."""
++
++    def __init__(self, config):
++        super().__init__(config)
++        self.cached = [object()]
++        self.live = object()
++        self.clear_started = asyncio.Event()
++        self.clear_gate = None
++        self.clear_error = None
++
++    async def _clear_prefix_cache_on_owner(self):
++        self.clear_started.set()
++        if self.clear_gate is not None:
++            await self.clear_gate.wait()
++        if self.clear_error is not None:
++            raise self.clear_error
++        self.cached.clear()
++
++    async def _clear_runtime_caches_on_owner(self):
++        await self._clear_prefix_cache_on_owner()
++        return {"prefix_cache": True}
++
++    def clear_prefix_cache(self):
++        raise AssertionError("owner helper must take precedence")
++
++    def clear_runtime_caches(self):
++        raise AssertionError("owner helper must take precedence")
++
++
++@pytest.mark.anyio
++@pytest.mark.parametrize("prefix_only", [False, True])
++async def test_registry_cache_clear_keeps_resident_models_and_active_leases(
++    tmp_path, prefix_only
++):
++    manager = ModelManager(
++        _manager_config(budget_gb=4),
++        _registry(tmp_path, {"a": 1, "b": 1, "unloaded": 1}),
++        _defaults(),
++        engine_factory=_CacheEngine,
++    )
++    leases = [await manager.acquire(name) for name in ("a", "b")]
++    live = [lease.engine.live for lease in leases]
++
++    result = await manager.clear_caches(prefix_only=prefix_only)
++
++    assert set(result) == {"a", "b"}
++    assert all(item["status"] == "cleared" for item in result.values())
++    assert set(manager._loaded) == {"a", "b"}
++    for lease, live_reference in zip(leases, live):
++        assert lease.engine.cached == []
++        assert lease.engine.live is live_reference
++        assert lease.engine.started == 1
++        assert lease.engine.stopped == 0
++        assert manager._loaded[lease.model_name].active_requests == 1
++        await lease.release()
++    await manager.shutdown()
++
++
++@pytest.mark.anyio
++async def test_registry_cache_clear_blocks_eviction_until_owner_finishes(tmp_path):
++    manager = ModelManager(
++        _manager_config(budget_gb=1),
++        _registry(tmp_path, {"a": 1, "b": 1}),
++        _defaults(),
++        engine_factory=_CacheEngine,
++    )
++    lease = await manager.acquire("a")
++    engine = lease.engine
++    await lease.release()
++    engine.clear_gate = asyncio.Event()
++    clearing = asyncio.create_task(manager.clear_caches(prefix_only=True))
++    await engine.clear_started.wait()
++    # This acquire must evict a, but cannot stop it during its owner operation.
++    acquiring = asyncio.create_task(manager.acquire("b"))
++    await asyncio.sleep(0)
++    assert not acquiring.done()
++    assert engine.stopped == 0
++    engine.clear_gate.set()
++    assert (await clearing)["a"]["status"] == "cleared"
++    replacement = await acquiring
++    assert engine.stopped == 1
++    await replacement.release()
++    await manager.shutdown()
++
++
++@pytest.mark.anyio
++async def test_registry_cache_clear_waits_for_cancelled_owner_before_eviction(tmp_path):
++    manager = ModelManager(
++        _manager_config(budget_gb=1),
++        _registry(tmp_path, {"a": 1, "b": 1}),
++        _defaults(),
++        engine_factory=_CacheEngine,
++    )
++    lease = await manager.acquire("a")
++    engine = lease.engine
++    await lease.release()
++    started, finish = threading.Event(), threading.Event()
++
++    def blocking_clear():
++        started.set()
++        finish.wait()
++        engine.cached.clear()
++
++    async def owner_clear():
++        # The production BatchedEngine owner helper uses this cancellation guard.
++        await run_blocking_startup_work(blocking_clear)
++
++    engine._clear_prefix_cache_on_owner = owner_clear
++    clearing = asyncio.create_task(manager.clear_caches(prefix_only=True))
++    try:
++        assert await asyncio.to_thread(started.wait, 5)
++        clearing.cancel()
++        acquiring = asyncio.create_task(manager.acquire("b"))
++        await asyncio.sleep(0)
++        assert not clearing.done()
++        assert not acquiring.done()
++        assert engine.stopped == 0
++    finally:
++        finish.set()
++    with pytest.raises(asyncio.CancelledError):
++        await clearing
++    replacement = await acquiring
++    assert engine.cached == []
++    assert engine.stopped == 1
++    await replacement.release()
++    await manager.shutdown()
++
++
++@pytest.mark.anyio
++@pytest.mark.parametrize("prefix_only", [True, False], ids=["prefix", "all"])
++@pytest.mark.parametrize("preempting", [False, True], ids=["resident", "preempting"])
++async def test_cancelled_request_release_during_registry_cache_clear(
++    tmp_path, prefix_only, preempting
++):
++    """Cancellation cannot lose the request lease while clear pins residency."""
++    from vllm_mlx.server import RequestModelContext
++
++    manager = ModelManager(
++        _manager_config(budget_gb=1, strategy="fail"),
++        _registry(tmp_path, {"a": 1, "b": 1}),
++        _defaults(),
++        engine_factory=_CacheEngine,
++    )
++    ready, release_now = asyncio.Event(), asyncio.Event()
++    holder = {}
++
++    async def request_owner():
++        lease = await manager.acquire("a")
++        context = RequestModelContext("a", lease.engine, lease)
++        holder.update(lease=lease, context=context)
++        ready.set()
++        await release_now.wait()
++        await context.release()
++
++    releasing = asyncio.create_task(request_owner())
++    await ready.wait()
++    lease, context = holder["lease"], holder["context"]
++    engine = lease.engine
++    loaded = manager._loaded["a"]
++    assert loaded.active_tasks == {releasing}
++    loaded.preempting = preempting
++    engine.clear_gate = asyncio.Event()
++    clearing = asyncio.create_task(manager.clear_caches(prefix_only=prefix_only))
++    try:
++        await engine.clear_started.wait()
++        release_now.set()
++        await asyncio.sleep(0)
++        assert not releasing.done()
++        for _ in range(3):
++            releasing.cancel()
++            await asyncio.sleep(0)
++            # Returning now would lose context.lease and lease.manager before
++            # the actual count/task removal can acquire the condition.
++            assert not releasing.done()
++            assert loaded.active_requests == 1
++            assert loaded.active_tasks == {releasing}
++            assert engine.stopped == 0
++    finally:
++        engine.clear_gate.set()
++        clear_result = await clearing
++        await asyncio.gather(releasing, return_exceptions=True)
++
++    assert clear_result["a"]["status"] == "cleared"
++    assert releasing.cancelled()
++    assert loaded.active_requests == 0
++    # A cleanup task using its own current_task() would leave releasing here.
++    assert loaded.active_tasks == set()
++    assert context.lease is None
++    assert lease.manager is None
++    await context.release()
++    await lease.release()
++    assert loaded.active_requests == 0
++    assert loaded.active_tasks == set()
++    replacement = await manager.acquire("b")
++    assert engine.stopped == 1
++    await replacement.release()
++    await manager.shutdown()
++    assert manager._loaded == {}
++    assert manager._unloading == {}
++
++
++@pytest.mark.anyio
++@pytest.mark.parametrize("route", ["/v1/cache/prefix", "/v1/cache"])
++@pytest.mark.parametrize("failed_model", [None, "a"])
++async def test_registry_cache_routes_clear_all_resident_owners_before_pool_flush(
++    tmp_path, monkeypatch, route, failed_model
++):
++    import httpx
++    import mlx.core as mx
++    import sys
++    import types
++
++    import vllm_mlx.server as server
++
++    manager = ModelManager(
++        _manager_config(budget_gb=4),
++        _registry(tmp_path, {"a": 1, "b": 1, "unloaded": 1}),
++        _defaults(),
++        engine_factory=_CacheEngine,
++    )
++    leases = [await manager.acquire(name) for name in ("a", "b")]
++    if failed_model:
++        leases[0].engine.clear_error = RuntimeError("owner failed")
++    flushes = []
++
++    def flush():
++        # A premature flush would leave b's now-unused arrays in the pool.
++        assert leases[1].engine.cached == []
++        flushes.append(True)
++
++    utils = types.ModuleType("mlx_vlm.utils")
++    utils.clear_multimodal_kv_cache = lambda: None
++    utils.clear_pixel_values_cache = lambda: None
++    monkeypatch.setitem(sys.modules, "mlx_vlm.utils", utils)
++    monkeypatch.setattr(mx, "clear_cache", flush)
++    monkeypatch.setattr(server, "_engine", None)
++    monkeypatch.setattr(server, "_model_manager", manager)
++    monkeypatch.setattr(server, "_api_key", None)
++    monkeypatch.setattr(server, "_warm_prompts_path", None)
++    transport = httpx.ASGITransport(app=server.app)
++    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
++        response = await client.delete(route)
++    assert response.status_code == 200
++    body = response.json()
++    assert body["status"] == "cleared"
++    models = body["model_caches"] if route.endswith("prefix") else body["engine_cache"]
++    assert set(models) == {"a", "b"}
++    assert models["b"]["status"] == "cleared"
++    assert models["a"]["status"] == ("error" if failed_model else "cleared")
++    assert flushes == [True]
++    assert set(manager._loaded) == {"a", "b"}
++    for lease in leases:
++        assert lease.engine.stopped == 0
++        assert manager._loaded[lease.model_name].active_requests == 1
++        await lease.release()
++    await manager.shutdown()
++
++
+ def _defaults() -> RegistryServeDefaults:
+     return RegistryServeDefaults(
+         continuous_batching=False,
+diff --git a/tests/test_server_cache_controls.py b/tests/test_server_cache_controls.py
+index a551051ac450da5aed985cf676372d58f44ae1b1..0ed6a81029615452b33785fa19dec6e570bccb5f 100644
+--- a/tests/test_server_cache_controls.py
++++ b/tests/test_server_cache_controls.py
+@@ -1,9 +1,14 @@
+ # SPDX-License-Identifier: Apache-2.0
+ """Tests for cache control endpoints."""
+ 
++import asyncio
++import builtins
++import importlib.util
+ import sys
+ import types
++from pathlib import Path
+ 
++import pytest
+ from fastapi.testclient import TestClient
+ 
+ 
+@@ -42,6 +47,278 @@ def test_cache_stats_includes_engine_cache(monkeypatch):
+             sys.modules.pop("mlx_vlm.utils", None)
+ 
+ 
++@pytest.fixture
++def cache_route(monkeypatch):
++    """Exercise real HTTP handlers; replace only backend/cache boundaries."""
++    import mlx.core as mx
++
++    import vllm_mlx.server as server
++
++    events = []
++    monkeypatch.setattr(mx, "clear_cache", lambda: events.append("flush"))
++    utils = types.ModuleType("mlx_vlm.utils")
++    utils.clear_multimodal_kv_cache = lambda: events.append("multimodal")
++    utils.clear_pixel_values_cache = lambda: events.append("pixel")
++    monkeypatch.setitem(sys.modules, "mlx_vlm.utils", utils)
++    monkeypatch.setattr(server, "_api_key", None)
++    monkeypatch.setattr(server, "_engine", None)
++    monkeypatch.setattr(server, "_model_manager", None)
++    monkeypatch.setattr(server, "_warm_prompts_path", None)
++    return server, TestClient(server.app), events
++
++
++def _engine_with_clear(events, method, mode):
++    """Owner and legacy operations finish only after the async yield."""
++
++    def clear():
++        events.append("engine")
++        return {"prefix_cache": True}
++
++    async def async_clear():
++        await asyncio.sleep(0)
++        return clear()
++
++    def wrong_fallback():
++        raise AssertionError("owner helper must take precedence")
++
++    engine = types.SimpleNamespace(model=object(), requests={"live": object()})
++    setattr(engine, method, clear if mode == "sync" else async_clear)
++    if mode == "owner":
++        setattr(engine, method, wrong_fallback)
++        setattr(engine, f"_{method}_on_owner", async_clear)
++    return engine
++
++
++@pytest.mark.parametrize("mode", ["owner", "sync", "awaitable"])
++@pytest.mark.parametrize("rewarm", [False, True])
++def test_prefix_clear_flushes_after_owner_release_before_rewarm(
++    cache_route, monkeypatch, mode, rewarm
++):
++    server, client, events = cache_route
++    engine = _engine_with_clear(events, "clear_prefix_cache", mode)
++    model, requests = engine.model, engine.requests.copy()
++    monkeypatch.setattr(server, "_engine", engine)
++    if rewarm:
++        import vllm_mlx.prompt_warmup as warmup
++
++        engine.stream_chat = object()
++        monkeypatch.setattr(server, "_warm_prompts_path", "unused.json")
++        monkeypatch.setattr(warmup, "load_warmup_file", lambda _: [])
++
++        async def warm(*args):
++            events.append("rewarm")
++            return {"count": 0, "skipped": 0, "elapsed_ms": 0}
++
++        monkeypatch.setattr(warmup, "warm_prefix_cache", warm)
++
++    response = client.delete("/v1/cache/prefix")
++
++    assert response.status_code == 200
++    assert response.json() == {"status": "cleared", "rewarm_scheduled": rewarm}
++    assert events == ["engine", "flush"] + (["rewarm"] if rewarm else [])
++    assert server._engine is engine
++    assert engine.model is model
++    assert engine.requests == requests
++
++
++@pytest.mark.parametrize("state", ["no_engine", "unsupported", "error"])
++def test_prefix_clear_does_not_flush_when_no_references_were_cleared(
++    cache_route, monkeypatch, state
++):
++    server, client, events = cache_route
++    if state != "no_engine":
++        engine = types.SimpleNamespace()
++        if state == "error":
++
++            async def fail():
++                raise RuntimeError("owner failed")
++
++            engine.clear_prefix_cache = fail
++        monkeypatch.setattr(server, "_engine", engine)
++
++    response = client.delete("/v1/cache/prefix")
++
++    expected = (
++        {"status": "no_engine"}
++        if state == "no_engine"
++        else {"status": "not_supported", "rewarm_scheduled": False}
++    )
++    assert response.status_code == 200
++    assert response.json() == expected
++    assert events == []
++
++
++@pytest.mark.parametrize("mode", ["owner", "sync", "awaitable"])
++@pytest.mark.parametrize("optional_vlm", [True, False])
++def test_all_cache_clear_flushes_last_including_optional_import_fallback(
++    cache_route, monkeypatch, mode, optional_vlm
++):
++    server, client, events = cache_route
++    engine = _engine_with_clear(events, "clear_runtime_caches", mode)
++    model, requests = engine.model, engine.requests.copy()
++    monkeypatch.setattr(server, "_engine", engine)
++    if not optional_vlm:
++        monkeypatch.setitem(sys.modules, "mlx_vlm.utils", None)
++
++    response = client.delete("/v1/cache")
++
++    expected = {"status": "cleared", "engine_cache": {"prefix_cache": True}}
++    if optional_vlm:
++        expected["caches"] = ["multimodal_kv", "pixel_values", "pil_image"]
++    else:
++        expected["error"] = "Cache clear not available (mlx_vlm not loaded)"
++    assert response.status_code == 200
++    assert response.json() == expected
++    assert events == ["engine"] + (["multimodal", "pixel"] if optional_vlm else []) + [
++        "flush"
++    ]
++    assert server._engine is engine
++    assert engine.model is model
++    assert engine.requests == requests
++
++
++def test_all_cache_clear_flushes_global_caches_without_engine(cache_route):
++    _, client, events = cache_route
++    response = client.delete("/v1/cache")
++    assert response.status_code == 200
++    assert response.json()["engine_cache"] is None
++    assert events == ["multimodal", "pixel", "flush"]
++
++
++def test_all_cache_clear_keeps_engine_error_and_releases_global_caches(
++    cache_route, monkeypatch
++):
++    server, client, events = cache_route
++
++    def fail():
++        events.append("engine-error")
++        raise RuntimeError("owner failed")
++
++    monkeypatch.setattr(
++        server, "_engine", types.SimpleNamespace(clear_runtime_caches=fail)
++    )
++    response = client.delete("/v1/cache")
++    assert response.status_code == 200
++    assert response.json()["engine_cache"] == {"error": "owner failed"}
++    assert events == ["engine-error", "multimodal", "pixel", "flush"]
++
++
++def test_all_cache_clear_flushes_released_subset_if_global_clear_fails(
++    cache_route, monkeypatch
++):
++    server, _, events = cache_route
++
++    def fail():
++        events.append("pixel-error")
++        raise RuntimeError("global cache failure")
++
++    monkeypatch.setattr(sys.modules["mlx_vlm.utils"], "clear_pixel_values_cache", fail)
++    client = TestClient(server.app, raise_server_exceptions=False)
++    assert client.delete("/v1/cache").status_code == 500
++    assert events == ["multimodal", "pixel-error", "flush"]
++
++
++@pytest.mark.parametrize("route", ["/v1/cache", "/v1/cache/prefix"])
++def test_allocator_flush_failure_is_logged_without_changing_response(
++    cache_route, monkeypatch, caplog, route
++):
++    import mlx.core as mx
++
++    server, client, events = cache_route
++    monkeypatch.setattr(
++        server, "_engine", _engine_with_clear(events, "clear_prefix_cache", "owner")
++    )
++
++    def fail():
++        raise RuntimeError("allocator unavailable")
++
++    monkeypatch.setattr(mx, "clear_cache", fail)
++    response = client.delete(route)
++    assert response.status_code == 200
++    assert response.json()["status"] == "cleared"
++    assert "allocator unavailable" in caplog.text
++
++
++@pytest.mark.parametrize("route", ["/v1/cache", "/v1/cache/prefix"])
++def test_optional_mlx_absence_preserves_clear_response(cache_route, monkeypatch, route):
++    server, client, events = cache_route
++    monkeypatch.setattr(
++        server, "_engine", _engine_with_clear(events, "clear_prefix_cache", "owner")
++    )
++    original_import = builtins.__import__
++
++    def import_without_mlx(name, *args, **kwargs):
++        if name == "mlx.core":
++            raise ImportError("MLX not installed")
++        return original_import(name, *args, **kwargs)
++
++    monkeypatch.setattr(builtins, "__import__", import_without_mlx)
++    response = client.delete(route)
++    assert response.status_code == 200
++    assert response.json()["status"] == "cleared"
++    assert "flush" not in events
++
++
++@pytest.mark.parametrize("route", ["/v1/cache", "/v1/cache/prefix"])
++def test_cache_clear_auth_failure_does_not_release_anything(
++    cache_route, monkeypatch, route
++):
++    server, client, events = cache_route
++    monkeypatch.setattr(server, "_api_key", "required-test-key")
++    response = client.delete(route)
++    assert response.status_code == 401
++    assert events == []
++
++
++@pytest.mark.anyio
++async def test_cache_release_benchmark_without_barrier_does_not_synchronize(
++    monkeypatch,
++):
++    path = (
++        Path(__file__).resolve().parents[1] / "scripts" / "benchmark_cache_release.py"
++    )
++    spec = importlib.util.spec_from_file_location("cache_release_no_barrier", path)
++    benchmark = importlib.util.module_from_spec(spec)
++    spec.loader.exec_module(benchmark)
++
++    def unexpected_sync(*args):
++        raise AssertionError("zero-request observation must not add a stream barrier")
++
++    mx = types.SimpleNamespace(synchronize=unexpected_sync)
++    engine = types.SimpleNamespace(
++        get_stats=lambda: {"num_running": 0, "num_waiting": 0}
++    )
++    await benchmark._quiesce(mx, engine, barrier=False)
++
++
++@pytest.mark.anyio
++async def test_cache_release_benchmark_registry_uses_manager_with_two_residents(
++    monkeypatch,
++):
++    import mlx.core as mx
++
++    path = (
++        Path(__file__).resolve().parents[1] / "scripts" / "benchmark_cache_release.py"
++    )
++    spec = importlib.util.spec_from_file_location("cache_release_registry", path)
++    benchmark = importlib.util.module_from_spec(spec)
++    spec.loader.exec_module(benchmark)
++    args = types.SimpleNamespace(synthetic_registry=True, cache_limit_mib=1024)
++    manager, group = await benchmark._load_registry(args, mx)
++    try:
++        assert set(manager._loaded) == {"synthetic-a", "synthetic-b"}
++        assert manager.has_model("unloaded")
++        for engine in group.engines.values():
++            engine.fill(mx, 16 * benchmark.MIB)
++        assert benchmark._entry_count(group.get_cache_stats()) == 2
++        result = await manager.clear_caches(prefix_only=True)
++        assert all(item["status"] == "cleared" for item in result.values())
++        assert benchmark._entry_count(group.get_cache_stats()) == 0
++        assert set(manager._loaded) == {"synthetic-a", "synthetic-b"}
++    finally:
++        await manager.shutdown()
++
++
+ def test_clear_cache_clears_engine_managed_runtime_caches(monkeypatch):
+     import vllm_mlx.server as server
+ 
+@@ -82,3 +359,49 @@ def test_clear_cache_clears_engine_managed_runtime_caches(monkeypatch):
+             sys.modules["mlx_vlm.utils"] = original_module
+         else:
+             sys.modules.pop("mlx_vlm.utils", None)
++
++
++@pytest.mark.anyio
++@pytest.mark.parametrize(
++    ("text", "finish_reason", "completion_tokens", "must_fail"),
++    [
++        ("", "error", 0, True),
++        ("partial", "error", 1, True),
++        ("", "stop", 0, False),  # Valid immediate EOS is not a failed request.
++        ("OK", "stop", 1, False),
++        ("OK", "length", 16, False),
++    ],
++)
++async def test_cache_release_benchmark_rejects_terminal_generation_errors(
++    capsys, text, finish_reason, completion_tokens, must_fail
++):
++    """A failed fill or post-clear liveness request cannot earn acceptance."""
++    from vllm_mlx.engine.base import GenerationOutput
++
++    path = (
++        Path(__file__).resolve().parents[1] / "scripts" / "benchmark_cache_release.py"
++    )
++    spec = importlib.util.spec_from_file_location("cache_release_benchmark", path)
++    benchmark = importlib.util.module_from_spec(spec)
++    spec.loader.exec_module(benchmark)
++
++    class OutputEngine:
++        async def stream_chat(self, messages, **kwargs):
++            assert messages == [{"role": "user", "content": "Reply with OK."}]
++            assert kwargs == {"max_tokens": 16, "temperature": 0}
++            yield GenerationOutput(text="", finished=False, finish_reason=None)
++            yield GenerationOutput(
++                text=text,
++                prompt_tokens=64,
++                completion_tokens=completion_tokens,
++                finished=True,
++                finish_reason=finish_reason,
++            )
++
++    if must_fail:
++        with pytest.raises(RuntimeError, match="generation"):
++            await benchmark._generate(OutputEngine(), "Reply with OK.")
++        assert capsys.readouterr().out == ""
++    else:
++        await benchmark._generate(OutputEngine(), "Reply with OK.")
++        assert '"event": "generation"' in capsys.readouterr().out
+diff --git a/vllm_mlx/engine_core.py b/vllm_mlx/engine_core.py
+index 2f8dda32f9c9de7b75b5ad12d381cc8dfa94c011..873d4bbbb46d3b886c6805181c69d4ad4f4361f8 100644
+--- a/vllm_mlx/engine_core.py
++++ b/vllm_mlx/engine_core.py
+@@ -944,3 +944,7 @@ class AsyncEngineCore:
+     def clear_runtime_caches(self) -> Dict[str, Any] | None:
+         """Clear scheduler-managed runtime caches."""
+         return self.engine.clear_runtime_caches()
++
++    def clear_prefix_cache(self) -> None:
++        """Clear the wrapped engine's prefix cache."""
++        self.engine.clear_prefix_cache()
+diff --git a/vllm_mlx/model_registry.py b/vllm_mlx/model_registry.py
+index fef110bdf3831f942bfc0c6b920c43812c4c4148..1e7e0392d0f5d1d4f6ee8329bf207d18845b74c5 100644
+--- a/vllm_mlx/model_registry.py
++++ b/vllm_mlx/model_registry.py
+@@ -11,6 +11,7 @@ behaviour.
+ from __future__ import annotations
+ 
+ import asyncio
++import inspect
+ import logging
+ import math
+ import os
+@@ -802,6 +803,38 @@ class ModelManager:
+             return None
+         return max(self._loaded.values(), key=lambda loaded: loaded.last_used_at).engine
+ 
++    async def clear_caches(
++        self, *, prefix_only: bool = False
++    ) -> dict[str, dict[str, Any]]:
++        """Clear resident engines without loading or unloading registry entries.
++
++        Keep residency protected until owner-side operations finish. In-flight
++        requests retain their own arrays; this drops only reusable cache owners.
++        The caller can then flush the process-wide allocator pool once, after
++        also dropping any global caches.
++        """
++        method = "clear_prefix_cache" if prefix_only else "clear_runtime_caches"
++        results: dict[str, dict[str, Any]] = {}
++        async with self._condition:
++            for name, loaded in self._loaded.items():
++                clear = getattr(loaded.engine, f"_{method}_on_owner", None)
++                if clear is None:
++                    clear = getattr(loaded.engine, method, None)
++                if clear is None:
++                    results[name] = {"status": "not_supported"}
++                    continue
++                try:
++                    result = clear()
++                    if inspect.isawaitable(result):
++                        result = await result
++                    results[name] = {"status": "cleared", "cache": result}
++                except Exception as exc:
++                    logger.warning(
++                        "Failed to clear caches for model %r", name, exc_info=True
++                    )
++                    results[name] = {"status": "error", "error": str(exc)}
++        return results
++
+     async def preload(self) -> None:
+         """Preload any entries marked preload=true."""
+         for entry in self._registry.values():
+@@ -934,25 +967,39 @@ class ModelManager:
+     async def release(self, model_name: str) -> None:
+         """Release a previously acquired model lease."""
+         unload: LoadedModel | None = None
++        cancelled: asyncio.CancelledError | None = None
+ 
+-        async with self._condition:
+-            loaded = self._loaded.get(model_name)
+-            if loaded is None:
+-                return
++        # ModelLease/RequestModelContext close their handles before awaiting us.
++        # A cache clear can hold this condition across owner work, so finish the
++        # decrement before propagating cancellation, including repeated cancels.
++        # Stay in the request task: active_tasks must discard its identity.
++        while True:
++            try:
++                await self._condition.acquire()
++                break
++            except asyncio.CancelledError as exc:
++                cancelled = exc
+ 
+-            loaded.active_requests = max(0, loaded.active_requests - 1)
+-            loaded.last_used_at = time.time()
+-            task = asyncio.current_task()
+-            if task is not None:
+-                loaded.active_tasks.discard(task)
++        try:
++            loaded = self._loaded.get(model_name)
++            if loaded is not None:
++                loaded.active_requests = max(0, loaded.active_requests - 1)
++                loaded.last_used_at = time.time()
++                task = asyncio.current_task()
++                if task is not None:
++                    loaded.active_tasks.discard(task)
+ 
+-            if loaded.preempting and loaded.active_requests == 0:
+-                unload = self._begin_unload_locked(model_name)
++                if loaded.preempting and loaded.active_requests == 0:
++                    unload = self._begin_unload_locked(model_name)
+ 
+-            self._condition.notify_all()
++                self._condition.notify_all()
++        finally:
++            self._condition.release()
+ 
+         if unload is not None:
+             await self._run_unloads([unload])
++        if cancelled is not None:
++            raise cancelled
+ 
+     async def unload_idle(self) -> list[str]:
+         """Unload every loaded model idle past ``idle_unload_seconds``.
+diff --git a/vllm_mlx/server.py b/vllm_mlx/server.py
+index 56a6b71daae0d49767dad4a76f6e6040a80fa295..2265584501df3b8bcb503749ebf0ebb67d3c3721 100644
+--- a/vllm_mlx/server.py
++++ b/vllm_mlx/server.py
+@@ -4543,11 +4543,29 @@ async def cache_stats():
+         }
+ 
+ 
++def _release_unused_mlx_buffers() -> None:
++    """Release the process-wide unused pool, not live model/request arrays."""
++    try:
++        import mlx.core as mx
++    except ImportError:
++        return
++
++    try:
++        mx.clear_cache()
++    except Exception as exc:
++        logger.warning(
++            "Failed to release unused MLX buffers: %s",
++            _sanitize_log_text(exc, limit=500),
++        )
++
++
+ @app.delete("/v1/cache", dependencies=[Depends(verify_api_key)])
+ async def clear_cache():
+     """Clear all caches."""
+     cleared_engine = None
+-    if _engine is not None and hasattr(_engine, "clear_runtime_caches"):
++    if _model_manager is not None:
++        cleared_engine = await _model_manager.clear_caches()
++    elif _engine is not None and hasattr(_engine, "clear_runtime_caches"):
+         try:
+             owned_clear = getattr(_engine, "_clear_runtime_caches_on_owner", None)
+             if owned_clear is not None:
+@@ -4579,6 +4597,9 @@ async def clear_cache():
+             "engine_cache": cleared_engine,
+             "error": "Cache clear not available (mlx_vlm not loaded)",
+         }
++    finally:
++        # Global mlx-vlm caches can release additional buffers after the engine.
++        _release_unused_mlx_buffers()
+ 
+ 
+ @app.delete("/v1/cache/prefix", dependencies=[Depends(verify_api_key)])
+@@ -4590,6 +4611,20 @@ async def clear_prefix_cache():
+     hits the cache. Response returns immediately without waiting for
+     the re-warm to finish.
+     """
++    if _model_manager is not None:
++        model_caches = await _model_manager.clear_caches(prefix_only=True)
++        cleared = any(item["status"] == "cleared" for item in model_caches.values())
++        if cleared:
++            _release_unused_mlx_buffers()
++        return {
++            "status": (
++                "cleared"
++                if cleared
++                else "not_supported" if model_caches else "no_engine"
++            ),
++            "rewarm_scheduled": False,
++            "model_caches": model_caches,
++        }
+     if _engine is None:
+         return {"status": "no_engine"}
+     cleared = False
+@@ -4609,6 +4644,9 @@ async def clear_prefix_cache():
+                 _sanitize_log_text(e, limit=500),
+             )
+ 
++    if cleared:
++        _release_unused_mlx_buffers()
++
+     # Auto re-warm in background if warm-prompts was configured.
+     rewarm_scheduled = False
+     if cleared and _warm_prompts_path and hasattr(_engine, "stream_chat"):

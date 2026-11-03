@@ -1,0 +1,2 @@
+# Frozen patches require blank context lines containing one space.
+*.patch -whitespace

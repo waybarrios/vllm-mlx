@@ -1,0 +1,2230 @@
+diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+index d8d4435cf0aa4caa9b72b643f9d37c407fa6772c..453476c99969bc76c442a1d8fafc5cc1163cf4c4 100644
+--- a/.github/workflows/ci.yml
++++ b/.github/workflows/ci.yml
+@@ -231,6 +231,7 @@ jobs:
+             tests/test_mllm.py \
+             tests/test_mllm_assistant_drafter.py \
+             tests/test_server.py \
++            tests/test_gpt_oss_tool_parsing.py \
+             tests/test_metrics.py \
+             tests/test_paged_cache.py \
+             tests/test_prefix_cache.py \
+diff --git a/tests/test_engine_base.py b/tests/test_engine_base.py
+index cd8027adaad6ff1833abfe40b20e9382639f53c6..f0adeb438be32b95dc8f93b5dc87fd5463261c3b 100644
+--- a/tests/test_engine_base.py
++++ b/tests/test_engine_base.py
+@@ -42,6 +42,7 @@ class TestGenerationOutput:
+             "new_text",
+             "finished",
+             "specprefill_outcome",
++            "raw_text",
+         )
+         declared = fields(GenerationOutput)
+         assert tuple(item.name for item in declared) == expected_names
+@@ -56,6 +57,7 @@ class TestGenerationOutput:
+             str,
+             bool,
+             "SpecPrefillOutcome | None",
++            str | None,
+         )
+         assert declared[0].default is MISSING
+         assert declared[1].default is MISSING
+@@ -69,6 +71,7 @@ class TestGenerationOutput:
+             "",
+             True,
+             None,
++            None,
+         )
+         assert all(item.default_factory is MISSING for item in declared[2:])
+         assert declared[0].default_factory is MISSING
+@@ -98,18 +101,20 @@ class TestGenerationOutput:
+             "new_text": "",
+             "finished": True,
+             "specprefill_outcome": None,
++            "raw_text": None,
+         }
+         assert asdict(first) == expected
+         assert json.dumps(asdict(first)) == (
+             '{"text": "hello", "tokens": [], "prompt_tokens": 0, '
+             '"completion_tokens": 0, "finish_reason": "stop", "mtp_drafts": 0, '
+             '"mtp_accepted": 0, "new_text": "", "finished": true, '
+-            '"specprefill_outcome": null}'
++            '"specprefill_outcome": null, "raw_text": null}'
+         )
+         assert repr(first) == (
+             "GenerationOutput(text='hello', tokens=[], prompt_tokens=0, "
+             "completion_tokens=0, finish_reason='stop', mtp_drafts=0, "
+-            "mtp_accepted=0, new_text='', finished=True, specprefill_outcome=None)"
++            "mtp_accepted=0, new_text='', finished=True, specprefill_outcome=None, "
++            "raw_text=None)"
+         )
+         assert first == second
+         assert first.tokens is not second.tokens
+@@ -134,6 +139,7 @@ class TestGenerationOutput:
+             specprefill_outcome=None,
+         )
+         assert positional == keyword
++        assert positional.raw_text is keyword.raw_text is None
+         assert asdict(positional) == {
+             "text": "hello",
+             "tokens": [7, 8],
+@@ -145,16 +151,68 @@ class TestGenerationOutput:
+             "new_text": "lo",
+             "finished": False,
+             "specprefill_outcome": None,
++            "raw_text": None,
+         }
+         assert json.dumps(asdict(positional)) == (
+             '{"text": "hello", "tokens": [7, 8], "prompt_tokens": 3, '
+             '"completion_tokens": 2, "finish_reason": null, "mtp_drafts": 9, '
+             '"mtp_accepted": 4, "new_text": "lo", "finished": false, '
+-            '"specprefill_outcome": null}'
++            '"specprefill_outcome": null, "raw_text": null}'
+         )
+         keyword.mtp_accepted = 3
+         assert positional != keyword
+ 
++    def test_nonempty_raw_text_roundtrip_preserves_separate_public_text(self):
++        raw = "<|channel|>final<|message|>hello<|return|>"
++        positional = GenerationOutput(
++            "hello", [7, 8], 3, 2, None, 9, 4, "lo", False, None, raw
++        )
++        keyword = GenerationOutput(
++            text="hello",
++            tokens=[7, 8],
++            prompt_tokens=3,
++            completion_tokens=2,
++            finish_reason=None,
++            mtp_drafts=9,
++            mtp_accepted=4,
++            new_text="lo",
++            finished=False,
++            specprefill_outcome=None,
++            raw_text=raw,
++        )
++        assert positional == keyword
++        assert positional.text == "hello"
++        assert positional.raw_text == raw
++        assert positional.text != positional.raw_text
++        assert asdict(positional) == {
++            "text": "hello",
++            "tokens": [7, 8],
++            "prompt_tokens": 3,
++            "completion_tokens": 2,
++            "finish_reason": None,
++            "mtp_drafts": 9,
++            "mtp_accepted": 4,
++            "new_text": "lo",
++            "finished": False,
++            "specprefill_outcome": None,
++            "raw_text": "<|channel|>final<|message|>hello<|return|>",
++        }
++        serialized = json.dumps(asdict(positional))
++        assert serialized == (
++            '{"text": "hello", "tokens": [7, 8], "prompt_tokens": 3, '
++            '"completion_tokens": 2, "finish_reason": null, "mtp_drafts": 9, '
++            '"mtp_accepted": 4, "new_text": "lo", "finished": false, '
++            '"specprefill_outcome": null, '
++            '"raw_text": "<|channel|>final<|message|>hello<|return|>"}'
++        )
++        restored = GenerationOutput(**json.loads(serialized))
++        assert restored == keyword
++        assert restored.text == "hello"
++        assert restored.raw_text == raw
++        keyword.raw_text = None
++        assert positional != keyword
++        assert keyword.text == "hello"
++
+ 
+ class _EngineWithoutStreams(BaseEngine):
+     @property
+diff --git a/tests/test_gpt_oss_tool_parsing.py b/tests/test_gpt_oss_tool_parsing.py
+index ef86214f83bcd4333da4f4a1073cb63ea54c46f4..2d2d3164e13d63d264082a64013c8e508290fe74 100644
+--- a/tests/test_gpt_oss_tool_parsing.py
++++ b/tests/test_gpt_oss_tool_parsing.py
+@@ -14,6 +14,10 @@ Usage:
+ 
+ from types import SimpleNamespace
+ 
++import json
++
++import pytest
++
+ 
+ def test_tools_branch_strips_analysis_block_before_parser(monkeypatch):
+     import vllm_mlx.server as server
+@@ -142,3 +146,898 @@ def test_streaming_marker_false_for_plain_text():
+     # Final-channel content (no commentary) is not tool markup either.
+     final_only = "<|channel|>final<|message|>The answer is 42.<|return|>"
+     assert server._streaming_tool_markup_possible(final_only) is False
++
++
++_HARMONY_CHUNKS = [
++    "<|channel|>",
++    "analysis",
++    "<|message|>",
++    "Need weather.",
++    "<|end|>",
++    "<|start|>",
++    "assistant",
++    "<|channel|>",
++    "commentary to=functions.get_weather ",
++    "<|constrain|>",
++    "json",
++    "<|message|>",
++    '{"city":"Paris"}',
++]
++_WEATHER_TOOL = {
++    "name": "get_weather",
++    "description": "Get weather",
++    "parameters": {
++        "type": "object",
++        "properties": {"city": {"type": "string"}},
++        "required": ["city"],
++    },
++}
++
++
++@pytest.fixture
++def harmony_api(monkeypatch):
++    """Use real HTTP handlers, parsers and SimpleEngine.chat, without model I/O."""
++    from fastapi.testclient import TestClient
++
++    import vllm_mlx.server as server
++    from vllm_mlx.engine.base import GenerationOutput
++    from vllm_mlx.engine.simple import SimpleEngine
++
++    class StreamEngine:
++        model_name = "test-model"
++        is_mllm = False
++        preserve_native_tool_format = False
++        _loaded = True
++        chat = SimpleEngine.chat
++
++        def __init__(self):
++            self.chunks = list(_HARMONY_CHUNKS)
++
++        async def stream_chat(self, messages, **kwargs):
++            text = ""
++            for i, delta in enumerate(self.chunks):
++                text += delta
++                yield GenerationOutput(
++                    text=text,
++                    new_text=delta,
++                    finished=False,
++                    finish_reason=None,
++                    prompt_tokens=7,
++                    completion_tokens=i + 1,
++                )
++            # EOS is deliberately a separate empty output, as in the scheduler.
++            yield GenerationOutput(
++                text=text,
++                new_text="",
++                finished=True,
++                finish_reason="stop",
++                prompt_tokens=7,
++                completion_tokens=len(self.chunks),
++            )
++
++    engine = StreamEngine()
++    for key, value in {
++        "_engine": engine,
++        "_model_manager": None,
++        "_model_name": "test-model",
++        "_api_key": None,
++        "_default_timeout": 30.0,
++        "_default_max_tokens": 128,
++        "_default_chat_template_kwargs": None,
++        "_default_thinking_token_budget": None,
++        "_enable_auto_tool_choice": True,
++        "_tool_call_parser": "harmony",
++        "_tool_parser_instance": None,
++        "_rate_limiter": server.RateLimiter(enabled=False),
++    }.items():
++        monkeypatch.setattr(server, key, value)
++
++    def configure(reasoning):
++        monkeypatch.setattr(server, "_reasoning_parser_name", reasoning)
++        monkeypatch.setattr(
++            server,
++            "_reasoning_parser",
++            server.get_reasoning_parser(reasoning)() if reasoning else None,
++        )
++
++    # Startup/shutdown owns model resources; only the HTTP application is under
++    # test here, just as in test_server.py's endpoint fixtures.
++    yield TestClient(server.app), engine, configure
++
++
++def _harmony_request(client, api, stream, *, tool_choice=None, tools=True, **extra):
++    body = {
++        "model": "test-model",
++        "messages": [{"role": "user", "content": "Weather?"}],
++        "max_tokens": 64,
++        "stream": stream,
++        **extra,
++    }
++    if tools:
++        if api == "openai":
++            body["tools"] = [{"type": "function", "function": _WEATHER_TOOL}]
++        else:
++            body["tools"] = [
++                {
++                    "name": _WEATHER_TOOL["name"],
++                    "description": _WEATHER_TOOL["description"],
++                    "input_schema": _WEATHER_TOOL["parameters"],
++                }
++            ]
++    if tool_choice:
++        body["tool_choice"] = tool_choice if api == "openai" else {"type": tool_choice}
++    response = client.post(
++        "/v1/chat/completions" if api == "openai" else "/v1/messages", json=body
++    )
++    assert response.status_code == 200, response.text
++    return response
++
++
++def _sse_data(response):
++    return [
++        json.loads(line[6:])
++        for line in response.text.splitlines()
++        if line.startswith("data: ") and line != "data: [DONE]"
++    ]
++
++
++@pytest.mark.parametrize("api", ["openai", "anthropic"])
++@pytest.mark.parametrize("reasoning", ["gpt_oss", "harmony", None])
++def test_harmony_nonstream_api_preserves_engine_framing(harmony_api, api, reasoning):
++    client, engine, configure = harmony_api
++    configure(reasoning)
++    body = _harmony_request(client, api, False).json()
++    if api == "openai":
++        choice = body["choices"][0]
++        assert choice["finish_reason"] == "tool_calls"
++        message = choice["message"]
++        calls = message["tool_calls"]
++        assert len(calls) == 1
++        assert calls[0]["function"]["name"] == "get_weather"
++        assert json.loads(calls[0]["function"]["arguments"]) == {"city": "Paris"}
++        assert not message.get("content")
++        assert message.get("reasoning_content") == (
++            "Need weather." if reasoning else None
++        )
++    else:
++        assert body["stop_reason"] == "tool_use"
++        calls = [b for b in body["content"] if b["type"] == "tool_use"]
++        assert len(calls) == 1
++        assert calls[0]["name"] == "get_weather"
++        assert calls[0]["input"] == {"city": "Paris"}
++        assert not [b for b in body["content"] if b["type"] == "text" and b["text"]]
++        thoughts = [b["thinking"] for b in body["content"] if b["type"] == "thinking"]
++        assert thoughts == (["Need weather."] if reasoning else [])
++
++
++@pytest.mark.parametrize("api", ["openai", "anthropic"])
++@pytest.mark.parametrize("reasoning", ["gpt_oss", "harmony", None])
++@pytest.mark.parametrize("fragmented", [True, False])
++@pytest.mark.parametrize("terminator", ["", "<|call|>"])
++@pytest.mark.parametrize("assistant_prefix", [False, True])
++def test_harmony_stream_api_preserves_raw_tool_channels(
++    harmony_api, api, reasoning, fragmented, terminator, assistant_prefix
++):
++    client, engine, configure = harmony_api
++    configure(reasoning)
++    if not fragmented:
++        engine.chunks = ["".join(_HARMONY_CHUNKS[:4]), "".join(_HARMONY_CHUNKS[4:])]
++    if terminator:
++        engine.chunks.append(terminator)
++    if assistant_prefix:
++        engine.chunks[:0] = ["<|start|>", "assistant"]
++    events = _sse_data(_harmony_request(client, api, True))
++    if api == "openai":
++        choices = [e["choices"][0] for e in events if e.get("choices")]
++        calls = [tc for c in choices for tc in c["delta"].get("tool_calls") or []]
++        assert len(calls) == 1
++        assert calls[0]["function"]["name"] == "get_weather"
++        assert json.loads(calls[0]["function"]["arguments"]) == {"city": "Paris"}
++        assert [c["finish_reason"] for c in choices if c["finish_reason"]] == [
++            "tool_calls"
++        ]
++        visible = "".join(c["delta"].get("content") or "" for c in choices)
++        thoughts = "".join(c["delta"].get("reasoning_content") or "" for c in choices)
++    else:
++        calls = [
++            e["content_block"]
++            for e in events
++            if e["type"] == "content_block_start"
++            and e["content_block"]["type"] == "tool_use"
++        ]
++        assert len(calls) == 1
++        assert calls[0]["name"] == "get_weather"
++        args = "".join(
++            e["delta"]["partial_json"]
++            for e in events
++            if e["type"] == "content_block_delta"
++            and e["delta"]["type"] == "input_json_delta"
++        )
++        assert json.loads(args) == {"city": "Paris"}
++        assert [
++            e["delta"]["stop_reason"] for e in events if e["type"] == "message_delta"
++        ] == ["tool_use"]
++        visible = "".join(
++            e["delta"]["text"]
++            for e in events
++            if e["type"] == "content_block_delta" and e["delta"]["type"] == "text_delta"
++        )
++        thoughts = "".join(
++            e["delta"]["thinking"]
++            for e in events
++            if e["type"] == "content_block_delta"
++            and e["delta"]["type"] == "thinking_delta"
++        )
++    assert visible == ""
++    assert thoughts == ("Need weather." if reasoning else "")
++
++
++@pytest.mark.parametrize("api", ["openai", "anthropic"])
++@pytest.mark.parametrize("stream", [False, True])
++@pytest.mark.parametrize("tools", [False, True])
++@pytest.mark.parametrize("final_answer", [False, True])
++@pytest.mark.parametrize("reasoning", ["harmony", "gpt_oss", None])
++def test_harmony_api_tool_gates_do_not_invent_calls(
++    harmony_api, api, stream, tools, final_answer, reasoning
++):
++    client, engine, configure = harmony_api
++    configure(reasoning)
++    engine.chunks.append("<|call|>")
++    if final_answer:
++        engine.chunks += [
++            "<|channel|>",
++            "final",
++            "<|message|>",
++            "Safe answer.",
++            "<|return|>",
++        ]
++    response = _harmony_request(
++        client, api, stream, tool_choice="none" if tools else None, tools=tools
++    )
++    assert "get_weather" not in response.text
++    assert "Paris" not in response.text
++    assert "commentary" not in response.text
++    assert "<|" not in response.text
++    if final_answer:
++        assert "Safe answer." in response.text
++    if stream:
++        events = _sse_data(response)
++        if api == "openai":
++            choices = [e["choices"][0] for e in events if e.get("choices")]
++            assert not [
++                tc for c in choices for tc in c["delta"].get("tool_calls") or []
++            ]
++            assert [c["finish_reason"] for c in choices if c["finish_reason"]] == [
++                "stop"
++            ]
++        else:
++            assert [
++                e["delta"]["stop_reason"]
++                for e in events
++                if e["type"] == "message_delta"
++            ] == ["end_turn"]
++    if not stream:
++        body = response.json()
++        if api == "openai":
++            assert body["choices"][0]["finish_reason"] == "stop"
++            assert not body["choices"][0]["message"].get("tool_calls")
++        else:
++            assert body["stop_reason"] == "end_turn"
++            assert not [b for b in body["content"] if b["type"] == "tool_use"]
++
++
++@pytest.mark.parametrize("api", ["openai", "anthropic"])
++def test_harmony_stream_final_content_is_clean_without_reasoning(harmony_api, api):
++    client, engine, configure = harmony_api
++    configure(None)
++    engine.chunks = ["<|channel|>final<|message|>Safe answer.<|return|>"]
++    response = _harmony_request(client, api, True)
++    assert "Safe answer." in response.text
++    assert "<|" not in response.text
++    assert "final" not in response.text
++
++
++@pytest.mark.anyio
++@pytest.mark.parametrize("mllm", [False, True])
++async def test_batched_aggregate_keeps_raw_parser_input(mllm):
++    from unittest.mock import AsyncMock
++
++    from vllm_mlx.engine.batched import BatchedEngine
++    from vllm_mlx.api.utils import clean_output_text
++
++    raw = "".join(_HARMONY_CHUNKS)
++    result = SimpleNamespace(
++        output_text=raw,
++        output_token_ids=[1, 2],
++        prompt_tokens=7,
++        completion_tokens=13,
++        finish_reason="stop",
++        mtp_drafts=0,
++        mtp_accepted=0,
++        specprefill_outcome=None,
++    )
++    backend = SimpleNamespace(generate=AsyncMock(return_value=result))
++    engine = SimpleNamespace(
++        _loaded=True,
++        _is_mllm=mllm,
++        _mllm_scheduler=backend if mllm else None,
++        _engine=backend,
++        _default_mllm_draft=False,
++    )
++    output = await BatchedEngine.generate(engine, "prompt")
++    assert output.text == clean_output_text(raw)
++    assert getattr(output, "raw_text", None) == raw
++
++
++def _stream_fields(response, api):
++    events = _sse_data(response)
++    if api == "openai":
++        choices = [e["choices"][0] for e in events if e.get("choices")]
++        return (
++            "".join(c["delta"].get("content") or "" for c in choices),
++            "".join(c["delta"].get("reasoning_content") or "" for c in choices),
++        )
++    deltas = [e["delta"] for e in events if e["type"] == "content_block_delta"]
++    return (
++        "".join(d["text"] for d in deltas if d["type"] == "text_delta"),
++        "".join(d["thinking"] for d in deltas if d["type"] == "thinking_delta"),
++    )
++
++
++def _response_fields(response, api, stream):
++    if stream:
++        return _stream_fields(response, api)
++    body = response.json()
++    if api == "openai":
++        message = body["choices"][0]["message"]
++        return message.get("content") or "", message.get("reasoning_content") or ""
++    return (
++        "".join(b["text"] for b in body["content"] if b["type"] == "text"),
++        "".join(b["thinking"] for b in body["content"] if b["type"] == "thinking"),
++    )
++
++
++@pytest.mark.parametrize("api", ["openai", "anthropic"])
++@pytest.mark.parametrize("stream", [False, True])
++@pytest.mark.parametrize("reasoning", ["harmony", "gpt_oss", None])
++def test_harmony_api_disabled_thinking_keeps_only_public_bodies(
++    harmony_api, api, stream, reasoning
++):
++    client, engine, configure = harmony_api
++    configure(reasoning)
++    engine.chunks = list(
++        "<|channel|>analysis<|message|>Private thoughts.<|end|>"
++        "<|channel|>final<|message|>Safe answer."
++    )
++    response = _harmony_request(
++        client,
++        api,
++        stream,
++        tools=False,
++        chat_template_kwargs={"enable_thinking": False},
++    )
++    assert _response_fields(response, api, stream) == ("Safe answer.", "")
++
++
++@pytest.mark.parametrize("api", ["openai", "anthropic"])
++@pytest.mark.parametrize("stream", [False, True])
++@pytest.mark.parametrize("reasoning", ["harmony", "gpt_oss"])
++def test_harmony_api_controls_never_leak_from_fragmented_bodies(
++    harmony_api, api, stream, reasoning
++):
++    client, engine, configure = harmony_api
++    configure(reasoning)
++    engine.chunks = list(
++        "<|channel|>analysis<|message|>Thinking.<|im_end|>"
++        "<|channel|>final<|message|>Safe.<|im_end|><|return|>"
++    )
++    response = _harmony_request(client, api, stream)
++    assert _response_fields(response, api, stream) == ("Safe.", "Thinking.")
++
++
++@pytest.mark.parametrize("api", ["openai", "anthropic"])
++@pytest.mark.parametrize("stream", [False, True])
++def test_harmony_api_preserves_two_identical_tool_blocks(harmony_api, api, stream):
++    client, engine, configure = harmony_api
++    configure("harmony")
++    block = (
++        "<|start|>assistant<|channel|>commentary to=functions.get_weather"
++        '<|message|>{"city":"Paris"}<|call|>'
++    )
++    engine.chunks = [block, block]
++    response = _harmony_request(client, api, stream)
++    assert _response_fields(response, api, stream) == ("", "")
++    if not stream:
++        body = response.json()
++        calls = (
++            body["choices"][0]["message"]["tool_calls"]
++            if api == "openai"
++            else [b for b in body["content"] if b["type"] == "tool_use"]
++        )
++    elif api == "openai":
++        calls = [
++            tc
++            for e in _sse_data(response)
++            if e.get("choices")
++            for tc in e["choices"][0]["delta"].get("tool_calls") or []
++        ]
++        assert [tc["index"] for tc in calls] == [0, 1]
++    else:
++        calls = [
++            e["content_block"]
++            for e in _sse_data(response)
++            if e["type"] == "content_block_start"
++            and e["content_block"]["type"] == "tool_use"
++        ]
++    assert len(calls) == 2
++    assert len({call["id"] for call in calls}) == 2
++
++
++def _stream_tool_calls(response, api):
++    events = _sse_data(response)
++    if api == "openai":
++        choices = [e["choices"][0] for e in events if e.get("choices")]
++        fragments = [tc for c in choices for tc in c["delta"].get("tool_calls") or []]
++        indices = sorted({tc["index"] for tc in fragments})
++        assert indices == list(range(len(indices)))
++        calls = []
++        for index in indices:
++            parts = [tc for tc in fragments if tc["index"] == index]
++            identities = [tc["id"] for tc in parts if tc.get("id")]
++            names = [
++                tc["function"]["name"] for tc in parts if tc["function"].get("name")
++            ]
++            assert len(identities) == len(names) == 1
++            calls.append(
++                {
++                    "id": identities[0],
++                    "name": names[0],
++                    "arguments": json.loads(
++                        "".join(tc["function"].get("arguments", "") for tc in parts)
++                    ),
++                }
++            )
++        assert [c["finish_reason"] for c in choices if c["finish_reason"]] == [
++            "tool_calls"
++        ]
++    else:
++        starts = [
++            e
++            for e in events
++            if e["type"] == "content_block_start"
++            and e["content_block"]["type"] == "tool_use"
++        ]
++        calls = []
++        for start in starts:
++            index = start["index"]
++            assert (
++                len(
++                    [
++                        e
++                        for e in events
++                        if e["type"] == "content_block_stop" and e["index"] == index
++                    ]
++                )
++                == 1
++            )
++            block = start["content_block"]
++            calls.append(
++                {
++                    "id": block["id"],
++                    "name": block["name"],
++                    "arguments": json.loads(
++                        "".join(
++                            e["delta"]["partial_json"]
++                            for e in events
++                            if e["type"] == "content_block_delta"
++                            and e["index"] == index
++                            and e["delta"]["type"] == "input_json_delta"
++                        )
++                    ),
++                }
++            )
++        assert [
++            e["delta"]["stop_reason"] for e in events if e["type"] == "message_delta"
++        ] == ["tool_use"]
++    assert len({call["id"] for call in calls}) == len(calls)
++    return calls
++
++
++@pytest.mark.parametrize("api", ["openai", "anthropic"])
++@pytest.mark.parametrize("reasoning", ["harmony", "gpt_oss", None])
++@pytest.mark.parametrize("identical", [False, True])
++@pytest.mark.parametrize("second_terminator", ["", "<|call|>"])
++@pytest.mark.parametrize("buffered", [False, True])
++def test_harmony_stream_finalizes_only_unemitted_tool_blocks(
++    harmony_api, api, reasoning, identical, second_terminator, buffered
++):
++    client, engine, configure = harmony_api
++    configure(reasoning)
++    header = "<|channel|>commentary to=functions.get_weather<|message|>"
++    first_args = {"city": "Paris<|im_end|>Ω\\n"}
++    second_args = first_args if identical else {"city": "Tokyo<|endoftext|>\\n"}
++    engine.chunks = [
++        "<|channel|>analysis<|message|>Need weather.<|end|>",
++        header + json.dumps(first_args) + "<|call|>",
++        *list(header + json.dumps(second_args) + second_terminator),
++    ]
++    extra = (
++        {"tool_argument_recovery": "buffered"} if buffered and api == "openai" else {}
++    )
++    response = _harmony_request(client, api, True, **extra)
++    assert _stream_fields(response, api) == ("", "Need weather." if reasoning else "")
++    calls = _stream_tool_calls(response, api)
++    assert len(calls) == 2
++    assert [call["name"] for call in calls] == ["get_weather", "get_weather"]
++    assert [call["arguments"] for call in calls] == [first_args, second_args]
++
++
++@pytest.mark.parametrize("api", ["openai", "anthropic"])
++@pytest.mark.parametrize("reasoning", ["harmony", "gpt_oss"])
++def test_harmony_stream_does_not_finalize_incomplete_json_after_emitted_call(
++    harmony_api, api, reasoning
++):
++    client, engine, configure = harmony_api
++    configure(reasoning)
++    header = "<|channel|>commentary to=functions.get_weather<|message|>"
++    engine.chunks = [
++        header + '{"city":"Paris"}<|call|>',
++        *list(header + '{"city":"Tok'),
++    ]
++    response = _harmony_request(client, api, True)
++    assert _stream_fields(response, api) == ("", "")
++    calls = _stream_tool_calls(response, api)
++    assert len(calls) == 1
++    assert calls[0]["name"] == "get_weather"
++    assert calls[0]["arguments"] == {"city": "Paris"}
++
++
++@pytest.mark.parametrize("api", ["openai", "anthropic"])
++@pytest.mark.parametrize("reasoning", ["harmony", "gpt_oss"])
++@pytest.mark.parametrize("gate", ["no_tools", "choice_none", "thinking_disabled"])
++def test_harmony_stream_eos_finalization_respects_request_gates(
++    harmony_api, api, reasoning, gate
++):
++    client, engine, configure = harmony_api
++    configure(reasoning)
++    header = "<|channel|>commentary to=functions.get_weather<|message|>"
++    engine.chunks = [
++        "<|channel|>analysis<|message|>Need weather.<|end|>",
++        header + '{"city":"Paris"}<|call|>',
++        *list(header + '{"city":"Tokyo"}'),
++    ]
++    extra = (
++        {"chat_template_kwargs": {"enable_thinking": False}}
++        if gate == "thinking_disabled"
++        else {}
++    )
++    response = _harmony_request(
++        client,
++        api,
++        True,
++        tools=gate != "no_tools",
++        tool_choice="none" if gate == "choice_none" else None,
++        **extra,
++    )
++    assert _stream_fields(response, api) == (
++        "",
++        "" if gate == "thinking_disabled" else "Need weather.",
++    )
++    if gate == "thinking_disabled":
++        calls = _stream_tool_calls(response, api)
++        assert [call["arguments"] for call in calls] == [
++            {"city": "Paris"},
++            {"city": "Tokyo"},
++        ]
++    else:
++        assert "get_weather" not in response.text
++        assert "Paris" not in response.text
++        assert "Tokyo" not in response.text
++        events = _sse_data(response)
++        if api == "openai":
++            choices = [e["choices"][0] for e in events if e.get("choices")]
++            assert not [
++                tc for c in choices for tc in c["delta"].get("tool_calls") or []
++            ]
++            assert [c["finish_reason"] for c in choices if c["finish_reason"]] == [
++                "stop"
++            ]
++        else:
++            assert not [
++                e
++                for e in events
++                if e["type"] == "content_block_start"
++                and e["content_block"]["type"] == "tool_use"
++            ]
++            assert [
++                e["delta"]["stop_reason"]
++                for e in events
++                if e["type"] == "message_delta"
++            ] == ["end_turn"]
++
++
++def test_harmony_tool_finalization_is_idempotent_and_resettable():
++    import vllm_mlx.server as server
++    from vllm_mlx.tool_parsers.harmony_tool_parser import HarmonyToolParser
++
++    parser = HarmonyToolParser()
++    header = "<|channel|>commentary to=functions.get_weather<|message|>"
++    first = header + '{"city":"Paris"}<|call|>'
++    second = header + '{"city":"Tokyo"}'
++    text, emitted = server._extract_streaming_tool_delta(parser, "", first, {})
++    assert len(emitted["tool_calls"]) == 1
++    first_id = emitted["tool_calls"][0]["id"]
++    for chunk in second:
++        text, emitted = server._extract_streaming_tool_delta(parser, text, chunk, {})
++        assert not (emitted or {}).get("tool_calls")
++    pending = server._finalize_streaming_tool_result(parser, text)
++    assert pending is not None
++    assert len(pending["tool_calls"]) == 1
++    assert pending["tool_calls"][0]["index"] == 1
++    assert pending["tool_calls"][0]["id"] != first_id
++    assert json.loads(pending["tool_calls"][0]["function"]["arguments"]) == {
++        "city": "Tokyo"
++    }
++    assert server._finalize_streaming_tool_result(parser, text) is None
++    parser.reset()
++    fresh = server._finalize_streaming_tool_result(parser, second)
++    assert len(fresh["tool_calls"]) == 1
++    assert fresh["tool_calls"][0]["index"] == 0
++    assert fresh["tool_calls"][0]["id"] != pending["tool_calls"][0]["id"]
++
++
++@pytest.mark.parametrize("api", ["openai", "anthropic"])
++@pytest.mark.parametrize("stream", [False, True])
++@pytest.mark.parametrize("reasoning", ["harmony", "gpt_oss", None])
++@pytest.mark.parametrize("fragmented", [False, True])
++def test_harmony_api_projects_renderer_headers_and_eos(
++    harmony_api, api, stream, reasoning, fragmented
++):
++    client, engine, configure = harmony_api
++    configure(reasoning)
++    raw = (
++        "<|channel|>analysis<|message|>Need weather.<|end|>"
++        "<|channel|>commentary<|message|>Checking now.<|end|>"
++        "<|start|>assistant to=functions.get_weather<|channel|>commentary"
++        '<|message|>{"city":"Paris"}<|call|>'
++        "<|start|>assistant<|channel|>final<|message|>Safe answer."
++    )
++    engine.chunks = list(raw) if fragmented else [raw]
++    response = _harmony_request(client, api, stream)
++    expected_thoughts = "Need weather." if reasoning else ""
++    if stream:
++        assert _stream_fields(response, api) == (
++            "Checking now.Safe answer.",
++            expected_thoughts,
++        )
++        events = _sse_data(response)
++        if api == "openai":
++            choices = [e["choices"][0] for e in events if e.get("choices")]
++            calls = [tc for c in choices for tc in c["delta"].get("tool_calls") or []]
++            assert len(calls) == 1
++            assert calls[0]["function"]["name"] == "get_weather"
++            assert json.loads(calls[0]["function"]["arguments"]) == {"city": "Paris"}
++            assert [c["finish_reason"] for c in choices if c["finish_reason"]] == [
++                "tool_calls"
++            ]
++        else:
++            calls = [
++                e["content_block"]
++                for e in events
++                if e["type"] == "content_block_start"
++                and e["content_block"]["type"] == "tool_use"
++            ]
++            assert len(calls) == 1
++            assert calls[0]["name"] == "get_weather"
++            assert json.loads(
++                "".join(
++                    e["delta"]["partial_json"]
++                    for e in events
++                    if e["type"] == "content_block_delta"
++                    and e["delta"]["type"] == "input_json_delta"
++                )
++            ) == {"city": "Paris"}
++            assert [
++                e["delta"]["stop_reason"]
++                for e in events
++                if e["type"] == "message_delta"
++            ] == ["tool_use"]
++    else:
++        body = response.json()
++        if api == "openai":
++            choice = body["choices"][0]
++            assert choice["finish_reason"] == "tool_calls"
++            message = choice["message"]
++            assert message["content"] == "Checking now.Safe answer."
++            assert (message.get("reasoning_content") or "") == expected_thoughts
++            assert len(message["tool_calls"]) == 1
++            call = message["tool_calls"][0]["function"]
++            assert call["name"] == "get_weather"
++            assert json.loads(call["arguments"]) == {"city": "Paris"}
++        else:
++            assert body["stop_reason"] == "tool_use"
++            assert "".join(
++                b["text"] for b in body["content"] if b["type"] == "text"
++            ) == ("Checking now.Safe answer.")
++            assert (
++                "".join(
++                    b["thinking"] for b in body["content"] if b["type"] == "thinking"
++                )
++                == expected_thoughts
++            )
++            calls = [b for b in body["content"] if b["type"] == "tool_use"]
++            assert len(calls) == 1
++            assert calls[0]["name"] == "get_weather"
++            assert calls[0]["input"] == {"city": "Paris"}
++
++
++@pytest.mark.parametrize("api", ["openai", "anthropic"])
++@pytest.mark.parametrize("final_channel", [False, True])
++def test_harmony_stream_preserves_public_whitespace(harmony_api, api, final_channel):
++    client, engine, configure = harmony_api
++    configure(None)
++    engine.chunks = ["Hello", " world", "\n", "    indented", "\n\n"]
++    if final_channel:
++        engine.chunks[:0] = ["<|channel|>final", "<|message|>"]
++        engine.chunks.append("<|return|>")
++    content, reasoning = _stream_fields(_harmony_request(client, api, True), api)
++    assert content == "Hello world\n    indented\n\n"
++    assert reasoning == ""
++
++
++@pytest.mark.parametrize("api", ["openai", "anthropic"])
++def test_non_harmony_nonstream_reasoning_still_removes_controls(harmony_api, api):
++    client, engine, configure = harmony_api
++    configure("deepseek_r1")
++    engine.chunks = ["<think>Thinking.<|im_end|></think>", "Hello"]
++    response = _harmony_request(client, api, False, tools=False)
++    body = response.json()
++    if api == "openai":
++        assert body["choices"][0]["message"]["reasoning_content"] == "Thinking."
++    else:
++        assert body["content"][0]["thinking"] == "Thinking."
++    assert "<|im_end|>" not in response.text
++
++
++def test_non_harmony_anthropic_stream_removes_public_controls(harmony_api):
++    client, engine, configure = harmony_api
++    configure("deepseek_r1")
++    engine.chunks = ["<think>Thinking.<|im_end|></think>", "Hello", "<|im_end|>"]
++    response = _harmony_request(client, "anthropic", True, tools=False)
++    assert _stream_fields(response, "anthropic") == ("Hello", "Thinking.")
++
++
++@pytest.mark.parametrize("api", ["openai", "anthropic"])
++@pytest.mark.parametrize(
++    "chunks, expected",
++    [
++        (["<", "div>", "literal", "</div>"], "<div>literal</div>"),
++        (["<"], "<"),
++        (["<|ch", "aracter>"], "<|character>"),
++    ],
++)
++def test_harmony_stream_releases_disproved_or_terminal_prefix(
++    harmony_api, api, chunks, expected
++):
++    client, engine, configure = harmony_api
++    configure(None)
++    engine.chunks = chunks
++    assert _stream_fields(_harmony_request(client, api, True), api) == (expected, "")
++
++
++@pytest.mark.parametrize("channel", ["analysis", "final"])
++@pytest.mark.parametrize(
++    "chunks, expected",
++    [
++        (
++            ["Example: <|unknown|> suffix", " after"],
++            "Example: <|unknown|> suffix after",
++        ),
++        (["Example: <|", "unknown|> suffix"], "Example: <|unknown|> suffix"),
++        (["Comparison: x <"], "Comparison: x <"),
++    ],
++)
++def test_harmony_reasoning_preserves_literal_body_and_flushes(
++    channel, chunks, expected
++):
++    from vllm_mlx.reasoning.harmony_parser import HarmonyReasoningParser
++
++    parser = HarmonyReasoningParser()
++    text = ""
++    emitted = []
++    for chunk in ["<|channel|>", channel, "<|message|>", *chunks]:
++        previous, text = text, text + chunk
++        delta = parser.extract_reasoning_streaming(previous, text, chunk)
++        if delta:
++            emitted.append(delta.reasoning if channel == "analysis" else delta.content)
++    delta = parser.finalize_stream()
++    if delta:
++        emitted.append(delta.reasoning if channel == "analysis" else delta.content)
++    assert "".join(value or "" for value in emitted) == expected
++    assert parser.finalize_stream() is None
++
++
++@pytest.mark.parametrize("api", ["openai", "anthropic"])
++@pytest.mark.parametrize(
++    "chunks, expected",
++    [
++        (
++            ["Example: <|unknown|> suffix", " after"],
++            "Example: <|unknown|> suffix after",
++        ),
++        (["Comparison: x <"], "Comparison: x <"),
++    ],
++)
++def test_harmony_stream_preserves_literal_final_body(
++    harmony_api, api, chunks, expected
++):
++    client, engine, configure = harmony_api
++    configure("harmony")
++    engine.chunks = ["<|channel|>final", "<|message|>", *chunks]
++    assert _stream_fields(_harmony_request(client, api, True, tools=False), api) == (
++        expected,
++        "",
++    )
++
++
++@pytest.mark.parametrize("api", ["openai", "anthropic"])
++@pytest.mark.parametrize("coalesced", [False, True])
++@pytest.mark.parametrize("buffered", [False, True])
++def test_harmony_stream_keeps_final_content_alongside_calls(
++    harmony_api, api, coalesced, buffered
++):
++    client, engine, configure = harmony_api
++    configure("harmony")
++    engine.chunks = list(_HARMONY_CHUNKS)
++    final = [
++        "<|call|>",
++        "<|channel|>final",
++        "<|message|>",
++        "Safe answer.",
++        "<|return|>",
++    ]
++    engine.chunks += ["".join(final)] if coalesced else final
++    full = _harmony_request(client, api, False).json()
++    extra = (
++        {"tool_argument_recovery": "buffered"} if buffered and api == "openai" else {}
++    )
++    response = _harmony_request(client, api, True, **extra)
++    assert _stream_fields(response, api) == ("Safe answer.", "Need weather.")
++    events = _sse_data(response)
++    if api == "openai":
++        assert full["choices"][0]["message"]["content"] == "Safe answer."
++        choices = [e["choices"][0] for e in events if e.get("choices")]
++        calls = [tc for c in choices for tc in c["delta"].get("tool_calls") or []]
++        # Buffered recovery may send identity and arguments in separate deltas;
++        # they must still describe exactly one call, with neither duplicated.
++        assert {tc["index"] for tc in calls} == {0}
++        assert len([tc for tc in calls if tc.get("id")]) == 1
++        assert [
++            tc["function"]["name"] for tc in calls if tc["function"].get("name")
++        ] == ["get_weather"]
++        assert json.loads(
++            "".join(tc["function"].get("arguments", "") for tc in calls)
++        ) == {"city": "Paris"}
++        assert [c["finish_reason"] for c in choices if c["finish_reason"]] == [
++            "tool_calls"
++        ]
++    else:
++        assert (
++            next(b["text"] for b in full["content"] if b["type"] == "text")
++            == "Safe answer."
++        )
++        calls = [
++            e["content_block"]
++            for e in events
++            if e["type"] == "content_block_start"
++            and e["content_block"]["type"] == "tool_use"
++        ]
++        assert len(calls) == 1
++        assert calls[0]["name"] == "get_weather"
++        arguments = "".join(
++            e["delta"]["partial_json"]
++            for e in events
++            if e["type"] == "content_block_delta"
++            and e["delta"]["type"] == "input_json_delta"
++        )
++        assert json.loads(arguments) == {"city": "Paris"}
+diff --git a/tests/test_harmony_parsers.py b/tests/test_harmony_parsers.py
+index dad7e0660a7a032eac607f76758dea62c9e29414..04522af3409839315ec314f0f1d05f4e601ca13c 100644
+--- a/tests/test_harmony_parsers.py
++++ b/tests/test_harmony_parsers.py
+@@ -21,6 +21,79 @@ from vllm_mlx.reasoning.harmony_parser import HarmonyReasoningParser
+ from vllm_mlx.tool_parsers import ToolParserManager
+ from vllm_mlx.tool_parsers.harmony_tool_parser import HarmonyToolParser
+ 
++
++@pytest.mark.parametrize("parser_name", ["harmony", "gpt_oss"])
++@pytest.mark.parametrize("fragmented", [False, True])
++def test_harmony_projection_keeps_each_body_at_eos(parser_name, fragmented):
++    """Header order and chunk boundaries must not change public channel bodies."""
++    raw = (
++        "<|channel|>analysis<|message|>Need weather.<|end|>"
++        "<|channel|>commentary<|message|>Checking now.<|end|>"
++        "<|start|>assistant to=functions.get_weather<|channel|>commentary"
++        '<|message|>{"city":"Paris"}<|call|>'
++        "<|start|>assistant<|channel|>final<|message|>Safe answer."
++    )
++    parser = get_parser(parser_name)()
++    assert parser.extract_reasoning(raw) == (
++        "Need weather.",
++        "Checking now.Safe answer.",
++    )
++    previous = ""
++    thoughts, contents = [], []
++    for chunk in list(raw) if fragmented else [raw]:
++        current = previous + chunk
++        delta = parser.extract_reasoning_streaming(previous, current, chunk)
++        if delta:
++            thoughts.append(delta.reasoning or "")
++            contents.append(delta.content or "")
++        previous = current
++    final = parser.finalize_stream()
++    if final:
++        thoughts.append(final.reasoning or "")
++        contents.append(final.content or "")
++    assert "".join(thoughts) == "Need weather."
++    assert "".join(contents) == "Checking now.Safe answer."
++
++
++@pytest.mark.parametrize("parser_name", ["harmony", "gpt_oss"])
++@pytest.mark.parametrize("fragmented", [False, True])
++def test_harmony_projection_holds_public_control_fragments(parser_name, fragmented):
++    raw = (
++        "<|channel|>analysis<|message|>Thinking.<|im_end|>"
++        "<|channel|>final<|message|>Safe.<|im_end|><|return|>"
++    )
++    parser = get_parser(parser_name)()
++    previous = ""
++    thoughts, contents = [], []
++    for chunk in list(raw) if fragmented else [raw]:
++        current = previous + chunk
++        delta = parser.extract_reasoning_streaming(previous, current, chunk)
++        if delta:
++            thoughts.append(delta.reasoning or "")
++            contents.append(delta.content or "")
++        previous = current
++    assert "".join(thoughts) == "Thinking."
++    assert "".join(contents) == "Safe."
++
++
++@pytest.mark.parametrize(
++    "header",
++    [
++        "<|start|>assistant to=functions.get-weather<|channel|>commentary",
++        "<|channel|>commentary to=functions.get-weather",
++    ],
++)
++def test_harmony_tool_recipient_order_and_hyphenated_name(header):
++    result = HarmonyToolParser().extract_tool_calls(
++        header + '<|message|>{"city":"Paris"}'
++    )
++    assert result.tools_called
++    assert len(result.tool_calls) == 1
++    assert result.tool_calls[0]["name"] == "get-weather"
++    assert json.loads(result.tool_calls[0]["arguments"]) == {"city": "Paris"}
++    assert not result.content
++
++
+ # ============================================================================
+ # Tool Parser Tests
+ # ============================================================================
+diff --git a/vllm_mlx/engine/base.py b/vllm_mlx/engine/base.py
+index c5c38f6034f33fe8db22aa3804c3f5cc3efa1502..47b8bf9ddfbc57f8fedbce06f65146f479a7ad78 100644
+--- a/vllm_mlx/engine/base.py
++++ b/vllm_mlx/engine/base.py
+@@ -39,6 +39,8 @@ class GenerationOutput:
+     finished: bool = True
+     # Request-level sparse-prefill decision and diagnostics.
+     specprefill_outcome: "SpecPrefillOutcome | None" = None
++    # Internal parser input for non-streaming APIs. ``text`` remains cleaned.
++    raw_text: str | None = None
+ 
+ 
+ class EngineBusy(RuntimeError):
+diff --git a/vllm_mlx/engine/batched.py b/vllm_mlx/engine/batched.py
+index c25d26fafe8b715f1c0a444d61c2b456b524efb7..938b5cbad1e351f72eeec2d915e11304e1802255 100644
+--- a/vllm_mlx/engine/batched.py
++++ b/vllm_mlx/engine/batched.py
+@@ -980,6 +980,7 @@ class BatchedEngine(BaseEngine):
+ 
+             return GenerationOutput(
+                 text=clean_output_text(output.output_text),
++                raw_text=output.output_text,
+                 tokens=output.output_token_ids,
+                 prompt_tokens=output.prompt_tokens,
+                 completion_tokens=output.completion_tokens,
+@@ -1014,6 +1015,7 @@ class BatchedEngine(BaseEngine):
+ 
+         return GenerationOutput(
+             text=text,
++            raw_text=output.output_text,
+             tokens=output.output_token_ids,
+             prompt_tokens=output.prompt_tokens,
+             completion_tokens=output.completion_tokens,
+diff --git a/vllm_mlx/engine/simple.py b/vllm_mlx/engine/simple.py
+index 0c32e77f17bd28802be57b13419cc3d8203d1038..65a820d5b1b424fcd034991dd6e867ee6e1fe0b8 100644
+--- a/vllm_mlx/engine/simple.py
++++ b/vllm_mlx/engine/simple.py
+@@ -1651,6 +1651,7 @@ class SimpleEngine(BaseEngine):
+             text = clean_output_text(final_output.text)
+             return GenerationOutput(
+                 text=text,
++                raw_text=final_output.text,
+                 tokens=list(final_output.tokens),
+                 prompt_tokens=final_output.prompt_tokens,
+                 completion_tokens=final_output.completion_tokens,
+diff --git a/vllm_mlx/reasoning/gpt_oss_parser.py b/vllm_mlx/reasoning/gpt_oss_parser.py
+index 8541faf25e28f31afff1158e40464a9bfc01c631..7232f76895b1029406a8595e3101e8a350818883 100644
+--- a/vllm_mlx/reasoning/gpt_oss_parser.py
++++ b/vllm_mlx/reasoning/gpt_oss_parser.py
+@@ -1,214 +1,18 @@
+ # SPDX-License-Identifier: Apache-2.0
+-"""
+-Reasoning parser for GPT-OSS models using channel-based format.
++"""GPT-OSS reasoning parser for Harmony channel-based model output."""
+ 
+-GPT-OSS models use a channel-based token format instead of <think>...</think> tags:
+-    <|channel|>analysis<|message|>[reasoning]<|start|>assistant<|channel|>final<|message|>[content]<|return|>
++from .harmony_parser import HarmonyReasoningParser
+ 
+-Some models also emit an extended format with a constrain token:
+-    <|channel|>final <|constrain|>JSON<|message|>[content]<|return|>
+ 
+-This parser extracts reasoning from the 'analysis' channel and content from
+-the 'final' channel, stripping all structural tokens from API responses.
+-"""
++class GptOssReasoningParser(HarmonyReasoningParser):
++    """Share Harmony body boundaries while retaining the plain-text fallback.
+ 
+-import re
+-
+-from .base import DeltaMessage, ReasoningParser
+-
+-# Structural tokens that should be stripped from output
+-_STRUCTURAL_TOKENS = re.compile(
+-    r"<\|start\|>|<\|end\|>|<\|channel\|>|<\|return\|>|<\|call\|>|<\|constrain\|>"
+-)
+-
+-# Flexible channel marker regex — matches both standard and extended formats:
+-#   <|channel|>analysis<|message|>
+-#   <|channel|>final<|message|>
+-#   <|channel|>final <|constrain|>JSON<|message|>
+-_CHANNEL_RE = re.compile(
+-    r"<\|channel\|>(analysis|final)(?:[^<]*(?:<\|constrain\|>[^<]*)?)?<\|message\|>"
+-)
+-
+-
+-def _extract_channel(text: str, channel_name: str) -> str | None:
++    Routing each accumulated response by only its last channel loses earlier
++    bodies in a coalesced delta and exposes partial controls in steady phases.
++    The Harmony parser tracks emitted body offsets across those boundaries.
+     """
+-    Extract content from a named channel.
+-
+-    Finds <|channel|>{name}...<|message|> (with optional constrain token)
+-    and extracts text up to the next structural token or end of string.
+-
+-    Args:
+-        text: Full model output text.
+-        channel_name: Channel name to extract (e.g., "analysis", "final").
+-
+-    Returns:
+-        Extracted channel content, or None if channel not found.
+-    """
+-    for m in _CHANNEL_RE.finditer(text):
+-        if m.group(1) == channel_name:
+-            start = m.end()
+-            # Find next structural token after message content
+-            end_match = _STRUCTURAL_TOKENS.search(text, start)
+-            content = text[start : end_match.start()] if end_match else text[start:]
+-            content = content.strip()
+-            return content if content else None
+-    return None
+-
+-
+-class GptOssReasoningParser(ReasoningParser):
+-    """
+-    Reasoning parser for GPT-OSS models.
+-
+-    GPT-OSS uses channel-based tokens:
+-        <|channel|>analysis<|message|>[reasoning]
+-        <|start|>assistant<|channel|>final<|message|>[content]<|return|>
+-
+-    The 'analysis' channel maps to reasoning, 'final' to content.
+-
+-    Also handles extended format with constrain token:
+-        <|channel|>final <|constrain|>JSON<|message|>[content]<|return|>
+-    """
+-
+-    def extract_reasoning(
+-        self,
+-        model_output: str,
+-    ) -> tuple[str | None, str | None]:
+-        """
+-        Extract reasoning and content from complete model output.
+-
+-        Args:
+-            model_output: Complete text output from the model.
+-
+-        Returns:
+-            (reasoning, content) tuple. Either may be None.
+-        """
+-        if not model_output or "<|channel|>" not in model_output:
+-            return None, model_output if model_output else None
+-
+-        reasoning = _extract_channel(model_output, "analysis")
+-        content = _extract_channel(model_output, "final")
+-
+-        # Strip trailing <|return|>
+-        if content:
+-            content = content.replace("<|return|>", "").strip()
+-            content = _STRUCTURAL_TOKENS.sub("", content).strip()
+-            content = content if content else None
+-
+-        # Strip any remaining structural tokens from reasoning
+-        if reasoning:
+-            reasoning = _STRUCTURAL_TOKENS.sub("", reasoning).strip()
+-            reasoning = reasoning if reasoning else None
+-
+-        # If no channels found, return as plain content
+-        if reasoning is None and content is None:
+-            return None, model_output
+-
+-        return reasoning, content
+-
+-    def extract_reasoning_streaming(
+-        self,
+-        previous_text: str,
+-        current_text: str,
+-        delta_text: str,
+-    ) -> DeltaMessage | None:
+-        """
+-        Extract reasoning from streaming delta.
+-
+-        Uses stateless phase detection from current_text on each call.
+-
+-        Args:
+-            previous_text: Accumulated text before this delta.
+-            current_text: Accumulated text including this delta.
+-            delta_text: Just the new text in this streaming chunk.
+-
+-        Returns:
+-            DeltaMessage with reasoning and/or content, or None to skip.
+-        """
+-        prev_phase = self._detect_phase(previous_text)
+-        curr_phase = self._detect_phase(current_text)
+-
+-        # Phase changed — extract content after the new marker
+-        if curr_phase != prev_phase and curr_phase in ("analysis", "final"):
+-            after_marker = self._extract_content_after_marker_in_delta(
+-                current_text, curr_phase
+-            )
+-            if after_marker:
+-                after_marker = self._strip_return(after_marker)
+-                if curr_phase == "analysis":
+-                    return DeltaMessage(reasoning=after_marker)
+-                else:
+-                    return DeltaMessage(content=after_marker)
+-            return None
+-
+-        # In a steady phase — emit delta directly
+-        if curr_phase == "analysis":
+-            cleaned = self._strip_return(delta_text)
+-            # Skip structural tokens in the delta
+-            if _STRUCTURAL_TOKENS.search(cleaned):
+-                cleaned = _STRUCTURAL_TOKENS.sub("", cleaned)
+-            if cleaned:
+-                return DeltaMessage(reasoning=cleaned)
+-            return None
+-        elif curr_phase == "final":
+-            cleaned = self._strip_return(delta_text)
+-            if _STRUCTURAL_TOKENS.search(cleaned):
+-                cleaned = _STRUCTURAL_TOKENS.sub("", cleaned)
+-            if cleaned:
+-                return DeltaMessage(content=cleaned)
+-            return None
+-
+-        # init or transition phase — skip structural tokens
+-        return None
+-
+-    @staticmethod
+-    def _detect_phase(text: str) -> str:
+-        """
+-        Detect current streaming phase from accumulated text.
+-
+-        Returns:
+-            "final"      — final channel marker complete
+-            "analysis"   — analysis marker complete, no structural token after
+-            "transition" — analysis present but structural token follows
+-            "init"       — no channel marker yet
+-        """
+-        # Find all channel markers in text
+-        matches = list(_CHANNEL_RE.finditer(text))
+-        if not matches:
+-            return "init"
+-
+-        last = matches[-1]
+-        if last.group(1) == "final":
+-            return "final"
+-
+-        # analysis channel found — check if there's a structural token after
+-        after = text[last.end() :]
+-        if _STRUCTURAL_TOKENS.search(after):
+-            return "transition"
+-        return "analysis"
+-
+-    @staticmethod
+-    def _extract_content_after_marker_in_delta(
+-        current_text: str, phase: str
+-    ) -> str | None:
+-        """
+-        When phase changes, extract only the content after the phase marker
+-        that falls within the current accumulated text's tail.
+-
+-        Args:
+-            current_text: Full accumulated text.
+-            phase: Current phase ("analysis" or "final").
+-
+-        Returns:
+-            Content after the marker, or None.
+-        """
+-        channel_name = "analysis" if phase == "analysis" else "final"
+-        matches = list(_CHANNEL_RE.finditer(current_text))
+-        for m in reversed(matches):
+-            if m.group(1) == channel_name:
+-                return current_text[m.end() :]
+-        return None
+ 
+-    @staticmethod
+-    def _strip_return(text: str) -> str:
+-        """Strip <|return|> from text."""
+-        return text.replace("<|return|>", "")
++    def extract_reasoning(self, model_output: str) -> tuple[str | None, str | None]:
++        if "<|channel|>" not in model_output:
++            return None, model_output or None
++        return super().extract_reasoning(model_output)
+diff --git a/vllm_mlx/reasoning/harmony_parser.py b/vllm_mlx/reasoning/harmony_parser.py
+index 9cead144c7370ee214ba0392cc82b863aa56b98f..798d6835cddbbb127ce1630cfb9bc466976456f7 100644
+--- a/vllm_mlx/reasoning/harmony_parser.py
++++ b/vllm_mlx/reasoning/harmony_parser.py
+@@ -19,17 +19,27 @@ import re
+ 
+ from .base import DeltaMessage, ReasoningParser
+ 
+-# Analysis channel blocks: <|channel|>analysis<|message|>...<|end|>
+-_ANALYSIS_PATTERN = re.compile(
+-    r"<\|channel\|>analysis\s*<\|message\|>(.*?)<\|end\|>",
+-    re.DOTALL,
++_CHANNEL_HEADER_PATTERN = re.compile(
++    r"(?:<\|start\|>assistant(?P<role_metadata>[^<]*))?"
++    r"<\|channel\|>(?P<channel>analysis|final|commentary)\b"
++    r"(?P<channel_metadata>[^<]*)"
++    r"(?:<\|constrain\|>[^<]*)?<\|message\|>"
+ )
+-
+-# Final channel content: <|channel|>final<|message|>...<|return|>
+-_FINAL_PATTERN = re.compile(
+-    r"<\|channel\|>final\s*<\|message\|>(.*?)<\|return\|>",
+-    re.DOTALL,
++_RECIPIENT_PATTERN = re.compile(r"(?:^|\s)to=\S+")
++
++_STRUCTURAL_TOKENS = (
++    "<|channel|>",
++    "<|message|>",
++    "<|start|>",
++    "<|end|>",
++    "<|return|>",
++    "<|call|>",
++    "<|constrain|>",
++    "<|im_end|>",
++    "<|im_start|>",
++    "<|endoftext|>",
+ )
++_STRUCTURAL_PATTERN = re.compile("|".join(map(re.escape, _STRUCTURAL_TOKENS)))
+ 
+ 
+ class HarmonyReasoningParser(ReasoningParser):
+@@ -37,8 +47,8 @@ class HarmonyReasoningParser(ReasoningParser):
+     Reasoning parser for GPT-OSS models using Harmony format.
+ 
+     Extracts reasoning from the 'analysis' channel and content from
+-    the 'final' channel. Commentary channels (tool calls) are ignored
+-    since they are handled by the tool parser.
++    the 'final' channel. Unaddressed commentary is public content; addressed
++    messages are handled by the tool parser.
+ 
+     Example:
+         Input: "<|channel|>analysis<|message|>Thinking...<|end|>
+@@ -46,10 +56,20 @@ class HarmonyReasoningParser(ReasoningParser):
+         Output: reasoning="Thinking...", content="Result."
+     """
+ 
+-    def __init__(self, tokenizer=None):
++    def __init__(
++        self,
++        tokenizer=None,
++        *,
++        include_plain: bool = False,
++        include_reasoning: bool = True,
++    ):
+         super().__init__(tokenizer)
+         self._current_channel: str | None = None
+         self._in_message: bool = False
++        self._stream_offset = 0
++        self._stream_text = ""
++        self._include_plain = include_plain
++        self._include_reasoning = include_reasoning
+ 
+     def extract_reasoning(
+         self,
+@@ -59,7 +79,7 @@ class HarmonyReasoningParser(ReasoningParser):
+         Extract reasoning from complete Harmony output.
+ 
+         Collects all analysis channel blocks as reasoning and the
+-        final channel block as content.
++        final and unaddressed commentary channel blocks as content.
+ 
+         Args:
+             model_output: Complete model output text.
+@@ -67,15 +87,33 @@ class HarmonyReasoningParser(ReasoningParser):
+         Returns:
+             (reasoning, content) tuple. Either may be None.
+         """
+-        # Collect all analysis blocks
+-        analysis_blocks = _ANALYSIS_PATTERN.findall(model_output)
+-        reasoning = "\n".join(block.strip() for block in analysis_blocks) or None
+-
+-        # Extract final channel content
+-        final_match = _FINAL_PATTERN.search(model_output)
+-        content = final_match.group(1).strip() if final_match else None
+-
+-        return reasoning, content
++        # EOS may be consumed before detokenization, so a body does not need
++        # a decoded terminator. Use the same boundaries as the stream path.
++        projection = HarmonyReasoningParser(include_plain=self._include_plain)
++        projection._stream_text = model_output
++        reasoning = "\n".join(
++            body.strip()
++            for header, body in projection._channel_bodies(len(model_output))
++            if header.group("channel") == "analysis" and body.strip()
++        )
++        delta = projection._extract_stream_delta(finished=True)
++        if delta is None:
++            return None, None
++        return reasoning or None, (delta.content or "").strip() or None
++
++    def _channel_bodies(self, safe_end: int):
++        for header in _CHANNEL_HEADER_PATTERN.finditer(self._stream_text):
++            metadata = (
++                (header.group("role_metadata") or "")
++                + " "
++                + header.group("channel_metadata")
++            )
++            if _RECIPIENT_PATTERN.search(metadata):
++                continue
++            boundary = _STRUCTURAL_PATTERN.search(self._stream_text, header.end())
++            end = min(boundary.start(), safe_end) if boundary else safe_end
++            start = max(header.end(), self._stream_offset)
++            yield header, self._stream_text[start:end] if start < end else ""
+ 
+     def extract_reasoning_streaming(
+         self,
+@@ -97,61 +135,55 @@ class HarmonyReasoningParser(ReasoningParser):
+         Returns:
+             DeltaMessage with reasoning and/or content, or None.
+         """
+-        # Detect channel switches in the delta
+-        if "<|channel|>" in delta_text:
+-            if "analysis" in delta_text:
+-                self._current_channel = "analysis"
+-                self._in_message = False
+-                return None
+-            elif "final" in delta_text:
+-                self._current_channel = "final"
+-                self._in_message = False
+-                return None
+-            elif "commentary" in delta_text:
+-                self._current_channel = "commentary"
+-                self._in_message = False
+-                return None
+-
+-        # Detect channel from full context if not yet determined
+-        if self._current_channel is None and "<|channel|>" in current_text:
+-            last_channel = current_text.rfind("<|channel|>")
+-            after = current_text[last_channel + len("<|channel|>") :]
+-            if after.startswith("analysis"):
+-                self._current_channel = "analysis"
+-            elif after.startswith("final"):
+-                self._current_channel = "final"
+-            elif after.startswith("commentary"):
+-                self._current_channel = "commentary"
+-
+-        # Handle message start
+-        if "<|message|>" in delta_text:
+-            self._in_message = True
+-            # Don't emit the token itself
+-            return None
+-
+-        # Handle channel/message end tokens
+-        if any(
+-            token in delta_text
+-            for token in ("<|end|>", "<|return|>", "<|call|>", "<|start|>")
+-        ):
+-            self._in_message = False
+-            return None
+-
+-        # Skip control tokens
+-        if delta_text.strip().startswith("<|") and delta_text.strip().endswith("|>"):
++        self._stream_text = current_text
++        return self._extract_stream_delta()
++
++    def _extract_stream_delta(self, *, finished: bool = False) -> DeltaMessage | None:
++        # Inspect raw context, not just this delta: a channel token and its name
++        # can arrive separately, or a complete header and body can arrive together.
++        # Only newly available body text is emitted; routing headers and tool
++        # arguments never become reasoning or visible content.
++        current_text = self._stream_text
++        reasoning, content = [], []
++        safe_end = len(current_text)
++        if not finished:
++            # Hold only real structural-token prefixes. A disproved prefix
++            # (e.g. <div> or <|unknown|>) remains ordinary body text.
++            for length in range(
++                1, min(len(current_text), max(map(len, _STRUCTURAL_TOKENS))) + 1
++            ):
++                suffix = current_text[-length:]
++                if any(
++                    token.startswith(suffix) and token != suffix
++                    for token in _STRUCTURAL_TOKENS
++                ):
++                    safe_end = len(current_text) - length
++        if self._include_plain:
++            boundary = _STRUCTURAL_PATTERN.search(current_text)
++            plain_end = min(boundary.start(), safe_end) if boundary else safe_end
++            content.append(current_text[self._stream_offset : plain_end])
++        for header, body in self._channel_bodies(safe_end):
++            if header.group("channel") == "analysis":
++                if self._include_reasoning:
++                    reasoning.append(body)
++            else:
++                # Unaddressed commentary is a public assistant preamble.
++                content.append(body)
++        self._stream_offset = safe_end
++        if not any(reasoning) and not any(content):
+             return None
++        return DeltaMessage(
++            reasoning="".join(reasoning) or None,
++            content="".join(content) or None,
++        )
+ 
+-        # Emit content based on current channel
+-        if self._in_message and self._current_channel == "analysis":
+-            return DeltaMessage(reasoning=delta_text)
+-
+-        if self._in_message and self._current_channel == "final":
+-            return DeltaMessage(content=delta_text)
+-
+-        # In commentary or unknown channel, suppress
+-        return None
++    def finalize_stream(self) -> DeltaMessage | None:
++        """Release a held literal prefix at EOS, without replaying body text."""
++        return self._extract_stream_delta(finished=True)
+ 
+     def reset_state(self, implicit_mode: bool = False):  # noqa: ARG002
+         """Reset streaming state for a new request."""
+         self._current_channel = None
+         self._in_message = False
++        self._stream_offset = 0
++        self._stream_text = ""
+diff --git a/vllm_mlx/server.py b/vllm_mlx/server.py
+index 56a6b71daae0d49767dad4a76f6e6040a80fa295..74ae7b4abd31bccbb6a9525941f3a6ef09d1d03b 100644
+--- a/vllm_mlx/server.py
++++ b/vllm_mlx/server.py
+@@ -184,7 +184,9 @@ from .metrics import metrics as _metrics
+ from .models.mllm import UnsafeRemoteURLError, _validate_url_safety, is_url
+ from .reasoning import DeltaMessage, get_parser as get_reasoning_parser
+ from .reasoning.base import ReasoningParser
++from .reasoning.harmony_parser import HarmonyReasoningParser
+ from .tool_parsers import ToolParserManager, get_parser_stop_tokens
++from .tool_parsers.harmony_tool_parser import HarmonyToolParser
+ 
+ if TYPE_CHECKING:
+     from .tool_parsers.abstract_tool_parser import ToolParserTokenizer
+@@ -1525,6 +1527,10 @@ def _prepare_streaming_reasoning_parser(
+     ):
+         return None
+     parser = _build_reasoning_parser(engine)
++    if parser is None and _tool_call_parser in ("harmony", "gpt-oss"):
++        # Harmony routing remains private even when reasoning/tool extraction
++        # is disabled for this request. Project only public assistant bodies.
++        parser = HarmonyReasoningParser(include_plain=True, include_reasoning=False)
+     if parser is not None:
+         parser.reset_state(implicit_mode=_detect_implicit_thinking(engine, chat_kwargs))
+     return parser
+@@ -3650,6 +3656,11 @@ def _extract_reasoning_and_tool_calls(
+     """
+     reasoning_text = None
+     text_for_tool_parse = output_text
++    tools_enabled = bool(
++        request is not None
++        and getattr(request, "tools", None)
++        and getattr(request, "tool_choice", None) != "none"
++    )
+ 
+     suppress_reasoning = not allow_reasoning
+     if _reasoning_parser and suppress_reasoning:
+@@ -3671,7 +3682,7 @@ def _extract_reasoning_and_tool_calls(
+             # output with the analysis (reasoning) blocks removed so the
+             # commentary call can be extracted without reasoning text
+             # reaching the generic fallback.
+-            if request is not None and getattr(request, "tools", None):
++            if tools_enabled:
+                 text_for_tool_parse = _strip_harmony_analysis_blocks(output_text)
+             else:
+                 text_for_tool_parse = ""
+@@ -3682,7 +3693,13 @@ def _extract_reasoning_and_tool_calls(
+ 
+     # Skip tool parsing when the request defines no tools — otherwise the
+     # parser can misinterpret JSON output (e.g. response_format) as tool calls.
+-    if request is not None and getattr(request, "tools", None):
++    cleaned_text: str | None
++    if tools_enabled:
++        if "<|channel|>" in output_text:
++            # Channel metadata belongs to the tool parser, not the reasoning
++            # parser's final-content projection. Never feed analysis JSON to
++            # the generic fallback, even when reasoning parsing is disabled.
++            text_for_tool_parse = _strip_harmony_analysis_blocks(output_text)
+         try:
+             cleaned_text, tool_calls = _parse_tool_calls_with_parser(
+                 text_for_tool_parse or "",
+@@ -3698,7 +3715,15 @@ def _extract_reasoning_and_tool_calls(
+             )
+     else:
+         cleaned_text, tool_calls = text_for_tool_parse, None
+-
++        if "<|channel|>" in output_text:
++            _, cleaned_text = HarmonyReasoningParser(
++                include_plain=True
++            ).extract_reasoning(output_text)
++
++    if reasoning_text:
++        # Raw framing is internal parser input, not public reasoning. Preserve
++        # whitespace and never run this cleanup over structured tool arguments.
++        reasoning_text = SPECIAL_TOKENS_PATTERN.sub("", reasoning_text)
+     return reasoning_text, cleaned_text, tool_calls
+ 
+ 
+@@ -3835,6 +3860,19 @@ def _extract_streaming_tool_delta(
+         delta_text,
+         request=request_context,
+     )
++    if isinstance(parser, HarmonyToolParser):
++        # Project public bodies independently from tool detection. This keeps
++        # whitespace and held literal prefixes intact without exposing headers.
++        projection = getattr(parser, "_harmony_content_projection", None)
++        if projection is None:
++            projection = HarmonyReasoningParser(include_plain=True)
++            setattr(parser, "_harmony_content_projection", projection)
++        delta = projection.extract_reasoning_streaming(
++            previous_text, current_text, delta_text
++        )
++        content = SPECIAL_TOKENS_PATTERN.sub("", delta.content or "") if delta else ""
++        if result is not None or content:
++            result = {**(result or {}), "content": content}
+     return current_text, result
+ 
+ 
+@@ -3943,7 +3981,9 @@ def _streaming_tool_markup_possible(text: str, tool_parser=None) -> bool:
+ 
+ def _requires_eager_tool_streaming(tool_parser) -> bool:
+     """Return whether a parser must receive every delta from response start."""
+-    return bool(getattr(tool_parser, "REQUIRES_EAGER_STREAMING", False))
++    return isinstance(tool_parser, HarmonyToolParser) or bool(
++        getattr(tool_parser, "REQUIRES_EAGER_STREAMING", False)
++    )
+ 
+ 
+ def _streaming_tool_markup_possible_after_delta(
+@@ -3968,6 +4008,14 @@ def _finalize_streaming_tool_result(
+     tool_parser, current_text: str, result: dict | None = None
+ ):
+     """Let parsers resolve an ambiguous prefix at end of generation."""
++    projection = getattr(tool_parser, "_harmony_content_projection", None)
++    if isinstance(projection, HarmonyReasoningParser):
++        delta = projection.finalize_stream()
++        if delta and delta.content:
++            result = {
++                **(result or {}),
++                "content": (result or {}).get("content", "") + delta.content,
++            }
+     finalize = getattr(tool_parser, "finalize_streaming", None)
+     if finalize is None:
+         return result
+@@ -6074,7 +6122,7 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
+         )
+ 
+         reasoning_text, cleaned_text, tool_calls = _extract_reasoning_and_tool_calls(
+-            output.text,
++            getattr(output, "raw_text", None) or output.text,
+             request,
+             allow_reasoning=not _thinking_disabled(request, prepared.chat_kwargs),
+             engine=engine,
+@@ -6517,7 +6565,7 @@ async def create_anthropic_message(
+         )
+ 
+         reasoning_text, cleaned_text, tool_calls = _extract_reasoning_and_tool_calls(
+-            output.text,
++            getattr(output, "raw_text", None) or output.text,
+             openai_request,
+             allow_reasoning=(
+                 not _thinking_disabled(openai_request, prepared.chat_kwargs)
+@@ -6821,7 +6869,7 @@ async def _stream_anthropic_messages(
+     # block. Parsed reasoning is suppressed — the request disabled
+     # thinking, so only cleaned content is emitted into the already-open
+     # text block (no thinking block is started).
+-    disabled_reasoning_latched = False
++    disabled_reasoning_latched = isinstance(reasoning_parser, HarmonyReasoningParser)
+ 
+     # Block index tracking: with reasoning parser we use index 0 for
+     # thinking and index 1 for text; without parser, index 0 for text.
+@@ -6843,7 +6891,8 @@ async def _stream_anthropic_messages(
+     # as text_delta events. Mirrors the OpenAI streaming path logic.
+     tool_accumulated_text = ""
+     tool_parser = _get_streaming_tool_parser(openai_request, engine)
+-    tool_markup_possible = _requires_eager_tool_streaming(tool_parser)
++    harmony_tools = isinstance(tool_parser, HarmonyToolParser)
++    tool_markup_possible = harmony_tools or _requires_eager_tool_streaming(tool_parser)
+     tool_request_context = openai_request.model_dump()
+ 
+     try:
+@@ -6870,7 +6919,8 @@ async def _stream_anthropic_messages(
+             # Filter special tokens
+             filtered = SPECIAL_TOKENS_PATTERN.sub("", delta_text)
+             if not filtered and not (
+-                (use_reasoning and output_finished)
++                reasoning_parser
++                or harmony_tools
+                 or (tool_parser and tool_markup_possible and output_finished)
+             ):
+                 continue
+@@ -6880,7 +6930,7 @@ async def _stream_anthropic_messages(
+                 and thinking_off
+                 and not disabled_reasoning_latched
+                 and _explicit_reasoning_markers_present(
+-                    accumulated_text + filtered, reasoning_parser
++                    accumulated_text + delta_text, reasoning_parser
+                 )
+             ):
+                 disabled_reasoning_latched = True
+@@ -6939,22 +6989,32 @@ async def _stream_anthropic_messages(
+ 
+             # Reasoning parser path
+             previous_text = accumulated_text
+-            accumulated_text += filtered
++            accumulated_text += delta_text
+             assert reasoning_parser is not None
+             delta_msg = _extract_streaming_reasoning_delta(
+                 reasoning_parser,
+                 previous_text,
+                 accumulated_text,
+-                filtered,
++                delta_text,
+                 finished=output_finished,
+             )
+ 
+             if delta_msg is None:
+-                if output_finished and tool_parser and tool_markup_possible:
++                if harmony_tools or (
++                    output_finished and tool_parser and tool_markup_possible
++                ):
+                     delta_msg = DeltaMessage()
+                 else:
+                     continue
+ 
++            # Non-Harmony parsers do not consume Harmony/ChatML controls from
++            # raw transport. Sanitize public projections without trimming them.
++            if delta_msg.content:
++                delta_msg.content = SPECIAL_TOKENS_PATTERN.sub("", delta_msg.content)
++            if delta_msg.reasoning:
++                delta_msg.reasoning = SPECIAL_TOKENS_PATTERN.sub(
++                    "", delta_msg.reasoning
++                )
+             if delta_msg.reasoning and not thinking_off:
+                 if not thinking_block_started:
+                     yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': thinking_index, 'content_block': {'type': 'thinking', 'thinking': ''}})}\n\n"
+@@ -6962,21 +7022,24 @@ async def _stream_anthropic_messages(
+                 yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': thinking_index, 'delta': {'type': 'thinking_delta', 'thinking': delta_msg.reasoning}})}\n\n"
+ 
+             content_to_emit = delta_msg.content or ""
+-            if content_to_emit or (
+-                tool_parser and output_finished and tool_markup_possible
++            tool_delta = delta_text if harmony_tools else content_to_emit
++            if (
++                content_to_emit
++                or tool_delta
++                or (tool_parser and output_finished and tool_markup_possible)
+             ):
+ 
+                 # Filter tool call markup during streaming
+                 if tool_parser and (
+-                    content_to_emit or (output.finished and tool_markup_possible)
++                    tool_delta or (output.finished and tool_markup_possible)
+                 ):
+                     if (
+                         not tool_markup_possible
+                         and not _streaming_tool_markup_possible_after_delta(
+-                            tool_accumulated_text, content_to_emit, tool_parser
++                            tool_accumulated_text, tool_delta, tool_parser
+                         )
+                     ):
+-                        tool_accumulated_text += content_to_emit
++                        tool_accumulated_text += tool_delta
+                     else:
+                         if not tool_markup_possible:
+                             tool_markup_possible = True
+@@ -6984,7 +7047,7 @@ async def _stream_anthropic_messages(
+                             _parse_streaming_tool_content(
+                                 tool_parser,
+                                 tool_accumulated_text,
+-                                content_to_emit,
++                                tool_delta,
+                                 tool_request_context,
+                             )
+                         )
+@@ -6996,10 +7059,13 @@ async def _stream_anthropic_messages(
+                                 tool_parser, tool_accumulated_text, tool_result
+                             )
+ 
+-                        if tool_result is None:
++                        if tool_result is None and not (
++                            harmony_tools and content_to_emit
++                        ):
+                             # Inside tool markup, so suppress this delta.
+                             continue
+-                        content_to_emit = tool_result.get("content", "")
++                        if not harmony_tools and tool_result is not None:
++                            content_to_emit = tool_result.get("content", "")
+                         if content_to_emit:
+                             content_to_emit = _TOOL_MARKUP_PATTERN.sub(
+                                 "", content_to_emit
+@@ -7032,7 +7098,7 @@ async def _stream_anthropic_messages(
+         # its tool call. Fall back to the stripped accumulation when no tool
+         # parser was active (mirrors prior behavior for non-tool responses).
+         _, tool_calls = _parse_tool_calls_with_parser(
+-            tool_accumulated_text or accumulated_text,
++            _strip_harmony_analysis_blocks(tool_accumulated_text or accumulated_text),
+             openai_request,
+             engine=engine,
+         )
+@@ -7250,7 +7316,9 @@ async def stream_chat_completion(
+     # request disabled thinking, so only cleaned content is emitted.
+     raw_stream_text = ""
+     thinking_off = _thinking_disabled(request, kwargs)
+-    disabled_reasoning_latched = False
++    # Harmony can safely classify bodies from the first byte. Waiting for a
++    # think-tag marker bypasses it and leaks fragmented headers when disabled.
++    disabled_reasoning_latched = isinstance(reasoning_parser, HarmonyReasoningParser)
+ 
+     # Track token counts for usage reporting
+     prompt_tokens = 0
+@@ -7270,7 +7338,8 @@ async def stream_chat_completion(
+     tool_accumulated_text = ""
+     tool_calls_detected = False
+     tool_parser = _get_streaming_tool_parser(request, engine)
+-    tool_markup_possible = _requires_eager_tool_streaming(tool_parser)
++    harmony_tools = isinstance(tool_parser, HarmonyToolParser)
++    tool_markup_possible = harmony_tools or _requires_eager_tool_streaming(tool_parser)
+     buffer_typed_tool_calls = request.tool_argument_recovery == "buffered"
+     buffered_tool_calls: dict[int, dict] = {}
+     # Whether any emitted chunk carried a terminal finish_reason. The engine's
+@@ -7327,9 +7396,12 @@ async def stream_chat_completion(
+                 )
+ 
+                 if delta_msg is None:
+-                    if output_finished and (
+-                        fence_stripper is not None
+-                        or (tool_parser and tool_markup_possible)
++                    if harmony_tools or (
++                        output_finished
++                        and (
++                            fence_stripper is not None
++                            or (tool_parser and tool_markup_possible)
++                        )
+                     ):
+                         delta_msg = DeltaMessage()
+                     else:
+@@ -7347,7 +7419,7 @@ async def stream_chat_completion(
+                 # blocks, so reasoning parser captures tool call XML as
+                 # reasoning while content stays None.  Redirect reasoning
+                 # to the content stream so the tool parser can handle it.
+-                if tool_parser and reasoning and not content:
++                if tool_parser and reasoning and not content and not harmony_tools:
+                     _check = tool_accumulated_text + reasoning
+                     if _streaming_tool_markup_possible(_check, tool_parser):
+                         content = reasoning
+@@ -7357,20 +7429,21 @@ async def stream_chat_completion(
+                     # The request disabled thinking — surface only parsed
+                     # content; drop reasoning the model emitted anyway.
+                     reasoning = None
+-                    if not content:
++                    if not content and not harmony_tools:
+                         continue
+ 
+                 # Tool call parsing on content portion
++                tool_delta = delta_text if harmony_tools else content
+                 if tool_parser and (
+-                    content or (output_finished and tool_markup_possible)
++                    tool_delta or (output_finished and tool_markup_possible)
+                 ):
+                     if (
+                         not tool_markup_possible
+                         and not _streaming_tool_markup_possible_after_delta(
+-                            tool_accumulated_text, content, tool_parser
++                            tool_accumulated_text, tool_delta, tool_parser
+                         )
+                     ):
+-                        tool_accumulated_text += content
++                        tool_accumulated_text += tool_delta
+                         # Emit as-is; no tool markup is even possible yet.
+                     else:
+                         if not tool_markup_possible:
+@@ -7379,7 +7452,7 @@ async def stream_chat_completion(
+                             _extract_streaming_tool_delta(
+                                 tool_parser,
+                                 tool_accumulated_text,
+-                                content,
++                                tool_delta,
+                                 tool_request_context,
+                             )
+                         )
+@@ -7400,6 +7473,10 @@ async def stream_chat_completion(
+                         ):
+                             tool_result = {**(tool_result or {}), "tool_calls": []}
+ 
++                        if harmony_tools and content and tool_result is None:
++                            # Tool suppression must not veto a final body that
++                            # the reasoning parser has already classified.
++                            tool_result = {}
+                         if tool_result is None:
+                             # Inside tool markup - suppress content output
+                             if reasoning:
+@@ -7431,6 +7508,8 @@ async def stream_chat_completion(
+                                 tool_accumulated_text,
+                                 tool_result.get("content", ""),
+                             )
++                            if harmony_tools:
++                                leading = content
+                             if leading:
+                                 yield f"data: {ChatCompletionChunk(id=response_id, model=_response_model_name(request.model), choices=[ChatCompletionChunkChoice(delta=ChatCompletionChunkDelta(content=leading))]).model_dump_json()}\n\n"
+ 
+@@ -7480,7 +7559,8 @@ async def stream_chat_completion(
+                             continue
+ 
+                         # Normal content from tool parser
+-                        content = tool_result.get("content", "")
++                        if not harmony_tools:
++                            content = tool_result.get("content", "")
+                         if (
+                             content
+                             and tool_calls_detected
+diff --git a/vllm_mlx/tool_parsers/harmony_tool_parser.py b/vllm_mlx/tool_parsers/harmony_tool_parser.py
+index b2ed9b3ef12627268ed822224528634e063a6a9f..0cc272990c1969a43dd11e7c1b15d0ed9bf64611 100644
+--- a/vllm_mlx/tool_parsers/harmony_tool_parser.py
++++ b/vllm_mlx/tool_parsers/harmony_tool_parser.py
+@@ -22,6 +22,7 @@ import uuid
+ from collections.abc import Sequence
+ from typing import Any
+ 
++from ..reasoning.harmony_parser import HarmonyReasoningParser
+ from .abstract_tool_parser import (
+     ExtractedToolCallInformation,
+     ToolParser,
+@@ -39,18 +40,15 @@ def _generate_tool_id() -> str:
+ # mid-block output, or args that would span into a later channel, must not
+ # become a structured tool call with malformed/glued args.
+ _COMMENTARY_BLOCK_PATTERN = re.compile(
+-    r"<\|channel\|>commentary\s+to=functions\.(\w+)"
++    r"(?:<\|start\|>assistant(?P<role_metadata>[^<]*))?"
++    r"<\|channel\|>commentary\b(?P<channel_metadata>[^<]*)"
+     r"(?:\s*<\|constrain\|>\w+)?"
+-    r"\s*<\|message\|>((?:(?!<\|channel\|>).)*?)"
++    r"\s*<\|message\|>(?P<arguments>(?:(?!<\|channel\|>).)*?)"
+     r"(?P<terminator><\|call\|>|<\|end\|>|<\|return\|>|<\|start\|>|<\|channel\|>|\Z)",
+     re.DOTALL,
+ )
+ 
+-# Pattern: <|channel|>final ... <|return|>
+-_FINAL_BLOCK_PATTERN = re.compile(
+-    r"<\|channel\|>final\s*<\|message\|>(.*?)<\|return\|>",
+-    re.DOTALL,
+-)
++_TOOL_RECIPIENT_PATTERN = re.compile(r"(?:^|\s)to=functions\.([A-Za-z0-9_-]+)(?=\s|$)")
+ 
+ 
+ @ToolParserManager.register_module(["harmony", "gpt-oss"])
+@@ -81,8 +79,16 @@ class HarmonyToolParser(ToolParser):
+ 
+         # Extract tool calls from commentary channel blocks
+         for match in _COMMENTARY_BLOCK_PATTERN.finditer(model_output):
+-            tool_name = match.group(1)
+-            args_str = match.group(2).strip()
++            metadata = (
++                (match.group("role_metadata") or "")
++                + " "
++                + match.group("channel_metadata")
++            )
++            recipient = _TOOL_RECIPIENT_PATTERN.search(metadata)
++            if recipient is None:
++                continue
++            tool_name = recipient.group(1)
++            args_str = match.group("arguments").strip()
+             terminator = match.group("terminator")
+             # End-of-string and a following channel boundary mean the args
+             # did not stop at an explicit call terminator: truncated or moved
+@@ -116,9 +122,11 @@ class HarmonyToolParser(ToolParser):
+                     }
+                 )
+ 
+-        # Extract final channel content
+-        final_match = _FINAL_BLOCK_PATTERN.search(model_output)
+-        content = final_match.group(1).strip() if final_match else None
++        # Public commentary and final bodies share the same projection as
++        # streaming, including a final body whose EOS token was not decoded.
++        _, content = HarmonyReasoningParser(include_plain=True).extract_reasoning(
++            model_output
++        )
+ 
+         if tool_calls:
+             return ExtractedToolCallInformation(
+@@ -127,16 +135,10 @@ class HarmonyToolParser(ToolParser):
+                 content=content,
+             )
+ 
+-        # No tool calls: return all text as content
+-        # If there's a final channel, use that; otherwise return the raw output
+-        # stripped of control tokens
+-        if content is None:
+-            content = _strip_control_tokens(model_output)
+-
+         return ExtractedToolCallInformation(
+             tools_called=False,
+             tool_calls=[],
+-            content=content,
++            content=content or "",
+         )
+ 
+     def extract_tool_calls_streaming(
+@@ -155,12 +157,9 @@ class HarmonyToolParser(ToolParser):
+         A commentary block completes when an explicit terminator arrives
+         (<|call|>, <|end|>, <|return|>, <|start|>) or when the model moves on
+         to the <|channel|>final block; the completed call is emitted once
+-        (deduplicated by name + arguments). Final-channel content is emitted
+-        as regular content deltas and plain text passes through unchanged.
++        (deduplicated by block index, name and arguments). Final-channel content
++        is emitted as regular content deltas and plain text passes unchanged.
+         """
+-        if not hasattr(self, "_emitted_streaming_signatures"):
+-            self._emitted_streaming_signatures: set[tuple[str, str]] = set()
+-
+         # No harmony channel at all: plain text passes through
+         if "<|channel|>" not in current_text:
+             return {"content": delta_text}
+@@ -176,26 +175,9 @@ class HarmonyToolParser(ToolParser):
+         )
+ 
+         if block_completed:
+-            result = self.extract_tool_calls(current_text)
+-            if result.tools_called:
+-                emitted = []
+-                for i, tc in enumerate(result.tool_calls):
+-                    signature = (tc["name"], tc["arguments"])
+-                    if signature not in self._emitted_streaming_signatures:
+-                        self._emitted_streaming_signatures.add(signature)
+-                        emitted.append(
+-                            {
+-                                "index": i,
+-                                "id": tc["id"],
+-                                "type": "function",
+-                                "function": {
+-                                    "name": tc["name"],
+-                                    "arguments": tc["arguments"],
+-                                },
+-                            }
+-                        )
+-                if emitted:
+-                    return {"tool_calls": emitted}
++            result = self._extract_unemitted_tool_calls(current_text)
++            if result:
++                return result
+ 
+         # In the final channel, emit content
+         if "<|channel|>final" in current_text and "<|call|>" not in current_text:
+@@ -213,33 +195,38 @@ class HarmonyToolParser(ToolParser):
+         # Building tool call or in analysis channel, suppress output
+         return None
+ 
++    def _extract_unemitted_tool_calls(self, current_text: str) -> dict[str, Any] | None:
++        if not hasattr(self, "_emitted_streaming_signatures"):
++            self._emitted_streaming_signatures: set[tuple[int, str, str]] = set()
++        result = self.extract_tool_calls(current_text)
++        emitted = []
++        for i, tc in enumerate(result.tool_calls):
++            signature = (i, tc["name"], tc["arguments"])
++            if signature not in self._emitted_streaming_signatures:
++                self._emitted_streaming_signatures.add(signature)
++                emitted.append(
++                    {
++                        "index": i,
++                        "id": tc["id"],
++                        "type": "function",
++                        "function": {
++                            "name": tc["name"],
++                            "arguments": tc["arguments"],
++                        },
++                    }
++                )
++        return {"tool_calls": emitted} if emitted else None
++
++    def finalize_streaming(self, current_text: str) -> dict[str, Any] | None:
++        """Emit pending valid EOS calls without replaying earlier call blocks."""
++        return self._extract_unemitted_tool_calls(current_text)
++
+     def reset(self) -> None:
+         """Reset parser state for a new request."""
+         super().reset()
+         self._emitted_streaming_signatures = set()
+ 
+ 
+-def _strip_control_tokens(text: str) -> str:
+-    """Remove Harmony control tokens from text."""
+-    tokens = [
+-        "<|start|>",
+-        "<|end|>",
+-        "<|message|>",
+-        "<|channel|>",
+-        "<|constrain|>",
+-        "<|return|>",
+-        "<|call|>",
+-    ]
+-    result = text
+-    for token in tokens:
+-        result = result.replace(token, "")
+-    # Clean up channel names and constrain values
+-    result = re.sub(r"(?:analysis|commentary|final)\s*", "", result)
+-    result = re.sub(r"to=functions\.\w+\s*", "", result)
+-    result = re.sub(r"json\s*", "", result)
+-    return result.strip()
+-
+-
+ def _is_control_token(text: str) -> bool:
+     """Check if text is a Harmony control token."""
+     return text.strip() in {

@@ -1,0 +1,97 @@
+name: Three issue validation
+
+on:
+  push:
+    branches: [validation/three-issue-fixes-20261103]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: three-issue-validation-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  PYTHONDONTWRITEBYTECODE: "1"
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
+      - name: Install portable check dependencies
+        run: python -m pip install pytest ruff black mypy fastapi pydantic
+      - name: Test and lint the validation controller
+        run: |
+          python -m pytest tests/test_three_issue_validation.py -q
+          python -m ruff check scripts/three_issue_validation.py tests/test_three_issue_validation.py --select E,F,W --ignore E402,E501,E731,F811,F841
+          python -m black --check scripts/three_issue_validation.py tests/test_three_issue_validation.py
+      - name: Verify source replay and static checks for all candidates
+        run: |
+          python scripts/three_issue_validation.py prepare --run-root "$GITHUB_WORKSPACE/.scratch/three-issue-ci"
+          python scripts/three_issue_validation.py static --run-root "$GITHUB_WORKSPACE/.scratch/three-issue-ci"
+      - name: Retain source replay proof
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: three-issue-source-replay
+          path: .scratch/three-issue-ci/replay-proof.json
+          if-no-files-found: warn
+          retention-days: 14
+
+  native:
+    needs: checks
+    runs-on: macos-15
+    timeout-minutes: ${{ matrix.timeout }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - phase: suites
+            timeout: 45
+          - phase: focused
+            timeout: 30
+          - phase: measurements
+            timeout: 330
+    env:
+      VALIDATION_PHASE: ${{ matrix.phase }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
+      - name: Install the recorded MLX runtime and project dependencies
+        run: >-
+          python -m pip install -e ".[dev,vision,harmony]"
+          mlx==0.32.4 mlx-lm==0.31.3 mlx-vlm==0.6.5 transformers==5.22.1
+      - name: Materialize and verify frozen source layers
+        run: python scripts/three_issue_validation.py prepare --run-root "$GITHUB_WORKSPACE/.scratch/three-issue-ci"
+      - name: Provision exact fixture revisions and model manifests
+        run: python scripts/three_issue_validation.py provision --run-root "$GITHUB_WORKSPACE/.scratch/three-issue-ci"
+      - name: Run the unchanged native acceptance phase
+        run: python scripts/three_issue_validation.py run --run-root "$GITHUB_WORKSPACE/.scratch/three-issue-ci" --phase "$VALIDATION_PHASE"
+      - name: Upload raw results and provenance
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: three-issue-${{ matrix.phase }}
+          path: |
+            .scratch/three-issue-ci/replay-proof.json
+            .scratch/three-issue-ci/operator.json
+            .scratch/three-issue-ci/inputs/
+            .scratch/three-issue-ci/receipts/
+            .scratch/three-issue-ci/results/
+          if-no-files-found: warn
+          retention-days: 14

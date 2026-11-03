@@ -68,6 +68,7 @@ jobs:
       - name: Run unit tests (no MLX required)
         run: |
           pytest \
+            tests/test_three_issue_validation.py \
             tests/test_client_acceptance_runner.py \
             tests/test_client_acceptance_clients.py \
             tests/test_client_acceptance_observe.py \
