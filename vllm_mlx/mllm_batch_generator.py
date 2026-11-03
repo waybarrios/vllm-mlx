@@ -4017,8 +4017,11 @@ def install_chunked_prefill_mllm(
                 # A prompt ending with the think suffix already holds its
                 # conversation-boundary checkpoint, which replaces this entry.
                 extends_cached = partial["cached_count"] > 0
+                prefix_cache: Optional[MemoryAwarePrefixCache] = getattr(
+                    batch_gen, "prefix_cache", None
+                )
                 if (
-                    batch_gen.prefix_cache is not None
+                    prefix_cache is not None
                     and is_text_only_prefix_cache_request(req)
                     and req.input_ids is not None
                     and batch_gen._needs_prefill_checkpoint(partial["cache"])
@@ -4027,7 +4030,7 @@ def install_chunked_prefill_mllm(
                     )
                     is None
                 ):
-                    full_prompt_entry = batch_gen.prefix_cache.prepare_store(
+                    full_prompt_entry = prefix_cache.prepare_store(
                         cast(List[int], req.input_ids.reshape(-1).tolist()),
                         partial["cache"],
                         auxiliary={"last_logits": prompt_last_logits},
