@@ -100,6 +100,7 @@ jobs:
             tests/test_mllm_stream_usage.py \
             tests/test_constrained_cache.py \
             tests/test_dependency_floors.py \
+            tests/test_manual_script_imports.py \
             tests/test_ssd_cache_shutdown.py \
             tests/test_chat_template_safety.py \
             tests/test_simple_engine_thread_pinning.py \
@@ -194,7 +195,7 @@ jobs:
           pytest tests/test_engine_base.py -v --tb=short
 
   test-apple-silicon:
-    runs-on: macos-14
+    runs-on: macos-15
     strategy:
       matrix:
         python-version: ["3.11", "3.13"]

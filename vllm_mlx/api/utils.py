@@ -145,7 +145,7 @@ class StreamingToolCallFilter:
     parsing at stream end.
     """
 
-    def __init__(self):
+    def __init__(self) -> None:
         self._buffer = ""
         self._in_block = False
         self._close_tag = ""
@@ -261,7 +261,7 @@ class StreamingThinkRouter:
     def process(self, delta: str) -> list[tuple[str, str]]:
         """Process a delta. Returns list of (block_type, text) pieces."""
         self._buffer += delta
-        pieces = []
+        pieces: list[tuple[str, str]] = []
         self._extract_pieces(pieces)
         return pieces
 

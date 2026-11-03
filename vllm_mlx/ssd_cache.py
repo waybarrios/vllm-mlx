@@ -381,13 +381,15 @@ class SSDIndex:
             cur = self._conn.execute(
                 "SELECT COALESCE(SUM(memory_bytes), 0) FROM entries"
             )
-            return cur.fetchone()[0]
+            total_bytes: int = cur.fetchone()[0]
+            return total_bytes
 
     def get_entry_count(self) -> int:
         """Get number of entries in the index."""
         with self._db_lock:
             cur = self._conn.execute("SELECT COUNT(*) FROM entries")
-            return cur.fetchone()[0]
+            entry_count: int = cur.fetchone()[0]
+            return entry_count
 
     def touch(self, tokens_key: tuple[int, ...]) -> None:
         """Update accessed_at timestamp for an entry (marks as recently used)."""
@@ -965,15 +967,17 @@ class SSDCacheTier:
         if any(_is_quantized_layer(layer) for layer in cache):
             try:
                 from mlx_lm.models.cache import QuantizedKVCache
+
+                quantized_cache_class: type | tuple[()] = QuantizedKVCache
             except ImportError:
-                QuantizedKVCache = ()  # never matches isinstance below
+                quantized_cache_class = ()  # never matches isinstance below
 
             converted: list = []
             for layer in cache:
                 if isinstance(layer, _QuantizedCacheWrapper):
                     # Existing path: wrapper → orig_type with dequantized keys.
                     converted.extend(_dequantize_cache([layer]))
-                elif isinstance(layer, QuantizedKVCache) or (
+                elif isinstance(layer, quantized_cache_class) or (
                     hasattr(layer, "keys") and isinstance(layer.keys, (tuple, list))
                 ):
                     # Native mlx-lm QuantizedKVCache: keys/values are
@@ -985,10 +989,18 @@ class SSDCacheTier:
                     group_size = getattr(layer, "group_size", 64)
                     kv = _KVCache.__new__(_KVCache)
                     kv.keys = mx.dequantize(
-                        *layer.keys, group_size=group_size, bits=bits
+                        layer.keys[0],
+                        layer.keys[1],
+                        layer.keys[2],
+                        group_size=group_size,
+                        bits=bits,
                     )
                     kv.values = mx.dequantize(
-                        *layer.values, group_size=group_size, bits=bits
+                        layer.values[0],
+                        layer.values[1],
+                        layer.values[2],
+                        group_size=group_size,
+                        bits=bits,
                     )
                     kv.offset = getattr(layer, "offset", kv.keys.shape[-2])
                     if (
@@ -1313,7 +1325,7 @@ class SSDCacheTier:
 
             try:
                 if layer_type in ("KVCache", "RotatingKVCache"):
-                    serializer = KVCacheSerializer()
+                    serializer: LayerSerializer = KVCacheSerializer()
                 elif layer_type in ("ArraysCache", "MambaCache"):
                     serializer = ArraysCacheSerializer()
                 elif layer_type == "CacheList":

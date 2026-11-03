@@ -15,11 +15,6 @@ import platform
 import sys
 from typing import List
 
-# Skip if not on Apple Silicon
-if sys.platform != "darwin" or platform.machine() != "arm64":
-    print("This test requires Apple Silicon")
-    sys.exit(0)
-
 
 def print_header(title: str) -> None:
     """Print a formatted header."""
@@ -54,7 +49,7 @@ def print_table(
     print(f"+{separator}+")
 
 
-def test_benefit_1_shared_system_prompts():
+def demonstrate_benefit_1_shared_system_prompts():
     """
     Benefit 1: Multiple users sharing the same system prompt.
 
@@ -157,7 +152,7 @@ def test_benefit_1_shared_system_prompts():
     return savings
 
 
-def test_benefit_2_memory_efficiency():
+def demonstrate_benefit_2_memory_efficiency():
     """
     Benefit 2: Memory efficiency with many concurrent requests.
 
@@ -261,7 +256,7 @@ def test_benefit_2_memory_efficiency():
     return savings
 
 
-def test_benefit_3_prefix_sharing():
+def demonstrate_benefit_3_prefix_sharing():
     """
     Benefit 3: Prefix sharing between similar conversations.
 
@@ -373,7 +368,7 @@ def test_benefit_3_prefix_sharing():
     return efficiency
 
 
-def test_copy_on_write_demo():
+def demonstrate_copy_on_write_demo():
     """
     Bonus: Demonstrate Copy-on-Write behavior.
     """
@@ -422,6 +417,10 @@ def test_copy_on_write_demo():
 
 def main():
     """Run all benefit demonstrations."""
+    if sys.platform != "darwin" or platform.machine() != "arm64":
+        print("This test requires Apple Silicon")
+        sys.exit(0)
+
     print("\n" + "=" * 70)
     print("     PAGED KV CACHE BENEFITS DEMONSTRATION")
     print("=" * 70)
@@ -429,10 +428,10 @@ def main():
     results = {}
 
     # Run each test
-    results["shared_prompts"] = test_benefit_1_shared_system_prompts()
-    results["memory_efficiency"] = test_benefit_2_memory_efficiency()
-    results["prefix_sharing"] = test_benefit_3_prefix_sharing()
-    test_copy_on_write_demo()
+    results["shared_prompts"] = demonstrate_benefit_1_shared_system_prompts()
+    results["memory_efficiency"] = demonstrate_benefit_2_memory_efficiency()
+    results["prefix_sharing"] = demonstrate_benefit_3_prefix_sharing()
+    demonstrate_copy_on_write_demo()
 
     # Final summary
     print_header("FINAL SUMMARY")

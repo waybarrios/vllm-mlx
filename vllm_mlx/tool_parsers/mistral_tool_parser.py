@@ -401,7 +401,7 @@ class MistralToolParser(ToolParser):
             content_part = parts[0]
             tool_part = self.BOT_TOKEN.join(parts[1:])
 
-            result: dict[str, Any] = {}
+            result = {}
             if content_part:
                 result["content"] = content_part
 
@@ -412,7 +412,7 @@ class MistralToolParser(ToolParser):
                 # Try to parse the tool part
                 tool_delta = self._parse_streaming_tool_delta(tool_part)
                 if tool_delta:
-                    tool_call: dict[str, Any] = {
+                    tool_call = {
                         "index": self.current_tool_id,
                         "type": "function",
                         "function": tool_delta,

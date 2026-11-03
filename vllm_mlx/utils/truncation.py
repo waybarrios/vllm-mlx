@@ -80,6 +80,7 @@ def resolve_max_length(
     tok_val = _positive_int(
         getattr(inner_tokenizer(tokenizer), "model_max_length", None)
     )
+    resolved: int | None
     if tok_val is not None and tok_val < sentinel_threshold:
         resolved = min(config_val, tok_val) if config_val is not None else tok_val
     else:

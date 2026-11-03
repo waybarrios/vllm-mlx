@@ -217,3 +217,177 @@ class TestMidPrefillSaveFailClosed:
 
         assert store.called is True, "all-trimmable stack must store"
         assert len(store.calls) == 1
+
+
+class TestSchedulerStatsContract:
+    def _make_stats_scheduler(self, monkeypatch, metal_mode, calls):
+        import vllm_mlx.scheduler as scheduler_module
+
+        sched = object.__new__(scheduler_module.Scheduler)
+        sched.waiting = [object(), object()]
+        sched.running = {"running": object()}
+        sched.num_requests_processed = 3
+        sched.total_prompt_tokens = 11
+        sched.total_completion_tokens = 7
+        sched.batch_generator = types.SimpleNamespace()
+        sched.block_aware_cache = None
+        sched.memory_aware_cache = None
+        sched.prefix_cache = None
+
+        def available():
+            calls.append("available")
+            if metal_mode == "availability_error":
+                raise RuntimeError("availability failed")
+            return metal_mode != "unavailable"
+
+        def active():
+            calls.append("active")
+            return 1_234_000_000
+
+        def peak():
+            calls.append("peak")
+            if metal_mode == "peak_error":
+                raise RuntimeError("peak failed")
+            return 2_345_000_000
+
+        def cache_memory():
+            calls.append("cache_memory")
+            return 3_456_000_000
+
+        # Patch the imported module explicitly: its cached mx need not be the
+        # autouse fixture's current sys.modules entry. Never call real Metal.
+        monkeypatch.setattr(
+            scheduler_module,
+            "mx",
+            types.SimpleNamespace(
+                metal=types.SimpleNamespace(is_available=available),
+                get_active_memory=active,
+                get_peak_memory=peak,
+                get_cache_memory=cache_memory,
+            ),
+        )
+        return sched
+
+    @pytest.mark.parametrize(
+        "metal_mode", ["unavailable", "available", "availability_error", "peak_error"]
+    )
+    @pytest.mark.parametrize("cache_mode", ["none", "paged", "memory", "prefix", "all"])
+    @pytest.mark.parametrize("mtp_mode", ["absent", "noncallable", "nested", "opaque"])
+    def test_heterogeneous_snapshots_preserve_values_identity_and_order(
+        self, monkeypatch, metal_mode, cache_mode, mtp_mode
+    ):
+        calls = []
+        sched = self._make_stats_scheduler(monkeypatch, metal_mode, calls)
+        cache_payloads = [
+            {"hits": 3, "ratio": 0.25, "legacy": None},
+            {"memory_mb": 1.5, "detail": {"unknown": [True, None]}},
+            {"hit_rate": 0.5, "tokens_saved": 8},
+        ]
+        cache_fields = ("block_aware_cache", "memory_aware_cache", "prefix_cache")
+        cache_keys = ("paged_cache", "memory_aware_cache", "prefix_cache")
+
+        def provider(index):
+            def get_stats():
+                calls.append(cache_keys[index])
+                return cache_payloads[index]
+
+            return types.SimpleNamespace(get_stats=get_stats)
+
+        for index, mode in enumerate(("paged", "memory", "prefix")):
+            if cache_mode in (mode, "all"):
+                setattr(sched, cache_fields[index], provider(index))
+        providers = tuple(getattr(sched, field) for field in cache_fields)
+        mtp_payload = {"enabled": True, "attempted": 2, "bypass_counts": {"x": 1}}
+        opaque = object()
+
+        def mtp_stats():
+            calls.append("mtp")
+            return mtp_payload if mtp_mode == "nested" else opaque
+
+        if mtp_mode == "noncallable":
+            sched.batch_generator.get_mtp_stats = "legacy"
+        elif mtp_mode in ("nested", "opaque"):
+            sched.batch_generator.get_mtp_stats = mtp_stats
+        generator = sched.batch_generator
+        expected = {
+            "num_waiting": 2,
+            "num_running": 1,
+            "num_requests_processed": 3,
+            "total_prompt_tokens": 11,
+            "total_completion_tokens": 7,
+        }
+        expected_calls = []
+        if mtp_mode in ("nested", "opaque"):
+            expected["mtp"] = mtp_payload if mtp_mode == "nested" else opaque
+            expected_calls.append("mtp")
+        expected_calls.append("available")
+        if metal_mode in ("available", "peak_error"):
+            expected["metal_active_memory_gb"] = 1.23
+            expected_calls.extend(["active", "peak"])
+        if metal_mode == "available":
+            expected["metal_peak_memory_gb"] = 2.35
+            expected["metal_cache_memory_gb"] = 3.46
+            expected_calls.append("cache_memory")
+        selected = {"none": None, "paged": 0, "memory": 1, "prefix": 2, "all": 0}[
+            cache_mode
+        ]
+        if selected is not None:
+            expected[cache_keys[selected]] = cache_payloads[selected]
+            expected_calls.append(cache_keys[selected])
+
+        first = sched.get_stats()
+        second = sched.get_stats()
+
+        assert first is not second
+        for result in (first, second):
+            assert result == expected
+            assert list(result) == list(expected)
+            if selected is not None:
+                assert result[cache_keys[selected]] is cache_payloads[selected]
+            if mtp_mode in ("nested", "opaque"):
+                assert result["mtp"] is expected["mtp"]
+        assert calls == expected_calls * 2
+        first["num_waiting"] = 999
+        assert second["num_waiting"] == 2
+        assert sched.batch_generator is generator
+        assert all(
+            getattr(sched, field) is original
+            for field, original in zip(cache_fields, providers)
+        )
+        assert cache_payloads == [
+            {"hits": 3, "ratio": 0.25, "legacy": None},
+            {"memory_mb": 1.5, "detail": {"unknown": [True, None]}},
+            {"hit_rate": 0.5, "tokens_saved": 8},
+        ]
+        assert mtp_payload == {
+            "enabled": True,
+            "attempted": 2,
+            "bypass_counts": {"x": 1},
+        }
+
+    @pytest.mark.parametrize("source", ["mtp", "paged", "memory", "prefix"])
+    def test_provider_errors_propagate_without_wrapping(self, monkeypatch, source):
+        calls = []
+        sched = self._make_stats_scheduler(monkeypatch, "unavailable", calls)
+        error = ValueError("provider failure")
+
+        def fail():
+            calls.append(source)
+            raise error
+
+        provider = types.SimpleNamespace(get_stats=fail)
+        if source == "mtp":
+            sched.batch_generator.get_mtp_stats = fail
+        else:
+            field = {
+                "paged": "block_aware_cache",
+                "memory": "memory_aware_cache",
+                "prefix": "prefix_cache",
+            }[source]
+            setattr(sched, field, provider)
+
+        with pytest.raises(ValueError) as caught:
+            sched.get_stats()
+
+        assert caught.value is error
+        assert calls == (["mtp"] if source == "mtp" else ["available", source])

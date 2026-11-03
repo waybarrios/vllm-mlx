@@ -856,6 +856,7 @@ def test_save_load_roundtrip_through_provenance_subdir(tmp_path):
     fake_cache_mod = types.ModuleType("mlx_lm.models.cache")
     fake_cache_mod.save_prompt_cache = _fake_save
     fake_cache_mod.load_prompt_cache = lambda path: [MockKVCache(500, 500)]
+    fake_mlx.__version__ = getattr(sys.modules.get("mlx_lm"), "__version__", "Unknown")
     fake_mlx.models = fake_models
     fake_models.cache = fake_cache_mod
 

@@ -86,11 +86,13 @@ class _FunctionDef:
 
     @property
     def name(self) -> str:
-        return self._d.get("name", "")
+        name: str = self._d.get("name", "")
+        return name
 
     @property
     def parameters(self) -> dict:
-        return self._d.get("parameters", {})
+        parameters: dict = self._d.get("parameters", {})
+        return parameters
 
 
 class _ToolDef:
@@ -104,7 +106,8 @@ class _ToolDef:
 
     @property
     def type(self) -> str:
-        return self._d.get("type", "function")
+        tool_type: str = self._d.get("type", "function")
+        return tool_type
 
     @property
     def function(self) -> _FunctionDef:
@@ -152,7 +155,7 @@ class StreamingXMLToolCallParser:
     def reset_streaming_state(self):
         """Reset streaming parsing state"""
 
-        self.deltas = []
+        self.deltas: list[DeltaMessage] = []
         # state for streaming
         self.tool_call_index = 0
         self.current_call_id = None
@@ -653,7 +656,7 @@ class StreamingXMLToolCallParser:
         ):
             is_tool_call = True
         # Handle <function=name> format -> <function name="name">
-        processed = re.sub(r"<function=([^>]+)>", r'<function name="\1">', chunk)
+        processed: str = re.sub(r"<function=([^>]+)>", r'<function name="\1">', chunk)
         # Handle <parameter=name> format -> <parameter name="name">
         processed = re.sub(r"<parameter=([^>]+)>", r'<parameter name="\1">', processed)
 
