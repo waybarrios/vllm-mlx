@@ -133,6 +133,25 @@ response = client.completions.create(
 )
 ```
 
+### Quantized KV cache for long prompts
+
+This option is off by default. If a long document or code prompt is close to
+your Mac's memory budget, try `extra_body={"kv_cache_bits": 8}` in the OpenAI
+Python client. For a raw HTTP request, send `"kv_cache_bits": 8` as a top-level
+JSON field. Both completion endpoints accept it, and it applies to that request
+only.
+
+SimpleEngine keeps every prompt token and quantizes each layer's KV cache as
+soon as the layer finishes the prompt. This lowers peak prefill memory compared
+with waiting until all layers finish. Choose `4` for a smaller cache than `8`.
+KV precision can affect the answer, and the first token can take longer.
+`--prefill-step-size` controls the chunk size within each layer.
+
+This option supports dense, full-attention Llama and Qwen3 models with head
+dimensions divisible by 64. It uses a fresh cache for each request, so repeated
+questions about the same document repeat prefill. Continuous batching,
+speculative decoding, SpecPrefill, and rotating caches are unsupported.
+
 ### Models
 
 ```bash
