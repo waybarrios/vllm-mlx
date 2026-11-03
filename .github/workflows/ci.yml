@@ -279,9 +279,12 @@ jobs:
             -m "not slow" \
             -k "not Integration"
 
-      - name: Run detached snapshot release regression
+      - name: Run prefix-cache persistence and snapshot release regressions
         run: |
-          pytest tests/test_memory_cache.py::test_detached_snapshot_is_freed_without_a_gc_pass -v --tb=short
+          pytest \
+            tests/test_memory_cache.py::test_save_load_roundtrip_through_provenance_subdir \
+            tests/test_memory_cache.py::test_detached_snapshot_is_freed_without_a_gc_pass \
+            -v --tb=short
 
       - name: Run hybrid boundary checkpoint regressions
         run: |
