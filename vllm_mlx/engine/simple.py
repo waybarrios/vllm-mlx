@@ -1651,6 +1651,7 @@ class SimpleEngine(BaseEngine):
             text = clean_output_text(final_output.text)
             return GenerationOutput(
                 text=text,
+                raw_text=final_output.text,
                 tokens=list(final_output.tokens),
                 prompt_tokens=final_output.prompt_tokens,
                 completion_tokens=final_output.completion_tokens,

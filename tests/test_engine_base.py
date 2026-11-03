@@ -42,6 +42,7 @@ class TestGenerationOutput:
             "new_text",
             "finished",
             "specprefill_outcome",
+            "raw_text",
         )
         declared = fields(GenerationOutput)
         assert tuple(item.name for item in declared) == expected_names
@@ -56,6 +57,7 @@ class TestGenerationOutput:
             str,
             bool,
             "SpecPrefillOutcome | None",
+            str | None,
         )
         assert declared[0].default is MISSING
         assert declared[1].default is MISSING
@@ -68,6 +70,7 @@ class TestGenerationOutput:
             0,
             "",
             True,
+            None,
             None,
         )
         assert all(item.default_factory is MISSING for item in declared[2:])
@@ -98,18 +101,20 @@ class TestGenerationOutput:
             "new_text": "",
             "finished": True,
             "specprefill_outcome": None,
+            "raw_text": None,
         }
         assert asdict(first) == expected
         assert json.dumps(asdict(first)) == (
             '{"text": "hello", "tokens": [], "prompt_tokens": 0, '
             '"completion_tokens": 0, "finish_reason": "stop", "mtp_drafts": 0, '
             '"mtp_accepted": 0, "new_text": "", "finished": true, '
-            '"specprefill_outcome": null}'
+            '"specprefill_outcome": null, "raw_text": null}'
         )
         assert repr(first) == (
             "GenerationOutput(text='hello', tokens=[], prompt_tokens=0, "
             "completion_tokens=0, finish_reason='stop', mtp_drafts=0, "
-            "mtp_accepted=0, new_text='', finished=True, specprefill_outcome=None)"
+            "mtp_accepted=0, new_text='', finished=True, specprefill_outcome=None, "
+            "raw_text=None)"
         )
         assert first == second
         assert first.tokens is not second.tokens
@@ -134,6 +139,7 @@ class TestGenerationOutput:
             specprefill_outcome=None,
         )
         assert positional == keyword
+        assert positional.raw_text is keyword.raw_text is None
         assert asdict(positional) == {
             "text": "hello",
             "tokens": [7, 8],
@@ -145,15 +151,67 @@ class TestGenerationOutput:
             "new_text": "lo",
             "finished": False,
             "specprefill_outcome": None,
+            "raw_text": None,
         }
         assert json.dumps(asdict(positional)) == (
             '{"text": "hello", "tokens": [7, 8], "prompt_tokens": 3, '
             '"completion_tokens": 2, "finish_reason": null, "mtp_drafts": 9, '
             '"mtp_accepted": 4, "new_text": "lo", "finished": false, '
-            '"specprefill_outcome": null}'
+            '"specprefill_outcome": null, "raw_text": null}'
         )
         keyword.mtp_accepted = 3
         assert positional != keyword
+
+    def test_nonempty_raw_text_roundtrip_preserves_separate_public_text(self):
+        raw = "<|channel|>final<|message|>hello<|return|>"
+        positional = GenerationOutput(
+            "hello", [7, 8], 3, 2, None, 9, 4, "lo", False, None, raw
+        )
+        keyword = GenerationOutput(
+            text="hello",
+            tokens=[7, 8],
+            prompt_tokens=3,
+            completion_tokens=2,
+            finish_reason=None,
+            mtp_drafts=9,
+            mtp_accepted=4,
+            new_text="lo",
+            finished=False,
+            specprefill_outcome=None,
+            raw_text=raw,
+        )
+        assert positional == keyword
+        assert positional.text == "hello"
+        assert positional.raw_text == raw
+        assert positional.text != positional.raw_text
+        assert asdict(positional) == {
+            "text": "hello",
+            "tokens": [7, 8],
+            "prompt_tokens": 3,
+            "completion_tokens": 2,
+            "finish_reason": None,
+            "mtp_drafts": 9,
+            "mtp_accepted": 4,
+            "new_text": "lo",
+            "finished": False,
+            "specprefill_outcome": None,
+            "raw_text": "<|channel|>final<|message|>hello<|return|>",
+        }
+        serialized = json.dumps(asdict(positional))
+        assert serialized == (
+            '{"text": "hello", "tokens": [7, 8], "prompt_tokens": 3, '
+            '"completion_tokens": 2, "finish_reason": null, "mtp_drafts": 9, '
+            '"mtp_accepted": 4, "new_text": "lo", "finished": false, '
+            '"specprefill_outcome": null, '
+            '"raw_text": "<|channel|>final<|message|>hello<|return|>"}'
+        )
+        restored = GenerationOutput(**json.loads(serialized))
+        assert restored == keyword
+        assert restored.text == "hello"
+        assert restored.raw_text == raw
+        keyword.raw_text = None
+        assert positional != keyword
+        assert keyword.text == "hello"
 
 
 class _EngineWithoutStreams(BaseEngine):

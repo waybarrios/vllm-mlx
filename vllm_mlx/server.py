@@ -184,7 +184,9 @@ from .metrics import metrics as _metrics
 from .models.mllm import UnsafeRemoteURLError, _validate_url_safety, is_url
 from .reasoning import DeltaMessage, get_parser as get_reasoning_parser
 from .reasoning.base import ReasoningParser
+from .reasoning.harmony_parser import HarmonyReasoningParser
 from .tool_parsers import ToolParserManager, get_parser_stop_tokens
+from .tool_parsers.harmony_tool_parser import HarmonyToolParser
 
 if TYPE_CHECKING:
     from .tool_parsers.abstract_tool_parser import ToolParserTokenizer
@@ -1525,6 +1527,10 @@ def _prepare_streaming_reasoning_parser(
     ):
         return None
     parser = _build_reasoning_parser(engine)
+    if parser is None and _tool_call_parser in ("harmony", "gpt-oss"):
+        # Harmony routing remains private even when reasoning/tool extraction
+        # is disabled for this request. Project only public assistant bodies.
+        parser = HarmonyReasoningParser(include_plain=True, include_reasoning=False)
     if parser is not None:
         parser.reset_state(implicit_mode=_detect_implicit_thinking(engine, chat_kwargs))
     return parser
@@ -3650,6 +3656,11 @@ def _extract_reasoning_and_tool_calls(
     """
     reasoning_text = None
     text_for_tool_parse = output_text
+    tools_enabled = bool(
+        request is not None
+        and getattr(request, "tools", None)
+        and getattr(request, "tool_choice", None) != "none"
+    )
 
     suppress_reasoning = not allow_reasoning
     if _reasoning_parser and suppress_reasoning:
@@ -3671,7 +3682,7 @@ def _extract_reasoning_and_tool_calls(
             # output with the analysis (reasoning) blocks removed so the
             # commentary call can be extracted without reasoning text
             # reaching the generic fallback.
-            if request is not None and getattr(request, "tools", None):
+            if tools_enabled:
                 text_for_tool_parse = _strip_harmony_analysis_blocks(output_text)
             else:
                 text_for_tool_parse = ""
@@ -3682,7 +3693,13 @@ def _extract_reasoning_and_tool_calls(
 
     # Skip tool parsing when the request defines no tools — otherwise the
     # parser can misinterpret JSON output (e.g. response_format) as tool calls.
-    if request is not None and getattr(request, "tools", None):
+    cleaned_text: str | None
+    if tools_enabled:
+        if "<|channel|>" in output_text:
+            # Channel metadata belongs to the tool parser, not the reasoning
+            # parser's final-content projection. Never feed analysis JSON to
+            # the generic fallback, even when reasoning parsing is disabled.
+            text_for_tool_parse = _strip_harmony_analysis_blocks(output_text)
         try:
             cleaned_text, tool_calls = _parse_tool_calls_with_parser(
                 text_for_tool_parse or "",
@@ -3698,7 +3715,15 @@ def _extract_reasoning_and_tool_calls(
             )
     else:
         cleaned_text, tool_calls = text_for_tool_parse, None
+        if "<|channel|>" in output_text:
+            _, cleaned_text = HarmonyReasoningParser(
+                include_plain=True
+            ).extract_reasoning(output_text)
 
+    if reasoning_text:
+        # Raw framing is internal parser input, not public reasoning. Preserve
+        # whitespace and never run this cleanup over structured tool arguments.
+        reasoning_text = SPECIAL_TOKENS_PATTERN.sub("", reasoning_text)
     return reasoning_text, cleaned_text, tool_calls
 
 
@@ -3835,6 +3860,19 @@ def _extract_streaming_tool_delta(
         delta_text,
         request=request_context,
     )
+    if isinstance(parser, HarmonyToolParser):
+        # Project public bodies independently from tool detection. This keeps
+        # whitespace and held literal prefixes intact without exposing headers.
+        projection = getattr(parser, "_harmony_content_projection", None)
+        if projection is None:
+            projection = HarmonyReasoningParser(include_plain=True)
+            setattr(parser, "_harmony_content_projection", projection)
+        delta = projection.extract_reasoning_streaming(
+            previous_text, current_text, delta_text
+        )
+        content = SPECIAL_TOKENS_PATTERN.sub("", delta.content or "") if delta else ""
+        if result is not None or content:
+            result = {**(result or {}), "content": content}
     return current_text, result
 
 
@@ -3943,7 +3981,9 @@ def _streaming_tool_markup_possible(text: str, tool_parser=None) -> bool:
 
 def _requires_eager_tool_streaming(tool_parser) -> bool:
     """Return whether a parser must receive every delta from response start."""
-    return bool(getattr(tool_parser, "REQUIRES_EAGER_STREAMING", False))
+    return isinstance(tool_parser, HarmonyToolParser) or bool(
+        getattr(tool_parser, "REQUIRES_EAGER_STREAMING", False)
+    )
 
 
 def _streaming_tool_markup_possible_after_delta(
@@ -3968,6 +4008,14 @@ def _finalize_streaming_tool_result(
     tool_parser, current_text: str, result: dict | None = None
 ):
     """Let parsers resolve an ambiguous prefix at end of generation."""
+    projection = getattr(tool_parser, "_harmony_content_projection", None)
+    if isinstance(projection, HarmonyReasoningParser):
+        delta = projection.finalize_stream()
+        if delta and delta.content:
+            result = {
+                **(result or {}),
+                "content": (result or {}).get("content", "") + delta.content,
+            }
     finalize = getattr(tool_parser, "finalize_streaming", None)
     if finalize is None:
         return result
@@ -6074,7 +6122,7 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
         )
 
         reasoning_text, cleaned_text, tool_calls = _extract_reasoning_and_tool_calls(
-            output.text,
+            getattr(output, "raw_text", None) or output.text,
             request,
             allow_reasoning=not _thinking_disabled(request, prepared.chat_kwargs),
             engine=engine,
@@ -6517,7 +6565,7 @@ async def create_anthropic_message(
         )
 
         reasoning_text, cleaned_text, tool_calls = _extract_reasoning_and_tool_calls(
-            output.text,
+            getattr(output, "raw_text", None) or output.text,
             openai_request,
             allow_reasoning=(
                 not _thinking_disabled(openai_request, prepared.chat_kwargs)
@@ -6821,7 +6869,7 @@ async def _stream_anthropic_messages(
     # block. Parsed reasoning is suppressed — the request disabled
     # thinking, so only cleaned content is emitted into the already-open
     # text block (no thinking block is started).
-    disabled_reasoning_latched = False
+    disabled_reasoning_latched = isinstance(reasoning_parser, HarmonyReasoningParser)
 
     # Block index tracking: with reasoning parser we use index 0 for
     # thinking and index 1 for text; without parser, index 0 for text.
@@ -6843,7 +6891,8 @@ async def _stream_anthropic_messages(
     # as text_delta events. Mirrors the OpenAI streaming path logic.
     tool_accumulated_text = ""
     tool_parser = _get_streaming_tool_parser(openai_request, engine)
-    tool_markup_possible = _requires_eager_tool_streaming(tool_parser)
+    harmony_tools = isinstance(tool_parser, HarmonyToolParser)
+    tool_markup_possible = harmony_tools or _requires_eager_tool_streaming(tool_parser)
     tool_request_context = openai_request.model_dump()
 
     try:
@@ -6870,7 +6919,8 @@ async def _stream_anthropic_messages(
             # Filter special tokens
             filtered = SPECIAL_TOKENS_PATTERN.sub("", delta_text)
             if not filtered and not (
-                (use_reasoning and output_finished)
+                reasoning_parser
+                or harmony_tools
                 or (tool_parser and tool_markup_possible and output_finished)
             ):
                 continue
@@ -6880,7 +6930,7 @@ async def _stream_anthropic_messages(
                 and thinking_off
                 and not disabled_reasoning_latched
                 and _explicit_reasoning_markers_present(
-                    accumulated_text + filtered, reasoning_parser
+                    accumulated_text + delta_text, reasoning_parser
                 )
             ):
                 disabled_reasoning_latched = True
@@ -6939,22 +6989,32 @@ async def _stream_anthropic_messages(
 
             # Reasoning parser path
             previous_text = accumulated_text
-            accumulated_text += filtered
+            accumulated_text += delta_text
             assert reasoning_parser is not None
             delta_msg = _extract_streaming_reasoning_delta(
                 reasoning_parser,
                 previous_text,
                 accumulated_text,
-                filtered,
+                delta_text,
                 finished=output_finished,
             )
 
             if delta_msg is None:
-                if output_finished and tool_parser and tool_markup_possible:
+                if harmony_tools or (
+                    output_finished and tool_parser and tool_markup_possible
+                ):
                     delta_msg = DeltaMessage()
                 else:
                     continue
 
+            # Non-Harmony parsers do not consume Harmony/ChatML controls from
+            # raw transport. Sanitize public projections without trimming them.
+            if delta_msg.content:
+                delta_msg.content = SPECIAL_TOKENS_PATTERN.sub("", delta_msg.content)
+            if delta_msg.reasoning:
+                delta_msg.reasoning = SPECIAL_TOKENS_PATTERN.sub(
+                    "", delta_msg.reasoning
+                )
             if delta_msg.reasoning and not thinking_off:
                 if not thinking_block_started:
                     yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': thinking_index, 'content_block': {'type': 'thinking', 'thinking': ''}})}\n\n"
@@ -6962,21 +7022,24 @@ async def _stream_anthropic_messages(
                 yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': thinking_index, 'delta': {'type': 'thinking_delta', 'thinking': delta_msg.reasoning}})}\n\n"
 
             content_to_emit = delta_msg.content or ""
-            if content_to_emit or (
-                tool_parser and output_finished and tool_markup_possible
+            tool_delta = delta_text if harmony_tools else content_to_emit
+            if (
+                content_to_emit
+                or tool_delta
+                or (tool_parser and output_finished and tool_markup_possible)
             ):
 
                 # Filter tool call markup during streaming
                 if tool_parser and (
-                    content_to_emit or (output.finished and tool_markup_possible)
+                    tool_delta or (output.finished and tool_markup_possible)
                 ):
                     if (
                         not tool_markup_possible
                         and not _streaming_tool_markup_possible_after_delta(
-                            tool_accumulated_text, content_to_emit, tool_parser
+                            tool_accumulated_text, tool_delta, tool_parser
                         )
                     ):
-                        tool_accumulated_text += content_to_emit
+                        tool_accumulated_text += tool_delta
                     else:
                         if not tool_markup_possible:
                             tool_markup_possible = True
@@ -6984,7 +7047,7 @@ async def _stream_anthropic_messages(
                             _parse_streaming_tool_content(
                                 tool_parser,
                                 tool_accumulated_text,
-                                content_to_emit,
+                                tool_delta,
                                 tool_request_context,
                             )
                         )
@@ -6996,10 +7059,13 @@ async def _stream_anthropic_messages(
                                 tool_parser, tool_accumulated_text, tool_result
                             )
 
-                        if tool_result is None:
+                        if tool_result is None and not (
+                            harmony_tools and content_to_emit
+                        ):
                             # Inside tool markup, so suppress this delta.
                             continue
-                        content_to_emit = tool_result.get("content", "")
+                        if not harmony_tools and tool_result is not None:
+                            content_to_emit = tool_result.get("content", "")
                         if content_to_emit:
                             content_to_emit = _TOOL_MARKUP_PATTERN.sub(
                                 "", content_to_emit
@@ -7032,7 +7098,7 @@ async def _stream_anthropic_messages(
         # its tool call. Fall back to the stripped accumulation when no tool
         # parser was active (mirrors prior behavior for non-tool responses).
         _, tool_calls = _parse_tool_calls_with_parser(
-            tool_accumulated_text or accumulated_text,
+            _strip_harmony_analysis_blocks(tool_accumulated_text or accumulated_text),
             openai_request,
             engine=engine,
         )
@@ -7250,7 +7316,9 @@ async def stream_chat_completion(
     # request disabled thinking, so only cleaned content is emitted.
     raw_stream_text = ""
     thinking_off = _thinking_disabled(request, kwargs)
-    disabled_reasoning_latched = False
+    # Harmony can safely classify bodies from the first byte. Waiting for a
+    # think-tag marker bypasses it and leaks fragmented headers when disabled.
+    disabled_reasoning_latched = isinstance(reasoning_parser, HarmonyReasoningParser)
 
     # Track token counts for usage reporting
     prompt_tokens = 0
@@ -7270,7 +7338,8 @@ async def stream_chat_completion(
     tool_accumulated_text = ""
     tool_calls_detected = False
     tool_parser = _get_streaming_tool_parser(request, engine)
-    tool_markup_possible = _requires_eager_tool_streaming(tool_parser)
+    harmony_tools = isinstance(tool_parser, HarmonyToolParser)
+    tool_markup_possible = harmony_tools or _requires_eager_tool_streaming(tool_parser)
     buffer_typed_tool_calls = request.tool_argument_recovery == "buffered"
     buffered_tool_calls: dict[int, dict] = {}
     # Whether any emitted chunk carried a terminal finish_reason. The engine's
@@ -7327,9 +7396,12 @@ async def stream_chat_completion(
                 )
 
                 if delta_msg is None:
-                    if output_finished and (
-                        fence_stripper is not None
-                        or (tool_parser and tool_markup_possible)
+                    if harmony_tools or (
+                        output_finished
+                        and (
+                            fence_stripper is not None
+                            or (tool_parser and tool_markup_possible)
+                        )
                     ):
                         delta_msg = DeltaMessage()
                     else:
@@ -7347,7 +7419,7 @@ async def stream_chat_completion(
                 # blocks, so reasoning parser captures tool call XML as
                 # reasoning while content stays None.  Redirect reasoning
                 # to the content stream so the tool parser can handle it.
-                if tool_parser and reasoning and not content:
+                if tool_parser and reasoning and not content and not harmony_tools:
                     _check = tool_accumulated_text + reasoning
                     if _streaming_tool_markup_possible(_check, tool_parser):
                         content = reasoning
@@ -7357,20 +7429,21 @@ async def stream_chat_completion(
                     # The request disabled thinking — surface only parsed
                     # content; drop reasoning the model emitted anyway.
                     reasoning = None
-                    if not content:
+                    if not content and not harmony_tools:
                         continue
 
                 # Tool call parsing on content portion
+                tool_delta = delta_text if harmony_tools else content
                 if tool_parser and (
-                    content or (output_finished and tool_markup_possible)
+                    tool_delta or (output_finished and tool_markup_possible)
                 ):
                     if (
                         not tool_markup_possible
                         and not _streaming_tool_markup_possible_after_delta(
-                            tool_accumulated_text, content, tool_parser
+                            tool_accumulated_text, tool_delta, tool_parser
                         )
                     ):
-                        tool_accumulated_text += content
+                        tool_accumulated_text += tool_delta
                         # Emit as-is; no tool markup is even possible yet.
                     else:
                         if not tool_markup_possible:
@@ -7379,7 +7452,7 @@ async def stream_chat_completion(
                             _extract_streaming_tool_delta(
                                 tool_parser,
                                 tool_accumulated_text,
-                                content,
+                                tool_delta,
                                 tool_request_context,
                             )
                         )
@@ -7400,6 +7473,10 @@ async def stream_chat_completion(
                         ):
                             tool_result = {**(tool_result or {}), "tool_calls": []}
 
+                        if harmony_tools and content and tool_result is None:
+                            # Tool suppression must not veto a final body that
+                            # the reasoning parser has already classified.
+                            tool_result = {}
                         if tool_result is None:
                             # Inside tool markup - suppress content output
                             if reasoning:
@@ -7431,6 +7508,8 @@ async def stream_chat_completion(
                                 tool_accumulated_text,
                                 tool_result.get("content", ""),
                             )
+                            if harmony_tools:
+                                leading = content
                             if leading:
                                 yield f"data: {ChatCompletionChunk(id=response_id, model=_response_model_name(request.model), choices=[ChatCompletionChunkChoice(delta=ChatCompletionChunkDelta(content=leading))]).model_dump_json()}\n\n"
 
@@ -7480,7 +7559,8 @@ async def stream_chat_completion(
                             continue
 
                         # Normal content from tool parser
-                        content = tool_result.get("content", "")
+                        if not harmony_tools:
+                            content = tool_result.get("content", "")
                         if (
                             content
                             and tool_calls_detected

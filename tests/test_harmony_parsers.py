@@ -21,6 +21,79 @@ from vllm_mlx.reasoning.harmony_parser import HarmonyReasoningParser
 from vllm_mlx.tool_parsers import ToolParserManager
 from vllm_mlx.tool_parsers.harmony_tool_parser import HarmonyToolParser
 
+
+@pytest.mark.parametrize("parser_name", ["harmony", "gpt_oss"])
+@pytest.mark.parametrize("fragmented", [False, True])
+def test_harmony_projection_keeps_each_body_at_eos(parser_name, fragmented):
+    """Header order and chunk boundaries must not change public channel bodies."""
+    raw = (
+        "<|channel|>analysis<|message|>Need weather.<|end|>"
+        "<|channel|>commentary<|message|>Checking now.<|end|>"
+        "<|start|>assistant to=functions.get_weather<|channel|>commentary"
+        '<|message|>{"city":"Paris"}<|call|>'
+        "<|start|>assistant<|channel|>final<|message|>Safe answer."
+    )
+    parser = get_parser(parser_name)()
+    assert parser.extract_reasoning(raw) == (
+        "Need weather.",
+        "Checking now.Safe answer.",
+    )
+    previous = ""
+    thoughts, contents = [], []
+    for chunk in list(raw) if fragmented else [raw]:
+        current = previous + chunk
+        delta = parser.extract_reasoning_streaming(previous, current, chunk)
+        if delta:
+            thoughts.append(delta.reasoning or "")
+            contents.append(delta.content or "")
+        previous = current
+    final = parser.finalize_stream()
+    if final:
+        thoughts.append(final.reasoning or "")
+        contents.append(final.content or "")
+    assert "".join(thoughts) == "Need weather."
+    assert "".join(contents) == "Checking now.Safe answer."
+
+
+@pytest.mark.parametrize("parser_name", ["harmony", "gpt_oss"])
+@pytest.mark.parametrize("fragmented", [False, True])
+def test_harmony_projection_holds_public_control_fragments(parser_name, fragmented):
+    raw = (
+        "<|channel|>analysis<|message|>Thinking.<|im_end|>"
+        "<|channel|>final<|message|>Safe.<|im_end|><|return|>"
+    )
+    parser = get_parser(parser_name)()
+    previous = ""
+    thoughts, contents = [], []
+    for chunk in list(raw) if fragmented else [raw]:
+        current = previous + chunk
+        delta = parser.extract_reasoning_streaming(previous, current, chunk)
+        if delta:
+            thoughts.append(delta.reasoning or "")
+            contents.append(delta.content or "")
+        previous = current
+    assert "".join(thoughts) == "Thinking."
+    assert "".join(contents) == "Safe."
+
+
+@pytest.mark.parametrize(
+    "header",
+    [
+        "<|start|>assistant to=functions.get-weather<|channel|>commentary",
+        "<|channel|>commentary to=functions.get-weather",
+    ],
+)
+def test_harmony_tool_recipient_order_and_hyphenated_name(header):
+    result = HarmonyToolParser().extract_tool_calls(
+        header + '<|message|>{"city":"Paris"}'
+    )
+    assert result.tools_called
+    assert len(result.tool_calls) == 1
+    assert result.tool_calls[0]["name"] == "get-weather"
+    assert json.loads(result.tool_calls[0]["arguments"]) == {"city": "Paris"}
+    assert not result.content
+
+
 # ============================================================================
 # Tool Parser Tests
 # ============================================================================

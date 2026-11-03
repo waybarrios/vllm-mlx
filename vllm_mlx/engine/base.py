@@ -39,6 +39,8 @@ class GenerationOutput:
     finished: bool = True
     # Request-level sparse-prefill decision and diagnostics.
     specprefill_outcome: "SpecPrefillOutcome | None" = None
+    # Internal parser input for non-streaming APIs. ``text`` remains cleaned.
+    raw_text: str | None = None
 
 
 class EngineBusy(RuntimeError):
