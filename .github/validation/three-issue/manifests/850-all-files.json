@@ -35,7 +35,7 @@
     "untracked": false
   },
   ".github/workflows/ci.yml": {
-    "sha256": "78e0ce789cea41361ab627c650b4c495620d2d2ba5dd7a7d9e515c02a584ee56",
+    "sha256": "24d0029d92963c9e114f28f6c6a54cbe857582e0de7180a59db29ba90ad5d783",
     "git_mode": "100644",
     "untracked": false
   },
@@ -1885,7 +1885,7 @@
     "untracked": false
   },
   "vllm_mlx/mllm_batch_generator.py": {
-    "sha256": "1f9eb0ad3d8bf04a3e17f16d81630ed46eb895fdfaf81b9b047233e61a3c5edd",
+    "sha256": "f353e1086a09a8be5ad8e6918d09f432dbfc18db464e2f3077b698282e944de5",
     "git_mode": "100644",
     "untracked": false
   },

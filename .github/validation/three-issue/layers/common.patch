@@ -1,5 +1,5 @@
 diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
-index 9cd47bc9f340442ac211c969438e16fcccb40728..d8d4435cf0aa4caa9b72b643f9d37c407fa6772c 100644
+index 9cd47bc9f340442ac211c969438e16fcccb40728..e53bc60de5ff3c26af4a8669408c581615964098 100644
 --- a/.github/workflows/ci.yml
 +++ b/.github/workflows/ci.yml
 @@ -100,6 +100,7 @@ jobs:
@@ -10,6 +10,15 @@ index 9cd47bc9f340442ac211c969438e16fcccb40728..d8d4435cf0aa4caa9b72b643f9d37c40
              tests/test_ssd_cache_shutdown.py \
              tests/test_chat_template_safety.py \
              tests/test_simple_engine_thread_pinning.py \
+@@ -194,7 +195,7 @@ jobs:
+           pytest tests/test_engine_base.py -v --tb=short
+ 
+   test-apple-silicon:
+-    runs-on: macos-14
++    runs-on: macos-15
+     strategy:
+       matrix:
+         python-version: ["3.11", "3.13"]
 diff --git a/tests/test_api_models.py b/tests/test_api_models.py
 index bf687474f8e6cd1340d6c43f33e299b0269894e4..1fd7d25d2db488f65c6f9d0f90822fd549eeab4d 100644
 --- a/tests/test_api_models.py
@@ -1428,6 +1437,139 @@ index 0b1e1fff5ad28594475eda7ad619a71e76b45c68..7ec79a7d1d5ebe210e642b5c7c15ee7b
  
  
  @pytest.mark.anyio
+diff --git a/tests/test_manual_script_imports.py b/tests/test_manual_script_imports.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..401a5a073459c4787739b25a783310701e6d06ba
+--- /dev/null
++++ b/tests/test_manual_script_imports.py
+@@ -0,0 +1,127 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Manual native experiments must be safe to import during pytest discovery."""
++
++import ast
++import os
++import platform
++import subprocess
++import sys
++import textwrap
++from pathlib import Path
++
++import pytest
++
++_ROOT = Path(__file__).resolve().parents[1]
++_SCRIPTS = (
++    "test_paged_cache_benefits.py",
++    "test_paged_cache_real_inference.py",
++    "test_paged_cache_real_model.py",
++    "test_registry_idle_unload_real_model.py",
++)
++_DEMONSTRATIONS = {
++    "demonstrate_benefit_1_shared_system_prompts",
++    "demonstrate_benefit_2_memory_efficiency",
++    "demonstrate_benefit_3_prefix_sharing",
++    "demonstrate_copy_on_write_demo",
++}
++
++
++def _run_python(*args):
++    return subprocess.run(
++        [sys.executable, *args],
++        cwd=_ROOT,
++        env={
++            **os.environ,
++            "PYTHONDONTWRITEBYTECODE": "1",
++            "HF_HUB_OFFLINE": "1",
++            "TRANSFORMERS_OFFLINE": "1",
++        },
++        capture_output=True,
++        text=True,
++        timeout=15,
++        check=False,
++    )
++
++
++@pytest.mark.parametrize("filename", _SCRIPTS)
++def test_manual_script_import_does_not_run_experiment(filename):
++    code = textwrap.dedent("""
++        import asyncio
++        import importlib.abc
++        import importlib.util
++        import subprocess
++        import sys
++
++        class NoExperimentImports(importlib.abc.MetaPathFinder):
++            def find_spec(self, fullname, path=None, target=None):
++                if fullname.split('.')[0] in {'mlx', 'mlx_lm', 'vllm_mlx'}:
++                    raise AssertionError('Experiment import during discovery: ' + fullname)
++
++        def no_experiment(*args, **kwargs):
++            raise AssertionError('Experiment execution during discovery')
++
++        sys.meta_path.insert(0, NoExperimentImports())
++        subprocess.Popen = no_experiment
++        asyncio.run = no_experiment
++        spec = importlib.util.spec_from_file_location('manual_script_import_probe', sys.argv[1])
++        module = importlib.util.module_from_spec(spec)
++        spec.loader.exec_module(module)
++        print('IMPORT_COMPLETED_WITHOUT_EXPERIMENT')
++        """)
++    result = _run_python("-c", code, str(_ROOT / "tests" / filename))
++    assert result.returncode == 0, result.stderr
++    # A module-level sys.exit(0) also has return code zero; the sentinel must
++    # execute after import, and no benchmark output may precede it.
++    assert result.stdout == "IMPORT_COMPLETED_WITHOUT_EXPERIMENT\n"
++    assert result.stderr == ""
++
++
++@pytest.mark.parametrize("filename", _SCRIPTS)
++def test_manual_script_keeps_direct_cli_hardware_guard(filename):
++    script = _ROOT / "tests" / filename
++    tree = ast.parse(script.read_text())
++    if filename == "test_paged_cache_real_inference.py":
++        entry = next(
++            node
++            for node in tree.body
++            if isinstance(node, ast.If) and "__name__" in ast.unparse(node.test)
++        )
++    else:
++        entry = next(
++            node
++            for node in tree.body
++            if isinstance(node, ast.FunctionDef) and node.name == "main"
++        )
++    body = list(entry.body)
++    if isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant):
++        body = body[1:]  # Ignore an entry-point docstring.
++    guard = body[0]
++    assert isinstance(guard, ast.If)
++    assert "sys.platform" in ast.unparse(guard.test)
++    assert "platform.machine()" in ast.unparse(guard.test)
++    assert "sys.exit(0)" in ast.unparse(guard)
++
++    # Never run real experiments on an available native host. The static
++    # entry-point contract above is checked there too, without platform spoofing.
++    if sys.platform != "darwin" or platform.machine() != "arm64":
++        result = _run_python(str(script))
++        assert result.returncode == 0, result.stderr
++        assert result.stdout == "This test requires Apple Silicon\n"
++        assert result.stderr == ""
++
++
++def test_benefit_demonstrations_remain_callable_from_main_not_pytest():
++    tree = ast.parse((_ROOT / "tests" / "test_paged_cache_benefits.py").read_text())
++    functions = {
++        node.name: node for node in tree.body if isinstance(node, ast.FunctionDef)
++    }
++    assert not any(name.startswith("test_") for name in functions)
++    assert {name for name in functions if name.startswith("demonstrate_")} == (
++        _DEMONSTRATIONS
++    )
++    main_calls = {
++        node.func.id
++        for node in ast.walk(functions["main"])
++        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
++    }
++    assert _DEMONSTRATIONS <= main_calls
 diff --git a/tests/test_mcp_security.py b/tests/test_mcp_security.py
 index b68b5d00a91b1280eb50819d8be46944507ee893..0d9bb3db92a7a61ecfa92758d387d5612ee4105e 100644
 --- a/tests/test_mcp_security.py
@@ -6667,7 +6809,7 @@ index b1851723ff5edf90fd46f2180e59abc516101027..5f2c2742aa0f2c8840f58e3efd52d5d4
              self._prom["generate_latest"](self._prom["registry"]),
              self._prom["content_type"],
 diff --git a/vllm_mlx/mllm_batch_generator.py b/vllm_mlx/mllm_batch_generator.py
-index 3fb48ac59a65cdf7b6ee0b413e7b94158f64961e..622505ddae42a32b64c73235ca911364b395bc0d 100644
+index 3fb48ac59a65cdf7b6ee0b413e7b94158f64961e..6fdb752d341af6c767c38980bdb6b30d28f24d88 100644
 --- a/vllm_mlx/mllm_batch_generator.py
 +++ b/vllm_mlx/mllm_batch_generator.py
 @@ -22,7 +22,18 @@ import os
@@ -7324,12 +7466,16 @@ index 3fb48ac59a65cdf7b6ee0b413e7b94158f64961e..622505ddae42a32b64c73235ca911364
                      # Preserve the raw prompt logits stored with the checkpoint.
                      last_logits = prompt_last_logits + 0
                      empty_tokens = mx.array([], dtype=mx.int32)
-@@ -3938,16 +4018,17 @@ def install_chunked_prefill_mllm(
+@@ -3937,17 +4017,21 @@ def install_chunked_prefill_mllm(
+                 # A prompt ending with the think suffix already holds its
                  # conversation-boundary checkpoint, which replaces this entry.
                  extends_cached = partial["cached_count"] > 0
++                prefix_cache: Optional[MemoryAwarePrefixCache] = getattr(
++                    batch_gen, "prefix_cache", None
++                )
                  if (
 -                    getattr(batch_gen, "prefix_cache", None) is not None
-+                    batch_gen.prefix_cache is not None
++                    prefix_cache is not None
                      and is_text_only_prefix_cache_request(req)
 +                    and req.input_ids is not None
                      and batch_gen._needs_prefill_checkpoint(partial["cache"])
@@ -7339,13 +7485,14 @@ index 3fb48ac59a65cdf7b6ee0b413e7b94158f64961e..622505ddae42a32b64c73235ca911364
                      )
                      is None
                  ):
-                     full_prompt_entry = batch_gen.prefix_cache.prepare_store(
+-                    full_prompt_entry = batch_gen.prefix_cache.prepare_store(
 -                        req.input_ids.reshape(-1).tolist(),
++                    full_prompt_entry = prefix_cache.prepare_store(
 +                        cast(List[int], req.input_ids.reshape(-1).tolist()),
                          partial["cache"],
                          auxiliary={"last_logits": prompt_last_logits},
                      )
-@@ -4009,7 +4090,7 @@ def install_chunked_prefill_mllm(
+@@ -4009,7 +4093,7 @@ def install_chunked_prefill_mllm(
                  need_rep = req.repetition_penalty and req.repetition_penalty != 1.0
                  need_pres = req.presence_penalty and req.presence_penalty != 0.0
                  if need_rep or need_pres:
@@ -7354,7 +7501,7 @@ index 3fb48ac59a65cdf7b6ee0b413e7b94158f64961e..622505ddae42a32b64c73235ca911364
                      if need_rep:
                          lp_kwargs["repetition_penalty"] = req.repetition_penalty
                      if need_pres:
-@@ -4081,7 +4162,10 @@ def install_chunked_prefill_mllm(
+@@ -4081,7 +4165,10 @@ def install_chunked_prefill_mllm(
                      and is_text_only_prefix_cache_request(req)
                  ):
                      try:
@@ -7366,7 +7513,7 @@ index 3fb48ac59a65cdf7b6ee0b413e7b94158f64961e..622505ddae42a32b64c73235ca911364
                          S = batch_gen._think_suffix_len
                          cache_key = input_ids_list[:-S] if S > 0 else input_ids_list
                          # Trim output: at store time output_count=0, so
-@@ -4156,6 +4240,7 @@ def install_chunked_prefill_mllm(
+@@ -4156,6 +4243,7 @@ def install_chunked_prefill_mllm(
  
                  # Check prefix cache
                  input_ids = text_only_req.input_ids
@@ -7374,7 +7521,7 @@ index 3fb48ac59a65cdf7b6ee0b413e7b94158f64961e..622505ddae42a32b64c73235ca911364
                  if input_ids.ndim == 1:
                      input_ids = input_ids[None, :]
  
-@@ -4167,7 +4252,7 @@ def install_chunked_prefill_mllm(
+@@ -4167,7 +4255,7 @@ def install_chunked_prefill_mllm(
                  if batch_gen.prefix_cache is not None and (
                      is_text_only_prefix_cache_request(text_only_req)
                  ):
@@ -7383,7 +7530,7 @@ index 3fb48ac59a65cdf7b6ee0b413e7b94158f64961e..622505ddae42a32b64c73235ca911364
                      fetch_auxiliary = getattr(
                          batch_gen.prefix_cache, "fetch_exact_auxiliary", None
                      )
-@@ -4215,6 +4300,7 @@ def install_chunked_prefill_mllm(
+@@ -4215,6 +4303,7 @@ def install_chunked_prefill_mllm(
  
                  if cached_kv is not None and remaining_ids:
                      # Prefix cache hit
@@ -7391,7 +7538,7 @@ index 3fb48ac59a65cdf7b6ee0b413e7b94158f64961e..622505ddae42a32b64c73235ca911364
                      request_cache = prepared_cache
                      remaining = mx.array(remaining_ids)[None, :]
                      cached_count = total_tokens - len(remaining_ids)
-@@ -4222,6 +4308,7 @@ def install_chunked_prefill_mllm(
+@@ -4222,6 +4311,7 @@ def install_chunked_prefill_mllm(
                  elif cached_kv is not None and not remaining_ids:
                      # Exact hit — trim cache by 1 so replaying the last token
                      # produces correct logits (same as _process_prompts path).
@@ -7399,7 +7546,7 @@ index 3fb48ac59a65cdf7b6ee0b413e7b94158f64961e..622505ddae42a32b64c73235ca911364
                      request_cache = prepared_cache
                      remaining = input_ids[:, -1:]
                      cached_count = total_tokens - 1
-@@ -4294,6 +4381,7 @@ def install_chunked_prefill_mllm(
+@@ -4294,6 +4384,7 @@ def install_chunked_prefill_mllm(
                              request_cache, 0
                          )
                          if checkpoint_snapshot is not None:
@@ -7407,7 +7554,7 @@ index 3fb48ac59a65cdf7b6ee0b413e7b94158f64961e..622505ddae42a32b64c73235ca911364
                              batch_gen._partial["checkpoint_entry"] = (
                                  batch_gen.prefix_cache.prepare_store(
                                      checkpoint_key, checkpoint_snapshot
-@@ -4342,7 +4430,7 @@ def install_chunked_prefill_mllm(
+@@ -4342,7 +4433,7 @@ def install_chunked_prefill_mllm(
                  mx.clear_cache()
          _orig_remove(uids)
  

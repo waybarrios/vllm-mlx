@@ -74,8 +74,17 @@ def suite_cache_inventory(cache, declarations):
             resolved = path.resolve()
             assert resolved.is_relative_to(cache), str(path)
             value = digest(path)
-            # Standard Hub cache blob names authenticate the cached bytes locally.
-            blob = resolved.name
+            # Authenticate the per-repository blob ETag. New Hub caches can
+            # link that blob again into a shared store named by its Xet hash,
+            # which is a different identity from the file's SHA-256.
+            blob_path = (
+                Path(os.path.abspath(path.parent / os.readlink(path)))
+                if path.is_symlink()
+                else resolved
+            )
+            assert blob_path.parent == repository / "blobs", str(path)
+            assert blob_path.resolve() == resolved, str(path)
+            blob = blob_path.name
             if len(blob) == 64:
                 assert value == blob, str(path)
             elif len(blob) == 40:

@@ -2,15 +2,15 @@
   "base": "3af7d7d61576606153f419816be2f4a1a9baab06",
   "base_archive_sha256": "9d91dd4548108ac390a8dbbb631bde3cdbfb2fdd9a2e77b74aa56001e8389d66",
   "base_files": "manifests/base-all-files.json",
-  "status": "Source replay prepared; full configured-suite and Metal/model acceptance PENDING",
-  "native_execution": "NOT RUN",
+  "status": "Hosted R3 inputs; actual full-suite and memory acceptance remain PENDING",
+  "native_execution": "Initial hosted input check failed before measurements; corrected source/cache checks await approved publication",
   "common": {
     "patch": "layers/common.patch",
-    "patch_sha256": "640c90519f49ed9bff9ea5bc8c4f38a1456fa9aaf6ee319f140b7aa258f165d2",
+    "patch_sha256": "de84fd93234c004318188a20a45c7973814021c0e0523028edf2c42aace88e02",
     "expected_files": "manifests/common-all-files.json",
     "complete_source_file_count": 456,
-    "source_manifest_sha256": "732ed08057d5824bd8563c8349d5110d0f05ba620b520d2a632eb87c484c584f",
-    "tracked_full_diff_sha256": "640c90519f49ed9bff9ea5bc8c4f38a1456fa9aaf6ee319f140b7aa258f165d2",
+    "source_manifest_sha256": "03779590aa1d9abd0f0c61053240227066aad8f94288ed714cf8dc822285b591",
+    "tracked_full_diff_sha256": "de84fd93234c004318188a20a45c7973814021c0e0523028edf2c42aace88e02",
     "untracked": [
       {
         "path": "tests/test_manual_script_imports.py",
@@ -18,16 +18,17 @@
         "sha256": "abae6a5f8bd3d488281e621892ad2a2cb4e9019faccaf1fd757c808e69fb861e",
         "mode": 33204
       }
-    ]
+    ],
+    "source_provenance": "provenance/common-hosted-r3.json"
   },
   "issues": {
     "850": {
       "patch": "layers/850.patch",
-      "patch_sha256": "5ef088142fa6c2d258c1712d4eb1b1a691407b8a43ec8aa09f9700a0c1d208e0",
+      "patch_sha256": "a875be85a0dee25f03513cc913f090c899ce0725b88cdf11b3dfae3d70867b6c",
       "expected_files": "manifests/850-all-files.json",
       "complete_source_file_count": 457,
-      "source_manifest_sha256": "00148e1040d6f0836a55ee3a1e21caa9d61c0f3474e366ad6c2f2027c277574a",
-      "tracked_full_diff_sha256": "8532f75c5f7d4c45d92b2596d96a31c0ae6d6546f6288a6676fef89b5f59da13",
+      "source_manifest_sha256": "08784b84218f0aa008180a4e0618c17b84b9e08675f1333a6de93fa3635ce78c",
+      "tracked_full_diff_sha256": "a875be85a0dee25f03513cc913f090c899ce0725b88cdf11b3dfae3d70867b6c",
       "untracked": [
         {
           "path": "tests/test_manual_script_imports.py",
@@ -41,15 +42,16 @@
           "sha256": "d73c2ef8b0394f1e9e8062331d3ead562657518a1184b7267bca16ad2d75aa81",
           "mode": 33204
         }
-      ]
+      ],
+      "source_provenance": "provenance/850-hosted-r3.json"
     },
     "859": {
       "patch": "layers/859.patch",
-      "patch_sha256": "a3683a9780d637bc361f5c1a012e287d9cd86179ddb24bc0f0a218b0cd43719e",
+      "patch_sha256": "c0b55be970956b54d10e6f709469791813574d6af5f9468d0a62e0d13c7efc46",
       "expected_files": "manifests/859-all-files.json",
       "complete_source_file_count": 456,
-      "source_manifest_sha256": "be2f83a30530694127a76e2fee3e8db1dd73c3e9beba3f1daf02b60395538a88",
-      "tracked_full_diff_sha256": "c9c085d1e2edff4feed788124c18ffd57f08488441c09cb46e6c4c458d6693d9",
+      "source_manifest_sha256": "6ba46190fc4cc8297b3c7be5fb61ae6bd4a18cc8bf48b5d368869cd8de6600ff",
+      "tracked_full_diff_sha256": "c0b55be970956b54d10e6f709469791813574d6af5f9468d0a62e0d13c7efc46",
       "untracked": [
         {
           "path": "tests/test_manual_script_imports.py",
@@ -57,15 +59,16 @@
           "sha256": "abae6a5f8bd3d488281e621892ad2a2cb4e9019faccaf1fd757c808e69fb861e",
           "mode": 33204
         }
-      ]
+      ],
+      "source_provenance": "provenance/859-hosted-r3.json"
     },
     "793": {
       "patch": "layers/793.patch",
-      "patch_sha256": "f5a99556ad2197c813ae165952b4e179437da7367ce446263a7d4c2352dd38c9",
+      "patch_sha256": "9b1d6174d7b3e2eb0b4b956f7f67a79230355a7889f918dae1600dabb172a169",
       "expected_files": "manifests/793-all-files.json",
       "complete_source_file_count": 457,
-      "source_manifest_sha256": "e7c8042fe3b29752f195a9248e36d030e8aa43f04df0a818bc6ddaf112b32d1a",
-      "tracked_full_diff_sha256": "7ef744efa57f0beab67a883a7e88c72cb8c6d1da849f76e823fd2742574f5f49",
+      "source_manifest_sha256": "68acfc20d5542f5bc2b502eda9e1deb252ec7d39907d7a6def2b34da1689bd08",
+      "tracked_full_diff_sha256": "9b1d6174d7b3e2eb0b4b956f7f67a79230355a7889f918dae1600dabb172a169",
       "untracked": [
         {
           "path": "scripts/benchmark_cache_release.py",
@@ -79,7 +82,8 @@
           "sha256": "abae6a5f8bd3d488281e621892ad2a2cb4e9019faccaf1fd757c808e69fb861e",
           "mode": 33204
         }
-      ]
+      ],
+      "source_provenance": "provenance/793-hosted-r3.json"
     }
   },
   "benchmark_sha256": "af143faba86f1bcd52177efbf906d773d919943dbdf1c0ae0cce0494bbd4a969",
