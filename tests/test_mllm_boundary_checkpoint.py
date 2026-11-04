@@ -357,3 +357,186 @@ def test_disabled_block_found_when_thinking_changes_the_preamble():
 
     assert gen._compute_think_suffix_len() == 2
     assert gen._think_suffixes == (SUFFIX, OFF_SUFFIX)
+
+
+# Sliding-window caches (Gemma 4). The thinking-enabled generation prompt ends
+# with the bare assistant header; with thinking disabled the template appends
+# an empty thought block (``<|channel>thought\n<channel|>``) that history never
+# renders. ``RotatingKVCache`` is rewindable while empty but not once it wraps.
+
+GEMMA_OFF_SUFFIX = (100, 45518, 107, 101)  # "<|channel>thought\n<channel|>"
+
+
+class _RotatingLeaf(_RecurrentLeaf):
+    """Sliding-window leaf: rewindable only until ``max_size`` tokens."""
+
+    def __init__(self, position=0, max_size=4):
+        super().__init__(position)
+        self.max_size = max_size
+
+    @property
+    def offset(self):
+        return self.position
+
+    @property
+    def meta_state(self):
+        return [str(self.max_size)]
+
+    @classmethod
+    def from_state(cls, state, meta_state):
+        return cls(int(state[0].shape[0]), int(meta_state[0]))
+
+    def is_trimmable(self):
+        return self.position < self.max_size
+
+
+@pytest.fixture
+def sliding_generator(generator):
+    generator._think_suffix_len = 0
+    generator._think_suffixes = (GEMMA_OFF_SUFFIX,)
+    return generator
+
+
+def _prefill_sliding(gen, tokens, request_id="req", max_size=4):
+    """Like _prefill, for a template with no enabled think tag: the whole
+    prompt is the lookup key (``_think_suffix_len == 0``)."""
+    stored, remaining = gen.prefix_cache.fetch(list(tokens))
+    if stored is not None:
+        cache = gen._clone_prefix_for_replay(stored)
+        start = len(tokens) - len(remaining)
+    else:
+        cache = [_RotatingLeaf(max_size=max_size)]
+        start = 0
+    req = _request(tokens, request_id)
+    logits = gen._run_chunked_text_prefill(req, cache, start=start)
+    gen._publish_prompt_state(req, cache, logits[:, -1, :], extends_cached=start > 0)
+    return start, cache
+
+
+@pytest.mark.parametrize(
+    "position, pending, expected",
+    [
+        (0, 0, False),
+        (0, 3, False),
+        (0, 4, True),
+        (2, 2, True),
+        (4, 0, True),
+    ],
+)
+def test_sliding_window_needs_checkpoint_when_pending_tokens_wrap(
+    monkeypatch, position, pending, expected
+):
+    # Same isolation as the ``generator`` fixture: without it, _cache_leaves
+    # imports the real mlx_lm / mlx_vlm cache classes (absent on Linux CI).
+    monkeypatch.setattr(
+        MLLMBatchGenerator, "_cache_class_families", staticmethod(lambda: ((), (), ()))
+    )
+    leaf = _RotatingLeaf(position=position, max_size=4)
+
+    assert (
+        MLLMBatchGenerator._needs_prefill_checkpoint([leaf], pending_tokens=pending)
+        is expected
+    )
+
+
+def test_sliding_window_cold_prefill_checkpoints_at_disabled_block(
+    sliding_generator,
+):
+    turn1 = [10, 11, 12, 13, 14, 15, *GEMMA_OFF_SUFFIX]
+
+    start, cache = _prefill_sliding(sliding_generator, turn1)
+
+    assert start == 0
+    # The empty cache would report rewindable; the window wraps during this
+    # prefill, so it still splits at the boundary.
+    assert sliding_generator.calls == [[10, 11, 12, 13, 14, 15], [*GEMMA_OFF_SUFFIX]]
+    assert cache[0].position == len(turn1)
+    assert _keys(sliding_generator) == [(10, 11, 12, 13, 14, 15)]
+    assert sliding_generator.prefix_cache.fetch_exact_auxiliary(turn1) is None
+
+
+def test_sliding_window_next_turn_hits_boundary(sliding_generator):
+    turn1 = [10, 11, 12, 13, 14, 15, *GEMMA_OFF_SUFFIX]
+    _prefill_sliding(sliding_generator, turn1)
+    sliding_generator.calls.clear()
+
+    # History renders turn 1's answer (50, 51) without the empty thought block.
+    turn2 = [10, 11, 12, 13, 14, 15, 50, 51, 20, 21, *GEMMA_OFF_SUFFIX]
+    start, cache = _prefill_sliding(sliding_generator, turn2)
+
+    assert start == 6
+    assert sliding_generator.calls == [[50, 51, 20, 21], [*GEMMA_OFF_SUFFIX]]
+    assert cache[0].position == len(turn2)
+    assert _keys(sliding_generator) == [(10, 11, 12, 13, 14, 15, 50, 51, 20, 21)]
+
+    sliding_generator.calls.clear()
+    turn3 = [*turn2[: -len(GEMMA_OFF_SUFFIX)], 52, 30, *GEMMA_OFF_SUFFIX]
+    start, _ = _prefill_sliding(sliding_generator, turn3)
+    assert start == len(turn2) - len(GEMMA_OFF_SUFFIX)
+    assert sliding_generator.calls == [[52, 30], [*GEMMA_OFF_SUFFIX]]
+
+
+def test_sliding_window_prompt_within_window_keeps_completion_store(
+    sliding_generator,
+):
+    # Shorter than the window: the cache stays rewindable, so the ordinary
+    # completion store (prompt key after rewinding output) still applies.
+    prompt = [10, *GEMMA_OFF_SUFFIX]
+    req = _request(prompt)
+
+    assert sliding_generator._prefill_checkpoint_plan(
+        req.input_ids, [_RotatingLeaf(max_size=8)]
+    ) == (None, None)
+
+
+def test_sliding_window_thinking_enabled_stores_full_prompt(sliding_generator):
+    # Thinking enabled: no trailing block, and the full prompt is already a
+    # prefix of the next turn. The wrapped window keeps the full-prompt entry.
+    prompt = [10, 11, 12, 13, 14, 15]
+
+    _prefill_sliding(sliding_generator, prompt)
+
+    assert sliding_generator.calls == [prompt]
+    assert _keys(sliding_generator) == [tuple(prompt)]
+    assert sliding_generator.prefix_cache.fetch_exact_auxiliary(prompt) is not None
+
+
+def test_disabled_block_recorded_without_enabled_think_tag():
+    # Gemma 4: thinking enabled adds a marker to the system turn and ends with
+    # the bare assistant header; disabled appends an empty thought block.
+    class Tokenizer:
+        def apply_chat_template(self, _messages, **kwargs):
+            if kwargs["enable_thinking"]:
+                return (
+                    "<bos><|turn>system\n<|think|>\n<turn|>\n"
+                    "<|turn>user\nx<turn|>\n<|turn>model\n"
+                )
+            return "<bos><|turn>user\nx<turn|>\n<|turn>model\n<|channel>thought\n<channel|>"
+
+        def encode(self, text):
+            return {"<|channel>thought\n<channel|>": list(GEMMA_OFF_SUFFIX)}.get(
+                text, []
+            )
+
+    gen = MLLMBatchGenerator.__new__(MLLMBatchGenerator)
+    gen.processor = SimpleNamespace(tokenizer=Tokenizer())
+
+    assert gen._compute_think_suffix_len() == 0
+    assert gen._think_suffixes == (GEMMA_OFF_SUFFIX,)
+
+
+def test_no_disabled_block_when_only_the_preamble_differs():
+    class Tokenizer:
+        def apply_chat_template(self, _messages, **kwargs):
+            if kwargs["enable_thinking"]:
+                return "<|system|>\nThink first.\n<|assistant|>\n"
+            return "<|assistant|>\n"
+
+        def encode(self, _text):
+            return [1, 2]
+
+    gen = MLLMBatchGenerator.__new__(MLLMBatchGenerator)
+    gen.processor = SimpleNamespace(tokenizer=Tokenizer())
+
+    assert gen._compute_think_suffix_len() == 0
+    assert gen._think_suffixes == ()
