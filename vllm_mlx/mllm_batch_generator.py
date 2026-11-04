@@ -861,6 +861,11 @@ class MLLMBatchGenerator:
         and, if the template appends one, when it is disabled (e.g.
         ``<think>\n\n</think>\n\n``). Empty when unknown. Hybrid prefill
         uses them to find a prompt's conversation boundary.
+
+        Templates whose enabled prompt ends with no think tag but whose
+        disabled prompt appends a short empty thought block after the same
+        assistant header (Gemma 4: ``<|channel>thought\\n<channel|>``) record
+        only the disabled block and return 0.
         """
         self._think_suffixes: Tuple[Tuple[int, ...], ...] = ()
         try:
@@ -932,6 +937,23 @@ class MLLMBatchGenerator:
                         )
                     return max(0, suffix_len)
 
+            # No think tag when enabled, but the disabled prompt may still
+            # append an empty thought block after the same assistant header.
+            # The enabled prompt is then a prefix of the next turn already;
+            # only the disabled block marks a conversation boundary.
+            tail = min(8, len(text_with))
+            header = text_with[-tail:] if tail else ""
+            pos = text_without.rfind(header) if header else -1
+            disabled = text_without[pos + tail :] if pos >= 0 else ""
+            if 0 < len(disabled) <= 64:
+                tokenizer = getattr(self.processor, "tokenizer", self.processor)
+                ids = self._suffix_token_ids(tokenizer, disabled, tokenizer.encode(""))
+                if ids:
+                    self._think_suffixes = (ids,)
+                    logger.info(
+                        f"[think_suffix] Detected disabled thought block "
+                        f"= {len(ids)} token(s)"
+                    )
             return 0
         except Exception:
             return 0
@@ -1410,7 +1432,7 @@ class MLLMBatchGenerator:
         return copied
 
     @classmethod
-    def _needs_prefill_checkpoint(cls, cache_list) -> bool:
+    def _needs_prefill_checkpoint(cls, cache_list, pending_tokens: int = 0) -> bool:
         """Return whether any cache leaf cannot be rewound after generation.
 
         Hybrid models such as Qwen3.5 mix ordinary KV caches with recurrent
@@ -1418,10 +1440,24 @@ class MLLMBatchGenerator:
         resume, but it cannot be rewound after output tokens have advanced it.
         Such models must therefore store their reusable prompt state while
         prefill is still at the cache-key boundary.
+
+        ``pending_tokens`` is the number of prompt tokens about to be
+        prefilled. A sliding-window ``RotatingKVCache`` is rewindable while
+        empty but not once it wraps, so it needs a checkpoint when the
+        pending tokens will fill its window.
         """
         for cache in cls._cache_leaves(cache_list):
             is_trimmable = getattr(cache, "is_trimmable", None)
             if not callable(is_trimmable) or not is_trimmable():
+                return True
+            max_size = getattr(cache, "max_size", None)
+            offset = getattr(cache, "offset", 0)
+            if (
+                pending_tokens > 0
+                and isinstance(max_size, int)
+                and isinstance(offset, int)
+                and offset + pending_tokens >= max_size
+            ):
                 return True
         return False
 
@@ -1535,9 +1571,13 @@ class MLLMBatchGenerator:
         ``start`` is the number of prompt tokens already restored from the
         prefix cache; a boundary at or before it is already stored.
         """
-        if self.prefix_cache is None or not self._needs_prefill_checkpoint(cache_list):
+        if self.prefix_cache is None:
             return None, None
         token_ids = cast(List[int], input_ids.reshape(-1).tolist())
+        if not self._needs_prefill_checkpoint(
+            cache_list, pending_tokens=len(token_ids) - start
+        ):
+            return None, None
         boundary = self._conversation_boundary(token_ids)
         if boundary is None or boundary <= start:
             return None, None
