@@ -1030,7 +1030,7 @@ index 33e74312e51a0a525e9fa8240e796b4c13dca6f4..95d5414910fcde78d51f90b25a3011c2
      return RegistryServeDefaults(
          continuous_batching=False,
 diff --git a/tests/test_server_cache_controls.py b/tests/test_server_cache_controls.py
-index a551051ac450da5aed985cf676372d58f44ae1b1..0ed6a81029615452b33785fa19dec6e570bccb5f 100644
+index a551051ac450da5aed985cf676372d58f44ae1b1..cddb1684d954ad697f9f4e9cb2d4b5a5e3985f10 100644
 --- a/tests/test_server_cache_controls.py
 +++ b/tests/test_server_cache_controls.py
 @@ -1,9 +1,14 @@
@@ -1048,7 +1048,7 @@ index a551051ac450da5aed985cf676372d58f44ae1b1..0ed6a81029615452b33785fa19dec6e5
  from fastapi.testclient import TestClient
  
  
-@@ -42,6 +47,278 @@ def test_cache_stats_includes_engine_cache(monkeypatch):
+@@ -42,6 +47,310 @@ def test_cache_stats_includes_engine_cache(monkeypatch):
              sys.modules.pop("mlx_vlm.utils", None)
  
  
@@ -1190,6 +1190,38 @@ index a551051ac450da5aed985cf676372d58f44ae1b1..0ed6a81029615452b33785fa19dec6e5
 +    assert events == ["multimodal", "pixel", "flush"]
 +
 +
++def test_all_cache_clear_does_not_load_unused_optional_backend(
++    cache_route, monkeypatch
++):
++    server, _, events = cache_route
++    cache = {"entry": object()}
++    monkeypatch.setattr(
++        server, "_engine", types.SimpleNamespace(clear_runtime_caches=cache.clear)
++    )
++    monkeypatch.delitem(sys.modules, "mlx_vlm.utils")
++    original_import = builtins.__import__
++
++    def forbid_unused_backend(name, *args, **kwargs):
++        if name == "mlx_vlm.utils":
++            raise RuntimeError("unused optional backend must not be loaded")
++        return original_import(name, *args, **kwargs)
++
++    monkeypatch.setattr(builtins, "__import__", forbid_unused_backend)
++    client = TestClient(server.app, raise_server_exceptions=False)
++
++    response = client.delete("/v1/cache")
++
++    assert response.status_code == 200
++    assert response.json() == {
++        "status": "cleared",
++        "engine_cache": None,
++        "error": "Cache clear not available (mlx_vlm not loaded)",
++    }
++    assert cache == {}
++    assert "mlx_vlm.utils" not in sys.modules
++    assert events == ["flush"]
++
++
 +def test_all_cache_clear_keeps_engine_error_and_releases_global_caches(
 +    cache_route, monkeypatch
 +):
@@ -1327,7 +1359,7 @@ index a551051ac450da5aed985cf676372d58f44ae1b1..0ed6a81029615452b33785fa19dec6e5
  def test_clear_cache_clears_engine_managed_runtime_caches(monkeypatch):
      import vllm_mlx.server as server
  
-@@ -82,3 +359,49 @@ def test_clear_cache_clears_engine_managed_runtime_caches(monkeypatch):
+@@ -82,3 +391,49 @@ def test_clear_cache_clears_engine_managed_runtime_caches(monkeypatch):
              sys.modules["mlx_vlm.utils"] = original_module
          else:
              sys.modules.pop("mlx_vlm.utils", None)
@@ -1493,10 +1525,18 @@ index fef110bdf3831f942bfc0c6b920c43812c4c4148..1e7e0392d0f5d1d4f6ee8329bf207d18
      async def unload_idle(self) -> list[str]:
          """Unload every loaded model idle past ``idle_unload_seconds``.
 diff --git a/vllm_mlx/server.py b/vllm_mlx/server.py
-index 56a6b71daae0d49767dad4a76f6e6040a80fa295..2265584501df3b8bcb503749ebf0ebb67d3c3721 100644
+index 56a6b71daae0d49767dad4a76f6e6040a80fa295..bf56915d031b3d2f5fe6b5e60acf39b0fda2178c 100644
 --- a/vllm_mlx/server.py
 +++ b/vllm_mlx/server.py
-@@ -4543,11 +4543,29 @@ async def cache_stats():
+@@ -49,6 +49,7 @@ import os
+ import re
+ import secrets
+ import socket as _socket
++import sys
+ import threading
+ import time
+ import uuid
+@@ -4543,11 +4544,29 @@ async def cache_stats():
          }
  
  
@@ -1527,7 +1567,18 @@ index 56a6b71daae0d49767dad4a76f6e6040a80fa295..2265584501df3b8bcb503749ebf0ebb6
          try:
              owned_clear = getattr(_engine, "_clear_runtime_caches_on_owner", None)
              if owned_clear is not None:
-@@ -4579,6 +4597,9 @@ async def clear_cache():
+@@ -4561,6 +4580,10 @@ async def clear_cache():
+             cleared_engine = {"error": str(exc)}
+ 
+     try:
++        # An unused backend has no global caches and importing it can allocate
++        # substantial host memory during the operation meant to release it.
++        if sys.modules.get("mlx_vlm.utils") is None:
++            raise ImportError("mlx_vlm.utils is not loaded")
+         from mlx_vlm.utils import (
+             clear_multimodal_kv_cache,
+             clear_pixel_values_cache,
+@@ -4579,6 +4602,9 @@ async def clear_cache():
              "engine_cache": cleared_engine,
              "error": "Cache clear not available (mlx_vlm not loaded)",
          }
@@ -1537,7 +1588,7 @@ index 56a6b71daae0d49767dad4a76f6e6040a80fa295..2265584501df3b8bcb503749ebf0ebb6
  
  
  @app.delete("/v1/cache/prefix", dependencies=[Depends(verify_api_key)])
-@@ -4590,6 +4611,20 @@ async def clear_prefix_cache():
+@@ -4590,6 +4616,20 @@ async def clear_prefix_cache():
      hits the cache. Response returns immediately without waiting for
      the re-warm to finish.
      """
@@ -1558,7 +1609,7 @@ index 56a6b71daae0d49767dad4a76f6e6040a80fa295..2265584501df3b8bcb503749ebf0ebb6
      if _engine is None:
          return {"status": "no_engine"}
      cleared = False
-@@ -4609,6 +4644,9 @@ async def clear_prefix_cache():
+@@ -4609,6 +4649,9 @@ async def clear_prefix_cache():
                  _sanitize_log_text(e, limit=500),
              )
  

@@ -2,8 +2,8 @@
   "base": "3af7d7d61576606153f419816be2f4a1a9baab06",
   "base_archive_sha256": "9d91dd4548108ac390a8dbbb631bde3cdbfb2fdd9a2e77b74aa56001e8389d66",
   "base_files": "manifests/base-all-files.json",
-  "status": "Hosted R3 inputs; actual full-suite and memory acceptance remain PENDING",
-  "native_execution": "Initial hosted input check failed before measurements; corrected source/cache checks await approved publication",
+  "status": "Hosted R4 product corrections; full-suite and unchanged memory acceptance remain PENDING",
+  "native_execution": "R3 native phases still running; new source corrections await commit and push approval",
   "common": {
     "patch": "layers/common.patch",
     "patch_sha256": "de84fd93234c004318188a20a45c7973814021c0e0523028edf2c42aace88e02",
@@ -47,11 +47,11 @@
     },
     "859": {
       "patch": "layers/859.patch",
-      "patch_sha256": "c0b55be970956b54d10e6f709469791813574d6af5f9468d0a62e0d13c7efc46",
+      "patch_sha256": "a6b5a063495da341c833c1b62c47af5906e3796a1048d7b2700409857c050b54",
       "expected_files": "manifests/859-all-files.json",
       "complete_source_file_count": 456,
-      "source_manifest_sha256": "6ba46190fc4cc8297b3c7be5fb61ae6bd4a18cc8bf48b5d368869cd8de6600ff",
-      "tracked_full_diff_sha256": "c0b55be970956b54d10e6f709469791813574d6af5f9468d0a62e0d13c7efc46",
+      "source_manifest_sha256": "eb0da79f9cf0cf746e74c47de7c14aeae6db971160a93267c43a35038899fab4",
+      "tracked_full_diff_sha256": "a6b5a063495da341c833c1b62c47af5906e3796a1048d7b2700409857c050b54",
       "untracked": [
         {
           "path": "tests/test_manual_script_imports.py",
@@ -60,15 +60,15 @@
           "mode": 33204
         }
       ],
-      "source_provenance": "provenance/859-hosted-r3.json"
+      "source_provenance": "provenance/859-hosted-r4.json"
     },
     "793": {
       "patch": "layers/793.patch",
-      "patch_sha256": "9b1d6174d7b3e2eb0b4b956f7f67a79230355a7889f918dae1600dabb172a169",
+      "patch_sha256": "a05666fc51ba47a3c5bb077d5975ed5b197b1e0036f68f45f951c35e2856bdbf",
       "expected_files": "manifests/793-all-files.json",
       "complete_source_file_count": 457,
-      "source_manifest_sha256": "68acfc20d5542f5bc2b502eda9e1deb252ec7d39907d7a6def2b34da1689bd08",
-      "tracked_full_diff_sha256": "9b1d6174d7b3e2eb0b4b956f7f67a79230355a7889f918dae1600dabb172a169",
+      "source_manifest_sha256": "8d9d8c5b8a76ab85427712e6ab9886d1451970a3c986761c0e04348b554ecdb8",
+      "tracked_full_diff_sha256": "a05666fc51ba47a3c5bb077d5975ed5b197b1e0036f68f45f951c35e2856bdbf",
       "untracked": [
         {
           "path": "scripts/benchmark_cache_release.py",
@@ -83,7 +83,7 @@
           "mode": 33204
         }
       ],
-      "source_provenance": "provenance/793-hosted-r3.json"
+      "source_provenance": "provenance/793-hosted-r4.json"
     }
   },
   "benchmark_sha256": "af143faba86f1bcd52177efbf906d773d919943dbdf1c0ae0cce0494bbd4a969",

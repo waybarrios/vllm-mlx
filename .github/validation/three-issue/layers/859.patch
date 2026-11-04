@@ -140,10 +140,10 @@ index cd8027adaad6ff1833abfe40b20e9382639f53c6..f0adeb438be32b95dc8f93b5dc87fd54
  class _EngineWithoutStreams(BaseEngine):
      @property
 diff --git a/tests/test_gpt_oss_tool_parsing.py b/tests/test_gpt_oss_tool_parsing.py
-index ef86214f83bcd4333da4f4a1073cb63ea54c46f4..2d2d3164e13d63d264082a64013c8e508290fe74 100644
+index ef86214f83bcd4333da4f4a1073cb63ea54c46f4..2dd3105974f8b5f33321d212b3399ba2234efe23 100644
 --- a/tests/test_gpt_oss_tool_parsing.py
 +++ b/tests/test_gpt_oss_tool_parsing.py
-@@ -14,6 +14,10 @@ Usage:
+@@ -14,6 +14,30 @@ Usage:
  
  from types import SimpleNamespace
  
@@ -151,10 +151,30 @@ index ef86214f83bcd4333da4f4a1073cb63ea54c46f4..2d2d3164e13d63d264082a64013c8e50
 +
 +import pytest
 +
++
++@pytest.mark.parametrize("tools", [None, [], [{"type": "function"}]])
++def test_disabled_tools_preserve_empty_public_harmony_content(monkeypatch, tools):
++    import vllm_mlx.server as server
++    from vllm_mlx.reasoning.harmony_parser import HarmonyReasoningParser
++
++    monkeypatch.setattr(server, "_reasoning_parser", HarmonyReasoningParser())
++    raw = (
++        "<|channel|>analysis<|message|>thinking..."
++        "<|channel|>commentary to=functions.read_file"
++        '<|message|>{"path":"/etc/hosts"}<|call|>'
++    )
++    request = SimpleNamespace(tools=tools, tool_choice="none")
++
++    assert server._extract_reasoning_and_tool_calls(raw, request) == (
++        "thinking...",
++        "",
++        None,
++    )
++
  
  def test_tools_branch_strips_analysis_block_before_parser(monkeypatch):
      import vllm_mlx.server as server
-@@ -142,3 +146,898 @@ def test_streaming_marker_false_for_plain_text():
+@@ -142,3 +166,898 @@ def test_streaming_marker_false_for_plain_text():
      # Final-channel content (no commentary) is not tool markup either.
      final_only = "<|channel|>final<|message|>The answer is 42.<|return|>"
      assert server._streaming_tool_markup_possible(final_only) is False
@@ -1646,7 +1666,7 @@ index 9cead144c7370ee214ba0392cc82b863aa56b98f..798d6835cddbbb127ce1630cfb9bc466
 +        self._stream_offset = 0
 +        self._stream_text = ""
 diff --git a/vllm_mlx/server.py b/vllm_mlx/server.py
-index 56a6b71daae0d49767dad4a76f6e6040a80fa295..74ae7b4abd31bccbb6a9525941f3a6ef09d1d03b 100644
+index 56a6b71daae0d49767dad4a76f6e6040a80fa295..dcf07ff53c273ee2c762da80d630e846a3081151 100644
 --- a/vllm_mlx/server.py
 +++ b/vllm_mlx/server.py
 @@ -184,7 +184,9 @@ from .metrics import metrics as _metrics
@@ -1706,7 +1726,7 @@ index 56a6b71daae0d49767dad4a76f6e6040a80fa295..74ae7b4abd31bccbb6a9525941f3a6ef
          try:
              cleaned_text, tool_calls = _parse_tool_calls_with_parser(
                  text_for_tool_parse or "",
-@@ -3698,7 +3715,15 @@ def _extract_reasoning_and_tool_calls(
+@@ -3698,7 +3715,16 @@ def _extract_reasoning_and_tool_calls(
              )
      else:
          cleaned_text, tool_calls = text_for_tool_parse, None
@@ -1715,6 +1735,7 @@ index 56a6b71daae0d49767dad4a76f6e6040a80fa295..74ae7b4abd31bccbb6a9525941f3a6ef
 +            _, cleaned_text = HarmonyReasoningParser(
 +                include_plain=True
 +            ).extract_reasoning(output_text)
++            cleaned_text = cleaned_text or ""
 +
 +    if reasoning_text:
 +        # Raw framing is internal parser input, not public reasoning. Preserve
@@ -1723,7 +1744,7 @@ index 56a6b71daae0d49767dad4a76f6e6040a80fa295..74ae7b4abd31bccbb6a9525941f3a6ef
      return reasoning_text, cleaned_text, tool_calls
  
  
-@@ -3835,6 +3860,19 @@ def _extract_streaming_tool_delta(
+@@ -3835,6 +3861,19 @@ def _extract_streaming_tool_delta(
          delta_text,
          request=request_context,
      )
@@ -1743,7 +1764,7 @@ index 56a6b71daae0d49767dad4a76f6e6040a80fa295..74ae7b4abd31bccbb6a9525941f3a6ef
      return current_text, result
  
  
-@@ -3943,7 +3981,9 @@ def _streaming_tool_markup_possible(text: str, tool_parser=None) -> bool:
+@@ -3943,7 +3982,9 @@ def _streaming_tool_markup_possible(text: str, tool_parser=None) -> bool:
  
  def _requires_eager_tool_streaming(tool_parser) -> bool:
      """Return whether a parser must receive every delta from response start."""
@@ -1754,7 +1775,7 @@ index 56a6b71daae0d49767dad4a76f6e6040a80fa295..74ae7b4abd31bccbb6a9525941f3a6ef
  
  
  def _streaming_tool_markup_possible_after_delta(
-@@ -3968,6 +4008,14 @@ def _finalize_streaming_tool_result(
+@@ -3968,6 +4009,14 @@ def _finalize_streaming_tool_result(
      tool_parser, current_text: str, result: dict | None = None
  ):
      """Let parsers resolve an ambiguous prefix at end of generation."""
@@ -1769,7 +1790,7 @@ index 56a6b71daae0d49767dad4a76f6e6040a80fa295..74ae7b4abd31bccbb6a9525941f3a6ef
      finalize = getattr(tool_parser, "finalize_streaming", None)
      if finalize is None:
          return result
-@@ -6074,7 +6122,7 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
+@@ -6074,7 +6123,7 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
          )
  
          reasoning_text, cleaned_text, tool_calls = _extract_reasoning_and_tool_calls(
@@ -1778,7 +1799,7 @@ index 56a6b71daae0d49767dad4a76f6e6040a80fa295..74ae7b4abd31bccbb6a9525941f3a6ef
              request,
              allow_reasoning=not _thinking_disabled(request, prepared.chat_kwargs),
              engine=engine,
-@@ -6517,7 +6565,7 @@ async def create_anthropic_message(
+@@ -6517,7 +6566,7 @@ async def create_anthropic_message(
          )
  
          reasoning_text, cleaned_text, tool_calls = _extract_reasoning_and_tool_calls(
@@ -1787,7 +1808,7 @@ index 56a6b71daae0d49767dad4a76f6e6040a80fa295..74ae7b4abd31bccbb6a9525941f3a6ef
              openai_request,
              allow_reasoning=(
                  not _thinking_disabled(openai_request, prepared.chat_kwargs)
-@@ -6821,7 +6869,7 @@ async def _stream_anthropic_messages(
+@@ -6821,7 +6870,7 @@ async def _stream_anthropic_messages(
      # block. Parsed reasoning is suppressed — the request disabled
      # thinking, so only cleaned content is emitted into the already-open
      # text block (no thinking block is started).
@@ -1796,7 +1817,7 @@ index 56a6b71daae0d49767dad4a76f6e6040a80fa295..74ae7b4abd31bccbb6a9525941f3a6ef
  
      # Block index tracking: with reasoning parser we use index 0 for
      # thinking and index 1 for text; without parser, index 0 for text.
-@@ -6843,7 +6891,8 @@ async def _stream_anthropic_messages(
+@@ -6843,7 +6892,8 @@ async def _stream_anthropic_messages(
      # as text_delta events. Mirrors the OpenAI streaming path logic.
      tool_accumulated_text = ""
      tool_parser = _get_streaming_tool_parser(openai_request, engine)
@@ -1806,7 +1827,7 @@ index 56a6b71daae0d49767dad4a76f6e6040a80fa295..74ae7b4abd31bccbb6a9525941f3a6ef
      tool_request_context = openai_request.model_dump()
  
      try:
-@@ -6870,7 +6919,8 @@ async def _stream_anthropic_messages(
+@@ -6870,7 +6920,8 @@ async def _stream_anthropic_messages(
              # Filter special tokens
              filtered = SPECIAL_TOKENS_PATTERN.sub("", delta_text)
              if not filtered and not (
@@ -1816,7 +1837,7 @@ index 56a6b71daae0d49767dad4a76f6e6040a80fa295..74ae7b4abd31bccbb6a9525941f3a6ef
                  or (tool_parser and tool_markup_possible and output_finished)
              ):
                  continue
-@@ -6880,7 +6930,7 @@ async def _stream_anthropic_messages(
+@@ -6880,7 +6931,7 @@ async def _stream_anthropic_messages(
                  and thinking_off
                  and not disabled_reasoning_latched
                  and _explicit_reasoning_markers_present(
@@ -1825,7 +1846,7 @@ index 56a6b71daae0d49767dad4a76f6e6040a80fa295..74ae7b4abd31bccbb6a9525941f3a6ef
                  )
              ):
                  disabled_reasoning_latched = True
-@@ -6939,22 +6989,32 @@ async def _stream_anthropic_messages(
+@@ -6939,22 +6990,32 @@ async def _stream_anthropic_messages(
  
              # Reasoning parser path
              previous_text = accumulated_text
@@ -1861,7 +1882,7 @@ index 56a6b71daae0d49767dad4a76f6e6040a80fa295..74ae7b4abd31bccbb6a9525941f3a6ef
              if delta_msg.reasoning and not thinking_off:
                  if not thinking_block_started:
                      yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': thinking_index, 'content_block': {'type': 'thinking', 'thinking': ''}})}\n\n"
-@@ -6962,21 +7022,24 @@ async def _stream_anthropic_messages(
+@@ -6962,21 +7023,24 @@ async def _stream_anthropic_messages(
                  yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': thinking_index, 'delta': {'type': 'thinking_delta', 'thinking': delta_msg.reasoning}})}\n\n"
  
              content_to_emit = delta_msg.content or ""
@@ -1891,7 +1912,7 @@ index 56a6b71daae0d49767dad4a76f6e6040a80fa295..74ae7b4abd31bccbb6a9525941f3a6ef
                      else:
                          if not tool_markup_possible:
                              tool_markup_possible = True
-@@ -6984,7 +7047,7 @@ async def _stream_anthropic_messages(
+@@ -6984,7 +7048,7 @@ async def _stream_anthropic_messages(
                              _parse_streaming_tool_content(
                                  tool_parser,
                                  tool_accumulated_text,
@@ -1900,7 +1921,7 @@ index 56a6b71daae0d49767dad4a76f6e6040a80fa295..74ae7b4abd31bccbb6a9525941f3a6ef
                                  tool_request_context,
                              )
                          )
-@@ -6996,10 +7059,13 @@ async def _stream_anthropic_messages(
+@@ -6996,10 +7060,13 @@ async def _stream_anthropic_messages(
                                  tool_parser, tool_accumulated_text, tool_result
                              )
  
@@ -1916,7 +1937,7 @@ index 56a6b71daae0d49767dad4a76f6e6040a80fa295..74ae7b4abd31bccbb6a9525941f3a6ef
                          if content_to_emit:
                              content_to_emit = _TOOL_MARKUP_PATTERN.sub(
                                  "", content_to_emit
-@@ -7032,7 +7098,7 @@ async def _stream_anthropic_messages(
+@@ -7032,7 +7099,7 @@ async def _stream_anthropic_messages(
          # its tool call. Fall back to the stripped accumulation when no tool
          # parser was active (mirrors prior behavior for non-tool responses).
          _, tool_calls = _parse_tool_calls_with_parser(
@@ -1925,7 +1946,7 @@ index 56a6b71daae0d49767dad4a76f6e6040a80fa295..74ae7b4abd31bccbb6a9525941f3a6ef
              openai_request,
              engine=engine,
          )
-@@ -7250,7 +7316,9 @@ async def stream_chat_completion(
+@@ -7250,7 +7317,9 @@ async def stream_chat_completion(
      # request disabled thinking, so only cleaned content is emitted.
      raw_stream_text = ""
      thinking_off = _thinking_disabled(request, kwargs)
@@ -1936,7 +1957,7 @@ index 56a6b71daae0d49767dad4a76f6e6040a80fa295..74ae7b4abd31bccbb6a9525941f3a6ef
  
      # Track token counts for usage reporting
      prompt_tokens = 0
-@@ -7270,7 +7338,8 @@ async def stream_chat_completion(
+@@ -7270,7 +7339,8 @@ async def stream_chat_completion(
      tool_accumulated_text = ""
      tool_calls_detected = False
      tool_parser = _get_streaming_tool_parser(request, engine)
@@ -1946,7 +1967,7 @@ index 56a6b71daae0d49767dad4a76f6e6040a80fa295..74ae7b4abd31bccbb6a9525941f3a6ef
      buffer_typed_tool_calls = request.tool_argument_recovery == "buffered"
      buffered_tool_calls: dict[int, dict] = {}
      # Whether any emitted chunk carried a terminal finish_reason. The engine's
-@@ -7327,9 +7396,12 @@ async def stream_chat_completion(
+@@ -7327,9 +7397,12 @@ async def stream_chat_completion(
                  )
  
                  if delta_msg is None:
@@ -1962,7 +1983,7 @@ index 56a6b71daae0d49767dad4a76f6e6040a80fa295..74ae7b4abd31bccbb6a9525941f3a6ef
                      ):
                          delta_msg = DeltaMessage()
                      else:
-@@ -7347,7 +7419,7 @@ async def stream_chat_completion(
+@@ -7347,7 +7420,7 @@ async def stream_chat_completion(
                  # blocks, so reasoning parser captures tool call XML as
                  # reasoning while content stays None.  Redirect reasoning
                  # to the content stream so the tool parser can handle it.
@@ -1971,7 +1992,7 @@ index 56a6b71daae0d49767dad4a76f6e6040a80fa295..74ae7b4abd31bccbb6a9525941f3a6ef
                      _check = tool_accumulated_text + reasoning
                      if _streaming_tool_markup_possible(_check, tool_parser):
                          content = reasoning
-@@ -7357,20 +7429,21 @@ async def stream_chat_completion(
+@@ -7357,20 +7430,21 @@ async def stream_chat_completion(
                      # The request disabled thinking — surface only parsed
                      # content; drop reasoning the model emitted anyway.
                      reasoning = None
@@ -1997,7 +2018,7 @@ index 56a6b71daae0d49767dad4a76f6e6040a80fa295..74ae7b4abd31bccbb6a9525941f3a6ef
                          # Emit as-is; no tool markup is even possible yet.
                      else:
                          if not tool_markup_possible:
-@@ -7379,7 +7452,7 @@ async def stream_chat_completion(
+@@ -7379,7 +7453,7 @@ async def stream_chat_completion(
                              _extract_streaming_tool_delta(
                                  tool_parser,
                                  tool_accumulated_text,
@@ -2006,7 +2027,7 @@ index 56a6b71daae0d49767dad4a76f6e6040a80fa295..74ae7b4abd31bccbb6a9525941f3a6ef
                                  tool_request_context,
                              )
                          )
-@@ -7400,6 +7473,10 @@ async def stream_chat_completion(
+@@ -7400,6 +7474,10 @@ async def stream_chat_completion(
                          ):
                              tool_result = {**(tool_result or {}), "tool_calls": []}
  
@@ -2017,7 +2038,7 @@ index 56a6b71daae0d49767dad4a76f6e6040a80fa295..74ae7b4abd31bccbb6a9525941f3a6ef
                          if tool_result is None:
                              # Inside tool markup - suppress content output
                              if reasoning:
-@@ -7431,6 +7508,8 @@ async def stream_chat_completion(
+@@ -7431,6 +7509,8 @@ async def stream_chat_completion(
                                  tool_accumulated_text,
                                  tool_result.get("content", ""),
                              )
@@ -2026,7 +2047,7 @@ index 56a6b71daae0d49767dad4a76f6e6040a80fa295..74ae7b4abd31bccbb6a9525941f3a6ef
                              if leading:
                                  yield f"data: {ChatCompletionChunk(id=response_id, model=_response_model_name(request.model), choices=[ChatCompletionChunkChoice(delta=ChatCompletionChunkDelta(content=leading))]).model_dump_json()}\n\n"
  
-@@ -7480,7 +7559,8 @@ async def stream_chat_completion(
+@@ -7480,7 +7560,8 @@ async def stream_chat_completion(
                              continue
  
                          # Normal content from tool parser

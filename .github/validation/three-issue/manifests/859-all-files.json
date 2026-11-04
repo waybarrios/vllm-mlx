@@ -1065,7 +1065,7 @@
     "untracked": false
   },
   "tests/test_gpt_oss_tool_parsing.py": {
-    "sha256": "972f228701ac99f66e9ade98d4585c163aaaa8446219ee680efc9856b211bb68",
+    "sha256": "c122e4e4011757379ef5cc28c5138f257b20bcf8193cdc093dd0087ad70508ba",
     "git_mode": "100644",
     "untracked": false
   },
@@ -2090,7 +2090,7 @@
     "untracked": false
   },
   "vllm_mlx/server.py": {
-    "sha256": "8cbce26d7b03fc3188497d739b50b79cea94906b1cc2503b2d5bcb1041f02a9a",
+    "sha256": "2e5229e9438b4cfeb57e74bf69e350b7a8445cd3d083571869f48db168493cac",
     "git_mode": "100644",
     "untracked": false
   },

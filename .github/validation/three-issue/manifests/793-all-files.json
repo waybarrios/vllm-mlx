@@ -1440,7 +1440,7 @@
     "untracked": false
   },
   "tests/test_server_cache_controls.py": {
-    "sha256": "5a1ad34507b4273ef44932fe00d943048dab3dc1dd0b02a7393a7c52c4f577b6",
+    "sha256": "ec90649a2290be97fa40e8062e37eab6f22a58f77d6d2e72b04eef7ffa5d4150",
     "git_mode": "100644",
     "untracked": false
   },
@@ -2090,7 +2090,7 @@
     "untracked": false
   },
   "vllm_mlx/server.py": {
-    "sha256": "7f8d3941829a43932a84c4fc6353fe786c0654196642df0b79c3cc79f08bddec",
+    "sha256": "8fe0cacf90535c233f7496fb20d77c03eb63b3c5cc8c67d6637ef339a78c2240",
     "git_mode": "100644",
     "untracked": false
   },
