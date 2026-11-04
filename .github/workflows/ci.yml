@@ -281,6 +281,11 @@ jobs:
             -m "not slow" \
             -k "not Integration"
 
+      - name: Run ordered CLI and cache replay regressions
+        run: |
+          # Exercise CLI teardown before API requests in the same process.
+          pytest tests/test_cli.py tests/test_gpt_oss_tool_parsing.py tests/test_prefix_cache_scheduler_parity.py -v --tb=short
+
       - name: Run detached snapshot release regression
         run: |
           pytest tests/test_memory_cache.py::test_detached_snapshot_is_freed_without_a_gc_pass -v --tb=short
