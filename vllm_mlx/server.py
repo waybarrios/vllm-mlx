@@ -3719,6 +3719,7 @@ def _extract_reasoning_and_tool_calls(
             _, cleaned_text = HarmonyReasoningParser(
                 include_plain=True
             ).extract_reasoning(output_text)
+            cleaned_text = cleaned_text or ""
 
     if reasoning_text:
         # Raw framing is internal parser input, not public reasoning. Preserve

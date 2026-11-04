@@ -19,6 +19,26 @@ import json
 import pytest
 
 
+@pytest.mark.parametrize("tools", [None, [], [{"type": "function"}]])
+def test_disabled_tools_preserve_empty_public_harmony_content(monkeypatch, tools):
+    import vllm_mlx.server as server
+    from vllm_mlx.reasoning.harmony_parser import HarmonyReasoningParser
+
+    monkeypatch.setattr(server, "_reasoning_parser", HarmonyReasoningParser())
+    raw = (
+        "<|channel|>analysis<|message|>thinking..."
+        "<|channel|>commentary to=functions.read_file"
+        '<|message|>{"path":"/etc/hosts"}<|call|>'
+    )
+    request = SimpleNamespace(tools=tools, tool_choice="none")
+
+    assert server._extract_reasoning_and_tool_calls(raw, request) == (
+        "thinking...",
+        "",
+        None,
+    )
+
+
 def test_tools_branch_strips_analysis_block_before_parser(monkeypatch):
     import vllm_mlx.server as server
 
