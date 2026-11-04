@@ -1,5 +1,5 @@
 diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
-index 9cd47bc9f340442ac211c969438e16fcccb40728..e53bc60de5ff3c26af4a8669408c581615964098 100644
+index 9cd47bc9f340442ac211c969438e16fcccb40728..a687afca397928a72acd0e71355cd7bacce81fb8 100644
 --- a/.github/workflows/ci.yml
 +++ b/.github/workflows/ci.yml
 @@ -100,6 +100,7 @@ jobs:
@@ -19,6 +19,18 @@ index 9cd47bc9f340442ac211c969438e16fcccb40728..e53bc60de5ff3c26af4a8669408c5816
      strategy:
        matrix:
          python-version: ["3.11", "3.13"]
+@@ -279,6 +280,11 @@ jobs:
+             -m "not slow" \
+             -k "not Integration"
+ 
++      - name: Run ordered CLI and cache replay regressions
++        run: |
++          # Exercise CLI teardown before API requests in the same process.
++          pytest tests/test_cli.py tests/test_gpt_oss_tool_parsing.py tests/test_prefix_cache_scheduler_parity.py -v --tb=short
++
+       - name: Run detached snapshot release regression
+         run: |
+           pytest tests/test_memory_cache.py::test_detached_snapshot_is_freed_without_a_gc_pass -v --tb=short
 diff --git a/tests/test_api_models.py b/tests/test_api_models.py
 index bf687474f8e6cd1340d6c43f33e299b0269894e4..1fd7d25d2db488f65c6f9d0f90822fd549eeab4d 100644
 --- a/tests/test_api_models.py
@@ -828,6 +840,127 @@ index 31d28b0c088fc518bd44e8773ff905059274ff69..53ac1d923a1c5181866e65e2fab5c260
 +
 +    assert normalize_messages_for_chat_template(messages)[0]["content"] == expected
 +    assert messages[0]["content"] == content
+diff --git a/tests/test_cli.py b/tests/test_cli.py
+index d3dda2b85b01e46dff6e9364f4b703a8da08de08..09fb3a755218318069241bb6bd93d446f1fcdfde 100644
+--- a/tests/test_cli.py
++++ b/tests/test_cli.py
+@@ -155,6 +155,7 @@ def test_serve_command_propagates_all_sampling_defaults(monkeypatch):
+     from vllm_mlx import cli, server
+     from vllm_mlx.utils import download
+ 
++    monkeypatch.setattr(server, "_max_request_tokens", server._max_request_tokens)
+     loaded = {}
+ 
+     monkeypatch.setattr(
+@@ -271,6 +272,7 @@ def test_serve_command_rejects_memory_budget_outside_registry_mode(capsys):
+ def test_serve_command_applies_memory_budget_override_end_to_end(tmp_path, monkeypatch):
+     from vllm_mlx import cli, server
+ 
++    monkeypatch.setattr(server, "_max_request_tokens", server._max_request_tokens)
+     config_path = tmp_path / "models.yaml"
+     config_path.write_text("""
+ manager:
+@@ -330,6 +332,7 @@ class TestServeCommandMllmRouting:
+         from vllm_mlx import cli, server
+         from vllm_mlx.utils import download
+ 
++        monkeypatch.setattr(server, "_max_request_tokens", server._max_request_tokens)
+         model_dir = self._write_config(
+             tmp_path,
+             "Qwen3.8-27B-8bit",
+@@ -367,6 +370,7 @@ class TestServeCommandMllmRouting:
+         from vllm_mlx import cli, server
+         from vllm_mlx.utils import download
+ 
++        monkeypatch.setattr(server, "_max_request_tokens", server._max_request_tokens)
+         model_dir = tmp_path / "mystery-repo"
+         model_dir.mkdir()  # resolved, but no config.json inside
+         called = {}
+@@ -392,6 +396,7 @@ class TestServeCommandMllmRouting:
+         from vllm_mlx import cli, server
+         from vllm_mlx.utils import download
+ 
++        monkeypatch.setattr(server, "_max_request_tokens", server._max_request_tokens)
+         model_dir = self._write_config(
+             tmp_path,
+             "Qwen3.8-27B-8bit",
+@@ -424,6 +429,7 @@ class TestServeCommandMllmRouting:
+         from vllm_mlx import cli, server
+         from vllm_mlx.utils import download
+ 
++        monkeypatch.setattr(server, "_max_request_tokens", server._max_request_tokens)
+         model_dir = self._write_config(
+             tmp_path,
+             "text-model",
+diff --git a/tests/test_client_acceptance_runner.py b/tests/test_client_acceptance_runner.py
+index 6808e21e4893d84f1a7e7703c0ebfc36eb7397c9..cfbebd262e959a30d1305bd976e62da790a4f792 100644
+--- a/tests/test_client_acceptance_runner.py
++++ b/tests/test_client_acceptance_runner.py
+@@ -6,6 +6,7 @@ import os
+ import signal
+ import subprocess
+ import sys
++import threading
+ import time
+ from pathlib import Path
+ 
+@@ -477,15 +478,47 @@ def test_runner_waits_for_final_stream_evidence_after_client_exits(
+ def test_final_stream_drain_stops_at_client_budget_and_keeps_exit_failure(
+     tmp_path, monkeypatch, returncode
+ ):
++    from scripts.client_acceptance import observe
++
++    release_finalization = threading.Event()
++    finish = observe.Evidence.finish
++    wait_for_idle = observe.RecordingProxy.wait_for_idle
++    exit_proxy = observe.RecordingProxy.__exit__
++
++    def finish_after_drain(self, stream):
++        # The upstream response can time out just after the runner's budget.
++        # Keep its evidence pending until the runner checks that budget, even
++        # if scheduling lets the forwarding thread reach finalization first.
++        if stream.final:
++            release_finalization.wait()
++        finish(self, stream)
++
++    def wait_then_release(self, timeout):
++        try:
++            return wait_for_idle(self, timeout)
++        finally:
++            release_finalization.set()
++
++    def release_then_exit(self, *exc):
++        # Also unblock cleanup if the runner raises before checking the drain.
++        release_finalization.set()
++        return exit_proxy(self, *exc)
++
++    monkeypatch.setattr(observe.Evidence, "finish", finish_after_drain)
++    monkeypatch.setattr(observe.RecordingProxy, "wait_for_idle", wait_then_release)
++    monkeypatch.setattr(observe.RecordingProxy, "__exit__", release_then_exit)
+     started = time.monotonic()
+-    result, _, _ = _scripted_tool_loop(
+-        tmp_path,
+-        monkeypatch,
+-        timeout=1,
+-        final_delay=2,
+-        client_returncode=returncode,
+-    )
++    try:
++        result, _, _ = _scripted_tool_loop(
++            tmp_path,
++            monkeypatch,
++            timeout=1,
++            final_delay=2,
++            client_returncode=returncode,
++        )
++    finally:
++        release_finalization.set()
+     assert result["status"] == "failed", result
+-    assert "proxy_drain_timeout" in result["reasons"]
+-    assert ("client_exit_nonzero" in result["reasons"]) == bool(returncode)
++    assert "proxy_drain_timeout" in result["reasons"], result
++    assert ("client_exit_nonzero" in result["reasons"]) == bool(returncode), result
+     assert time.monotonic() - started < 1.5
 diff --git a/tests/test_deepseek_v4_encoding.py b/tests/test_deepseek_v4_encoding.py
 index 7624374bf35703e8fb820b88baa648cd4ab8ede5..cf2b3744d857739dd411087c7ee96834197e85bc 100644
 --- a/tests/test_deepseek_v4_encoding.py
@@ -2926,6 +3059,49 @@ index 9a8f77616879e7810d1544ae454a32cabfbd15b6..fc96ad8c684f349b66bf27af5e13279c
  class TestSchedulerIntegration:
      """Test integration with scheduler."""
  
+diff --git a/tests/test_prefix_cache_scheduler_parity.py b/tests/test_prefix_cache_scheduler_parity.py
+index c071077699224ebe10ad885042f8fa3d8c158dba..801900bcdeb9104244ce8b64d2220d6fcc621500 100644
+--- a/tests/test_prefix_cache_scheduler_parity.py
++++ b/tests/test_prefix_cache_scheduler_parity.py
+@@ -127,7 +127,7 @@ def test_arrays_cache_next_turn_matches_cold_when_coverage_is_unknown():
+     assert warm_tokens == cold_tokens
+ 
+ 
+-def test_identical_plain_kv_prompt_never_replays_a_supersequence():
++def test_identical_plain_kv_prompt_safely_replays_an_authoritative_supersequence():
+     warm = _scheduler("kv")
+     prompt = [1, 2, 3]
+     cold_tokens, _ = _generate(warm, "kv-first", prompt)
+@@ -135,16 +135,25 @@ def test_identical_plain_kv_prompt_never_replays_a_supersequence():
+     entries = list(warm.memory_aware_cache._entries)
+     assert len(entries) == 1
+     assert list(entries[0]) == prompt + cold_tokens
++    resident = warm.memory_aware_cache._entries[entries[0]].cache[0]
++    assert resident.offset == len(entries[0])
++    assert resident.keys.shape[2] == resident.values.shape[2] == len(entries[0])
++    stored_keys = resident.keys.tolist()
++    stored_values = resident.values.tolist()
+ 
+     replay_tokens, replay_request = _generate(warm, "kv-identical", prompt)
+     oracle_tokens, _ = _generate(_scheduler("kv"), "kv-cold", prompt)
+ 
+-    # The only stored entry is N+completion tokens and must not be trimmed into
+-    # an apparent N-token hit.  Cache coverage plus replay is therefore exactly N.
+-    assert replay_request.cached_tokens == 0
+-    assert replay_request.remaining_tokens == prompt
++    # The authoritative supersequence can be trimmed to the prompt and then
++    # independently rewound for one-token replay without duplicating that token.
++    assert replay_request.cache_hit_type == "supersequence"
++    assert replay_request.cached_tokens == len(prompt) - 1
++    assert replay_request.remaining_tokens == prompt[-1:]
+     assert replay_request.cached_tokens + len(replay_request.remaining_tokens) == len(
+         prompt
+     )
+     assert replay_tokens == oracle_tokens == cold_tokens
+     assert len(warm.memory_aware_cache._entries) == 1
++    assert resident.offset == len(entries[0])
++    assert resident.keys.tolist() == stored_keys
++    assert resident.values.tolist() == stored_values
 diff --git a/tests/test_qwen3_xml_streaming_chunks.py b/tests/test_qwen3_xml_streaming_chunks.py
 index 03e60cce5cf999bce9589d3f3dbd5429bc44b529..9263beff211d5f326769097c6312c869555932e3 100644
 --- a/tests/test_qwen3_xml_streaming_chunks.py

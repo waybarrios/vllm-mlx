@@ -35,7 +35,7 @@
     "untracked": false
   },
   ".github/workflows/ci.yml": {
-    "sha256": "24d0029d92963c9e114f28f6c6a54cbe857582e0de7180a59db29ba90ad5d783",
+    "sha256": "668d1a30f42705139bc9270297572b2cdfbba3c749b08b5a036bdf940417cbf2",
     "git_mode": "100644",
     "untracked": false
   },
@@ -930,7 +930,7 @@
     "untracked": false
   },
   "tests/test_cli.py": {
-    "sha256": "dc3d1342c451eb257a3584e3bf7dbf5870aba45d4a0f51f7b186ee6fb8eb51ed",
+    "sha256": "afc049753019c0b42c694f94e3cad1eafbc6129d805599be49765a4067898d86",
     "git_mode": "100644",
     "untracked": false
   },
@@ -950,7 +950,7 @@
     "untracked": false
   },
   "tests/test_client_acceptance_runner.py": {
-    "sha256": "8abaff1ddd65a32483c101e8c7ac19c38c7062da331c30323a4033da7e408af3",
+    "sha256": "e7eea87060356bed19cfdd85800fb863458cf3b8213033523436901f414f62f7",
     "git_mode": "100644",
     "untracked": false
   },
@@ -1340,7 +1340,7 @@
     "untracked": false
   },
   "tests/test_prefix_cache_scheduler_parity.py": {
-    "sha256": "ed0141cee552d203b6065a2f49f1c405db9a92efea798337d09f3fe0e3c3776c",
+    "sha256": "328f279c1b60beff8f881e0a83fa29690540014ada26df2d845dd5aad41f8b95",
     "git_mode": "100644",
     "untracked": false
   },

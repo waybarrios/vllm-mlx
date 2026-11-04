@@ -159,3 +159,19 @@ Expected baseline failures do not abort the matrix; they remain nonzero in the
 results. Inspect all candidate terminal summaries and every repetition, report
 failed gates and variance, and retain synthetic/production labels. This bundle
 establishes no TTFT, throughput, output-quality, or physical-memory success.
+
+## R6 shared full-suite repairs
+
+The R5 full configured suites reached normal terminal pytest results under the
+600-second budget and exposed CLI request-limit leakage, competing client-drain
+finalization and an obsolete cold-prefill strategy expectation. R6 changes only
+existing test fixtures, the safe-replay integration assertions and an additional
+ordered CLI/API/cache regression step. Package and benchmark bytes are unchanged.
+Exact prompt coverage, cold-output parity, snapshot ownership, client failure
+checks and the original timeout budgets remain enforced. The original workflow
+commands and full configured-suite selection are preserved.
+
+All four prospective source maps incorporate the same four shared test/workflow
+changes. Explicit approval is required before the shared commit, three ordinary
+merge commits and normal pushes. Historical R5 results remain attributed to R5;
+new complete-suite and full memory-matrix acceptance remain pending.

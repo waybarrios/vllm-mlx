@@ -2,15 +2,15 @@
   "base": "3af7d7d61576606153f419816be2f4a1a9baab06",
   "base_archive_sha256": "9d91dd4548108ac390a8dbbb631bde3cdbfb2fdd9a2e77b74aa56001e8389d66",
   "base_files": "manifests/base-all-files.json",
-  "status": "R5 explicit accounting, owner-stream barriers and suite budget; hosted acceptance remains PENDING",
-  "native_execution": "R4 strict run41745693665 completed with failure; R5 code is not yet published or executed natively",
+  "status": "R6 shared test isolation and authoritative replay coverage; complete native acceptance remains pending",
+  "native_execution": "R5 regular PR CI and focused native tests passed; full suites failed assertions; R5 memory job126366976120 remains live and must not be cancelled or reclassified",
   "common": {
     "patch": "layers/common.patch",
-    "patch_sha256": "de84fd93234c004318188a20a45c7973814021c0e0523028edf2c42aace88e02",
+    "patch_sha256": "614c3d5e4fcb0fefa540fe4136ea4188dee036458264c89f32f26eaa135da724",
     "expected_files": "manifests/common-all-files.json",
     "complete_source_file_count": 456,
-    "source_manifest_sha256": "03779590aa1d9abd0f0c61053240227066aad8f94288ed714cf8dc822285b591",
-    "tracked_full_diff_sha256": "de84fd93234c004318188a20a45c7973814021c0e0523028edf2c42aace88e02",
+    "source_manifest_sha256": "14ea3acf128685897b8393aaf5b0d76c8d3fd2b2456ec875bc1d6ab227834d6c",
+    "tracked_full_diff_sha256": "614c3d5e4fcb0fefa540fe4136ea4188dee036458264c89f32f26eaa135da724",
     "untracked": [
       {
         "path": "tests/test_manual_script_imports.py",
@@ -19,7 +19,7 @@
         "mode": 33204
       }
     ],
-    "source_provenance": "provenance/common-hosted-r3.json"
+    "source_provenance": "provenance/common-hosted-r6.json"
   },
   "issues": {
     "850": {
@@ -27,7 +27,7 @@
       "patch_sha256": "a875be85a0dee25f03513cc913f090c899ce0725b88cdf11b3dfae3d70867b6c",
       "expected_files": "manifests/850-all-files.json",
       "complete_source_file_count": 457,
-      "source_manifest_sha256": "08784b84218f0aa008180a4e0618c17b84b9e08675f1333a6de93fa3635ce78c",
+      "source_manifest_sha256": "b360681254a07ee8b5df9c2aeda2c02cdb910d4b0a4678218f30fa5a6455ba76",
       "tracked_full_diff_sha256": "a875be85a0dee25f03513cc913f090c899ce0725b88cdf11b3dfae3d70867b6c",
       "untracked": [
         {
@@ -43,14 +43,14 @@
           "mode": 33204
         }
       ],
-      "source_provenance": "provenance/850-hosted-r3.json"
+      "source_provenance": "provenance/850-hosted-r6.json"
     },
     "859": {
       "patch": "layers/859.patch",
       "patch_sha256": "a6b5a063495da341c833c1b62c47af5906e3796a1048d7b2700409857c050b54",
       "expected_files": "manifests/859-all-files.json",
       "complete_source_file_count": 456,
-      "source_manifest_sha256": "eb0da79f9cf0cf746e74c47de7c14aeae6db971160a93267c43a35038899fab4",
+      "source_manifest_sha256": "d7617ad7c3a2736c43a628eb46ceb4dfb9b8e7989135ad0e73615c5b2d1fe0ba",
       "tracked_full_diff_sha256": "a6b5a063495da341c833c1b62c47af5906e3796a1048d7b2700409857c050b54",
       "untracked": [
         {
@@ -60,14 +60,14 @@
           "mode": 33204
         }
       ],
-      "source_provenance": "provenance/859-hosted-r4.json"
+      "source_provenance": "provenance/859-hosted-r6.json"
     },
     "793": {
       "patch": "layers/793.patch",
       "patch_sha256": "8e1acff5027e0c82cbac195cc4b4e7a6d717317ec8e9bd6ef3607f08b56ea075",
       "expected_files": "manifests/793-all-files.json",
       "complete_source_file_count": 457,
-      "source_manifest_sha256": "a28a29270baaa097a7b3da5fb7eeb3035d3650531336b3fea2840d3a3e96e96c",
+      "source_manifest_sha256": "cae3f00866870a1289af0379a69a302a65f0df86db0034a60d4295bd76d5d4ae",
       "tracked_full_diff_sha256": "8e1acff5027e0c82cbac195cc4b4e7a6d717317ec8e9bd6ef3607f08b56ea075",
       "untracked": [
         {
@@ -83,7 +83,7 @@
           "mode": 33204
         }
       ],
-      "source_provenance": "provenance/793-hosted-r5.json"
+      "source_provenance": "provenance/793-hosted-r6.json"
     }
   },
   "benchmark_sha256": "c9a49503020bb4e0cdb2de2330aacb4cf138a077e013860916d07ae5e0b034a1",
