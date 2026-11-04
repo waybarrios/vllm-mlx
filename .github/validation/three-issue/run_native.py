@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the unchanged native gates with explicit operator inputs and raw provenance."""
+"""Run source-bound native gates with explicit budgets and accounting policies."""
 
 import argparse
 from datetime import datetime, timezone
@@ -99,7 +99,9 @@ def suite_cache_inventory(cache, declarations):
     return result
 
 
-def run(argv, cwd, stem, environment, *, bounded):
+def run(argv, cwd, stem, environment, *, bounded, timeout_seconds=120):
+    if bounded and timeout_seconds <= 0:
+        raise ValueError("A bounded process requires a positive timeout")
     started = time.monotonic()
     started_at = datetime.now(timezone.utc).isoformat()
     with stem.with_suffix(".stdout").open("wb") as stdout, stem.with_suffix(".stderr").open("wb") as stderr:
@@ -107,7 +109,7 @@ def run(argv, cwd, stem, environment, *, bounded):
         timed_out = False
         killed = False
         try:
-            code = process.wait(timeout=120 if bounded else None)
+            code = process.wait(timeout=timeout_seconds if bounded else None)
         except subprocess.TimeoutExpired:
             timed_out = True
             os.killpg(process.pid, signal.SIGTERM)
@@ -118,7 +120,7 @@ def run(argv, cwd, stem, environment, *, bounded):
                 os.killpg(process.pid, signal.SIGKILL)
                 process.wait()
             code = 137 if killed else 124
-    record = {"argv": argv, "cwd": str(cwd), "started_at_utc": started_at, "exit_code": code, "process_returncode": process.returncode, "duration_seconds": round(time.monotonic() - started, 3), "timeout_seconds": 120 if bounded else None, "kill_grace_seconds": 10 if bounded else None, "timed_out": timed_out, "stdout": str(stem.with_suffix(".stdout")), "stderr": str(stem.with_suffix(".stderr"))}
+    record = {"argv": argv, "cwd": str(cwd), "started_at_utc": started_at, "exit_code": code, "process_returncode": process.returncode, "duration_seconds": round(time.monotonic() - started, 3), "timeout_seconds": timeout_seconds if bounded else None, "kill_grace_seconds": 10 if bounded else None, "timed_out": timed_out, "stdout": str(stem.with_suffix(".stdout")), "stderr": str(stem.with_suffix(".stderr"))}
     stem.with_suffix(".json").write_text(json.dumps(record, indent=2) + "\n")
     return record
 
@@ -127,8 +129,12 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--operator", type=Path, required=True)
     parser.add_argument("--phase", choices=("suites", "focused", "measurements"), required=True)
+    parser.add_argument("--suite-timeout-seconds", type=int, default=600)
+    parser.add_argument("--memory-accounting", choices=("strict-rss", "gpu-footprint"), default="strict-rss")
     parser.add_argument("--measurement-profile", choices=("historical24", "acceptance48", "exhaustive96"), default="acceptance48", help="acceptance48 is the default; exhaustive96 is optional diagnostic coverage")
     args = parser.parse_args()
+    if args.suite_timeout_seconds <= 0:
+        parser.error("suite timeout must be positive")
     verify_bundle()
     assert platform.system() == "Darwin" and platform.machine() == "arm64", "Actual Apple Silicon macOS required"
     config = json.loads(args.operator.read_text())
@@ -169,17 +175,18 @@ def main():
     paths = json.loads(subprocess.check_output([str(python), "-c", registry_code, str(models_config)], env=environment))
     assert all(paths[name] == row["model_path"] for name, row in registry_identities.items())
     provenance = {"operator_input_sha256": digest(args.operator), "base": bundle["base"], "bundle_manifest_sha256": digest(BUNDLE / "manifest.json"), "python": str(python), "platform": platform.platform(), "benchmark_model": benchmark_identity, "registry_config_sha256": digest(models_config), "registry_models": registry_identities, "resident_models": config["resident_models"], "optional_fixture_sources": bundle["optional_fixture_sources"], "fixture_model_substitutions": False, "measurement_profile": args.measurement_profile if args.phase == "measurements" else None, "full_suite_and_metal_acceptance": "PENDING until terminal logs and all unchanged predicates are independently reviewed"}
+    provenance.update(memory_accounting=args.memory_accounting if args.phase == "measurements" else None, suite_timeout_seconds=args.suite_timeout_seconds if args.phase == "suites" else None)
     (output / "provenance.json").write_text(json.dumps(provenance, indent=2) + "\n")
     records = []
 
-    def execute(variant, label, argv, bounded=True):
+    def execute(variant, label, argv, bounded=True, timeout_seconds=120):
         child_environment = dict(environment, PYTHONPATH=str(root / variant))
-        record = run([str(python), *argv], root / variant, output / label, child_environment, bounded=bounded)
+        record = run([str(python), *argv], root / variant, output / label, child_environment, bounded=bounded, timeout_seconds=timeout_seconds)
         records.append({"variant": variant, **record})
 
     if args.phase == "suites":
         for variant in ("baseline", "common", "850", "859", "793"):
-            execute(variant, f"{variant}-full-configured-suite", FULL_SUITE)
+            execute(variant, f"{variant}-full-configured-suite", FULL_SUITE, timeout_seconds=args.suite_timeout_seconds)
     elif args.phase == "focused":
         execute("850", "850-focused", ["-m", "pytest", "tests/test_scheduler_sampling_controls.py", "tests/test_mllm_media_specprefill.py", "tests/test_request.py", "tests/test_batch_compat.py", "-q"])
         execute("859", "859-focused", ["-m", "pytest", "tests/test_gpt_oss_tool_parsing.py", "tests/test_harmony_parsers.py", "tests/test_engine_base.py", "-q"])
@@ -199,6 +206,7 @@ def main():
                 for name in config["resident_models"]:
                     mode_args += ["--resident-model", name]
             argv = ["scripts/benchmark_cache_release.py", *mode_args, "--pre-delete-barrier", barrier, "--route", route, "--cycles", "3", "--kv-mib", "256", "--cache-limit-mib", "1024", "--settle-seconds", "60", "--requests", "3", "--prompt-repeats", "1024"]
+            argv += ["--memory-accounting", args.memory_accounting]
             execute(variant, f"{variant}-{mode}-{barrier}-{route}-{repeat}", argv, bounded=False)
     (output / "results.json").write_text(json.dumps({"phase": args.phase, "measurement_profile": args.measurement_profile if args.phase == "measurements" else None, "provenance": provenance, "records": records, "acceptance": "NOT automatically established; inspect all terminal summaries, skips, failures and unchanged measurement gates"}, indent=2) + "\n")
     print(json.dumps({"results": str(output), "runs": len(records), "nonzero_runs": sum(row["exit_code"] != 0 for row in records)}, indent=2))

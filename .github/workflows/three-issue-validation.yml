@@ -57,7 +57,7 @@ jobs:
       matrix:
         include:
           - phase: suites
-            timeout: 45
+            timeout: 75
           - phase: focused
             timeout: 30
           - phase: measurements

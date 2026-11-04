@@ -2,8 +2,8 @@
   "base": "3af7d7d61576606153f419816be2f4a1a9baab06",
   "base_archive_sha256": "9d91dd4548108ac390a8dbbb631bde3cdbfb2fdd9a2e77b74aa56001e8389d66",
   "base_files": "manifests/base-all-files.json",
-  "status": "Hosted R4 product corrections; full-suite and unchanged memory acceptance remain PENDING",
-  "native_execution": "R3 native phases still running; new source corrections await commit and push approval",
+  "status": "R5 explicit accounting, owner-stream barriers and suite budget; hosted acceptance remains PENDING",
+  "native_execution": "R4 strict run41745693665 completed with failure; R5 code is not yet published or executed natively",
   "common": {
     "patch": "layers/common.patch",
     "patch_sha256": "de84fd93234c004318188a20a45c7973814021c0e0523028edf2c42aace88e02",
@@ -64,16 +64,16 @@
     },
     "793": {
       "patch": "layers/793.patch",
-      "patch_sha256": "a05666fc51ba47a3c5bb077d5975ed5b197b1e0036f68f45f951c35e2856bdbf",
+      "patch_sha256": "8e1acff5027e0c82cbac195cc4b4e7a6d717317ec8e9bd6ef3607f08b56ea075",
       "expected_files": "manifests/793-all-files.json",
       "complete_source_file_count": 457,
-      "source_manifest_sha256": "8d9d8c5b8a76ab85427712e6ab9886d1451970a3c986761c0e04348b554ecdb8",
-      "tracked_full_diff_sha256": "a05666fc51ba47a3c5bb077d5975ed5b197b1e0036f68f45f951c35e2856bdbf",
+      "source_manifest_sha256": "a28a29270baaa097a7b3da5fb7eeb3035d3650531336b3fea2840d3a3e96e96c",
+      "tracked_full_diff_sha256": "8e1acff5027e0c82cbac195cc4b4e7a6d717317ec8e9bd6ef3607f08b56ea075",
       "untracked": [
         {
           "path": "scripts/benchmark_cache_release.py",
           "payload": "untracked/793/scripts/benchmark_cache_release.py",
-          "sha256": "af143faba86f1bcd52177efbf906d773d919943dbdf1c0ae0cce0494bbd4a969",
+          "sha256": "c9a49503020bb4e0cdb2de2330aacb4cf138a077e013860916d07ae5e0b034a1",
           "mode": 33204
         },
         {
@@ -83,10 +83,10 @@
           "mode": 33204
         }
       ],
-      "source_provenance": "provenance/793-hosted-r4.json"
+      "source_provenance": "provenance/793-hosted-r5.json"
     }
   },
-  "benchmark_sha256": "af143faba86f1bcd52177efbf906d773d919943dbdf1c0ae0cce0494bbd4a969",
+  "benchmark_sha256": "c9a49503020bb4e0cdb2de2330aacb4cf138a077e013860916d07ae5e0b034a1",
   "benchmark_mode": 33204,
   "optional_fixture_sources": {
     "default_slow_exclusion": "pytest.ini addopts -m not slow and not integration; unchanged",
@@ -97,5 +97,14 @@
     ],
     "opt_in_environment_path": "VLLM_MLX_QWEN36_VLM_MTP_MODEL",
     "source": "tests/test_text_model_from_vlm.py; preserve existing existence/opt-in guards and report skipped coverage"
+  },
+  "validation_policy": {
+    "version": 2,
+    "measurement_accounting": "gpu-footprint",
+    "strict_rss": "retained as explicit diagnostic outcome",
+    "full_suite_timeout_seconds": 600,
+    "focused_timeout_seconds": 120,
+    "kill_grace_seconds": 10,
+    "memory_workload_changed": false
   }
 }

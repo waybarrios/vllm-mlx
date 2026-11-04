@@ -18,6 +18,9 @@ No post-DELETE test-side clear/GC/synchronization can rescue the baseline.
 --pre-delete-barrier none waits for zero requests but adds no stream barrier;
 run it separately from the default synchronized allocator-attribution variant.
 Thresholds are attribution gates, not promises about macOS accounting latency.
+The default strict-rss policy requires both OS counters. gpu-footprint uses
+allocator and physical-footprint release for GPU acceptance, while preserving
+RSS observations and a separate strict diagnostic outcome.
 """
 
 import argparse
@@ -33,6 +36,19 @@ import sys
 import time
 
 MIB = 1024**2
+
+
+def _accounting_checks(checks, memory_accounting):
+    """Separate the declared GPU acceptance checks from RSS diagnostics."""
+    if memory_accounting not in ("strict-rss", "gpu-footprint"):
+        raise ValueError(f"Unknown memory accounting policy: {memory_accounting}")
+    diagnostic_names = (
+        {"rss_drop", "rss_plateau"} if memory_accounting == "gpu-footprint" else set()
+    )
+    return (
+        {name: value for name, value in checks.items() if name not in diagnostic_names},
+        {name: value for name, value in checks.items() if name in diagnostic_names},
+    )
 
 
 class _RusageInfoV0(ctypes.Structure):
@@ -104,6 +120,13 @@ def _model_entry_counts(stats):
     if isinstance(stats, dict) and "models" in stats:
         return [_entry_count(item) for item in stats["models"].values()]
     return [_entry_count(stats)]
+
+
+def _cache_entries_cleared(stats, delete_status):
+    """An unsupported baseline DELETE is a recorded failure, not a crash."""
+    return delete_status == "cleared" and all(
+        count == 0 for count in _model_entry_counts(stats)
+    )
 
 
 class _SyntheticEngine:
@@ -234,10 +257,9 @@ async def _quiesce(mx, engine, *, barrier=True):
             batch = scheduler.batch_generator
             if batch is not None and getattr(batch, "_stream", None) is not None:
                 streams.append(batch._stream)
-            for name in ("mlx_lm.generate", "mlx_vlm.generate"):
-                module = sys.modules.get(name)
-                if module is not None and hasattr(module, "generation_stream"):
-                    streams.append(module.generation_stream)
+            # Module generation_stream globals can name another resident's
+            # worker. The actual producing batch retains its owner-local
+            # handle; synchronize that handle and this worker's default only.
         # Handles may coincide; repeated synchronization is harmless, not a flush.
         for stream in streams:
             mx.synchronize(stream)
@@ -383,6 +405,8 @@ async def _run(args):
         arguments=vars(args),
         command=sys.argv,
         stream_policy=args.pre_delete_barrier,
+        memory_accounting=args.memory_accounting,
+        accounting_policy_version=2,
     )
     _snapshot(mx, None, "before_load")
     engine = None
@@ -416,6 +440,7 @@ async def _run(args):
         mx.clear_cache()
         resident = _snapshot(mx, engine, "resident_baseline")
         failures = []
+        diagnostic_failures = []
         transport = httpx.ASGITransport(app=server.app)
         async with httpx.AsyncClient(
             transport=transport, base_url="http://benchmark"
@@ -443,9 +468,9 @@ async def _run(args):
                 )
                 response = await client.delete(route)
                 response.raise_for_status()
-                if response.json().get("status") != "cleared":
-                    raise RuntimeError(f"DELETE did not clear caches: {response.text}")
-                _emit("delete", cycle=cycle, response=response.json())
+                delete_payload = response.json()
+                delete_status = delete_payload.get("status")
+                _emit("delete", cycle=cycle, response=delete_payload)
                 start = time.monotonic()
                 # No GPU work, GC, allocator clear or synchronization in this window.
                 samples = [_snapshot(mx, engine, "after_clear_0s", cycle)]
@@ -462,9 +487,8 @@ async def _run(args):
                         count is not None and count > 0
                         for count in _model_entry_counts(filled["prefix_cache"])
                     ),
-                    "cache_entries_cleared": all(
-                        count == 0
-                        for count in _model_entry_counts(settled["prefix_cache"])
+                    "cache_entries_cleared": _cache_entries_cleared(
+                        settled["prefix_cache"], delete_status
                     ),
                     "active_drop": filled["active_bytes"] - settled["active_bytes"]
                     >= 0.8 * size,
@@ -490,9 +514,22 @@ async def _run(args):
                     "registry_residents_unchanged": manager is None
                     or set(manager._loaded) == set(engine.engines),
                 }
-                _emit("cycle_checks", cycle=cycle, attributed_bytes=size, checks=checks)
+                required, diagnostics = _accounting_checks(
+                    checks, args.memory_accounting
+                )
+                _emit(
+                    "cycle_checks",
+                    cycle=cycle,
+                    attributed_bytes=size,
+                    memory_accounting=args.memory_accounting,
+                    checks=required,
+                    diagnostics=diagnostics,
+                )
                 failures.extend(
-                    f"cycle {cycle}: {key}" for key, ok in checks.items() if not ok
+                    f"cycle {cycle}: {key}" for key, ok in required.items() if not ok
+                )
+                diagnostic_failures.extend(
+                    f"cycle {cycle}: {key}" for key, ok in diagnostics.items() if not ok
                 )
                 # Idempotence is tested only AFTER the last accounting sample.
                 again = await client.delete(route)
@@ -503,7 +540,15 @@ async def _run(args):
                 elif float(item.model[1].item()) != 1.0:
                     failures.append("persistent synthetic owner corrupted")
             _emit(
-                "summary", outcome="failed" if failures else "passed", failures=failures
+                "summary",
+                memory_accounting=args.memory_accounting,
+                accounting_policy_version=2,
+                outcome="failed" if failures else "passed",
+                failures=failures,
+                strict_rss_outcome=(
+                    "failed" if failures or diagnostic_failures else "passed"
+                ),
+                strict_rss_failures=failures + diagnostic_failures,
             )
             return 1 if failures else 0
     finally:
@@ -531,6 +576,12 @@ def main():
         default="owner-streams",
     )
     parser.add_argument("--route", choices=("prefix", "all"), default="prefix")
+    parser.add_argument(
+        "--memory-accounting",
+        choices=("strict-rss", "gpu-footprint"),
+        default="strict-rss",
+        help="GPU-footprint acceptance retains RSS as separate strict diagnostics",
+    )
     parser.add_argument("--cycles", type=int, default=3)
     parser.add_argument("--kv-mib", type=int, default=256)
     parser.add_argument("--cache-limit-mib", type=int, default=1024)

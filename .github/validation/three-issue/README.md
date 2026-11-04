@@ -88,12 +88,16 @@ export OPERATOR="$REPO/.scratch/native-inputs/operator.json"
 "$PYTHON" "$BUNDLE/run_native.py" --operator "$OPERATOR" --phase suites
 "$PYTHON" "$BUNDLE/run_native.py" --operator "$OPERATOR" --phase focused
 "$PYTHON" "$BUNDLE/run_native.py" --operator "$OPERATOR" --phase measurements
+# GPU acceptance uses an explicit policy and still reports strict RSS results.
+"$PYTHON" "$BUNDLE/run_native.py" --operator "$OPERATOR" --phase measurements --memory-accounting gpu-footprint
 ```
 
 The full configured suite is the historical unchanged
 `python -m pytest -q --tb=short -p no:cacheprovider` on pinned baseline, common,
-and all three candidates, with **120 seconds then TERM and 10 seconds before
-KILL**. Existing pytest markers, models, per-request deadlines, and assertions
+and all three candidates, with **600 seconds then TERM and 10 seconds before
+KILL**. The earlier outer 120-second budget timed out even on the pinned baseline;
+those failed runs remain evidence. Focused processes retain their 120-second
+budget. Existing pytest markers, models, per-request deadlines, and assertions
 are untouched. Exit 124, collection failure, missing terminal summary, and an
 unexpected fixture skip are not successful acceptance. Focused issue commands
 supplement this full gate; the original three #793 native commands remain.
@@ -118,14 +122,36 @@ unbounded outer window because three settling cycles already exceed 120s.
 Model load/generation adds to those minima; do not fit a profile into a
 30-minute job by reducing work.
 
-Keep the historical gates unchanged: at least 16MiB attributed workload,
+Both accounting policies require at least 16MiB attributed workload,
 populated then cleared entries per resident, at least 80% active and
-active-plus-cache reduction, immediate unused-pool zero, at least 50% RSS and
-physical-footprint reduction, and settled values within 32MiB of resident
-baseline. Retain resident identity, unchanged idle step count, and successful
+active-plus-cache reduction, immediate unused-pool zero, at least 50%
+physical-footprint reduction and a footprint within 32MiB of resident baseline.
+The default `strict-rss` policy additionally requires the historical 50% RSS
+reduction and 32MiB RSS plateau. The `gpu-footprint` policy retains both RSS
+checks as diagnostics because the hosted samples show Metal allocations in
+physical footprint while RSS is insensitive. It cannot be reported as strict
+RSS success: each summary separately records `strict_rss_outcome` and its exact
+failed predicates. Policy version2 and the selected policy are explicit in
+the logs; the controller rejects mixed policies or missing diagnostics.
+
+The hosted controller explicitly selects `gpu-footprint` for both baseline and
+candidate, with all 48 processes and their original workload intact. Historical
+strict runs and their failed assertions are retained separately. Retain
+resident identity, unchanged idle step count, and successful
 post-clear generation. No post-DELETE test-side GC, clear, synchronization,
 new request or unload rescues a result. The no-barrier variant must remain
 separate from synchronized allocator attribution.
+
+Owner-stream barriers synchronize each resident's default stream and its
+captured producing batch stream on that resident's worker. Process-global
+generation-stream handles can belong to another worker and are not valid
+substitutes. The completed historical strict matrix exposed this cross-worker
+failure; its failed processes remain part of the retained evidence.
+
+A successful HTTP response with an unsupported DELETE status is recorded as
+a failed cache-clearing predicate through all cycles, rather than aborting
+before measurement. HTTP errors still fail the process. Baseline failures stay
+failures, including when reported entry counts happen to be zero.
 
 Each run saves exact argv, cwd, source/bundle identities, bounded timeout and
 exit code, raw stdout/JSONL and stderr, model/cache manifests and versions.

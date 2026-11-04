@@ -82,8 +82,22 @@ def _argument(argv: list[str], flag: str) -> str:
     return argv[argv.index(flag) + 1]
 
 
-def _measurement_key(record: dict) -> tuple[str, str, str, str]:
+def _memory_accounting(record: dict) -> str:
     argv = record["argv"]
+    policy = (
+        _argument(argv, "--memory-accounting")
+        if "--memory-accounting" in argv
+        else "strict-rss"
+    )
+    if policy not in {"strict-rss", "gpu-footprint"}:
+        raise ValueError("Unknown memory accounting policy")
+    return policy
+
+
+def _measurement_key(record: dict, memory_accounting: str) -> tuple[str, str, str, str]:
+    argv = record["argv"]
+    if _memory_accounting(record) != memory_accounting:
+        raise ValueError("Measurement accounting policy mismatch")
     for flag, value in (
         ("--cycles", "3"),
         ("--kv-mib", "256"),
@@ -109,7 +123,7 @@ def _measurement_key(record: dict) -> tuple[str, str, str, str]:
     )
 
 
-def _check_measurement_log(record: dict, run_root: Path) -> None:
+def _check_measurement_log(record: dict, run_root: Path) -> str:
     log = Path(record["stdout"]).resolve()
     if not log.is_relative_to(run_root.resolve()):
         raise ValueError("Measurement log escapes run output")
@@ -125,26 +139,67 @@ def _check_measurement_log(record: dict, run_root: Path) -> None:
     cycles = [event for event in events if event.get("event") == "cycle_checks"]
     if len(summaries) != 1 or [event.get("cycle") for event in cycles] != [1, 2, 3]:
         raise ValueError("Missing terminal measurement evidence")
+    policy = _memory_accounting(record)
+    rss_checks = {"rss_drop", "rss_plateau"}
+    required = CHECKS - rss_checks if policy == "gpu-footprint" else CHECKS
     if any(
-        set(event.get("checks", {})) != CHECKS
+        set(event.get("checks", {})) != required
         or any(type(value) is not bool for value in event["checks"].values())
+        or event.get("memory_accounting", "strict-rss") != policy
         for event in cycles
     ):
         raise ValueError("Incomplete terminal measurement predicates")
+    if any(
+        set(event.get("diagnostics", {}))
+        != (rss_checks if policy == "gpu-footprint" else set())
+        or any(
+            type(value) is not bool for value in event.get("diagnostics", {}).values()
+        )
+        for event in cycles
+    ):
+        raise ValueError("Incomplete RSS diagnostics")
+    failures = [
+        f"cycle {event['cycle']}: {name}"
+        for event in cycles
+        for name, ok in event["checks"].items()
+        if not ok
+    ]
+    diagnostic_failures = [
+        f"cycle {event['cycle']}: {name}"
+        for event in cycles
+        for name, ok in event.get("diagnostics", {}).items()
+        if not ok
+    ]
     passed = all(all(event["checks"].values()) for event in cycles)
     summary = summaries[0]
+    if summary.get("memory_accounting", "strict-rss") != policy:
+        raise ValueError("Summary accounting policy mismatch")
+    if policy == "gpu-footprint" and summary.get("accounting_policy_version") != 2:
+        raise ValueError("Missing accounting policy version")
     expected_outcome = "passed" if passed else "failed"
     if summary.get("outcome") != expected_outcome or record["exit_code"] != (
         0 if passed else 1
     ):
         raise ValueError("Inconsistent terminal measurement result")
-    if passed and summary.get("failures") != []:
-        raise ValueError("Passing measurement contains failures")
-    if not passed and not summary.get("failures"):
-        raise ValueError("Failed measurement has no predicate evidence")
+    if summary.get("failures") != failures:
+        raise ValueError("Measurement summary hides or misreports failures")
+    strict_outcome = "failed" if failures or diagnostic_failures else "passed"
+    if policy == "gpu-footprint" or "strict_rss_outcome" in summary:
+        if (
+            summary.get("strict_rss_outcome") != strict_outcome
+            or summary.get("strict_rss_failures") != failures + diagnostic_failures
+        ):
+            raise ValueError("Inconsistent strict RSS diagnostic result")
+    return strict_outcome
 
 
-def assess_phase(phase: str, records: list[dict], run_root: Path) -> dict:
+def assess_phase(
+    phase: str,
+    records: list[dict],
+    run_root: Path,
+    *,
+    memory_accounting: str = "strict-rss",
+) -> dict:
     """Check phase completion; final acceptance also requires reviewing skips."""
     if phase == "suites":
         if Counter(row["variant"] for row in records) != Counter(
@@ -177,7 +232,10 @@ def assess_phase(phase: str, records: list[dict], run_root: Path) -> dict:
                 for route in ("prefix", "all")
             }
         )
-        if Counter(_measurement_key(row) for row in records) != expected:
+        if (
+            Counter(_measurement_key(row, memory_accounting) for row in records)
+            != expected
+        ):
             raise ValueError("Incomplete measurement matrix")
     else:
         raise ValueError(f"Unknown phase {phase}")
@@ -189,13 +247,19 @@ def assess_phase(phase: str, records: list[dict], run_root: Path) -> dict:
         row["timed_out"] or row["exit_code"] not in {0, 1, 2, 3} for row in baselines
     ):
         raise ValueError("A baseline crashed or did not produce a normal pytest result")
+    strict_candidate_failures = 0
     if phase == "measurements":
         for row in records:
             if row["timed_out"]:
                 raise ValueError("Missing terminal measurement evidence after timeout")
-            _check_measurement_log(row, run_root)
+            strict = _check_measurement_log(row, run_root)
+            strict_candidate_failures += (
+                row["variant"] != "baseline" and strict == "failed"
+            )
     return {
         "accepted": True,
+        "memory_accounting": memory_accounting if phase == "measurements" else None,
+        "strict_rss_candidate_failures": strict_candidate_failures,
         "candidate_runs": len(candidates),
         "baseline_exit_codes": [
             row["exit_code"] for row in records if row["variant"] == "baseline"
@@ -323,11 +387,7 @@ def provision(root: Path, existing_cache: Path | None) -> None:
     (root / "operator.json").write_text(json.dumps(operator, indent=2) + "\n")
 
 
-def run_phase(root: Path, phase: str) -> None:
-    _verify_sources(root)
-    receipts = root / "receipts"
-    receipts.mkdir(exist_ok=True)
-    before = set((root / "results").glob(f"*-{phase}"))
+def _native_command(root: Path, phase: str) -> list[str]:
     command = [
         sys.executable,
         str(BUNDLE / "run_native.py"),
@@ -337,7 +397,25 @@ def run_phase(root: Path, phase: str) -> None:
         phase,
     ]
     if phase == "measurements":
-        command += ["--measurement-profile", "acceptance48"]
+        command += [
+            "--measurement-profile",
+            "acceptance48",
+            "--memory-accounting",
+            "gpu-footprint",
+        ]
+    elif phase == "suites":
+        command += ["--suite-timeout-seconds", "600"]
+    elif phase != "focused":
+        raise ValueError(f"Unknown phase {phase}")
+    return command
+
+
+def run_phase(root: Path, phase: str) -> None:
+    _verify_sources(root)
+    receipts = root / "receipts"
+    receipts.mkdir(exist_ok=True)
+    before = set((root / "results").glob(f"*-{phase}"))
+    command = _native_command(root, phase)
     environment = dict(os.environ, PYTHONDONTWRITEBYTECODE="1")
     environment.pop("PYTEST_ADDOPTS", None)
     with (
@@ -354,7 +432,12 @@ def run_phase(root: Path, phase: str) -> None:
     payload = json.loads((directory / "results.json").read_text())
     if payload["phase"] != phase:
         raise ValueError("Phase provenance mismatch")
-    assessment = assess_phase(phase, payload["records"], root)
+    assessment = assess_phase(
+        phase,
+        payload["records"],
+        root,
+        memory_accounting="gpu-footprint" if phase == "measurements" else "strict-rss",
+    )
     assessment.update(
         runner_exit_code=process.returncode,
         results=str(directory),

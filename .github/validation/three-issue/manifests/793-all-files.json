@@ -1145,7 +1145,7 @@
     "untracked": false
   },
   "tests/test_memory_cache_mlx.py": {
-    "sha256": "d01d42d1007441da7f9a0328c9617dadd02f7f9c6087a1371d708757c0a8df6e",
+    "sha256": "1601e82b6a1de618cfde2c77abab51af294ab6f28440792fe349710bc8f74eee",
     "git_mode": "100644",
     "untracked": false
   },
@@ -1440,7 +1440,7 @@
     "untracked": false
   },
   "tests/test_server_cache_controls.py": {
-    "sha256": "ec90649a2290be97fa40e8062e37eab6f22a58f77d6d2e72b04eef7ffa5d4150",
+    "sha256": "2ca34e0ab9819689fd01fcba3b0a1e68f0eb06749ba7e09b52d79a3d5267df1c",
     "git_mode": "100644",
     "untracked": false
   },
@@ -2275,7 +2275,7 @@
     "untracked": false
   },
   "scripts/benchmark_cache_release.py": {
-    "sha256": "af143faba86f1bcd52177efbf906d773d919943dbdf1c0ae0cce0494bbd4a969",
+    "sha256": "c9a49503020bb4e0cdb2de2330aacb4cf138a077e013860916d07ae5e0b034a1",
     "git_mode": "100644",
     "untracked": true,
     "mode": 33204

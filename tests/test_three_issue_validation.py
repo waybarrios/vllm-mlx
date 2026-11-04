@@ -9,6 +9,7 @@ import pytest
 
 from scripts.three_issue_validation import assess_phase
 from scripts.three_issue_validation import _replay_module, BUNDLE, MODELS
+import scripts.three_issue_validation as controller
 
 _CHECK_NAMES = (
     "sufficient_workload",
@@ -93,11 +94,17 @@ def _measurement_records(tmp_path, *, baseline_summary=True):
                             }
                             for cycle in (1, 2, 3)
                         ]
+                        failures = [
+                            f"cycle {event['cycle']}: {name}"
+                            for event in events
+                            for name, ok in event["checks"].items()
+                            if not ok
+                        ]
                         events.append(
                             {
                                 "event": "summary",
                                 "outcome": "passed" if passed else "failed",
-                                "failures": [] if passed else ["cycle 1: active_drop"],
+                                "failures": failures,
                             }
                         )
                     log.write_text("\n".join(json.dumps(event) for event in events))
@@ -189,14 +196,154 @@ def test_unknown_phase_is_rejected(tmp_path):
         assess_phase("anything", [], Path(tmp_path))
 
 
-def _native_cache_inventory(monkeypatch):
+def _native_module(monkeypatch):
     monkeypatch.setitem(sys.modules, "replay_sources", _replay_module())
     spec = importlib.util.spec_from_file_location(
         "native_cache_probe", BUNDLE / "run_native.py"
     )
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    return module.suite_cache_inventory
+    return module
+
+
+def _native_cache_inventory(monkeypatch):
+    return _native_module(monkeypatch).suite_cache_inventory
+
+
+def _gpu_measurement_records(tmp_path):
+    records = _measurement_records(tmp_path)
+    for record in records:
+        record["argv"] += ["--memory-accounting", "gpu-footprint"]
+        log = Path(record["stdout"])
+        events = [json.loads(line) for line in log.read_text().splitlines()]
+        failures = []
+        diagnostic_failures = []
+        for event in events[:-1]:
+            event["memory_accounting"] = "gpu-footprint"
+            event["diagnostics"] = {"rss_drop": False, "rss_plateau": False}
+            for name in ("rss_drop", "rss_plateau"):
+                del event["checks"][name]
+            failures += [
+                f"cycle {event['cycle']}: {name}"
+                for name, ok in event["checks"].items()
+                if not ok
+            ]
+            diagnostic_failures += [
+                f"cycle {event['cycle']}: rss_drop",
+                f"cycle {event['cycle']}: rss_plateau",
+            ]
+        events[-1].update(
+            memory_accounting="gpu-footprint",
+            accounting_policy_version=2,
+            failures=failures,
+            strict_rss_outcome="failed",
+            strict_rss_failures=failures + diagnostic_failures,
+        )
+        log.write_text("\n".join(json.dumps(event) for event in events))
+    return records
+
+
+def test_gpu_accounting_accepts_release_and_reports_failed_strict_diagnostics(tmp_path):
+    result = assess_phase(
+        "measurements",
+        _gpu_measurement_records(tmp_path),
+        tmp_path,
+        memory_accounting="gpu-footprint",
+    )
+    assert result["accepted"] is True
+    assert result["memory_accounting"] == "gpu-footprint"
+    assert result["strict_rss_candidate_failures"] == 24
+
+
+def test_gpu_accounting_cannot_silently_replace_strict_policy(tmp_path):
+    with pytest.raises(ValueError, match="accounting"):
+        assess_phase("measurements", _gpu_measurement_records(tmp_path), tmp_path)
+
+
+@pytest.mark.parametrize("missing", ["footprint_drop", "pool_release", "rss_drop"])
+def test_gpu_accounting_rejects_missing_required_or_diagnostic_evidence(
+    tmp_path, missing
+):
+    records = _gpu_measurement_records(tmp_path)
+    log = Path(records[1]["stdout"])
+    events = [json.loads(line) for line in log.read_text().splitlines()]
+    del events[0]["diagnostics" if missing == "rss_drop" else "checks"][missing]
+    log.write_text("\n".join(json.dumps(event) for event in events))
+    with pytest.raises(ValueError, match="predicates|diagnostics"):
+        assess_phase(
+            "measurements", records, tmp_path, memory_accounting="gpu-footprint"
+        )
+
+
+def test_gpu_accounting_rejects_falsely_passing_strict_diagnostics(tmp_path):
+    records = _gpu_measurement_records(tmp_path)
+    log = Path(records[1]["stdout"])
+    events = [json.loads(line) for line in log.read_text().splitlines()]
+    events[-1]["strict_rss_outcome"] = "passed"
+    log.write_text("\n".join(json.dumps(event) for event in events))
+    with pytest.raises(ValueError, match="strict"):
+        assess_phase(
+            "measurements", records, tmp_path, memory_accounting="gpu-footprint"
+        )
+
+
+def test_baseline_cannot_hide_failed_predicates_in_its_summary(tmp_path):
+    records = _measurement_records(tmp_path)
+    log = Path(records[0]["stdout"])
+    events = [json.loads(line) for line in log.read_text().splitlines()]
+    events[-1]["failures"] = ["cycle 1: active_drop"]
+    log.write_text("\n".join(json.dumps(event) for event in events))
+    with pytest.raises(ValueError, match="failures"):
+        assess_phase("measurements", records, tmp_path)
+
+
+@pytest.mark.parametrize("phase", ["suites", "focused", "measurements"])
+def test_native_command_selects_full_suite_budget_and_explicit_accounting(
+    tmp_path, phase
+):
+    argv = controller._native_command(tmp_path, phase)
+    assert argv[:2] == [sys.executable, str(BUNDLE / "run_native.py")]
+    assert argv[argv.index("--phase") + 1] == phase
+    assert argv[argv.index("--operator") + 1] == str(tmp_path / "operator.json")
+    if phase == "suites":
+        assert argv[argv.index("--suite-timeout-seconds") + 1] == "600"
+    else:
+        assert "--suite-timeout-seconds" not in argv
+    if phase == "measurements":
+        assert argv[argv.index("--measurement-profile") + 1] == "acceptance48"
+        assert argv[argv.index("--memory-accounting") + 1] == "gpu-footprint"
+    else:
+        assert "--memory-accounting" not in argv
+
+
+def test_native_runner_records_explicit_bounded_budget(tmp_path, monkeypatch):
+    module = _native_module(monkeypatch)
+    record = module.run(
+        [sys.executable, "-c", "print('complete')"],
+        tmp_path,
+        tmp_path / "complete",
+        dict(os.environ),
+        bounded=True,
+        timeout_seconds=2,
+    )
+    assert record["exit_code"] == 0 and record["timed_out"] is False
+    assert record["timeout_seconds"] == 2
+    assert Path(record["stdout"]).read_text().strip() == "complete"
+
+
+def test_native_runner_still_terminates_a_real_timeout(tmp_path, monkeypatch):
+    module = _native_module(monkeypatch)
+    record = module.run(
+        [sys.executable, "-c", "import time; time.sleep(30)"],
+        tmp_path,
+        tmp_path / "timeout",
+        dict(os.environ),
+        bounded=True,
+        timeout_seconds=0.05,
+    )
+    assert record["exit_code"] == 124 and record["timed_out"] is True
+    assert record["timeout_seconds"] == 0.05
+    assert record["kill_grace_seconds"] == 10
 
 
 def _fixture_hub_cache(tmp_path, *, shared):
