@@ -181,6 +181,7 @@ from .metrics import metrics as _metrics
 from .models.mllm import UnsafeRemoteURLError, _validate_url_safety, is_url
 from .reasoning import DeltaMessage, get_parser as get_reasoning_parser
 from .tool_parsers import ToolParserManager, get_parser_stop_tokens
+from .utils.tokenizer import count_prompt_tokens
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -296,6 +297,54 @@ def _resolve_request_max_tokens(requested_value: int | None) -> int:
             detail=f"max_tokens exceeds server limit ({_max_request_tokens})",
         )
     return requested_value
+
+
+def _reject_prompt_over_context(limit: int, prompt_tokens: int, param: str) -> None:
+    """Refuse a prompt longer than the model context before any engine work."""
+    if prompt_tokens > limit:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "message": (
+                    f"This model's maximum context length is {limit} tokens, "
+                    f"but the prompt has {prompt_tokens} tokens. "
+                    "Reduce the length of the prompt."
+                ),
+                "type": "invalid_request_error",
+                "param": param,
+                "code": "context_length_exceeded",
+                "prompt_tokens": prompt_tokens,
+                "max_model_len": limit,
+            },
+        )
+
+
+def _reject_chat_prompt_over_context(
+    engine: BaseEngine, messages: list[dict], chat_kwargs: dict
+) -> None:
+    """Refuse a chat whose rendered prompt is longer than the model context."""
+    limit = engine.context_limit
+    if limit is None:
+        return
+    prompt_tokens = engine.count_chat_prompt_tokens(
+        messages,
+        tools=chat_kwargs.get("tools"),
+        chat_template_kwargs=chat_kwargs.get("chat_template_kwargs"),
+        enable_thinking=chat_kwargs.get("enable_thinking"),
+    )
+    if prompt_tokens is not None:
+        _reject_prompt_over_context(limit, prompt_tokens, "messages")
+
+
+def _reject_prompts_over_context(engine: BaseEngine, prompts: list[str]) -> None:
+    """Refuse a completion prompt longer than the model context."""
+    limit = engine.context_limit
+    if limit is None:
+        return
+    for prompt in prompts:
+        _reject_prompt_over_context(
+            limit, count_prompt_tokens(engine.tokenizer, prompt), "prompt"
+        )
 
 
 def _resolve_chat_template_kwargs(
@@ -5756,6 +5805,14 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
     release_on_exit = True
 
     try:
+        try:
+            _reject_prompts_over_context(
+                engine, prompts[:1] if request.stream else prompts
+            )
+        except HTTPException:
+            tracker.finish(result="client_error")
+            raise
+
         if request.stream:
             response = StreamingResponse(
                 _disconnect_guard(
@@ -5972,6 +6029,14 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
         except UnsafeRemoteURLError as exc:
             tracker.finish(result="client_error")
             _raise_remote_media_http_error(exc)
+
+        try:
+            _reject_chat_prompt_over_context(
+                engine, prepared.messages, prepared.chat_kwargs
+            )
+        except HTTPException:
+            tracker.finish(result="client_error")
+            raise
 
         if request.stream:
             response, release_on_exit = await _build_chat_streaming_response(

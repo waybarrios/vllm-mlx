@@ -34,6 +34,8 @@ from .base import (
     run_blocking_startup_work,
 )
 from .chat_template_safety import normalize_messages_for_chat_template
+from ..utils.tokenizer import count_prompt_tokens
+from ..utils.truncation import declared_context_limit
 
 logger = logging.getLogger(__name__)
 
@@ -255,6 +257,31 @@ class BatchedEngine(BaseEngine):
         if self._is_mllm and self._processor:
             return getattr(self._processor, "tokenizer", self._processor)
         return self._tokenizer
+
+    @property
+    def context_limit(self) -> int | None:
+        """Context length the text model declares, or None when unknown."""
+        if self._is_mllm:
+            return None
+        return declared_context_limit(self._model)
+
+    def count_chat_prompt_tokens(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict] | None = None,
+        chat_template_kwargs: dict[str, Any] | None = None,
+        enable_thinking: bool | None = None,
+    ) -> int | None:
+        """Tokens in the prompt this engine renders for a text chat, or None."""
+        if self._is_mllm or self._tokenizer is None:
+            return None
+        prompt = self._apply_chat_template(
+            messages,
+            tools=tools,
+            chat_template_kwargs=chat_template_kwargs,
+            enable_thinking=enable_thinking,
+        )
+        return count_prompt_tokens(self.tokenizer, prompt)
 
     def prepare_for_start(self) -> None:
         """Load heavyweight model state off the serving event loop."""

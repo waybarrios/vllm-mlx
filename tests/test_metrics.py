@@ -38,6 +38,7 @@ class FakeEngine:
     is_mllm = False
     preserve_native_tool_format = False
     tokenizer = None
+    context_limit = None
 
     async def start(self) -> None:
         return None
