@@ -30,6 +30,8 @@ def test_explicit_cache_delete_releases_synthetic_kv_in_fresh_process(route):
             str(root / "scripts" / "benchmark_cache_release.py"),
             "--route",
             route,
+            "--memory-accounting",
+            "gpu-footprint",
             "--settle-seconds",
             "10",
         ],

@@ -5,11 +5,227 @@ import asyncio
 import builtins
 import importlib.util
 import sys
+import threading
 import types
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
+
+
+@pytest.fixture
+def benchmark_accounting_module():
+    path = Path(__file__).resolve().parents[1] / "scripts/benchmark_cache_release.py"
+    spec = importlib.util.spec_from_file_location("benchmark_accounting", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _released_gpu_checks():
+    return {
+        "sufficient_workload": True,
+        "cache_was_populated": True,
+        "cache_entries_cleared": True,
+        "active_drop": True,
+        "pool_release": True,
+        "unused_pool_empty": True,
+        "rss_drop": False,
+        "footprint_drop": True,
+        "rss_plateau": True,
+        "footprint_plateau": True,
+        "idle_steps_unchanged": True,
+        "model_resident": True,
+        "registry_residents_unchanged": True,
+    }
+
+
+def test_benchmark_accounting_gpu_footprint_preserves_rss_diagnostics(
+    benchmark_accounting_module,
+):
+    checks = _released_gpu_checks()
+    required, diagnostics = benchmark_accounting_module._accounting_checks(
+        checks, "gpu-footprint"
+    )
+    assert set(required) == {
+        "sufficient_workload",
+        "cache_was_populated",
+        "cache_entries_cleared",
+        "active_drop",
+        "pool_release",
+        "unused_pool_empty",
+        "footprint_drop",
+        "footprint_plateau",
+        "idle_steps_unchanged",
+        "model_resident",
+        "registry_residents_unchanged",
+    }
+    assert all(required.values())
+    assert diagnostics == {"rss_drop": False, "rss_plateau": True}
+    assert checks["rss_drop"] is False
+
+
+def test_benchmark_accounting_strict_rss_still_rejects_flat_rss(
+    benchmark_accounting_module,
+):
+    checks = _released_gpu_checks()
+    required, diagnostics = benchmark_accounting_module._accounting_checks(
+        checks, "strict-rss"
+    )
+    assert required == checks
+    assert not all(required.values())
+    assert diagnostics == {}
+
+
+@pytest.mark.parametrize(
+    "failed",
+    [
+        "sufficient_workload",
+        "cache_was_populated",
+        "cache_entries_cleared",
+        "active_drop",
+        "pool_release",
+        "unused_pool_empty",
+        "footprint_drop",
+        "footprint_plateau",
+        "idle_steps_unchanged",
+        "model_resident",
+        "registry_residents_unchanged",
+    ],
+)
+def test_benchmark_accounting_gpu_policy_rejects_retention_and_lifecycle_failures(
+    benchmark_accounting_module, failed
+):
+    checks = _released_gpu_checks()
+    checks[failed] = False
+    required, _ = benchmark_accounting_module._accounting_checks(
+        checks, "gpu-footprint"
+    )
+    assert required[failed] is False
+    assert not all(required.values())
+
+
+def test_benchmark_accounting_rejects_unknown_policy(benchmark_accounting_module):
+    with pytest.raises(ValueError, match="accounting"):
+        benchmark_accounting_module._accounting_checks(_released_gpu_checks(), "ignore")
+
+
+@pytest.mark.parametrize(
+    ("arguments", "expected"),
+    [
+        ([], "strict-rss"),
+        (["--memory-accounting", "strict-rss"], "strict-rss"),
+        (["--memory-accounting", "gpu-footprint"], "gpu-footprint"),
+    ],
+)
+def test_benchmark_accounting_cli_selection(
+    benchmark_accounting_module, monkeypatch, arguments, expected
+):
+    observed = []
+
+    async def capture(args):
+        observed.append(args.memory_accounting)
+        return 0
+
+    monkeypatch.setattr(benchmark_accounting_module, "_run", capture)
+    monkeypatch.setattr(
+        benchmark_accounting_module,
+        "platform",
+        types.SimpleNamespace(system=lambda: "Darwin", machine=lambda: "arm64"),
+    )
+    monkeypatch.setattr(sys, "argv", ["benchmark_cache_release.py", *arguments])
+    monkeypatch.setattr(sys, "path", sys.path.copy())
+    for key in ("HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE", "HF_DATASETS_OFFLINE"):
+        monkeypatch.setenv(key, "1")
+    assert benchmark_accounting_module.main() == 0
+    assert observed == [expected]
+
+
+@pytest.mark.parametrize(
+    ("status", "entries", "expected"),
+    [
+        ("cleared", 0, True),
+        ("cleared", 1, False),
+        ("no_engine", 0, False),
+        ("no_engine", 1, False),
+        ("not_supported", 0, False),
+        ("not_supported", 1, False),
+    ],
+)
+def test_benchmark_records_unsupported_delete_as_failed_clear(
+    benchmark_accounting_module, status, entries, expected
+):
+    assert (
+        benchmark_accounting_module._cache_entries_cleared(
+            {"prefix_cache": {"entry_count": entries}}, status
+        )
+        is expected
+    )
+
+
+@pytest.mark.anyio
+async def test_benchmark_quiesces_each_resident_own_streams_not_module_globals(
+    benchmark_accounting_module, monkeypatch
+):
+    benchmark = benchmark_accounting_module
+    defaults = {}
+    observed = []
+    owners = []
+    executors = [ThreadPoolExecutor(max_workers=1) for _ in range(2)]
+
+    def initialize(index):
+        owner = threading.get_ident()
+        default = (owner, f"default-{index}")
+        batch = (owner, f"batch-{index}")
+        defaults[owner] = default
+        return owner, batch
+
+    def synchronize(stream):
+        assert stream[0] == threading.get_ident(), "foreign model stream used"
+        observed.append(stream)
+
+    foreign_module = types.ModuleType("mlx_lm.generate")
+    foreign_module.generation_stream = (-1, "foreign-global")
+    monkeypatch.setitem(sys.modules, "mlx_lm.generate", foreign_module)
+    mx = types.SimpleNamespace(
+        default_device=lambda: "gpu",
+        default_stream=lambda _: defaults[threading.get_ident()],
+        synchronize=synchronize,
+    )
+    engines = {}
+    try:
+        for index, executor in enumerate(executors):
+            owner, batch = executor.submit(initialize, index).result()
+            owners.append(owner)
+
+            async def on_owner(operation, executor=executor):
+                return await asyncio.get_running_loop().run_in_executor(
+                    executor, operation
+                )
+
+            engines[str(index)] = types.SimpleNamespace(
+                is_mllm=False,
+                get_stats=lambda: {"num_running": 0, "num_waiting": 0},
+                _engine=types.SimpleNamespace(
+                    engine=types.SimpleNamespace(
+                        scheduler=types.SimpleNamespace(
+                            batch_generator=types.SimpleNamespace(_stream=batch)
+                        )
+                    )
+                ),
+                _run_on_generation_worker=on_owner,
+            )
+        await benchmark._quiesce(mx, benchmark._RegistryEngines(engines))
+        assert observed == [
+            (owners[0], "default-0"),
+            (owners[0], "batch-0"),
+            (owners[1], "default-1"),
+            (owners[1], "batch-1"),
+        ]
+    finally:
+        for executor in executors:
+            executor.shutdown(wait=True)
 
 
 def test_cache_stats_includes_engine_cache(monkeypatch):
