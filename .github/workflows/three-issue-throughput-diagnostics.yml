@@ -1,0 +1,69 @@
+name: Three issue throughput diagnostics
+
+on:
+  push:
+    branches: [validation/throughput-diagnostics-20261104]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: three-issue-throughput-diagnostics-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  PYTHONDONTWRITEBYTECODE: "1"
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
+      - name: Verify diagnostic controls
+        run: |
+          python -m pip install pytest ruff black fastapi pydantic
+          python -m pytest tests/test_three_issue_validation.py -q
+          python -m ruff check scripts/three_issue_throughput_diagnostics.py tests/test_three_issue_validation.py --select E,F,W --ignore E402,E501,E731,F811,F841
+          python -m black --check scripts/three_issue_throughput_diagnostics.py tests/test_three_issue_validation.py
+
+  native:
+    needs: checks
+    runs-on: macos-15
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
+      - name: Install the recorded runtime
+        run: >-
+          python -m pip install -e ".[dev,vision,harmony]"
+          mlx==0.32.4 mlx-lm==0.31.3 mlx-vlm==0.6.5 transformers==5.22.1
+      - name: Replay exact sources and provision unchanged fixture revisions
+        run: |
+          python scripts/three_issue_validation.py prepare --run-root "$GITHUB_WORKSPACE/.scratch/throughput-diagnostics"
+          python scripts/three_issue_validation.py provision --run-root "$GITHUB_WORKSPACE/.scratch/throughput-diagnostics"
+      - name: Record unchanged first and repeated test invocations
+        run: python scripts/three_issue_throughput_diagnostics.py --run-root "$GITHUB_WORKSPACE/.scratch/throughput-diagnostics"
+      - name: Retain all diagnostic results and provenance
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: three-issue-throughput-diagnostics
+          path: |
+            .scratch/throughput-diagnostics/replay-proof.json
+            .scratch/throughput-diagnostics/operator.json
+            .scratch/throughput-diagnostics/inputs/
+            .scratch/throughput-diagnostics/diagnostics/
+          if-no-files-found: warn
+          retention-days: 14

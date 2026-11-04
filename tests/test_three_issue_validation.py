@@ -10,6 +10,7 @@ import pytest
 from scripts.three_issue_validation import assess_phase
 from scripts.three_issue_validation import _replay_module, BUNDLE, MODELS
 import scripts.three_issue_validation as controller
+import scripts.three_issue_throughput_diagnostics as throughput_diagnostics
 
 _CHECK_NAMES = (
     "sufficient_workload",
@@ -26,6 +27,103 @@ _CHECK_NAMES = (
     "model_resident",
     "registry_residents_unchanged",
 )
+
+
+def _throughput_record(exit_code=0):
+    return {
+        "exit_code": exit_code,
+        "process_returncode": exit_code,
+        "timed_out": False,
+    }
+
+
+def _throughput_stdout(summary="10 passed", first="110.0", repeated="120.0"):
+    return (
+        f"Throughput: {first} tok/s\n"
+        f"Throughput: {repeated} tok/s\n"
+        f"================ {summary} in 8.0s ================\n"
+    )
+
+
+def test_throughput_diagnostic_counterbalances_fresh_process_source_order():
+    forward, reverse = throughput_diagnostics.diagnostic_orders()
+    assert forward == ("baseline", "common", "850", "859", "793")
+    assert reverse == tuple(reversed(forward))
+
+
+def test_throughput_diagnostic_repeats_the_original_file_without_filters():
+    command = throughput_diagnostics.diagnostic_command("python")
+    assert command[:3] == ["python", "-m", "pytest"]
+    assert command.count("tests/test_continuous_batching.py") == 2
+    assert "--keep-duplicates" in command
+    assert "--durations=0" in command
+    assert not {"-k", "-m", "--deselect", "--ignore"}.intersection(command[3:])
+
+
+def test_throughput_diagnostic_never_claims_acceptance_from_a_pass():
+    result = throughput_diagnostics.summarize_process(
+        _throughput_record(), _throughput_stdout()
+    )
+    assert result["diagnostic_complete"]
+    assert result["underlying_tests_passed"]
+    assert result["accepted"] is False
+    assert result["observations"] == [
+        {"invocation": "first", "printed_tokens_per_second": 110.0},
+        {"invocation": "repeated", "printed_tokens_per_second": 120.0},
+    ]
+
+
+def test_throughput_diagnostic_retains_failures_when_repeated_invocation_is_fast():
+    result = throughput_diagnostics.summarize_process(
+        _throughput_record(1), _throughput_stdout("1 failed, 9 passed", first="90.0")
+    )
+    assert result["diagnostic_complete"]
+    assert result["underlying_tests_passed"] is False
+    assert result["accepted"] is False
+    assert "1 failed" in result["pytest_summary"]
+
+
+def test_throughput_diagnostic_rejects_metrics_contradicting_a_passing_assertion():
+    with pytest.raises(ValueError, match="inconsistent"):
+        throughput_diagnostics.summarize_process(
+            _throughput_record(), _throughput_stdout(first="90.0")
+        )
+
+
+@pytest.mark.parametrize("value", ["nan", "inf", "-1", "0"])
+def test_throughput_diagnostic_rejects_invalid_observations(value):
+    with pytest.raises(ValueError, match="observation"):
+        throughput_diagnostics.summarize_process(
+            _throughput_record(), _throughput_stdout(first=value)
+        )
+
+
+@pytest.mark.parametrize(
+    "stdout",
+    [
+        "Throughput: 110.0 tok/s\n========== 10 passed in 8s ==========\n",
+        "Throughput: 110.0 tok/s\nThroughput: 120.0 tok/s\n",
+        _throughput_stdout("5 passed, 5 skipped"),
+        _throughput_stdout("1 failed, 9 passed"),
+    ],
+)
+def test_throughput_diagnostic_rejects_missing_or_inconsistent_completion(stdout):
+    with pytest.raises(ValueError):
+        throughput_diagnostics.summarize_process(_throughput_record(), stdout)
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"timed_out": True, "exit_code": 124, "process_returncode": -15},
+        {"exit_code": -11, "process_returncode": -11},
+        {"exit_code": 0, "process_returncode": 1},
+    ],
+)
+def test_throughput_diagnostic_rejects_timeout_crash_or_mismatched_status(changes):
+    record = {**_throughput_record(), **changes}
+    with pytest.raises(ValueError):
+        throughput_diagnostics.summarize_process(record, _throughput_stdout())
 
 
 def _suite_records():
