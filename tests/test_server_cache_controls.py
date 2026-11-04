@@ -185,6 +185,38 @@ def test_all_cache_clear_flushes_global_caches_without_engine(cache_route):
     assert events == ["multimodal", "pixel", "flush"]
 
 
+def test_all_cache_clear_does_not_load_unused_optional_backend(
+    cache_route, monkeypatch
+):
+    server, _, events = cache_route
+    cache = {"entry": object()}
+    monkeypatch.setattr(
+        server, "_engine", types.SimpleNamespace(clear_runtime_caches=cache.clear)
+    )
+    monkeypatch.delitem(sys.modules, "mlx_vlm.utils")
+    original_import = builtins.__import__
+
+    def forbid_unused_backend(name, *args, **kwargs):
+        if name == "mlx_vlm.utils":
+            raise RuntimeError("unused optional backend must not be loaded")
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", forbid_unused_backend)
+    client = TestClient(server.app, raise_server_exceptions=False)
+
+    response = client.delete("/v1/cache")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "status": "cleared",
+        "engine_cache": None,
+        "error": "Cache clear not available (mlx_vlm not loaded)",
+    }
+    assert cache == {}
+    assert "mlx_vlm.utils" not in sys.modules
+    assert events == ["flush"]
+
+
 def test_all_cache_clear_keeps_engine_error_and_releases_global_caches(
     cache_route, monkeypatch
 ):

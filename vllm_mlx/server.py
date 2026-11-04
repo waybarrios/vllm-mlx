@@ -49,6 +49,7 @@ import os
 import re
 import secrets
 import socket as _socket
+import sys
 import threading
 import time
 import uuid
@@ -4579,6 +4580,10 @@ async def clear_cache():
             cleared_engine = {"error": str(exc)}
 
     try:
+        # An unused backend has no global caches and importing it can allocate
+        # substantial host memory during the operation meant to release it.
+        if sys.modules.get("mlx_vlm.utils") is None:
+            raise ImportError("mlx_vlm.utils is not loaded")
         from mlx_vlm.utils import (
             clear_multimodal_kv_cache,
             clear_pixel_values_cache,
