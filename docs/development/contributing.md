@@ -25,6 +25,24 @@ pytest tests/
 pytest tests/test_paged_cache.py -v
 ```
 
+`pytest tests/` discovers the whole test directory and applies the defaults in
+[`pytest.ini`](../../pytest.ini), which exclude tests marked `slow` or
+`integration` unless you override the marker selection.
+
+CI does not run bare `pytest tests/`. The
+[`CI workflow`](../../.github/workflows/ci.yml) runs separate pytest invocations
+over explicit test files or node IDs in `test-matrix`, `test-python-3-14`, and
+`test-apple-silicon`. Each step can also apply its own `-k` or `-m` filters. To
+reproduce a CI step, use that job's dependencies and copy its complete pytest
+command, including the file list and options. Keep separate steps in separate
+processes: some groups isolate MLX stubs or generation-stream globals.
+
+The full-directory run discovers more test modules than CI's explicit lists,
+and its test order and filters can expose failures that CI does not see. If a
+test outside your change fails, rerun that file on its own and compare with the
+unchanged base before attributing the failure to your change. Report the
+original full-suite result alongside any isolated rerun.
+
 MLX-dependent tests require an Apple Silicon environment. Other platforms can
 still run supported static checks and non-MLX tests.
 
