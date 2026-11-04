@@ -127,7 +127,7 @@ def test_arrays_cache_next_turn_matches_cold_when_coverage_is_unknown():
     assert warm_tokens == cold_tokens
 
 
-def test_identical_plain_kv_prompt_never_replays_a_supersequence():
+def test_identical_plain_kv_prompt_safely_replays_an_authoritative_supersequence():
     warm = _scheduler("kv")
     prompt = [1, 2, 3]
     cold_tokens, _ = _generate(warm, "kv-first", prompt)
@@ -135,16 +135,25 @@ def test_identical_plain_kv_prompt_never_replays_a_supersequence():
     entries = list(warm.memory_aware_cache._entries)
     assert len(entries) == 1
     assert list(entries[0]) == prompt + cold_tokens
+    resident = warm.memory_aware_cache._entries[entries[0]].cache[0]
+    assert resident.offset == len(entries[0])
+    assert resident.keys.shape[2] == resident.values.shape[2] == len(entries[0])
+    stored_keys = resident.keys.tolist()
+    stored_values = resident.values.tolist()
 
     replay_tokens, replay_request = _generate(warm, "kv-identical", prompt)
     oracle_tokens, _ = _generate(_scheduler("kv"), "kv-cold", prompt)
 
-    # The only stored entry is N+completion tokens and must not be trimmed into
-    # an apparent N-token hit.  Cache coverage plus replay is therefore exactly N.
-    assert replay_request.cached_tokens == 0
-    assert replay_request.remaining_tokens == prompt
+    # The authoritative supersequence can be trimmed to the prompt and then
+    # independently rewound for one-token replay without duplicating that token.
+    assert replay_request.cache_hit_type == "supersequence"
+    assert replay_request.cached_tokens == len(prompt) - 1
+    assert replay_request.remaining_tokens == prompt[-1:]
     assert replay_request.cached_tokens + len(replay_request.remaining_tokens) == len(
         prompt
     )
     assert replay_tokens == oracle_tokens == cold_tokens
     assert len(warm.memory_aware_cache._entries) == 1
+    assert resident.offset == len(entries[0])
+    assert resident.keys.tolist() == stored_keys
+    assert resident.values.tolist() == stored_values
