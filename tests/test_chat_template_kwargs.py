@@ -81,6 +81,7 @@ def test_chat_completion_endpoint_forwards_chat_template_kwargs():
     class FakeEngine:
         model_name = "test-model"
         is_mllm = False
+        context_limit = None
         preserve_native_tool_format = False
 
         async def chat(self, messages, **kwargs):
@@ -160,6 +161,7 @@ def test_chat_completion_endpoint_applies_server_default_chat_template_kwargs():
     class FakeEngine:
         model_name = "test-model"
         is_mllm = False
+        context_limit = None
         preserve_native_tool_format = False
 
         async def chat(self, messages, **kwargs):
@@ -204,6 +206,7 @@ def test_chat_completion_endpoint_request_kwargs_override_server_defaults():
     class FakeEngine:
         model_name = "test-model"
         is_mllm = False
+        context_limit = None
         preserve_native_tool_format = False
 
         async def chat(self, messages, **kwargs):

@@ -3,9 +3,12 @@
 
 from types import SimpleNamespace
 
+import pytest
+
 from vllm_mlx.utils.truncation import (
     MAX_LENGTH_DEFAULT,
     TOKENIZER_SENTINEL_THRESHOLD,
+    declared_context_limit,
     inner_tokenizer,
     resolve_max_length,
 )
@@ -122,3 +125,77 @@ def test_inner_tokenizer_unwraps_and_passes_through():
     assert inner_tokenizer(SimpleNamespace(_tokenizer=inner)) is inner
     plain = _Tok()
     assert inner_tokenizer(plain) is plain
+
+
+def _model(**configs):
+    return SimpleNamespace(
+        **{
+            name: SimpleNamespace(max_position_embeddings=value)
+            for name, value in configs.items()
+        }
+    )
+
+
+@pytest.mark.parametrize("attr", ["config", "args", "model_config"])
+def test_declared_context_limit_reads_each_config_attribute(attr):
+    assert declared_context_limit(_model(**{attr: 40960})) == 40960
+
+
+def test_declared_context_limit_prefers_config_over_args_and_model_config():
+    """The attributes lose in order: config, then args, then model_config."""
+    assert declared_context_limit(_model(config=100, args=200, model_config=300)) == 100
+    assert declared_context_limit(_model(args=200, model_config=300)) == 200
+    assert declared_context_limit(_model(model_config=300)) == 300
+
+
+def test_declared_context_limit_falls_through_a_config_without_the_field():
+    """A config that lacks the field does not hide the one that has it."""
+    model = SimpleNamespace(
+        config=SimpleNamespace(hidden_size=64),
+        args=SimpleNamespace(max_position_embeddings=2048),
+    )
+    assert declared_context_limit(model) == 2048
+
+
+def test_declared_context_limit_reads_a_dict_config():
+    model = SimpleNamespace(config={"max_position_embeddings": 4096})
+    assert declared_context_limit(model) == 4096
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        pytest.param(0, id="zero"),
+        pytest.param(-1, id="negative"),
+        pytest.param(True, id="true"),
+        pytest.param(False, id="false"),
+        pytest.param(1.5, id="float"),
+        pytest.param("40960", id="numeric-string"),
+        pytest.param(None, id="none"),
+    ],
+)
+def test_declared_context_limit_ignores_an_unusable_value(value):
+    """An unusable value is skipped, so a usable one further down still wins."""
+    model = _model(config=value, args=77)
+    assert declared_context_limit(model) == 77
+
+
+def test_declared_context_limit_is_none_when_no_attribute_declares_one():
+    assert declared_context_limit(SimpleNamespace()) is None
+    assert declared_context_limit(_model(config=None, args=0)) is None
+    assert declared_context_limit(None) is None
+
+
+def test_declared_context_limit_does_not_read_a_nested_text_config():
+    model = SimpleNamespace(
+        config=SimpleNamespace(
+            text_config=SimpleNamespace(max_position_embeddings=32768)
+        )
+    )
+    assert declared_context_limit(model) is None
+
+
+def test_declared_context_limit_trusts_a_large_value():
+    """No sentinel threshold applies to a value the model's own config declares."""
+    huge = TOKENIZER_SENTINEL_THRESHOLD + 1
+    assert declared_context_limit(_model(config=huge)) == huge

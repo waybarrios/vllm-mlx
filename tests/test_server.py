@@ -277,6 +277,8 @@ class TestCompletionMllmDraft:
         captured = {}
 
         class DummyEngine:
+            context_limit = None
+
             async def generate(self, **kwargs):
                 captured.update(kwargs)
                 return SimpleNamespace(
@@ -1713,6 +1715,7 @@ class TestMaxTokensLimit:
         class FakeEngine:
             model_name = "fake-engine"
             is_mllm = False
+            context_limit = None
             preserve_native_tool_format = False
 
             async def chat(self, messages, **kwargs):
@@ -1916,6 +1919,8 @@ class TestLogAndExceptionSanitization:
         import vllm_mlx.server as server
 
         class DummyEngine:
+            context_limit = None
+
             async def generate(self, **kwargs):
                 return SimpleNamespace(
                     text="ok",
@@ -4079,6 +4084,7 @@ class TestStreamChatCompletion:
 
         class FakeEngine:
             model_name = "fake-engine"
+            context_limit = None
 
             async def stream_chat(self, messages, **kwargs):
                 yield GenerationOutput(
@@ -4319,6 +4325,7 @@ class TestReasoningAndToolCallsNonStreaming:
         class FakeEngine:
             model_name = "fake-engine"
             is_mllm = False
+            context_limit = None
             preserve_native_tool_format = False
 
             async def chat(self, messages, **kwargs):
@@ -4611,6 +4618,7 @@ class TestReasoningAndToolCallsNonStreaming:
         class FakeEngine:
             model_name = "fake-engine"
             is_mllm = False
+            context_limit = None
             preserve_native_tool_format = False
 
             async def chat(self, messages, **kwargs):
@@ -4803,6 +4811,7 @@ class TestChatCompletionStreamingModeSwitching:
         class FakeLLMModel:
             def __init__(self, *_args, **_kwargs):
                 self.tokenizer = MagicMock()
+                self.model = None
                 self.tokenizer.bos_token = None
                 self.tokenizer.apply_chat_template.return_value = (
                     "Count: one, two, three"
@@ -5011,6 +5020,7 @@ class TestChatCompletionStreamingModeSwitching:
         class FakeLLMModel:
             def __init__(self, *_args, **_kwargs):
                 self.tokenizer = MagicMock()
+                self.model = None
                 self.tokenizer.bos_token = None
                 self.tokenizer.apply_chat_template.return_value = (
                     "Count: one, two, three"
@@ -5144,6 +5154,7 @@ class TestChatCompletionStreamingModeSwitching:
         class FakeLLMModel:
             def __init__(self, *_args, **_kwargs):
                 self.tokenizer = MagicMock()
+                self.model = None
                 self.tokenizer.bos_token = None
                 self.tokenizer.apply_chat_template.return_value = (
                     "Count: one, two, three"
