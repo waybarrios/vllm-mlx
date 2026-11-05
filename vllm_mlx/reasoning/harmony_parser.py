@@ -19,17 +19,27 @@ import re
 
 from .base import DeltaMessage, ReasoningParser
 
-# Analysis channel blocks: <|channel|>analysis<|message|>...<|end|>
-_ANALYSIS_PATTERN = re.compile(
-    r"<\|channel\|>analysis\s*<\|message\|>(.*?)<\|end\|>",
-    re.DOTALL,
+_CHANNEL_HEADER_PATTERN = re.compile(
+    r"(?:<\|start\|>assistant(?P<role_metadata>[^<]*))?"
+    r"<\|channel\|>(?P<channel>analysis|final|commentary)\b"
+    r"(?P<channel_metadata>[^<]*)"
+    r"(?:<\|constrain\|>[^<]*)?<\|message\|>"
 )
+_RECIPIENT_PATTERN = re.compile(r"(?:^|\s)to=\S+")
 
-# Final channel content: <|channel|>final<|message|>...<|return|>
-_FINAL_PATTERN = re.compile(
-    r"<\|channel\|>final\s*<\|message\|>(.*?)<\|return\|>",
-    re.DOTALL,
+_STRUCTURAL_TOKENS = (
+    "<|channel|>",
+    "<|message|>",
+    "<|start|>",
+    "<|end|>",
+    "<|return|>",
+    "<|call|>",
+    "<|constrain|>",
+    "<|im_end|>",
+    "<|im_start|>",
+    "<|endoftext|>",
 )
+_STRUCTURAL_PATTERN = re.compile("|".join(map(re.escape, _STRUCTURAL_TOKENS)))
 
 
 class HarmonyReasoningParser(ReasoningParser):
@@ -37,8 +47,8 @@ class HarmonyReasoningParser(ReasoningParser):
     Reasoning parser for GPT-OSS models using Harmony format.
 
     Extracts reasoning from the 'analysis' channel and content from
-    the 'final' channel. Commentary channels (tool calls) are ignored
-    since they are handled by the tool parser.
+    the 'final' channel. Unaddressed commentary is public content; addressed
+    messages are handled by the tool parser.
 
     Example:
         Input: "<|channel|>analysis<|message|>Thinking...<|end|>
@@ -46,10 +56,20 @@ class HarmonyReasoningParser(ReasoningParser):
         Output: reasoning="Thinking...", content="Result."
     """
 
-    def __init__(self, tokenizer=None):
+    def __init__(
+        self,
+        tokenizer=None,
+        *,
+        include_plain: bool = False,
+        include_reasoning: bool = True,
+    ):
         super().__init__(tokenizer)
         self._current_channel: str | None = None
         self._in_message: bool = False
+        self._stream_offset = 0
+        self._stream_text = ""
+        self._include_plain = include_plain
+        self._include_reasoning = include_reasoning
 
     def extract_reasoning(
         self,
@@ -59,7 +79,7 @@ class HarmonyReasoningParser(ReasoningParser):
         Extract reasoning from complete Harmony output.
 
         Collects all analysis channel blocks as reasoning and the
-        final channel block as content.
+        final and unaddressed commentary channel blocks as content.
 
         Args:
             model_output: Complete model output text.
@@ -67,15 +87,33 @@ class HarmonyReasoningParser(ReasoningParser):
         Returns:
             (reasoning, content) tuple. Either may be None.
         """
-        # Collect all analysis blocks
-        analysis_blocks = _ANALYSIS_PATTERN.findall(model_output)
-        reasoning = "\n".join(block.strip() for block in analysis_blocks) or None
+        # EOS may be consumed before detokenization, so a body does not need
+        # a decoded terminator. Use the same boundaries as the stream path.
+        projection = HarmonyReasoningParser(include_plain=self._include_plain)
+        projection._stream_text = model_output
+        reasoning = "\n".join(
+            body.strip()
+            for header, body in projection._channel_bodies(len(model_output))
+            if header.group("channel") == "analysis" and body.strip()
+        )
+        delta = projection._extract_stream_delta(finished=True)
+        if delta is None:
+            return None, None
+        return reasoning or None, (delta.content or "").strip() or None
 
-        # Extract final channel content
-        final_match = _FINAL_PATTERN.search(model_output)
-        content = final_match.group(1).strip() if final_match else None
-
-        return reasoning, content
+    def _channel_bodies(self, safe_end: int):
+        for header in _CHANNEL_HEADER_PATTERN.finditer(self._stream_text):
+            metadata = (
+                (header.group("role_metadata") or "")
+                + " "
+                + header.group("channel_metadata")
+            )
+            if _RECIPIENT_PATTERN.search(metadata):
+                continue
+            boundary = _STRUCTURAL_PATTERN.search(self._stream_text, header.end())
+            end = min(boundary.start(), safe_end) if boundary else safe_end
+            start = max(header.end(), self._stream_offset)
+            yield header, self._stream_text[start:end] if start < end else ""
 
     def extract_reasoning_streaming(
         self,
@@ -97,61 +135,55 @@ class HarmonyReasoningParser(ReasoningParser):
         Returns:
             DeltaMessage with reasoning and/or content, or None.
         """
-        # Detect channel switches in the delta
-        if "<|channel|>" in delta_text:
-            if "analysis" in delta_text:
-                self._current_channel = "analysis"
-                self._in_message = False
-                return None
-            elif "final" in delta_text:
-                self._current_channel = "final"
-                self._in_message = False
-                return None
-            elif "commentary" in delta_text:
-                self._current_channel = "commentary"
-                self._in_message = False
-                return None
+        self._stream_text = current_text
+        return self._extract_stream_delta()
 
-        # Detect channel from full context if not yet determined
-        if self._current_channel is None and "<|channel|>" in current_text:
-            last_channel = current_text.rfind("<|channel|>")
-            after = current_text[last_channel + len("<|channel|>") :]
-            if after.startswith("analysis"):
-                self._current_channel = "analysis"
-            elif after.startswith("final"):
-                self._current_channel = "final"
-            elif after.startswith("commentary"):
-                self._current_channel = "commentary"
-
-        # Handle message start
-        if "<|message|>" in delta_text:
-            self._in_message = True
-            # Don't emit the token itself
+    def _extract_stream_delta(self, *, finished: bool = False) -> DeltaMessage | None:
+        # Inspect raw context, not just this delta: a channel token and its name
+        # can arrive separately, or a complete header and body can arrive together.
+        # Only newly available body text is emitted; routing headers and tool
+        # arguments never become reasoning or visible content.
+        current_text = self._stream_text
+        reasoning, content = [], []
+        safe_end = len(current_text)
+        if not finished:
+            # Hold only real structural-token prefixes. A disproved prefix
+            # (e.g. <div> or <|unknown|>) remains ordinary body text.
+            for length in range(
+                1, min(len(current_text), max(map(len, _STRUCTURAL_TOKENS))) + 1
+            ):
+                suffix = current_text[-length:]
+                if any(
+                    token.startswith(suffix) and token != suffix
+                    for token in _STRUCTURAL_TOKENS
+                ):
+                    safe_end = len(current_text) - length
+        if self._include_plain:
+            boundary = _STRUCTURAL_PATTERN.search(current_text)
+            plain_end = min(boundary.start(), safe_end) if boundary else safe_end
+            content.append(current_text[self._stream_offset : plain_end])
+        for header, body in self._channel_bodies(safe_end):
+            if header.group("channel") == "analysis":
+                if self._include_reasoning:
+                    reasoning.append(body)
+            else:
+                # Unaddressed commentary is a public assistant preamble.
+                content.append(body)
+        self._stream_offset = safe_end
+        if not any(reasoning) and not any(content):
             return None
+        return DeltaMessage(
+            reasoning="".join(reasoning) or None,
+            content="".join(content) or None,
+        )
 
-        # Handle channel/message end tokens
-        if any(
-            token in delta_text
-            for token in ("<|end|>", "<|return|>", "<|call|>", "<|start|>")
-        ):
-            self._in_message = False
-            return None
-
-        # Skip control tokens
-        if delta_text.strip().startswith("<|") and delta_text.strip().endswith("|>"):
-            return None
-
-        # Emit content based on current channel
-        if self._in_message and self._current_channel == "analysis":
-            return DeltaMessage(reasoning=delta_text)
-
-        if self._in_message and self._current_channel == "final":
-            return DeltaMessage(content=delta_text)
-
-        # In commentary or unknown channel, suppress
-        return None
+    def finalize_stream(self) -> DeltaMessage | None:
+        """Release a held literal prefix at EOS, without replaying body text."""
+        return self._extract_stream_delta(finished=True)
 
     def reset_state(self, implicit_mode: bool = False):  # noqa: ARG002
         """Reset streaming state for a new request."""
         self._current_channel = None
         self._in_message = False
+        self._stream_offset = 0
+        self._stream_text = ""

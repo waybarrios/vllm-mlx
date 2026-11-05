@@ -32,6 +32,7 @@ import threading
 from collections import OrderedDict
 from contextlib import nullcontext
 from dataclasses import dataclass
+from types import ModuleType
 from typing import Any, Callable
 
 
@@ -65,7 +66,8 @@ def _get_available_memory() -> int:
     try:
         import psutil
 
-        return psutil.virtual_memory().available
+        available: int = psutil.virtual_memory().available
+        return available
     except ImportError:
         logger.warning("psutil not installed, using fallback memory limit")
         return 0
@@ -92,10 +94,12 @@ def _array_memory(arr) -> int:
     if hasattr(arr, "shape") and hasattr(arr, "dtype"):
         dtype = arr.dtype
         if hasattr(dtype, "size"):
-            return math.prod(arr.shape) * dtype.size
+            size: int = math.prod(arr.shape) * dtype.size
+            return size
     # Fallback for non-MLX arrays or objects without shape/dtype
     if hasattr(arr, "nbytes"):
-        return arr.nbytes
+        nbytes: int = arr.nbytes
+        return nbytes
     return 0
 
 
@@ -418,7 +422,7 @@ def _trim_cache_offset(cache: list[Any], trim_by: int) -> list[Any]:
             old_size = min(old_offset, layer_cache.max_size)
             entries_to_keep = max(0, old_size - trim_by)
 
-            orig_cls = type(layer_cache)
+            orig_cls: Any = type(layer_cache)
             tc = orig_cls.__new__(orig_cls)
             tc.offset = new_offset
             tc.max_size = layer_cache.max_size
@@ -551,7 +555,8 @@ def _needs_kv_trim(layer: Any) -> bool:
     shape = getattr(keys, "shape", None)
     if shape is None or len(shape) < 3:
         return False
-    return 0 < offset < shape[2]
+    needs_trim: bool = 0 < offset < shape[2]
+    return needs_trim
 
 
 def _trim_to_offset(cache: list[Any]) -> list[Any]:
@@ -702,8 +707,11 @@ def _detach_cache_for_storage(
     arrays, or a recognized layer whose snapshot fails.  Array-free unknown
     layers pass through unchanged (nothing to pin).
     """
+    mx: ModuleType | None
     try:
-        import mlx.core as mx
+        import mlx.core as mlx_core
+
+        mx = mlx_core
     except ImportError:
         # No-MLX environments (e.g. the CI unit-test lane) have no MLX
         # arrays to materialize; container/attribute snapshotting below
@@ -713,7 +721,7 @@ def _detach_cache_for_storage(
     # Recursive calls (CacheList children) share the caller's target list
     # so the whole entry still materializes in one batched eval.
     is_root = _eval_targets is None
-    eval_targets: list[Any] = [] if is_root else _eval_targets
+    eval_targets: list[Any] = [] if _eval_targets is None else _eval_targets
 
     def _detach(arr: Any) -> Any:
         # Only real MLX arrays are detached: they alone carry a lazy graph
@@ -857,6 +865,7 @@ def _detach_cache_for_storage(
                 )
 
         if is_root and eval_targets:
+            assert mx is not None
             try:
                 mx.eval(*eval_targets)
             except Exception as e:
@@ -943,7 +952,7 @@ def _dequantize_cache(cache: list[Any]) -> list[Any]:
     for layer in cache:
         if isinstance(layer, _QuantizedCacheWrapper):
             # Reconstruct original cache type from quantized data
-            orig_cls = layer.orig_type
+            orig_cls: Any = layer.orig_type
             kv = orig_cls.__new__(orig_cls)
             kv.keys = mx.dequantize(
                 *layer.keys, group_size=layer.group_size, bits=layer.bits
@@ -1913,7 +1922,7 @@ class MemoryAwarePrefixCache:
             logger.warning("[cache_persist] mlx_lm not available, cannot save")
             return False
 
-        index = {
+        index: dict[str, Any] = {
             "version": _CACHE_PERSIST_VERSION,
             "model_fingerprint": self._model_fingerprint,
             "model_revision": self._model_revision,

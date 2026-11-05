@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import importlib
 import logging
-from typing import Any, Optional
+from typing import Any, Optional, cast
 
 import mlx.core as mx
 
@@ -38,7 +38,7 @@ def _cache_offset_to_int(cache) -> int:
     if isinstance(off, int):
         return off
     if isinstance(off, mx.array):
-        return int(off.max().item()) if off.ndim > 0 else int(off.item())
+        return int(cast(int, off.max().item() if off.ndim > 0 else off.item()))
     return int(off)
 
 
@@ -72,7 +72,7 @@ def _position_ids_for_offset(offset: int, length: int) -> mx.array:
 
 
 def _kv_seq_len(keys: mx.array, cache: Optional[Any], offset: int) -> int:
-    length = keys.shape[-2]
+    length: int = keys.shape[-2]
     return length + offset + 1 if cache is not None else length
 
 
@@ -87,18 +87,23 @@ def _apply_rotary(
 ) -> tuple[mx.array, mx.array]:
     if position_embeddings is not None:
         cos, sin = position_embeddings
-        return apply_multimodal_rotary_pos_emb(queries, keys, cos, sin)
+        result: tuple[mx.array, mx.array] = apply_multimodal_rotary_pos_emb(
+            queries, keys, cos, sin
+        )
+        return result
 
     if hasattr(attention.rotary_emb, "apply_rotary"):
-        return attention.rotary_emb.apply_rotary(
+        result = attention.rotary_emb.apply_rotary(
             queries,
             keys,
             position_ids,
             unsqueeze_dim=1,
         )
+        return result
 
     cos, sin = attention.rotary_emb(values, position_ids)
-    return apply_multimodal_rotary_pos_emb(queries, keys, cos, sin)
+    result = apply_multimodal_rotary_pos_emb(queries, keys, cos, sin)
+    return result
 
 
 def _slice_attention_mask(
@@ -131,7 +136,7 @@ def _maybe_target_verify_attention(
 ) -> Optional[mx.array]:
     if not ((target_verify and length > 1) or left_padded_decode):
         return None
-    return target_verify_left_padded_attention(
+    output: Optional[mx.array] = target_verify_left_padded_attention(
         queries,
         keys,
         values,
@@ -139,6 +144,7 @@ def _maybe_target_verify_attention(
         scale=scale,
         mask=mask,
     )
+    return output
 
 
 def patch_qwen35_attention_for_batching() -> bool:
@@ -258,7 +264,8 @@ def patch_qwen35_attention_for_batching() -> bool:
             )
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
 
-        return self.o_proj(output * mx.sigmoid(gate))
+        projected: mx.array = self.o_proj(output * mx.sigmoid(gate))
+        return projected
 
     Qwen3_5Attention.__call__ = _patched_call
     setattr(Qwen3_5Attention, "_batch_patched", True)

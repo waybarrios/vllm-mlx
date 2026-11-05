@@ -22,6 +22,7 @@ import uuid
 from collections.abc import Sequence
 from typing import Any
 
+from ..reasoning.harmony_parser import HarmonyReasoningParser
 from .abstract_tool_parser import (
     ExtractedToolCallInformation,
     ToolParser,
@@ -39,18 +40,15 @@ def _generate_tool_id() -> str:
 # mid-block output, or args that would span into a later channel, must not
 # become a structured tool call with malformed/glued args.
 _COMMENTARY_BLOCK_PATTERN = re.compile(
-    r"<\|channel\|>commentary\s+to=functions\.(\w+)"
+    r"(?:<\|start\|>assistant(?P<role_metadata>[^<]*))?"
+    r"<\|channel\|>commentary\b(?P<channel_metadata>[^<]*)"
     r"(?:\s*<\|constrain\|>\w+)?"
-    r"\s*<\|message\|>((?:(?!<\|channel\|>).)*?)"
+    r"\s*<\|message\|>(?P<arguments>(?:(?!<\|channel\|>).)*?)"
     r"(?P<terminator><\|call\|>|<\|end\|>|<\|return\|>|<\|start\|>|<\|channel\|>|\Z)",
     re.DOTALL,
 )
 
-# Pattern: <|channel|>final ... <|return|>
-_FINAL_BLOCK_PATTERN = re.compile(
-    r"<\|channel\|>final\s*<\|message\|>(.*?)<\|return\|>",
-    re.DOTALL,
-)
+_TOOL_RECIPIENT_PATTERN = re.compile(r"(?:^|\s)to=functions\.([A-Za-z0-9_-]+)(?=\s|$)")
 
 
 @ToolParserManager.register_module(["harmony", "gpt-oss"])
@@ -81,8 +79,16 @@ class HarmonyToolParser(ToolParser):
 
         # Extract tool calls from commentary channel blocks
         for match in _COMMENTARY_BLOCK_PATTERN.finditer(model_output):
-            tool_name = match.group(1)
-            args_str = match.group(2).strip()
+            metadata = (
+                (match.group("role_metadata") or "")
+                + " "
+                + match.group("channel_metadata")
+            )
+            recipient = _TOOL_RECIPIENT_PATTERN.search(metadata)
+            if recipient is None:
+                continue
+            tool_name = recipient.group(1)
+            args_str = match.group("arguments").strip()
             terminator = match.group("terminator")
             # End-of-string and a following channel boundary mean the args
             # did not stop at an explicit call terminator: truncated or moved
@@ -116,9 +122,11 @@ class HarmonyToolParser(ToolParser):
                     }
                 )
 
-        # Extract final channel content
-        final_match = _FINAL_BLOCK_PATTERN.search(model_output)
-        content = final_match.group(1).strip() if final_match else None
+        # Public commentary and final bodies share the same projection as
+        # streaming, including a final body whose EOS token was not decoded.
+        _, content = HarmonyReasoningParser(include_plain=True).extract_reasoning(
+            model_output
+        )
 
         if tool_calls:
             return ExtractedToolCallInformation(
@@ -127,16 +135,10 @@ class HarmonyToolParser(ToolParser):
                 content=content,
             )
 
-        # No tool calls: return all text as content
-        # If there's a final channel, use that; otherwise return the raw output
-        # stripped of control tokens
-        if content is None:
-            content = _strip_control_tokens(model_output)
-
         return ExtractedToolCallInformation(
             tools_called=False,
             tool_calls=[],
-            content=content,
+            content=content or "",
         )
 
     def extract_tool_calls_streaming(
@@ -155,12 +157,9 @@ class HarmonyToolParser(ToolParser):
         A commentary block completes when an explicit terminator arrives
         (<|call|>, <|end|>, <|return|>, <|start|>) or when the model moves on
         to the <|channel|>final block; the completed call is emitted once
-        (deduplicated by name + arguments). Final-channel content is emitted
-        as regular content deltas and plain text passes through unchanged.
+        (deduplicated by block index, name and arguments). Final-channel content
+        is emitted as regular content deltas and plain text passes unchanged.
         """
-        if not hasattr(self, "_emitted_streaming_signatures"):
-            self._emitted_streaming_signatures = set()
-
         # No harmony channel at all: plain text passes through
         if "<|channel|>" not in current_text:
             return {"content": delta_text}
@@ -176,26 +175,9 @@ class HarmonyToolParser(ToolParser):
         )
 
         if block_completed:
-            result = self.extract_tool_calls(current_text)
-            if result.tools_called:
-                emitted = []
-                for i, tc in enumerate(result.tool_calls):
-                    signature = (tc["name"], tc["arguments"])
-                    if signature not in self._emitted_streaming_signatures:
-                        self._emitted_streaming_signatures.add(signature)
-                        emitted.append(
-                            {
-                                "index": i,
-                                "id": tc["id"],
-                                "type": "function",
-                                "function": {
-                                    "name": tc["name"],
-                                    "arguments": tc["arguments"],
-                                },
-                            }
-                        )
-                if emitted:
-                    return {"tool_calls": emitted}
+            result = self._extract_unemitted_tool_calls(current_text)
+            if result:
+                return result
 
         # In the final channel, emit content
         if "<|channel|>final" in current_text and "<|call|>" not in current_text:
@@ -213,31 +195,36 @@ class HarmonyToolParser(ToolParser):
         # Building tool call or in analysis channel, suppress output
         return None
 
+    def _extract_unemitted_tool_calls(self, current_text: str) -> dict[str, Any] | None:
+        if not hasattr(self, "_emitted_streaming_signatures"):
+            self._emitted_streaming_signatures: set[tuple[int, str, str]] = set()
+        result = self.extract_tool_calls(current_text)
+        emitted = []
+        for i, tc in enumerate(result.tool_calls):
+            signature = (i, tc["name"], tc["arguments"])
+            if signature not in self._emitted_streaming_signatures:
+                self._emitted_streaming_signatures.add(signature)
+                emitted.append(
+                    {
+                        "index": i,
+                        "id": tc["id"],
+                        "type": "function",
+                        "function": {
+                            "name": tc["name"],
+                            "arguments": tc["arguments"],
+                        },
+                    }
+                )
+        return {"tool_calls": emitted} if emitted else None
+
+    def finalize_streaming(self, current_text: str) -> dict[str, Any] | None:
+        """Emit pending valid EOS calls without replaying earlier call blocks."""
+        return self._extract_unemitted_tool_calls(current_text)
+
     def reset(self) -> None:
         """Reset parser state for a new request."""
         super().reset()
         self._emitted_streaming_signatures = set()
-
-
-def _strip_control_tokens(text: str) -> str:
-    """Remove Harmony control tokens from text."""
-    tokens = [
-        "<|start|>",
-        "<|end|>",
-        "<|message|>",
-        "<|channel|>",
-        "<|constrain|>",
-        "<|return|>",
-        "<|call|>",
-    ]
-    result = text
-    for token in tokens:
-        result = result.replace(token, "")
-    # Clean up channel names and constrain values
-    result = re.sub(r"(?:analysis|commentary|final)\s*", "", result)
-    result = re.sub(r"to=functions\.\w+\s*", "", result)
-    result = re.sub(r"json\s*", "", result)
-    return result.strip()
 
 
 def _is_control_token(text: str) -> bool:

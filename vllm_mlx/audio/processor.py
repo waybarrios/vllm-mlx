@@ -10,7 +10,7 @@ Supports:
 import logging
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Tuple, Union
+from typing import Any, Optional, Protocol, Tuple, Union
 
 import numpy as np
 
@@ -18,6 +18,35 @@ logger = logging.getLogger(__name__)
 
 # Default models
 DEFAULT_SAM_MODEL = "mlx-community/sam-audio-large-fp16"
+
+
+class _SeparationModel(Protocol):
+    sample_rate: int
+
+    def separate_long(
+        self,
+        *,
+        audios: Any,
+        descriptions: Any,
+        chunk_seconds: float,
+        overlap_seconds: float,
+        anchor_ids: Any,
+        anchor_alignment: Any,
+    ) -> Any: ...
+
+    def separate(
+        self,
+        *,
+        audios: Any,
+        descriptions: Any,
+        sizes: Any,
+        anchor_ids: Any,
+        anchor_alignment: Any,
+    ) -> Any: ...
+
+
+class _SeparationProcessor(Protocol):
+    def __call__(self, *, descriptions: list[str], audios: list[str]) -> Any: ...
 
 
 @dataclass
@@ -60,8 +89,8 @@ class AudioProcessor:
                 - mlx-community/sam-audio-small
         """
         self.model_name = model_name
-        self.model = None
-        self.processor = None
+        self.model: _SeparationModel | None = None
+        self.processor: _SeparationProcessor | None = None
         self._loaded = False
         self.sample_rate = 44100  # SAM-Audio default
 
@@ -106,6 +135,9 @@ class AudioProcessor:
         """
         if not self._loaded:
             self.load()
+
+        assert self.model is not None
+        assert self.processor is not None
 
         audio_path = str(audio_path)
 

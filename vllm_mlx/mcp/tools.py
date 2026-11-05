@@ -158,7 +158,8 @@ def extract_tool_calls(response: Dict[str, Any]) -> List[Dict[str, Any]]:
         return []
 
     message = choices[0].get("message", {})
-    return message.get("tool_calls", [])
+    tool_calls: List[Dict[str, Any]] = message.get("tool_calls", [])
+    return tool_calls
 
 
 def has_tool_calls(response: Dict[str, Any]) -> bool:

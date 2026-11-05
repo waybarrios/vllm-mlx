@@ -492,7 +492,7 @@ def log_memory_budget_report(report: MemoryBudgetReport) -> None:
     gb = 1024**3
     ceiling = report.allocation_ceiling_bytes
 
-    if ceiling is None:
+    if ceiling is None or report.gpu_memory_utilization is None:
         if report.gpu_memory_utilization is None:
             reason = (
                 "no continuous-batching entries, and --gpu-memory-utilization "
@@ -870,9 +870,9 @@ class ModelManager:
                     if claimed is not None:
                         return claimed
 
-                    same_model_future = self._loading.get(model_name, None)
-                    if same_model_future is not None:
-                        same_model_future = same_model_future.future
+                    pending_load = self._loading.get(model_name, None)
+                    if pending_load is not None:
+                        same_model_future = pending_load.future
                     elif model_name in self._unloading:
                         wait_timeout = self._remaining_wait_timeout(start)
                     else:

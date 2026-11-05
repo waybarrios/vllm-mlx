@@ -19,9 +19,17 @@ import os
 import re
 import threading
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any
+from functools import partial
+from typing import TYPE_CHECKING, Any, TypeVar, cast
+
+if TYPE_CHECKING:
+    from ..engine_core import AsyncEngineCore
+    from ..mllm_scheduler import MLLMScheduler
+    from ..models.mllm import MLXMultimodalLM
+    from mlx.nn import Module
+    from mlx_lm.tokenizer_utils import TokenizerWrapper
 
 import mlx.core as mx
 
@@ -40,6 +48,8 @@ from .drafter_capabilities import (
 )
 
 logger = logging.getLogger(__name__)
+
+_ResultT = TypeVar("_ResultT")
 
 
 _MLX_CACHE_SUFFIX_MULTIPLIERS = {
@@ -229,15 +239,15 @@ class BatchedEngine(BaseEngine):
         self._specprefill_keep_pct = specprefill_keep_pct
         self._specprefill_backbone_pct = specprefill_backbone_pct
         self._specprefill_draft_model_path = specprefill_draft_model
-        self._specprefill_draft_model = None
+        self._specprefill_draft_model: "Module | None" = None
         self._is_mllm = force_mllm or is_mllm_model(self._model_path)
 
-        self._model = None
-        self._processor = None  # For MLLM
-        self._tokenizer = None  # For LLM
-        self._engine = None  # AsyncEngineCore for LLM
-        self._mllm_scheduler = None  # MLLMScheduler for MLLM
-        self._mllm_instance = None  # MLXMultimodalLM instance
+        self._model: Any | None = None
+        self._processor: Any | None = None  # For MLLM
+        self._tokenizer: Any | None = None  # For LLM
+        self._engine: "AsyncEngineCore | None" = None  # AsyncEngineCore for LLM
+        self._mllm_scheduler: "MLLMScheduler | None" = None  # MLLMScheduler for MLLM
+        self._mllm_instance: "MLXMultimodalLM | None" = None  # MLXMultimodalLM instance
         self._loaded = False
         # Single thread that owns the model; see _generation_worker.
         self._generation_executor: ThreadPoolExecutor | None = None
@@ -358,17 +368,22 @@ class BatchedEngine(BaseEngine):
         """Record the sole worker thread so synchronous calls cannot deadlock."""
         self._generation_thread_id = threading.get_ident()
 
-    def _run_on_generation_worker_sync(self, operation):
+    def _run_on_generation_worker_sync(
+        self, operation: Callable[[], _ResultT]
+    ) -> _ResultT:
         """Run an MLX operation on its owner while preserving a sync API."""
         if threading.get_ident() == getattr(self, "_generation_thread_id", None):
             return operation()
         return self._generation_worker().submit(operation).result()
 
-    async def _run_on_generation_worker(self, operation):
+    async def _run_on_generation_worker(
+        self, operation: Callable[[], _ResultT]
+    ) -> _ResultT:
         """Run an MLX operation on the thread that owns the text model."""
-        return await run_blocking_startup_work(
+        result: _ResultT = await run_blocking_startup_work(
             operation, executor=self._generation_worker()
         )
+        return result
 
     def _prepare_mllm_model(self) -> None:
         """Load the MLLM model before scheduler startup."""
@@ -396,8 +411,10 @@ class BatchedEngine(BaseEngine):
             try:
                 from mlx_lm import load as mlx_lm_load
 
-                self._specprefill_draft_model, _ = mlx_lm_load(
-                    self._specprefill_draft_model_path
+                # No return_config request means the result is a pair.
+                self._specprefill_draft_model, _ = cast(
+                    "tuple[Module, TokenizerWrapper]",
+                    mlx_lm_load(self._specprefill_draft_model_path),
                 )
                 logger.info(
                     "Media SpecPrefill draft loaded: model=%s threshold=%d keep=%.0f%%",
@@ -418,9 +435,13 @@ class BatchedEngine(BaseEngine):
 
             if mx.metal.is_available():
                 device_info = mx.device_info()
-                max_recommended = device_info.get(
-                    "max_recommended_working_set_size",
-                    device_info.get("memory_size", 0),
+                # MLX memory-size fields are integer byte counts.
+                max_recommended = cast(
+                    int,
+                    device_info.get(
+                        "max_recommended_working_set_size",
+                        device_info.get("memory_size", 0),
+                    ),
                 )
                 if max_recommended > 0:
                     soft_limit = int(max_recommended * self._gpu_memory_utilization)
@@ -538,7 +559,7 @@ class BatchedEngine(BaseEngine):
         )
 
         # Create and start MLLM scheduler
-        scheduler_kwargs = {
+        scheduler_kwargs: dict[str, Any] = {
             "specprefill_draft_model": self._specprefill_draft_model,
         }
         if self._mllm_draft_model is not None:
@@ -572,6 +593,7 @@ class BatchedEngine(BaseEngine):
         from mlx_lm.utils import _download
 
         model = self._model
+        assert model is not None
         model_path = Path(_download(self._model_path))
         config_path = model_path / "config.json"
         if not config_path.exists():
@@ -620,7 +642,9 @@ class BatchedEngine(BaseEngine):
             return
 
         # Build tokenizer config
-        tokenizer_config = {"trust_remote_code": self._trust_remote_code}
+        tokenizer_config: dict[str, Any] = {
+            "trust_remote_code": self._trust_remote_code
+        }
 
         # Qwen3 fix
         if "qwen3" in self._model_name.lower() or "Qwen3" in self._model_name:
@@ -654,9 +678,13 @@ class BatchedEngine(BaseEngine):
 
             if mx.metal.is_available():
                 device_info = mx.device_info()
-                max_recommended = device_info.get(
-                    "max_recommended_working_set_size",
-                    device_info.get("memory_size", 0),
+                # MLX memory-size fields are integer byte counts.
+                max_recommended = cast(
+                    int,
+                    device_info.get(
+                        "max_recommended_working_set_size",
+                        device_info.get("memory_size", 0),
+                    ),
                 )
                 if max_recommended > 0:
                     soft_limit = int(max_recommended * self._gpu_memory_utilization)
@@ -808,7 +836,7 @@ class BatchedEngine(BaseEngine):
             # Per-request enable_thinking override; default: True unless coder model.
             if enable_thinking is None:
                 enable_thinking = "coder" not in self._model_name.lower()
-            template_kwargs = {
+            template_kwargs: dict[str, Any] = {
                 "tokenize": False,
                 "add_generation_prompt": True,
                 "enable_thinking": enable_thinking,
@@ -826,9 +854,10 @@ class BatchedEngine(BaseEngine):
                 tokenizer_applicator = tokenizer
 
             try:
-                return template_applicator.apply_chat_template(
+                prompt: str = template_applicator.apply_chat_template(
                     messages, **template_kwargs
                 )
+                return prompt
             except ValueError as e:
                 # Some HF processors define apply_chat_template but do not carry
                 # a template (e.g. Gemma-3 processor). Retry on tokenizer.
@@ -836,9 +865,10 @@ class BatchedEngine(BaseEngine):
                     tokenizer_applicator is not None
                     and "does not have a chat template" in str(e)
                 ):
-                    return tokenizer_applicator.apply_chat_template(
+                    prompt = tokenizer_applicator.apply_chat_template(
                         messages, **template_kwargs
                     )
+                    return prompt
                 raise
             except TypeError as e:
                 # Some templates don't accept extra kwargs; retry without them.
@@ -849,9 +879,10 @@ class BatchedEngine(BaseEngine):
                     *(chat_template_kwargs or {}).keys(),
                 ]:
                     template_kwargs.pop(key, None)
-                return template_applicator.apply_chat_template(
+                prompt = template_applicator.apply_chat_template(
                     messages, **template_kwargs
                 )
+                return prompt
         else:
             # Fallback for models without apply_chat_template
             prompt = "\n".join(f"{m['role']}: {m['content']}" for m in messages)
@@ -882,7 +913,7 @@ class BatchedEngine(BaseEngine):
                 continue
             content = msg.get("content")
             if isinstance(content, list):
-                new_content = []
+                new_content: list[dict | str] = []
                 for part in content:
                     if isinstance(part, dict) and part.get("type") == "image_url":
                         new_content.append({"type": "image"})
@@ -953,6 +984,7 @@ class BatchedEngine(BaseEngine):
 
             return GenerationOutput(
                 text=clean_output_text(output.output_text),
+                raw_text=output.output_text,
                 tokens=output.output_token_ids,
                 prompt_tokens=output.prompt_tokens,
                 completion_tokens=output.completion_tokens,
@@ -977,6 +1009,7 @@ class BatchedEngine(BaseEngine):
             logits_processors=kwargs.pop("logits_processors", None),
         )
 
+        assert self._engine is not None
         output = await self._engine.generate(
             prompt=prompt,
             sampling_params=sampling_params,
@@ -986,6 +1019,7 @@ class BatchedEngine(BaseEngine):
 
         return GenerationOutput(
             text=text,
+            raw_text=output.output_text,
             tokens=output.output_token_ids,
             prompt_tokens=output.prompt_tokens,
             completion_tokens=output.completion_tokens,
@@ -1077,6 +1111,7 @@ class BatchedEngine(BaseEngine):
         )
 
         prefix_boundary = kwargs.pop("prefix_boundary", 0)
+        assert self._engine is not None
         request_id = await self._engine.add_request(
             prompt=prompt,
             sampling_params=sampling_params,
@@ -1313,7 +1348,7 @@ class BatchedEngine(BaseEngine):
 
     def get_stats(self) -> dict[str, Any]:
         """Get engine statistics."""
-        stats = {
+        stats: dict[str, Any] = {
             "engine_type": "batched",
             "model_name": self._model_name,
             "uptime_seconds": time.time() - self._created_at,
@@ -1425,7 +1460,7 @@ class BatchedEngine(BaseEngine):
                 return pc.save_to_disk(cache_dir)
         if self._engine:
             return self._run_on_generation_worker_sync(
-                lambda: self._engine.save_cache_to_disk(cache_dir)
+                partial(self._engine.save_cache_to_disk, cache_dir)
             )
         return False
 
@@ -1435,7 +1470,7 @@ class BatchedEngine(BaseEngine):
             return self.save_cache_to_disk(cache_dir)
         if self._engine is not None:
             return await self._run_on_generation_worker(
-                lambda: self._engine.save_cache_to_disk(cache_dir)
+                partial(self._engine.save_cache_to_disk, cache_dir)
             )
         return False
 
@@ -1443,12 +1478,13 @@ class BatchedEngine(BaseEngine):
         """Load prefix cache from disk. Returns number of entries loaded."""
         if self._mllm_scheduler:
             self._mllm_scheduler._ensure_batch_generator()
+            assert self._mllm_scheduler.batch_generator is not None
             pc = self._mllm_scheduler.batch_generator.prefix_cache
             if pc is not None:
                 return pc.load_from_disk(cache_dir)
         if self._engine:
             return self._run_on_generation_worker_sync(
-                lambda: self._engine.load_cache_from_disk(cache_dir)
+                partial(self._engine.load_cache_from_disk, cache_dir)
             )
         return 0
 
@@ -1458,7 +1494,7 @@ class BatchedEngine(BaseEngine):
             return self.load_cache_from_disk(cache_dir)
         if self._engine is not None:
             return await self._run_on_generation_worker(
-                lambda: self._engine.load_cache_from_disk(cache_dir)
+                partial(self._engine.load_cache_from_disk, cache_dir)
             )
         return 0
 
