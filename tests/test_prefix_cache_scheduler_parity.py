@@ -7,6 +7,7 @@ avoid model downloads while exercising the production scheduler/cache boundary.
 """
 
 from dataclasses import replace
+from types import SimpleNamespace
 
 import pytest
 
@@ -105,6 +106,62 @@ def _generate(scheduler, request_id, prompt, max_tokens=2):
         if request_id in result.finished_request_ids:
             return emitted, request
     raise AssertionError(f"request {request_id} did not finish")
+
+
+def test_plain_kv_first_output_does_not_extract_an_unused_snapshot(monkeypatch):
+    scheduler = _scheduler("kv")
+    extractions = []
+    original = cache_mod.BatchKVCache.extract
+
+    def record_extract(layer, index):
+        extractions.append(index)
+        return original(layer, index)
+
+    monkeypatch.setattr(cache_mod.BatchKVCache, "extract", record_extract)
+    request = Request(
+        request_id="plain-first-token",
+        prompt=[1, 2, 3],
+        sampling_params=SamplingParams(max_tokens=2, temperature=0.0),
+    )
+    scheduler.add_request(request)
+    try:
+        for _ in range(8):
+            result = scheduler.step()
+            if result.outputs:
+                assert not result.outputs[0].finished
+                assert result.outputs[0].new_token_ids
+                assert extractions == [], "a discarded snapshot synchronized live KV"
+                break
+        else:
+            pytest.fail("request did not produce its first token")
+    finally:
+        scheduler._close_batch_generator()
+
+
+@pytest.mark.parametrize(
+    "kind", ["rotating", "mixed", "subclass", "unknown", "missing", "empty", "iterator"]
+)
+def test_snapshot_extraction_keeps_nonplain_and_unknown_topologies(kind):
+    class CustomBatchKV(cache_mod.BatchKVCache):
+        pass
+
+    plain = cache_mod.BatchKVCache([0])
+    layers = {
+        "rotating": [cache_mod.BatchRotatingKVCache(8, [0])],
+        "mixed": [plain, cache_mod.ArraysCache(1)],
+        "subclass": [CustomBatchKV([0])],
+        "unknown": [object()],
+        "missing": None,
+        "empty": [],
+        "iterator": iter([plain]),
+    }[kind]
+    extracted = [object()]
+    batch = SimpleNamespace(
+        uids=[7], prompt_cache=layers, extract_cache=lambda index: extracted
+    )
+    scheduler = object.__new__(Scheduler)
+    scheduler.batch_generator = SimpleNamespace(_generation_batch=batch)
+    assert scheduler._extract_cache_for_uid(7) is extracted
 
 
 def test_arrays_cache_next_turn_matches_cold_when_coverage_is_unknown():
