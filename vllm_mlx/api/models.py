@@ -16,6 +16,12 @@ from typing import Any, Literal
 
 from pydantic import AliasChoices, BaseModel, Field, model_serializer, model_validator
 
+_KV_CACHE_BITS_DESCRIPTION = (
+    "Off by default. For long text prompts in SimpleEngine, set to 8 or 4 to "
+    "reduce peak prefill memory. Each layer's KV cache is quantized as it "
+    "finishes the prompt. This uses a fresh cache and can delay the first token."
+)
+
 # =============================================================================
 # Content Types (for multimodal messages)
 # =============================================================================
@@ -213,6 +219,9 @@ class ChatCompletionRequest(BaseModel):
     specprefill_keep_pct: float | None = None
     # SpecPrefill: per-request evenly spaced backbone percentage.
     specprefill_backbone_pct: float | None = None
+    kv_cache_bits: Literal[4, 8] | None = Field(
+        default=None, description=_KV_CACHE_BITS_DESCRIPTION, examples=[8]
+    )
     # Enable/disable thinking mode (None = server default, typically True)
     enable_thinking: bool | None = None
     # MLLM assistant-drafter per-request override (None = server default).
@@ -328,6 +337,9 @@ class CompletionRequest(BaseModel):
     specprefill_keep_pct: float | None = None
     # SpecPrefill: per-request evenly spaced backbone percentage.
     specprefill_backbone_pct: float | None = None
+    kv_cache_bits: Literal[4, 8] | None = Field(
+        default=None, description=_KV_CACHE_BITS_DESCRIPTION, examples=[8]
+    )
     # MLLM assistant-drafter per-request override (None = server default).
     mllm_draft: bool | None = None
 

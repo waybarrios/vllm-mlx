@@ -871,6 +871,24 @@ def _attach_logit_bias_processor(
         chat_kwargs["logits_processors"] = list(existing) + list(processors)
 
 
+def _validate_kv_cache_bits_request(
+    engine: BaseEngine,
+    request: ChatCompletionRequest | CompletionRequest,
+    *,
+    has_media: bool = False,
+) -> None:
+    if not request.kv_cache_bits:
+        return
+    if not isinstance(engine, SimpleEngine):
+        raise HTTPException(
+            400, "Layerwise KV quantization requires text-only SimpleEngine"
+        )
+    try:
+        engine.validate_quantized_prefill(request.specprefill, has_media=has_media)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
 def _prepare_chat_completion_invocation(
     engine: BaseEngine,
     request: ChatCompletionRequest,
@@ -880,6 +898,7 @@ def _prepare_chat_completion_invocation(
     messages, images, videos, audios, has_media = _prepare_chat_messages(
         engine, request.messages
     )
+    _validate_kv_cache_bits_request(engine, request, has_media=has_media)
     response_format = request.response_format
     messages, json_logits_processor = _prepare_json_logits_processor(
         engine,
@@ -911,6 +930,8 @@ def _prepare_chat_completion_invocation(
         if video_max_frames:
             chat_kwargs["video_max_frames"] = video_max_frames
 
+    if request.kv_cache_bits:
+        chat_kwargs["kv_cache_bits"] = request.kv_cache_bits
     if request.specprefill is not None:
         chat_kwargs["specprefill"] = request.specprefill
     if request.specprefill_keep_pct is not None:
@@ -5756,6 +5777,7 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
     release_on_exit = True
 
     try:
+        _validate_kv_cache_bits_request(engine, request)
         if request.stream:
             response = StreamingResponse(
                 _disconnect_guard(
@@ -5798,6 +5820,8 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
             generate_kwargs["repetition_penalty"] = _resolve_repetition_penalty(
                 comp_rep_penalty
             )
+            if request.kv_cache_bits:
+                generate_kwargs["kv_cache_bits"] = request.kv_cache_bits
             if request.specprefill is not None:
                 generate_kwargs["specprefill"] = request.specprefill
             if request.specprefill_keep_pct is not None:
@@ -7063,6 +7087,8 @@ async def stream_completion(
     generate_kwargs["repetition_penalty"] = _resolve_repetition_penalty(
         repetition_penalty
     )
+    if request.kv_cache_bits:
+        generate_kwargs["kv_cache_bits"] = request.kv_cache_bits
     if request.specprefill is not None:
         generate_kwargs["specprefill"] = request.specprefill
     if request.specprefill_keep_pct is not None:
