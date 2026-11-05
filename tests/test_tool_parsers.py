@@ -17,6 +17,7 @@ from vllm_mlx.tool_parsers import (
     KimiToolParser,
     LlamaToolParser,
     MistralToolParser,
+    MuseGlimmerToolParser,
     NemotronToolParser,
     QwenToolParser,
     ToolParserManager,
@@ -2589,6 +2590,151 @@ class TestGLM47ToolParser:
                 assert args == {}
 
         assert tool_calls_found, "Zero-argument tool call should have been detected"
+
+
+def _fail_on_constant(name: str) -> None:
+    """``json.loads`` hook that rejects non-standard ``NaN``/``Infinity``."""
+    raise AssertionError(f"non-finite JSON constant: {name}")
+
+
+class TestMuseGlimmerToolParser:
+    """Tests for the Muse Glimmer ATEM tool parser (content after the reasoning parser)."""
+
+    SINGLE = (
+        '<atem:function_calls>\n<atem:invoke name="weather.get">\n'
+        '<atem:parameter name="city">Paris</atem:parameter>\n'
+        '<atem:parameter name="units">celsius</atem:parameter>\n'
+        "</atem:invoke>\n</atem:function_calls>"
+    )
+
+    def test_single_call(self):
+        result = MuseGlimmerToolParser().extract_tool_calls(self.SINGLE)
+        assert result.tools_called is True
+        assert result.content is None
+        [call] = result.tool_calls
+        assert call["name"] == "weather.get"
+        assert json.loads(call["arguments"]) == {"city": "Paris", "units": "celsius"}
+
+    def test_json_values_and_string_fallback(self):
+        output = (
+            '<atem:function_calls><atem:invoke name="f">'
+            '<atem:parameter name="payload">{"nested": [1, 2, 3]}</atem:parameter>'
+            '<atem:parameter name="flag">true</atem:parameter>'
+            '<atem:parameter name="word">bare</atem:parameter>'
+            "</atem:invoke></atem:function_calls>"
+        )
+        [call] = MuseGlimmerToolParser().extract_tool_calls(output).tool_calls
+        assert json.loads(call["arguments"]) == {
+            "payload": {"nested": [1, 2, 3]},
+            "flag": True,
+            "word": "bare",
+        }
+
+    @pytest.mark.parametrize("chunk", [1, 7])
+    def test_streaming_emits_the_call_once_when_its_block_closes(self, chunk):
+        parser = MuseGlimmerToolParser()
+        accumulated, calls = "", []
+        for i in range(0, len(self.SINGLE), chunk):
+            delta = self.SINGLE[i : i + chunk]
+            previous, accumulated = accumulated, accumulated + delta
+            result = parser.extract_tool_calls_streaming(previous, accumulated, delta)
+            if result is not None:
+                assert "content" not in result
+                calls.extend(result["tool_calls"])
+        [call] = calls
+        assert call["index"] == 0
+        assert json.loads(call["function"]["arguments"]) == {
+            "city": "Paris",
+            "units": "celsius",
+        }
+
+    def test_streaming_withholds_split_marker(self):
+        """Text before the block is content; no fragment of the marker leaks."""
+        parser = MuseGlimmerToolParser()
+        text = "Sure. " + self.SINGLE
+        accumulated, content, calls = "", "", []
+        for delta in text:
+            previous, accumulated = accumulated, accumulated + delta
+            result = parser.extract_tool_calls_streaming(previous, accumulated, delta)
+            if result is not None:
+                content += result.get("content", "")
+                calls.extend(result.get("tool_calls", []))
+        assert content == "Sure. "
+        assert [c["function"]["name"] for c in calls] == ["weather.get"]
+
+    def test_channel_header_and_parallel_separator_removed_with_block(self):
+        """Complete output keeps nothing of the non-reply channels in content."""
+        channel = "assistant to=user_lookup" + self.SINGLE.replace(
+            "weather.get", "user_lookup"
+        )
+        output = "to=selfR<|eom|>" + channel + "<|eom|>" + channel
+        result = MuseGlimmerToolParser().extract_tool_calls(output)
+        assert [c["name"] for c in result.tool_calls] == ["user_lookup"] * 2
+        # The reasoning channel is parsed separately (reasoning parser /
+        # reasoning_text in _run_responses_request), so tool-parser content
+        # carries only reply text -- none here.
+        assert result.content is None
+
+    def test_bare_invoke_outside_a_block_is_not_a_call(self):
+        """An ``<atem:invoke>`` outside ``<atem:function_calls>`` is prose.
+
+        Complete extraction is scoped to recognized call blocks, matching
+        streaming, which only ever waits for the ``<atem:function_calls>``
+        wrapper. A quoted XML example must not become a call.
+        """
+        example = (
+            "to=user<|message|>Call it like "
+            '<atem:invoke name="ghost"><atem:parameter name="x">1</atem:parameter>'
+            "</atem:invoke>"
+        )
+        result = MuseGlimmerToolParser().extract_tool_calls(example)
+        assert result.tools_called is False
+        assert result.tool_calls == []
+        assert '<atem:invoke name="ghost">' in result.content
+
+    def test_bare_invoke_after_a_real_block_is_ignored(self):
+        """Only the wrapped block is a call; a trailing example is not."""
+        output = (
+            "to=user<|message|>" + self.SINGLE + " example "
+            '<atem:invoke name="ghost"><atem:parameter name="x">1</atem:parameter>'
+            "</atem:invoke>"
+        )
+        [call] = MuseGlimmerToolParser().extract_tool_calls(output).tool_calls
+        assert call["name"] == "weather.get"
+
+    @pytest.mark.parametrize("literal", ["NaN", "Infinity", "-Infinity"])
+    def test_nonfinite_literals_are_kept_as_strings(self, literal):
+        """``NaN``/``Infinity`` never reach ``arguments`` as non-finite floats.
+
+        ``json.dumps`` would emit them as bare ``NaN``/``Infinity``, which is
+        not valid JSON; the raw text is preserved as a string instead.
+        """
+        output = (
+            '<atem:function_calls><atem:invoke name="f">'
+            f'<atem:parameter name="n">{literal}</atem:parameter>'
+            "</atem:invoke></atem:function_calls>"
+        )
+        [call] = MuseGlimmerToolParser().extract_tool_calls(output).tool_calls
+        assert json.loads(call["arguments"], parse_constant=_fail_on_constant) == {
+            "n": literal
+        }
+
+    def test_overflow_to_infinity_is_kept_as_string(self):
+        """``1e400`` parses to ``inf``; it is kept as the raw string too."""
+        output = (
+            '<atem:function_calls><atem:invoke name="f">'
+            '<atem:parameter name="n">1e400</atem:parameter>'
+            "</atem:invoke></atem:function_calls>"
+        )
+        [call] = MuseGlimmerToolParser().extract_tool_calls(output).tool_calls
+        assert json.loads(call["arguments"]) == {"n": "1e400"}
+
+    def test_finalize_releases_partial_marker(self):
+        parser = MuseGlimmerToolParser()
+        assert parser.extract_tool_calls_streaming("", "a <atem", "a <atem") == {
+            "content": "a "
+        }
+        assert parser.finalize_streaming("a <atem") == {"content": "<atem"}
 
 
 class TestStreamingTwoToolCalls:
