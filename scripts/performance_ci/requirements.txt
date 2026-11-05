@@ -1,0 +1,5 @@
+# One shared runtime for both source checkouts. Keep workloads.json in sync.
+mlx==0.32.4
+mlx-lm==0.31.3
+mlx-vlm==0.6.5
+transformers==5.22.1
