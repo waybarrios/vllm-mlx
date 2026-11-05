@@ -264,6 +264,21 @@ class BaseEngine(ABC):
         pass
 
     @property
+    def context_limit(self) -> int | None:
+        """Context length in tokens the model declares, or None when unknown."""
+        return None
+
+    def count_chat_prompt_tokens(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict] | None = None,
+        chat_template_kwargs: dict[str, Any] | None = None,
+        enable_thinking: bool | None = None,
+    ) -> int | None:
+        """Tokens in the prompt this engine renders for a chat, or None when unknown."""
+        return None
+
+    @property
     def preserve_native_tool_format(self) -> bool:
         """
         Whether to preserve native tool message format.

@@ -51,6 +51,8 @@ from ..mlx_streams import (
     restore_generation_streams,
     snapshot_generation_streams,
 )
+from ..utils.tokenizer import count_prompt_tokens
+from ..utils.truncation import declared_context_limit
 
 logger = logging.getLogger(__name__)
 
@@ -718,6 +720,31 @@ class SimpleEngine(BaseEngine):
             processor = getattr(self._model, "processor", None)
             return getattr(processor, "tokenizer", processor)
         return self._model.tokenizer
+
+    @property
+    def context_limit(self) -> int | None:
+        """Context length the text model declares, or None when unknown."""
+        if self._is_mllm or self._model is None:
+            return None
+        return declared_context_limit(self._model.model)
+
+    def count_chat_prompt_tokens(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict] | None = None,
+        chat_template_kwargs: dict[str, Any] | None = None,
+        enable_thinking: bool | None = None,
+    ) -> int | None:
+        """Tokens in the prompt this engine renders for a text chat, or None."""
+        if self._is_mllm or self._model is None:
+            return None
+        prompt = self._apply_chat_template(
+            messages,
+            tools=tools,
+            chat_template_kwargs=chat_template_kwargs,
+            enable_thinking=enable_thinking,
+        )
+        return count_prompt_tokens(self.tokenizer, prompt)
 
     def _generation_lock_holder_summary(self) -> str:
         if not self._active_requests:

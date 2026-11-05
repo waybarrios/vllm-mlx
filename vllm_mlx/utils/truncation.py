@@ -8,6 +8,8 @@ The input token limit follows each model's own context window
 limit further constrains that architecture value, while HuggingFace's huge
 unset placeholder is ignored. This keeps position-table offsets safe for
 RoBERTa-family models without losing model-derived limits for sentinel values.
+
+``declared_context_limit`` is the separate bound for generation prompts.
 """
 
 from typing import Any
@@ -39,6 +41,26 @@ def inner_tokenizer(tokenizer: Any) -> Any:
 def _positive_int(value: Any) -> int | None:
     if isinstance(value, int) and not isinstance(value, bool) and value > 0:
         return value
+    return None
+
+
+def declared_context_limit(model: Any) -> int | None:
+    """
+    The context length a loaded model declares, or ``None`` when it declares none.
+
+    This is the generation limit: ``max_position_embeddings`` from the model's
+    own config. The first of ``model.config``, ``model.args`` and
+    ``model.model_config`` that carries a usable value wins. A tokenizer's
+    ``model_max_length`` does not constrain it (that rule is the embedding
+    truncation length of ``resolve_max_length``), and a value nested under
+    ``text_config`` is not read.
+    """
+    for attr in ("config", "args", "model_config"):
+        limit = _positive_int(
+            _config_get(getattr(model, attr, None), "max_position_embeddings")
+        )
+        if limit is not None:
+            return limit
     return None
 
 

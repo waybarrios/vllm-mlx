@@ -28,6 +28,17 @@ def _needs_tokenizer_fallback(model_name: str) -> bool:
     return any(pattern.lower() in model_lower for pattern in FALLBACK_MODELS)
 
 
+def count_prompt_tokens(tokenizer, prompt: str) -> int:
+    """Count the tokens the engines feed the model for a rendered prompt.
+
+    A prompt that already starts with the tokenizer's BOS token is encoded
+    without adding special tokens, so the BOS is counted once.
+    """
+    bos_token = getattr(tokenizer, "bos_token", None)
+    add_special = bos_token is None or not prompt.startswith(bos_token)
+    return len(tokenizer.encode(prompt, add_special_tokens=add_special))
+
+
 def collect_eos_token_ids(tokenizer, model_path=None) -> set:
     """Collect the full EOS/stop token-id set for a model.
 

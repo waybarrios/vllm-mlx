@@ -36,6 +36,7 @@ class FailingEngine:
     is_mllm = False
     preserve_native_tool_format = False
     tokenizer = None
+    context_limit = None
 
     async def chat(self, messages, **kwargs):
         return _error_output()
