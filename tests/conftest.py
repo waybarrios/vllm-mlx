@@ -66,6 +66,28 @@ def anyio_backend():
     return "asyncio"
 
 
+@pytest.fixture(autouse=True)
+def _no_leaked_process_exit_opt_in():
+    """Fail the test that leaves ``server._exit_process_after_shutdown`` on.
+
+    The serve launchers set that process-wide flag so the real server exits
+    before MLX's thread-local teardown crashes. If a test leaves it on, a
+    later, unrelated test that runs a lifespan shutdown reaches the real
+    ``os._exit(0)``: pytest stops with status 0 and no summary, and CI reports
+    green for a suite that never finished. Blame the leak where it happens.
+    """
+    yield
+    import sys
+
+    server = sys.modules.get("vllm_mlx.server")
+    if server is not None and getattr(server, "_exit_process_after_shutdown", False):
+        server._exit_process_after_shutdown = False
+        pytest.fail(
+            "test left vllm_mlx.server._exit_process_after_shutdown enabled; "
+            "a later lifespan shutdown would os._exit(0) the test process"
+        )
+
+
 @pytest.fixture(autouse=True, scope="session")
 def _bind_mlx_default_stream():
     """Ensure the main-thread default MLX stream is set once at session start.

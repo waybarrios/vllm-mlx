@@ -235,13 +235,12 @@ class TestLifecycleCli:
         import vllm_mlx.cli as cli
 
         captured = {}
-        import uvicorn
         import vllm_mlx.server as server
         import vllm_mlx.utils.download as download
 
         monkeypatch.setattr(server, "load_model", lambda *a, **k: captured.update(k))
         monkeypatch.setattr(download, "ensure_model_downloaded", lambda *a, **k: None)
-        monkeypatch.setattr(uvicorn, "run", lambda *a, **k: None)
+        monkeypatch.setattr(server, "run_uvicorn", lambda *a, **k: None)
 
         args = SimpleNamespace(
             model="gemma4",
@@ -366,8 +365,6 @@ class TestLifecycleCli:
         self, monkeypatch
     ):
         """serve_command should pass lifecycle config into model loading."""
-        import uvicorn
-
         import vllm_mlx.cli as cli
         import vllm_mlx.server as srv
         import vllm_mlx.utils.download as download_mod
@@ -379,7 +376,7 @@ class TestLifecycleCli:
             captured["kwargs"] = kwargs
 
         monkeypatch.setattr(srv, "load_model", fake_load_model)
-        monkeypatch.setattr(uvicorn, "run", lambda *args, **kwargs: None)
+        monkeypatch.setattr(srv, "run_uvicorn", lambda *args, **kwargs: None)
         monkeypatch.setattr(
             download_mod,
             "ensure_model_downloaded",
@@ -465,8 +462,6 @@ class TestLifecycleCli:
         --models-config mode: it should reach RegistryServeDefaults so the
         registry's idle reaper can fall back to it.
         """
-        import uvicorn
-
         import vllm_mlx.cli as cli
         import vllm_mlx.server as srv
 
@@ -478,7 +473,7 @@ class TestLifecycleCli:
             captured["memory_budget_gb"] = memory_budget_gb
 
         monkeypatch.setattr(srv, "load_model_registry", fake_load_model_registry)
-        monkeypatch.setattr(uvicorn, "run", lambda *args, **kwargs: None)
+        monkeypatch.setattr(srv, "run_uvicorn", lambda *args, **kwargs: None)
 
         args = SimpleNamespace(
             model=None,
@@ -556,8 +551,6 @@ class TestLifecycleCli:
         self, monkeypatch
     ):
         """serve_command should keep batching/MTP config intact alongside residency."""
-        import uvicorn
-
         import vllm_mlx.cli as cli
         import vllm_mlx.server as srv
 
@@ -572,7 +565,7 @@ class TestLifecycleCli:
                 self.__dict__.update(kwargs)
 
         monkeypatch.setattr(srv, "load_model", fake_load_model)
-        monkeypatch.setattr(uvicorn, "run", lambda *args, **kwargs: None)
+        monkeypatch.setattr(srv, "run_uvicorn", lambda *args, **kwargs: None)
         monkeypatch.setitem(
             sys.modules,
             "vllm_mlx.scheduler",
@@ -668,7 +661,7 @@ class TestLifecycleCli:
 
         monkeypatch.setattr(srv, "load_model", fake_load_model)
         monkeypatch.setattr(srv, "load_embedding_model", lambda *args, **kwargs: None)
-        monkeypatch.setattr(srv.uvicorn, "run", lambda *args, **kwargs: None)
+        monkeypatch.setattr(srv, "run_uvicorn", lambda *args, **kwargs: None)
         monkeypatch.setattr(
             sys,
             "argv",
@@ -703,7 +696,7 @@ class TestLifecycleCli:
 
         monkeypatch.setattr(srv, "load_embedding_model", fake_load_embedding_model)
         monkeypatch.setattr(srv, "load_model", lambda *args, **kwargs: None)
-        monkeypatch.setattr(srv.uvicorn, "run", lambda *args, **kwargs: None)
+        monkeypatch.setattr(srv, "run_uvicorn", lambda *args, **kwargs: None)
         monkeypatch.setattr(
             sys,
             "argv",
@@ -729,13 +722,11 @@ class TestLifecycleCli:
         self, monkeypatch, capsys
     ):
         """Lazy startup output should mention the first request, not claim eager load."""
-        import uvicorn
-
         import vllm_mlx.cli as cli
         import vllm_mlx.server as srv
 
         monkeypatch.setattr(srv, "load_model", lambda *args, **kwargs: None)
-        monkeypatch.setattr(uvicorn, "run", lambda *args, **kwargs: None)
+        monkeypatch.setattr(srv, "run_uvicorn", lambda *args, **kwargs: None)
 
         args = SimpleNamespace(
             model="mlx-community/Qwen3-0.6B-8bit",
