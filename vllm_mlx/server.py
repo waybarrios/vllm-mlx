@@ -100,6 +100,7 @@ from .api.models import (
     Message,  # noqa: F401
     ModelInfo,  # noqa: F401
     ModelsResponse,
+    PromptTokensDetails,
     RerankRequest,
     RerankResponse,
     RerankResult,
@@ -4300,10 +4301,16 @@ def get_usage(output: GenerationOutput) -> Usage:
     total_completion_tokens = (
         output.completion_tokens if hasattr(output, "completion_tokens") else 0
     )
+    cached_tokens = getattr(output, "cached_tokens", None)
     return Usage(
         prompt_tokens=total_prompt_tokens,
         completion_tokens=total_completion_tokens,
         total_tokens=total_prompt_tokens + total_completion_tokens,
+        prompt_tokens_details=(
+            PromptTokensDetails(cached_tokens=cached_tokens)
+            if cached_tokens is not None
+            else None
+        ),
     )
 
 
@@ -6060,11 +6067,7 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
                     finish_reason=finish_reason,
                 )
             ],
-            usage=Usage(
-                prompt_tokens=output.prompt_tokens,
-                completion_tokens=output.completion_tokens,
-                total_tokens=output.prompt_tokens + output.completion_tokens,
-            ),
+            usage=get_usage(output),
             generation_metadata=_generation_metadata(
                 prepared.thinking_processor, output
             ),
@@ -7195,6 +7198,7 @@ async def stream_chat_completion(
     # Track token counts for usage reporting
     prompt_tokens = 0
     completion_tokens = 0
+    cached_tokens: int | None = None
     last_output = None
 
     # Response-format streaming filter — strip markdown code fences from
@@ -7234,6 +7238,9 @@ async def stream_chat_completion(
                 prompt_tokens = output.prompt_tokens
             if hasattr(output, "completion_tokens") and output.completion_tokens:
                 completion_tokens = output.completion_tokens
+            output_cached_tokens = getattr(output, "cached_tokens", None)
+            if output_cached_tokens is not None:
+                cached_tokens = output_cached_tokens
 
             if reasoning_parser and delta_text:
                 previous_raw = raw_stream_text
@@ -7760,6 +7767,11 @@ async def stream_chat_completion(
                     prompt_tokens=prompt_tokens,
                     completion_tokens=completion_tokens,
                     total_tokens=prompt_tokens + completion_tokens,
+                    prompt_tokens_details=(
+                        PromptTokensDetails(cached_tokens=cached_tokens)
+                        if cached_tokens is not None
+                        else None
+                    ),
                 ),
                 generation_metadata=terminal_metadata,
             )

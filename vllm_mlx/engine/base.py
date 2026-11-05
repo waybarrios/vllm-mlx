@@ -39,6 +39,9 @@ class GenerationOutput:
     # MTP speculative decoding counters. Zero means no MTP attempt occurred.
     mtp_drafts: int = 0
     mtp_accepted: int = 0
+    # Request-owned prompt positions supplied by a validated cache. None means
+    # the engine did not provide request-level cache accounting.
+    cached_tokens: int | None = None
     # Request-level sparse-prefill decision and diagnostics.
     specprefill_outcome: "SpecPrefillOutcome | None" = None
 
