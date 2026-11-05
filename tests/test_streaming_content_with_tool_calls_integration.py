@@ -124,6 +124,53 @@ def _data_payloads(chunks):
 
 class TestOpenAIStream:
     @pytest.mark.anyio
+    @pytest.mark.parametrize("with_reasoning", [False, True])
+    async def test_buffered_text_chunk_carries_logprobs(
+        self, both_in_one_delta, monkeypatch, with_reasoning
+    ):
+        from vllm_mlx.api.models import ChatCompletionRequest
+        from vllm_mlx.logprobs import TokenLogprob
+
+        if with_reasoning:
+
+            class _Reasoning:
+                def extract_reasoning_streaming(self, previous, current, delta):
+                    return SimpleNamespace(reasoning=None, content=delta)
+
+                def reset_state(self, *args, **kwargs):
+                    pass
+
+            monkeypatch.setattr(srv, "_reasoning_parser", _Reasoning())
+
+        request = ChatCompletionRequest(
+            model="test-model",
+            messages=[{"role": "user", "content": "weather?"}],
+            stream=True,
+            logprobs=True,
+        )
+        first = _stream_output(BUFFERED_OUTPUT)
+        first.new_logprobs = [TokenLogprob(token_id=1, token=TEXT, logprob=-0.2)]
+        engine = _engine(first, _stream_output("", "stop"))
+
+        payloads = _data_payloads(
+            await _collect(
+                srv.stream_chat_completion(engine, request.messages, request)
+            )
+        )
+        choices = [
+            payload["choices"][0] for payload in payloads if payload.get("choices")
+        ]
+        leading = next(
+            choice for choice in choices if choice["delta"].get("content") == TEXT
+        )
+        tool_call = next(
+            choice for choice in choices if choice["delta"].get("tool_calls")
+        )
+
+        assert [item["token"] for item in leading["logprobs"]["content"]] == [TEXT]
+        assert tool_call["logprobs"] is None
+
+    @pytest.mark.anyio
     async def test_text_precedes_the_call_and_each_appears_once(
         self, both_in_one_delta
     ):
