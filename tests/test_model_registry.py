@@ -7,6 +7,7 @@ import asyncio
 import dataclasses
 import logging
 import re
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -14,7 +15,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from vllm_mlx.engine.base import BaseEngine, GenerationOutput
+from vllm_mlx.engine.base import BaseEngine, GenerationOutput, run_blocking_startup_work
 from vllm_mlx.model_registry import (
     ContentionPolicy,
     ModelManager,
@@ -75,6 +76,265 @@ class FakeEngine(BaseEngine):
 
     async def stream_chat(self, *args, **kwargs):
         yield GenerationOutput(text="ok", new_text="ok", finished=True)
+
+
+class _CacheEngine(FakeEngine):
+    """Keep cached and live references distinct across owner-dispatched clears."""
+
+    def __init__(self, config):
+        super().__init__(config)
+        self.cached = [object()]
+        self.live = object()
+        self.clear_started = asyncio.Event()
+        self.clear_gate = None
+        self.clear_error = None
+
+    async def _clear_prefix_cache_on_owner(self):
+        self.clear_started.set()
+        if self.clear_gate is not None:
+            await self.clear_gate.wait()
+        if self.clear_error is not None:
+            raise self.clear_error
+        self.cached.clear()
+
+    async def _clear_runtime_caches_on_owner(self):
+        await self._clear_prefix_cache_on_owner()
+        return {"prefix_cache": True}
+
+    def clear_prefix_cache(self):
+        raise AssertionError("owner helper must take precedence")
+
+    def clear_runtime_caches(self):
+        raise AssertionError("owner helper must take precedence")
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("prefix_only", [False, True])
+async def test_registry_cache_clear_keeps_resident_models_and_active_leases(
+    tmp_path, prefix_only
+):
+    manager = ModelManager(
+        _manager_config(budget_gb=4),
+        _registry(tmp_path, {"a": 1, "b": 1, "unloaded": 1}),
+        _defaults(),
+        engine_factory=_CacheEngine,
+    )
+    leases = [await manager.acquire(name) for name in ("a", "b")]
+    live = [lease.engine.live for lease in leases]
+
+    result = await manager.clear_caches(prefix_only=prefix_only)
+
+    assert set(result) == {"a", "b"}
+    assert all(item["status"] == "cleared" for item in result.values())
+    assert set(manager._loaded) == {"a", "b"}
+    for lease, live_reference in zip(leases, live):
+        assert lease.engine.cached == []
+        assert lease.engine.live is live_reference
+        assert lease.engine.started == 1
+        assert lease.engine.stopped == 0
+        assert manager._loaded[lease.model_name].active_requests == 1
+        await lease.release()
+    await manager.shutdown()
+
+
+@pytest.mark.anyio
+async def test_registry_cache_clear_blocks_eviction_until_owner_finishes(tmp_path):
+    manager = ModelManager(
+        _manager_config(budget_gb=1),
+        _registry(tmp_path, {"a": 1, "b": 1}),
+        _defaults(),
+        engine_factory=_CacheEngine,
+    )
+    lease = await manager.acquire("a")
+    engine = lease.engine
+    await lease.release()
+    engine.clear_gate = asyncio.Event()
+    clearing = asyncio.create_task(manager.clear_caches(prefix_only=True))
+    await engine.clear_started.wait()
+    # This acquire must evict a, but cannot stop it during its owner operation.
+    acquiring = asyncio.create_task(manager.acquire("b"))
+    await asyncio.sleep(0)
+    assert not acquiring.done()
+    assert engine.stopped == 0
+    engine.clear_gate.set()
+    assert (await clearing)["a"]["status"] == "cleared"
+    replacement = await acquiring
+    assert engine.stopped == 1
+    await replacement.release()
+    await manager.shutdown()
+
+
+@pytest.mark.anyio
+async def test_registry_cache_clear_waits_for_cancelled_owner_before_eviction(tmp_path):
+    manager = ModelManager(
+        _manager_config(budget_gb=1),
+        _registry(tmp_path, {"a": 1, "b": 1}),
+        _defaults(),
+        engine_factory=_CacheEngine,
+    )
+    lease = await manager.acquire("a")
+    engine = lease.engine
+    await lease.release()
+    started, finish = threading.Event(), threading.Event()
+
+    def blocking_clear():
+        started.set()
+        finish.wait()
+        engine.cached.clear()
+
+    async def owner_clear():
+        # The production BatchedEngine owner helper uses this cancellation guard.
+        await run_blocking_startup_work(blocking_clear)
+
+    engine._clear_prefix_cache_on_owner = owner_clear
+    clearing = asyncio.create_task(manager.clear_caches(prefix_only=True))
+    try:
+        assert await asyncio.to_thread(started.wait, 5)
+        clearing.cancel()
+        acquiring = asyncio.create_task(manager.acquire("b"))
+        await asyncio.sleep(0)
+        assert not clearing.done()
+        assert not acquiring.done()
+        assert engine.stopped == 0
+    finally:
+        finish.set()
+    with pytest.raises(asyncio.CancelledError):
+        await clearing
+    replacement = await acquiring
+    assert engine.cached == []
+    assert engine.stopped == 1
+    await replacement.release()
+    await manager.shutdown()
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("prefix_only", [True, False], ids=["prefix", "all"])
+@pytest.mark.parametrize("preempting", [False, True], ids=["resident", "preempting"])
+async def test_cancelled_request_release_during_registry_cache_clear(
+    tmp_path, prefix_only, preempting
+):
+    """Cancellation cannot lose the request lease while clear pins residency."""
+    from vllm_mlx.server import RequestModelContext
+
+    manager = ModelManager(
+        _manager_config(budget_gb=1, strategy="fail"),
+        _registry(tmp_path, {"a": 1, "b": 1}),
+        _defaults(),
+        engine_factory=_CacheEngine,
+    )
+    ready, release_now = asyncio.Event(), asyncio.Event()
+    holder = {}
+
+    async def request_owner():
+        lease = await manager.acquire("a")
+        context = RequestModelContext("a", lease.engine, lease)
+        holder.update(lease=lease, context=context)
+        ready.set()
+        await release_now.wait()
+        await context.release()
+
+    releasing = asyncio.create_task(request_owner())
+    await ready.wait()
+    lease, context = holder["lease"], holder["context"]
+    engine = lease.engine
+    loaded = manager._loaded["a"]
+    assert loaded.active_tasks == {releasing}
+    loaded.preempting = preempting
+    engine.clear_gate = asyncio.Event()
+    clearing = asyncio.create_task(manager.clear_caches(prefix_only=prefix_only))
+    try:
+        await engine.clear_started.wait()
+        release_now.set()
+        await asyncio.sleep(0)
+        assert not releasing.done()
+        for _ in range(3):
+            releasing.cancel()
+            await asyncio.sleep(0)
+            # Returning now would lose context.lease and lease.manager before
+            # the actual count/task removal can acquire the condition.
+            assert not releasing.done()
+            assert loaded.active_requests == 1
+            assert loaded.active_tasks == {releasing}
+            assert engine.stopped == 0
+    finally:
+        engine.clear_gate.set()
+        clear_result = await clearing
+        await asyncio.gather(releasing, return_exceptions=True)
+
+    assert clear_result["a"]["status"] == "cleared"
+    assert releasing.cancelled()
+    assert loaded.active_requests == 0
+    # A cleanup task using its own current_task() would leave releasing here.
+    assert loaded.active_tasks == set()
+    assert context.lease is None
+    assert lease.manager is None
+    await context.release()
+    await lease.release()
+    assert loaded.active_requests == 0
+    assert loaded.active_tasks == set()
+    replacement = await manager.acquire("b")
+    assert engine.stopped == 1
+    await replacement.release()
+    await manager.shutdown()
+    assert manager._loaded == {}
+    assert manager._unloading == {}
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("route", ["/v1/cache/prefix", "/v1/cache"])
+@pytest.mark.parametrize("failed_model", [None, "a"])
+async def test_registry_cache_routes_clear_all_resident_owners_before_pool_flush(
+    tmp_path, monkeypatch, route, failed_model
+):
+    import httpx
+    import mlx.core as mx
+    import sys
+    import types
+
+    import vllm_mlx.server as server
+
+    manager = ModelManager(
+        _manager_config(budget_gb=4),
+        _registry(tmp_path, {"a": 1, "b": 1, "unloaded": 1}),
+        _defaults(),
+        engine_factory=_CacheEngine,
+    )
+    leases = [await manager.acquire(name) for name in ("a", "b")]
+    if failed_model:
+        leases[0].engine.clear_error = RuntimeError("owner failed")
+    flushes = []
+
+    def flush():
+        # A premature flush would leave b's now-unused arrays in the pool.
+        assert leases[1].engine.cached == []
+        flushes.append(True)
+
+    utils = types.ModuleType("mlx_vlm.utils")
+    utils.clear_multimodal_kv_cache = lambda: None
+    utils.clear_pixel_values_cache = lambda: None
+    monkeypatch.setitem(sys.modules, "mlx_vlm.utils", utils)
+    monkeypatch.setattr(mx, "clear_cache", flush)
+    monkeypatch.setattr(server, "_engine", None)
+    monkeypatch.setattr(server, "_model_manager", manager)
+    monkeypatch.setattr(server, "_api_key", None)
+    monkeypatch.setattr(server, "_warm_prompts_path", None)
+    transport = httpx.ASGITransport(app=server.app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.delete(route)
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "cleared"
+    models = body["model_caches"] if route.endswith("prefix") else body["engine_cache"]
+    assert set(models) == {"a", "b"}
+    assert models["b"]["status"] == "cleared"
+    assert models["a"]["status"] == ("error" if failed_model else "cleared")
+    assert flushes == [True]
+    assert set(manager._loaded) == {"a", "b"}
+    for lease in leases:
+        assert lease.engine.stopped == 0
+        assert manager._loaded[lease.model_name].active_requests == 1
+        await lease.release()
+    await manager.shutdown()
 
 
 def _defaults() -> RegistryServeDefaults:
@@ -1404,3 +1664,401 @@ def test_healthy_engine_is_untouched(tmp_path):
         await second_lease.release()
 
     asyncio.run(_run())
+
+
+class TestPendingLoadFutureContract:
+    """Static local separation and characterizations of existing load ownership."""
+
+    def test_pending_record_is_distinct_from_awaited_future_and_owner_work(self):
+        import ast
+        import inspect
+        import textwrap
+
+        method = ast.parse(textwrap.dedent(inspect.getsource(ModelManager.acquire)))
+        lookups = [
+            node
+            for node in ast.walk(method)
+            if isinstance(node, ast.Assign)
+            and isinstance(node.value, ast.Call)
+            and isinstance(node.value.func, ast.Attribute)
+            and node.value.func.attr == "get"
+            and isinstance(node.value.func.value, ast.Attribute)
+            and node.value.func.value.attr == "_loading"
+        ]
+        assert len(lookups) == 1
+        lookup = lookups[0]
+        record = lookup.targets[0].id
+        body = next(
+            statements
+            for node in ast.walk(method)
+            for _, statements in ast.iter_fields(node)
+            if isinstance(statements, list) and lookup in statements
+        )
+        guard = body[body.index(lookup) + 1]
+        assert ast.dump(guard.test) == ast.dump(
+            ast.Compare(
+                left=ast.Name(id=record, ctx=ast.Load()),
+                ops=[ast.IsNot()],
+                comparators=[ast.Constant(value=None)],
+            )
+        )
+        extraction = guard.body[0]
+        assert isinstance(extraction, ast.Assign)
+        assert isinstance(extraction.value, ast.Attribute)
+        assert extraction.value.attr == "future"
+        assert extraction.value.value.id == record
+        future = extraction.targets[0].id
+        assert record != future, "PendingLoad record must not occupy the Future local"
+        assert (
+            len(
+                [
+                    node
+                    for node in ast.walk(method)
+                    if isinstance(node, ast.Await)
+                    and isinstance(node.value, ast.Name)
+                    and node.value.id == future
+                ]
+            )
+            == 1
+        )
+        owner = next(
+            node.args[0].id
+            for node in ast.walk(method)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "_execute_load"
+        )
+        assert owner not in {record, future}
+
+    @pytest.mark.parametrize(
+        "fail_first", [False, True], ids=["success", "failure-retry"]
+    )
+    def test_same_model_followers_share_actual_future(self, tmp_path, fail_first):
+        async def _run():
+            gate = asyncio.Event()
+            starting = asyncio.Event()
+            created = []
+            load_tasks = []
+            failure = RuntimeError("controlled engine start failure")
+
+            class ControlledEngine(FakeEngine):
+                async def start(self):
+                    load_tasks.append(asyncio.current_task())
+                    starting.set()
+                    await gate.wait()
+                    if fail_first and self is created[0]:
+                        raise failure
+                    await super().start()
+
+            def factory(config):
+                engine = ControlledEngine(config)
+                created.append(engine)
+                return engine
+
+            manager = ModelManager(
+                _manager_config(budget_gb=8),
+                _registry(tmp_path, {"alpha": 4}),
+                _defaults(),
+                engine_factory=factory,
+            )
+            tasks = []
+            leases = []
+            try:
+                owner = asyncio.create_task(manager.acquire("alpha"))
+                tasks.append(owner)
+                await asyncio.wait_for(starting.wait(), timeout=2)
+                pending = manager._loading["alpha"]
+                assert pending.required_bytes == 4 * GB
+                assert manager._committed_bytes_locked() == 4 * GB
+                assert not pending.future.done()
+
+                async def follow(entered):
+                    entered.set()
+                    return await manager.acquire("alpha")
+
+                for _ in range(3):
+                    entered = asyncio.Event()
+                    follower = asyncio.create_task(follow(entered))
+                    tasks.append(follower)
+                    await asyncio.wait_for(entered.wait(), timeout=2)
+                    # No suspension between entered.set() and acquire's wait:
+                    # inspect the actual awaited Future, not a replacement mock.
+                    assert follower._fut_waiter is pending.future
+                    assert manager._loading["alpha"] is pending
+                assert load_tasks == [owner]
+                assert len(created) == 1
+                gate.set()
+                results = await asyncio.wait_for(
+                    asyncio.gather(*tasks, return_exceptions=True), timeout=2
+                )
+                assert manager._loading == {}
+                assert manager._unloading == {}
+                if fail_first:
+                    assert all(result is failure for result in results)
+                    assert pending.future.exception() is failure
+                    assert manager._loaded == {}
+                    assert manager._committed_bytes_locked() == 0
+                    retry = asyncio.create_task(manager.acquire("alpha"))
+                    tasks.append(retry)
+                    lease = await asyncio.wait_for(retry, timeout=2)
+                    leases.append(lease)
+                    assert lease.engine is created[1]
+                    assert len(created) == 2
+                    assert load_tasks == [owner, retry]
+                    assert created[0].started == 0
+                    assert created[1].started == 1
+                else:
+                    leases.extend(results)
+                    loaded = pending.future.result()
+                    assert loaded is manager._loaded["alpha"]
+                    assert all(lease.engine is created[0] for lease in leases)
+                    assert loaded.active_requests == 4
+                    assert created[0].started == 1
+                assert manager._committed_bytes_locked() == 4 * GB
+                for lease in leases:
+                    await lease.release()
+                assert manager._loaded["alpha"].active_requests == 0
+            finally:
+                gate.set()
+                results = await asyncio.wait_for(
+                    asyncio.gather(*tasks, return_exceptions=True), timeout=2
+                )
+                for result in results:
+                    if not isinstance(result, BaseException):
+                        await result.release()
+                await asyncio.wait_for(manager.shutdown(), timeout=2)
+            assert manager._loaded == manager._loading == manager._unloading == {}
+            assert created[-1].stopped == 1
+
+        asyncio.run(_run())
+
+    def test_other_model_and_ready_loaded_paths_do_not_wait_on_pending(self, tmp_path):
+        async def _run():
+            gate = asyncio.Event()
+            starting = asyncio.Event()
+            created = {}
+
+            class ControlledEngine(FakeEngine):
+                async def start(self):
+                    if self._config.entry.name == "alpha":
+                        starting.set()
+                        await gate.wait()
+                    await super().start()
+
+            def factory(config):
+                engine = ControlledEngine(config)
+                created[config.entry.name] = engine
+                return engine
+
+            manager = ModelManager(
+                _manager_config(budget_gb=8),
+                _registry(tmp_path, {"alpha": 4, "beta": 4}),
+                _defaults(),
+                engine_factory=factory,
+            )
+            owner = asyncio.create_task(manager.acquire("alpha"))
+            leases = []
+            try:
+                await asyncio.wait_for(starting.wait(), timeout=2)
+                pending = manager._loading["alpha"]
+                with pytest.raises(KeyError, match="missing"):
+                    await manager.acquire("missing")
+                for _ in range(2):
+                    lease = await asyncio.wait_for(manager.acquire("beta"), timeout=2)
+                    leases.append(lease)
+                    assert lease.engine is created["beta"]
+                    assert manager._loading["alpha"] is pending
+                    assert not pending.future.done()
+                assert created["beta"].started == 1
+                assert manager._loaded["beta"].active_requests == 2
+                assert manager._committed_bytes_locked() == 8 * GB
+                assert not owner.done()
+                gate.set()
+                lease = await asyncio.wait_for(owner, timeout=2)
+                leases.append(lease)
+                assert lease.engine is created["alpha"]
+                assert pending.future.result() is manager._loaded["alpha"]
+                assert manager._loading == {}
+            finally:
+                gate.set()
+                results = await asyncio.wait_for(
+                    asyncio.gather(owner, return_exceptions=True), timeout=2
+                )
+                for result in [*leases, *results]:
+                    if not isinstance(result, BaseException):
+                        await result.release()
+                await asyncio.wait_for(manager.shutdown(), timeout=2)
+            assert manager._loaded == manager._loading == manager._unloading == {}
+            assert all(engine.stopped == 1 for engine in created.values())
+
+        asyncio.run(_run())
+
+
+class TestMemoryBudgetUtilizationContract:
+    def test_optional_utilization_is_narrowed_before_percentage(self):
+        """A derived ceiling alone cannot narrow an optional report field."""
+        import ast
+        import inspect
+
+        function = ast.parse(inspect.getsource(log_memory_budget_report)).body[0]
+        percentage = next(
+            node
+            for node in ast.walk(function)
+            if isinstance(node, ast.BinOp)
+            and isinstance(node.op, ast.Mult)
+            and isinstance(node.left, ast.Attribute)
+            and node.left.attr == "gpu_memory_utilization"
+        )
+        operand = ast.dump(percentage.left)
+        guards = []
+        for statement in function.body:
+            if (
+                not isinstance(statement, ast.If)
+                or statement.lineno >= percentage.lineno
+            ):
+                continue
+            terms = (
+                statement.test.values
+                if isinstance(statement.test, ast.BoolOp)
+                and isinstance(statement.test.op, ast.Or)
+                else [statement.test]
+            )
+            if any(
+                isinstance(term, ast.Compare)
+                and ast.dump(term.left) == operand
+                and len(term.ops) == 1
+                and isinstance(term.ops[0], ast.Is)
+                and isinstance(term.comparators[0], ast.Constant)
+                and term.comparators[0].value is None
+                for term in terms
+            ):
+                guards.append(statement)
+        assert any(
+            isinstance(statement.body[-1], ast.Return) for statement in guards
+        ), "Optional utilization must take an explicit None early return before multiplication"
+
+    @pytest.mark.parametrize(
+        "device,utilization,budget,cache,percent,ceiling,budget_warning,cache_warning,reason",
+        [
+            (8, None, 1, None, None, None, False, False, "utilization"),
+            (None, 0.5, 1, None, None, None, False, False, "device"),
+            (None, None, 1, None, None, None, False, False, "utilization"),
+            (8, 0.0, 0, None, None, 0, False, False, None),
+            (0, 0.5, 0, None, None, 0, False, False, None),
+            (8, 0.5, 3, None, None, 4, False, False, None),
+            (8, 0.5, 4, 3, None, 4, False, False, None),
+            (8, 0.5, 5, 4, None, 4, True, True, None),
+            (8, 0.5, 3, 5, None, 4, False, True, None),
+            (8, 0.5, 3, None, 0.25, 4, False, False, None),
+            (8, 0.5, 3, 0, 0.25, 4, False, False, None),
+            (8, 0.5, 3, None, 0.0, 4, False, False, None),
+        ],
+        ids=[
+            "missing-utilization",
+            "missing-device",
+            "both-missing",
+            "zero-utilization",
+            "zero-device",
+            "ordinary-no-cache",
+            "exact-budget-cache-under",
+            "over-budget-cache-at",
+            "under-budget-cache-over",
+            "cache-percent",
+            "zero-cache-bytes-precede-percent",
+            "zero-cache-percent",
+        ],
+    )
+    def test_concrete_report_logging(
+        self,
+        caplog,
+        device,
+        utilization,
+        budget,
+        cache,
+        percent,
+        ceiling,
+        budget_warning,
+        cache_warning,
+        reason,
+    ):
+        from vllm_mlx.model_registry import MemoryBudgetReport
+
+        report = MemoryBudgetReport(
+            budget_bytes=budget * GB,
+            device_working_set_bytes=None if device is None else device * GB,
+            gpu_memory_utilization=utilization,
+            gpu_memory_utilization_source="contract fixture",
+            per_engine_cache_limit_bytes=None if cache is None else cache * GB,
+            per_engine_cache_percent=percent,
+            memory_aware_prefix_cache_entries=1,
+            continuous_batching_entries=2,
+            total_entries=3,
+        )
+        before = dataclasses.asdict(report)
+        assert report.allocation_ceiling_bytes == (
+            None if ceiling is None else ceiling * GB
+        )
+        assert report.exceeds_ceiling is budget_warning
+        assert report.cache_limit_exceeds_ceiling is cache_warning
+        with caplog.at_level(logging.INFO, logger="vllm_mlx.model_registry"):
+            log_memory_budget_report(report)
+        records = [r for r in caplog.records if r.name == "vllm_mlx.model_registry"]
+        assert dataclasses.asdict(report) == before
+        assert report.allocation_ceiling_bytes == (
+            None if ceiling is None else ceiling * GB
+        )
+        assert records[0].levelno == logging.INFO
+        warnings = [r for r in records if r.levelno >= logging.WARNING]
+        assert len(warnings) == int(budget_warning) + int(cache_warning)
+        if reason is not None:
+            expected_reason = {
+                "utilization": (
+                    "no continuous-batching entries, and --gpu-memory-utilization "
+                    "installs a Metal limit only for those"
+                ),
+                "device": "MLX cannot report a device working set on this host",
+            }[reason]
+            assert len(records) == 1
+            assert records[0].args == (budget, expected_reason)
+            assert "no Metal allocation ceiling to reconcile" in records[0].getMessage()
+            return
+
+        if cache is not None:
+            cache_description = (
+                f"{cache:.1f} GB per memory-aware prefix-cache engine "
+                "(--cache-memory-mb, 1 of 3 entries)"
+            )
+        elif percent is not None:
+            cache_description = (
+                f"~{percent * 100:.0f}% of available RAM per memory-aware "
+                "prefix-cache engine (--cache-memory-percent, 1 of 3 entries); "
+                "scales at runtime"
+            )
+        else:
+            cache_description = "none configured"
+        assert records[0].args == (
+            budget,
+            ceiling,
+            utilization * 100,
+            device,
+            "contract fixture",
+            cache_description,
+        )
+        assert f"Metal allocation ceiling {ceiling:.1f} GB" in records[0].getMessage()
+        assert cache_description in records[0].getMessage()
+        assert sum("exceeds the Metal" in r.getMessage() for r in warnings) == int(
+            budget_warning
+        )
+        assert sum("at or above the Metal" in r.getMessage() for r in warnings) == int(
+            cache_warning
+        )
+        for record in warnings:
+            if "exceeds the Metal" in record.getMessage():
+                assert record.args == (budget, ceiling, ceiling)
+            else:
+                assert record.args == (cache, ceiling)
+        if not warnings:
+            assert len(records) == 2
+            assert "additional and are not reserved" in records[1].getMessage()
+        else:
+            assert len(records) == 1 + len(warnings)

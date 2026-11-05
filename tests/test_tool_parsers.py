@@ -27,6 +27,106 @@ from vllm_mlx.tool_parsers import (
 class TestToolParserManager:
     """Test the ToolParserManager registry."""
 
+    @pytest.fixture
+    def registry(self):
+        class Registry(ToolParserManager):
+            tool_parsers = {}
+            lazy_parsers = {}
+
+        return Registry
+
+    @pytest.mark.parametrize("names", ["custom", ["custom", "alias"]])
+    @pytest.mark.parametrize("decorator", [False, True])
+    def test_registration_preserves_subclass_identity(self, registry, names, decorator):
+        class CustomParser(QwenToolParser):
+            pass
+
+        if decorator:
+            registered = registry.register_module(names)(CustomParser)
+        else:
+            registered = registry.register_module(names, CustomParser)
+
+        assert registered is CustomParser
+        for name in [names] if isinstance(names, str) else names:
+            assert registry.get_tool_parser(name) is CustomParser
+            assert type(registry.get_tool_parser(name)()) is CustomParser
+
+    def test_explicit_none_returns_reusable_decorator(self, registry):
+        decorator = registry.register_module("custom", None, False)
+        assert decorator(QwenToolParser) is QwenToolParser
+        with pytest.raises(KeyError, match="Parser 'custom' is already registered"):
+            decorator(HermesToolParser)
+        assert registry.get_tool_parser("custom") is QwenToolParser
+
+    @pytest.mark.parametrize("decorator", [False, True])
+    def test_force_false_collision_preserves_prior_alias_registrations(
+        self, registry, decorator
+    ):
+        registry.register_module("taken", QwenToolParser)
+        names = ["before", "taken", "after"]
+
+        with pytest.raises(KeyError, match="Parser 'taken' is already registered"):
+            if decorator:
+                registry.register_module(names, force=False)(HermesToolParser)
+            else:
+                registry.register_module(names, HermesToolParser, False)
+
+        assert registry.get_tool_parser("before") is HermesToolParser
+        assert registry.get_tool_parser("taken") is QwenToolParser
+        with pytest.raises(KeyError):
+            registry.get_tool_parser("after")
+
+    @pytest.mark.parametrize("decorator", [False, True])
+    @pytest.mark.parametrize("force", [None, True])
+    def test_registration_replaces_collisions_when_forced(
+        self, registry, decorator, force
+    ):
+        registry.register_module("custom", QwenToolParser)
+        kwargs = {} if force is None else {"force": force}
+        if decorator:
+            registered = registry.register_module("custom", **kwargs)(HermesToolParser)
+        else:
+            registered = registry.register_module("custom", HermesToolParser, **kwargs)
+        assert registered is HermesToolParser
+        assert registry.get_tool_parser("custom") is HermesToolParser
+
+    def test_direct_registration_rejects_non_parser_class(self, registry):
+        with pytest.raises(TypeError, match="module must be subclass of ToolParser"):
+            registry.register_module("invalid", dict)
+        assert registry.list_registered() == []
+
+    def test_lazy_registration_caches_validated_class(self, registry):
+        registry.register_lazy_module(
+            "lazy", "vllm_mlx.tool_parsers.qwen_tool_parser", "QwenToolParser"
+        )
+        assert registry.list_registered() == ["lazy"]
+        assert registry.tool_parsers == {}
+        assert registry.get_tool_parser("lazy") is QwenToolParser
+        assert registry.tool_parsers == {"lazy": QwenToolParser}
+
+        registry.register_lazy_module("lazy", "nonexistent_parser_module", "Missing")
+        assert registry.get_tool_parser("lazy") is QwenToolParser
+
+    @pytest.mark.parametrize(
+        "module_path, class_name, cause",
+        [
+            ("json", "JSONDecoder", TypeError),
+            ("json", "loads", TypeError),
+            ("json", "Missing", AttributeError),
+            ("nonexistent_parser_module", "Missing", ModuleNotFoundError),
+        ],
+    )
+    def test_lazy_registration_wraps_import_and_subclass_failures(
+        self, registry, module_path, class_name, cause
+    ):
+        registry.register_lazy_module("invalid", module_path, class_name)
+        with pytest.raises(
+            ImportError, match="Failed to import tool parser 'invalid'"
+        ) as exc:
+            registry.get_tool_parser("invalid")
+        assert isinstance(exc.value.__cause__, cause)
+        assert registry.tool_parsers == {}
+
     def test_list_registered(self):
         """Test that all expected parsers are registered."""
         parsers = ToolParserManager.list_registered()

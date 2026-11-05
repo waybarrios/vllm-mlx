@@ -9,8 +9,66 @@ import threading
 import types
 import weakref
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 
 import pytest
+
+
+@contextmanager
+def _isolated_module_import(module_name):
+    """Restore both import-cache and package links after a stubbed import."""
+    missing = object()
+    previous_module = sys.modules.pop(module_name, missing)
+    parent_name, _, child_name = module_name.rpartition(".")
+    parent = sys.modules.get(parent_name)
+    previous_attr = vars(parent).get(child_name, missing) if parent else missing
+    try:
+        yield importlib.import_module(module_name)
+    finally:
+        if previous_module is missing:
+            sys.modules.pop(module_name, None)
+        else:
+            sys.modules[module_name] = previous_module
+        if parent is None:
+            parent = sys.modules.get(parent_name)
+        if parent is not None:
+            if previous_attr is missing:
+                vars(parent).pop(child_name, None)
+            else:
+                setattr(parent, child_name, previous_attr)
+
+
+@pytest.mark.parametrize("fixture_name", ["engine_core_module", "batched_module"])
+@pytest.mark.parametrize("preexisting", [False, True], ids=["absent", "present"])
+def test_import_fixture_restores_module_and_parent(
+    monkeypatch, fixture_name, preexisting
+):
+    module_name = {
+        "engine_core_module": "vllm_mlx.engine_core",
+        "batched_module": "vllm_mlx.engine.batched",
+    }[fixture_name]
+    parent_name, _, child_name = module_name.rpartition(".")
+    parent = importlib.import_module(parent_name)
+    previous = types.ModuleType(module_name)
+    monkeypatch.setitem(sys.modules, module_name, previous)
+    monkeypatch.setitem(vars(parent), child_name, previous)
+    if not preexisting:
+        sys.modules.pop(module_name)
+        vars(parent).pop(child_name)
+
+    with pytest.MonkeyPatch.context() as local_patch:
+        fixture = globals()[fixture_name].__wrapped__(local_patch)
+        if isinstance(fixture, types.GeneratorType):
+            next(fixture)
+            with pytest.raises(StopIteration):
+                next(fixture)
+
+    if preexisting:
+        assert sys.modules[module_name] is previous
+        assert vars(parent)[child_name] is previous
+    else:
+        assert module_name not in sys.modules
+        assert child_name not in vars(parent)
 
 
 @pytest.fixture
@@ -32,16 +90,17 @@ def engine_core_module(monkeypatch):
     fake_registry.get_registry = lambda: None
 
     fake_streams = types.ModuleType("vllm_mlx.mlx_streams")
+    fake_streams.GenerationStreamBinding = object
     fake_streams.bind_generation_streams = lambda: None
+    fake_streams.capture_generation_streams = None
 
     monkeypatch.setitem(sys.modules, "mlx", fake_mlx)
     monkeypatch.setitem(sys.modules, "mlx.core", fake_mx)
     monkeypatch.setitem(sys.modules, "vllm_mlx.scheduler", fake_scheduler)
     monkeypatch.setitem(sys.modules, "vllm_mlx.model_registry", fake_registry)
     monkeypatch.setitem(sys.modules, "vllm_mlx.mlx_streams", fake_streams)
-    monkeypatch.delitem(sys.modules, "vllm_mlx.engine_core", raising=False)
-
-    return importlib.import_module("vllm_mlx.engine_core")
+    with _isolated_module_import("vllm_mlx.engine_core") as module:
+        yield module
 
 
 @pytest.fixture
@@ -54,10 +113,8 @@ def batched_module(monkeypatch):
 
     monkeypatch.setitem(sys.modules, "mlx", fake_mlx)
     monkeypatch.setitem(sys.modules, "mlx.core", fake_mx)
-    monkeypatch.delitem(sys.modules, "vllm_mlx.engine.batched", raising=False)
-
-    module = importlib.import_module("vllm_mlx.engine.batched")
-    return module, fake_mx
+    with _isolated_module_import("vllm_mlx.engine.batched") as module:
+        yield module, fake_mx
 
 
 @pytest.mark.anyio
@@ -521,3 +578,55 @@ async def test_cache_mutations_run_on_model_owner_thread(
 
     assert result == expected
     assert mutation_threads == [owner_thread]
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("owner_async", [False, True])
+async def test_prefix_clear_reaches_scheduler_through_real_async_wrapper_on_owner(
+    engine_core_module, batched_module, owner_async
+):
+    """A real AsyncEngineCore must expose the clear, not silently skip it."""
+    module, _ = batched_module
+    mutation_threads = []
+    cached = {"prefix": object()}
+    requests = {"live": object()}
+
+    class RecordedScheduler:
+        def clear_prefix_cache(self):
+            mutation_threads.append(threading.get_ident())
+            cached.clear()
+
+    # Bypass model loading only: all three production clear/dispatch layers are
+    # actual classes, so a missing wrapper method cannot be supplied by a fake.
+    core = object.__new__(engine_core_module.EngineCore)
+    core.scheduler = RecordedScheduler()
+    core.model = object()
+    core._output_collectors = requests
+    wrapper = object.__new__(engine_core_module.AsyncEngineCore)
+    wrapper.engine = core
+    engine = object.__new__(module.BatchedEngine)
+    engine._generation_executor = None
+    engine._engine = wrapper
+    engine._mllm_scheduler = None
+    model = core.model
+    worker = engine._generation_worker()
+    owner_thread = worker.submit(threading.get_ident).result(timeout=5)
+
+    try:
+        if owner_async:
+            result = await engine._clear_prefix_cache_on_owner()
+        else:
+            result = engine.clear_prefix_cache()
+    finally:
+        worker.shutdown(wait=True)
+        engine._generation_executor = None
+
+    assert result is None
+    assert cached == {}
+    assert mutation_threads == [owner_thread]
+    assert owner_thread != threading.get_ident()
+    assert engine._engine is wrapper
+    assert wrapper.engine is core
+    assert core.model is model
+    assert core._output_collectors is requests
+    assert list(requests) == ["live"]

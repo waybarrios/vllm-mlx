@@ -10,6 +10,11 @@ directly from tokenizer.json.
 import json
 import logging
 from pathlib import Path
+from typing import TYPE_CHECKING, Any, cast
+
+if TYPE_CHECKING:
+    from mlx.nn import Module
+    from mlx_lm.tokenizer_utils import TokenizerWrapper
 
 from .chat_templates import DEFAULT_CHATML_TEMPLATE, NEMOTRON_CHAT_TEMPLATE
 
@@ -52,7 +57,7 @@ def collect_eos_token_ids(tokenizer, model_path=None) -> set:
     Returns:
         Set of EOS token ids; may be empty if nothing is declared anywhere.
     """
-    eos_ids = set()
+    eos_ids: set[int] = set()
 
     for attr in ("eos_token_id", "eos_token_ids"):
         value = getattr(tokenizer, attr, None)
@@ -130,7 +135,10 @@ def _install_custom_chat_template(model_name: str, tokenizer):
 
 
 def load_model_with_fallback(
-    model_name: str, tokenizer_config: dict = None, *, model_id: str | None = None
+    model_name: str,
+    tokenizer_config: dict | None = None,
+    *,
+    model_id: str | None = None,
 ):
     """
     Load model and tokenizer with fallback for non-standard tokenizers.
@@ -152,7 +160,10 @@ def load_model_with_fallback(
 
 
 def _load_model_with_fallback(
-    model_name: str, tokenizer_config: dict = None, *, model_id: str | None = None
+    model_name: str,
+    tokenizer_config: dict | None = None,
+    *,
+    model_id: str | None = None,
 ):
     from mlx_lm import load
 
@@ -175,7 +186,11 @@ def _load_model_with_fallback(
         return _load_strict_false(model_name, tokenizer_config)
 
     try:
-        model, tokenizer = load(model_name, tokenizer_config=tokenizer_config)
+        # return_config defaults to False, so mlx-lm returns exactly two values.
+        model, tokenizer = cast(
+            "tuple[Module, TokenizerWrapper]",
+            load(model_name, tokenizer_config=tokenizer_config),
+        )
     except ValueError as e:
         # Fallback for models with non-standard tokenizers
         if "TokenizersBackend" in str(e) or "Tokenizer class" in str(e):
@@ -205,7 +220,7 @@ def _load_model_with_fallback(
     return model, tokenizer
 
 
-def _load_strict_false(model_name: str, tokenizer_config: dict = None):
+def _load_strict_false(model_name: str, tokenizer_config: dict | None = None):
     """Load model with strict=False to discard extra weights.
 
     Handles models with extra parameters that the text-only model class
@@ -223,7 +238,8 @@ def _load_strict_false(model_name: str, tokenizer_config: dict = None):
     # Verify weights loaded correctly
     from mlx.utils import tree_flatten
 
-    params = tree_flatten(model.parameters())
+    # With no destination mapping, tree_flatten returns its default pair list.
+    params = cast(list[tuple[str, Any]], tree_flatten(model.parameters()))
     total_params = len(params)
     zero_params = sum(1 for _, v in params if mx.all(v == 0).item())
     logger.info(

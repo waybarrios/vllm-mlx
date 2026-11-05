@@ -300,4 +300,5 @@ def render_messages(
     token_ids = enc.render_conversation_for_completion(
         conv, next_turn_role=_oh.Role.ASSISTANT
     )
-    return enc.decode(token_ids)
+    rendered: str = enc.decode(token_ids)
+    return rendered

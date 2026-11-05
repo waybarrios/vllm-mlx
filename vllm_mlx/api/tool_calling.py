@@ -14,11 +14,15 @@ Also includes structured output (JSON Schema) utilities:
 import json
 import re
 import uuid
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, TypeAlias, Union
 
 from jsonschema import validate, ValidationError
 
 from .models import FunctionCall, ResponseFormat, ToolCall
+
+_JSONValue: TypeAlias = Union[
+    Dict[str, "_JSONValue"], List["_JSONValue"], str, int, float, bool, None
+]
 
 
 class InvalidResponseFormatOutput(ValueError):
@@ -494,7 +498,7 @@ def _scan_balanced_json(text: str, start: int) -> Optional[str]:
     return None
 
 
-def _repair_truncated_json(fragment: str) -> Optional[Dict[str, Any]]:
+def _repair_truncated_json(fragment: str) -> _JSONValue:
     """
     Attempt to parse a JSON fragment whose closing brackets were cut off
     (e.g. because the model hit ``max_tokens`` mid-object).
@@ -576,13 +580,14 @@ def _repair_truncated_json(fragment: str) -> Optional[Dict[str, Any]]:
 
     for candidate in candidates:
         try:
-            return json.loads(candidate)
+            decoded_repair: _JSONValue = json.loads(candidate)
+            return decoded_repair
         except json.JSONDecodeError:
             continue
     return None
 
 
-def extract_json_from_text(text: str) -> Optional[Dict[str, Any]]:
+def extract_json_from_text(text: str) -> _JSONValue:
     """
     Extract JSON from model output text.
 
@@ -606,7 +611,8 @@ def extract_json_from_text(text: str) -> Optional[Dict[str, Any]]:
 
     # Strategy 1: Try to parse entire text as JSON
     try:
-        return json.loads(text)
+        decoded_text: _JSONValue = json.loads(text)
+        return decoded_text
     except json.JSONDecodeError:
         pass
 
@@ -616,7 +622,8 @@ def extract_json_from_text(text: str) -> Optional[Dict[str, Any]]:
     matches = re.findall(code_block_pattern, text)
     for match in matches:
         try:
-            return json.loads(match.strip())
+            decoded_block: _JSONValue = json.loads(match.strip())
+            return decoded_block
         except json.JSONDecodeError:
             continue
 
@@ -630,7 +637,8 @@ def extract_json_from_text(text: str) -> Optional[Dict[str, Any]]:
         if fenced_candidate.endswith("```"):
             fenced_candidate = fenced_candidate[:-3].strip()
         try:
-            return json.loads(fenced_candidate)
+            decoded_fence: _JSONValue = json.loads(fenced_candidate)
+            return decoded_fence
         except json.JSONDecodeError:
             pass
 
@@ -643,7 +651,8 @@ def extract_json_from_text(text: str) -> Optional[Dict[str, Any]]:
             candidate = _scan_balanced_json(text, idx)
             if candidate is not None:
                 try:
-                    return json.loads(candidate)
+                    decoded_balanced: _JSONValue = json.loads(candidate)
+                    return decoded_balanced
                 except json.JSONDecodeError:
                     pass
             idx = text.find(opener, idx + 1)
@@ -812,7 +821,7 @@ def parse_json_output(
 
     # Normalize response_format to dict
     if isinstance(response_format, ResponseFormat):
-        rf_dict = {"type": response_format.type, "json_schema": None}
+        rf_dict: Dict[str, Any] = {"type": response_format.type, "json_schema": None}
         if response_format.json_schema:
             rf_dict["json_schema"] = {
                 "name": response_format.json_schema.name,
@@ -859,7 +868,7 @@ def parse_json_output(
 
 def apply_response_format_or_error(
     text: str,
-    response_format: object,
+    response_format: ResponseFormat | dict[str, Any] | None,
     *,
     ensure_ascii: bool = False,
 ) -> str:
@@ -901,7 +910,7 @@ def build_json_system_prompt(
 
     # Normalize to dict
     if isinstance(response_format, ResponseFormat):
-        rf_dict = {"type": response_format.type, "json_schema": None}
+        rf_dict: Dict[str, Any] = {"type": response_format.type, "json_schema": None}
         if response_format.json_schema:
             rf_dict["json_schema"] = {
                 "name": response_format.json_schema.name,

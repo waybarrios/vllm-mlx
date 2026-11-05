@@ -14,11 +14,6 @@ import platform
 import sys
 import time
 
-# Skip if not on Apple Silicon
-if sys.platform != "darwin" or platform.machine() != "arm64":
-    print("This test requires Apple Silicon")
-    sys.exit(0)
-
 
 async def run_concurrent_inference():
     """Run 20 concurrent requests with real inference in 2 rounds."""
@@ -266,4 +261,8 @@ Always explain your reasoning and provide learning resources."""
 
 
 if __name__ == "__main__":
+    if sys.platform != "darwin" or platform.machine() != "arm64":
+        print("This test requires Apple Silicon")
+        sys.exit(0)
+
     asyncio.run(run_concurrent_inference())

@@ -1411,11 +1411,14 @@ async def stream_chat_completion(
 
     try:
         if timeout_s and timeout_s > 0:
-            async with asyncio.timeout(timeout_s):
-                await _consume_stream()
+            if sys.version_info >= (3, 11):
+                async with asyncio.timeout(timeout_s):
+                    await _consume_stream()
+            else:
+                await asyncio.wait_for(_consume_stream(), timeout=timeout_s)
         else:
             await _consume_stream()
-    except TimeoutError:
+    except (TimeoutError, asyncio.TimeoutError):
         await _cancel_server_request(client, base_url, request_id)
         raise TimeoutError(
             f"stream_chat_completion timed out after {timeout_s:.3f}s"
@@ -1839,7 +1842,8 @@ async def _fetch_post_run_status(client: httpx.AsyncClient, base_url: str) -> di
     try:
         resp = await client.get(f"{base_url}/v1/status")
         resp.raise_for_status()
-        return resp.json()
+        status: dict = resp.json()
+        return status
     except Exception:
         return {}
 
@@ -1902,7 +1906,7 @@ def _build_workload_record(
     """Assemble the JSON-serializable workload-case record from the raw
     inputs and the completion result. Pure function: no I/O, deterministic
     given its arguments."""
-    record = {
+    record: dict[str, Any] = {
         "run_id": run_id,
         "timestamp": timestamp,
         "started_at": started_wall,
@@ -2169,7 +2173,7 @@ async def run_bench_serve_workload(
             raise ValueError("could not determine model ID; pass --model")
 
         records = []
-        cache_events = []
+        cache_events: list[dict[str, Any]] = []
         if resolved_cache_policy == "before-run":
             cache_events.append(
                 {
@@ -2310,7 +2314,8 @@ def format_table(results: list[BenchServeResult]) -> str:
                 val = round(val, 1)
             row.append(val)
         rows.append(row)
-    return _tabulate(rows, headers=_TABLE_COLUMNS, tablefmt="simple")
+    formatted: str = _tabulate(rows, headers=_TABLE_COLUMNS, tablefmt="simple")
+    return formatted
 
 
 def format_json(results: list[BenchServeResult]) -> str:
@@ -2569,7 +2574,8 @@ def format_workload_table(payload: dict) -> str:
                 for value in (row[col] for col in _WORKLOAD_TABLE_COLUMNS)
             ]
         )
-    return _tabulate(rows, headers=_WORKLOAD_TABLE_COLUMNS, tablefmt="simple")
+    formatted: str = _tabulate(rows, headers=_WORKLOAD_TABLE_COLUMNS, tablefmt="simple")
+    return formatted
 
 
 def format_workload_json(payload: dict) -> str:
@@ -2645,14 +2651,14 @@ logger = logging.getLogger(__name__)
 async def run_bench_serve(
     url: str = "http://127.0.0.1:8080",
     model: Optional[str] = None,
-    prompt_sets: list[str] = None,
+    prompt_sets: list[str] | None = None,
     prompt_file: Optional[str] = None,
-    concurrencies: list[int] = None,
+    concurrencies: list[int] | None = None,
     max_tokens: int = 256,
     repetitions: int = 3,
     warmup: int = 1,
-    thinking_values: list[Optional[bool]] = None,
-    extra_bodies: list[str] = None,
+    thinking_values: list[Optional[bool]] | None = None,
+    extra_bodies: list[str] | None = None,
     output_path: Optional[str] = None,
     fmt: str = "table",
     do_validate: bool = True,
@@ -3613,6 +3619,7 @@ async def run_capacity_envelope(
                                     }
                                 )
                             if baseline_url and batch:
+                                assert baseline_identity is not None
                                 baseline_batch = await asyncio.gather(
                                     *[
                                         _run_capacity_request(

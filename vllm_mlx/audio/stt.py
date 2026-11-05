@@ -10,7 +10,7 @@ Supports:
 import logging
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Union
+from typing import Optional, Protocol, TypedDict, Union
 
 logger = logging.getLogger(__name__)
 
@@ -25,6 +25,23 @@ _WHISPER_PROCESSOR_REPOS = {
     "mlx-community/whisper-large-v3-mlx": "openai/whisper-large-v3",
     "mlx-community/whisper-large-v3-turbo": "openai/whisper-large-v3-turbo",
 }
+
+
+class _STTModel(Protocol):
+    def generate(
+        self,
+        audio_path: str,
+        *,
+        verbose: bool,
+        language: str = ...,
+        task: str = ...,
+    ) -> object: ...
+
+
+class _TranscriptionKwargs(TypedDict, total=False):
+    verbose: bool
+    language: str
+    task: str
 
 
 def _canonical_whisper_processor(model_name: str) -> Optional[str]:
@@ -75,7 +92,7 @@ class STTEngine:
                 - mlx-community/parakeet-tdt-0.6b-v3
         """
         self.model_name = model_name
-        self.model = None
+        self.model: _STTModel | None = None
         self._loaded = False
         self._is_parakeet = "parakeet" in model_name.lower()
 
@@ -136,11 +153,13 @@ class STTEngine:
         if not self._loaded:
             self.load()
 
+        assert self.model is not None
+
         audio_path = str(audio_path)
 
         try:
             # Use the model's generate method directly
-            kwargs = {"verbose": False}
+            kwargs: _TranscriptionKwargs = {"verbose": False}
             if language and not self._is_parakeet:
                 kwargs["language"] = language
             if task and not self._is_parakeet:

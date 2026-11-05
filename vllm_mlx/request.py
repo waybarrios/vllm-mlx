@@ -151,6 +151,12 @@ class Request:
     mtp_drafts: int = 0
     mtp_accepted: int = 0
 
+    if TYPE_CHECKING:
+        _ssd_candidate: dict[str, Any] = field(init=False, repr=False, compare=False)
+        _extracted_cache: Optional[List[Any]] = field(
+            init=False, repr=False, compare=False
+        )
+
     @property
     def num_output_tokens(self) -> int:
         """Number of output tokens generated so far."""

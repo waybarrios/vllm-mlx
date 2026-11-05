@@ -8,8 +8,11 @@ for the vLLM-style continuous batching implementation.
 
 import asyncio
 import importlib
+import sys
+import threading
+from concurrent.futures import ThreadPoolExecutor
 import pytest
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from unittest.mock import MagicMock
 import mlx.core as mx
 
@@ -27,6 +30,124 @@ from vllm_mlx.scheduler import (
 )
 
 mlx_generate = importlib.import_module("mlx_lm.generate")
+
+
+def _generation_values(stream=None):
+    with mx.stream(mlx_generate.generation_stream if stream is None else stream):
+        return (mx.array([1, 2]) + 1).tolist()
+
+
+def _array_engine(worker=None, close_error=False, fallback=False):
+    """Exercise real stream ownership with one small scheduler step."""
+    from vllm_mlx.engine_core import EngineConfig, EngineCore
+
+    engine = EngineCore(
+        object(),
+        SimpleNamespace(eos_token_id=-1),
+        EngineConfig(scheduler_config=SchedulerConfig(enable_prefix_cache=False)),
+        force_model_ownership=False,
+        generation_worker=worker,
+    )
+    loop = asyncio.get_running_loop()
+    stepped = asyncio.Event()
+
+    class ArrayScheduler:
+        closed = False
+        worker_stream = None
+
+        def has_requests(self):
+            return not stepped.is_set()
+
+        def step(self):
+            if fallback and self.worker_stream is None:
+                self.worker_stream = mlx_generate.generation_stream
+                raise RuntimeError("There is no Stream(cpu, 999) in current thread.")
+            assert _generation_values() == [2, 3]
+            self.worker_stream = mlx_generate.generation_stream
+            loop.call_soon_threadsafe(stepped.set)
+            return SimpleNamespace(outputs=[], finished_request_ids=[])
+
+        def _recover_from_cache_error(self):
+            pass
+
+        def _reschedule_running_requests(self):
+            pass
+
+        def _close_batch_generator(self):
+            if self.closed:
+                return
+            self.closed = True
+            assert _generation_values(self.worker_stream) == [2, 3]
+            if close_error:
+                raise ValueError("close failed")
+
+        def close_ssd_tier(self):
+            pass
+
+    engine.scheduler = ArrayScheduler()
+    return engine, stepped
+
+
+@pytest.mark.parametrize("bind_fails", [False, True])
+def test_owned_stream_capture_retires_once_even_when_binder_fails(bind_fails):
+    from vllm_mlx.mlx_streams import bind_generation_streams, capture_generation_streams
+
+    previous = mlx_generate.generation_stream
+    default = mx.default_stream(mx.default_device())
+
+    def bind():
+        bind_generation_streams(module_names=("mlx_lm.generate",))
+        if bind_fails:
+            raise ValueError("bind failed after updating module")
+
+    try:
+        if bind_fails:
+            with pytest.raises(ValueError, match="bind failed"):
+                with capture_generation_streams() as binding:
+                    bind()
+            assert mlx_generate.generation_stream is previous
+        else:
+            with capture_generation_streams() as binding:
+                bind()
+        binding.retire()
+        binding.retire()
+        assert mlx_generate.generation_stream is previous
+        assert _generation_values() == [2, 3]
+    finally:
+        mlx_generate.generation_stream = previous
+        mx.set_default_stream(default)
+
+
+def test_retiring_capture_without_rebind_keeps_generation_stream():
+    from vllm_mlx.mlx_streams import capture_generation_streams
+
+    previous = mlx_generate.generation_stream
+    with capture_generation_streams() as binding:
+        pass
+    binding.retire()
+    assert mlx_generate.generation_stream is previous
+    assert _generation_values() == [2, 3]
+
+
+def test_retirement_preserves_external_binding_and_later_module(monkeypatch):
+    from vllm_mlx.mlx_streams import bind_generation_streams, capture_generation_streams
+
+    previous = mlx_generate.generation_stream
+    default = mx.default_stream(mx.default_device())
+    try:
+        with capture_generation_streams() as binding:
+            bind_generation_streams(module_names=("mlx_lm.generate",))
+        external = bind_generation_streams(module_names=("mlx_lm.generate",))
+        later_module = ModuleType("mlx_vlm.generate")
+        later_module.generation_stream = external
+        monkeypatch.setitem(sys.modules, "mlx_vlm.generate", later_module)
+        binding.retire()
+        assert mlx_generate.generation_stream is external
+        assert later_module.generation_stream is external
+        assert _generation_values() == [2, 3]
+    finally:
+        mlx_generate.generation_stream = previous
+        mx.set_default_stream(default)
 
 
 class _MergeableFakeCache:
@@ -480,10 +601,34 @@ class TestSchedulerBasic:
         assert uid == 7
         assert checkpoint == 3
 
-    def test_chunked_prefill_works_without_private_mlx_generate_exports(
-        self, monkeypatch
+    @pytest.mark.parametrize("has_private_exports", [True, False])
+    def test_chunked_prefill_loads_optional_exports_from_generate_submodule(
+        self, monkeypatch, has_private_exports
     ):
-        """Chunked prefill should tolerate missing private mlx_lm.generate exports."""
+        """The package's generate function must not hide submodule cache helpers."""
+
+        import mlx_lm
+        from dataclasses import dataclass
+
+        callback_payloads = []
+
+        @dataclass
+        class ModuleBatch:
+            uids: list
+            y: mx.array
+            logprobs: list
+            max_tokens: list
+            num_tokens: list
+            cache: list
+            samplers: list
+            logits_processors: list
+            tokens: list
+
+            def __len__(self):
+                return len(self.uids)
+
+            def extract_cache(self, _idx):
+                return ["module-batch-cache"]
 
         class FakeStats:
             prompt_tokens = 0
@@ -520,7 +665,7 @@ class TestSchedulerBasic:
                 self.max_kv_size = None
                 self.stop_tokens = {99}
                 self.prompt_progress_callback = lambda _progress: None
-                self.prompt_checkpoint_callback = None
+                self.prompt_checkpoint_callback = callback_payloads.extend
                 self._next = lambda: []
                 self.remove = lambda _uids: None
                 self._process_prompts = lambda _prompts: None
@@ -537,6 +682,15 @@ class TestSchedulerBasic:
         monkeypatch.delattr(mlx_generate, "Batch", raising=False)
         monkeypatch.delattr(mlx_generate, "_lazy_extract_cache", raising=False)
         monkeypatch.delattr(mlx_generate, "_make_cache", raising=False)
+        monkeypatch.setattr(mlx_lm, "generate", lambda *_args, **_kwargs: None)
+        if has_private_exports:
+            monkeypatch.setattr(mlx_generate, "Batch", ModuleBatch, raising=False)
+            monkeypatch.setattr(
+                mlx_generate,
+                "_lazy_extract_cache",
+                lambda _cache, _idx: iter(["module-checkpoint-cache"]),
+                raising=False,
+            )
         monkeypatch.setattr(
             mlx_generate,
             "_left_pad_prompts",
@@ -548,8 +702,19 @@ class TestSchedulerBasic:
 
         batch_gen._next()
         assert batch_gen._partial is not None
-        batch_gen._next()
+        responses = batch_gen._next()
         assert batch_gen.active_batch is None
+        assert len(callback_payloads) == 1
+        uid, checkpoint, cached = callback_payloads[0]
+        assert (uid, checkpoint) == (7, 1)
+        if has_private_exports:
+            assert list(cached) == ["module-checkpoint-cache"]
+            assert responses[0].cache == ["module-batch-cache"]
+        else:
+            restored = list(cached)
+            assert len(restored) == 1
+            assert isinstance(restored[0], _MergeableFakeCache)
+            assert responses[0].cache == restored
 
     def test_scheduler_creation(self, mock_model, mock_tokenizer):
         """Test scheduler creation."""
@@ -945,6 +1110,125 @@ class TestEngineAsync:
             await asyncio.sleep(0.05)
 
         assert not engine.engine.is_running()
+
+        # The retired worker must not leave the upstream module pointing at
+        # its thread-owned stream: later callers still build real MLX arrays.
+        assert _generation_values() == [2, 3]
+
+    @pytest.mark.parametrize("close_error", [False, True])
+    async def test_active_owned_worker_retires_stream_after_close(self, close_error):
+        previous = mlx_generate.generation_stream
+        engine, stepped = _array_engine(close_error=close_error)
+        await engine.start()
+        await asyncio.wait_for(stepped.wait(), timeout=5)
+        if close_error:
+            with pytest.raises(ValueError, match="close failed"):
+                await engine.stop()
+        else:
+            await engine.stop()
+
+        assert mlx_generate.generation_stream is previous
+        assert _generation_values() == [2, 3]
+
+    @pytest.mark.parametrize("retirement_order", [(0, 1), (1, 0)])
+    async def test_overlapping_owned_workers_restore_live_predecessors(
+        self, retirement_order
+    ):
+        previous = mlx_generate.generation_stream
+        engines = []
+        try:
+            for _ in range(2):
+                engine, stepped = _array_engine()
+                engines.append(engine)
+                await engine.start()
+                await asyncio.wait_for(stepped.wait(), timeout=5)
+            first, second = retirement_order
+            await engines[first].stop()
+            assert (
+                mlx_generate.generation_stream
+                is engines[second].scheduler.worker_stream
+            )
+            await engines[second].stop()
+            assert mlx_generate.generation_stream is previous
+            assert _generation_values() == [2, 3]
+        finally:
+            for engine in engines:
+                await engine.stop()
+            mlx_generate.generation_stream = previous
+
+    async def test_supplied_worker_keeps_its_stream_after_engine_stop(self):
+        from vllm_mlx.mlx_streams import (
+            restore_generation_streams,
+            snapshot_generation_streams,
+        )
+
+        previous = snapshot_generation_streams()
+        try:
+            with ThreadPoolExecutor(max_workers=1) as worker:
+                engine, stepped = _array_engine(worker=worker)
+                try:
+                    await engine.start()
+                    await asyncio.wait_for(stepped.wait(), timeout=5)
+                    await engine.stop()
+                    assert (
+                        mlx_generate.generation_stream is engine.scheduler.worker_stream
+                    )
+                    assert worker.submit(_generation_values).result(timeout=5) == [2, 3]
+                finally:
+                    await engine.stop()
+        finally:
+            restore_generation_streams(previous)
+
+    async def test_worker_fallback_keeps_model_thread_stream_usable(self):
+        from vllm_mlx.mlx_streams import (
+            restore_generation_streams,
+            snapshot_generation_streams,
+        )
+
+        previous = snapshot_generation_streams()
+        engine, stepped = _array_engine(fallback=True)
+        try:
+            await engine.start()
+            await asyncio.wait_for(stepped.wait(), timeout=5)
+            await engine.stop()
+            assert _generation_values() == [2, 3]
+        finally:
+            await engine.stop()
+            restore_generation_streams(previous)
+
+    async def test_cancelled_stop_waits_for_owned_worker_before_retiring_stream(self):
+        previous = mlx_generate.generation_stream
+        engine, stepped = _array_engine()
+        close_started = threading.Event()
+        release_close = threading.Event()
+        close_finished = threading.Event()
+        original_close = engine.scheduler._close_batch_generator
+
+        def close():
+            if close_finished.is_set():
+                return
+            close_started.set()
+            assert release_close.wait(timeout=5)
+            assert mlx_generate.generation_stream is engine.scheduler.worker_stream
+            original_close()
+            close_finished.set()
+
+        engine.scheduler._close_batch_generator = close
+        await engine.start()
+        await asyncio.wait_for(stepped.wait(), timeout=5)
+        stopping = asyncio.create_task(engine.stop())
+        try:
+            assert await asyncio.to_thread(close_started.wait, 5)
+            stopping.cancel()
+            release_close.set()
+            with pytest.raises(asyncio.CancelledError):
+                await stopping
+            assert close_finished.is_set()
+            assert mlx_generate.generation_stream is previous
+            assert _generation_values() == [2, 3]
+        finally:
+            release_close.set()
+            await engine.stop()
 
     async def test_engine_context_manager(self, mock_model_and_tokenizer):
         """Test engine as async context manager."""

@@ -6,6 +6,7 @@ These tests verify that the MCP command validation properly prevents
 command injection attacks and other security vulnerabilities.
 """
 
+import asyncio
 import json
 import re
 
@@ -20,7 +21,69 @@ from vllm_mlx.mcp.security import (
     ToolSandbox,
     ToolExecutionAudit,
 )
-from vllm_mlx.mcp.types import MCPServerConfig, MCPTransport
+from vllm_mlx.mcp.types import MCPConfig, MCPServerConfig, MCPTransport
+from vllm_mlx.mcp.executor import ToolExecutor
+from vllm_mlx.mcp.manager import MCPClientManager
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("parallel", [False, True])
+async def test_tool_execution_propagates_child_cancellation(monkeypatch, parallel):
+    manager = MCPClientManager(MCPConfig())
+
+    async def cancel_tool(tool_call, timeout):
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(manager, "execute_tool_call", cancel_tool)
+    executor = ToolExecutor(manager)
+    calls = [{"id": "call_1", "function": {"name": "safe__read", "arguments": {}}}]
+
+    with pytest.raises(asyncio.CancelledError):
+        await executor.execute_tool_calls(calls, parallel=parallel)
+
+
+@pytest.mark.anyio
+async def test_parallel_tool_execution_propagates_outer_cancellation(monkeypatch):
+    manager = MCPClientManager(MCPConfig())
+    started = asyncio.Event()
+    cancelled = asyncio.Event()
+
+    async def wait_for_cancellation(tool_call, timeout):
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.set()
+
+    monkeypatch.setattr(manager, "execute_tool_call", wait_for_cancellation)
+    executor = ToolExecutor(manager)
+    calls = [{"id": "call_1", "function": {"name": "safe__read", "arguments": {}}}]
+    task = asyncio.create_task(executor.execute_tool_calls(calls))
+    await started.wait()
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert cancelled.is_set()
+
+
+@pytest.mark.anyio
+async def test_parallel_tool_execution_keeps_ordinary_error_result(monkeypatch):
+    manager = MCPClientManager(MCPConfig())
+
+    async def fail_tool(tool_call, timeout):
+        raise RuntimeError("tool failed")
+
+    monkeypatch.setattr(manager, "execute_tool_call", fail_tool)
+    executor = ToolExecutor(manager)
+    calls = [{"id": "call_1", "function": {"name": "safe__read", "arguments": {}}}]
+
+    results = await executor.execute_tool_calls(calls)
+    assert len(results) == 1
+    result, call_id = results[0]
+    assert call_id == "call_1"
+    assert result.is_error
+    assert result.error_message == "tool failed"
 
 
 class TestMCPCommandValidator:

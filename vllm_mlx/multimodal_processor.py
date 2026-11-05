@@ -9,7 +9,7 @@ inputs that can be batched together efficiently.
 
 import logging
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, cast
 
 import mlx.core as mx
 
@@ -305,7 +305,10 @@ class MultimodalProcessor:
             if ids is None:
                 padded_ids.append([0] * max_length)
             else:
-                tokens = ids.tolist() if hasattr(ids, "tolist") else list(ids)
+                # Each request supplies a one-dimensional sequence of token IDs.
+                tokens = cast(
+                    list[int], ids.tolist() if hasattr(ids, "tolist") else list(ids)
+                )
                 padded_ids.append([0] * pad_amount + tokens)
 
         input_ids = mx.array(padded_ids)
@@ -390,6 +393,7 @@ class MultimodalProcessor:
             raise ValueError("Could not find vision encoder in model")
 
         # Run vision encoding
+        embeddings: mx.array
         if image_grid_thw is not None:
             # Qwen-VL style with grid info
             try:

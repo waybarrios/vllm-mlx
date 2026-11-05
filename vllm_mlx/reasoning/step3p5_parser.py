@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 from .base import DeltaMessage
+from typing import Literal
+
 from .think_parser import BaseThinkingReasoningParser
 
 
@@ -55,7 +57,7 @@ class Step3p5ReasoningParser(BaseThinkingReasoningParser):
         self,
         previous_text: str,
         delta_text: str,
-    ) -> str | bool:
+    ) -> str | Literal[False]:
         if not previous_text.endswith(self.end_token) or not delta_text:
             return False
         remaining = delta_text.removeprefix("\n")

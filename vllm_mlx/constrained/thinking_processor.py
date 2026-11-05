@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import enum
 from collections import deque
-from typing import Callable
+from typing import Callable, cast
 
 import mlx.core as mx
 
@@ -226,7 +226,7 @@ class ThinkingAwareLogitsProcessor:
 
     def _sync_to_tokens(self, tokens: mx.array) -> None:
         target_len = int(tokens.size)
-        token_ids = tokens.tolist()
+        token_ids = cast(list[int], tokens.tolist())
         common_len = 0
         max_common = min(target_len, self._processed_len)
         while (

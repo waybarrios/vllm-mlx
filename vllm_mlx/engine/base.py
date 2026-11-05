@@ -31,14 +31,12 @@ class GenerationOutput:
     prompt_tokens: int = 0
     completion_tokens: int = 0
     finish_reason: str | None = "stop"
+    # MTP speculative decoding counters. Zero means no MTP attempt occurred.
     mtp_drafts: int = 0
     mtp_accepted: int = 0
     # For streaming
     new_text: str = ""
     finished: bool = True
-    # MTP speculative decoding counters. Zero means no MTP attempt occurred.
-    mtp_drafts: int = 0
-    mtp_accepted: int = 0
     # Request-level sparse-prefill decision and diagnostics.
     specprefill_outcome: "SpecPrefillOutcome | None" = None
 
@@ -245,6 +243,8 @@ class BaseEngine(ABC):
     allowing the server to use either without code changes.
     """
 
+    use_harmony_rendering: bool
+
     @property
     @abstractmethod
     def model_name(self) -> str:
@@ -323,7 +323,7 @@ class BaseEngine(ABC):
         pass
 
     @abstractmethod
-    async def stream_generate(
+    def stream_generate(
         self,
         prompt: str,
         max_tokens: int = 256,
@@ -379,7 +379,7 @@ class BaseEngine(ABC):
         pass
 
     @abstractmethod
-    async def stream_chat(
+    def stream_chat(
         self,
         messages: list[dict[str, Any]],
         max_tokens: int = 256,

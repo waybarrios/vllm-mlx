@@ -20,7 +20,7 @@ import copy
 import hashlib
 import json
 import logging
-from typing import Any, Callable
+from typing import Any, Callable, cast
 
 import mlx.core as mx
 import numpy as np
@@ -247,7 +247,8 @@ def _simplify_schema(schema: dict) -> dict:
 
         return node
 
-    return _resolve(schema)
+    resolved: dict = _resolve(schema)
+    return resolved
 
 
 def _force_no_additional_properties(schema: dict) -> dict:
@@ -327,7 +328,7 @@ def _eos_logits(
     if not eos_set:
         return None
     actual_vocab = logits.shape[-1]
-    mask = build_allow_mask(sorted(eos_set), actual_vocab)
+    mask: mx.array = build_allow_mask(sorted(eos_set), actual_vocab)
     if logits.ndim == 2 and logits.shape[0] == 1:
         mask = mask[None, :]
     return logits + mask
@@ -557,7 +558,8 @@ class JSONSchemaLogitsProcessor:
             value = json.loads(text)
         except (ValueError, json.JSONDecodeError):
             return False
-        return self._schema_validator.is_valid(value)
+        is_valid: bool = self._schema_validator.is_valid(value)
+        return is_valid
 
     def _get_json_context(self, suffix: list[int]) -> str:
         """Determine the JSON structural context of the current suffix.
@@ -623,7 +625,7 @@ class JSONSchemaLogitsProcessor:
             last_quote_pos = -1
             brace_depth = 0
             bracket_depth = 0
-            container_stack: list[str] = []
+            container_stack = []
             i = 0
             while i < text_len:
                 ch = text[i]
@@ -865,13 +867,16 @@ class JSONSchemaLogitsProcessor:
             )
 
         try:
-            tokens_list = tokens.tolist() if hasattr(tokens, "tolist") else list(tokens)
+            tokens_list = cast(
+                int | list[int] | list[list[int]],
+                tokens.tolist() if hasattr(tokens, "tolist") else list(tokens),
+            )
             if isinstance(tokens_list, int):
                 tokens_list = [tokens_list]
             elif tokens_list and isinstance(tokens_list[0], list):
                 tokens_list = tokens_list[0]
 
-            suffix = self._suffix(tokens_list)
+            suffix = self._suffix(cast(list[int], tokens_list))
             eos_logits = _complete_json_eos_logits(
                 self._eos_set,
                 suffix,

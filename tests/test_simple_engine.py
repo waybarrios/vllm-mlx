@@ -19,6 +19,39 @@ class TestSimpleEngineConcurrency:
     def anyio_backend(self):
         return "asyncio"
 
+    async def test_chat_aggregates_overridden_stream_without_model(self):
+        from vllm_mlx.engine.base import GenerationOutput
+        from vllm_mlx.engine.simple import SimpleEngine
+
+        calls = []
+
+        class StreamEngine:
+            _loaded = True
+            chat = SimpleEngine.chat
+
+            async def stream_chat(self, **kwargs):
+                calls.append(kwargs)
+                yield GenerationOutput(text="partial", finished=False)
+                yield GenerationOutput(
+                    text="streamed response",
+                    tokens=[7, 8],
+                    prompt_tokens=3,
+                    completion_tokens=2,
+                    finish_reason="length",
+                )
+
+        engine = StreamEngine()
+        messages = [{"role": "user", "content": "hello"}]
+        result = await engine.chat(messages, max_tokens=2)
+
+        assert result.text == "streamed response"
+        assert result.tokens == [7, 8]
+        assert result.prompt_tokens == 3
+        assert result.completion_tokens == 2
+        assert result.finish_reason == "length"
+        assert calls[0]["messages"] is messages
+        assert calls[0]["max_tokens"] == 2
+
     @pytest.fixture
     def mock_model(self):
         """Create a mock model that tracks concurrent calls."""

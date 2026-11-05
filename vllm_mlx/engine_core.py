@@ -17,7 +17,7 @@ import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from typing import Any, AsyncIterator, Dict, List, Optional, Union
+from typing import cast, Any, AsyncIterator, Dict, List, Optional, Union
 
 import mlx.core as mx
 
@@ -26,7 +26,11 @@ from .scheduler import Scheduler, SchedulerConfig
 from .engine.base import run_blocking_startup_work, suspend_cancellation
 from .output_collector import RequestOutputCollector, RequestStreamState
 from .model_registry import get_registry
-from .mlx_streams import bind_generation_streams
+from .mlx_streams import (
+    GenerationStreamBinding,
+    bind_generation_streams,
+    capture_generation_streams,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -234,14 +238,19 @@ class EngineCore:
             max_workers=1, thread_name_prefix="engine-core"
         )
         worker_stream_bound = False
+        worker_stream_binding: GenerationStreamBinding | None = None
         model_thread_stream_bound = False
         use_worker_thread = True
         stream_thread_fallback_used = False
 
         def _bind_worker_streams_once() -> None:
-            nonlocal worker_stream_bound
+            nonlocal worker_stream_bound, worker_stream_binding
             if not worker_stream_bound:
-                bind_generation_streams()
+                if owns_worker:
+                    with capture_generation_streams() as worker_stream_binding:
+                        bind_generation_streams()
+                else:
+                    bind_generation_streams()
                 worker_stream_bound = True
 
         def _bind_model_streams_once() -> None:
@@ -310,7 +319,10 @@ class EngineCore:
         # Emergency memory pressure threshold — dynamic based on gpu_memory_utilization
         _gpu_mem_util = self.config.gpu_memory_utilization
         try:
-            _device_mem = mx.device_info().get("memory_size", 200 * 1024 * 1024 * 1024)
+            # MLX reports memory_size as an integer byte count.
+            _device_mem = cast(
+                int, mx.device_info().get("memory_size", 200 * 1024 * 1024 * 1024)
+            )
             _memory_pressure_threshold = int(
                 _device_mem * min(_gpu_mem_util + 0.05, 0.99)
             )
@@ -438,6 +450,8 @@ class EngineCore:
                     # one owns the loaded model and outlives the engine loop.
                     if owns_worker:
                         worker.shutdown(wait=True)
+                        if worker_stream_binding is not None:
+                            worker_stream_binding.retire()
 
     async def add_request(
         self,
@@ -930,3 +944,7 @@ class AsyncEngineCore:
     def clear_runtime_caches(self) -> Dict[str, Any] | None:
         """Clear scheduler-managed runtime caches."""
         return self.engine.clear_runtime_caches()
+
+    def clear_prefix_cache(self) -> None:
+        """Clear the wrapped engine's prefix cache."""
+        self.engine.clear_prefix_cache()
