@@ -173,7 +173,7 @@ def _source_sha(path):
 def _model_manifest(directory):
     files = {}
     for path in sorted(Path(directory).rglob("*")):
-        if path.is_file() and ".cache" not in path.parts:
+        if path.is_file() and ".cache" not in path.relative_to(directory).parts:
             digest = hashlib.sha256()
             with path.open("rb") as stream:
                 for chunk in iter(lambda: stream.read(4 * 1024 * 1024), b""):

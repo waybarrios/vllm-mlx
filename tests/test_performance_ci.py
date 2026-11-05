@@ -6,7 +6,12 @@ import sys
 
 import pytest
 
-from scripts.performance_ci.controller import pair_order, run_child, summarize
+from scripts.performance_ci.controller import (
+    _model_manifest,
+    pair_order,
+    run_child,
+    summarize,
+)
 
 CASE = {
     "id": "tiny-decode",
@@ -18,6 +23,19 @@ CASE = {
     "prefix_cache": False,
 }
 SOURCES = {"base": "b" * 40, "head": "c" * 40}
+
+
+def test_model_manifest_hashes_snapshots_inside_default_hub_cache(tmp_path):
+    snapshot = tmp_path / ".cache" / "huggingface" / "hub" / "snapshots" / ("a" * 40)
+    snapshot.mkdir(parents=True)
+    (snapshot / "config.json").write_bytes(b"abc")
+    metadata = snapshot / ".cache" / "huggingface"
+    metadata.mkdir(parents=True)
+    (metadata / "download.metadata").write_text("not model content")
+
+    assert _model_manifest(snapshot) == {
+        "config.json": "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+    }
 
 
 def observations():
