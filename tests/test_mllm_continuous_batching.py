@@ -15,6 +15,7 @@ Test Cases:
 
 import asyncio
 import base64
+import math
 import os
 import threading
 import tempfile
@@ -2000,6 +2001,246 @@ class TestMLLMBatchGeneratorMTPGuards:
         assert _accept_sampled_draft(-0.1, -1.1, 0.999)
         assert not _accept_sampled_draft(-2.1, -0.1, 0.99)
         assert _accept_sampled_draft(-2.1, -0.1, 0.01)
+
+    def test_greedy_sampling_logprobs_is_one_hot_distribution(self):
+        """temperature=0 must not raise and must select only the argmax.
+
+        Regression: the greedy branch passed a float to ``mx.put_along_axis``,
+        so a greedy request in a stochastic batch failed every MTP verify and
+        degenerated into repeating output, corrupting every row of the batch.
+        """
+        from vllm_mlx.mllm_batch_generator import _sampling_logprobs
+
+        request = SimpleNamespace(temperature=0.0, top_p=1.0, top_k=0, min_p=0.0)
+        logits = mx.array([[1.0, 3.0, 2.0, 0.0], [5.0, 1.0, 1.0, 2.0]])
+        logprobs = _sampling_logprobs(logits, request)
+        probs = mx.exp(logprobs)
+        mx.eval(logprobs, probs)
+
+        assert float(logprobs[0, 1]) == 0.0
+        assert bool(mx.all(mx.isinf(logprobs[0][mx.array([0, 2, 3])])))
+        assert float(logprobs[1, 0]) == 0.0
+        assert bool(mx.all(mx.isinf(logprobs[1][mx.array([1, 2, 3])])))
+        assert probs.sum(axis=-1).tolist() == pytest.approx([1.0, 1.0])
+        # Row 1 picks index 0, not a higher column.
+        assert mx.argmax(logprobs, axis=-1).tolist() == [1, 0]
+
+    def test_greedy_mixed_into_stochastic_batch_verifies(self):
+        """A greedy request in a stochastic batch must verify without errors.
+
+        ``uses_stochastic_sampling`` is batch-wide, so one stochastic row
+        routes the greedy row through ``_sampling_logprobs`` too.
+        """
+        from vllm_mlx.mllm_batch_generator import install_mtp_mllm
+
+        greedy = SimpleNamespace(
+            uid=10,
+            request_id="greedy",
+            temperature=0.0,
+            top_p=1.0,
+            top_k=0,
+            min_p=0.0,
+            mllm_draft=True,
+        )
+        stochastic = SimpleNamespace(
+            uid=20,
+            request_id="stochastic",
+            temperature=0.7,
+            top_p=0.9,
+            top_k=0,
+            min_p=0.0,
+            mllm_draft=True,
+        )
+
+        class Batch:
+            def __init__(self):
+                self.uids = [10, 20]
+                self.requests = [greedy, stochastic]
+
+            def __len__(self):
+                return 2
+
+        class Generator:
+            def __init__(self):
+                self.active_batch = Batch()
+                self._step = self._original_step
+                self._next = lambda: []
+                self.sampler = lambda logprobs: mx.argmax(logprobs, axis=-1)
+
+            @staticmethod
+            def _original_step(*_args, **_kwargs):
+                raise AssertionError("mixed MTP batch must not take the bypass path")
+
+        class LanguageModel:
+            def __init__(self):
+                self.mtp_calls = 0
+
+            def mtp_forward(self, hidden_states, next_token_ids, mtp_cache=None):
+                self.mtp_calls += 1
+                del hidden_states, next_token_ids, mtp_cache
+                return mx.array([[[1.0, 2.0, 0.5]], [[1.0, 2.0, 0.5]]])
+
+            def __call__(self, input_tokens, cache=None, return_hidden=False):
+                del cache, return_hidden
+                batch_size, seq_len = input_tokens.shape
+                logits = mx.full((batch_size, seq_len, 3), -3.0)
+                logits[:, :, 1] = 4.0
+                return logits, mx.zeros((batch_size, seq_len, 2))
+
+        generator = Generator()
+        model = LanguageModel()
+        install_mtp_mllm(generator, model)
+
+        tokens, _ = generator._step(
+            mx.array([[0], [0]], dtype=mx.uint32),
+            cache=[],
+            logits_processors=None,
+            output_tokens=None,
+            samplers=None,
+        )
+
+        assert model.mtp_calls == 1
+        stats = generator.get_mtp_stats()
+        assert stats["attempted"] == 1
+        assert stats["errors"] == 0
+        assert stats["accepted"] + stats["rejected"] == 1
+        assert tokens.shape == (2,)
+
+    @staticmethod
+    def _mtp_stream(seed, rows, steps, speculative, trimmable=True):
+        """Emit one MLLM batch stream and return the tokens per uid.
+
+        ``rows`` holds ``(uid, temperature, target logits, draft logits)``.
+        The stub model returns each row's constant distribution at every
+        position, so emitted tokens expose the sampler path directly.
+        ``trimmable=False`` exercises the hybrid-model replay, which trims two
+        positions and restores snapshot state instead of advancing one.
+        """
+        from mlx_lm.sample_utils import make_sampler
+        from vllm_mlx.mllm_batch_generator import (
+            MLLMBatch,
+            MLLMBatchGenerator,
+            MLLMBatchRequest,
+            install_mtp_mllm,
+        )
+
+        target_rows = [row[2] for row in rows]
+        draft_rows = [row[3] for row in rows]
+
+        class LanguageModel:
+            def mtp_forward(self, hidden_states, next_token_ids, mtp_cache=None):
+                del next_token_ids, mtp_cache
+                batch_size = hidden_states.shape[0]
+                return mx.array([[draft_rows[row]] for row in range(batch_size)])
+
+            def __call__(self, input_tokens, cache=None, return_hidden=False):
+                del cache
+                batch_size, seq_len = input_tokens.shape
+                logits = mx.array(
+                    [
+                        [target_rows[row] for _ in range(seq_len)]
+                        for row in range(batch_size)
+                    ]
+                )
+                if not return_hidden:
+                    return logits
+                return logits, mx.zeros((batch_size, seq_len, 2))
+
+        class TrimmableCache:
+            """Batch-cache stand-in: trimmable, and the stub model ignores KV."""
+
+            trimmed = 0
+
+            def is_trimmable(self):
+                return True
+
+            def trim(self, count):
+                self.trimmed += count
+
+        class HybridCache:
+            """Non-trimmable cache: replays through snapshot state instead."""
+
+            def __init__(self):
+                self.state = [mx.zeros((1, 1, 2))]
+
+            def is_trimmable(self):
+                return False
+
+        mx.random.seed(seed)
+        model = LanguageModel()
+        generator = MLLMBatchGenerator(
+            model=model,
+            processor=None,
+            sampler=make_sampler(temp=1.0),
+            stop_tokens=set(),
+        )
+        if speculative:
+            install_mtp_mllm(generator, model)
+        requests = [
+            MLLMBatchRequest(
+                uid=uid,
+                request_id=f"r{uid}",
+                prompt="",
+                max_tokens=steps + 5,
+                temperature=temperature,
+                top_p=1.0,
+                top_k=0,
+                min_p=0.0,
+                mllm_draft=True,
+            )
+            for uid, temperature, _, _ in rows
+        ]
+        generator.active_batch = MLLMBatch(
+            uids=[row[0] for row in rows],
+            request_ids=[request.request_id for request in requests],
+            y=mx.array([0] * len(rows)),
+            logprobs=[mx.array([0.5, 0.5]) for _ in rows],
+            max_tokens=[steps + 5] * len(rows),
+            num_tokens=[0] * len(rows),
+            cache=[TrimmableCache() if trimmable else HybridCache()],
+            requests=requests,
+            samplers=[make_sampler(temp=row[1]) for row in rows],
+        )
+        emitted = {row[0]: [] for row in rows}
+        for _ in range(steps):
+            responses = generator.next()
+            if not responses:
+                break
+            for response in responses:
+                emitted[response.uid].append(response.token)
+        return emitted
+
+    def test_multi_row_sampled_rejection_emits_the_target_distribution(self):
+        """A rejected row in a concurrent batch resumes the target distribution.
+
+        Rejecting a draft means emitting from the residual max(p - q, 0), not
+        from the full target distribution p again. Target p=(0.8, 0.2) against
+        draft q=(0.2, 0.8) puts every bit of a rejection's residual mass on
+        token 0, so correct speculative decoding emits token 0 at p's 0.8 rate.
+        A rejected row re-drawn from p, with the batch-wide accept/reject
+        decision the single-row residual guard imposed, drifts to ~0.75.
+        """
+        rows = [
+            (20, 1.0, [math.log(0.8), math.log(0.2)], [math.log(0.2), math.log(0.8)]),
+            (30, 1.0, [math.log(0.8), math.log(0.2)], [math.log(0.2), math.log(0.8)]),
+        ]
+        for trimmable in (True, False):
+            speculative = []
+            baseline = []
+            for seed in range(40):
+                emitted = self._mtp_stream(
+                    seed, rows, steps=20, speculative=True, trimmable=trimmable
+                )
+                speculative.extend(emitted[20] + emitted[30])
+                emitted = self._mtp_stream(
+                    seed, rows, steps=20, speculative=False, trimmable=trimmable
+                )
+                baseline.extend(emitted[20] + emitted[30])
+
+            share = speculative.count(0) / len(speculative)
+            baseline_share = baseline.count(0) / len(baseline)
+            assert abs(baseline_share - 0.8) < 0.05, (trimmable, baseline_share)
+            assert abs(share - 0.8) < 0.035, (trimmable, share)
 
     def test_sampled_mtp_attempts_request_with_normal_sampling(self):
         from vllm_mlx.mllm_batch_generator import install_mtp_mllm
