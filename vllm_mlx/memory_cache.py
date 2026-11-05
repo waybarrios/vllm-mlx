@@ -49,9 +49,10 @@ logger = logging.getLogger(__name__)
 _BYTES_PER_MB = 1024 * 1024
 _DEFAULT_MEMORY_PERCENT = 0.20  # 20% of available RAM
 _MIN_MEMORY_BYTES = 100 * _BYTES_PER_MB  # Minimum 100MB
-# Bump this when the cache on-disk format or KV semantics change.
+# Version 5 rejects token-only entries from before media fetch/store isolation.
+# Those entries cannot identify whether their KV state includes media content.
 # Loading a cache with a different version is rejected automatically.
-_CACHE_PERSIST_VERSION = 4
+_CACHE_PERSIST_VERSION = 5
 
 
 def _get_available_memory() -> int:

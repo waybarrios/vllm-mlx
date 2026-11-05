@@ -686,6 +686,23 @@ class TestMLLMCompletionCacheStore:
         assert estimate_kv_cache_memory(stored) > 0
         assert [child.offset for child in stored[0].caches] == [3, 3]
 
+    def test_multimodal_request_is_never_stored_in_token_only_cache(self):
+        mx = pytest.importorskip("mlx.core")
+        pytest.importorskip("mlx.nn")
+        from vllm_mlx.mllm_batch_generator import MLLMBatchGenerator
+
+        generator = MLLMBatchGenerator.__new__(MLLMBatchGenerator)
+        generator.prefix_cache = MagicMock()
+        request = SimpleNamespace(
+            request_id="media", input_ids=mx.array([[1, 2, 3]]), is_text_only=False
+        )
+        batch = SimpleNamespace(
+            requests=[request], num_tokens=[1], extract_cache=MagicMock()
+        )
+        generator._maybe_store_prefix_cache(batch, [0])
+        batch.extract_cache.assert_not_called()
+        generator.prefix_cache.store.assert_not_called()
+
     def test_media_cache_is_never_stored_under_dense_prompt_tokens(self):
         from vllm_mlx.memory_cache import is_text_only_prefix_cache_request
 
