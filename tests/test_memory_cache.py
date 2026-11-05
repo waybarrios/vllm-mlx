@@ -851,22 +851,12 @@ def test_save_load_roundtrip_through_provenance_subdir(tmp_path):
         with open(path, "wb") as f:
             f.write(b"data")
 
-    fake_mlx = types.ModuleType("mlx_lm")
-    fake_models = types.ModuleType("mlx_lm.models")
+    # The package version is part of the cache directory name. Stub only the I/O.
     fake_cache_mod = types.ModuleType("mlx_lm.models.cache")
     fake_cache_mod.save_prompt_cache = _fake_save
     fake_cache_mod.load_prompt_cache = lambda path: [MockKVCache(500, 500)]
-    fake_mlx.models = fake_models
-    fake_models.cache = fake_cache_mod
 
-    with patch.dict(
-        sys.modules,
-        {
-            "mlx_lm": fake_mlx,
-            "mlx_lm.models": fake_models,
-            "mlx_lm.models.cache": fake_cache_mod,
-        },
-    ):
+    with patch.dict(sys.modules, {"mlx_lm.models.cache": fake_cache_mod}):
         assert cache.save_to_disk(str(tmp_path)) is True
         other = MemoryAwarePrefixCache(
             model, MemoryCacheConfig(max_memory_mb=100, min_prefix_tokens=1)
