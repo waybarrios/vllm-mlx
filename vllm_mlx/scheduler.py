@@ -2611,7 +2611,9 @@ class Scheduler:
             return False
 
     def _extract_cache_for_uid(self, uid: int) -> Any:
-        """Pull one sequence's cache out of the live BatchGenerator batch."""
+        """Extract a sequence cache when a first-response snapshot may be needed."""
+        from mlx_lm.models.cache import BatchKVCache
+
         bg = self.batch_generator
         if bg is None:
             return None
@@ -2620,6 +2622,17 @@ class Scheduler:
             uids = getattr(batch, "uids", None)
             if not uids or uid not in uids:
                 continue
+            layers = getattr(batch, "prompt_cache", None)
+            if (
+                isinstance(layers, (list, tuple))
+                and layers
+                and all(type(layer) is BatchKVCache for layer in layers)
+            ):
+                # Plain KV snapshots are discarded by the caller. Inspect the
+                # batched topology first: extracting it reads GPU padding
+                # scalars for every layer before returning plain KVCache.
+                # Unknown, mixed and sliding-window stacks retain extraction.
+                return None
             extract = getattr(batch, "extract_cache", None)
             if extract is None:
                 continue
