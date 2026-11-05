@@ -18,8 +18,8 @@ def diagnostic_orders():
     return variants, tuple(reversed(variants))
 
 
-def diagnostic_command(python):
-    return [
+def diagnostic_command(python, *, profile=False):
+    command = [
         str(python),
         "-m",
         "pytest",
@@ -33,6 +33,58 @@ def diagnostic_command(python):
         "-p",
         "no:cacheprovider",
     ]
+    if profile:
+        command += ["-p", "three_issue_throughput_profile"]
+    return command
+
+
+def summarize_profile(profiles, test_sha256, source_hashes):
+    required = {
+        "scheduler.step",
+        "scheduler.admit",
+        "scheduler.outputs",
+        "scheduler.cleanup",
+        "generator.next",
+        "generator.prefill",
+        "generator.start_decode",
+        "generator.decode",
+        "generator.forward",
+        "engine.add_request",
+        "engine.cleanup",
+        "collector.put",
+        "collector.get",
+    }
+    if len(profiles) != 2:
+        raise ValueError("Missing complete first/repeated phase profiles")
+    for profile in profiles:
+        calls = profile.get("calls", [])
+        ids = {call.get("id") for call in calls}
+        if (
+            profile.get("accepted") is not False
+            or profile.get("outcome") not in {"passed", "failed"}
+            or profile.get("test_sha256") != test_sha256
+            or not required.issubset(call.get("name") for call in calls)
+            or len(ids) != len(calls)
+            or any(
+                type(call.get("id")) is not int
+                or type(call.get("thread_id")) is not int
+                or call.get("parent_id") == call["id"]
+                or (call.get("parent_id") is not None and call["parent_id"] not in ids)
+                or any(
+                    type(call.get(field)) not in (int, float)
+                    or not math.isfinite(call[field])
+                    or call[field] < 0
+                    for field in ("start_seconds", "wall_seconds", "thread_cpu_seconds")
+                )
+                for call in calls
+            )
+            or any(
+                profile.get("sources", {}).get(name, {}).get("sha256") != digest
+                for name, digest in source_hashes.items()
+            )
+        ):
+            raise ValueError("Missing, mismatched or incomplete phase profile")
+    return {"profiles_complete": True, "accepted": False, "invocations": len(profiles)}
 
 
 def summarize_process(record, stdout):
@@ -80,7 +132,7 @@ def summarize_process(record, stdout):
     }
 
 
-def run_diagnostics(root):
+def run_diagnostics(root, *, profile=False):
     repo = Path(__file__).resolve().parents[1]
     sys.path.insert(0, str(repo))
     from scripts import three_issue_validation as controller
@@ -129,9 +181,15 @@ def run_diagnostics(root):
     result = {
         "accepted": False,
         "complete_matrix": False,
+        "instrumented": profile,
         "purpose": "Diagnose the unchanged greater-than-100 throughput assertion without altering acceptance semantics",
         "source_manifest_sha256": runner.digest(controller.BUNDLE / "manifest.json"),
         "diagnostic_script_sha256": runner.digest(Path(__file__).resolve()),
+        "profile_plugin_sha256": (
+            runner.digest(repo / "scripts/three_issue_throughput_profile.py")
+            if profile
+            else None
+        ),
         "workflow_commit": os.environ.get("GITHUB_SHA"),
         "operator_sha256": runner.digest(root / "operator.json"),
         "orders": diagnostic_orders(),
@@ -141,11 +199,20 @@ def run_diagnostics(root):
         for order_index, order in enumerate(diagnostic_orders(), 1):
             for variant in order:
                 controller._verify_sources(root)
+                child_environment = dict(environment, PYTHONPATH=str(root / variant))
+                profile_path = output / f"order-{order_index}-{variant}.profile.json"
+                if profile:
+                    child_environment.update(
+                        PYTHONPATH=os.pathsep.join(
+                            (str(root / variant), str(repo / "scripts"))
+                        ),
+                        VLLM_MLX_THROUGHPUT_PROFILE=str(profile_path),
+                    )
                 record = runner.run(
-                    diagnostic_command(python),
+                    diagnostic_command(python, profile=profile),
                     root / variant,
                     output / f"order-{order_index}-{variant}",
-                    dict(environment, PYTHONPATH=str(root / variant)),
+                    child_environment,
                     bounded=True,
                     timeout_seconds=120,
                 )
@@ -160,7 +227,23 @@ def run_diagnostics(root):
                     record["diagnostic"] = summarize_process(
                         record, Path(record["stdout"]).read_text()
                     )
-                except ValueError as error:
+                    if profile:
+                        record["profile"] = summarize_profile(
+                            json.loads(profile_path.read_text()),
+                            record["original_test_sha256"],
+                            {
+                                f"vllm_mlx.{name}": runner.digest(
+                                    root / variant / "vllm_mlx" / f"{name}.py"
+                                )
+                                for name in (
+                                    "scheduler",
+                                    "engine_core",
+                                    "output_collector",
+                                )
+                            },
+                        )
+                        record["profile_sha256"] = runner.digest(profile_path)
+                except (ValueError, OSError) as error:
                     record["diagnostic"] = {
                         "diagnostic_complete": False,
                         "accepted": False,
@@ -196,4 +279,10 @@ def run_diagnostics(root):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--run-root", required=True, type=Path)
-    raise SystemExit(run_diagnostics(parser.parse_args().run_root.resolve()))
+    parser.add_argument(
+        "--profile",
+        action="store_true",
+        help="Record separate instrumented phase timings; never acceptance",
+    )
+    args = parser.parse_args()
+    raise SystemExit(run_diagnostics(args.run_root.resolve(), profile=args.profile))

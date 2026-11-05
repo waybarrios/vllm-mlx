@@ -30,8 +30,8 @@ jobs:
         run: |
           python -m pip install pytest ruff black fastapi pydantic
           python -m pytest tests/test_three_issue_validation.py -q
-          python -m ruff check scripts/three_issue_throughput_diagnostics.py tests/test_three_issue_validation.py --select E,F,W --ignore E402,E501,E731,F811,F841
-          python -m black --check scripts/three_issue_throughput_diagnostics.py tests/test_three_issue_validation.py
+          python -m ruff check scripts/three_issue_throughput_diagnostics.py scripts/three_issue_throughput_profile.py tests/test_three_issue_validation.py --select E,F,W --ignore E402,E501,E731,F811,F841
+          python -m black --check scripts/three_issue_throughput_diagnostics.py scripts/three_issue_throughput_profile.py tests/test_three_issue_validation.py
 
   native:
     needs: checks
@@ -53,8 +53,8 @@ jobs:
         run: |
           python scripts/three_issue_validation.py prepare --run-root "$GITHUB_WORKSPACE/.scratch/throughput-diagnostics"
           python scripts/three_issue_validation.py provision --run-root "$GITHUB_WORKSPACE/.scratch/throughput-diagnostics"
-      - name: Record unchanged first and repeated test invocations
-        run: python scripts/three_issue_throughput_diagnostics.py --run-root "$GITHUB_WORKSPACE/.scratch/throughput-diagnostics"
+      - name: Profile unchanged first and repeated test invocations
+        run: python scripts/three_issue_throughput_diagnostics.py --run-root "$GITHUB_WORKSPACE/.scratch/throughput-diagnostics" --profile
       - name: Retain all diagnostic results and provenance
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4

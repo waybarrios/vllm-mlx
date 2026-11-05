@@ -1,8 +1,11 @@
 import hashlib
 import importlib.util
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
 import json
 import os
 from pathlib import Path
+import subprocess
 import sys
 
 import pytest
@@ -11,6 +14,238 @@ from scripts.three_issue_validation import assess_phase
 from scripts.three_issue_validation import _replay_module, BUNDLE, MODELS
 import scripts.three_issue_validation as controller
 import scripts.three_issue_throughput_diagnostics as throughput_diagnostics
+
+
+def _profile_module():
+    name = "scripts.three_issue_throughput_profile"
+    assert importlib.util.find_spec(name) is not None, "Missing phase timing plugin"
+    return __import__(name, fromlist=["CallTimings"])
+
+
+def test_phase_timing_preserves_nested_results_and_restores_methods():
+    profile = _profile_module()
+
+    class Work:
+        def inner(self):
+            return 42
+
+        def outer(self):
+            return self.inner()
+
+    original = Work.inner
+    with profile.profile_calls(
+        [(Work, "outer", "outer"), (Work, "inner", "inner")]
+    ) as trace:
+        assert Work().outer() == 42
+    assert Work.inner is original
+    calls = {call["name"]: call for call in trace.calls}
+    assert calls["inner"]["parent_id"] == calls["outer"]["id"]
+    assert calls["outer"]["parent_id"] is None
+    assert calls["outer"]["wall_seconds"] >= calls["inner"]["wall_seconds"] >= 0
+    assert calls["inner"]["thread_cpu_seconds"] >= 0
+
+
+def test_phase_timing_preserves_async_errors_and_thread_identity():
+    profile = _profile_module()
+    trace = profile.CallTimings()
+
+    async def fail():
+        await asyncio.sleep(0)
+        raise ValueError("original error")
+
+    def work():
+        return 7
+
+    with ThreadPoolExecutor(max_workers=1) as worker:
+        assert worker.submit(trace.wrap("worker", work)).result(timeout=5) == 7
+    with pytest.raises(ValueError, match="original error"):
+        asyncio.run(trace.wrap("async", fail)())
+    calls = {call["name"]: call for call in trace.calls}
+    assert calls["async"]["error"] == "ValueError"
+    assert calls["worker"]["error"] is None
+    assert calls["async"]["thread_id"] != calls["worker"]["thread_id"]
+    assert all(call["parent_id"] is None for call in trace.calls)
+
+
+@pytest.mark.parametrize("fails", [False, True], ids=["passing", "failing"])
+def test_phase_plugin_records_both_pytest_invocations_without_changing_outcome(
+    tmp_path, fails
+):
+    profile = _profile_module()
+    modules = {
+        "vllm_mlx/scheduler.py": (
+            "from mlx_lm.generate import BatchGenerator\n"
+            "class Scheduler:\n"
+            " def step(self):\n"
+            "  self._schedule_waiting()\n"
+            "  BatchGenerator().next()\n"
+            "  self._process_batch_responses()\n"
+            "  self._cleanup_finished()\n"
+            " def _schedule_waiting(self): pass\n"
+            " def _process_batch_responses(self): pass\n"
+            " def _cleanup_finished(self): pass\n"
+        ),
+        "vllm_mlx/engine_core.py": (
+            "class EngineCore:\n"
+            " async def add_request(self): return 42\n"
+            " def _cleanup_request(self): pass\n"
+        ),
+        "vllm_mlx/output_collector.py": (
+            "class RequestOutputCollector:\n"
+            " def put(self, value): return value\n"
+            " async def get(self): return 42\n"
+        ),
+        "mlx_lm/generate.py": (
+            "class BatchGenerator:\n"
+            " def next(self):\n"
+            "  PromptProcessingBatch().prompt()\n"
+            "  PromptProcessingBatch().generate()\n"
+            "  GenerationBatch().next()\n"
+            "class PromptProcessingBatch:\n"
+            " def prompt(self): pass\n"
+            " def generate(self): pass\n"
+            "class GenerationBatch:\n"
+            " def next(self): return self._step()\n"
+            " def _step(self): return 42\n"
+        ),
+        "mlx/core.py": "def clear_cache(): pass\n",
+    }
+    for name, source in modules.items():
+        path = tmp_path / name
+        path.parent.mkdir(exist_ok=True)
+        (path.parent / "__init__.py").touch()
+        path.write_text(source)
+    (tmp_path / "pytest.ini").write_text("[pytest]\n")
+    test = tmp_path / "test_continuous_batching.py"
+    test.write_text(
+        "import asyncio\n"
+        "from concurrent.futures import ThreadPoolExecutor\n"
+        "from vllm_mlx.engine_core import EngineCore\n"
+        "from vllm_mlx.scheduler import Scheduler\n"
+        "from vllm_mlx.output_collector import RequestOutputCollector\n"
+        "def test_batching_improves_throughput():\n"
+        " assert asyncio.run(EngineCore().add_request()) == 42\n"
+        " with ThreadPoolExecutor(max_workers=1) as worker:\n"
+        "  worker.submit(Scheduler().step).result(timeout=5)\n"
+        " assert RequestOutputCollector().put(42) == 42\n"
+        " assert asyncio.run(RequestOutputCollector().get()) == 42\n"
+        " EngineCore()._cleanup_request()\n"
+        f" assert {not fails}\n"
+    )
+    output = tmp_path / "timings.json"
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            "-p",
+            "three_issue_throughput_profile",
+            str(test),
+            str(test),
+            "--keep-duplicates",
+            "-q",
+            "-p",
+            "no:cacheprovider",
+        ],
+        cwd=tmp_path,
+        env=dict(
+            os.environ,
+            PYTHONPATH=os.pathsep.join(
+                (str(tmp_path), str(Path(profile.__file__).parent))
+            ),
+            PYTEST_DISABLE_PLUGIN_AUTOLOAD="1",
+            VLLM_MLX_THROUGHPUT_PROFILE=str(output),
+        ),
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == int(fails), result.stdout + result.stderr
+    profiles = json.loads(output.read_text())
+    assert [row["outcome"] for row in profiles] == ["failed" if fails else "passed"] * 2
+    assessment = throughput_diagnostics.summarize_profile(
+        profiles,
+        hashlib.sha256(test.read_bytes()).hexdigest(),
+        {
+            "vllm_mlx.scheduler": hashlib.sha256(
+                (tmp_path / "vllm_mlx/scheduler.py").read_bytes()
+            ).hexdigest()
+        },
+    )
+    assert assessment["profiles_complete"] is True
+    assert assessment["accepted"] is False
+
+
+@pytest.mark.parametrize(
+    "damage",
+    [
+        "empty",
+        "one",
+        "wrong-source",
+        "no-decode",
+        "skipped",
+        "missing-timing",
+        "nan-timing",
+    ],
+)
+def test_profile_assessment_rejects_missing_or_mismatched_evidence(damage):
+    assert hasattr(throughput_diagnostics, "summarize_profile"), "Missing profile audit"
+    profiles = [
+        {
+            "outcome": "passed",
+            "test_sha256": "frozen-test",
+            "sources": {"vllm_mlx.scheduler": {"sha256": "frozen-scheduler"}},
+            "calls": [
+                {
+                    "id": index,
+                    "parent_id": None,
+                    "thread_id": 1,
+                    "name": name,
+                    "start_seconds": 0.0,
+                    "wall_seconds": 0.1,
+                    "thread_cpu_seconds": 0.01,
+                }
+                for index, name in enumerate(
+                    (
+                        "scheduler.step",
+                        "scheduler.admit",
+                        "scheduler.outputs",
+                        "scheduler.cleanup",
+                        "generator.next",
+                        "generator.prefill",
+                        "generator.start_decode",
+                        "generator.decode",
+                        "generator.forward",
+                        "engine.add_request",
+                        "engine.cleanup",
+                        "collector.put",
+                        "collector.get",
+                    )
+                )
+            ],
+            "accepted": False,
+        }
+        for _ in range(2)
+    ]
+    if damage == "empty":
+        profiles = []
+    elif damage == "one":
+        profiles.pop()
+    elif damage == "wrong-source":
+        profiles[0]["sources"]["vllm_mlx.scheduler"]["sha256"] = "different"
+    elif damage == "no-decode":
+        profiles[0]["calls"].pop(7)
+    elif damage == "missing-timing":
+        del profiles[0]["calls"][0]["wall_seconds"]
+    elif damage == "nan-timing":
+        profiles[0]["calls"][0]["wall_seconds"] = float("nan")
+    else:
+        profiles[0]["outcome"] = "skipped"
+    with pytest.raises(ValueError):
+        throughput_diagnostics.summarize_profile(
+            profiles, "frozen-test", {"vllm_mlx.scheduler": "frozen-scheduler"}
+        )
+
 
 _CHECK_NAMES = (
     "sufficient_workload",
