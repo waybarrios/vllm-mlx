@@ -175,3 +175,23 @@ All four prospective source maps incorporate the same four shared test/workflow
 changes. Explicit approval is required before the shared commit, three ordinary
 merge commits and normal pushes. Historical R5 results remain attributed to R5;
 new complete-suite and full memory-matrix acceptance remain pending.
+
+## R7 first-response extraction correction
+
+The approved timing diagnostic run 42058262093 completed with both baseline and
+candidate throughput failures. It localizes variation in prefill, first-response
+processing and final generation; it does not establish a candidate-specific
+regression or a compiler or hardware cause.
+
+R7 adds the reviewed shared correction bddc276. Only nonempty list/tuple stacks
+of exact BatchKVCache objects avoid first-response cache extraction that the
+caller would discard. Other topologies and completion-time storage are intact.
+Source-bound regression tests cover the avoided extraction and conservative
+fallbacks. No native throughput improvement is presumed.
+
+The new common-r7 patch, four R7 complete source maps and four R7 provenance
+files are additive. All original R6 patch, map and provenance bytes remain
+available. Baseline, models/revisions, test selection, assertions, request
+deadlines, outer budgets, memory workload, repetitions and accounting policy
+are unchanged. Run the original complete candidate suites, focused phase and
+full memory matrix before claiming acceptance for these new source identities.

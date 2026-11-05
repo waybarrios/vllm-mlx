@@ -2,15 +2,15 @@
   "base": "3af7d7d61576606153f419816be2f4a1a9baab06",
   "base_archive_sha256": "9d91dd4548108ac390a8dbbb631bde3cdbfb2fdd9a2e77b74aa56001e8389d66",
   "base_files": "manifests/base-all-files.json",
-  "status": "R6 shared test isolation and authoritative replay coverage; complete native acceptance remains pending",
-  "native_execution": "R5 regular PR CI and focused native tests passed; full suites failed assertions; R5 memory job126366976120 remains live and must not be cancelled or reclassified",
+  "status": "R7 avoids discarded plain KV extraction before the first token; complete native acceptance pending",
+  "native_execution": "R6 suites failed unchanged throughput assertions; approved timing run42058262093 also failed; R7 acceptance not yet run",
   "common": {
-    "patch": "layers/common.patch",
-    "patch_sha256": "614c3d5e4fcb0fefa540fe4136ea4188dee036458264c89f32f26eaa135da724",
-    "expected_files": "manifests/common-all-files.json",
+    "patch": "layers/common-r7.patch",
+    "patch_sha256": "2d5ba95e197aeff028a7c67f8ba1f1d0fe3c01a251fd56109f0007e46c4a3ca0",
+    "expected_files": "manifests/common-r7-all-files.json",
     "complete_source_file_count": 456,
-    "source_manifest_sha256": "14ea3acf128685897b8393aaf5b0d76c8d3fd2b2456ec875bc1d6ab227834d6c",
-    "tracked_full_diff_sha256": "614c3d5e4fcb0fefa540fe4136ea4188dee036458264c89f32f26eaa135da724",
+    "source_manifest_sha256": "3a4c09ee8c29e698d9d10ca672e8f6919c4f1b99dc0fc0695221741e921c125a",
+    "tracked_full_diff_sha256": "2d5ba95e197aeff028a7c67f8ba1f1d0fe3c01a251fd56109f0007e46c4a3ca0",
     "untracked": [
       {
         "path": "tests/test_manual_script_imports.py",
@@ -19,15 +19,15 @@
         "mode": 33204
       }
     ],
-    "source_provenance": "provenance/common-hosted-r6.json"
+    "source_provenance": "provenance/common-hosted-r7.json"
   },
   "issues": {
     "850": {
       "patch": "layers/850.patch",
       "patch_sha256": "a875be85a0dee25f03513cc913f090c899ce0725b88cdf11b3dfae3d70867b6c",
-      "expected_files": "manifests/850-all-files.json",
+      "expected_files": "manifests/850-r7-all-files.json",
       "complete_source_file_count": 457,
-      "source_manifest_sha256": "b360681254a07ee8b5df9c2aeda2c02cdb910d4b0a4678218f30fa5a6455ba76",
+      "source_manifest_sha256": "4c108776d15c68acdc26377b61531a77c10c37aaf0cbe5a425051913251bc78f",
       "tracked_full_diff_sha256": "a875be85a0dee25f03513cc913f090c899ce0725b88cdf11b3dfae3d70867b6c",
       "untracked": [
         {
@@ -43,14 +43,14 @@
           "mode": 33204
         }
       ],
-      "source_provenance": "provenance/850-hosted-r6.json"
+      "source_provenance": "provenance/850-hosted-r7.json"
     },
     "859": {
       "patch": "layers/859.patch",
       "patch_sha256": "a6b5a063495da341c833c1b62c47af5906e3796a1048d7b2700409857c050b54",
-      "expected_files": "manifests/859-all-files.json",
+      "expected_files": "manifests/859-r7-all-files.json",
       "complete_source_file_count": 456,
-      "source_manifest_sha256": "d7617ad7c3a2736c43a628eb46ceb4dfb9b8e7989135ad0e73615c5b2d1fe0ba",
+      "source_manifest_sha256": "a58c834fa194999dfe87cb147f60c77427cf0b55e0146316679e0b4cc6876da5",
       "tracked_full_diff_sha256": "a6b5a063495da341c833c1b62c47af5906e3796a1048d7b2700409857c050b54",
       "untracked": [
         {
@@ -60,14 +60,14 @@
           "mode": 33204
         }
       ],
-      "source_provenance": "provenance/859-hosted-r6.json"
+      "source_provenance": "provenance/859-hosted-r7.json"
     },
     "793": {
       "patch": "layers/793.patch",
       "patch_sha256": "8e1acff5027e0c82cbac195cc4b4e7a6d717317ec8e9bd6ef3607f08b56ea075",
-      "expected_files": "manifests/793-all-files.json",
+      "expected_files": "manifests/793-r7-all-files.json",
       "complete_source_file_count": 457,
-      "source_manifest_sha256": "cae3f00866870a1289af0379a69a302a65f0df86db0034a60d4295bd76d5d4ae",
+      "source_manifest_sha256": "60d22c8b5a77c2862b08da346e8f24163d7152f906f3335bdb87899cdbcc2e77",
       "tracked_full_diff_sha256": "8e1acff5027e0c82cbac195cc4b4e7a6d717317ec8e9bd6ef3607f08b56ea075",
       "untracked": [
         {
@@ -83,7 +83,7 @@
           "mode": 33204
         }
       ],
-      "source_provenance": "provenance/793-hosted-r6.json"
+      "source_provenance": "provenance/793-hosted-r7.json"
     }
   },
   "benchmark_sha256": "c9a49503020bb4e0cdb2de2330aacb4cf138a077e013860916d07ae5e0b034a1",
