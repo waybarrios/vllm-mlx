@@ -23,10 +23,10 @@ jobs:
           pip install ruff black
 
       - name: Run ruff
-        run: ruff check vllm_mlx/ tests/ scripts/client_acceptance/ --select E,F,W --ignore E402,E501,E731,F811,F841
+        run: ruff check vllm_mlx/ tests/ scripts/client_acceptance/ scripts/performance_ci/ --select E,F,W --ignore E402,E501,E731,F811,F841
 
       - name: Run black
-        run: black --check vllm_mlx/ tests/ scripts/client_acceptance/
+        run: black --check vllm_mlx/ tests/ scripts/client_acceptance/ scripts/performance_ci/
 
   type-check:
     runs-on: ubuntu-latest
@@ -100,6 +100,7 @@ jobs:
             tests/test_mllm_stream_usage.py \
             tests/test_constrained_cache.py \
             tests/test_dependency_floors.py \
+            tests/test_performance_ci.py \
             tests/test_ssd_cache_shutdown.py \
             tests/test_chat_template_safety.py \
             tests/test_simple_engine_thread_pinning.py \
@@ -194,7 +195,7 @@ jobs:
           pytest tests/test_engine_base.py -v --tb=short
 
   test-apple-silicon:
-    runs-on: macos-14
+    runs-on: macos-15
     strategy:
       matrix:
         python-version: ["3.11", "3.13"]
@@ -220,6 +221,15 @@ jobs:
       - name: Run strict JSON schema admission regressions
         run: |
           pytest tests/test_invalid_json_schema_admission.py -v --tb=short
+
+      - name: Run native performance worker smoke
+        run: |
+          # Keep the replay target after the smoke in the same process to
+          # catch generation-stream state leaking from a retired worker.
+          pytest \
+            tests/test_performance_ci_native.py \
+            tests/test_scheduler_exact_cache_replay.py::test_real_batch_processors_see_the_same_history_after_replay \
+            -v --tb=short
 
       - name: Run MLX-dependent tests
         run: |
