@@ -1500,15 +1500,21 @@ class Scheduler:
                     stop_tokens.add(tok.eos_token_ids)
         return stop_tokens
 
+    @staticmethod
+    def _make_request_sampler(sampling_params: SamplingParams):
+        """Build the complete sampling policy for one request."""
+        return make_sampler(
+            temp=sampling_params.temperature,
+            top_p=sampling_params.top_p,
+            min_p=sampling_params.min_p,
+            top_k=sampling_params.top_k,
+        )
+
     def _create_batch_generator(
         self, sampling_params: SamplingParams
     ) -> BatchGenerator:
         """Create a BatchGenerator with the given sampling parameters."""
-        sampler = make_sampler(
-            temp=sampling_params.temperature,
-            top_p=sampling_params.top_p,
-            min_p=sampling_params.min_p,
-        )
+        sampler = self._make_request_sampler(sampling_params)
 
         stop_tokens = self._get_stop_tokens()
         # Add custom stop token IDs
@@ -1747,6 +1753,7 @@ class Scheduler:
             sampling_params.temperature,
             sampling_params.top_p,
             sampling_params.min_p,
+            sampling_params.top_k,
         )
 
         # Create new generator if needed or if sampling params changed
@@ -1754,17 +1761,14 @@ class Scheduler:
             self.batch_generator is None
             or self._current_sampler_params != sampler_params
         ):
-            # If we have an existing generator with requests, we need to drain it first
+            # Keep an active generator until its requests finish. Each new
+            # request supplies its own sampler at insertion.
             if self.batch_generator is not None and self.running:
-                logger.warning(
-                    "Sampling parameters changed with active requests. "
-                    "New requests will use new parameters after current batch completes."
-                )
                 return
 
             # Keep prefix cache across BatchGenerator recreations.
             # KV cache entries depend only on the input tokens, not on
-            # sampling params (temperature, top_p, min_p).  Since the
+            # sampling params (temperature, top_p, min_p, top_k). Since the
             # server runs a single model, the cache is always valid.
             if self.batch_generator is not None:
                 n_entries = 0
@@ -2473,10 +2477,10 @@ class Scheduler:
                     make_prompt_cache(self.model), bounded_kv_size
                 )
 
-            # Build per-request logits_processors from repetition_penalty and
-            # any caller-supplied extras (e.g. JSON schema constrained
-            # decoding).
+            # Apply repetition and presence penalties before caller-supplied
+            # processors (e.g. JSON schema constrained decoding).
             rep_penalty = request.sampling_params.repetition_penalty
+            presence_penalty = request.sampling_params.presence_penalty
             extra_lp = request.sampling_params.logits_processors or []
             combined_lp: list = []
             if rep_penalty and rep_penalty != 1.0:
@@ -2486,6 +2490,10 @@ class Scheduler:
                 logger.info(
                     f"[rep_penalty] request={request.request_id[:12]} "
                     f"penalty={rep_penalty}"
+                )
+            if presence_penalty != 0.0:
+                combined_lp.extend(
+                    make_logits_processors(presence_penalty=presence_penalty)
                 )
             if extra_lp:
                 combined_lp.extend(extra_lp)
@@ -2511,6 +2519,7 @@ class Scheduler:
                 "max_tokens": [request.sampling_params.max_tokens],
                 "caches": [cache_to_use] if cache_to_use else None,
                 "all_tokens": [cached_history],
+                "samplers": [self._make_request_sampler(request.sampling_params)],
                 # Keep queued per-sequence state explicit. mlx-lm 0.31.3 can
                 # still turn this empty list into None while extending a
                 # prompt batch; batch_compat normalizes that transition.
