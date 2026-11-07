@@ -143,10 +143,19 @@ def run_child(command, log_path, timeout, env):
         )
         try:
             code = process.wait(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            os.killpg(process.pid, signal.SIGKILL)
+        except BaseException as error:
+            # The worker has its own session, so terminal interrupts do not
+            # reach it. Retire its group before propagating an interrupted wait.
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
             process.wait()
-            raise TimeoutError(f"Worker exceeded {timeout}s; see {log_path}") from None
+            if isinstance(error, subprocess.TimeoutExpired):
+                raise TimeoutError(
+                    f"Worker exceeded {timeout}s; see {log_path}"
+                ) from None
+            raise
         if code:
             raise RuntimeError(f"Worker exited {code}; see {log_path}")
 

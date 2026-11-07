@@ -223,7 +223,13 @@ jobs:
           pytest tests/test_invalid_json_schema_admission.py -v --tb=short
 
       - name: Run native performance worker smoke
-        run: pytest tests/test_performance_ci_native.py -v --tb=short
+        run: |
+          # Keep the replay target after the smoke in the same process to
+          # catch generation-stream state leaking from a retired worker.
+          pytest \
+            tests/test_performance_ci_native.py \
+            tests/test_scheduler_exact_cache_replay.py::test_real_batch_processors_see_the_same_history_after_replay \
+            -v --tb=short
 
       - name: Run MLX-dependent tests
         run: |

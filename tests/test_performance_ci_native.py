@@ -10,6 +10,20 @@ mx = pytest.importorskip("mlx.core")
 from scripts.performance_ci.worker import eos_processor, make_prompts, measure
 
 
+@pytest.fixture
+def _preserve_generation_streams():
+    from vllm_mlx.mlx_streams import (
+        restore_generation_streams,
+        snapshot_generation_streams,
+    )
+
+    snapshot = snapshot_generation_streams()
+    try:
+        yield
+    finally:
+        restore_generation_streams(snapshot)
+
+
 class TinyTokenizer:
     eos_token_id = 31
     eos_token_ids = {31}
@@ -40,6 +54,7 @@ def test_eos_mask_preserves_other_logits_and_supports_batched_shape():
 
 
 @pytest.mark.parametrize("prefix_cache,concurrency", [(False, 2), (True, 1)])
+@pytest.mark.usefixtures("_preserve_generation_streams")
 def test_worker_runs_fixed_length_first_and_warm_batches(prefix_cache, concurrency):
     from mlx_lm.models.qwen2 import Model, ModelArgs
 
