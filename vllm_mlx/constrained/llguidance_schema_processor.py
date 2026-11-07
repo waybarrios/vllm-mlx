@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, cast
 
 import mlx.core as mx
 import numpy as np
@@ -26,12 +26,15 @@ def is_available() -> bool:
 
 
 def _token_list(tokens: mx.array) -> list[int]:
-    values = tokens.tolist() if hasattr(tokens, "tolist") else list(tokens)
+    values = cast(
+        int | list[int] | list[list[int]],
+        tokens.tolist() if hasattr(tokens, "tolist") else list(tokens),
+    )
     if isinstance(values, int):
         return [values]
     if values and isinstance(values[0], list):
         values = values[0]
-    return [int(token) for token in values]
+    return [int(token) for token in cast(list[int], values)]
 
 
 def _ll_tokenizer(tokenizer: Any):
@@ -205,7 +208,7 @@ class LLGuidanceJSONSchemaLogitsProcessor:
             if _trailing_json_whitespace(decoded) >= _MAX_NONPROGRESS_WHITESPACE_CHARS:
                 for token_id in self._whitespace_tokens:
                     _clear_mask_token(mask, token_id)
-            masked = llguidance.mlx.apply_token_bitmask(logits, mask)
+            masked: mx.array = llguidance.mlx.apply_token_bitmask(logits, mask)
         except Exception as exc:
             raise ConstrainedDecodingError(
                 f"failed to construct strict JSON Schema token mask: {exc}"

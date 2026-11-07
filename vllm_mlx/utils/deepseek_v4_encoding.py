@@ -667,6 +667,7 @@ def resolve_thinking(
             f"Invalid reasoning effort profile: {reasoning_effort_profile}"
         )
 
+    effort: str | None
     if reasoning_effort is None:
         effort = "high"
     else:
@@ -702,8 +703,12 @@ def _profile_from_encoder_source(path: Path) -> str | None:
     }
 
     try:
-        default = ast.literal_eval(assignments["DEFAULT_REASONING_EFFORT"])
-        prompts = ast.literal_eval(assignments["REASONING_EFFORT_PROMPTS"])
+        default_node = assignments["DEFAULT_REASONING_EFFORT"]
+        prompts_node = assignments["REASONING_EFFORT_PROMPTS"]
+        if default_node is None or prompts_node is None:
+            raise TypeError("Reasoning effort constants have no literal values")
+        default = ast.literal_eval(default_node)
+        prompts = ast.literal_eval(prompts_node)
     except (KeyError, ValueError, TypeError):
         default = None
         prompts = None

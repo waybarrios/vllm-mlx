@@ -806,7 +806,26 @@ class TestRequestMetrics:
         # Single token → no inter-token interval → TPOT = 0.0
         assert metrics["tpot_ms"] == pytest.approx(0.0)
 
-    def test_stream_chat_completion_timeout_cancels_request(self):
+    @pytest.mark.parametrize("legacy_timeout", [False, True])
+    def test_stream_chat_completion_timeout_cancels_request(
+        self, monkeypatch, legacy_timeout
+    ):
+        if legacy_timeout:
+            from types import SimpleNamespace
+
+            from vllm_mlx import bench_serve
+
+            monkeypatch.setattr(
+                bench_serve, "sys", SimpleNamespace(version_info=(3, 10))
+            )
+            monkeypatch.setattr(
+                bench_serve,
+                "asyncio",
+                SimpleNamespace(
+                    wait_for=asyncio.wait_for, TimeoutError=asyncio.TimeoutError
+                ),
+            )
+
         class SlowResponse:
             async def __aenter__(self):
                 return self
@@ -852,6 +871,75 @@ class TestRequestMetrics:
         assert client.cancel_urls == [
             "http://server/v1/requests/chatcmpl-timeout/cancel"
         ]
+
+    @pytest.mark.parametrize("legacy_timeout", [False, True])
+    def test_stream_chat_completion_parent_cancellation_closes_stream(
+        self, monkeypatch, legacy_timeout
+    ):
+        from types import SimpleNamespace
+
+        from vllm_mlx import bench_serve
+
+        if legacy_timeout:
+            monkeypatch.setattr(
+                bench_serve, "sys", SimpleNamespace(version_info=(3, 10))
+            )
+            monkeypatch.setattr(
+                bench_serve,
+                "asyncio",
+                SimpleNamespace(
+                    wait_for=asyncio.wait_for, TimeoutError=asyncio.TimeoutError
+                ),
+            )
+
+        async def run():
+            started = asyncio.Event()
+            closed = asyncio.Event()
+
+            class Response:
+                async def __aenter__(self):
+                    return self
+
+                async def __aexit__(self, exc_type, exc, tb):
+                    closed.set()
+
+                def raise_for_status(self):
+                    pass
+
+                async def aiter_lines(self):
+                    yield 'data: {"id":"chatcmpl-cancel","choices":[{"delta":{"content":"A"},"finish_reason":null}]}'
+                    started.set()
+                    await asyncio.Event().wait()
+
+            class Client:
+                def stream(self, *args, **kwargs):
+                    return Response()
+
+                async def post(self, *args, **kwargs):
+                    pytest.fail("parent cancellation must not become a timeout")
+
+            task = asyncio.create_task(
+                stream_chat_completion(
+                    client=Client(),
+                    base_url="http://server",
+                    messages=[{"role": "user", "content": "slow"}],
+                    model="test-model",
+                    timeout_s=0.01,
+                )
+            )
+            started_waiter = asyncio.create_task(started.wait())
+            done, _ = await asyncio.wait(
+                {task, started_waiter}, return_when=asyncio.FIRST_COMPLETED
+            )
+            if task in done:
+                started_waiter.cancel()
+                await task
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            assert closed.is_set()
+
+        asyncio.run(run())
 
 
 # ---------------------------------------------------------------------------

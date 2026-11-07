@@ -16,16 +16,11 @@ import sys
 import time
 from typing import List
 
-# Skip if not on Apple Silicon
-if sys.platform != "darwin" or platform.machine() != "arm64":
-    print("This test requires Apple Silicon")
-    sys.exit(0)
-
-import mlx.core as mx
-
 
 def get_memory_usage_mb() -> float:
     """Get current MLX memory usage in MB."""
+    import mlx.core as mx
+
     mx.eval(mx.zeros(1))  # Sync
     # MLX doesn't have direct memory query, estimate from cache
     return 0  # Placeholder - we'll measure block counts instead
@@ -555,6 +550,10 @@ Always explain your reasoning thoroughly and provide learning resources when hel
 
 
 def main():
+    if sys.platform != "darwin" or platform.machine() != "arm64":
+        print("This test requires Apple Silicon")
+        sys.exit(0)
+
     import asyncio
 
     parser = argparse.ArgumentParser(description="Test Paged KV Cache with real model")

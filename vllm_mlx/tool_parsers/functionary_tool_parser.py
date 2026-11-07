@@ -65,6 +65,7 @@ class FunctionaryToolParser(ToolParser):
         Extract tool calls from Functionary model output.
         """
         tool_calls = []
+        cleaned_text: str | None
         cleaned_text = model_output
 
         # Try recipient pattern (Functionary v3)

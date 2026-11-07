@@ -9,13 +9,15 @@ modeling stack at inference time — only the tokenizer is needed
 from transformers.
 """
 
+from typing import cast
+
 import mlx.core as mx
 import mlx.nn as nn
 
 
 def classifier_forward(
     input_ids: mx.array,
-    attention_mask: mx.array,
+    attention_mask: mx.array | None,
     weights: dict[str, mx.array],
     config: dict,
 ) -> mx.array:
@@ -75,7 +77,8 @@ def classifier_forward(
     pooler_w = weights.get(f"{prefix}.pooler.dense.weight")
     pooler_b = weights.get(f"{prefix}.pooler.dense.bias")
     if pooler_w is not None:
-        pooled = mx.tanh(cls_hidden @ pooler_w.T + pooler_b)
+        # BERT pooler weights include the matching dense bias tensor.
+        pooled = mx.tanh(cls_hidden @ pooler_w.T + cast("mx.array", pooler_b))
     else:
         pooled = cls_hidden
 

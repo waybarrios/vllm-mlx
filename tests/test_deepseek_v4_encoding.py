@@ -204,6 +204,26 @@ class TestResolveThinking:
             == "official"
         )
 
+    @pytest.mark.parametrize(
+        "source",
+        [
+            "REASONING_EFFORT_MAX: str\n",
+            "DEFAULT_REASONING_EFFORT: str\n"
+            "REASONING_EFFORT_PROMPTS: dict\n"
+            "REASONING_EFFORT_MAX = 'max'\n",
+        ],
+    )
+    def test_detects_preview_profile_with_annotation_only_constants(
+        self, tmp_path, source
+    ):
+        from vllm_mlx.utils.deepseek_v4_encoding import _profile_from_encoder_source
+
+        encoding = tmp_path / "encoding"
+        encoding.mkdir()
+        (encoding / "encoding_dsv4.py").write_text(source)
+
+        assert _profile_from_encoder_source(tmp_path) == "preview"
+
 
 class TestTools:
     def test_schema_lands_in_system_message(self):

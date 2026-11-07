@@ -67,22 +67,19 @@ def _scoped_mlx_stubs():
         for name, module in sys.modules.items()
         if any(name == prefix or name.startswith(f"{prefix}.") for prefix in prefixes)
     }
-    child_links = (
-        ("mlx", "core"),
-        ("vllm_mlx", "engine"),
-        ("vllm_mlx.engine", "batched"),
-    )
     saved_child_attrs = {
-        (parent_name, child_name): getattr(
-            saved_modules.get(parent_name), child_name, missing
-        )
-        for parent_name, child_name in child_links
+        name: vars(module).copy() for name, module in saved_modules.items()
     }
     installed = _install_mlx_stubs()
     yield
     if not installed:
         return
 
+    affected_modules = set(saved_modules) | {
+        name
+        for name in sys.modules
+        if any(name == prefix or name.startswith(f"{prefix}.") for prefix in prefixes)
+    }
     for name in list(sys.modules):
         if (
             any(name == prefix or name.startswith(f"{prefix}.") for prefix in prefixes)
@@ -91,14 +88,38 @@ def _scoped_mlx_stubs():
             sys.modules.pop(name, None)
     sys.modules.update(saved_modules)
 
-    for (parent_name, child_name), saved_attr in saved_child_attrs.items():
+    for name in affected_modules:
+        parent_name, _, child_name = name.rpartition(".")
         parent = saved_modules.get(parent_name)
         if parent is None:
             continue
+        saved_attr = saved_child_attrs[parent_name].get(child_name, missing)
         if saved_attr is missing:
             parent.__dict__.pop(child_name, None)
         else:
             setattr(parent, child_name, saved_attr)
+
+
+def test_scoped_mlx_stubs_restore_imported_parent_links(monkeypatch):
+    import importlib
+
+    parent = importlib.import_module("vllm_mlx.engine")
+    for child_name in ("batched", "chat_template_safety"):
+        monkeypatch.delitem(sys.modules, f"vllm_mlx.engine.{child_name}", raising=False)
+        monkeypatch.delattr(parent, child_name, raising=False)
+    monkeypatch.setattr(sys.modules[__name__], "_install_mlx_stubs", lambda: True)
+
+    scope = _scoped_mlx_stubs.__wrapped__()
+    next(scope)
+    try:
+        importlib.import_module("vllm_mlx.engine.batched")
+        assert "chat_template_safety" in vars(parent)
+    finally:
+        with pytest.raises(StopIteration):
+            next(scope)
+
+    assert "vllm_mlx.engine.chat_template_safety" not in sys.modules
+    assert "chat_template_safety" not in vars(parent)
 
 
 def test_start_mllm_forwards_prefix_cache_disable_to_mllm_scheduler(monkeypatch):

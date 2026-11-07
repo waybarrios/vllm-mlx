@@ -199,7 +199,9 @@ class ToolExecutor:
         """Execute tool calls in parallel with concurrency limit."""
         semaphore = asyncio.Semaphore(self.max_parallel)
 
-        async def execute_with_semaphore(tool_call: Dict[str, Any]):
+        async def execute_with_semaphore(
+            tool_call: Dict[str, Any],
+        ) -> Tuple[MCPToolResult, str]:
             async with semaphore:
                 func = tool_call.get("function", {})
                 name = func.get("name", "")
@@ -299,6 +301,8 @@ class ToolExecutor:
                         call_id,
                     )
                 )
+            elif isinstance(result, BaseException):
+                raise result
             else:
                 processed.append(result)
 

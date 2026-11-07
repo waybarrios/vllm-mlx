@@ -53,8 +53,9 @@ import threading
 import time
 import uuid
 from collections import OrderedDict, defaultdict
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from contextlib import suppress
+from typing import TYPE_CHECKING, Any, NoReturn, TypedDict, TypeVar, overload
 
 import uvicorn
 from fastapi import Depends, FastAPI, HTTPException, Request, UploadFile
@@ -62,6 +63,7 @@ from fastapi.responses import Response, StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel
 from starlette.routing import Match
+from typing_extensions import Unpack
 
 # Import from new modular API
 # Re-export for backwards compatibility with tests
@@ -104,6 +106,7 @@ from .api.models import (
     RerankResponse,
     RerankResult,
     RerankUsage,
+    ResponseFormat,
     ToolCall,
     Usage,  # noqa: F401
     VideoUrl,  # noqa: F401
@@ -180,7 +183,11 @@ from .model_registry import (
 from .metrics import metrics as _metrics
 from .models.mllm import UnsafeRemoteURLError, _validate_url_safety, is_url
 from .reasoning import DeltaMessage, get_parser as get_reasoning_parser
+from .reasoning.base import ReasoningParser
 from .tool_parsers import ToolParserManager, get_parser_stop_tokens
+
+if TYPE_CHECKING:
+    from .tool_parsers.abstract_tool_parser import ToolParserTokenizer
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -313,20 +320,47 @@ def _resolve_chat_template_kwargs(
     return resolved
 
 
+class ChatGenerationKwargs(TypedDict, total=False):
+    max_tokens: int
+    temperature: float
+    top_p: float
+    top_k: int
+    min_p: float
+    presence_penalty: float
+    repetition_penalty: float
+    tools: list[dict] | None
+    stop: list[str] | None
+    images: list[str] | None
+    videos: list[str] | None
+    video_fps: float
+    video_max_frames: int
+    specprefill: bool
+    specprefill_keep_pct: float
+    specprefill_backbone_pct: float
+    mllm_draft: bool
+    chat_template_kwargs: dict[str, object]
+    enable_thinking: bool
+    logits_processors: list[Callable[[Any, Any], Any]]
+
+
+class CompletionGenerationKwargs(ChatGenerationKwargs):
+    prompt: str
+
+
 @dataclass
 class PreparedChatInvocation:
     """Fully prepared inputs for a single engine.chat/stream_chat call."""
 
     messages: list[dict]
-    chat_kwargs: dict[str, object]
-    response_format: object | None
+    chat_kwargs: ChatGenerationKwargs
+    response_format: ResponseFormat | dict[str, Any] | None
     json_logits_processor: object | None
     thinking_processor: object | None = None
 
 
 def _prepare_chat_messages(
     engine: BaseEngine,
-    request_messages: list[Message | dict],
+    request_messages: Sequence[Message | dict],
 ) -> tuple[list[dict], list, list, list, bool]:
     """Normalize messages and collect media once for both stream/non-stream paths."""
     _validate_remote_media_urls(request_messages)
@@ -355,7 +389,9 @@ def _prepare_chat_messages(
                 raw = dict(msg)
                 msg_dict = {k: v for k, v in raw.items() if v is not None}
             messages.append(msg_dict)
-        images, videos, audios = [], [], []  # MLLM extracts these from messages
+        images: list[str] = []
+        videos: list[str] = []
+        audios: list[str] = []  # MLLM extracts these from messages
         logger.debug(f"MLLM: Processing {len(messages)} messages")
         # Convert tool_call arguments from JSON string to dict so that
         # chat templates can iterate them (e.g. GLM-4.6V calls .items()).
@@ -411,7 +447,7 @@ def _prepare_chat_messages(
     return messages, images, videos, audios, has_media
 
 
-def _iter_remote_media_urls(messages: list[Message | dict]):
+def _iter_remote_media_urls(messages: Sequence[Message | dict]):
     """Yield remote media URLs from OpenAI-style multimodal message content."""
     for msg in messages:
         content = msg.get("content") if isinstance(msg, dict) else msg.content
@@ -442,13 +478,13 @@ def _iter_remote_media_urls(messages: list[Message | dict]):
                 yield media_value
 
 
-def _validate_remote_media_urls(messages: list[Message | dict]) -> None:
+def _validate_remote_media_urls(messages: Sequence[Message | dict]) -> None:
     """Validate remote media URLs during request preparation."""
     for url in _iter_remote_media_urls(messages):
         _validate_url_safety(url)
 
 
-def _raise_remote_media_http_error(exc: UnsafeRemoteURLError) -> None:
+def _raise_remote_media_http_error(exc: UnsafeRemoteURLError) -> NoReturn:
     """Log internal URL-safety detail while returning a generic client error."""
     logger.warning(
         "Blocked unsafe remote media URL: %s",
@@ -535,13 +571,13 @@ async def _preflight_response_format_backend(raw_request: Request | None) -> Non
 def _prepare_json_logits_processor(
     engine: BaseEngine,
     messages: list[dict],
-    response_format: object | None,
+    response_format: ResponseFormat | dict[str, Any] | None,
     *,
     tools: list | None,
     tool_choice: object | None,
     log_context: str | None = None,
     thinking_model: bool = False,
-) -> tuple[list[dict], object | None]:
+) -> tuple[list[dict], Callable[[Any, Any], Any] | None]:
     """Inject response_format instruction and build constrained decoding processor."""
     _raise_if_outlines_response_format_requested(response_format)
     json_logits_processor = None
@@ -598,9 +634,9 @@ def _build_thinking_processor(
     engine: BaseEngine,
     thinking_token_budget: int,
     *,
-    inner: object | None = None,
+    inner: Callable[[Any, Any], Any] | None = None,
     prompt_has_think_tag: bool = True,
-) -> object | None:
+) -> Callable[[Any, Any], Any] | None:
     """Build a ThinkingAwareLogitsProcessor if the tokenizer has think tokens."""
     from .constrained.thinking_processor import ThinkingAwareLogitsProcessor
 
@@ -610,8 +646,9 @@ def _build_thinking_processor(
 
     # Resolve <think> and </think> token IDs from the tokenizer.
     try:
-        start_ids = tokenizer.encode("<think>", add_special_tokens=False)
-        end_ids = tokenizer.encode("</think>", add_special_tokens=False)
+        encode = getattr(tokenizer, "encode")
+        start_ids = encode("<think>", add_special_tokens=False)
+        end_ids = encode("</think>", add_special_tokens=False)
     except Exception:
         logger.debug("Tokenizer cannot encode think tags; skipping thinking processor")
         return None
@@ -825,8 +862,9 @@ class _ThinkingAwareLogitsProcessor:
 
 
 def _attach_response_format_logits_processor(
-    chat_kwargs: dict, json_logits_processor: object
-) -> object:
+    chat_kwargs: ChatGenerationKwargs,
+    json_logits_processor: Callable[[Any, Any], Any],
+) -> Callable[[Any, Any], Any]:
     """Attach response_format constraints and keep thinking disabled.
 
     response_format content must be constrained from the first generated token.
@@ -858,7 +896,7 @@ def _coerce_logit_bias(logit_bias: dict[str, float]) -> dict[int, float]:
 
 
 def _attach_logit_bias_processor(
-    chat_kwargs: dict, logit_bias: dict[str, float] | None
+    chat_kwargs: ChatGenerationKwargs, logit_bias: dict[str, float] | None
 ):
     if not logit_bias:
         return
@@ -890,7 +928,7 @@ def _prepare_chat_completion_invocation(
         thinking_model=bool(_reasoning_parser),
     )
 
-    chat_kwargs = {
+    chat_kwargs: ChatGenerationKwargs = {
         "max_tokens": effective_max_tokens,
         "temperature": _resolve_temperature(request.temperature),
         "top_p": _resolve_top_p(request.top_p),
@@ -1001,7 +1039,7 @@ def _prepare_anthropic_invocation(
         thinking_model=bool(_reasoning_parser),
     )
 
-    chat_kwargs = {
+    chat_kwargs: ChatGenerationKwargs = {
         "max_tokens": effective_max_tokens,
         "temperature": _resolve_temperature(openai_request.temperature),
         "top_p": _resolve_top_p(openai_request.top_p),
@@ -1055,11 +1093,13 @@ _api_key: str | None = None
 _auth_warning_logged: bool = False
 
 # Reasoning parser (for models like Qwen3, DeepSeek-R1)
-_reasoning_parser = None  # ReasoningParser instance when enabled
+_reasoning_parser: ReasoningParser | None = None
 _reasoning_parser_name: str | None = None
 
 
-def _thinking_disabled(request, chat_kwargs: dict | None = None) -> bool:
+def _thinking_disabled(
+    request, chat_kwargs: ChatGenerationKwargs | None = None
+) -> bool:
     """Return True iff thinking is explicitly disabled for this request.
 
     Checks both the request-level ``enable_thinking`` field and the resolved
@@ -1115,6 +1155,14 @@ _STREAMING_BARE_JSON_PARTIAL = re.compile(
 _STREAMING_TOOL_MARKUP_SCAN_CHARS = 512
 
 
+@overload
+def _strip_backslash_before_unicode(obj: str) -> str: ...
+
+
+@overload
+def _strip_backslash_before_unicode(obj: object) -> object: ...
+
+
 def _strip_backslash_before_unicode(obj: object) -> object:
     """Remove spurious backslashes before non-ASCII chars in JSON string values.
 
@@ -1157,7 +1205,9 @@ def _sanitize_log_text(value: object, limit: int | None = None) -> str:
     return sanitized
 
 
-def _log_and_raise_internal_error(log_prefix: str, exc: Exception, detail: str) -> None:
+def _log_and_raise_internal_error(
+    log_prefix: str, exc: Exception, detail: str
+) -> NoReturn:
     """Log a sanitized exception string and raise a generic 500 response."""
     logger.error("%s: %s", log_prefix, _sanitize_log_text(exc, limit=500))
     raise HTTPException(status_code=500, detail=detail)
@@ -1309,7 +1359,9 @@ def _build_tool_parser(engine: BaseEngine | None):
         return parser_cls()
 
 
-def _build_reasoning_parser(engine: BaseEngine | None = None):
+def _build_reasoning_parser(
+    engine: BaseEngine | None = None,
+) -> ReasoningParser | None:
     """Create a fresh reasoning parser instance for a single request/stream."""
     tokenizer = getattr(engine, "tokenizer", None) if engine is not None else None
     if _reasoning_parser_name is not None:
@@ -1379,7 +1431,9 @@ def _tool_signature(tools: list | None) -> tuple[str, ...] | None:
     return tuple(sorted(names))
 
 
-def _detect_implicit_thinking(engine: BaseEngine, chat_kwargs: dict | None) -> bool:
+def _detect_implicit_thinking(
+    engine: BaseEngine, chat_kwargs: ChatGenerationKwargs | None
+) -> bool:
     """Return True iff the chat template injects an open ``<think>``.
 
     GLM-5.2/5.3 templates end the rendered prompt with ``<think>``, so
@@ -1460,7 +1514,7 @@ def _detect_implicit_thinking(engine: BaseEngine, chat_kwargs: dict | None) -> b
 def _prepare_streaming_reasoning_parser(
     engine: BaseEngine,
     request: ChatCompletionRequest | ResponsesRequest | None,
-    chat_kwargs: dict[str, object],
+    chat_kwargs: ChatGenerationKwargs,
     *,
     allowed: bool = True,
     allow_disabled_thinking: bool = False,
@@ -1479,8 +1533,8 @@ def _prepare_streaming_reasoning_parser(
 def _prepare_openai_stream_reasoning_state(
     engine: BaseEngine,
     request: ChatCompletionRequest,
-    chat_kwargs: dict[str, object],
-) -> tuple[object | None, bool]:
+    chat_kwargs: ChatGenerationKwargs,
+) -> tuple[ReasoningParser | None, bool]:
     """Return request-local reasoning state and the legacy Nemotron marker state."""
     parser = _prepare_streaming_reasoning_parser(
         engine,
@@ -1510,7 +1564,7 @@ def _streaming_json_fence_stripper(
 
 
 def _extract_streaming_reasoning_delta(
-    parser,
+    parser: ReasoningParser,
     previous_text: str,
     current_text: str,
     delta_text: str,
@@ -1526,7 +1580,7 @@ def _extract_streaming_reasoning_delta(
     if finalize_stream is None:
         return delta
 
-    final = finalize_stream()
+    final: DeltaMessage | None = finalize_stream()
     if final is None:
         return delta
     if delta is None:
@@ -1589,7 +1643,7 @@ async def _load_prefix_cache_from_disk(engine: BaseEngine | None = None) -> None
         if owned_load is not None:
             loaded = await owned_load(d)
         else:
-            load_cache = target_engine.load_cache_from_disk
+            load_cache = getattr(target_engine, "load_cache_from_disk")
             if inspect.iscoroutinefunction(load_cache):
                 loaded = await load_cache(d)
             else:
@@ -1618,7 +1672,7 @@ async def _save_prefix_cache_to_disk(engine: BaseEngine | None = None) -> None:
         if owned_save is not None:
             saved = await owned_save(d)
         else:
-            save_cache = target_engine.save_cache_to_disk
+            save_cache = getattr(target_engine, "save_cache_to_disk")
             if inspect.iscoroutinefunction(save_cache):
                 saved = await save_cache(d)
             else:
@@ -2263,6 +2317,7 @@ def _coerce_tool_arguments(
 
 
 def _coerce_tool_argument_value(value: object, declared_type: object) -> object:
+    expected_types: tuple[str, ...]
     if isinstance(declared_type, str):
         expected_types = (declared_type,)
     elif isinstance(declared_type, list):
@@ -2338,7 +2393,7 @@ def _merge_streaming_tool_call_fragments(
                 "function": {"name": "", "arguments": ""},
             },
         )
-        identity = {"index": index}
+        identity: dict[str, object] = {"index": index}
         if fragment.get("id") and not call["id"]:
             call["id"] = fragment["id"]
             identity["id"] = call["id"]
@@ -2392,21 +2447,12 @@ def _validate_model_name(request_model: str) -> None:
         )
 
 
-def _get_engine_tokenizer(engine: BaseEngine | None) -> object | None:
-    """Return tokenizer-like parser state from the active engine."""
-    if engine is None:
-        return None
-    tokenizer = getattr(engine, "tokenizer", None)
-    if tokenizer is not None:
-        return tokenizer
-    return getattr(engine, "_tokenizer", None)
-
-
 def _get_or_init_tool_parser(engine: BaseEngine | None = None):
     """Return the cached tool parser, initializing it from the given engine."""
     global _tool_parser_instance
 
     if _tool_parser_instance is None:
+        assert _tool_call_parser is not None
         parser_cls = ToolParserManager.get_tool_parser(_tool_call_parser)
         tokenizer = _get_engine_tokenizer(engine if engine is not None else _engine)
         _tool_parser_instance = parser_cls(tokenizer)
@@ -2470,6 +2516,7 @@ def _parse_tool_calls_with_parser(
     # Use the configured parser
     try:
         # Reset parser state between requests
+        assert _tool_parser_instance is not None
         _tool_parser_instance.reset()
         result = _tool_parser_instance.extract_tool_calls(output_text, request_dict)
         if result.tools_called:
@@ -2510,7 +2557,7 @@ def _parse_tool_calls_with_parser(
 
 def _apply_response_format_or_raise(
     text: str,
-    response_format: object,
+    response_format: ResponseFormat | dict[str, Any] | None,
     *,
     ensure_ascii: bool = False,
 ) -> str:
@@ -2818,16 +2865,18 @@ def _responses_request_to_chat_request(
         else []
     ) + non_system_messages
 
-    return ChatCompletionRequest(
-        model=request.model,
-        messages=[Message(**msg) for msg in messages],
-        temperature=request.temperature,
-        top_p=request.top_p,
-        max_tokens=request.max_output_tokens,
-        stream=False,
-        tools=tools,
-        tool_choice=request.tool_choice,
-        chat_template_kwargs=request.chat_template_kwargs,
+    return ChatCompletionRequest.model_validate(
+        {
+            "model": request.model,
+            "messages": [Message(**msg) for msg in messages],
+            "temperature": request.temperature,
+            "top_p": request.top_p,
+            "max_tokens": request.max_output_tokens,
+            "stream": False,
+            "tools": tools,
+            "tool_choice": request.tool_choice,
+            "chat_template_kwargs": request.chat_template_kwargs,
+        }
     )
 
 
@@ -2949,7 +2998,7 @@ def _prepare_responses_request(
     request: ResponsesRequest,
     *,
     validate_remote_media: bool = True,
-) -> tuple[BaseEngine, ChatCompletionRequest, list[dict], dict]:
+) -> tuple[BaseEngine, ChatCompletionRequest, list[dict], ChatGenerationKwargs]:
     """Prepare a Responses request for execution on the chat engine."""
     _validate_model_name(request.model)
     engine = get_engine()
@@ -2972,7 +3021,7 @@ def _prepare_responses_request(
     )
     messages = canonicalize_system_messages(messages)
 
-    chat_kwargs = {
+    chat_kwargs: ChatGenerationKwargs = {
         "max_tokens": chat_request.max_tokens or _default_max_tokens,
         "temperature": _resolve_temperature(chat_request.temperature),
         "top_p": _resolve_top_p(chat_request.top_p),
@@ -2994,7 +3043,7 @@ def _prepare_responses_request(
 
 def _prepare_streaming_responses_request(
     request: ResponsesRequest,
-) -> tuple[BaseEngine, ChatCompletionRequest, list[dict], dict]:
+) -> tuple[BaseEngine, ChatCompletionRequest, list[dict], ChatGenerationKwargs]:
     """Prepare a streaming Responses request after eager URL validation."""
     return _prepare_responses_request(request, validate_remote_media=False)
 
@@ -3016,6 +3065,7 @@ async def _run_responses_request(
         return None, []
     _raise_if_generation_error(output)
 
+    cleaned_text: str | None
     cleaned_text, tool_calls = _parse_tool_calls_with_parser(output.text, chat_request)
     reasoning_text = None
     if _reasoning_parser:
@@ -3096,9 +3146,9 @@ async def _stream_responses_request(request: ResponsesRequest) -> AsyncIterator[
     accumulated_reasoning = ""
 
     text_item_id: str | None = None
-    text_output_index: int | None = None
+    text_output_index = 0
     reasoning_item_id: str | None = None
-    reasoning_output_index: int | None = None
+    reasoning_output_index = 0
     next_output_index = 0
 
     def _start_text_item() -> list[str]:
@@ -3268,6 +3318,7 @@ async def _stream_responses_request(request: ResponsesRequest) -> AsyncIterator[
             if delta_msg.reasoning and not thinking_off:
                 for event in _start_reasoning_item():
                     yield event
+                assert reasoning_item_id is not None
                 accumulated_reasoning += delta_msg.reasoning
                 yield _responses_sse_event(
                     "response.reasoning_text.delta",
@@ -3300,6 +3351,7 @@ async def _stream_responses_request(request: ResponsesRequest) -> AsyncIterator[
             if content:
                 for event in _start_text_item():
                     yield event
+                assert text_item_id is not None
                 accumulated_text += content
                 yield _responses_sse_event(
                     "response.output_text.delta",
@@ -3350,6 +3402,7 @@ async def _stream_responses_request(request: ResponsesRequest) -> AsyncIterator[
 
         for event in _start_text_item():
             yield event
+        assert text_item_id is not None
         accumulated_text += content
         yield _responses_sse_event(
             "response.output_text.delta",
@@ -3414,11 +3467,13 @@ async def _stream_responses_request(request: ResponsesRequest) -> AsyncIterator[
         if text_item_id is None:
             for event in _start_text_item():
                 yield event
+        assert text_item_id is not None
+        text_content_part = ResponseTextContentPart(type="output_text", text=final_text)
         text_item = ResponseMessageItem(
             id=text_item_id,
             role="assistant",
             status="completed",
-            content=[ResponseTextContentPart(type="output_text", text=final_text)],
+            content=[text_content_part],
         )
         yield _responses_sse_event(
             "response.output_text.done",
@@ -3438,7 +3493,7 @@ async def _stream_responses_request(request: ResponsesRequest) -> AsyncIterator[
                 item_id=text_item_id,
                 output_index=text_output_index,
                 content_index=0,
-                part=text_item.content[0],
+                part=text_content_part,
             ),
         )
         sequence += 1
@@ -3456,8 +3511,9 @@ async def _stream_responses_request(request: ResponsesRequest) -> AsyncIterator[
     for tool_call in tool_calls or []:
         output_index = next_output_index
         next_output_index += 1
+        function_item_id = _new_response_item_id("fc")
         item = ResponseFunctionCallItem(
-            id=_new_response_item_id("fc"),
+            id=function_item_id,
             call_id=tool_call.id,
             name=tool_call.function.name,
             arguments=tool_call.function.arguments,
@@ -3476,7 +3532,7 @@ async def _stream_responses_request(request: ResponsesRequest) -> AsyncIterator[
             "response.function_call_arguments.delta",
             ResponseFunctionCallArgumentsDeltaEvent(
                 sequence_number=sequence,
-                item_id=item.id,
+                item_id=function_item_id,
                 output_index=output_index,
                 delta=item.arguments,
             ),
@@ -4009,7 +4065,7 @@ def load_model(
     specprefill_threshold: int = 8192,
     specprefill_keep_pct: float = 0.3,
     specprefill_backbone_pct: float = 0.0,
-    specprefill_draft_model: str = None,
+    specprefill_draft_model: str | None = None,
     prefix_trie_cache: bool = False,
     prefix_trie_cache_size: int = 32,
     prefix_trie_cache_memory_mb: int | None = None,
@@ -4631,7 +4687,7 @@ async def delete_request(request_id: str):
 @app.get("/v1/models", dependencies=[Depends(verify_api_key)])
 async def list_models() -> ModelsResponse:
     """List available models."""
-    models = []
+    models: list[ModelInfo] = []
     if _model_manager is not None:
         models.extend(ModelInfo(id=item["id"]) for item in _model_manager.list_models())
     elif _model_name:
@@ -4732,6 +4788,7 @@ async def create_embeddings(request: EmbeddingRequest) -> EmbeddingResponse:
         start_time = time.perf_counter()
 
         # Count tokens for usage reporting
+        assert _embedding_engine is not None
         prompt_tokens = _embedding_engine.count_tokens(texts)
 
         # Generate embeddings (batch)
@@ -5326,7 +5383,7 @@ def _is_client_disconnected(raw_request: Request) -> bool:
             return False
         cycle = _find_uvicorn_cycle(receive)
         # Cache even if None (to avoid repeated searches)
-        raw_request._uvicorn_cycle = cycle
+        setattr(raw_request, "_uvicorn_cycle", cycle)
     if cycle is not None and cycle.disconnected:
         raw_request._is_disconnected = True
         return True
@@ -5505,14 +5562,17 @@ async def _disconnect_guard(
         )
 
 
+_AwaitedResult = TypeVar("_AwaitedResult")
+
+
 async def _wait_with_disconnect(
-    coro,
+    coro: Awaitable[_AwaitedResult],
     raw_request: Request,
     timeout: float,
     poll_interval: float = 0.5,
     timeout_detail_seconds: float | None = None,
-    cleanup_result=None,
-):
+    cleanup_result: Callable[[_AwaitedResult], Awaitable[None]] | None = None,
+) -> _AwaitedResult | None:
     """Run a coroutine with both timeout and client disconnect detection.
 
     For non-streaming requests where _disconnect_guard() can't be used.
@@ -5637,7 +5697,7 @@ async def _acquire_default_engine_for_request(
     """
     if _model_manager is not None and model is not None:
 
-        async def _registry_acquire():
+        async def _registry_acquire() -> BaseEngine:
             ctx = await _acquire_request_model(model)
             if raw_request is not None:
                 _active_request_contexts[id(raw_request)] = ctx
@@ -5785,7 +5845,7 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
         total_completion_tokens = 0
         total_prompt_tokens = 0
         for i, prompt in enumerate(prompts):
-            generate_kwargs = {
+            generate_kwargs: CompletionGenerationKwargs = {
                 "prompt": prompt,
                 "max_tokens": effective_max_tokens,
                 "temperature": _resolve_temperature(request.temperature),
@@ -6054,7 +6114,7 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
                         content=(
                             clean_output_text(cleaned_text) if cleaned_text else None
                         ),
-                        reasoning=reasoning_text,
+                        reasoning_content=reasoning_text,
                         tool_calls=tool_calls,
                     ),
                     finish_reason=finish_reason,
@@ -6136,7 +6196,7 @@ def _normalize_messages(messages: list[dict]) -> list[dict]:
     return merged
 
 
-def _get_engine_tokenizer(engine) -> object | None:
+def _get_engine_tokenizer(engine) -> "ToolParserTokenizer | None":
     """
     Return the tokenizer backing ``engine``, if exposed.
 
@@ -6145,7 +6205,7 @@ def _get_engine_tokenizer(engine) -> object | None:
     optional features like constrained decoding can degrade gracefully.
     """
     for attr in ("_tokenizer", "tokenizer", "_processor", "processor"):
-        tok = getattr(engine, attr, None)
+        tok: ToolParserTokenizer | None = getattr(engine, attr, None)
         if tok is not None:
             return tok
     return None
@@ -6723,7 +6783,7 @@ async def _stream_anthropic_messages(
     prompt_tokens = 0
 
     messages = prepared.messages
-    chat_kwargs = dict(prepared.chat_kwargs)
+    chat_kwargs = prepared.chat_kwargs.copy()
 
     # Emit message_start
     message_start = {
@@ -7050,7 +7110,7 @@ async def stream_completion(
     result = "success"
     prompt_tokens = 0
     completion_tokens = 0
-    generate_kwargs = {
+    generate_kwargs: CompletionGenerationKwargs = {
         "prompt": prompt,
         "max_tokens": max_tokens,
         "temperature": _resolve_temperature(request.temperature),
@@ -7135,7 +7195,7 @@ async def stream_chat_completion(
     metrics_tracker=None,
     *,
     thinking_processor: object | None = None,
-    **kwargs,
+    **kwargs: Unpack[ChatGenerationKwargs],
 ) -> AsyncIterator[str]:
     """Stream chat completion response."""
     response_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
@@ -7350,7 +7410,7 @@ async def stream_chat_completion(
                                     choices=[
                                         ChatCompletionChunkChoice(
                                             delta=ChatCompletionChunkDelta(
-                                                reasoning=reasoning,
+                                                reasoning_content=reasoning,
                                             ),
                                             finish_reason=None,
                                         )
@@ -7403,7 +7463,7 @@ async def stream_chat_completion(
                                             # this text as its own chunk, so
                                             # repeating it here would double it.
                                             content=None,
-                                            reasoning=reasoning,
+                                            reasoning_content=reasoning,
                                         ),
                                         finish_reason=(
                                             "tool_calls" if output.finished else None
@@ -7458,7 +7518,7 @@ async def stream_chat_completion(
                         ChatCompletionChunkChoice(
                             delta=ChatCompletionChunkDelta(
                                 content=content if content else None,
-                                reasoning=reasoning,
+                                reasoning_content=reasoning,
                             ),
                             finish_reason=(
                                 "tool_calls"
