@@ -944,3 +944,7 @@ class AsyncEngineCore:
     def clear_runtime_caches(self) -> Dict[str, Any] | None:
         """Clear scheduler-managed runtime caches."""
         return self.engine.clear_runtime_caches()
+
+    def clear_prefix_cache(self) -> None:
+        """Clear the wrapped engine's prefix cache."""
+        self.engine.clear_prefix_cache()

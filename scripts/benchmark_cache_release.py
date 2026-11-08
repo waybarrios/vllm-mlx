@@ -1,0 +1,625 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+"""Apple-only, fresh-process explicit cache DELETE memory attribution harness.
+
+Run identically on base and candidate, e.g. from an editable project environment:
+  python scripts/benchmark_cache_release.py --route prefix > prefix.jsonl
+  python scripts/benchmark_cache_release.py --route all > all.jsonl
+  python scripts/benchmark_cache_release.py --model /existing/snapshot --route prefix
+  python scripts/benchmark_cache_release.py --synthetic-registry --route prefix
+  python scripts/benchmark_cache_release.py --models-config models.yaml \
+    --resident-model first --resident-model second --pre-delete-barrier none
+
+Default mode is SYNTHETIC KV in a real PrefixCacheManager, not production-model
+validation. --model uses a real BatchedEngine and generation from a LOCAL snapshot
+only, kept loaded through all measurements. Offline mode prevents downloads.
+Repeat each command three times in separate processes for median comparisons.
+No post-DELETE test-side clear/GC/synchronization can rescue the baseline.
+--pre-delete-barrier none waits for zero requests but adds no stream barrier;
+run it separately from the default synchronized allocator-attribution variant.
+Thresholds are attribution gates, not promises about macOS accounting latency.
+The default strict-rss policy requires both OS counters. gpu-footprint uses
+allocator and physical-footprint release for GPU acceptance, while preserving
+RSS observations and a separate strict diagnostic outcome.
+"""
+
+import argparse
+import asyncio
+import ctypes
+import hashlib
+import importlib.metadata
+import json
+import os
+import platform
+from pathlib import Path
+import sys
+import time
+
+MIB = 1024**2
+
+
+def _accounting_checks(checks, memory_accounting):
+    """Separate the declared GPU acceptance checks from RSS diagnostics."""
+    if memory_accounting not in ("strict-rss", "gpu-footprint"):
+        raise ValueError(f"Unknown memory accounting policy: {memory_accounting}")
+    diagnostic_names = (
+        {"rss_drop", "rss_plateau"} if memory_accounting == "gpu-footprint" else set()
+    )
+    return (
+        {name: value for name, value in checks.items() if name not in diagnostic_names},
+        {name: value for name, value in checks.items() if name in diagnostic_names},
+    )
+
+
+class _RusageInfoV0(ctypes.Structure):
+    # RUSAGE_INFO_V0, current (not lifetime-peak) resident/physical bytes.
+    # https://github.com/apple-oss-distributions/xnu/blob/main/bsd/sys/resource.h
+    _fields_ = [("uuid", ctypes.c_uint8 * 16)] + [
+        (name, ctypes.c_uint64)
+        for name in (
+            "user_time",
+            "system_time",
+            "pkg_idle_wkups",
+            "interrupt_wkups",
+            "pageins",
+            "wired_size",
+            "resident_size",
+            "phys_footprint",
+            "proc_start_abstime",
+            "proc_exit_abstime",
+        )
+    ]
+
+
+def _os_memory():
+    libproc = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
+    call = libproc.proc_pid_rusage
+    call.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_void_p]
+    call.restype = ctypes.c_int
+    info = _RusageInfoV0()
+    if call(os.getpid(), 0, ctypes.byref(info)) != 0:
+        raise OSError(ctypes.get_errno(), "proc_pid_rusage failed")
+    return {"rss_bytes": info.resident_size, "footprint_bytes": info.phys_footprint}
+
+
+def _emit(event, **data):
+    print(
+        json.dumps({"event": event, "monotonic_s": time.monotonic(), **data}),
+        flush=True,
+    )
+
+
+def _snapshot(mx, engine, phase, cycle=0):
+    active, cached = mx.get_active_memory(), mx.get_cache_memory()
+    sample = {
+        "phase": phase,
+        "cycle": cycle,
+        "active_bytes": active,
+        "cache_bytes": cached,
+        "active_plus_cache_bytes": active + cached,
+        **_os_memory(),
+    }
+    if engine is not None:
+        sample["engine"] = engine.get_stats()
+        sample["prefix_cache"] = engine.get_cache_stats()
+    _emit("sample", **sample)
+    return sample
+
+
+def _entry_count(stats):
+    """Read the existing cache stats schemas; unknown is not an empty cache."""
+    if not isinstance(stats, dict):
+        return None
+    for key in ("entry_count", "entries", "size"):
+        if isinstance(stats.get(key), int):
+            return stats[key]
+    return _entry_count(stats.get("prefix_cache"))
+
+
+def _model_entry_counts(stats):
+    if isinstance(stats, dict) and "models" in stats:
+        return [_entry_count(item) for item in stats["models"].values()]
+    return [_entry_count(stats)]
+
+
+def _cache_entries_cleared(stats, delete_status):
+    """An unsupported baseline DELETE is a recorded failure, not a crash."""
+    return delete_status == "cleared" and all(
+        count == 0 for count in _model_entry_counts(stats)
+    )
+
+
+class _SyntheticEngine:
+    """Single event-loop owner; NOT a production-engine/worker substitute."""
+
+    def __init__(self, mx):
+        from vllm_mlx.prefix_cache import PrefixCacheManager
+
+        self.model = mx.arange(4 * MIB, dtype=mx.float32)  # 16MiB persistent owner
+        mx.eval(self.model)
+        self.cache = PrefixCacheManager(self.model)
+
+    def fill(self, mx, size):
+        from mlx_lm.models.cache import KVCache
+
+        layer = KVCache()
+        shape = (1, 1, size // 8 // 128, 128)
+        layer.keys = mx.arange(size // 8, dtype=mx.float32).reshape(shape)
+        layer.values = (mx.arange(size // 8, dtype=mx.float32) + 1).reshape(shape)
+        mx.eval(layer.keys, layer.values)
+        layer.offset = shape[-2]
+        self.cache.store_cache([1, 2, 3], [layer])
+        # No layer/array aliases escape; cache is now the sole KV owner.
+
+    async def start(self):
+        pass
+
+    async def stop(self):
+        pass
+
+    def is_healthy(self):
+        return True
+
+    def clear_prefix_cache(self):
+        self.cache.clear()
+
+    async def _clear_prefix_cache_on_owner(self):
+        self.clear_prefix_cache()
+
+    def clear_runtime_caches(self):
+        self.clear_prefix_cache()
+        return {"prefix_cache": True}
+
+    async def _clear_runtime_caches_on_owner(self):
+        return self.clear_runtime_caches()
+
+    def get_stats(self):
+        return {"num_running": 0, "num_waiting": 0, "steps_executed": 0}
+
+    def get_cache_stats(self):
+        return {"prefix_cache": {"entry_count": len(self.cache._lru)}}
+
+
+class _RegistryEngines:
+    """Measurement view only; DELETE must use the real ModelManager."""
+
+    def __init__(self, engines):
+        self.engines = engines
+
+    def get_stats(self):
+        stats = {name: engine.get_stats() for name, engine in self.engines.items()}
+        return {
+            **{
+                key: (
+                    sum(item[key] for item in stats.values())
+                    if all(item.get(key) is not None for item in stats.values())
+                    else None
+                )
+                for key in ("num_running", "num_waiting", "steps_executed")
+            },
+            "models": stats,
+        }
+
+    def get_cache_stats(self):
+        stats = {
+            name: engine.get_cache_stats() for name, engine in self.engines.items()
+        }
+        counts = [_entry_count(item) for item in stats.values()]
+        return {
+            "prefix_cache": {
+                "entry_count": (
+                    sum(counts) if all(count is not None for count in counts) else None
+                )
+            },
+            "models": stats,
+        }
+
+
+def _engines(engine):
+    if isinstance(engine, _RegistryEngines):
+        return list(engine.engines.values())
+    return [engine]
+
+
+def _models(engine):
+    return [
+        item.model if isinstance(item, _SyntheticEngine) else item._model
+        for item in _engines(engine)
+    ]
+
+
+async def _quiesce(mx, engine, *, barrier=True):
+    """Benchmark only: finish cleanup and synchronize actual producing streams."""
+    if isinstance(engine, _RegistryEngines):
+        for item in engine.engines.values():
+            await _quiesce(mx, item, barrier=barrier)
+        return
+    deadline = time.monotonic() + 30
+    while True:
+        stats = engine.get_stats()
+        if not stats.get("num_running", 0) and not stats.get("num_waiting", 0):
+            break
+        if time.monotonic() >= deadline:
+            raise RuntimeError("engine did not become idle")
+        await asyncio.sleep(0.01)
+
+    if not barrier:
+        return
+
+    def synchronize():
+        streams = [mx.default_stream(mx.default_device())]
+        if not isinstance(engine, _SyntheticEngine):
+            scheduler = (
+                engine._mllm_scheduler
+                if engine.is_mllm
+                else engine._engine.engine.scheduler
+            )
+            batch = scheduler.batch_generator
+            if batch is not None and getattr(batch, "_stream", None) is not None:
+                streams.append(batch._stream)
+            # Module generation_stream globals can name another resident's
+            # worker. The actual producing batch retains its owner-local
+            # handle; synchronize that handle and this worker's default only.
+        # Handles may coincide; repeated synchronization is harmless, not a flush.
+        for stream in streams:
+            mx.synchronize(stream)
+
+    if isinstance(engine, _SyntheticEngine) or engine.is_mllm:
+        synchronize()
+    else:
+        await engine._run_on_generation_worker(synchronize)
+
+
+async def _generate(engine, text):
+    output = None
+    async for output in engine.stream_chat(
+        [{"role": "user", "content": text}], max_tokens=16, temperature=0
+    ):
+        pass
+    if output is None or not output.finished:
+        raise RuntimeError("generation did not finish")
+    if output.finish_reason == "error":
+        raise RuntimeError("generation failed")
+    _emit(
+        "generation",
+        prompt_tokens=output.prompt_tokens,
+        completion_tokens=output.completion_tokens,
+        output_sha256=hashlib.sha256(output.text.encode()).hexdigest(),
+    )
+
+
+def _registry_defaults(args):
+    from vllm_mlx.model_registry import RegistryServeDefaults
+    from vllm_mlx.scheduler import SchedulerConfig
+    from vllm_mlx.utils.download import DownloadConfig
+
+    return RegistryServeDefaults(
+        continuous_batching=True,
+        force_mllm=False,
+        enable_mtp=False,
+        prefill_step_size=2048,
+        specprefill_enabled=False,
+        specprefill_threshold=8192,
+        specprefill_keep_pct=0.3,
+        specprefill_backbone_pct=0.0,
+        specprefill_draft_model=None,
+        prefix_trie_cache=False,
+        prefix_trie_cache_size=32,
+        prefix_trie_cache_memory_mb=None,
+        stream_interval=1,
+        gpu_memory_utilization=0.9,
+        scheduler_config=SchedulerConfig(cache_memory_mb=args.cache_limit_mib),
+        max_tokens=32768,
+        download_config=DownloadConfig(),
+    )
+
+
+async def _load_registry(args, mx):
+    from vllm_mlx.model_registry import (
+        ContentionPolicy,
+        ModelManager,
+        RegisteredModel,
+        RegistryManagerConfig,
+        load_registry_config,
+    )
+
+    defaults = _registry_defaults(args)
+    if args.synthetic_registry:
+        registry = {
+            name: RegisteredModel(
+                name=name, source=str(Path.cwd()), estimated_memory_bytes=1
+            )
+            for name in ("synthetic-a", "synthetic-b", "unloaded")
+        }
+        config = RegistryManagerConfig(
+            memory_budget_bytes=1024**3,
+            idle_unload_seconds=0,
+            policy=ContentionPolicy(strategy="fail"),
+        )
+        manager = ModelManager(
+            config, registry, defaults, engine_factory=lambda _: _SyntheticEngine(mx)
+        )
+        names = ["synthetic-a", "synthetic-b"]
+    else:
+        config, registry = load_registry_config(Path(args.models_config), defaults)
+        for entry in registry.values():
+            if not (
+                Path(entry.source).is_dir()
+                and (Path(entry.source) / "config.json").is_file()
+            ):
+                raise ValueError("Registry sources must be existing local snapshots")
+        manager = ModelManager(config, registry, defaults)
+        names = args.resident_model
+        if any(name not in registry for name in names):
+            raise ValueError("Unknown --resident-model")
+        if any(registry[name].continuous_batching is False for name in names):
+            raise ValueError(
+                "Registry benchmark requires continuous-batching residents"
+            )
+    engines = {}
+    try:
+        for name in names:
+            lease = await manager.acquire(name)
+            engines[name] = lease.engine
+            await lease.release()
+        if set(manager._loaded) != set(names):
+            raise RuntimeError(
+                "Registry memory budget cannot keep selected models resident"
+            )
+    except BaseException:
+        await manager.shutdown()
+        raise
+    return manager, _RegistryEngines(engines)
+
+
+async def _run(args):
+    import httpx
+    import mlx.core as mx
+
+    import vllm_mlx.server as server
+
+    if not mx.metal.is_available():
+        raise RuntimeError("BLOCKED: Metal backend unavailable")
+    mx.set_default_device(mx.gpu)
+    versions = {}
+    for name in ("mlx", "mlx-lm", "mlx-vlm", "vllm-mlx", "httpx"):
+        try:
+            versions[name] = importlib.metadata.version(name)
+        except importlib.metadata.PackageNotFoundError:
+            versions[name] = "not installed"
+    _emit(
+        "config",
+        platform=platform.platform(),
+        python=sys.version,
+        versions=versions,
+        device=getattr(mx, "device_info", mx.metal.device_info)(),
+        mode=(
+            "production-registry"
+            if args.models_config
+            else (
+                "synthetic-registry"
+                if args.synthetic_registry
+                else "production-model" if args.model else "synthetic-kv-only"
+            )
+        ),
+        arguments=vars(args),
+        command=sys.argv,
+        stream_policy=args.pre_delete_barrier,
+        memory_accounting=args.memory_accounting,
+        accounting_policy_version=2,
+    )
+    _snapshot(mx, None, "before_load")
+    engine = None
+    manager = None
+    production = bool(args.model or args.models_config)
+    try:
+        if args.models_config or args.synthetic_registry:
+            manager, engine = await _load_registry(args, mx)
+        elif args.model:
+            from vllm_mlx.engine.batched import BatchedEngine
+            from vllm_mlx.scheduler import SchedulerConfig
+
+            engine = BatchedEngine(
+                str(Path(args.model).resolve()),
+                trust_remote_code=False,
+                scheduler_config=SchedulerConfig(cache_memory_mb=args.cache_limit_mib),
+            )
+            await engine.start()
+        else:
+            engine = _SyntheticEngine(mx)
+        server._model_manager = manager
+        server._engine = None if manager is not None else engine
+        server._warm_prompts_path = None
+        server._api_key = None
+        await _quiesce(mx, engine)
+        _snapshot(mx, engine, "after_load")
+        model_ids = [id(model) for model in _models(engine)]
+        # One setup-only drain before any fill. Never repeated between cycles.
+        old_cap = mx.set_cache_limit(args.cache_limit_mib * MIB)
+        _emit("allocator_policy", previous_cap_bytes=old_cap)
+        mx.clear_cache()
+        resident = _snapshot(mx, engine, "resident_baseline")
+        failures = []
+        diagnostic_failures = []
+        transport = httpx.ASGITransport(app=server.app)
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://benchmark"
+        ) as client:
+            route = "/v1/cache/prefix" if args.route == "prefix" else "/v1/cache"
+            for cycle in range(1, args.cycles + 1):
+                for item in _engines(engine):
+                    if production:
+                        for request in range(args.requests):
+                            text = (
+                                f"Cycle {cycle} request {request}. "
+                                + "memory cache test " * args.prompt_repeats
+                            )
+                            await _generate(item, text)
+                    else:
+                        item.fill(mx, args.kv_mib * MIB)
+                await _quiesce(
+                    mx, engine, barrier=args.pre_delete_barrier == "owner-streams"
+                )
+                filled = _snapshot(mx, engine, "filled_idle", cycle)
+                size = (
+                    filled["active_bytes"] - resident["active_bytes"]
+                    if production
+                    else args.kv_mib * MIB * len(_engines(engine))
+                )
+                response = await client.delete(route)
+                response.raise_for_status()
+                delete_payload = response.json()
+                delete_status = delete_payload.get("status")
+                _emit("delete", cycle=cycle, response=delete_payload)
+                start = time.monotonic()
+                # No GPU work, GC, allocator clear or synchronization in this window.
+                samples = [_snapshot(mx, engine, "after_clear_0s", cycle)]
+                for delay in (1, 5, 10, 60):
+                    if delay <= args.settle_seconds:
+                        await asyncio.sleep(max(0, start + delay - time.monotonic()))
+                        samples.append(
+                            _snapshot(mx, engine, f"after_clear_{delay}s", cycle)
+                        )
+                settled = samples[-1]
+                checks = {
+                    "sufficient_workload": size >= 16 * MIB,
+                    "cache_was_populated": all(
+                        count is not None and count > 0
+                        for count in _model_entry_counts(filled["prefix_cache"])
+                    ),
+                    "cache_entries_cleared": _cache_entries_cleared(
+                        settled["prefix_cache"], delete_status
+                    ),
+                    "active_drop": filled["active_bytes"] - settled["active_bytes"]
+                    >= 0.8 * size,
+                    "pool_release": filled["active_plus_cache_bytes"]
+                    - settled["active_plus_cache_bytes"]
+                    >= 0.8 * size,
+                    "unused_pool_empty": samples[0]["cache_bytes"] == 0,
+                    "rss_drop": filled["rss_bytes"] - settled["rss_bytes"]
+                    >= 0.5 * size,
+                    "footprint_drop": filled["footprint_bytes"]
+                    - settled["footprint_bytes"]
+                    >= 0.5 * size,
+                    "rss_plateau": settled["rss_bytes"]
+                    <= resident["rss_bytes"] + 32 * MIB,
+                    "footprint_plateau": settled["footprint_bytes"]
+                    <= resident["footprint_bytes"] + 32 * MIB,
+                    "idle_steps_unchanged": filled["engine"].get("steps_executed")
+                    is not None
+                    and settled["engine"].get("steps_executed")
+                    == filled["engine"].get("steps_executed"),
+                    "model_resident": model_ids
+                    == [id(model) for model in _models(engine)],
+                    "registry_residents_unchanged": manager is None
+                    or set(manager._loaded) == set(engine.engines),
+                }
+                required, diagnostics = _accounting_checks(
+                    checks, args.memory_accounting
+                )
+                _emit(
+                    "cycle_checks",
+                    cycle=cycle,
+                    attributed_bytes=size,
+                    memory_accounting=args.memory_accounting,
+                    checks=required,
+                    diagnostics=diagnostics,
+                )
+                failures.extend(
+                    f"cycle {cycle}: {key}" for key, ok in required.items() if not ok
+                )
+                diagnostic_failures.extend(
+                    f"cycle {cycle}: {key}" for key, ok in diagnostics.items() if not ok
+                )
+                # Idempotence is tested only AFTER the last accounting sample.
+                again = await client.delete(route)
+                again.raise_for_status()
+            for item in _engines(engine):
+                if production:
+                    await _generate(item, "Reply with OK.")
+                elif float(item.model[1].item()) != 1.0:
+                    failures.append("persistent synthetic owner corrupted")
+            _emit(
+                "summary",
+                memory_accounting=args.memory_accounting,
+                accounting_policy_version=2,
+                outcome="failed" if failures else "passed",
+                failures=failures,
+                strict_rss_outcome=(
+                    "failed" if failures or diagnostic_failures else "passed"
+                ),
+                strict_rss_failures=failures + diagnostic_failures,
+            )
+            return 1 if failures else 0
+    finally:
+        # Shutdown follows all measured samples; unload cannot explain a drop.
+        if manager is not None:
+            await manager.shutdown()
+        elif args.model and engine is not None:
+            await engine.stop()
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    modes = parser.add_mutually_exclusive_group()
+    modes.add_argument(
+        "--model", help="Already-present local model directory; never a Hub ID"
+    )
+    modes.add_argument(
+        "--models-config", help="Registry YAML with local snapshots only"
+    )
+    modes.add_argument("--synthetic-registry", action="store_true")
+    parser.add_argument("--resident-model", action="append", default=[])
+    parser.add_argument(
+        "--pre-delete-barrier",
+        choices=("owner-streams", "none"),
+        default="owner-streams",
+    )
+    parser.add_argument("--route", choices=("prefix", "all"), default="prefix")
+    parser.add_argument(
+        "--memory-accounting",
+        choices=("strict-rss", "gpu-footprint"),
+        default="strict-rss",
+        help="GPU-footprint acceptance retains RSS as separate strict diagnostics",
+    )
+    parser.add_argument("--cycles", type=int, default=3)
+    parser.add_argument("--kv-mib", type=int, default=256)
+    parser.add_argument("--cache-limit-mib", type=int, default=1024)
+    parser.add_argument("--settle-seconds", type=int, choices=(10, 60), default=60)
+    parser.add_argument("--requests", type=int, default=3)
+    parser.add_argument("--prompt-repeats", type=int, default=1024)
+    args = parser.parse_args()
+    if platform.system() != "Darwin" or platform.machine() != "arm64":
+        _emit(
+            "blocked",
+            reason="requires actual Apple Silicon macOS/Metal",
+            platform=platform.platform(),
+        )
+        return 2
+    if args.cycles < 3 or args.kv_mib < 16 or args.kv_mib % 16:
+        parser.error("require >=3 cycles and KV MiB a positive multiple of 16")
+    if args.cache_limit_mib < max(1024, 2 * args.kv_mib):
+        parser.error("allocator cap must be >=1GiB and >=2x synthetic KV size")
+    if args.requests < 1 or args.prompt_repeats < 1:
+        parser.error("requests and prompt-repeats must be positive")
+    if args.models_config and len(set(args.resident_model)) < 2:
+        parser.error(
+            "registry production mode requires at least two --resident-model names"
+        )
+    if args.resident_model and not args.models_config:
+        parser.error("--resident-model requires --models-config")
+    if args.model and not (
+        Path(args.model).is_dir() and (Path(args.model) / "config.json").is_file()
+    ):
+        parser.error(
+            "--model must name an existing local snapshot containing config.json"
+        )
+    for key in ("HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE", "HF_DATASETS_OFFLINE"):
+        os.environ[key] = "1"
+    # Ensure a direct source-checkout invocation imports this checkout, not another.
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    return asyncio.run(_run(args))
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
