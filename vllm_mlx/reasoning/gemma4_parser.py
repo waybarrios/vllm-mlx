@@ -30,6 +30,8 @@ Degenerate cycling:
     both sides.
 """
 
+import re
+
 from .base import DeltaMessage
 from .think_parser import BaseThinkingReasoningParser
 
@@ -41,6 +43,15 @@ _RESPONSE_MARKER = "<|channel>response"
 # held back until the label completes, instead of leaking 'th', 'tho', etc.
 # into the reasoning output.
 _THOUGHT_MARKER = "<|channel>thought"
+# A thought channel written WITHOUT its opening <|channel>. With thinking
+# off the template ends the prompt with an empty <|channel>thought\n<channel|>,
+# and Gemma 4 sometimes writes it again as plain "thought" + "\n" + <channel|>.
+_ORPHAN_HEAD_RE = re.compile(r"\s*thought(?:\n|$)")
+# The label echoed before a bare <channel|>, possibly glued to junk the model
+# wrote first (" enoughthought", "://thought").
+_ORPHAN_TAIL_RE = re.compile(r"thought[ \t]*\n?$")
+# Trailing text held back until the next token shows whether it is a label.
+_ORPHAN_HOLD = ("thought\n", "thought")
 
 
 def _strip_channel_name(text: str, prefix: str) -> str:
@@ -111,6 +122,19 @@ class Gemma4ReasoningParser(BaseThinkingReasoningParser):
         via finalize_stream() when the stream ends.
     """
 
+    def thinking_off_markers_present(self, text: str) -> bool:  # noqa: ARG002
+        """Run this parser although thinking is disabled.
+
+        Gemma 4 writes thought channels without the <|channel> opener (output
+        opening with ``thought\n`` or a bare ``<channel|>``, or the label echoed
+        later before a bare ``<channel|>``), which a text check for the opener
+        cannot see. vLLM, SGLang and llama.cpp all run their Gemma 4 parser
+        regardless of the thinking switch. Plain content is not swallowed: text
+        without markers stays content, and a bare ``<channel|>`` inside ordinary
+        text (no ``thought`` label before it) is kept verbatim.
+        """
+        return True
+
     @property
     def start_token(self) -> str:
         return "<|channel>"
@@ -127,11 +151,20 @@ class Gemma4ReasoningParser(BaseThinkingReasoningParser):
         # Tracks whether we have emitted the first content delta past the
         # <|channel>response transition — used to strip the leading newline.
         self._content_seen: bool = False
+        # Orphan thought (no <|channel>) opened at the start of the output and
+        # not closed yet; its text is kept so it can be returned as content if
+        # the model never writes <channel|> (thinking-off clients drop reasoning).
+        self._orphan_open: bool = False
+        self._orphan_text: str = ""
+        self._content_emitted: bool = False
 
     def reset_state(self, implicit_mode: bool = False):  # noqa: ARG002
         super().reset_state()
         self._pending = ""
         self._content_seen = False
+        self._orphan_open = False
+        self._orphan_text = ""
+        self._content_emitted = False
 
     def _trailing_partial_marker_len(self, text: str) -> int:
         """
@@ -157,6 +190,13 @@ class Gemma4ReasoningParser(BaseThinkingReasoningParser):
                         if i > max_len:
                             max_len = i
                         break
+        # Hold a trailing "thought" / "thought\n" outside a thought channel: it
+        # may be the label of an orphan thought whose <channel|> comes next.
+        if self._phase != "thinking":
+            for tail in _ORPHAN_HOLD:
+                if text.endswith(tail) and len(tail) > max_len:
+                    max_len = len(tail)
+                    break
         return max_len
 
     def finalize_stream(self) -> DeltaMessage | None:
@@ -166,13 +206,25 @@ class Gemma4ReasoningParser(BaseThinkingReasoningParser):
         If the stream ends while we have a partial marker buffered (e.g.
         model emitted "<|channel>" as its last token and got truncated by
         max_tokens), emit it as reasoning so the client doesn't lose the
-        text. Content phase flushes as content.
+        text. Content phase flushes as content, and so does held-back text
+        before any channel opened (a literal "<", a truncated "<chan", or
+        "thought"): thinking-off clients drop reasoning, so it would be lost.
         """
+        if self._orphan_open:
+            # Orphan thought never closed: it was the answer after all.
+            text = self._orphan_text + self._pending
+            self._orphan_open = False
+            self._orphan_text = ""
+            self._pending = ""
+            return DeltaMessage(content=text) if text else None
         if not self._pending:
             return None
         pending = self._pending
         self._pending = ""
-        if self._phase == "content":
+        if self._phase == "content" or (
+            self._phase == "pre_think" and self.start_token not in pending
+        ):
+            # No channel opened: the held-back text was ordinary content
             return DeltaMessage(content=pending)
         return DeltaMessage(reasoning=pending)
 
@@ -209,6 +261,24 @@ class Gemma4ReasoningParser(BaseThinkingReasoningParser):
             reasoning = _strip_channel_tokens(reasoning)
             content = _strip_channel_tokens(content)
             return reasoning or None, content or None
+
+        # Orphan thought: "thought\n...<channel|>answer" without <|channel>
+        if self.start_token not in text and self.end_token in text:
+            head = _ORPHAN_HEAD_RE.match(text)
+            before, _, after = text.rpartition(self.end_token)
+            if head:
+                reasoning = _strip_channel_tokens(before[head.end() :])
+                return reasoning or None, _strip_channel_tokens(after) or None
+            tail = _ORPHAN_TAIL_RE.search(before)
+            if tail:
+                # The label echoed after real content: keep the content.
+                content = before[: tail.start()] + after
+                return None, content.replace(self.end_token, "") or None
+            if not before.strip():
+                # Bare <channel|> at the very start of the answer
+                return None, _strip_channel_tokens(after) or None
+            # Bare <channel|> inside ordinary text: may be literal, keep verbatim
+            return None, model_output
 
         # Only closing tag (think injected in prompt)
         if self.end_token in text:
@@ -297,8 +367,28 @@ class Gemma4ReasoningParser(BaseThinkingReasoningParser):
         correctly — each NEW <|channel> re-enters reasoning, each NEW
         <channel|> transitions to content.
         """
+        # Orphan thought opened at the very start: reasoning until <channel|>
+        if (
+            self._phase == "pre_think"
+            and not self._content_emitted
+            and self.start_token not in current_text
+            and _ORPHAN_HEAD_RE.match(current_text)
+        ):
+            self._phase = "thinking"
+            self._orphan_open = True
+            delta_text = current_text[_ORPHAN_HEAD_RE.match(current_text).end() :]
+            if self.end_token not in delta_text:
+                self._orphan_text += delta_text
+                return DeltaMessage(reasoning=delta_text) if delta_text else None
+            previous_text = ""  # fall through to the <channel|> handling below
+
         # No channel tokens at all — plain content
         if self.start_token not in current_text and self.end_token not in current_text:
+            if self._orphan_open:
+                self._orphan_text += delta_text
+                return DeltaMessage(reasoning=delta_text) if delta_text else None
+            if delta_text.strip():
+                self._content_emitted = True
             return DeltaMessage(content=delta_text)
 
         # ── Alternative transition: <|channel>response ──
@@ -331,17 +421,41 @@ class Gemma4ReasoningParser(BaseThinkingReasoningParser):
 
         # ── NEW <channel|> (transition to content) ──
         if cur_ends > prev_ends:
+            orphan_echo = (
+                not self._orphan_open
+                and self._phase != "thinking"
+                and self.start_token not in current_text
+            )
             self._phase = "content"
             self._content_seen = False
+            closing_orphan = self._orphan_open
+            self._orphan_open = False
+            self._orphan_text = ""
             # Text after the last <channel|> in this delta is content
             last_end = delta_text.rfind(self.end_token)
             if last_end >= 0:
                 after = delta_text[last_end + len(self.end_token) :]
                 after = _strip_channel_name(after.lstrip("\n"), _THOUGHT_PREFIX)
                 after = _strip_channel_name(after, "response")
-                if after:
-                    self._content_seen = True
-                    return DeltaMessage(content=after)
+                before = ""
+                if orphan_echo:
+                    # Bare <channel|> without <|channel>. Text before it in
+                    # this delta is content minus an echoed "thought" label. With
+                    # no label and real content already out, the marker may be
+                    # literal text: keep it verbatim (upstream intent).
+                    before = delta_text[: delta_text.find(self.end_token)]
+                    stripped = _ORPHAN_TAIL_RE.sub("", before)
+                    if stripped == before and self._content_emitted:
+                        raw_after = delta_text[last_end + len(self.end_token) :]
+                        return DeltaMessage(content=before + self.end_token + raw_after)
+                    before = stripped
+                elif closing_orphan:
+                    before = ""
+                text = before + after
+                if text:
+                    self._content_seen = bool(after)
+                    self._content_emitted = True
+                    return DeltaMessage(content=text)
             return None
 
         # ── Content phase ──
@@ -353,6 +467,7 @@ class Gemma4ReasoningParser(BaseThinkingReasoningParser):
                 self._content_seen = bool(stripped)
                 if not stripped:
                     return None
+                self._content_emitted = True
                 return self._strip_channel_tokens_from_delta(
                     DeltaMessage(content=stripped)
                 )
