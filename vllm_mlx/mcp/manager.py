@@ -189,9 +189,10 @@ class MCPClientManager:
             MCPToolResult with the result or error
         """
         # Parse full name
-        server_name, tool_name, _ = openai_call_to_mcp(
+        parsed_server_name, tool_name, _ = openai_call_to_mcp(
             {"function": {"name": full_name, "arguments": "{}"}}
         )
+        server_name: Optional[str] = parsed_server_name
 
         # If no server prefix, try to find the tool
         if not server_name:

@@ -411,7 +411,7 @@ def _draft_model_type(model: Any) -> str | None:
 
 def run_media_specprefill(
     model: Any,
-    language_model: Any,
+    language_model: Callable[..., Any],
     draft_model: Any,
     request: Any,
     cache: Any,
@@ -473,7 +473,9 @@ def run_media_specprefill(
     else:
         score_input_ids = tokens
 
-    score_kwargs = {
+    score_kwargs: dict[
+        str, int | Callable[[], None] | Callable[[Any, Any, Any], Any] | None
+    ] = {
         "prefill_step_size": step_size,
         "cancel_check": cancel_check,
     }

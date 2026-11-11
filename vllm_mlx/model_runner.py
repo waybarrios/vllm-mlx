@@ -14,11 +14,15 @@ Includes low-level optimizations:
 import logging
 import time
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from collections.abc import Callable
+from typing import TYPE_CHECKING, Any, cast
 
 import mlx.core as mx
 
 if TYPE_CHECKING:
+    from vllm_mlx.optimizations import HardwareInfo
+    from mlx.nn import Module
+    from mlx_lm.tokenizer_utils import TokenizerWrapper
     from vllm.config import VllmConfig
     from vllm.v1.core.sched.output import SchedulerOutput
 
@@ -80,12 +84,12 @@ class MLXModelRunner:
         self.scheduler_config = vllm_config.scheduler_config
 
         # mlx-lm model and tokenizer
-        self.model = None
-        self.tokenizer = None
+        self.model: "Module | None" = None
+        self.tokenizer: "TokenizerWrapper | None" = None
         self._loaded = False
 
         # Sampler for generation
-        self._sampler = None
+        self._sampler: Callable[[mx.array], mx.array] | None = None
 
         # Cache for prompt processing
         self._prompt_cache = None
@@ -95,8 +99,10 @@ class MLXModelRunner:
 
         # Optimization settings
         self._enable_optimizations = enable_optimizations
-        self._compiled_forward = None  # Compiled model forward pass
-        self._hardware_info = None  # Detected hardware profile
+        self._compiled_forward: Callable[..., Any] | None = (
+            None  # Compiled model forward pass
+        )
+        self._hardware_info: "HardwareInfo | None" = None  # Detected hardware profile
 
         logger.info(f"MLXModelRunner initialized for model: {self.model_config.model}")
         logger.info(
@@ -116,11 +122,15 @@ class MLXModelRunner:
             logger.info(f"Loading model with mlx-lm: {model_name}")
             start_time = time.time()
 
-            self.model, self.tokenizer = load(
-                model_name,
-                tokenizer_config={
-                    "trust_remote_code": self.model_config.trust_remote_code,
-                },
+            # return_config defaults to False; the optional third value is absent.
+            self.model, self.tokenizer = cast(
+                "tuple[Module, TokenizerWrapper]",
+                load(
+                    model_name,
+                    tokenizer_config={
+                        "trust_remote_code": self.model_config.trust_remote_code,
+                    },
+                ),
             )
 
             load_time = time.time() - start_time
@@ -147,19 +157,13 @@ class MLXModelRunner:
     def _apply_optimizations(self) -> None:
         """Apply low-level optimizations for maximum performance."""
         try:
-            from vllm_mlx.optimizations import (
-                configure_memory_optimization,
-                detect_hardware,
-            )
+            from vllm_mlx.optimizations import detect_hardware
 
             # Detect hardware and apply memory optimization
             self._hardware_info = detect_hardware()
             logger.info(f"Hardware detected: {self._hardware_info.chip_name}")
             logger.info(f"Memory: {self._hardware_info.total_memory_gb:.1f} GB")
             logger.info(f"Bandwidth: {self._hardware_info.memory_bandwidth_gbs} GB/s")
-
-            # Configure memory settings
-            configure_memory_optimization()
 
             # Compile the model forward pass for kernel fusion
             self._setup_compiled_forward()
@@ -237,13 +241,16 @@ class MLXModelRunner:
         block_size = self.cache_config.block_size
 
         # 2 for K and V, 2 bytes for float16
-        return 2 * block_size * num_layers * num_kv_heads * head_size * 2
+        size_bytes: int = 2 * block_size * num_layers * num_kv_heads * head_size * 2
+        return size_bytes
 
     def warm_up(self) -> None:
         """Warm up model with a test generation."""
         if not self._loaded:
             self.load_model()
 
+        assert self.model is not None
+        assert self.tokenizer is not None
         logger.info("Warming up model...")
 
         try:
@@ -350,6 +357,7 @@ class MLXModelRunner:
             generated_ids = []
 
             # Generate tokens
+            assert self.model is not None
             for token_info in generate_step(
                 prompt=prompt,
                 model=self.model,
@@ -357,7 +365,7 @@ class MLXModelRunner:
                 sampler=sampler,
             ):
                 if hasattr(token_info, "token"):
-                    generated_ids.append(token_info.token)
+                    generated_ids.append(getattr(token_info, "token"))
                 elif isinstance(token_info, tuple) and len(token_info) > 0:
                     generated_ids.append(token_info[0])
 
@@ -384,7 +392,8 @@ class MLXModelRunner:
         """Decode token IDs to text."""
         if self.tokenizer is None:
             return ""
-        return self.tokenizer.decode(token_ids)
+        text: str = self.tokenizer.decode(token_ids)
+        return text
 
     def get_model_info(self) -> dict:
         """Get information about the loaded model and optimizations."""
@@ -418,7 +427,6 @@ class MLXModelRunner:
                     "memory_gb": self._hardware_info.total_memory_gb,
                     "bandwidth_gbs": self._hardware_info.memory_bandwidth_gbs,
                     "gpu_cores": self._hardware_info.gpu_cores,
-                    "prefill_chunk_size": self._hardware_info.optimal_prefill_size,
                 }
 
         return info

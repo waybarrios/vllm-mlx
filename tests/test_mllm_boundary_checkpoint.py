@@ -71,14 +71,18 @@ def generator(monkeypatch):
         # Under the stub, memory_cache's ``isinstance(x, mx.array)`` would
         # test against a MagicMock and raise. A real class makes numpy state
         # pass through detach unchanged, as with no MLX installed at all.
-        monkeypatch.setattr(
-            sys.modules["mlx.core"], "array", type("_NoMLXArray", (), {})
+        # Patch dictionary entries so undo does not call MagicMock.__delattr__
+        # and permanently delete its dynamically supplied array/eval children.
+        monkeypatch.setitem(
+            vars(sys.modules["mlx.core"]), "array", type("_NoMLXArray", (), {})
         )
+        monkeypatch.setitem(vars(module.mx), "eval", lambda *_args: None)
+    else:
+        monkeypatch.setattr(module.mx, "eval", lambda *_args: None)
     monkeypatch.setattr(
         MLLMBatchGenerator, "_cache_class_families", staticmethod(lambda: ((), (), ()))
     )
     monkeypatch.setattr(module, "_eval_prompt_cache", lambda _cache: None)
-    monkeypatch.setattr(module.mx, "eval", lambda *_args: None)
 
     gen = MLLMBatchGenerator.__new__(MLLMBatchGenerator)
     gen.prefix_cache = MemoryAwarePrefixCache(

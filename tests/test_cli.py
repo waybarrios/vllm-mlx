@@ -155,6 +155,7 @@ def test_serve_command_propagates_all_sampling_defaults(monkeypatch):
     from vllm_mlx import cli, server
     from vllm_mlx.utils import download
 
+    monkeypatch.setattr(server, "_max_request_tokens", server._max_request_tokens)
     loaded = {}
 
     monkeypatch.setattr(
@@ -271,6 +272,7 @@ def test_serve_command_rejects_memory_budget_outside_registry_mode(capsys):
 def test_serve_command_applies_memory_budget_override_end_to_end(tmp_path, monkeypatch):
     from vllm_mlx import cli, server
 
+    monkeypatch.setattr(server, "_max_request_tokens", server._max_request_tokens)
     config_path = tmp_path / "models.yaml"
     config_path.write_text("""
 manager:
@@ -330,6 +332,7 @@ class TestServeCommandMllmRouting:
         from vllm_mlx import cli, server
         from vllm_mlx.utils import download
 
+        monkeypatch.setattr(server, "_max_request_tokens", server._max_request_tokens)
         model_dir = self._write_config(
             tmp_path,
             "Qwen3.8-27B-8bit",
@@ -367,6 +370,7 @@ class TestServeCommandMllmRouting:
         from vllm_mlx import cli, server
         from vllm_mlx.utils import download
 
+        monkeypatch.setattr(server, "_max_request_tokens", server._max_request_tokens)
         model_dir = tmp_path / "mystery-repo"
         model_dir.mkdir()  # resolved, but no config.json inside
         called = {}
@@ -392,6 +396,7 @@ class TestServeCommandMllmRouting:
         from vllm_mlx import cli, server
         from vllm_mlx.utils import download
 
+        monkeypatch.setattr(server, "_max_request_tokens", server._max_request_tokens)
         model_dir = self._write_config(
             tmp_path,
             "Qwen3.8-27B-8bit",
@@ -424,6 +429,7 @@ class TestServeCommandMllmRouting:
         from vllm_mlx import cli, server
         from vllm_mlx.utils import download
 
+        monkeypatch.setattr(server, "_max_request_tokens", server._max_request_tokens)
         model_dir = self._write_config(
             tmp_path,
             "text-model",

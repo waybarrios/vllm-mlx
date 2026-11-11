@@ -18,7 +18,14 @@ from collections import OrderedDict, deque
 from collections.abc import AsyncGenerator
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import aclosing, asynccontextmanager
-from typing import Any
+from typing import TYPE_CHECKING, Any, cast
+
+if TYPE_CHECKING:
+    from ..models.llm import MLXLanguageModel
+    from ..models.mllm import MLXMultimodalLM
+    from mlx_lm.models.cache import LRUPromptCache
+    from mlx_lm.tokenizer_utils import TokenizerWrapper
+    from mlx.nn import Module
 
 # Re-entrancy guard for SimpleEngine._track_request_stream so that
 # internal fallback paths inside _stream_chat_impl (which call back into
@@ -46,6 +53,7 @@ from .chat_template_safety import (
     build_system_prompt_cache_prefix,
     normalize_messages_for_chat_template,
 )
+from .drafter_capabilities import continuous_batching_capability
 from ..mlx_streams import (
     bind_generation_streams,
     restore_generation_streams,
@@ -120,7 +128,7 @@ def _processors_can_retire(processors: list[Any] | None) -> bool:
     """True when any processor advertises a retire-to-content transition."""
     if os.getenv("VLLM_MLX_ENABLE_THINKING_RETIREMENT_RESUME") != "1":
         return False
-    return bool(processors) and any(
+    return processors is not None and any(
         isinstance(getattr(p, "is_retired", None), bool) for p in processors
     )
 
@@ -129,7 +137,7 @@ def _processors_retired(processors: list[Any] | None) -> bool:
     """True when any retire-capable processor has entered its retired state."""
     if os.getenv("VLLM_MLX_ENABLE_THINKING_RETIREMENT_RESUME") != "1":
         return False
-    return bool(processors) and any(
+    return processors is not None and any(
         getattr(p, "is_retired", False) is True for p in processors
     )
 
@@ -249,7 +257,7 @@ class SimpleEngine(BaseEngine):
         self._prefix_trie_cache_enabled = prefix_trie_cache
         self._prefix_trie_cache_size = max(1, prefix_trie_cache_size)
         self._prefix_trie_cache_memory_mb = prefix_trie_cache_memory_mb
-        self._prefix_trie_cache = None
+        self._prefix_trie_cache: "LRUPromptCache | None" = None
         self._prefix_trie_cache_lock = threading.Lock()
         self._prefix_trie_cache_stats = {
             "lookups": 0,
@@ -264,17 +272,17 @@ class SimpleEngine(BaseEngine):
         # KV cache size limit
         self._max_kv_size = max_kv_size
 
-        self._model = None
+        self._model: "MLXLanguageModel | MLXMultimodalLM | None" = None
         self._loaded = False
 
         # Per-request routing state (MLLM+MTP mode)
         self._text_model = None
-        self._text_tokenizer = None
+        self._text_tokenizer: Any | None = None
         self._text_model_init_lock = asyncio.Lock()
         self._text_model_initialization_attempted = False
 
         # SpecPrefill draft model (loaded at start if enabled)
-        self._draft_model = None
+        self._draft_model: "Module | None" = None
 
         # Lock to serialize MLX operations (prevents Metal command buffer conflicts)
         self._generation_lock = asyncio.Lock()
@@ -651,7 +659,8 @@ class SimpleEngine(BaseEngine):
             prompt_cache = getattr(entry, "prompt_cache", None)
             if prompt_cache is None:
                 return None
-            return can_trim_prompt_cache(prompt_cache)
+            trimmable: bool = can_trim_prompt_cache(prompt_cache)
+            return trimmable
 
         exact = getattr(result, "exact", None)
         if exact is not None:
@@ -717,7 +726,7 @@ class SimpleEngine(BaseEngine):
         if self._is_mllm:
             processor = getattr(self._model, "processor", None)
             return getattr(processor, "tokenizer", processor)
-        return self._model.tokenizer
+        return getattr(self._model, "tokenizer")
 
     def _generation_lock_holder_summary(self) -> str:
         if not self._active_requests:
@@ -871,8 +880,10 @@ class SimpleEngine(BaseEngine):
                 try:
                     from mlx_lm import load as mlx_lm_load
 
-                    self._draft_model, _ = mlx_lm_load(
-                        self._specprefill_draft_model_path
+                    # No return_config request means the result is a pair.
+                    self._draft_model, _ = cast(
+                        "tuple[Module, TokenizerWrapper]",
+                        mlx_lm_load(self._specprefill_draft_model_path),
                     )
                     logger.info(
                         "SpecPrefill: draft model loaded (%s), threshold=%d, keep=%.0f%%",
@@ -1002,6 +1013,7 @@ class SimpleEngine(BaseEngine):
     def _initialize_text_model(self) -> None:
         """Build the optional text-only MLLM route from already-loaded weights."""
         self._text_model_initialization_attempted = True
+        assert self._model is not None
         try:
             from ..text_model_from_vlm import build_text_model
 
@@ -1015,7 +1027,8 @@ class SimpleEngine(BaseEngine):
                 self._text_tokenizer = None
                 return
 
-            self._text_tokenizer = self._model.get_tokenizer()
+            self._text_tokenizer = getattr(self._model, "get_tokenizer")()
+            assert self._text_tokenizer is not None
             self._supports_system_kv_cache = self._probe_system_kv_cache_support(
                 self._text_model,
                 "mllm_text",
@@ -1403,6 +1416,7 @@ class SimpleEngine(BaseEngine):
         """
         if not self._loaded:
             await self.start()
+        assert self._model is not None
 
         # Per-request specprefill overrides (from extra_body)
         specprefill_override = kwargs.pop("specprefill", None)
@@ -1419,7 +1433,7 @@ class SimpleEngine(BaseEngine):
                 use_specprefill = False
 
             if use_specprefill:
-                tokenizer = self._model.tokenizer
+                tokenizer = getattr(self._model, "tokenizer")
                 add_special = tokenizer.bos_token is None or not prompt.startswith(
                     tokenizer.bos_token
                 )
@@ -1570,7 +1584,8 @@ class SimpleEngine(BaseEngine):
 
                     if not finished:
                         if prompt_tokens == 0 and self._model is not None:
-                            prompt_tokens = len(self._model.tokenizer.encode(prompt))
+                            tokenizer = getattr(self._model, "tokenizer")
+                            prompt_tokens = len(tokenizer.encode(prompt))
                         if request_id in self._active_requests:
                             self._active_requests[request_id].update(
                                 {
@@ -1698,8 +1713,9 @@ class SimpleEngine(BaseEngine):
         enable_thinking: bool | None,
     ) -> tuple[str, dict[str, Any] | None, list[dict[str, Any]] | None]:
         """Return the prompt, template kwargs and normalized messages."""
-        tokenizer = self._model.tokenizer
-        template_kwargs = None
+        assert self._model is not None
+        tokenizer = getattr(self._model, "tokenizer")
+        template_kwargs: dict[str, Any] | None = None
         safe_messages = None
         if hasattr(tokenizer, "apply_chat_template"):
             # Per-request enable_thinking override; default: True unless coder model.
@@ -1814,6 +1830,7 @@ class SimpleEngine(BaseEngine):
         """
         if not self._loaded:
             await self.start()
+        assert self._model is not None
 
         chat_template_kwargs = dict(kwargs.pop("chat_template_kwargs", {}) or {})
         mllm_draft_requested = bool(kwargs.pop("mllm_draft", self._default_mllm_draft))
@@ -1880,7 +1897,7 @@ class SimpleEngine(BaseEngine):
             request_id = str(kwargs.pop("request_id", "") or f"simple-{id(messages):x}")
             native_video_request = bool(
                 getattr(self._model, "_video_native", False) is True
-                and self._model._collect_video_inputs(messages)
+                and getattr(self._model, "_collect_video_inputs")(messages)
             )
 
             if not native_video_request:
@@ -1908,7 +1925,7 @@ class SimpleEngine(BaseEngine):
                     self._acquire_generation_slot(request_id),
                     self._generation_worker_in_use(),
                 ):
-                    iterator = self._model.stream_chat(
+                    iterator = getattr(self._model, "stream_chat")(
                         messages=messages,
                         max_tokens=max_tokens,
                         temperature=temperature,
@@ -2012,7 +2029,8 @@ class SimpleEngine(BaseEngine):
             return
 
         # For LLM, apply chat template and stream
-        tokenizer = self._model.tokenizer
+        assert self._model is not None
+        tokenizer = getattr(self._model, "tokenizer")
         prompt, template_kwargs, safe_messages = self._render_chat_prompt(
             messages,
             template_tools,
@@ -2146,7 +2164,7 @@ class SimpleEngine(BaseEngine):
             system_prefix_text = build_system_prompt_cache_prefix(
                 tokenizer,
                 messages,
-                template_kwargs=template_kwargs,
+                template_kwargs=template_kwargs or {},
                 normalized_messages=safe_messages,
             )
 
@@ -2220,7 +2238,9 @@ class SimpleEngine(BaseEngine):
                 from mlx_lm.models.cache import make_prompt_cache
                 from mlx_lm.sample_utils import make_sampler
 
+                assert self._model is not None
                 model = self._model.model
+                assert model is not None
                 sampler = make_sampler(temp=temperature, top_p=top_p)
 
                 cache_key = list(full_tokens_list or [])
@@ -2272,10 +2292,12 @@ class SimpleEngine(BaseEngine):
                     self._restore_prompt_cache(bc, local_hit_snapshot)
                     # Bump LRU position. Safe to mutate here because the
                     # worker is serialized under ``_generation_lock``.
-                    if system_hash in self._system_kv_cache:
+                    if system_hash is not None and system_hash in self._system_kv_cache:
                         self._system_kv_cache.move_to_end(system_hash)
                     self._system_kv_cache_stats["hits"] += 1
                 elif kv_cache_eligible:
+                    assert system_hash is not None
+                    assert system_tokens is not None
                     bc = make_prompt_cache(model)
                     sys_arr = mx.array(system_tokens)
                     step = self._prefill_step_size
@@ -2334,6 +2356,7 @@ class SimpleEngine(BaseEngine):
                     if prefix_trie_hit
                     else suffix_tokens if kv_cache_eligible else cache_key
                 )
+                assert prompt_tokens_for_decode is not None
                 prompt_arr = mx.array(prompt_tokens_for_decode)
                 for resp in mlx_stream_generate(
                     model,
@@ -2477,8 +2500,10 @@ class SimpleEngine(BaseEngine):
         """
         from threading import Event
 
+        assert self._model is not None
         model = self._model.model
-        tokenizer = self._model.tokenizer
+        assert self._model is not None
+        tokenizer = getattr(self._model, "tokenizer")
         n_tokens = len(tokens)
         cancel_requested = Event()
 
@@ -2710,6 +2735,7 @@ class SimpleEngine(BaseEngine):
             enable_thinking = enable_thinking_env.lower() in ("true", "1", "yes")
 
         # Apply chat template for full prompt
+        assert self._text_tokenizer is not None
         template_kwargs = {
             "tokenize": False,
             "add_generation_prompt": True,
@@ -2964,6 +2990,7 @@ class SimpleEngine(BaseEngine):
                 # processor-to-content handoff.
                 resume_kwargs["prompt_cache"] = prompt_cache + model.make_mtp_cache()
                 resume_kwargs["num_draft_tokens"] = self._mtp_num_draft_tokens
+            assert self._text_tokenizer is not None
             for resp in mlx_stream_generate(
                 model,
                 self._text_tokenizer,
@@ -3436,7 +3463,7 @@ class SimpleEngine(BaseEngine):
         # entry_count) render cache utilization for SimpleEngine services.
         if self._is_mllm and self._model is not None:
             try:
-                raw_cache = self._model.get_cache_stats()
+                raw_cache = getattr(self._model, "get_cache_stats")()
             except Exception:
                 raw_cache = None
             if raw_cache and raw_cache.get("enabled"):
@@ -3469,6 +3496,7 @@ class SimpleEngine(BaseEngine):
             }
 
         if self._mllm_draft_model_path is not None:
+            loaded_drafter = getattr(self._model, "_draft_model", None)
             stats["mtp"] = {
                 "enabled": True,
                 "implementation": "mlx_vlm_assistant",
@@ -3476,7 +3504,9 @@ class SimpleEngine(BaseEngine):
                 "draft_kind": self._mllm_draft_kind,
                 "draft_block_size": self._mllm_draft_block_size,
                 "default_enabled": self._default_mllm_draft,
-                "continuous_batching_supported": True,
+                "continuous_batching_supported": continuous_batching_capability(
+                    loaded_drafter
+                ),
             }
 
         # System KV cache stats (LRU over multiple system prefixes)
@@ -3498,10 +3528,11 @@ class SimpleEngine(BaseEngine):
                         "memory_mb": round(slot_bytes / 1e6, 1),
                     }
                 )
-            counters = dict(self._system_kv_cache_stats)
-            denom = counters["hits"] + counters["misses"]
+            raw_counters = dict(self._system_kv_cache_stats)
+            denom = raw_counters["hits"] + raw_counters["misses"]
+            counters: dict[str, int | float | None] = dict(raw_counters)
             counters["hit_ratio"] = (
-                round(counters["hits"] / denom, 3) if denom > 0 else None
+                round(raw_counters["hits"] / denom, 3) if denom > 0 else None
             )
             stats["system_kv_cache"] = {
                 "capacity": self._system_kv_capacity,
@@ -3539,10 +3570,11 @@ class SimpleEngine(BaseEngine):
         """
         result: dict[str, Any] = {}
         if self._supports_system_kv_cache:
-            counters = dict(self._system_kv_cache_stats)
-            denom = counters["hits"] + counters["misses"]
+            raw_counters = dict(self._system_kv_cache_stats)
+            denom = raw_counters["hits"] + raw_counters["misses"]
+            counters: dict[str, int | float | None] = dict(raw_counters)
             counters["hit_ratio"] = (
-                round(counters["hits"] / denom, 3) if denom > 0 else None
+                round(raw_counters["hits"] / denom, 3) if denom > 0 else None
             )
             result["system_kv_cache"] = {
                 "capacity": self._system_kv_capacity,
@@ -3550,7 +3582,7 @@ class SimpleEngine(BaseEngine):
                 "counters": counters,
             }
         if self._is_mllm and self._model is not None:
-            result["mllm_cache"] = self._model.get_cache_stats()
+            result["mllm_cache"] = getattr(self._model, "get_cache_stats")()
         return result or None
 
     def clear_runtime_caches(self) -> dict[str, Any] | None:
@@ -3582,7 +3614,7 @@ class SimpleEngine(BaseEngine):
             result["system_kv_cache"] = {"dropped_entries": dropped}
 
         if self._is_mllm and self._model is not None:
-            self._model.clear_cache()
+            getattr(self._model, "clear_cache")()
             result["model_cache"] = True
 
         return result or None

@@ -1,14 +1,320 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for shared engine helpers in vllm_mlx/engine/base.py."""
 
+import ast
 import asyncio
 import gc
+import inspect
+import json
 import time
+from collections.abc import AsyncIterator
+from contextlib import aclosing
+from dataclasses import MISSING, asdict, fields
+from typing import get_type_hints
 
 import anyio
 import pytest
 
-from vllm_mlx.engine.base import shield_task
+from vllm_mlx.engine.base import BaseEngine, GenerationOutput, shield_task
+
+
+class TestGenerationOutput:
+    @pytest.mark.parametrize("name", ["mtp_drafts", "mtp_accepted"])
+    def test_mtp_counter_has_one_source_declaration(self, name):
+        # Runtime annotations deduplicate names, hiding the static contract error.
+        declaration = ast.parse(inspect.getsource(GenerationOutput)).body[0]
+        counters = [
+            node.target.id
+            for node in declaration.body
+            if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name)
+        ]
+        assert counters.count(name) == 1
+
+    def test_field_and_positional_constructor_contract(self):
+        expected_names = (
+            "text",
+            "tokens",
+            "prompt_tokens",
+            "completion_tokens",
+            "finish_reason",
+            "mtp_drafts",
+            "mtp_accepted",
+            "new_text",
+            "finished",
+            "specprefill_outcome",
+        )
+        declared = fields(GenerationOutput)
+        assert tuple(item.name for item in declared) == expected_names
+        assert tuple(item.type for item in declared) == (
+            str,
+            list[int],
+            int,
+            int,
+            str | None,
+            int,
+            int,
+            str,
+            bool,
+            "SpecPrefillOutcome | None",
+        )
+        assert declared[0].default is MISSING
+        assert declared[1].default is MISSING
+        assert declared[1].default_factory is list
+        assert tuple(item.default for item in declared[2:]) == (
+            0,
+            0,
+            "stop",
+            0,
+            0,
+            "",
+            True,
+            None,
+        )
+        assert all(item.default_factory is MISSING for item in declared[2:])
+        assert declared[0].default_factory is MISSING
+        assert all(item.init and item.repr and item.compare for item in declared)
+        assert all(not item.metadata and not item.kw_only for item in declared)
+        signature = inspect.signature(GenerationOutput)
+        assert tuple(signature.parameters) == expected_names
+        assert all(
+            parameter.kind is inspect.Parameter.POSITIONAL_OR_KEYWORD
+            for parameter in signature.parameters.values()
+        )
+        assert GenerationOutput.__match_args__ == expected_names
+        with pytest.raises(TypeError, match="text"):
+            GenerationOutput()
+
+    def test_defaults_serialization_and_independent_token_lists(self):
+        first = GenerationOutput("hello")
+        second = GenerationOutput("hello")
+        expected = {
+            "text": "hello",
+            "tokens": [],
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "finish_reason": "stop",
+            "mtp_drafts": 0,
+            "mtp_accepted": 0,
+            "new_text": "",
+            "finished": True,
+            "specprefill_outcome": None,
+        }
+        assert asdict(first) == expected
+        assert json.dumps(asdict(first)) == (
+            '{"text": "hello", "tokens": [], "prompt_tokens": 0, '
+            '"completion_tokens": 0, "finish_reason": "stop", "mtp_drafts": 0, '
+            '"mtp_accepted": 0, "new_text": "", "finished": true, '
+            '"specprefill_outcome": null}'
+        )
+        assert repr(first) == (
+            "GenerationOutput(text='hello', tokens=[], prompt_tokens=0, "
+            "completion_tokens=0, finish_reason='stop', mtp_drafts=0, "
+            "mtp_accepted=0, new_text='', finished=True, specprefill_outcome=None)"
+        )
+        assert first == second
+        assert first.tokens is not second.tokens
+        first.tokens.append(7)
+        assert second.tokens == []
+        assert first != second
+
+    def test_populated_positional_and_keyword_values_serialize_unchanged(self):
+        positional = GenerationOutput(
+            "hello", [7, 8], 3, 2, None, 9, 4, "lo", False, None
+        )
+        keyword = GenerationOutput(
+            text="hello",
+            tokens=[7, 8],
+            prompt_tokens=3,
+            completion_tokens=2,
+            finish_reason=None,
+            mtp_drafts=9,
+            mtp_accepted=4,
+            new_text="lo",
+            finished=False,
+            specprefill_outcome=None,
+        )
+        assert positional == keyword
+        assert asdict(positional) == {
+            "text": "hello",
+            "tokens": [7, 8],
+            "prompt_tokens": 3,
+            "completion_tokens": 2,
+            "finish_reason": None,
+            "mtp_drafts": 9,
+            "mtp_accepted": 4,
+            "new_text": "lo",
+            "finished": False,
+            "specprefill_outcome": None,
+        }
+        assert json.dumps(asdict(positional)) == (
+            '{"text": "hello", "tokens": [7, 8], "prompt_tokens": 3, '
+            '"completion_tokens": 2, "finish_reason": null, "mtp_drafts": 9, '
+            '"mtp_accepted": 4, "new_text": "lo", "finished": false, '
+            '"specprefill_outcome": null}'
+        )
+        keyword.mtp_accepted = 3
+        assert positional != keyword
+
+
+class _EngineWithoutStreams(BaseEngine):
+    @property
+    def model_name(self):
+        return "test-engine"
+
+    @property
+    def is_mllm(self):
+        return False
+
+    @property
+    def tokenizer(self):
+        return None
+
+    async def start(self):
+        pass
+
+    async def stop(self):
+        pass
+
+    async def generate(self, *args, **kwargs):
+        return GenerationOutput(text="complete")
+
+    async def chat(self, *args, **kwargs):
+        return GenerationOutput(text="complete")
+
+
+class _StreamingEngine(_EngineWithoutStreams):
+    def __init__(self, *, error=None, block=False):
+        self.chunks = [
+            GenerationOutput(text="first", new_text="first", finished=False),
+            GenerationOutput(text="first second", new_text=" second"),
+        ]
+        self.error = error
+        self.block = block
+        self.waiting = asyncio.Event()
+        self.release = asyncio.Event()
+        self.cleanups = 0
+
+    async def _outputs(self) -> AsyncIterator[GenerationOutput]:
+        try:
+            yield self.chunks[0]
+            if self.error is not None:
+                raise self.error
+            if self.block:
+                self.waiting.set()
+                await self.release.wait()
+            yield self.chunks[1]
+        finally:
+            self.cleanups += 1
+
+    async def stream_generate(self, *args, **kwargs) -> AsyncIterator[GenerationOutput]:
+        async with aclosing(self._outputs()) as outputs:
+            async for output in outputs:
+                yield output
+
+    async def stream_chat(self, *args, **kwargs) -> AsyncIterator[GenerationOutput]:
+        async with aclosing(self._outputs()) as outputs:
+            async for output in outputs:
+                yield output
+
+
+def _engine_stream(engine: BaseEngine, method: str) -> AsyncIterator[GenerationOutput]:
+    if method == "stream_generate":
+        return engine.stream_generate("prompt")
+    return engine.stream_chat([{"role": "user", "content": "prompt"}])
+
+
+class TestBaseEngineStreaming:
+    @pytest.mark.parametrize("method", ["stream_generate", "stream_chat"])
+    def test_abstract_stream_is_an_iterator_factory_not_a_coroutine(self, method):
+        declaration = getattr(BaseEngine, method)
+        assert not inspect.iscoroutinefunction(declaration)
+        assert not inspect.isasyncgenfunction(declaration)
+        assert declaration.__isabstractmethod__
+        assert get_type_hints(declaration)["return"] == AsyncIterator[GenerationOutput]
+
+    @pytest.mark.parametrize("method", ["start", "stop", "generate", "chat"])
+    def test_nonstream_methods_remain_abstract_coroutines(self, method):
+        declaration = getattr(BaseEngine, method)
+        assert inspect.iscoroutinefunction(declaration)
+        assert declaration.__isabstractmethod__
+
+    def test_both_stream_implementations_are_required(self):
+        assert _EngineWithoutStreams.__abstractmethods__ == {
+            "stream_generate",
+            "stream_chat",
+        }
+        with pytest.raises(TypeError, match="abstract"):
+            _EngineWithoutStreams()
+
+    @pytest.mark.parametrize("method", ["stream_generate", "stream_chat"])
+    def test_one_stream_implementation_does_not_satisfy_the_other(self, method):
+        partial_engine = type(
+            "PartialEngine",
+            (_EngineWithoutStreams,),
+            {method: getattr(_StreamingEngine, method)},
+        )
+        other = "stream_chat" if method == "stream_generate" else "stream_generate"
+        assert partial_engine.__abstractmethods__ == {other}
+        with pytest.raises(TypeError, match=other):
+            partial_engine()
+
+    @pytest.mark.anyio
+    @pytest.mark.parametrize("method", ["stream_generate", "stream_chat"])
+    async def test_direct_iteration_preserves_chunk_identity_and_order(self, method):
+        engine = _StreamingEngine()
+        stream = _engine_stream(engine, method)
+        assert inspect.isasyncgen(stream)
+        assert not inspect.isawaitable(stream)
+        received = [output async for output in stream]
+        assert len(received) == 2
+        assert received[0] is engine.chunks[0]
+        assert received[1] is engine.chunks[1]
+        assert engine.cleanups == 1
+
+    @pytest.mark.anyio
+    @pytest.mark.parametrize("method", ["stream_generate", "stream_chat"])
+    async def test_error_after_first_chunk_propagates_and_cleans_up(self, method):
+        error = ValueError("stream failed")
+        engine = _StreamingEngine(error=error)
+        stream = _engine_stream(engine, method)
+        assert await anext(stream) is engine.chunks[0]
+        with pytest.raises(ValueError, match="stream failed") as raised:
+            await anext(stream)
+        assert raised.value is error
+        assert engine.cleanups == 1
+
+    @pytest.mark.anyio
+    @pytest.mark.parametrize("method", ["stream_generate", "stream_chat"])
+    async def test_closing_partially_consumed_generator_cleans_up(self, method):
+        engine = _StreamingEngine()
+        async with aclosing(_engine_stream(engine, method)) as stream:
+            assert await anext(stream) is engine.chunks[0]
+            assert engine.cleanups == 0
+        assert engine.cleanups == 1
+        with pytest.raises(StopAsyncIteration):
+            await anext(stream)
+
+    @pytest.mark.anyio
+    @pytest.mark.parametrize("method", ["stream_generate", "stream_chat"])
+    async def test_cancelling_partially_consumed_generator_cleans_up(self, method):
+        engine = _StreamingEngine(block=True)
+        received = []
+
+        async def consume():
+            async for output in _engine_stream(engine, method):
+                received.append(output)
+
+        consumer = asyncio.create_task(consume())
+        try:
+            await asyncio.wait_for(engine.waiting.wait(), timeout=1)
+            assert len(received) == 1
+            assert received[0] is engine.chunks[0]
+            assert engine.cleanups == 0
+        finally:
+            consumer.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await consumer
+        assert engine.cleanups == 1
 
 
 class TestShieldTask:

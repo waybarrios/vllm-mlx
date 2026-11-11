@@ -95,14 +95,14 @@ def build_text_model(
     if vlm_model is None:
         return None
 
-    model_path = Path(model_path) if model_path else None
-    if model_path is None or not (model_path / "config.json").exists():
+    local_model_path = Path(model_path) if model_path else None
+    if local_model_path is None or not (local_model_path / "config.json").exists():
         return None
 
     model_type = ""
     text_model_cls = None
     try:
-        config = json.loads((model_path / "config.json").read_text())
+        config = json.loads((local_model_path / "config.json").read_text())
         text_config = config.get("text_config", config)
         model_type = text_config.get("model_type") or config.get("model_type", "")
         if not model_type.startswith(_EXTRACTABLE_TEXT_MODEL_PREFIXES):
@@ -127,9 +127,9 @@ def build_text_model(
         # the serving engine explicitly enabled speculative MTP decoding.
         vlm_lm = vlm_model.language_model
         vlm_weights = mlx.utils.tree_flatten(vlm_lm.parameters())
-        mtp_weights = _load_mtp_weights(model_path) if enable_mtp else []
+        mtp_weights = _load_mtp_weights(local_model_path) if enable_mtp else []
 
-        all_weight_names = set(name for name, _ in vlm_weights)
+        all_weight_names = set(pair[0] for pair in vlm_weights)
         all_weight_names.update(name for name, _ in mtp_weights)
 
         # Quantize the TextModel skeleton to match source weights.
@@ -180,7 +180,7 @@ def build_text_model(
             text_model.load_weights(mtp_weights, strict=False)
             logger.info("Loaded %d MTP weights from safetensors", len(mtp_weights))
         elif enable_mtp:
-            logger.warning("No MTP weights found in %s", model_path.name)
+            logger.warning("No MTP weights found in %s", local_model_path.name)
 
         # Inject MTP if TextModel doesn't have native MTP support.
         # mlx_lm's qwen3_5.TextModel strips MTP weights in sanitize(),
@@ -192,7 +192,7 @@ def build_text_model(
             if num_mtp > 0:
                 from .patches.qwen3_5_mtp import inject_mtp_support
 
-                inject_mtp_support(text_model, model_path, config)
+                inject_mtp_support(text_model, local_model_path, config)
 
         if hasattr(text_model, "mtp") and text_model.mtp is not None:
             mx.eval(text_model.mtp.parameters())
@@ -289,6 +289,10 @@ def _load_mtp_weights(model_path: Path) -> list[tuple[str, mx.array]]:
             logger.warning("MTP shard not found: %s", shard_file)
             continue
         shard_data = mx.load(str(shard_path))
+        if not isinstance(shard_data, dict):
+            raise TypeError(
+                "MTP shard must contain a dictionary of named weight arrays"
+            )
         for orig, clean in key_pairs:
             if orig in shard_data:
                 weights.append((clean, shard_data[orig]))

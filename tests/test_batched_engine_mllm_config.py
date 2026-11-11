@@ -1,6 +1,7 @@
 """BatchedEngine MLLM scheduler configuration wiring tests.
 
-These tests avoid model loading and MLX imports. They validate that CLI-level
+These tests avoid model loading; importing the real loader may import MLX.
+They validate that CLI-level
 SchedulerConfig fields survive the BatchedEngine -> MLLMSchedulerConfig bridge.
 """
 
@@ -66,22 +67,19 @@ def _scoped_mlx_stubs():
         for name, module in sys.modules.items()
         if any(name == prefix or name.startswith(f"{prefix}.") for prefix in prefixes)
     }
-    child_links = (
-        ("mlx", "core"),
-        ("vllm_mlx", "engine"),
-        ("vllm_mlx.engine", "batched"),
-    )
     saved_child_attrs = {
-        (parent_name, child_name): getattr(
-            saved_modules.get(parent_name), child_name, missing
-        )
-        for parent_name, child_name in child_links
+        name: vars(module).copy() for name, module in saved_modules.items()
     }
     installed = _install_mlx_stubs()
     yield
     if not installed:
         return
 
+    affected_modules = set(saved_modules) | {
+        name
+        for name in sys.modules
+        if any(name == prefix or name.startswith(f"{prefix}.") for prefix in prefixes)
+    }
     for name in list(sys.modules):
         if (
             any(name == prefix or name.startswith(f"{prefix}.") for prefix in prefixes)
@@ -90,14 +88,38 @@ def _scoped_mlx_stubs():
             sys.modules.pop(name, None)
     sys.modules.update(saved_modules)
 
-    for (parent_name, child_name), saved_attr in saved_child_attrs.items():
+    for name in affected_modules:
+        parent_name, _, child_name = name.rpartition(".")
         parent = saved_modules.get(parent_name)
         if parent is None:
             continue
+        saved_attr = saved_child_attrs[parent_name].get(child_name, missing)
         if saved_attr is missing:
             parent.__dict__.pop(child_name, None)
         else:
             setattr(parent, child_name, saved_attr)
+
+
+def test_scoped_mlx_stubs_restore_imported_parent_links(monkeypatch):
+    import importlib
+
+    parent = importlib.import_module("vllm_mlx.engine")
+    for child_name in ("batched", "chat_template_safety"):
+        monkeypatch.delitem(sys.modules, f"vllm_mlx.engine.{child_name}", raising=False)
+        monkeypatch.delattr(parent, child_name, raising=False)
+    monkeypatch.setattr(sys.modules[__name__], "_install_mlx_stubs", lambda: True)
+
+    scope = _scoped_mlx_stubs.__wrapped__()
+    next(scope)
+    try:
+        importlib.import_module("vllm_mlx.engine.batched")
+        assert "chat_template_safety" in vars(parent)
+    finally:
+        with pytest.raises(StopIteration):
+            next(scope)
+
+    assert "vllm_mlx.engine.chat_template_safety" not in sys.modules
+    assert "chat_template_safety" not in vars(parent)
 
 
 def test_start_mllm_forwards_prefix_cache_disable_to_mllm_scheduler(monkeypatch):
@@ -174,21 +196,30 @@ def test_start_mllm_forwards_prefix_cache_disable_to_mllm_scheduler(monkeypatch)
     assert captured["scheduler_kwargs"]["specprefill_draft_model"] is None
 
 
-def test_start_mllm_forwards_external_assistant_drafter(monkeypatch):
+def _run_start_mllm_with_external_drafter(monkeypatch, loaded_drafter):
     from vllm_mlx.engine.batched import BatchedEngine
+    import vllm_mlx.models.mllm as mllm_mod
 
     captured = {}
-    loaded_drafter = object()
+
+    def load_drafter_fixture(model_path, *, target_model=None):
+        captured["loader_path"] = model_path
+        return loaded_drafter
+
+    monkeypatch.setattr(mllm_mod, "load_mtp_drafter", load_drafter_fixture)
 
     class FakeMLXMultimodalLM:
+        _load_draft_model = mllm_mod.MLXMultimodalLM._load_draft_model
+
         def __init__(self, model_name, trust_remote_code=True, **kwargs):
             captured["model_kwargs"] = kwargs
             self.model = object()
             self.processor = object()
-            self._draft_model = loaded_drafter
+            self.draft_kind = kwargs["draft_kind"]
+            self.draft_model_path = kwargs["draft_model"]
 
         def load(self):
-            return None
+            self._draft_model = self._load_draft_model()
 
     class FakeMLLMSchedulerConfig:
         def __init__(self, **kwargs):
@@ -200,6 +231,9 @@ def test_start_mllm_forwards_external_assistant_drafter(monkeypatch):
 
         async def start(self):
             return None
+
+        def get_stats(self):
+            return {}
 
     import vllm_mlx.engine.batched as batched_mod
 
@@ -223,7 +257,22 @@ def test_start_mllm_forwards_external_assistant_drafter(monkeypatch):
         mllm_draft_block_size=6,
     )
     asyncio.run(engine._start_mllm())
+    captured["stats"] = engine.get_stats()
+    return captured
 
+
+def test_start_mllm_forwards_external_assistant_drafter(monkeypatch):
+    # Released mlx-vlm v0.6.5 (84f43753) and v0.6.6 (c9e27b08):
+    # gemma4_assistant.Gemma4AssistantDraftModel has no capability marker.
+    # This models that attribute contract only; no weights are loaded and no
+    # numerical Gemma support is certified by this fixture.
+    class ReleasedGemmaDrafter:
+        pass
+
+    loaded_drafter = ReleasedGemmaDrafter()
+    captured = _run_start_mllm_with_external_drafter(monkeypatch, loaded_drafter)
+
+    assert captured["loader_path"] == "assistant"
     assert captured["model_kwargs"]["draft_model"] == "assistant"
     assert captured["model_kwargs"]["draft_kind"] == "mtp"
     assert captured["model_kwargs"]["draft_block_size"] == 6
@@ -233,6 +282,25 @@ def test_start_mllm_forwards_external_assistant_drafter(monkeypatch):
         "draft_kind": "mtp",
         "draft_block_size": 6,
     }
+    assert captured["stats"]["mtp"]["continuous_batching_supported"] is None
+    assert not hasattr(loaded_drafter, "supports_continuous_batching")
+
+
+@pytest.mark.parametrize(
+    "loaded_drafter",
+    [
+        None,
+        object(),
+        SimpleNamespace(supports_continuous_batching=None),
+        SimpleNamespace(supports_continuous_batching="false"),
+        SimpleNamespace(supports_continuous_batching=False),
+    ],
+)
+def test_capability_reporting_does_not_change_startup_admission(
+    monkeypatch, loaded_drafter
+):
+    captured = _run_start_mllm_with_external_drafter(monkeypatch, loaded_drafter)
+    assert captured["scheduler_kwargs"]["draft_model"] is loaded_drafter
 
 
 def _generation_output():
@@ -260,6 +328,9 @@ def _batched_mllm_engine(scheduler, *, default_mllm_draft=False):
     )
     engine._loaded = True
     engine._mllm_scheduler = scheduler
+    engine._mllm_instance = SimpleNamespace(
+        _draft_model=SimpleNamespace(supports_continuous_batching=True)
+    )
     return engine
 
 
@@ -344,6 +415,19 @@ def test_idle_stats_report_configured_mllm_draft_default():
         "default_enabled": True,
         "continuous_batching_supported": True,
     }
+
+
+@pytest.mark.parametrize("reported", [False, None, "false"])
+def test_batched_stats_preserve_scheduler_batch_capability(reported):
+    engine = _batched_mllm_engine(
+        SimpleNamespace(
+            get_stats=lambda: {"mtp": {"continuous_batching_supported": reported}}
+        )
+    )
+
+    assert engine.get_stats()["mtp"]["continuous_batching_supported"] is (
+        reported if type(reported) is bool else None
+    )
 
 
 def _run_start_mllm(monkeypatch, scheduler_config, **engine_kwargs):

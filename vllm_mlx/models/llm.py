@@ -7,9 +7,9 @@ integrating with vLLM's model execution system.
 """
 
 import logging
-from collections.abc import Iterator
+from collections.abc import Generator
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Union
+from typing import TYPE_CHECKING, Any, Union
 
 if TYPE_CHECKING:
     import mlx.core as mx
@@ -82,8 +82,8 @@ class MLXLanguageModel:
         self._mtp_num_draft_tokens = mtp_num_draft_tokens
         self._prefill_step_size = prefill_step_size
 
-        self.model = None
-        self.tokenizer = None
+        self.model: Any | None = None
+        self.tokenizer: Any | None = None
         self._loaded = False
 
     def load(self) -> None:
@@ -97,7 +97,9 @@ class MLXLanguageModel:
             logger.info(f"Loading model: {self.model_name}")
 
             # Build tokenizer config
-            tokenizer_config = {"trust_remote_code": self.trust_remote_code}
+            tokenizer_config: dict[str, Any] = {
+                "trust_remote_code": self.trust_remote_code
+            }
 
             # Qwen3 fix: eos_token changed from <|im_end|> to <|endoftext|>
             # but chat template still uses <|im_end|>, so we need to set it explicitly
@@ -207,6 +209,9 @@ class MLXLanguageModel:
         if logits_processors:
             all_processors = list(logits_processors) + all_processors
 
+        # Generate text
+        assert self.model is not None
+        assert self.tokenizer is not None
         model, prompt, cache_kwargs = self._generation_inputs(prompt, kv_cache_bits)
         output_text = generate(
             model,
@@ -220,6 +225,7 @@ class MLXLanguageModel:
         )
 
         # Tokenize output to get token IDs
+        assert self.tokenizer is not None
         tokens = self.tokenizer.encode(output_text)
 
         # Determine finish reason
@@ -268,7 +274,7 @@ class MLXLanguageModel:
         prompt_cache=None,
         kv_cache_bits: int | None = None,
         **kwargs,
-    ) -> Iterator[StreamingOutput]:
+    ) -> Generator[StreamingOutput, None, None]:
         """
         Stream text generation token by token.
 
@@ -311,6 +317,7 @@ class MLXLanguageModel:
             generation_kwargs["num_draft_tokens"] = self._mtp_num_draft_tokens
 
         # Count prompt tokens once upfront
+        assert self.tokenizer is not None
         if isinstance(prompt, str):
             num_prompt_tokens = len(self.tokenizer.encode(prompt))
         else:
@@ -320,6 +327,7 @@ class MLXLanguageModel:
         max_stop_len = max((len(s) for s in stop_list), default=0)
         accumulated_tail = ""
 
+        assert self.model is not None
         for token_count, response in enumerate(
             stream_generate(
                 model,
@@ -389,10 +397,12 @@ class MLXLanguageModel:
         if not self._loaded:
             self.load()
 
+        assert self.tokenizer is not None
+
         # Apply chat template
         if hasattr(self.tokenizer, "apply_chat_template"):
             # Build kwargs for apply_chat_template
-            template_kwargs = {
+            template_kwargs: dict[str, Any] = {
                 "tokenize": False,
                 "add_generation_prompt": True,
             }
@@ -442,7 +452,7 @@ class MLXLanguageModel:
         }
 
         # Try to get model config
-        if hasattr(self.model, "config"):
+        if self.model is not None and hasattr(self.model, "config"):
             config = self.model.config
             info.update(
                 {

@@ -22,7 +22,7 @@ The actual MTP scheduling logic lives in:
 import json
 import logging
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 logger = logging.getLogger(__name__)
 
@@ -360,7 +360,7 @@ def inject_mtp_support(model: Any, model_path, config: dict) -> bool:
     logger.info(
         f"[MTP inject] Loading weights from {mtp_file.name} (BF16, no quantization)"
     )
-    raw = mx.load(str(mtp_file))
+    raw = cast(dict[str, mx.array], mx.load(str(mtp_file)))
     raw_mtp = {
         clean: value
         for key, value in raw.items()
@@ -467,7 +467,7 @@ def inject_mtp_support(model: Any, model_path, config: dict) -> bool:
     # --- Attach MTP and monkey-patch model class ---
     text_model.mtp = mtp
 
-    original_class = text_model.__class__
+    original_class: Any = text_model.__class__
 
     class _Qwen3_5MTP(original_class):
         """Qwen3.5 with MTP support (injected at runtime)."""

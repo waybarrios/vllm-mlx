@@ -9,6 +9,83 @@ Usage:
 import pytest
 
 
+def test_model_runner_optimizations_reach_hardware_and_compilation(monkeypatch):
+    from vllm_mlx import optimizations
+    from vllm_mlx.model_runner import MLXModelRunner
+
+    hardware = optimizations.HardwareInfo("Test", 16.0, 100.0, 8)
+    monkeypatch.setattr(optimizations, "detect_hardware", lambda: hardware)
+    runner = MLXModelRunner.__new__(MLXModelRunner)
+    runner._hardware_info = None
+    compiled = []
+    monkeypatch.setattr(
+        runner, "_setup_compiled_forward", lambda: compiled.append(True)
+    )
+
+    runner._apply_optimizations()
+
+    assert runner._hardware_info is hardware
+    assert compiled == [True]
+
+
+def test_model_runner_optimization_failure_preserves_fallback(monkeypatch, caplog):
+    from vllm_mlx import optimizations
+    from vllm_mlx.model_runner import MLXModelRunner
+
+    def fail_detection():
+        raise RuntimeError("hardware unavailable")
+
+    monkeypatch.setattr(optimizations, "detect_hardware", fail_detection)
+    runner = MLXModelRunner.__new__(MLXModelRunner)
+    runner._hardware_info = None
+    compiled = []
+    monkeypatch.setattr(
+        runner, "_setup_compiled_forward", lambda: compiled.append(True)
+    )
+
+    runner._apply_optimizations()
+
+    assert runner._hardware_info is None
+    assert compiled == []
+    assert "Failed to apply optimizations" in caplog.text
+
+
+def test_model_runner_compiled_forward_matches_mlx_forward():
+    from types import SimpleNamespace
+
+    import mlx.core as mx
+
+    from vllm_mlx.model_runner import MLXModelRunner
+
+    class Model:
+        def __call__(self, inputs):
+            return mx.tanh(inputs @ mx.array([[0.5, -1.0], [1.5, 0.25]]))
+
+    runner = MLXModelRunner.__new__(MLXModelRunner)
+    runner.model = Model()
+    runner._compiled_forward = None
+    runner._hardware_info = None
+    runner._loaded = True
+    runner._enable_optimizations = True
+    runner.model_config = SimpleNamespace(model="tiny-compile")
+    runner._apply_optimizations()
+
+    assert runner._compiled_forward is not None
+    inputs = mx.array([[1.0, 2.0], [-1.0, 0.5]])
+    expected = runner.model(inputs)
+    actual = runner._compiled_forward(inputs)
+    mx.eval(expected, actual)
+    assert mx.allclose(actual, expected).item()
+    hardware = runner._hardware_info
+    assert hardware is not None
+    assert runner.get_model_info()["hardware"] == {
+        "chip": hardware.chip_name,
+        "memory_gb": hardware.total_memory_gb,
+        "bandwidth_gbs": hardware.memory_bandwidth_gbs,
+        "gpu_cores": hardware.gpu_cores,
+    }
+
+
 class TestHardwareDetection:
     """Tests for hardware detection functionality."""
 

@@ -96,7 +96,8 @@ def create_chat_function(
             )
             response.raise_for_status()
             result = response.json()
-            return result["choices"][0]["message"]["content"]
+            response_text: str = result["choices"][0]["message"]["content"]
+            return response_text
 
         except requests.exceptions.ConnectionError:
             return "Error: Cannot connect to server. Make sure vllm-mlx is running."

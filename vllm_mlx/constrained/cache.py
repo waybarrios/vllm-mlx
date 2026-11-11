@@ -105,7 +105,7 @@ def _get_eos_token_id(tokenizer: Any) -> int | list[int]:
     eos_list = getattr(tokenizer, "eos_token_ids", None)
     if isinstance(eos_list, (list, tuple)) and eos_list:
         return list(eos_list)
-    eos = getattr(tokenizer, "eos_token_id", None)
+    eos: int | list[int] | None = getattr(tokenizer, "eos_token_id", None)
     if eos is not None:
         return eos
     return 0

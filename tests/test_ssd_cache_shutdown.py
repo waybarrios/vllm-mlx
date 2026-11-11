@@ -196,3 +196,264 @@ class TestSSDCacheTierShutdown:
                 heartbeat_task.cancel()
 
         assert heartbeat_ran_during_close
+
+
+class TestSSDReaderSerializerContract:
+    @pytest.mark.parametrize(
+        "layer_type, serializer_name",
+        [
+            ("KVCache", "KVCacheSerializer"),
+            ("RotatingKVCache", "KVCacheSerializer"),
+            ("ArraysCache", "ArraysCacheSerializer"),
+            ("MambaCache", "ArraysCacheSerializer"),
+            ("CacheList", "CacheListSerializer"),
+        ],
+    )
+    def test_known_alias_dispatch_preserves_payload(
+        self, tmp_path, monkeypatch, layer_type, serializer_name
+    ):
+        import json
+
+        from vllm_mlx import ssd_cache
+
+        tier = object.__new__(SSDCacheTier)
+        tier._data_dir = str(tmp_path)
+        entry = tmp_path / "entry"
+        entry.mkdir()
+        metadata = {"layer_type": layer_type, "layer_idx": 7, "opaque": [3, None]}
+        (entry / "manifest.json").write_text(json.dumps({"layers": [metadata]}))
+        calls, quarantines = [], []
+        state = {"nested": [object()], "opaque": object()}
+
+        def deserialize(serializer, path, meta):
+            calls.append((type(serializer), path, meta))
+            return state
+
+        for cls in (
+            ssd_cache.KVCacheSerializer,
+            ssd_cache.ArraysCacheSerializer,
+            ssd_cache.CacheListSerializer,
+        ):
+            monkeypatch.setattr(cls, "deserialize_layer", deserialize)
+        monkeypatch.setattr(
+            tier, "_quarantine_entry", lambda *args: quarantines.append(args)
+        )
+
+        result = tier._read_entry((4, 5), "entry")
+
+        assert len(result) == 1
+        assert result[0] is state
+        assert result[0]["nested"] is state["nested"]
+        assert calls == [
+            (
+                getattr(ssd_cache, serializer_name),
+                str(entry / "layer_7.safetensors"),
+                metadata,
+            )
+        ]
+        assert quarantines == []
+
+    def test_mixed_layers_keep_order_and_returned_dictionary_identity(
+        self, tmp_path, monkeypatch
+    ):
+        import json
+
+        from vllm_mlx import ssd_cache
+
+        tier = object.__new__(SSDCacheTier)
+        tier._data_dir = str(tmp_path)
+        entry = tmp_path / "mixed"
+        entry.mkdir()
+        layers = [
+            {"layer_type": "MambaCache", "layer_idx": 8},
+            {"layer_type": "CacheList", "layer_idx": 2},
+            {"layer_type": "RotatingKVCache", "layer_idx": 5},
+            {"layer_type": "ArraysCache", "layer_idx": 1},
+            {"layer_type": "KVCache", "layer_idx": 9},
+        ]
+        (entry / "manifest.json").write_text(json.dumps({"layers": layers}))
+        states = [{"nested": [object()]} for _ in layers]
+        calls, quarantines = [], []
+
+        def deserialize(serializer, path, meta):
+            state = states[len(calls)]
+            calls.append((type(serializer), path, meta))
+            return state
+
+        for cls in (
+            ssd_cache.KVCacheSerializer,
+            ssd_cache.ArraysCacheSerializer,
+            ssd_cache.CacheListSerializer,
+        ):
+            monkeypatch.setattr(cls, "deserialize_layer", deserialize)
+        monkeypatch.setattr(
+            tier, "_quarantine_entry", lambda *args: quarantines.append(args)
+        )
+
+        result = tier._read_entry((1, 2), "mixed")
+
+        assert len(result) == 5
+        assert all(actual is expected for actual, expected in zip(result, states))
+        assert all(result[i]["nested"] is states[i]["nested"] for i in range(5))
+        assert [cls for cls, _, _ in calls] == [
+            ssd_cache.ArraysCacheSerializer,
+            ssd_cache.CacheListSerializer,
+            ssd_cache.KVCacheSerializer,
+            ssd_cache.ArraysCacheSerializer,
+            ssd_cache.KVCacheSerializer,
+        ]
+        assert [path for _, path, _ in calls] == [
+            str(entry / "layer_8.safetensors"),
+            str(entry / "layer_2.safetensors"),
+            str(entry / "layer_5.safetensors"),
+            str(entry / "layer_1.safetensors"),
+            str(entry / "layer_9.safetensors"),
+        ]
+        assert [meta for _, _, meta in calls] == layers
+        assert quarantines == []
+
+    @pytest.mark.parametrize("successful_prefix", [False, True])
+    def test_unknown_layer_quarantines_once_and_stops_without_partial_result(
+        self, tmp_path, monkeypatch, caplog, successful_prefix
+    ):
+        import json
+
+        from vllm_mlx import ssd_cache
+
+        tier = object.__new__(SSDCacheTier)
+        tier._data_dir = str(tmp_path)
+        entry = tmp_path / "unknown"
+        entry.mkdir()
+        layers = [{"layer_type": "UnknownCache", "layer_idx": 1}]
+        if successful_prefix:
+            layers.insert(0, {"layer_type": "KVCache", "layer_idx": 0})
+        layers.append({"layer_type": "CacheList", "layer_idx": 2})
+        (entry / "manifest.json").write_text(json.dumps({"layers": layers}))
+        calls, quarantines = [], []
+
+        def deserialize(serializer, path, meta):
+            calls.append(meta["layer_idx"])
+            return {"opaque": object()}
+
+        for cls in (
+            ssd_cache.KVCacheSerializer,
+            ssd_cache.ArraysCacheSerializer,
+            ssd_cache.CacheListSerializer,
+        ):
+            monkeypatch.setattr(cls, "deserialize_layer", deserialize)
+        monkeypatch.setattr(
+            tier, "_quarantine_entry", lambda *args: quarantines.append(args)
+        )
+
+        assert tier._read_entry((11,), "unknown") is None
+        assert calls == ([0] if successful_prefix else [])
+        assert quarantines == [((11,), "unknown")]
+        assert len(caplog.records) == 1
+        assert "unknown layer type UnknownCache" in caplog.text
+
+    @pytest.mark.parametrize("failing_type", ["KVCache", "ArraysCache", "CacheList"])
+    def test_deserializer_error_quarantines_and_discards_earlier_success(
+        self, tmp_path, monkeypatch, caplog, failing_type
+    ):
+        import json
+
+        from vllm_mlx import ssd_cache
+
+        tier = object.__new__(SSDCacheTier)
+        tier._data_dir = str(tmp_path)
+        entry = tmp_path / "failed"
+        entry.mkdir()
+        layers = [
+            {"layer_type": "KVCache", "layer_idx": 0},
+            {"layer_type": failing_type, "layer_idx": 4},
+            {"layer_type": "MambaCache", "layer_idx": 9},
+        ]
+        (entry / "manifest.json").write_text(json.dumps({"layers": layers}))
+        calls, quarantines = [], []
+
+        def deserialize(serializer, path, meta):
+            calls.append(meta["layer_idx"])
+            if meta["layer_idx"] == 4:
+                raise ValueError("broken layer payload")
+            return {"opaque": object()}
+
+        for cls in (
+            ssd_cache.KVCacheSerializer,
+            ssd_cache.ArraysCacheSerializer,
+            ssd_cache.CacheListSerializer,
+        ):
+            monkeypatch.setattr(cls, "deserialize_layer", deserialize)
+        monkeypatch.setattr(
+            tier, "_quarantine_entry", lambda *args: quarantines.append(args)
+        )
+
+        assert tier._read_entry((12,), "failed") is None
+        assert calls == [0, 4]
+        assert quarantines == [((12,), "failed")]
+        assert len(caplog.records) == 1
+        assert "corrupt layer 4 in failed" in caplog.text
+        assert "broken layer payload" in caplog.text
+
+    @pytest.mark.parametrize("manifest_kind", ["invalid_json", "missing_file"])
+    def test_manifest_failure_quarantines_before_any_deserialization(
+        self, tmp_path, monkeypatch, caplog, manifest_kind
+    ):
+        from vllm_mlx import ssd_cache
+
+        tier = object.__new__(SSDCacheTier)
+        tier._data_dir = str(tmp_path)
+        entry = tmp_path / "corrupt"
+        entry.mkdir()
+        if manifest_kind == "invalid_json":
+            (entry / "manifest.json").write_text("{")
+        calls, quarantines = [], []
+
+        def deserialize(serializer, path, meta):
+            calls.append(meta)
+            return {}
+
+        for cls in (
+            ssd_cache.KVCacheSerializer,
+            ssd_cache.ArraysCacheSerializer,
+            ssd_cache.CacheListSerializer,
+        ):
+            monkeypatch.setattr(cls, "deserialize_layer", deserialize)
+        monkeypatch.setattr(
+            tier, "_quarantine_entry", lambda *args: quarantines.append(args)
+        )
+
+        assert tier._read_entry((13,), "corrupt") is None
+        assert calls == []
+        assert quarantines == [((13,), "corrupt")]
+        assert len(caplog.records) == 1
+        assert "corrupt manifest for corrupt" in caplog.text
+
+    def test_empty_manifest_returns_empty_layers_without_callbacks(
+        self, tmp_path, monkeypatch
+    ):
+        from vllm_mlx import ssd_cache
+
+        tier = object.__new__(SSDCacheTier)
+        tier._data_dir = str(tmp_path)
+        entry = tmp_path / "empty"
+        entry.mkdir()
+        (entry / "manifest.json").write_text('{"layers": []}')
+        calls, quarantines = [], []
+
+        def deserialize(serializer, path, meta):
+            calls.append(meta)
+            return {}
+
+        for cls in (
+            ssd_cache.KVCacheSerializer,
+            ssd_cache.ArraysCacheSerializer,
+            ssd_cache.CacheListSerializer,
+        ):
+            monkeypatch.setattr(cls, "deserialize_layer", deserialize)
+        monkeypatch.setattr(
+            tier, "_quarantine_entry", lambda *args: quarantines.append(args)
+        )
+
+        assert tier._read_entry((), "empty") == []
+        assert calls == []
+        assert quarantines == []
