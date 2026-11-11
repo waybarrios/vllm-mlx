@@ -58,6 +58,7 @@ class MLXLanguageModel:
         mtp: bool = False,
         mtp_num_draft_tokens: int = 1,
         model_id: str | None = None,
+        prefill_step_size: int = 2048,
     ):
         """
         Initialize the MLX language model.
@@ -71,6 +72,7 @@ class MLXLanguageModel:
             model_id: The model's identity when ``model_name`` is a resolved
                 local snapshot; name-based fixes key on it. Defaults to
                 ``model_name``.
+            prefill_step_size: Prompt chunk size within each layer for quantized prefill.
         """
         self.model_name = model_name
         self.model_id = model_id or model_name
@@ -78,6 +80,7 @@ class MLXLanguageModel:
         self.trust_remote_code = trust_remote_code
         self._mtp = mtp
         self._mtp_num_draft_tokens = mtp_num_draft_tokens
+        self._prefill_step_size = prefill_step_size
 
         self.model: Any | None = None
         self.tokenizer: Any | None = None
@@ -166,6 +169,7 @@ class MLXLanguageModel:
         repetition_penalty: float = 1.0,
         stop: list[str] | None = None,
         logits_processors: list | None = None,
+        kv_cache_bits: int | None = None,
         **kwargs,
     ) -> GenerationOutput:
         """
@@ -184,6 +188,8 @@ class MLXLanguageModel:
             logits_processors: Optional externally-supplied logits processors
                 (e.g. JSON schema constrained decoding).  Merged with built-in
                 penalty processors.
+            kv_cache_bits: Set to 4 or 8 to reduce peak memory when prefilling a
+                long prompt. Omit to use the standard generation path.
 
         Returns:
             GenerationOutput with generated text and tokens
@@ -206,14 +212,16 @@ class MLXLanguageModel:
         # Generate text
         assert self.model is not None
         assert self.tokenizer is not None
+        model, prompt, cache_kwargs = self._generation_inputs(prompt, kv_cache_bits)
         output_text = generate(
-            self.model,
+            model,
             self.tokenizer,
             prompt=prompt,
             max_tokens=max_tokens,
             sampler=sampler,
             logits_processors=all_processors if all_processors else None,
             verbose=False,
+            **cache_kwargs,
         )
 
         # Tokenize output to get token IDs
@@ -229,6 +237,28 @@ class MLXLanguageModel:
             finish_reason=finish_reason,
         )
 
+    def _generation_inputs(self, prompt, kv_cache_bits, prompt_cache=None):
+        if kv_cache_bits is None:
+            cache_kwargs = (
+                {} if prompt_cache is None else {"prompt_cache": prompt_cache}
+            )
+            return self.model, prompt, cache_kwargs
+        if self._mtp or prompt_cache is not None:
+            raise ValueError(
+                "Layerwise KV quantization requires a fresh prompt without speculative decoding"
+            )
+        from ..quantized_prefill import layerwise_prefill_model
+
+        if isinstance(prompt, str):
+            add_special = self.tokenizer.bos_token is None or not prompt.startswith(
+                self.tokenizer.bos_token
+            )
+            prompt = self.tokenizer.encode(prompt, add_special_tokens=add_special)
+        model = layerwise_prefill_model(
+            self.model, prompt, kv_cache_bits, self._prefill_step_size
+        )
+        return model, prompt, {"prefill_step_size": len(prompt)}
+
     def stream_generate(
         self,
         prompt: Union[str, "mx.array", list[int]],
@@ -242,6 +272,7 @@ class MLXLanguageModel:
         stop: list[str] | None = None,
         logits_processors: list | None = None,
         prompt_cache=None,
+        kv_cache_bits: int | None = None,
         **kwargs,
     ) -> Generator[StreamingOutput, None, None]:
         """
@@ -258,6 +289,8 @@ class MLXLanguageModel:
             repetition_penalty: Multiplicative penalty for repeating tokens
             stop: List of stop sequences
             prompt_cache: Pre-populated KV cache (e.g. from SpecPrefill)
+            kv_cache_bits: Set to 4 or 8 to reduce peak memory when prefilling a
+                long prompt. Omit to use the standard generation path.
 
         Yields:
             StreamingOutput for each generated token
@@ -277,6 +310,12 @@ class MLXLanguageModel:
         if penalty_processors or logits_processors:
             all_processors = (logits_processors or []) + (penalty_processors or [])
 
+        model, prompt, generation_kwargs = self._generation_inputs(
+            prompt, kv_cache_bits, prompt_cache
+        )
+        if self._mtp:
+            generation_kwargs["num_draft_tokens"] = self._mtp_num_draft_tokens
+
         # Count prompt tokens once upfront
         assert self.tokenizer is not None
         if isinstance(prompt, str):
@@ -288,22 +327,16 @@ class MLXLanguageModel:
         max_stop_len = max((len(s) for s in stop_list), default=0)
         accumulated_tail = ""
 
-        mtp_kwargs: dict[str, Any] = {}
-        if self._mtp:
-            mtp_kwargs["num_draft_tokens"] = self._mtp_num_draft_tokens
-        if prompt_cache is not None:
-            mtp_kwargs["prompt_cache"] = prompt_cache
-
         assert self.model is not None
         for token_count, response in enumerate(
             stream_generate(
-                self.model,
+                model,
                 self.tokenizer,
                 prompt=prompt,
                 max_tokens=max_tokens,
                 sampler=sampler,
                 logits_processors=all_processors,
-                **mtp_kwargs,
+                **generation_kwargs,
             ),
             start=1,
         ):

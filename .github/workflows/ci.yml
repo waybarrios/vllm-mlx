@@ -251,6 +251,7 @@ jobs:
             tests/test_batched_engine.py \
             tests/test_simple_engine.py \
             tests/test_simple_engine_prefix_trie_cache.py \
+            tests/test_quantized_prefill.py \
             tests/test_text_model_dispatch.py \
             tests/test_cli.py \
             tests/test_model_registry.py \
