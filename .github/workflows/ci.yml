@@ -106,6 +106,7 @@ jobs:
             tests/test_simple_engine_thread_pinning.py \
             tests/test_engine_base.py \
             tests/test_engine_core_request_owner.py \
+            tests/test_prefix_cache_clear_release.py \
             tests/test_harmony_parsers.py \
             tests/test_endpoint_model_policies.py \
             tests/test_truncation.py \
