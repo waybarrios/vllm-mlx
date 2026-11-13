@@ -289,6 +289,10 @@ jobs:
         run: |
           pytest tests/test_memory_cache.py::test_detached_snapshot_is_freed_without_a_gc_pass -v --tb=short
 
+      - name: Run prefix cache clear release regressions
+        run: |
+          pytest tests/test_prefix_cache_clear_release.py -v --tb=short
+
       - name: Run hybrid boundary checkpoint regressions
         run: |
           pytest tests/test_mllm_boundary_checkpoint.py -v --tb=short

@@ -1503,6 +1503,9 @@ class BatchedEngine(BaseEngine):
             pc = self._mllm_scheduler.batch_generator.prefix_cache
             if pc is not None and hasattr(pc, "clear"):
                 pc.clear()
+                # Return the freed buffers to the OS (issue #793).
+                gc.collect()
+                mx.clear_cache()
                 return
         if self._engine and hasattr(self._engine, "clear_prefix_cache"):
             self._run_on_generation_worker_sync(self._engine.clear_prefix_cache)
