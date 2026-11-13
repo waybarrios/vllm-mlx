@@ -106,7 +106,6 @@ jobs:
             tests/test_simple_engine_thread_pinning.py \
             tests/test_engine_base.py \
             tests/test_engine_core_request_owner.py \
-            tests/test_prefix_cache_clear_release.py \
             tests/test_harmony_parsers.py \
             tests/test_endpoint_model_policies.py \
             tests/test_truncation.py \
@@ -289,6 +288,10 @@ jobs:
       - name: Run detached snapshot release regression
         run: |
           pytest tests/test_memory_cache.py::test_detached_snapshot_is_freed_without_a_gc_pass -v --tb=short
+
+      - name: Run prefix cache clear release regressions
+        run: |
+          pytest tests/test_prefix_cache_clear_release.py -v --tb=short
 
       - name: Run hybrid boundary checkpoint regressions
         run: |
