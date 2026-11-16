@@ -16,6 +16,7 @@ Architecture:
 3. Language model generation is batched using BatchKVCache (like LLM batching)
 """
 
+import inspect
 import logging
 import math
 import os
@@ -1816,6 +1817,14 @@ class MLLMBatchGenerator:
             kwargs["attention_mask"] = request.attention_mask
         if request.image_grid_thw is not None:
             kwargs["image_grid_thw"] = request.image_grid_thw
+        if "mask" not in kwargs:
+            try:
+                sig_params = inspect.signature(self.model.__call__).parameters
+            except (TypeError, ValueError):
+                sig_params = {}
+            mask_param = sig_params.get("mask")
+            if mask_param is not None and mask_param.default is inspect.Parameter.empty:
+                kwargs["mask"] = request.attention_mask
 
         # Run full VLM forward pass with cache.
         # The VLM passes cache= through to self.language_model(),
