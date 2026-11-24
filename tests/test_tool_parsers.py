@@ -1198,6 +1198,59 @@ class TestAutoToolParser:
         assert result.tools_called
         assert result.tool_calls[0]["name"] == "test_func"
 
+    def test_detects_mistral_args_token(self, parser):
+        """Mistral tokenizer v11+ splits name and args on [ARGS]."""
+        text = '[TOOL_CALLS]get_weather[ARGS]{"city": "Reykjavik"}'
+        result = parser.extract_tool_calls(text)
+
+        assert result.tools_called
+        assert len(result.tool_calls) == 1
+        assert result.tool_calls[0]["name"] == "get_weather"
+        args = json.loads(result.tool_calls[0]["arguments"])
+        assert args == {"city": "Reykjavik"}
+
+    def test_mistral_args_token_value_with_brace(self, parser):
+        """A brace inside the arguments value must not move the boundary."""
+        text = '[TOOL_CALLS]write[ARGS]{"text": "a{b"}'
+        result = parser.extract_tool_calls(text)
+
+        assert result.tools_called
+        assert result.tool_calls[0]["name"] == "write"
+        args = json.loads(result.tool_calls[0]["arguments"])
+        assert args == {"text": "a{b"}
+
+    def test_detects_raw_json_parameters(self, parser):
+        """Llama 3.x raw JSON carries its args under "parameters"."""
+        text = '{"name": "get_weather", "parameters": {"city": "Reykjavik"}}'
+        result = parser.extract_tool_calls(text)
+
+        assert result.tools_called
+        assert result.tool_calls[0]["name"] == "get_weather"
+        args = json.loads(result.tool_calls[0]["arguments"])
+        assert args == {"city": "Reykjavik"}
+
+    def test_detects_python_tag_parameters(self, parser):
+        """A <|python_tag|> prefix must not block the raw JSON fallback."""
+        text = (
+            '<|python_tag|>{"name": "get_weather", '
+            '"parameters": {"city": "Reykjavik"}}'
+        )
+        result = parser.extract_tool_calls(text)
+
+        assert result.tools_called
+        assert result.tool_calls[0]["name"] == "get_weather"
+        args = json.loads(result.tool_calls[0]["arguments"])
+        assert args == {"city": "Reykjavik"}
+
+    def test_raw_json_arguments_win_over_parameters(self, parser):
+        """When both keys are present, "arguments" wins."""
+        text = '{"name": "f", "arguments": {"a": 1}, "parameters": {"b": 2}}'
+        result = parser.extract_tool_calls(text)
+
+        assert result.tools_called
+        args = json.loads(result.tool_calls[0]["arguments"])
+        assert args == {"a": 1}
+
     def test_no_tool_call(self, parser):
         """Test text without tool calls."""
         text = "This is just a regular response."
