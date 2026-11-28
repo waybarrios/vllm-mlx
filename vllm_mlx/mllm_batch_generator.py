@@ -4064,7 +4064,8 @@ def install_chunked_prefill_mllm(
                 # request-local processors are applied.
                 # A prompt ending with the think suffix already holds its
                 # conversation-boundary checkpoint, which replaces this entry.
-                extends_cached = partial["cached_count"] > 0
+                cached_count = partial["cached_count"]
+                extends_cached = cached_count > 0
                 prefix_cache: Optional[MemoryAwarePrefixCache] = getattr(
                     batch_gen, "prefix_cache", None
                 )
@@ -4209,7 +4210,7 @@ def install_chunked_prefill_mllm(
                 # Store in prefix cache (prompt-only)
                 if (
                     checkpoint_entry is None
-                    and batch_gen.prefix_cache is not None
+                    and prefix_cache is not None
                     and is_text_only_prefix_cache_request(req)
                 ):
                     try:
@@ -4217,19 +4218,26 @@ def install_chunked_prefill_mllm(
                         input_ids_list = cast(
                             List[int], req.input_ids.reshape(-1).tolist()
                         )
-                        S = batch_gen._think_suffix_len
-                        cache_key = input_ids_list[:-S] if S > 0 else input_ids_list
-                        # Trim output: at store time output_count=0, so
-                        # trim by S only (matching canonical path's
-                        # output_count + S invariant).
-                        trim_amount = S
-                        batch_gen._store_prefix_snapshot(
-                            cache_key,
-                            partial["cache"],
-                            trim_amount,
-                            req.request_id,
-                            "interleaved prefill",
+                        restored_boundary = (
+                            extends_cached
+                            and batch_gen._needs_prefill_checkpoint(partial["cache"])
+                            and batch_gen._conversation_boundary(input_ids_list)
+                            == cached_count
+                            and input_ids_list[:cached_count] in prefix_cache
                         )
+                        # Keep the restored conversation checkpoint on an exact resend.
+                        # Storing the full prompt here would evict the reusable prefix.
+                        if not restored_boundary:
+                            S = batch_gen._think_suffix_len
+                            cache_key = input_ids_list[:-S] if S > 0 else input_ids_list
+                            # At store time output_count=0, so trim by S only.
+                            batch_gen._store_prefix_snapshot(
+                                cache_key,
+                                partial["cache"],
+                                S,
+                                req.request_id,
+                                "interleaved prefill",
+                            )
                     except Exception as e:
                         logger.warning(
                             f"Failed to store prefix cache after chunked "

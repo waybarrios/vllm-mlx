@@ -3438,6 +3438,74 @@ class TestChunkedPrefillCacheHandling:
         assert int(stored[0][0].item()) == 15
         assert stored[1].offset == 15
 
+    def _interleaved_rotating_gen(self, monkeypatch, make_cache):
+        from vllm_mlx.memory_cache import MemoryAwarePrefixCache, MemoryCacheConfig
+        from vllm_mlx.mllm_batch_generator import install_chunked_prefill_mllm
+
+        gen = self._make_fake_batch_gen()
+        gen._think_suffixes = ((100, 45518, 107, 101),)
+        gen.prefix_cache = MemoryAwarePrefixCache(
+            MagicMock(), MemoryCacheConfig(max_memory_mb=1, min_prefix_tokens=1)
+        )
+        monkeypatch.setattr(
+            "mlx_lm.models.cache.make_prompt_cache",
+            lambda *_args, **_kwargs: [make_cache()],
+        )
+        chunks = []
+
+        def language_model(tokens, cache, **_kwargs):
+            chunks.append(tokens.reshape(-1).tolist())
+            keys = tokens[:, None, :, None].astype(mx.float32)
+            cache[0].update_and_fetch(keys, keys)
+            return mx.zeros((*tokens.shape, 4))
+
+        gen.language_model = language_model
+        gen.stop_tokens = {0}
+        gen._next = lambda: []
+        gen._preprocess_request = lambda _: None
+        install_chunked_prefill_mllm(gen, budget=1)
+        return gen, chunks
+
+    @pytest.mark.parametrize(
+        "cache_module", ["mlx_lm.models.cache", "mlx_vlm.models.cache"]
+    )
+    def test_interleaved_exact_repeats_keep_rotating_checkpoint(
+        self, monkeypatch, cache_module
+    ):
+        cache_types = pytest.importorskip(cache_module)
+        gen, chunks = self._interleaved_rotating_gen(
+            monkeypatch, lambda: cache_types.RotatingKVCache(max_size=4)
+        )
+        suffix = (100, 45518, 107, 101)
+        prompt = [10, 11, 12, 13, 14, 15, *suffix]
+
+        self._run_interleaved(gen, "first", prompt)
+        for request_id in ("repeat-1", "repeat-2"):
+            chunks.clear()
+            self._run_interleaved(gen, request_id, prompt)
+            assert chunks[: len(suffix)] == [[token] for token in suffix]
+
+    def test_interleaved_trimmed_neighbor_keeps_prompt_fallback(self, monkeypatch):
+        from mlx_vlm.models.cache import RotatingKVCache
+
+        gen, chunks = self._interleaved_rotating_gen(
+            monkeypatch, lambda: RotatingKVCache(max_size=5)
+        )
+        neighbor = [10, 11, 12, 90]
+        cache = [RotatingKVCache(max_size=5)]
+        gen.language_model(mx.array([neighbor]), cache=cache)
+        assert gen.prefix_cache.store(neighbor, cache)
+
+        suffix = (100, 45518, 107, 101)
+        prompt = [10, 11, 12, *suffix]
+        chunks.clear()
+        self._run_interleaved(gen, "neighbor-hit", prompt)
+
+        assert chunks[: len(suffix)] == [[token] for token in suffix]
+        chunks.clear()
+        self._run_interleaved(gen, "extension", [*prompt, 20, 21])
+        assert chunks[:2] == [[20], [21]]
+
     def test_interleaved_abort_during_checkpoint_commit_is_request_local(self):
         from types import SimpleNamespace
 
