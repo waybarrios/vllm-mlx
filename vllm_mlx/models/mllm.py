@@ -393,19 +393,6 @@ def _generation_kwargs_with_stop(
     return generation_kwargs
 
 
-def _until_stop_sequence(chunks, stop: list[str] | None):
-    if not stop:
-        yield from chunks
-        return
-
-    accumulated_text = ""
-    for chunk in chunks:
-        accumulated_text += _chunk_text(chunk)
-        yield chunk
-        if any(stop_seq in accumulated_text for stop_seq in stop):
-            break
-
-
 def _stream_mllm_generated_outputs(
     *,
     stream_generate_fn,
@@ -424,6 +411,9 @@ def _stream_mllm_generated_outputs(
 ):
     token_count = 0
     last_chunk = None
+    finish_reason = "stop"
+    stop_tail = ""
+    max_stop_len = max((len(sequence) for sequence in stop or ()), default=0)
     chunks = stream_generate_fn(
         model,
         processor,
@@ -436,23 +426,31 @@ def _stream_mllm_generated_outputs(
         **draft_kwargs,
         **generation_kwargs,
     )
-    for chunk in _until_stop_sequence(chunks, stop):
+    for chunk in chunks:
         last_chunk = chunk
+        text = _chunk_text(chunk)
         reported = getattr(chunk, "generation_tokens", None)
         if type(reported) is int:
             token_count = reported
         else:
             token_count += 1
         yield MLLMOutput(
-            text=_chunk_text(chunk),
+            text=text,
             finish_reason=None,
             prompt_tokens=getattr(chunk, "prompt_tokens", 0),
             completion_tokens=token_count,
         )
+        if stop:
+            stop_tail += text
+            if any(sequence in stop_tail for sequence in stop):
+                break
+            stop_tail = stop_tail[-max_stop_len:]
+    else:
+        finish_reason = getattr(last_chunk, "finish_reason", None) or "stop"
 
     yield MLLMOutput(
         text="",
-        finish_reason="stop",
+        finish_reason=finish_reason,
         prompt_tokens=getattr(last_chunk, "prompt_tokens", 0) if last_chunk else 0,
         completion_tokens=token_count,
         **draft_metrics(),

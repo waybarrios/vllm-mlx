@@ -5315,6 +5315,103 @@ class TestChatCompletionStreamingModeSwitching:
         assert response.status_code == 200
         assert extract_calls["count"] == 1
 
+    @pytest.mark.anyio
+    @pytest.mark.parametrize(
+        "terminal_text, terminal_token, finish_reason, expected_stop_reason",
+        [
+            pytest.param("", 2, "stop", "end_turn", id="eos-at-cap"),
+            pytest.param(" world", 12, "length", "max_tokens", id="token-cap"),
+        ],
+    )
+    async def test_anthropic_stream_preserves_text_backend_finish_reason(
+        self,
+        monkeypatch,
+        terminal_text,
+        terminal_token,
+        finish_reason,
+        expected_stop_reason,
+    ):
+        """Report backend stop reasons and usage through uncached text streaming."""
+        from httpx import ASGITransport, AsyncClient
+
+        import vllm_mlx.server as server
+        from vllm_mlx.engine.simple import SimpleEngine
+
+        prompt = "user: Hello\nassistant:"
+        tokenizer = MagicMock()
+        tokenizer.bos_token = None
+        tokenizer.eos_token_ids = {2}
+        tokenizer.apply_chat_template.return_value = prompt
+        tokenizer.encode.return_value = [21, 22, 23, 24, 25, 26, 27]
+        monkeypatch.setattr(
+            "vllm_mlx.utils.tokenizer.load_model_with_fallback",
+            lambda *_args, **_kwargs: (SimpleNamespace(layers=[]), tokenizer),
+        )
+        backend_stream = MagicMock(
+            return_value=iter(
+                [
+                    SimpleNamespace(text="Hello", token=11, finish_reason=None),
+                    SimpleNamespace(
+                        text=terminal_text,
+                        token=terminal_token,
+                        finish_reason=finish_reason,
+                    ),
+                ]
+            )
+        )
+        monkeypatch.setattr("mlx_lm.stream_generate", backend_stream)
+
+        engine = SimpleEngine("test-model", enable_cache=False)
+        monkeypatch.setattr(server, "_engine", engine)
+        monkeypatch.setattr(server, "_model_name", "test-model")
+        monkeypatch.setattr(server, "_model_manager", None)
+        monkeypatch.setattr(server, "_residency_manager", None)
+        monkeypatch.setattr(server, "_api_key", None)
+        monkeypatch.setattr(server, "_reasoning_parser", None)
+        monkeypatch.setattr(
+            server,
+            "_rate_limiter",
+            server.RateLimiter(requests_per_minute=60, enabled=False),
+        )
+
+        try:
+            async with AsyncClient(
+                transport=ASGITransport(app=server.app), base_url="http://testserver"
+            ) as client:
+                response = await client.post(
+                    "/v1/messages",
+                    json={
+                        "model": "test-model",
+                        "max_tokens": 2,
+                        "stream": True,
+                        "messages": [{"role": "user", "content": "Hello"}],
+                    },
+                )
+        finally:
+            await engine.stop()
+
+        assert response.status_code == 200
+        backend_stream.assert_called_once()
+        assert backend_stream.call_args.kwargs["max_tokens"] == 2
+        assert backend_stream.call_args.kwargs.get("prompt_cache") is None
+        tokenizer.encode.assert_called_with(prompt)
+
+        events = [
+            json.loads(line.removeprefix("data: "))
+            for line in response.text.splitlines()
+            if line.startswith("data: ")
+        ]
+        text = "".join(
+            event["delta"]["text"]
+            for event in events
+            if event["type"] == "content_block_delta"
+        )
+        assert text == "Hello" + terminal_text
+        assert events[-1]["type"] == "message_stop"
+        (delta,) = [event for event in events if event["type"] == "message_delta"]
+        assert delta["delta"]["stop_reason"] == expected_stop_reason
+        assert delta["usage"] == {"input_tokens": 7, "output_tokens": 2}
+
     @pytest.mark.parametrize(
         "terminal_text, finish_reason, expected_stop_reason",
         [
