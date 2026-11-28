@@ -77,6 +77,7 @@ def test_invalid_schema_is_rejected_during_construction(tokenizer, invalid_schem
 class _RecordingEngine:
     model_name = "test-model"
     is_mllm = False
+    context_limit = None
     preserve_native_tool_format = False
 
     def __init__(self, tokenizer):

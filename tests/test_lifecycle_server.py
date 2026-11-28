@@ -369,6 +369,7 @@ class TestCompletionStreamingRelease:
         class FakeEngine:
             preserve_native_tool_format = False
             is_mllm = False
+            context_limit = None
 
             async def start(self):
                 pass
@@ -440,6 +441,7 @@ class TestCompletionStreamingRelease:
         class FakeEngine:
             preserve_native_tool_format = False
             is_mllm = False
+            context_limit = None
 
             async def start(self):
                 pass
@@ -635,6 +637,7 @@ class TestToolParserUsesLocalEngine:
         class FakeEngine:
             preserve_native_tool_format = False
             is_mllm = False
+            context_limit = None
 
             def __init__(self, tokenizer):
                 self.tokenizer = tokenizer
@@ -3699,6 +3702,7 @@ class TestResponseModelFieldUsesServedName:
         class FakeEngine:
             preserve_native_tool_format = False
             is_mllm = False
+            context_limit = None
 
             async def generate(self, **kwargs):
                 return GenerationOutput(
@@ -3750,6 +3754,7 @@ class TestResponseModelFieldUsesServedName:
         class FakeEngine:
             preserve_native_tool_format = False
             is_mllm = False
+            context_limit = None
             tokenizer = None
 
             async def chat(self, **kwargs):
@@ -3868,6 +3873,7 @@ class TestResponseModelFieldUsesServedName:
         class FakeEngine:
             preserve_native_tool_format = False
             is_mllm = False
+            context_limit = None
 
             async def generate(self, **kwargs):
                 return GenerationOutput(
