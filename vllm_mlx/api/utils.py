@@ -448,8 +448,16 @@ def _config_indicates_vlm(config: dict) -> bool:
                 if keyword.lower() in arch_lower:
                     return True
 
+    # Some text-only checkpoints ship an empty placeholder like "vision_config": {}
+    text_only_arch = (
+        isinstance(archs, list)
+        and bool(archs)
+        and all(isinstance(a, str) and a.endswith("ForCausalLM") for a in archs)
+    )
     for key in _VLM_CONFIG_KEYS:
         if key in config:
+            if config[key] == {} and text_only_arch:
+                continue
             return True
 
     return False
