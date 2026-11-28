@@ -50,6 +50,7 @@ class AutoToolParser(ToolParser):
 
     # Patterns for different formats
     MISTRAL_TOKEN = "[TOOL_CALLS]"
+    MISTRAL_ARGS_TOKEN = "[ARGS]"
 
     # GLM-4.7's native format opens with a bare function name right after
     # <tool_call> (e.g. "Bash\n<arg_key>..." or "Bash</tool_call>" for a
@@ -138,11 +139,17 @@ class AutoToolParser(ToolParser):
                 if not raw:
                     continue
 
-                # New Mistral format: func_name{"args"}
+                # New Mistral formats: func_name[ARGS]{...} (v11+) and
+                # func_name{...}
                 if not raw.startswith("[") and "{" in raw:
+                    args_idx = raw.find(self.MISTRAL_ARGS_TOKEN)
                     end_name = raw.find("{")
-                    name = raw[:end_name].strip()
-                    args = raw[end_name:]
+                    if 0 <= args_idx < end_name:
+                        name = raw[:args_idx].strip()
+                        args = raw[args_idx + len(self.MISTRAL_ARGS_TOKEN) :]
+                    else:
+                        name = raw[:end_name].strip()
+                        args = raw[end_name:]
                     if name:
                         tool_calls.append(
                             {"id": generate_tool_id(), "name": name, "arguments": args}
@@ -344,7 +351,7 @@ class AutoToolParser(ToolParser):
                             # Support "name" and "type" fields (Granite)
                             func_name = item.get("name") or item.get("type")
                             if func_name:
-                                args = item.get("arguments", {})
+                                args = item.get("arguments", item.get("parameters", {}))
                                 tool_calls.append(
                                     {
                                         "id": generate_tool_id(),
@@ -384,7 +391,7 @@ class AutoToolParser(ToolParser):
                             # Support both "name" and "type" fields
                             func_name = obj.get("name") or obj.get("type")
                             if func_name:
-                                args = obj.get("arguments", {})
+                                args = obj.get("arguments", obj.get("parameters", {}))
                                 tool_calls.append(
                                     {
                                         "id": generate_tool_id(),
