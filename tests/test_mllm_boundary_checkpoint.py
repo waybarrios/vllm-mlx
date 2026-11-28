@@ -17,6 +17,7 @@ Keep this file in its own CI invocation (see _mlx_stub.py's docstring).
 
 import sys
 import threading
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -32,7 +33,11 @@ from vllm_mlx.memory_cache import (  # noqa: E402
     MemoryAwarePrefixCache,
     MemoryCacheConfig,
 )
-from vllm_mlx.mllm_batch_generator import MLLMBatchGenerator  # noqa: E402
+from vllm_mlx.mllm_batch_generator import (  # noqa: E402
+    MLLMBatchGenerator,
+    MLLMBatchRequest,
+    MLLMBatchStats,
+)
 
 SUFFIX = (98, 99)  # stands in for the tokenized "<think>\n"
 OFF_SUFFIX = (98, 77, 97, 77)  # "<think>\n\n</think>\n\n" (thinking disabled)
@@ -361,3 +366,308 @@ def test_disabled_block_found_when_thinking_changes_the_preamble():
 
     assert gen._compute_think_suffix_len() == 2
     assert gen._think_suffixes == (SUFFIX, OFF_SUFFIX)
+
+
+# Sliding-window caches (Gemma 4). The thinking-enabled generation prompt ends
+# with the bare assistant header; with thinking disabled the template appends
+# an empty thought block (``<|channel>thought\n<channel|>``) that history never
+# renders. ``RotatingKVCache`` is rewindable while empty but not once it wraps.
+
+GEMMA_OFF_SUFFIX = (100, 45518, 107, 101)  # "<|channel>thought\n<channel|>"
+
+
+class _RotatingLeaf:
+    """Sliding-window leaf: rewindable only until ``max_size`` tokens."""
+
+    def __init__(self, position=0, max_size=4):
+        self.max_size = max_size
+        self.position = position
+
+    @property
+    def position(self):
+        return self.offset
+
+    @position.setter
+    def position(self, position):
+        self.offset = position
+        size = min(position, self.max_size)
+        self.keys = self.values = np.zeros((1, 1, size, 1), dtype=np.float32)
+
+    @property
+    def state(self):
+        return self.keys, self.values
+
+    @property
+    def meta_state(self):
+        return [str(self.offset), str(self.max_size)]
+
+    @classmethod
+    def from_state(cls, state, meta_state):
+        leaf = cls(*map(int, meta_state))
+        leaf.keys, leaf.values = state
+        return leaf
+
+    def is_trimmable(self):
+        return self.position < self.max_size
+
+    def merge(self, caches):
+        (cache,) = caches
+        return cache
+
+
+@pytest.fixture
+def sliding_generator(generator):
+    generator._think_suffix_len = 0
+    generator._think_suffixes = (GEMMA_OFF_SUFFIX,)
+    return generator
+
+
+@pytest.fixture
+def blocking_sliding_generator(sliding_generator, monkeypatch):
+    from mlx_lm import sample_utils
+    from mlx_lm.models import cache as mlx_cache
+
+    gen = sliding_generator
+    gen._stats = MLLMBatchStats()
+    gen.max_kv_size = 8
+    if isinstance(module.mx, MagicMock):
+        # The blocking path also samples logits and constructs a batch tensor.
+
+        class _NumpyArray(np.ndarray):
+            def __new__(cls, value):
+                return np.asarray(value).view(cls)
+
+        monkeypatch.setitem(vars(module.mx), "array", _NumpyArray)
+        monkeypatch.setitem(vars(module.mx), "logsumexp", np.logaddexp.reduce)
+        monkeypatch.setitem(
+            vars(sample_utils),
+            "make_sampler",
+            lambda **_kwargs: lambda x: np.argmax(x, axis=-1),
+        )
+        monkeypatch.setitem(vars(mlx_cache), "RotatingKVCache", ())
+
+    monkeypatch.setitem(vars(module.mx), "stream", lambda _stream: nullcontext())
+    monkeypatch.setitem(
+        vars(mlx_cache),
+        "make_prompt_cache",
+        lambda _model, max_kv_size: [_RotatingLeaf(max_size=max_kv_size)],
+    )
+
+    def forward(tokens, cache):
+        gen.calls.append(tokens.reshape(-1).tolist())
+        cache[0].position += tokens.shape[1]
+        # Distinguish logits at the final prompt token from the boundary.
+        scores = np.asarray(tokens, dtype=np.float32)
+        return module.mx.array(np.stack((scores - 1, scores, scores - 2), axis=-1))
+
+    gen.language_model = forward
+    return gen
+
+
+def _blocking_prefill(gen, tokens, request_id):
+    return gen._process_prompts(
+        [
+            MLLMBatchRequest(
+                uid=0,
+                request_id=request_id,
+                prompt="",
+                input_ids=module.mx.array([tokens]),
+                temperature=0.0,
+            )
+        ]
+    )
+
+
+def _assert_exact_resend(gen, prompt, first):
+    auxiliary = gen.prefix_cache.fetch_exact_auxiliary(prompt)
+    assert auxiliary is not None
+    assert auxiliary["last_logits"].tolist() == [[100.0, 101.0, 99.0]]
+
+    gen.calls.clear()
+    repeat = _blocking_prefill(gen, prompt, "repeat")
+
+    assert not gen.calls
+    assert first.y.tolist() == repeat.y.tolist() == [1]
+    assert repeat.cache[0].position == len(prompt)
+
+
+def _prefill_sliding(gen, tokens, request_id="req", max_size=4):
+    """Like _prefill, for a template with no enabled think tag: the whole
+    prompt is the lookup key (``_think_suffix_len == 0``)."""
+    stored, remaining = gen.prefix_cache.fetch(list(tokens))
+    if stored is not None:
+        cache = gen._clone_prefix_for_replay(stored)
+        start = len(tokens) - len(remaining)
+    else:
+        cache = [_RotatingLeaf(max_size=max_size)]
+        start = 0
+    req = _request(tokens, request_id)
+    logits = gen._run_chunked_text_prefill(req, cache, start=start)
+    gen._publish_prompt_state(req, cache, logits[:, -1, :], extends_cached=start > 0)
+    return start, cache
+
+
+@pytest.mark.parametrize(
+    "position, pending, expected",
+    [
+        (0, 0, False),
+        (0, 3, False),
+        (0, 4, True),
+        (2, 2, True),
+        (4, 0, True),
+    ],
+)
+def test_sliding_window_needs_checkpoint_when_pending_tokens_wrap(
+    monkeypatch, position, pending, expected
+):
+    # Same isolation as the ``generator`` fixture: without it, _cache_leaves
+    # imports the real mlx_lm / mlx_vlm cache classes (absent on Linux CI).
+    monkeypatch.setattr(
+        MLLMBatchGenerator, "_cache_class_families", staticmethod(lambda: ((), (), ()))
+    )
+    leaf = _RotatingLeaf(position=position, max_size=4)
+
+    assert (
+        MLLMBatchGenerator._needs_prefill_checkpoint([leaf], pending_tokens=pending)
+        is expected
+    )
+
+
+def test_sliding_window_cold_prefill_checkpoints_at_disabled_block(
+    sliding_generator,
+):
+    turn1 = [10, 11, 12, 13, 14, 15, *GEMMA_OFF_SUFFIX]
+
+    start, cache = _prefill_sliding(sliding_generator, turn1)
+
+    assert start == 0
+    # The empty cache would report rewindable; the window wraps during this
+    # prefill, so it still splits at the boundary.
+    assert sliding_generator.calls == [[10, 11, 12, 13, 14, 15], [*GEMMA_OFF_SUFFIX]]
+    assert cache[0].position == len(turn1)
+    assert _keys(sliding_generator) == [(10, 11, 12, 13, 14, 15)]
+    assert sliding_generator.prefix_cache.fetch_exact_auxiliary(turn1) is None
+
+
+def test_sliding_window_caches_full_prompt_when_boundary_is_too_short(
+    blocking_sliding_generator,
+):
+    gen = blocking_sliding_generator
+    gen.prefix_cache = MemoryAwarePrefixCache(
+        MagicMock(), MemoryCacheConfig(max_memory_mb=1, min_prefix_tokens=8)
+    )
+    boundary = [10, 11, 12, 13, 14, 15]
+    prompt = [*boundary, *GEMMA_OFF_SUFFIX]
+
+    first = _blocking_prefill(gen, prompt, "first")
+
+    assert gen.calls == [boundary, list(GEMMA_OFF_SUFFIX)]
+    assert boundary not in gen.prefix_cache
+    _assert_exact_resend(gen, prompt, first)
+
+
+def test_sliding_window_caches_full_prompt_when_trimmed_hit_resumes_at_boundary(
+    blocking_sliding_generator,
+):
+    gen = blocking_sliding_generator
+    boundary = [10, 11, 12, 13, 14, 15]
+    divergent = [*boundary, 50]
+    prompt = [*boundary, *GEMMA_OFF_SUFFIX]
+    assert gen.prefix_cache.store(
+        divergent, [_RotatingLeaf(len(divergent), max_size=8)]
+    )
+    assert boundary not in gen.prefix_cache
+
+    first = _blocking_prefill(gen, prompt, "first")
+
+    assert gen.calls == [list(GEMMA_OFF_SUFFIX)]
+    assert first.cache[0].position == len(prompt)
+    assert boundary not in gen.prefix_cache
+    _assert_exact_resend(gen, prompt, first)
+
+
+def test_sliding_window_next_turn_hits_boundary(sliding_generator):
+    turn1 = [10, 11, 12, 13, 14, 15, *GEMMA_OFF_SUFFIX]
+    _prefill_sliding(sliding_generator, turn1)
+    sliding_generator.calls.clear()
+
+    # History renders turn 1's answer (50, 51) without the empty thought block.
+    turn2 = [10, 11, 12, 13, 14, 15, 50, 51, 20, 21, *GEMMA_OFF_SUFFIX]
+    start, cache = _prefill_sliding(sliding_generator, turn2)
+
+    assert start == 6
+    assert sliding_generator.calls == [[50, 51, 20, 21], [*GEMMA_OFF_SUFFIX]]
+    assert cache[0].position == len(turn2)
+    assert _keys(sliding_generator) == [(10, 11, 12, 13, 14, 15, 50, 51, 20, 21)]
+
+    sliding_generator.calls.clear()
+    turn3 = [*turn2[: -len(GEMMA_OFF_SUFFIX)], 52, 30, *GEMMA_OFF_SUFFIX]
+    start, _ = _prefill_sliding(sliding_generator, turn3)
+    assert start == len(turn2) - len(GEMMA_OFF_SUFFIX)
+    assert sliding_generator.calls == [[52, 30], [*GEMMA_OFF_SUFFIX]]
+
+
+def test_sliding_window_prompt_within_window_keeps_completion_store(
+    sliding_generator,
+):
+    # Shorter than the window: the cache stays rewindable, so the ordinary
+    # completion store (prompt key after rewinding output) still applies.
+    prompt = [10, *GEMMA_OFF_SUFFIX]
+    req = _request(prompt)
+
+    assert sliding_generator._prefill_checkpoint_plan(
+        req.input_ids, [_RotatingLeaf(max_size=8)]
+    ) == (None, None)
+
+
+def test_sliding_window_thinking_enabled_stores_full_prompt(sliding_generator):
+    # Thinking enabled: no trailing block, and the full prompt is already a
+    # prefix of the next turn. The wrapped window keeps the full-prompt entry.
+    prompt = [10, 11, 12, 13, 14, 15]
+
+    _prefill_sliding(sliding_generator, prompt)
+
+    assert sliding_generator.calls == [prompt]
+    assert _keys(sliding_generator) == [tuple(prompt)]
+    assert sliding_generator.prefix_cache.fetch_exact_auxiliary(prompt) is not None
+
+
+def test_disabled_block_recorded_without_enabled_think_tag():
+    # Gemma 4: thinking enabled adds a marker to the system turn and ends with
+    # the bare assistant header; disabled appends an empty thought block.
+    class Tokenizer:
+        def apply_chat_template(self, _messages, **kwargs):
+            if kwargs["enable_thinking"]:
+                return (
+                    "<bos><|turn>system\n<|think|>\n<turn|>\n"
+                    "<|turn>user\nx<turn|>\n<|turn>model\n"
+                )
+            return "<bos><|turn>user\nx<turn|>\n<|turn>model\n<|channel>thought\n<channel|>"
+
+        def encode(self, text):
+            return {"<|channel>thought\n<channel|>": list(GEMMA_OFF_SUFFIX)}.get(
+                text, []
+            )
+
+    gen = MLLMBatchGenerator.__new__(MLLMBatchGenerator)
+    gen.processor = SimpleNamespace(tokenizer=Tokenizer())
+
+    assert gen._compute_think_suffix_len() == 0
+    assert gen._think_suffixes == (GEMMA_OFF_SUFFIX,)
+
+
+def test_no_disabled_block_when_only_the_preamble_differs():
+    class Tokenizer:
+        def apply_chat_template(self, _messages, **kwargs):
+            if kwargs["enable_thinking"]:
+                return "<|system|>\nThink first.\n<|assistant|>\n"
+            return "<|assistant|>\n"
+
+        def encode(self, _text):
+            return [1, 2]
+
+    gen = MLLMBatchGenerator.__new__(MLLMBatchGenerator)
+    gen.processor = SimpleNamespace(tokenizer=Tokenizer())
+
+    assert gen._compute_think_suffix_len() == 0
+    assert gen._think_suffixes == ()
