@@ -11,6 +11,7 @@ The scheduler follows vLLM's design with:
 - Continuous batching via BatchGenerator
 """
 
+import gc
 import importlib
 import logging
 from collections import deque
@@ -41,6 +42,19 @@ from .request import Request, RequestOutput, RequestStatus, SamplingParams
 from .utils.mamba_cache import ensure_mamba_support
 
 logger = logging.getLogger(__name__)
+
+
+def _release_freed_metal_buffers() -> None:
+    """Return buffers freed by an explicit cache clear to the OS.
+
+    Dropping cache entries only moves their Metal buffers into MLX's
+    retained buffer pool, which by default is allowed to grow up to the
+    allocation limit (issue #793). Without this, clearing the prefix cache
+    on an idle server frees nothing from the process footprint.
+    """
+    gc.collect()
+    mx.clear_cache()
+
 
 # Enable MambaCache batching support for models like Nemotron
 ensure_mamba_support()
@@ -3534,6 +3548,8 @@ class Scheduler:
         if self.prefix_cache is not None:
             self.prefix_cache.clear()
             cleared["prefix_cache"] = True
+        if any(cleared.values()):
+            _release_freed_metal_buffers()
         return cleared
 
     def reset(self) -> None:
@@ -3615,10 +3631,12 @@ class Scheduler:
             self.memory_aware_cache, "clear"
         ):
             self.memory_aware_cache.clear()
+            _release_freed_metal_buffers()
             logger.info("[clear_prefix_cache] memory-aware cache cleared")
             return
         if self.prefix_cache is not None and hasattr(self.prefix_cache, "clear"):
             self.prefix_cache.clear()
+            _release_freed_metal_buffers()
             logger.info("[clear_prefix_cache] prefix cache cleared")
 
     def ensure_ssd_tier(self) -> None:
