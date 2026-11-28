@@ -11,6 +11,7 @@ import logging
 import math
 import time
 from abc import ABC, abstractmethod
+from typing import Any
 
 import asyncio
 
@@ -93,7 +94,7 @@ class SigmoidAdapter(RerankAdapter):
         self, tokenizer, query: str, document: str, max_length: int
     ) -> dict:
         """Tokenize as a sentence pair (query, document)."""
-        return tokenizer(
+        encoded: dict = tokenizer(
             query,
             document,
             padding=True,
@@ -101,6 +102,7 @@ class SigmoidAdapter(RerankAdapter):
             max_length=max_length,
             return_tensors="np",
         )
+        return encoded
 
     def extract_score(self, logits) -> float:
         """Extract the first logit as the relevance score."""
@@ -154,8 +156,8 @@ class RerankEngine:
         self.token_budget = token_budget
         self.max_concurrency = max_concurrency
         self._semaphore = asyncio.Semaphore(max_concurrency)
-        self._model = None
-        self._tokenizer = None
+        self._model: _MLXClassifierWrapper | None = None
+        self._tokenizer: Any | None = None
         self._adapter: RerankAdapter | None = None
 
     @property
@@ -249,6 +251,8 @@ class RerankEngine:
             in the same order as the input documents.
         """
         self._ensure_loaded()
+        assert self._model is not None
+        assert self._adapter is not None
 
         max_length = resolve_max_length(
             getattr(self._model, "config", None),
@@ -270,7 +274,7 @@ class RerankEngine:
 
         # Build batches by token budget
         batches = []
-        current_batch = []
+        current_batch: list[tuple[int, dict[str, Any]]] = []
         current_tokens = 0
         for i, (enc, tok_count) in enumerate(zip(pair_encodings, pair_token_counts)):
             if current_batch and current_tokens + tok_count > self.token_budget:
@@ -366,7 +370,7 @@ class _MLXClassifierWrapper:
         """Return model parameters for mx.eval."""
         return self._params
 
-    def __call__(self, input_ids: mx.array, attention_mask: mx.array = None):
+    def __call__(self, input_ids: mx.array, attention_mask: mx.array | None = None):
         """
         Forward pass through the classifier.
 

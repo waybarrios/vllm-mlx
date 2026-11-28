@@ -6,6 +6,7 @@ import os
 import signal
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -477,15 +478,47 @@ def test_runner_waits_for_final_stream_evidence_after_client_exits(
 def test_final_stream_drain_stops_at_client_budget_and_keeps_exit_failure(
     tmp_path, monkeypatch, returncode
 ):
+    from scripts.client_acceptance import observe
+
+    release_finalization = threading.Event()
+    finish = observe.Evidence.finish
+    wait_for_idle = observe.RecordingProxy.wait_for_idle
+    exit_proxy = observe.RecordingProxy.__exit__
+
+    def finish_after_drain(self, stream):
+        # The upstream response can time out just after the runner's budget.
+        # Keep its evidence pending until the runner checks that budget, even
+        # if scheduling lets the forwarding thread reach finalization first.
+        if stream.final:
+            release_finalization.wait()
+        finish(self, stream)
+
+    def wait_then_release(self, timeout):
+        try:
+            return wait_for_idle(self, timeout)
+        finally:
+            release_finalization.set()
+
+    def release_then_exit(self, *exc):
+        # Also unblock cleanup if the runner raises before checking the drain.
+        release_finalization.set()
+        return exit_proxy(self, *exc)
+
+    monkeypatch.setattr(observe.Evidence, "finish", finish_after_drain)
+    monkeypatch.setattr(observe.RecordingProxy, "wait_for_idle", wait_then_release)
+    monkeypatch.setattr(observe.RecordingProxy, "__exit__", release_then_exit)
     started = time.monotonic()
-    result, _, _ = _scripted_tool_loop(
-        tmp_path,
-        monkeypatch,
-        timeout=1,
-        final_delay=2,
-        client_returncode=returncode,
-    )
+    try:
+        result, _, _ = _scripted_tool_loop(
+            tmp_path,
+            monkeypatch,
+            timeout=1,
+            final_delay=2,
+            client_returncode=returncode,
+        )
+    finally:
+        release_finalization.set()
     assert result["status"] == "failed", result
-    assert "proxy_drain_timeout" in result["reasons"]
-    assert ("client_exit_nonzero" in result["reasons"]) == bool(returncode)
+    assert "proxy_drain_timeout" in result["reasons"], result
+    assert ("client_exit_nonzero" in result["reasons"]) == bool(returncode), result
     assert time.monotonic() - started < 1.5

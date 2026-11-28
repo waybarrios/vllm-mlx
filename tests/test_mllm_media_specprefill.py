@@ -566,6 +566,75 @@ def test_sparse_media_prefill_rejects_nonmedia_token_outside_draft_vocab(
     assert runtime_calls["score"] == []
 
 
+@pytest.mark.parametrize("draft_type_source", ["config", "args", "model"])
+@pytest.mark.parametrize(
+    ("draft_model_type", "expects_explicit_extractor"),
+    [
+        ("qwen3_5", True),
+        ("qwen3_5_moe", True),
+        ("qwen3_vl", False),
+        ("qwen3_vl_moe", False),
+    ],
+)
+@pytest.mark.parametrize("with_cancellation", [False, True])
+def test_scoring_preserves_callback_identity_and_draft_routing(
+    monkeypatch,
+    draft_type_source,
+    draft_model_type,
+    expects_explicit_extractor,
+    with_cancellation,
+):
+    runtime_calls = _install_numpy_runtime(monkeypatch, selected=[0])
+    model = _model(*SUPPORTED_IDENTITIES[0])
+    draft = SimpleNamespace()
+    type_config = SimpleNamespace(model_type=draft_model_type)
+    if draft_type_source == "model":
+        draft.model_type = draft_model_type
+    else:
+        setattr(draft, draft_type_source, type_config)
+    request = SimpleNamespace(input_ids=np.array([[92, 90, 93, 4]]))
+    cancellation_checks = []
+
+    def cancel() -> None:
+        cancellation_checks.append(True)
+
+    def extract_queries(attn, x, cache):
+        return (attn, x, cache)
+
+    monkeypatch.setattr(
+        sys.modules["vllm_mlx.specprefill"],
+        "_qwen35_extract_queries",
+        extract_queries,
+    )
+    cancel_check = cancel if with_cancellation else None
+
+    assert run_media_specprefill(
+        model,
+        model.language_model,
+        draft,
+        request,
+        [],
+        keep_pct=0.5,
+        backbone_pct=0.0,
+        step_size=7,
+        cancel_check=cancel_check,
+    ) == (None, None, 4)
+
+    scored_model, scored_tokens, kwargs = runtime_calls["score"][0]
+    assert scored_model is draft
+    assert scored_tokens == [92, 90, 93, 4]
+    assert kwargs["prefill_step_size"] == 7
+    assert kwargs["cancel_check"] is cancel_check
+    assert cancellation_checks == ([True, True] if with_cancellation else [])
+    if expects_explicit_extractor:
+        assert set(kwargs) == {"prefill_step_size", "cancel_check", "query_extractor"}
+        assert kwargs["query_extractor"] is extract_queries
+        attn, x, cache = object(), object(), object()
+        assert kwargs["query_extractor"](attn, x, cache) == (attn, x, cache)
+    else:
+        assert set(kwargs) == {"prefill_step_size", "cancel_check"}
+
+
 def _ensure_mlx_stubs_for_media_specprefill(monkeypatch) -> bool:
     """Make the MLLM configuration bridge importable on non-Apple CI."""
     try:  # pragma: no cover - depends on the environment

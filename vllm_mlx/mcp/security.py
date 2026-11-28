@@ -791,7 +791,8 @@ class ToolSandbox:
                 return obj[:100] + f"... [truncated, {len(obj)} chars total]"
             return obj
 
-        return sanitize(arguments)
+        sanitized: Dict[str, Any] = sanitize(arguments)
+        return sanitized
 
     def get_audit_log(
         self,

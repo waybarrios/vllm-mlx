@@ -83,7 +83,7 @@ class MetricsCollector:
     def __init__(self) -> None:
         self._enabled = False
         self._lock = threading.Lock()
-        self._prom = None
+        self._prom: dict[str, Any] | None = None
 
     @property
     def enabled(self) -> bool:
@@ -510,6 +510,7 @@ class MetricsCollector:
         if self._prom is None:
             self._init_prometheus()
         self._update_engine_gauges(engine=engine, mcp_manager=mcp_manager)
+        assert self._prom is not None
         return (
             self._prom["generate_latest"](self._prom["registry"]),
             self._prom["content_type"],

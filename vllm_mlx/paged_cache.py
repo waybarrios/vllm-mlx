@@ -29,12 +29,32 @@ import threading
 import time
 from collections.abc import Iterable
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, NewType, Optional, Tuple
+from typing import Any, Dict, List, Literal, NewType, Optional, Tuple, TypedDict, Union
 
 logger = logging.getLogger(__name__)
 
 # Type alias for block hash (content-based hash for prefix caching)
 BlockHash = NewType("BlockHash", bytes)
+
+
+class BlockLayerMetadata(TypedDict):
+    state: Any
+    meta_state: object
+    class_ref: Optional[type]
+    class_name: Optional[str]
+
+
+class ConcatBlockLayerState(BlockLayerMetadata):
+    storage: Literal["concat"]
+    seq_axis: int
+
+
+class LatestBlockLayerState(BlockLayerMetadata):
+    storage: Literal["latest"]
+
+
+BlockLayerState = Union[ConcatBlockLayerState, LatestBlockLayerState]
+BlockCacheData = List[Optional[BlockLayerState]]
 
 
 def compute_block_hash(
@@ -112,8 +132,8 @@ class CacheBlock:
     is_null: bool = False
 
     # Actual tensor data for this block
-    # List of (keys, values) per layer, shape: (1, n_kv_heads, block_tokens, head_dim)
-    cache_data: Optional[List[Tuple[Any, Any]]] = None
+    # Normalized layer state envelopes, retaining None slots for absent layers
+    cache_data: Optional[BlockCacheData] = None
 
     # Metadata
     token_count: int = 0

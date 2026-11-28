@@ -14,7 +14,7 @@ from .glm47_tool_parser import Glm47ToolParser, generate_tool_id
 
 
 def _consume_stream_state(
-    parser,
+    parser: "PoolsideV1ToolParser",
     pending: dict[int, dict[str, Any]],
     valid_names: set[str],
     request: dict[str, Any] | None,
@@ -61,7 +61,7 @@ class PoolsideV1ToolParser(Glm47ToolParser):
 
     @staticmethod
     def _string_argument_names(
-        request: dict[str, Any] | None, tool_name: str
+        request: dict[str, Any] | None, tool_name: str | None
     ) -> set[str]:
         if request is None:
             return set()
@@ -124,8 +124,8 @@ class PoolsideV1ToolParser(Glm47ToolParser):
             )
 
         marker = cleaned_text.find(self._START)
-        content = cleaned_text[:marker] if marker >= 0 else cleaned_text
-        content = content.strip() or None
+        content_text = cleaned_text[:marker] if marker >= 0 else cleaned_text
+        content = content_text.strip() or None
         if tool_calls:
             return ExtractedToolCallInformation(True, tool_calls, content)
 

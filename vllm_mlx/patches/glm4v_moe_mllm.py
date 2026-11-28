@@ -21,7 +21,7 @@ cache[0].offset to int before computing position_ids.
 """
 
 import logging
-from typing import Any, Optional
+from typing import Any, Optional, cast
 
 import mlx.core as mx
 
@@ -63,9 +63,10 @@ def patch_glm4v_moe_for_batching() -> bool:
         if position_ids is None:
             # BatchKVCache stores offset as mx.array — convert to int
             # so mx.arange gets scalar start/stop arguments.
+            assert cache is not None
             offset = cache[0].offset
             if isinstance(offset, mx.array):
-                offset = int(offset.max().item())
+                offset = int(cast(int, offset.max().item()))
             position_ids = mx.arange(offset, offset + h.shape[-2])
             position_ids = mx.expand_dims(position_ids, axis=0)
             position_ids = mx.tile(position_ids, (3, 1, 1))
@@ -81,7 +82,8 @@ def patch_glm4v_moe_for_batching() -> bool:
         for i in range(self.num_layers):
             h = self.layers[self.start_idx + i](h, mask, cache[i], position_embeddings)
 
-        return self.norm(h)
+        normalized: mx.array = self.norm(h)
+        return normalized
 
     GLM4VModel.__call__ = _patched_call
     GLM4VModel._batch_patched = True

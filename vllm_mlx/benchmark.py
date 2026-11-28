@@ -40,7 +40,7 @@ import time
 import statistics
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import cv2
 import numpy as np
@@ -142,7 +142,8 @@ def get_process_memory() -> float:
 
     try:
         process = psutil.Process()
-        return process.memory_info().rss / (1024**3)
+        memory_gb: float = process.memory_info().rss / (1024**3)
+        return memory_gb
     except Exception:
         return 0.0
 
@@ -315,7 +316,7 @@ class BenchmarkSummary:
     resources: ResourceMetrics = field(default_factory=ResourceMetrics)
 
 
-def calculate_percentile(data: list, percentile: float) -> float:
+def calculate_percentile(data: list[float], percentile: float) -> float:
     """Calculate percentile from a list."""
     if not data:
         return 0.0
@@ -1081,7 +1082,7 @@ def get_video_info(video_path: str) -> dict:
     if not cap.isOpened():
         return {"error": "Cannot open video"}
 
-    info = {
+    info: dict[str, Any] = {
         "path": video_path,
         "total_frames": int(cap.get(cv2.CAP_PROP_FRAME_COUNT)),
         "fps": cap.get(cv2.CAP_PROP_FPS) or 30.0,
@@ -1164,8 +1165,8 @@ def benchmark_video_config(
 
 def run_video_benchmark(
     model_name: str,
-    video_url: str = None,
-    video_path: str = None,
+    video_url: str | None = None,
+    video_path: str | None = None,
     quick: bool = False,
     max_tokens: int = 150,
     warmup_runs: int = 1,

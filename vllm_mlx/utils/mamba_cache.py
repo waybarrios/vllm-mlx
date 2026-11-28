@@ -8,15 +8,18 @@ provides a BatchMambaCache wrapper that adds batching support.
 """
 
 import logging
-from typing import List, Optional
+from typing import TYPE_CHECKING, List, Optional, cast
 
 import mlx.core as mx
 
 # MambaCache was removed in mlx-lm 0.30.6, fall back to ArraysCache
-try:
-    from mlx_lm.models.cache import MambaCache
-except ImportError:
+if TYPE_CHECKING:
     from mlx_lm.models.cache import ArraysCache as MambaCache
+else:
+    try:
+        from mlx_lm.models.cache import MambaCache
+    except ImportError:
+        from mlx_lm.models.cache import ArraysCache as MambaCache
 
 logger = logging.getLogger(__name__)
 
@@ -59,7 +62,8 @@ class BatchMambaCache(MambaCache):
             mx.contiguous(c[idx : idx + 1]) if c is not None else None
             for c in self.cache
         ]
-        cache.left_padding = None  # Single sequence, no batch padding
+        # ArraysCache.__new__ and finalize also clear this optional field.
+        setattr(cache, "left_padding", None)  # Single sequence, no batch padding
         return cache
 
     @classmethod
@@ -85,13 +89,17 @@ class BatchMambaCache(MambaCache):
         # Merge each array in the cache
         num_arrays = len(caches[0].cache)
         merged_cache.cache = []
+        merged_states = cast(list[mx.array | None], merged_cache.cache)
 
         for i in range(num_arrays):
-            arrays = [c.cache[i] for c in caches if c.cache[i] is not None]
+            # ArraysCache initializes entries to None, then stores state arrays.
+            arrays = cast(
+                list[mx.array], [c.cache[i] for c in caches if c.cache[i] is not None]
+            )
             if arrays:
-                merged_cache.cache.append(mx.concatenate(arrays, axis=0))
+                merged_states.append(mx.concatenate(arrays, axis=0))
             else:
-                merged_cache.cache.append(None)
+                merged_states.append(None)
 
         return merged_cache
 

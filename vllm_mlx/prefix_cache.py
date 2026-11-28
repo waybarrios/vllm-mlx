@@ -24,7 +24,7 @@ try:
 except ImportError:
     HAS_MLX = False
 
-from .paged_cache import BlockTable, PagedCacheManager
+from .paged_cache import BlockCacheData, BlockTable, PagedCacheManager
 
 logger = logging.getLogger(__name__)
 
@@ -131,7 +131,7 @@ class PrefixCacheManager:
             return None, None, None, 0
 
         current = self._cache[self.model_key]
-        path = []
+        path: List[int] = []
 
         # Traverse trie following token sequence
         for i, tok in enumerate(tokens):
@@ -293,7 +293,7 @@ class PrefixCacheManager:
             return
 
         # Navigate to entry
-        path = [(self._cache[model_key], None)]
+        path: List[Tuple[Dict, Optional[int]]] = [(self._cache[model_key], None)]
         current = self._cache[model_key]
 
         for tok in tokens:
@@ -308,10 +308,10 @@ class PrefixCacheManager:
 
         # Clean up empty branches (bottom-up)
         for i in range(len(path) - 1, 0, -1):
-            node, tok = path[i]
+            node, cleanup_token = path[i]
             parent, _ = path[i - 1]
             if not node:  # Empty dict
-                del parent[tok]
+                del parent[cleanup_token]
 
     def _can_trim_cache(self, prompt_cache: List[Any]) -> bool:
         """Check if cache can be trimmed.
@@ -658,7 +658,7 @@ class BlockAwarePrefixCache:
         start_idx: int,
         end_idx: int,
         total_tokens: int,
-    ) -> Optional[List[Optional[Dict[str, Any]]]]:
+    ) -> Optional[BlockCacheData]:
         """
         Extract per-layer cache data for a single block.
 
@@ -675,7 +675,7 @@ class BlockAwarePrefixCache:
             return None
 
         try:
-            block_slices: List[Optional[Dict[str, Any]]] = []
+            block_slices: BlockCacheData = []
             for layer_state in cache_data:
                 if "state" not in layer_state:
                     block_slices.append(None)
@@ -921,12 +921,14 @@ class BlockAwarePrefixCache:
 
             reconstructed_caches = []
             for layer_idx in range(num_layers):
-                layer_entries = [
+                raw_layer_entries = [
                     block_data[layer_idx]
                     for block_data in all_block_data
                     if layer_idx < len(block_data)
                 ]
-                layer_entries = [entry for entry in layer_entries if entry is not None]
+                layer_entries = [
+                    entry for entry in raw_layer_entries if entry is not None
+                ]
                 if not layer_entries:
                     return None
 

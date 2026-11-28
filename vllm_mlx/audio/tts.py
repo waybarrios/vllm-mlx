@@ -13,7 +13,7 @@ import io
 import logging
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterator, Union
+from typing import Any, Iterator, Protocol, Union
 
 import numpy as np
 
@@ -38,6 +38,17 @@ KOKORO_VOICES = [
 ]
 
 CHATTERBOX_VOICES = ["default"]  # Uses reference audio for voice
+
+
+class _TTSModel(Protocol):
+    def generate(
+        self,
+        *,
+        text: str,
+        voice: str,
+        speed: float,
+        lang_code: str = ...,
+    ) -> Iterator[Any]: ...
 
 
 @dataclass
@@ -75,7 +86,7 @@ class TTSEngine:
                 - VoxCPM: mlx-community/VoxCPM1.5
         """
         self.model_name = model_name
-        self.model = None
+        self.model: _TTSModel | None = None
         self._loaded = False
         self._model_family = self._detect_family(model_name)
 
@@ -137,6 +148,8 @@ class TTSEngine:
         """
         if not self._loaded:
             self.load()
+
+        assert self.model is not None
 
         try:
             import mlx.core as mx
@@ -203,6 +216,8 @@ class TTSEngine:
         """
         if not self._loaded:
             self.load()
+
+        assert self.model is not None
 
         sample_rate = 24000
 

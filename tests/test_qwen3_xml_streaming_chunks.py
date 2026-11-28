@@ -487,3 +487,188 @@ def test_streaming_two_sequential_bare_functions(chunk_size):
         if tc["name"]
     ]
     assert streamed_calls == expected
+
+
+class TestQwenXmlDeltaStateContract:
+    """Characterize the existing delta storage, aliasing and request boundaries."""
+
+    @pytest.mark.parametrize("initial_count", [0, 2])
+    def test_empty_merge_does_not_emit_or_replace_history(self, initial_count):
+        from vllm_mlx.tool_parsers.qwen3_xml_tool_parser import (
+            StreamingXMLToolCallParser,
+        )
+
+        parser = StreamingXMLToolCallParser()
+        history = parser.deltas
+        result = parser._merge_new_deltas_to_single_response(initial_count)
+        assert result.content is None and result.tool_calls is None
+        assert parser.deltas is history and history == []
+
+    @pytest.mark.parametrize("offset", [0, 1])
+    def test_singleton_merge_returns_original_delta(self, offset):
+        from vllm_mlx.tool_parsers.qwen3_xml_tool_parser import (
+            DeltaMessage,
+            StreamingXMLToolCallParser,
+        )
+
+        parser = StreamingXMLToolCallParser()
+        if offset:
+            parser._emit_delta(DeltaMessage(content="earlier"))
+        delta = DeltaMessage(content="now", role="assistant", reasoning_content="why")
+        parser._emit_delta(delta)
+        assert parser._merge_new_deltas_to_single_response(offset) is delta
+
+    def test_writer_preserves_order_and_content_merge_skips_old_entries(self):
+        from vllm_mlx.tool_parsers.qwen3_xml_tool_parser import (
+            DeltaMessage,
+            StreamingXMLToolCallParser,
+        )
+
+        parser = StreamingXMLToolCallParser()
+        history = parser.deltas
+        deltas = [DeltaMessage(content=value) for value in ("old", "A", "B")]
+        for delta in deltas:
+            parser._emit_delta(delta)
+        assert parser.deltas is history
+        assert all(actual is delta for actual, delta in zip(history, deltas))
+        merged = parser._merge_new_deltas_to_single_response(1)
+        assert merged.content == "AB" and merged.tool_calls == []
+        assert all(merged is not delta for delta in deltas)
+        assert [delta.content for delta in history] == ["old", "A", "B"]
+
+    def test_multi_merge_keeps_nested_identity_order_and_existing_mutation(self):
+        from vllm_mlx.tool_parsers.qwen3_xml_tool_parser import (
+            DeltaFunctionCall,
+            DeltaMessage,
+            DeltaToolCall,
+            StreamingXMLToolCallParser,
+        )
+
+        parser = StreamingXMLToolCallParser()
+        function = DeltaFunctionCall(name="initial", arguments="{")
+        first = DeltaToolCall(index=0, id="a", function=function)
+        other = DeltaToolCall(
+            index=1, id="b", function=DeltaFunctionCall(name="other", arguments="{}")
+        )
+        continuation = DeltaToolCall(
+            id="a",
+            type="",
+            function=DeltaFunctionCall(name="updated", arguments='"x":1}'),
+        )
+        for call in (first, other, continuation):
+            parser._emit_delta(DeltaMessage(tool_calls=[call]))
+        merged = parser._merge_new_deltas_to_single_response(0)
+        assert merged.tool_calls[0] is first and merged.tool_calls[1] is other
+        assert len(merged.tool_calls) == 2
+        assert first.function is function
+        assert function.name == "updated" and function.arguments == '{"x":1}'
+        assert first.type == "function"
+        assert parser.deltas[0].tool_calls[0] is first
+        assert continuation.function.arguments == '"x":1}'
+
+    def test_full_reset_replaces_list_without_clearing_old_alias(self):
+        from vllm_mlx.tool_parsers.qwen3_xml_tool_parser import (
+            DeltaMessage,
+            StreamingXMLToolCallParser,
+        )
+
+        parser = StreamingXMLToolCallParser()
+        delta = DeltaMessage(content="previous request")
+        parser._emit_delta(delta)
+        history, expat = parser.deltas, parser.parser
+        parser.reset_streaming_state()
+        assert parser.deltas == [] and parser.deltas is not history
+        assert len(history) == 1 and history[0] is delta
+        assert parser.parser is not expat
+        assert parser.tool_call_index == 0 and parser.current_call_id is None
+
+    def test_parser_instances_do_not_share_delta_state(self):
+        from vllm_mlx.tool_parsers.qwen3_xml_tool_parser import (
+            DeltaMessage,
+            StreamingXMLToolCallParser,
+        )
+
+        left, right = StreamingXMLToolCallParser(), StreamingXMLToolCallParser()
+        delta = DeltaMessage(content="left only")
+        left._emit_delta(delta)
+        assert left.deltas is not right.deltas and right.deltas == []
+        right.reset_streaming_state()
+        assert len(left.deltas) == 1 and left.deltas[0] is delta
+
+    def test_per_tool_reset_retains_history_across_actual_xml_calls(self):
+        from vllm_mlx.tool_parsers.qwen3_xml_tool_parser import (
+            DeltaMessage,
+            StreamingXMLToolCallParser,
+        )
+
+        parser = StreamingXMLToolCallParser()
+        history = parser.deltas
+        first = parser.parse_single_streaming_chunks(SINGLE_CALL)
+        prior_entries = tuple(history)
+        old_expat = parser.parser
+        parser._reset_xml_parser_after_tool_call()
+        assert parser.deltas is history and parser.parser is not old_expat
+        second = parser.parse_single_streaming_chunks(SINGLE_CALL)
+        assert parser.deltas is history and len(history) > len(prior_entries)
+        assert all(history[i] is delta for i, delta in enumerate(prior_entries))
+        assert all(isinstance(delta, DeltaMessage) for delta in history)
+        assert first.tool_calls[0].index == 0 and second.tool_calls[0].index == 1
+        assert first.tool_calls[0].id != second.tool_calls[0].id
+        assert first.tool_calls[0].function.arguments == '{"city": "Tokyo"}'
+        assert second.tool_calls[0].function.arguments == '{"city": "Tokyo"}'
+
+    def test_complete_request_reuse_replaces_history_and_retains_old_entries(self):
+        parser = Qwen3XMLToolParser(None)
+        first = parser.extract_tool_calls(SINGLE_CALL)
+        history = parser._xml_parser.deltas
+        prior_entries = tuple(history)
+        second = parser.extract_tool_calls(SINGLE_CALL.replace("Tokyo", "Paris"))
+        assert parser._xml_parser.deltas is not history
+        assert tuple(history) == prior_entries and history
+        assert first.tool_calls[0]["id"] != second.tool_calls[0]["id"]
+        assert json.loads(first.tool_calls[0]["arguments"]) == {"city": "Tokyo"}
+        assert json.loads(second.tool_calls[0]["arguments"]) == {"city": "Paris"}
+
+    @pytest.mark.parametrize("chunk_size", [1, 7, 4096])
+    def test_streaming_request_reuse_preserves_fragments_ids_and_content(
+        self, chunk_size
+    ):
+        parser = Qwen3XMLToolParser(None)
+        old_history = parser._xml_parser.deltas
+        request_ids = []
+        for text, city in (
+            ("Hello.", None),
+            (SINGLE_CALL, "Tokyo"),
+            (SINGLE_CALL.replace("Tokyo", "Paris"), "Paris"),
+        ):
+            prior_entries = tuple(old_history)
+            previous, content, arguments = "", "", ""
+            names, ids = [], []
+            for chunk in _fixed_chunks(text, chunk_size):
+                delta = parser.extract_tool_calls_streaming(
+                    previous, previous + chunk, chunk
+                )
+                previous += chunk
+                if delta is None:
+                    continue
+                content += delta.get("content", "")
+                for call in delta.get("tool_calls", []):
+                    assert call["index"] == 0 and call["type"] == "function"
+                    ids.append(call["id"])
+                    function = call.get("function", {})
+                    if function.get("name"):
+                        names.append(function["name"])
+                    arguments += function.get("arguments", "")
+            assert parser._xml_parser.deltas is not old_history
+            assert len(old_history) == len(prior_entries)
+            assert all(old_history[i] is delta for i, delta in enumerate(prior_entries))
+            old_history = parser._xml_parser.deltas
+            if city is None:
+                assert content == "Hello." and names == ids == [] and arguments == ""
+            else:
+                assert content == "" and names == ["get_weather"]
+                assert json.loads(arguments) == {"city": city}
+                assert arguments == '{"city": "' + city + '"}'
+                assert ids and len(set(ids)) == 1 and ids[0].startswith("call_")
+                request_ids.append(ids[0])
+        assert len(set(request_ids)) == 2

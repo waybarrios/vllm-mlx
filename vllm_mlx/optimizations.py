@@ -24,6 +24,7 @@ Usage:
 
 import logging
 from dataclasses import dataclass
+from typing import TypedDict, cast
 
 import mlx.core as mx
 
@@ -40,8 +41,13 @@ class HardwareInfo:
     gpu_cores: int
 
 
+class _HardwareProfile(TypedDict):
+    bandwidth: float
+    gpu_cores: int
+
+
 # Hardware profiles for Apple Silicon chips
-HARDWARE_PROFILES = {
+HARDWARE_PROFILES: dict[str, _HardwareProfile] = {
     # M1 Series
     "M1": {"bandwidth": 68.25, "gpu_cores": 8},
     "M1 Pro": {"bandwidth": 200, "gpu_cores": 16},
@@ -88,7 +94,8 @@ def get_system_memory_gb() -> float:
         try:
             device_info = mx.device_info()
             if "memory_size" in device_info:
-                return device_info["memory_size"] / (1024**3)
+                memory_size = cast(int, device_info["memory_size"])
+                return memory_size / (1024**3)
         except Exception:
             pass
         return 16.0  # Conservative default
@@ -106,7 +113,7 @@ def detect_hardware() -> HardwareInfo:
     """
     try:
         device_info = mx.device_info()
-        device_name = device_info.get("device_name", "")
+        device_name = cast(str, device_info.get("device_name", ""))
         actual_memory_gb = get_system_memory_gb()
 
         # Match with known profiles (check longest names first)

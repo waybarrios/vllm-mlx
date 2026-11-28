@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING
 import torch
 
 if TYPE_CHECKING:
+    from vllm_mlx.model_runner import MLXModelRunner
     from vllm.config import VllmConfig
     from vllm.v1.core.sched.output import SchedulerOutput
     from vllm.v1.outputs import ModelRunnerOutput
@@ -67,7 +68,7 @@ class MLXWorker:
         # MLX model and tokenizer
         self.model = None
         self.tokenizer = None
-        self.model_runner = None
+        self.model_runner: "MLXModelRunner | None" = None
 
         # Device info
         self.device = torch.device("cpu")  # MLX uses its own device management
@@ -242,7 +243,8 @@ class MLXWorker:
     @property
     def vocab_size(self) -> int:
         """Get vocabulary size."""
-        return self.model_config.get_vocab_size()
+        vocab_size: int = self.model_config.get_vocab_size()
+        return vocab_size
 
     def get_cache_block_size_bytes(self) -> int:
         """Get size of a cache block in bytes."""
@@ -256,7 +258,8 @@ class MLXWorker:
 
         # 2 for K and V, assuming float16
         block_size = self.cache_config.block_size
-        return 2 * block_size * num_layers * num_heads * head_size * 2
+        size_bytes: int = 2 * block_size * num_layers * num_heads * head_size * 2
+        return size_bytes
 
     def profile(self, is_start: bool = True) -> None:
         """Profiling (not yet implemented for MLX)."""

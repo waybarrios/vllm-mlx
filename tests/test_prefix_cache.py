@@ -8,6 +8,7 @@ to speed up inference with repeated prompts.
 
 import threading
 from types import SimpleNamespace
+from typing import Any, List, Literal, Optional, get_args, get_type_hints
 from unittest.mock import MagicMock
 
 import pytest
@@ -256,6 +257,511 @@ class TestPrefixCacheManager:
 
         assert cache_123 == ["cache_123"]
         assert cache_124 == ["cache_124"]
+
+
+class TestPrefixTrieInferenceContract:
+    @pytest.mark.parametrize(
+        "method, annotation",
+        [
+            ("_search", "List[int]"),
+            ("_delete_cache", "List[Tuple[Dict, Optional[int]]]"),
+        ],
+    )
+    def test_local_paths_describe_tokens_and_root_sentinel(self, method, annotation):
+        import ast
+        import inspect
+        import textwrap
+
+        tree = ast.parse(
+            textwrap.dedent(inspect.getsource(getattr(PrefixCacheManager, method)))
+        )
+        declarations = [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.AnnAssign)
+            and isinstance(node.target, ast.Name)
+            and node.target.id == "path"
+        ]
+        assert len(declarations) == 1, "trie path needs its actual local element type"
+        assert ast.dump(declarations[0].annotation) == ast.dump(
+            ast.parse(annotation, mode="eval").body
+        )
+
+    def test_cleanup_key_does_not_rebind_integer_navigation_token(self):
+        import ast
+        import inspect
+        import textwrap
+
+        tree = ast.parse(
+            textwrap.dedent(inspect.getsource(PrefixCacheManager._delete_cache))
+        )
+        navigation = next(node for node in ast.walk(tree) if isinstance(node, ast.For))
+        cleanup = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Assign)
+            and isinstance(node.value, ast.Subscript)
+            and isinstance(node.value.value, ast.Name)
+            and node.value.value.id == "path"
+        )
+        assert cleanup.targets[0].elts[1].id != navigation.target.id
+
+    @pytest.mark.parametrize(
+        "tokens, expected",
+        [
+            ([1, 2], ([1, 2], None, None, 0)),
+            ([1, 2, 9], (None, [1, 2], None, 0)),
+            ([1, 4], (None, None, [1, 4, 5], 2)),
+            ([1, 9], (None, None, None, 0)),
+            ([8], (None, None, None, 0)),
+        ],
+    )
+    def test_search_results_are_independent_without_mutating_shared_branches(
+        self, tokens, expected
+    ):
+        import copy
+
+        manager = PrefixCacheManager(None)
+        manager.store_cache([1, 2], ["prefix"])
+        manager.store_cache([1, 2, 3], ["descendant"])
+        manager.store_cache([1, 4, 5], ["sibling"])
+        original_tokens = list(tokens)
+        before = copy.deepcopy(manager._cache)
+        root = manager._cache[manager.model_key]
+        branch = root[1]
+        lru = list(manager._lru)
+        result = manager._search(tokens)
+        assert result == expected
+        assert tokens == original_tokens
+        for path in result[:3]:
+            if path is not None:
+                assert path is not tokens
+                path.append(99)
+        assert manager._search(tokens) == expected
+        assert manager._cache == before
+        assert manager._cache[manager.model_key] is root
+        assert root[1] is branch
+        assert list(manager._lru) == lru
+        assert manager.stats == PrefixCacheStats()
+
+    def test_search_absent_and_empty_roots_and_empty_query(self):
+        manager = PrefixCacheManager(None)
+        assert manager._search([]) == (None, None, None, 0)
+        assert manager._search([0]) == (None, None, None, 0)
+        manager.store_cache([], ["not-stored"])
+        assert manager._cache == {}
+        manager._cache[manager.model_key] = {}
+        assert manager._search([]) == (None, None, None, 0)
+        manager.store_cache([0, -2], ["only-extension"])
+        assert manager._search([]) == (None, None, [0, -2], 0)
+        root = manager._cache[manager.model_key]
+        root["cache"] = CacheEntry(["root"], 1)
+        assert manager._search([]) == ([], None, None, 0)
+        assert manager.fetch_cache([]) == (None, [])
+        assert manager.stats.misses == manager.stats.total_queries == 1
+
+    @pytest.mark.parametrize("token", [0, -7])
+    def test_delete_prunes_only_empty_branches_and_retains_root_and_survivors(
+        self, token
+    ):
+        manager = PrefixCacheManager(None)
+        prefix, leaf, sibling, other = ["prefix"], ["leaf"], ["sibling"], ["other"]
+        for tokens, payload in [
+            ([token], prefix),
+            ([token, 2], leaf),
+            ([token, 3], sibling),
+            ([9], other),
+        ]:
+            manager.store_cache(tokens, payload)
+        root = manager._cache[manager.model_key]
+        branch = root[token]
+        surviving_entry = manager._get_cache_entry([token, 3])
+        other_entry = manager._get_cache_entry([9])
+        lru = list(manager._lru)
+        manager._delete_cache(manager.model_key, [token, 2])
+        assert 2 not in branch
+        assert manager._get_cache_entry([token]).prompt_cache is prefix
+        manager._delete_cache(manager.model_key, [token])
+        assert "cache" not in branch
+        assert root[token] is branch
+        assert manager._get_cache_entry([token, 3]) is surviving_entry
+        assert surviving_entry.prompt_cache is sibling
+        assert manager._get_cache_entry([9]) is other_entry
+        assert other_entry.prompt_cache is other
+        manager._delete_cache(manager.model_key, [token, 3])
+        assert token not in root
+        assert manager._get_cache_entry([9]) is other_entry
+        manager._delete_cache(manager.model_key, [9])
+        assert manager._cache[manager.model_key] is root
+        assert root == {}
+        assert None not in root
+        assert list(manager._lru) == lru
+        assert manager.stats == PrefixCacheStats()
+
+    def test_delete_missing_empty_paths_and_other_namespace_preserve_identity(self):
+        manager = PrefixCacheManager(None)
+        manager._delete_cache(manager.model_key, [])
+        assert manager._cache == {}
+        payload = ["survivor"]
+        manager.store_cache([0, -1], payload)
+        root = manager._cache[manager.model_key]
+        branch = root[0]
+        entry = manager._get_cache_entry([0, -1])
+        other_key = object()
+        foreign_root = {0: {"cache": CacheEntry(["foreign"], 1)}}
+        manager._cache[other_key] = foreign_root
+        for key, tokens in [
+            (object(), [0]),
+            (manager.model_key, [9]),
+            (manager.model_key, [0, 9]),
+            (manager.model_key, []),
+        ]:
+            manager._delete_cache(key, tokens)
+            assert manager._cache[manager.model_key] is root
+            assert root[0] is branch
+            assert manager._get_cache_entry([0, -1]) is entry
+            assert entry.prompt_cache is payload
+            assert manager._cache[other_key] is foreign_root
+        root["cache"] = CacheEntry(["root"], 1)
+        manager._delete_cache(manager.model_key, [])
+        assert "cache" not in root
+        assert root[0] is branch
+        manager._delete_cache(other_key, [0])
+        assert manager._cache[other_key] is foreign_root
+        assert foreign_root == {}
+        assert manager._get_cache_entry([0, -1]) is entry
+
+    def test_actual_lru_touch_eviction_duplicate_store_and_query_counters(self):
+        manager = PrefixCacheManager(None, max_entries=2)
+        first, second, third = ["first"], ["second"], ["third"]
+        manager.store_cache([0], first)
+        manager.store_cache([-1], second)
+        entry = manager._get_cache_entry([0])
+        fetched, remaining = manager.fetch_cache([0, 9])
+        assert fetched is first
+        assert remaining == [9]
+        assert list(manager._lru) == [
+            (manager.model_key, (-1,)),
+            (manager.model_key, (0,)),
+        ]
+        manager.store_cache([2], third)
+        assert manager._get_cache_entry([-1]) is None
+        assert manager._get_cache_entry([0]) is entry
+        assert manager.stats.evictions == 1
+        manager.store_cache([0], ["replacement-not-used"])
+        assert entry.count == 2
+        assert entry.prompt_cache is first
+        assert list(manager._lru) == [
+            (manager.model_key, (2,)),
+            (manager.model_key, (0,)),
+        ]
+        fetched, remaining = manager.fetch_cache([0])
+        assert fetched is first and remaining == []
+        missing = [-1]
+        fetched, remaining = manager.fetch_cache(missing)
+        assert fetched is None and remaining is missing
+        assert manager.get_stats() == {
+            "hits": 2,
+            "misses": 1,
+            "hit_rate": 2 / 3,
+            "tokens_saved": 2,
+            "total_queries": 3,
+            "evictions": 1,
+        }
+
+
+class TestBlockLayerStorageContract:
+    def test_block_annotation_matches_normalized_producer_schema(self):
+        from vllm_mlx.paged_cache import CacheBlock
+        from vllm_mlx.prefix_cache import BlockAwarePrefixCache
+
+        stored = get_type_hints(CacheBlock)["cache_data"]
+        produced = get_type_hints(BlockAwarePrefixCache._extract_block_tensor_slice)[
+            "return"
+        ]
+        assert stored == produced
+
+        from vllm_mlx.paged_cache import (
+            BlockCacheData,
+            BlockLayerState,
+            ConcatBlockLayerState,
+            LatestBlockLayerState,
+        )
+
+        assert stored == Optional[BlockCacheData]
+        assert BlockCacheData == List[Optional[BlockLayerState]]
+        assert set(get_args(BlockLayerState)) == {
+            ConcatBlockLayerState,
+            LatestBlockLayerState,
+        }
+        metadata = {
+            "state": Any,
+            "meta_state": object,
+            "class_ref": Optional[type],
+            "class_name": Optional[str],
+        }
+        concat = {**metadata, "storage": Literal["concat"], "seq_axis": int}
+        latest = {**metadata, "storage": Literal["latest"]}
+        assert get_type_hints(ConcatBlockLayerState) == concat
+        assert get_type_hints(LatestBlockLayerState) == latest
+        assert ConcatBlockLayerState.__required_keys__ == frozenset(concat)
+        assert LatestBlockLayerState.__required_keys__ == frozenset(latest)
+        assert ConcatBlockLayerState.__optional_keys__ == frozenset()
+        assert LatestBlockLayerState.__optional_keys__ == frozenset()
+        assert CacheBlock(1).cache_data is None
+
+    @pytest.mark.parametrize("legacy", [["legacy-reference"], [("keys", "values")]])
+    def test_legacy_request_entries_keep_original_reference_and_cow(self, legacy):
+        from vllm_mlx.paged_cache import PagedCacheManager
+        from vllm_mlx.prefix_cache import BlockAwarePrefixCache
+
+        manager = PagedCacheManager(block_size=4, max_blocks=10)
+        cache = BlockAwarePrefixCache(None, manager)
+        table = cache.store_cache("legacy", list(range(4)), legacy)
+        assert table is not None
+        source = manager.allocated_blocks[table.block_ids[0]]
+        assert source.cache_data is None
+        assert cache._request_tables["legacy"].cache_data is legacy
+        returned, copied = cache.get_cache_for_generation("legacy")
+        assert returned is legacy
+        assert copied is False
+        assert cache.reconstruct_cache(table) is None
+
+        fork = cache.fork_cache("legacy", "fork")
+        assert fork is not None
+        assert cache._request_tables["fork"].cache_data is legacy
+        returned, copied = cache.get_cache_for_generation("fork")
+        assert copied is True
+        assert returned == legacy
+        assert returned is not legacy
+        assert cache._request_tables["legacy"].cache_data is legacy
+        assert source.cache_data is None
+        assert manager.allocated_blocks[fork.block_ids[0]].cache_data is None
+
+    def test_normalized_cow_shares_payload_and_clear_recreates_empty_blocks(self):
+        from vllm_mlx.paged_cache import PagedCacheManager
+
+        manager = PagedCacheManager(block_size=4, max_blocks=10)
+        source = manager.allocate_block()
+        assert source is not None
+        state, metadata = object(), {"opaque": object()}
+        payload = [
+            None,
+            {
+                "state": state,
+                "meta_state": metadata,
+                "class_ref": None,
+                "class_name": None,
+                "storage": "latest",
+            },
+        ]
+        source.cache_data = payload
+        table = manager.create_block_table("source")
+        manager.add_block_to_table(table, source, 4)
+        fork = manager.fork_block_table(table, "fork")
+        blocks, copied = manager.get_blocks_for_generation(fork)
+        assert copied is True
+        assert blocks[0] is not source
+        assert blocks[0].cache_data is payload
+        assert source.cache_data is payload
+        assert payload[0] is None
+        assert payload[1]["state"] is state
+        assert payload[1]["meta_state"] is metadata
+        assert source.ref_count == blocks[0].ref_count == 1
+
+        manager.clear()
+        assert all(block.cache_data is None for block in manager.blocks)
+        assert manager.request_tables == {}
+        assert list(manager.allocated_blocks) == [manager.null_block.block_id]
+        assert source.cache_data is payload
+
+    @pytest.mark.parametrize("shape, seq_axis", [((1, 2, 8, 3), 2), ((2, 8, 3), 1)])
+    @pytest.mark.parametrize("container", [tuple, list])
+    def test_concat_envelope_slices_and_reconstructs_values(
+        self, shape, seq_axis, container
+    ):
+        mx = pytest.importorskip("mlx.core")
+        cache_types = pytest.importorskip("mlx_lm.models.cache")
+        from vllm_mlx.paged_cache import BlockTable, PagedCacheManager
+        from vllm_mlx.prefix_cache import BlockAwarePrefixCache
+
+        manager = PagedCacheManager(block_size=4, max_blocks=10)
+        cache = BlockAwarePrefixCache(None, manager)
+        keys = mx.arange(48).reshape(shape)
+        values = mx.arange(1000, 1048).reshape(shape)
+        state = container([keys, values])
+        extracted = [
+            {
+                "state": state,
+                "meta_state": "",
+                "class_ref": cache_types.KVCache,
+                "class_name": "KVCache",
+            }
+        ]
+        table = cache.store_cache("tensor", list(range(8)), extracted)
+        assert table is not None
+        assert cache._request_tables["tensor"].cache_data is extracted
+        for index, block_id in enumerate(table.block_ids):
+            payload = manager.allocated_blocks[block_id].cache_data
+            assert isinstance(payload, list) and len(payload) == 1
+            layer = payload[0]
+            assert set(layer) == {
+                "state",
+                "meta_state",
+                "class_ref",
+                "class_name",
+                "storage",
+                "seq_axis",
+            }
+            assert layer["storage"] == "concat"
+            assert layer["seq_axis"] == seq_axis
+            assert layer["class_ref"] is cache_types.KVCache
+            assert layer["class_name"] == "KVCache"
+            assert layer["meta_state"] == ""
+            assert isinstance(layer["state"], container)
+            start, end = index * 4, (index + 1) * 4
+            for actual, original in zip(layer["state"], [keys, values]):
+                expected = (
+                    original[:, :, start:end, :]
+                    if seq_axis == 2
+                    else original[:, start:end, :]
+                )
+                assert actual.shape == expected.shape
+                assert actual.tolist() == expected.tolist()
+
+        reconstructed = cache.reconstruct_cache(table)
+        assert reconstructed is not None
+        assert reconstructed[0].keys.shape == shape
+        assert reconstructed[0].keys.tolist() == keys.tolist()
+        assert reconstructed[0].values.tolist() == values.tolist()
+        prefix = BlockTable("prefix", block_ids=table.block_ids[:1], num_tokens=4)
+        rebuilt_prefix = cache.reconstruct_cache(prefix)
+        assert rebuilt_prefix is not None
+        expected_keys = keys[:, :, :4, :] if seq_axis == 2 else keys[:, :4, :]
+        expected_values = values[:, :, :4, :] if seq_axis == 2 else values[:, :4, :]
+        assert rebuilt_prefix[0].keys.shape == expected_keys.shape
+        assert rebuilt_prefix[0].keys.tolist() == expected_keys.tolist()
+        assert rebuilt_prefix[0].values.tolist() == expected_values.tolist()
+        if seq_axis == 2:
+            assert reconstructed[0].offset == 8
+            assert rebuilt_prefix[0].offset == 4
+
+    def test_hybrid_latest_none_slots_and_missing_boundary_fail_closed(self):
+        mx = pytest.importorskip("mlx.core")
+        cache_types = pytest.importorskip("mlx_lm.models.cache")
+        from vllm_mlx.paged_cache import BlockTable, PagedCacheManager
+        from vllm_mlx.prefix_cache import BlockAwarePrefixCache
+
+        manager = PagedCacheManager(block_size=4, max_blocks=10)
+        cache = BlockAwarePrefixCache(None, manager)
+        keys = mx.arange(48).reshape(1, 2, 8, 3)
+        recurrent = [mx.ones((1, 3, 8)), mx.full((1, 2, 4, 4), 7)]
+        extracted = [
+            {"state": (keys, keys), "class_ref": cache_types.KVCache, "meta_state": ""},
+            {
+                "state": recurrent,
+                "class_ref": cache_types.ArraysCache,
+                "meta_state": "",
+            },
+        ]
+        table = cache.store_cache("hybrid", list(range(8)), extracted)
+        assert table is not None
+        first, last = [manager.allocated_blocks[bid] for bid in table.block_ids]
+        assert len(first.cache_data) == len(last.cache_data) == 2
+        assert first.cache_data[1] is None
+        latest = last.cache_data[1]
+        assert set(latest) == {
+            "state",
+            "meta_state",
+            "class_ref",
+            "class_name",
+            "storage",
+        }
+        assert latest["storage"] == "latest"
+        assert latest["state"] is recurrent
+        assert latest["class_name"] is None
+        prefix = BlockTable("prefix", block_ids=table.block_ids[:1], num_tokens=4)
+        assert cache.reconstruct_cache(prefix) is None
+        rebuilt = cache.reconstruct_cache(table)
+        assert rebuilt is not None
+        assert isinstance(rebuilt[1], cache_types.ArraysCache)
+        assert rebuilt[1].state[0].tolist() == recurrent[0].tolist()
+        assert rebuilt[1].state[1].tolist() == recurrent[1].tolist()
+        assert cache._extract_block_tensor_slice([{}, {}], 0, 4, 8) is None
+        hole = cache._extract_block_tensor_slice([extracted[0], {}], 0, 4, 8)
+        assert hole is not None
+        assert len(hole) == 2 and hole[1] is None
+
+    def test_opaque_latest_state_and_metadata_keep_identity(self):
+        pytest.importorskip("mlx.core")
+        pytest.importorskip("mlx_lm.models.cache")
+        from vllm_mlx.paged_cache import BlockTable, PagedCacheManager
+        from vllm_mlx.prefix_cache import BlockAwarePrefixCache
+
+        class OpaqueCache:
+            @classmethod
+            def from_state(cls, state, meta):
+                restored = cls()
+                restored.state, restored.meta = state, meta
+                return restored
+
+        manager = PagedCacheManager(block_size=4, max_blocks=10)
+        cache = BlockAwarePrefixCache(None, manager)
+        state, metadata = object(), {"opaque": object()}
+        table = cache.store_cache(
+            "opaque",
+            list(range(8)),
+            [{"state": state, "meta_state": metadata, "class_ref": OpaqueCache}],
+        )
+        assert table is not None
+        first, last = [manager.allocated_blocks[bid] for bid in table.block_ids]
+        assert first.cache_data is None
+        assert last.cache_data[0]["state"] is state
+        assert last.cache_data[0]["meta_state"] is metadata
+        assert cache.reconstruct_cache(table) is None
+        terminal = BlockTable("last", block_ids=table.block_ids[-1:], num_tokens=4)
+        rebuilt = cache.reconstruct_cache(terminal)
+        assert rebuilt is not None
+        assert rebuilt[0].state is state
+        assert rebuilt[0].meta is metadata
+
+    def test_batch_state_envelope_cow_and_clear_keep_payload_identity(self):
+        mx = pytest.importorskip("mlx.core")
+        cache_types = pytest.importorskip("mlx_lm.models.cache")
+        from vllm_mlx.paged_cache import PagedCacheManager
+        from vllm_mlx.prefix_cache import BlockAwarePrefixCache
+
+        manager = PagedCacheManager(block_size=4, max_blocks=10)
+        cache = BlockAwarePrefixCache(None, manager)
+        keys = mx.arange(24).reshape(1, 2, 4, 3)
+        batch = cache_types.BatchKVCache(left_padding=[0])
+        batch.update_and_fetch(keys, keys)
+        state, metadata = batch.state, batch.meta_state
+        table = cache.store_cache(
+            "batch",
+            list(range(4)),
+            [
+                {
+                    "state": state,
+                    "meta_state": metadata,
+                    "class_ref": cache_types.BatchKVCache,
+                }
+            ],
+        )
+        assert table is not None
+        source = manager.allocated_blocks[table.block_ids[0]]
+        assert source.cache_data[0]["storage"] == "latest"
+        assert source.cache_data[0]["state"] is state
+        assert source.cache_data[0]["meta_state"] is metadata
+        assert "seq_axis" not in source.cache_data[0]
+        fork = cache.fork_cache("batch", "fork")
+        assert fork is not None
+        blocks, copied = manager.get_blocks_for_generation(fork)
+        assert copied is True
+        assert blocks[0].cache_data is source.cache_data
+        cache.clear()
+        assert all(block.cache_data is None for block in manager.blocks)
+        assert len(cache) == 0
 
 
 class TestSchedulerIntegration:
@@ -685,6 +1191,23 @@ class TestMLLMCompletionCacheStore:
         _, stored = generator.prefix_cache.store.call_args.args
         assert estimate_kv_cache_memory(stored) > 0
         assert [child.offset for child in stored[0].caches] == [3, 3]
+
+    def test_multimodal_request_is_never_stored_in_token_only_cache(self):
+        mx = pytest.importorskip("mlx.core")
+        pytest.importorskip("mlx.nn")
+        from vllm_mlx.mllm_batch_generator import MLLMBatchGenerator
+
+        generator = MLLMBatchGenerator.__new__(MLLMBatchGenerator)
+        generator.prefix_cache = MagicMock()
+        request = SimpleNamespace(
+            request_id="media", input_ids=mx.array([[1, 2, 3]]), is_text_only=False
+        )
+        batch = SimpleNamespace(
+            requests=[request], num_tokens=[1], extract_cache=MagicMock()
+        )
+        generator._maybe_store_prefix_cache(batch, [0])
+        batch.extract_cache.assert_not_called()
+        generator.prefix_cache.store.assert_not_called()
 
     def test_media_cache_is_never_stored_under_dense_prompt_tokens(self):
         from vllm_mlx.memory_cache import is_text_only_prefix_cache_request

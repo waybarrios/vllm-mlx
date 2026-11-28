@@ -665,3 +665,825 @@ class TestStructuredOutputIntegration:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+class TestResponseFormatNormalizationContract:
+    """Guard the normalized local type and its existing runtime semantics."""
+
+    @pytest.mark.parametrize("function", [parse_json_output, build_json_system_prompt])
+    def test_normalized_local_reuses_declared_dictionary_alternative(self, function):
+        # Dropping or narrowing this local contract recreates nested-schema
+        # inference errors; runtime characterization alone cannot detect that.
+        import ast
+        import inspect
+
+        node = ast.parse(inspect.getsource(function)).body[0]
+        argument = next(arg for arg in node.args.args if arg.arg == "response_format")
+        boundary = next(
+            item
+            for item in ast.walk(argument.annotation)
+            if isinstance(item, ast.Subscript)
+            and isinstance(item.value, ast.Name)
+            and item.value.id in ("Dict", "dict")
+        )
+        initializers = [
+            item
+            for item in ast.walk(node)
+            if isinstance(item, (ast.Assign, ast.AnnAssign))
+            and isinstance(item.value, ast.Dict)
+            and {key.value for key in item.value.keys if isinstance(key, ast.Constant)}
+            == {"type", "json_schema"}
+        ]
+        assert len(initializers) == 1
+        initializer = initializers[0]
+        assert isinstance(
+            initializer, ast.AnnAssign
+        ), "Normalized local must explicitly reuse the declared dictionary alternative"
+        assert ast.dump(initializer.annotation) == ast.dump(
+            boundary
+        ), "Normalized local must not narrow the declared dictionary alternative"
+        assert isinstance(initializer.target, ast.Name)
+        assert any(
+            isinstance(item, ast.Assign)
+            and any(
+                isinstance(target, ast.Name) and target.id == initializer.target.id
+                for target in item.targets
+            )
+            and isinstance(item.value, ast.Name)
+            and item.value.id == argument.arg
+            for item in ast.walk(node)
+        ), "The same normalized local must retain the raw dictionary input"
+
+    @pytest.mark.parametrize("format_type", [None, "text", "unknown", "json_object"])
+    def test_model_and_raw_formats_preserve_unicode_and_prompt_modes(self, format_type):
+        text = 'prefix {"name":"Zoë"} suffix'
+        formats = (
+            [None]
+            if format_type is None
+            else [ResponseFormat(type=format_type), {"type": format_type}]
+        )
+        for response_format in formats:
+            if format_type == "json_object":
+                assert parse_json_output(text, response_format) == (
+                    text,
+                    {"name": "Zoë"},
+                    True,
+                    None,
+                )
+                for ensure_ascii, expected in [
+                    (False, '{"name": "Zoë"}'),
+                    (True, '{"name": "Zo\\u00eb"}'),
+                ]:
+                    assert (
+                        apply_response_format_or_error(
+                            text, response_format, ensure_ascii=ensure_ascii
+                        )
+                        == expected
+                    )
+            else:
+                assert parse_json_output(text, response_format) == (
+                    text,
+                    None,
+                    True,
+                    None,
+                )
+                assert apply_response_format_or_error(text, response_format) == text
+
+            for thinking in (False, True):
+                prompt = build_json_system_prompt(
+                    response_format, thinking_model=thinking
+                )
+                if format_type == "json_object":
+                    assert prompt.startswith(
+                        "You must respond with a single valid JSON value only.\n\n"
+                    )
+                    assert ("You may reason first" in prompt) is thinking
+                    assert ("Your first character MUST" in prompt) is not thinking
+                    assert "no ``` fences" in prompt
+                else:
+                    assert prompt is None
+
+    @pytest.mark.parametrize("strict", [None, False])
+    @pytest.mark.parametrize("schema_key", ["schema", "schema_"])
+    def test_schema_alias_references_and_raw_input_are_preserved(
+        self, strict, schema_key, monkeypatch
+    ):
+        import copy
+
+        from vllm_mlx.api import tool_calling
+
+        schema = {
+            "type": "object",
+            "properties": {"name": {"type": "string"}},
+            "required": ["name"],
+        }
+        nested = ResponseFormatJsonSchema(
+            name="person", description=None, strict=strict, **{schema_key: schema}
+        )
+        model = ResponseFormat(type="json_schema", json_schema=nested)
+        accesses = []
+
+        class RawFormat(dict):
+            def get(self, key, default=None):
+                accesses.append(key)
+                return super().get(key, default)
+
+        raw = RawFormat(
+            type="json_schema",
+            json_schema={
+                "name": "person",
+                "description": None,
+                "strict": strict,
+                "schema": schema,
+            },
+        )
+        before = copy.deepcopy(raw)
+        validated = []
+        rendered = []
+        validate = tool_calling.validate_json_schema
+        dumps = json.dumps
+
+        def validate_recording_reference(data, supplied_schema):
+            validated.append(supplied_schema)
+            return validate(data, supplied_schema)
+
+        def dump_recording_reference(value, **kwargs):
+            if kwargs.get("indent") == 2:
+                rendered.append(value)
+            return dumps(value, **kwargs)
+
+        monkeypatch.setattr(
+            tool_calling, "validate_json_schema", validate_recording_reference
+        )
+        monkeypatch.setattr(tool_calling.json, "dumps", dump_recording_reference)
+        for response_format, original_schema in [
+            (model, nested.schema_),
+            (raw, schema),
+        ]:
+            assert parse_json_output('{"name":"Zoë"}', response_format) == (
+                '{"name":"Zoë"}',
+                {"name": "Zoë"},
+                True,
+                None,
+            )
+            assert validated[-1] is original_schema
+            assert (
+                apply_response_format_or_error('{"name":"Zoë"}', response_format)
+                == '{"name": "Zoë"}'
+            )
+            assert validated[-1] is original_schema
+            for thinking in (False, True):
+                prompt = build_json_system_prompt(
+                    response_format, thinking_model=thinking
+                )
+                assert "matching the 'person' schema." in prompt
+                assert '"required": [\n    "name"\n  ]' in prompt
+                assert ("You may reason first" in prompt) is thinking
+                assert ("Your first character MUST" in prompt) is not thinking
+                assert rendered[-1] is original_schema
+        assert accesses == ["type", "json_schema"] * 4
+        assert raw == before
+        assert raw["json_schema"]["schema"] is schema
+        assert nested.schema_ == schema == before["json_schema"]["schema"]
+        assert nested.description is None
+        assert nested.strict is strict
+
+    @pytest.mark.parametrize("as_model", [False, True])
+    @pytest.mark.parametrize(
+        "format_type,text,error_fragment",
+        [
+            ("json_object", "[1,2]", "JSON object root must be an object"),
+            ("json_schema", '{"user":{}}', "'name' is a required property"),
+        ],
+    )
+    def test_model_and_raw_formats_keep_validation_errors(
+        self, as_model, format_type, text, error_fragment
+    ):
+        response_format = {"type": format_type}
+        if format_type == "json_schema":
+            response_format["json_schema"] = {
+                "name": "nested",
+                "schema": {
+                    "type": "object",
+                    "properties": {
+                        "user": {
+                            "type": "object",
+                            "properties": {"name": {"type": "string"}},
+                            "required": ["name"],
+                        }
+                    },
+                    "required": ["user"],
+                },
+            }
+        if as_model:
+            response_format = ResponseFormat(**response_format)
+        cleaned, parsed, valid, error = parse_json_output(text, response_format)
+        assert cleaned == text
+        assert parsed == json.loads(text)
+        assert valid is False
+        assert error_fragment in error
+        with pytest.raises(InvalidResponseFormatOutput) as excinfo:
+            apply_response_format_or_error(text, response_format)
+        assert excinfo.value.message == error
+
+
+class TestResponseFormatBoundaryContract:
+    """Typed boundaries, with selected real server bodies and explicit CPU stubs.
+
+    Engine/media/default resolution and native processor construction are stubbed;
+    these tests do not execute endpoints or certify constrained decoding.
+    """
+
+    @staticmethod
+    def _server_namespace(source=None):
+        import ast
+        import dataclasses
+        import logging
+        from pathlib import Path
+        from typing import Any, Callable, TypedDict, overload
+
+        from fastapi import HTTPException
+
+        from vllm_mlx.api import tool_calling
+        from vllm_mlx.api.models import ChatCompletionRequest
+
+        if source is None:
+            source = (Path(__file__).parents[1] / "vllm_mlx/server.py").read_text()
+        names = {
+            "ChatGenerationKwargs",
+            "PreparedChatInvocation",
+            "_prepare_json_logits_processor",
+            "_prepare_chat_completion_invocation",
+            "_prepare_anthropic_invocation",
+            "_apply_response_format_or_raise",
+            "_inject_json_instruction",
+            "_strip_backslash_before_unicode",
+            "_is_outlines_backend_selector",
+            "_response_format_uses_outlines_backend",
+            "_raise_if_outlines_response_format_requested",
+        }
+        nodes = [
+            node
+            for node in ast.parse(source).body
+            if getattr(node, "name", None) in names
+        ]
+        assert {node.name for node in nodes} == names
+        namespace = dict(vars(tool_calling)) | {
+            "dataclass": dataclasses.dataclass,
+            "Any": Any,
+            "Callable": Callable,
+            "TypedDict": TypedDict,
+            "overload": overload,
+            "BaseEngine": object,
+            "ChatCompletionRequest": ChatCompletionRequest,
+            "HTTPException": HTTPException,
+            "logger": logging.getLogger(__name__),
+            "_OUTLINES_BACKEND_UNAVAILABLE_DETAIL": "response_format backend 'outlines' is unavailable",
+            "_reasoning_parser": None,
+            "_enable_auto_tool_choice": False,
+            "_tool_call_parser": None,
+            "_default_thinking_token_budget": None,
+            "_get_engine_tokenizer": lambda engine: engine,
+            "_prepare_chat_messages": lambda engine, messages: (
+                [message.model_dump(exclude_none=True) for message in messages],
+                [],
+                [],
+                [],
+                False,
+            ),
+            "_attach_logit_bias_processor": lambda *args: None,
+            "_resolve_chat_template_kwargs": lambda *args, **kwargs: {},
+            "get_parser_stop_tokens": lambda *args: None,
+            "_attach_response_format_logits_processor": lambda kwargs, processor: processor,
+        }
+        for name in (
+            "temperature",
+            "top_p",
+            "top_k",
+            "min_p",
+            "presence_penalty",
+            "repetition_penalty",
+        ):
+            namespace["_resolve_" + name] = lambda value: value
+        exec(
+            compile(ast.Module(body=nodes, type_ignores=[]), "selected-server", "exec"),
+            namespace,
+        )
+        return namespace
+
+    @pytest.mark.parametrize(
+        "site",
+        [
+            "apply_response_format_or_error",
+            "PreparedChatInvocation",
+            "_prepare_json_logits_processor",
+            "_apply_response_format_or_raise",
+        ],
+    )
+    def test_boundary_preserves_semantic_model_dictionary_nullable_domain(self, site):
+        # Erasing any one site to object recreates lost-domain diagnostics.
+        import ast
+        import inspect
+        from pathlib import Path
+        from typing import Any, get_args, get_origin
+
+        if site == "apply_response_format_or_error":
+            node = ast.parse(inspect.getsource(apply_response_format_or_error)).body[0]
+        else:
+            tree = ast.parse(
+                (Path(__file__).parents[1] / "vllm_mlx/server.py").read_text()
+            )
+            node = next(
+                node for node in tree.body if getattr(node, "name", None) == site
+            )
+        if isinstance(node, ast.ClassDef):
+            annotation = next(
+                item.annotation
+                for item in node.body
+                if isinstance(item, ast.AnnAssign)
+                and item.target.id == "response_format"
+            )
+        else:
+            annotation = next(
+                arg.annotation for arg in node.args.args if arg.arg == "response_format"
+            )
+        from vllm_mlx.api import tool_calling
+
+        domain = eval(
+            compile(ast.Expression(annotation), "boundary-annotation", "eval"),
+            vars(tool_calling),
+        )
+        alternatives = {
+            (get_origin(value), get_args(value)) if get_origin(value) else value
+            for value in get_args(domain)
+        }
+        assert alternatives == {ResponseFormat, (dict, (str, Any)), type(None)}, site
+
+    def test_required_nullable_constructor_and_intended_reflection(self):
+        import dataclasses
+        import inspect
+        from typing import Any, get_type_hints
+
+        namespace = self._server_namespace()
+        constructor = namespace["PreparedChatInvocation"]
+        expected = ResponseFormat | dict[str, Any] | None
+        assert get_type_hints(constructor)["response_format"] == expected
+        assert constructor.__init__.__annotations__["response_format"] == expected
+        fields = dataclasses.fields(constructor)
+        assert [field.name for field in fields] == [
+            "messages",
+            "chat_kwargs",
+            "response_format",
+            "json_logits_processor",
+            "thinking_processor",
+        ]
+        for field in fields:
+            assert field.default_factory is dataclasses.MISSING
+            assert field.init and field.repr and field.compare
+            assert field.hash is None and not field.kw_only
+            assert field.default is (
+                None if field.name == "thinking_processor" else dataclasses.MISSING
+            )
+        assert fields[2].type == expected
+        signature = inspect.signature(constructor)
+        assert list(signature.parameters) == [field.name for field in fields]
+        assert all(
+            parameter.kind == inspect.Parameter.POSITIONAL_OR_KEYWORD
+            for parameter in signature.parameters.values()
+        )
+        assert (
+            signature.parameters["response_format"].default is inspect.Parameter.empty
+        )
+        with pytest.raises(TypeError):
+            constructor(messages=[], chat_kwargs={}, json_logits_processor=None)
+        assert constructor([], {}, None, None).response_format is None
+        for function in (
+            apply_response_format_or_error,
+            namespace["_prepare_json_logits_processor"],
+            namespace["_apply_response_format_or_raise"],
+        ):
+            assert get_type_hints(function)["response_format"] == expected
+            assert (
+                inspect.signature(function).parameters["response_format"].default
+                is inspect.Parameter.empty
+            )
+
+    @pytest.mark.parametrize("adapted", [False, True])
+    @pytest.mark.parametrize("with_format", [False, True])
+    @pytest.mark.parametrize(
+        "producer",
+        ["_prepare_chat_completion_invocation", "_prepare_anthropic_invocation"],
+    )
+    def test_actual_requests_and_extracted_producers_keep_format_identity(
+        self, adapted, with_format, producer
+    ):
+        from vllm_mlx.api.anthropic_adapter import anthropic_to_openai
+        from vllm_mlx.api.anthropic_models import AnthropicRequest
+        from vllm_mlx.api.models import ChatCompletionRequest
+
+        response_format = ResponseFormat(type="json_object") if with_format else None
+        values = {"model": "offline", "messages": [{"role": "user", "content": "json"}]}
+        if adapted:
+            request = anthropic_to_openai(
+                AnthropicRequest(
+                    **values,
+                    max_tokens=32,
+                    response_format=(
+                        response_format.model_dump(by_alias=True)
+                        if response_format
+                        else None
+                    ),
+                )
+            )
+        else:
+            request = ChatCompletionRequest(**values, response_format=response_format)
+            assert request.response_format is response_format
+        snapshot = request.model_dump(by_alias=True)
+        namespace = self._server_namespace()
+        supplied = []
+        processor = object()
+
+        def build(format_value, tokenizer):
+            supplied.append(format_value)
+            return processor
+
+        namespace["build_json_logits_processor"] = build
+        prepared = namespace[producer](object(), request, 32)
+        assert prepared.response_format is request.response_format
+        assert prepared.chat_kwargs["max_tokens"] == 32
+        assert prepared.json_logits_processor is (processor if with_format else None)
+        assert supplied == ([request.response_format] if with_format else [])
+        if supplied:
+            assert supplied[0] is request.response_format
+        assert request.model_dump(by_alias=True) == snapshot
+
+    def test_raw_schema_reference_and_http_output_are_preserved(self):
+        import copy
+        from fastapi import HTTPException
+
+        namespace = self._server_namespace()
+        schema = {"type": "object", "required": ["name"]}
+        raw = {
+            "type": "json_schema",
+            "json_schema": {"name": "person", "schema": schema},
+        }
+        snapshot = copy.deepcopy(raw)
+        supplied = []
+        namespace["build_json_logits_processor"] = (
+            lambda format_value, tokenizer: supplied.append(format_value)
+        )
+        namespace["_prepare_json_logits_processor"](
+            object(), [], raw, tools=None, tool_choice=None
+        )
+        assert supplied[0] is raw
+        assert (
+            namespace["PreparedChatInvocation"]([], {}, raw, None).response_format
+            is raw
+        )
+        apply = namespace["_apply_response_format_or_raise"]
+        assert apply('{"name":"Zoë"}', raw) == '{"name": "Zoë"}'
+        assert (
+            apply('{"name":"Zoë"}', raw, ensure_ascii=True) == '{"name": "Zo\\u00eb"}'
+        )
+        with pytest.raises(HTTPException) as excinfo:
+            apply("not JSON", raw)
+        assert excinfo.value.status_code == 422
+        assert excinfo.value.detail == {
+            "error": "invalid_response_format_output",
+            "message": "Failed to extract valid JSON from output",
+        }
+        assert raw == snapshot and raw["json_schema"]["schema"] is schema
+        assert apply("plain text", None) == "plain text"
+
+    @pytest.mark.parametrize(
+        "case,status,detail",
+        [
+            ("backend", 422, "response_format backend 'outlines' is unavailable"),
+            ("tools", 400, "tools and response_format cannot be combined"),
+            (
+                "tokenizer",
+                422,
+                "response_format is unavailable: serving tokenizer not found",
+            ),
+            ("builder", 422, "response_format is unavailable: bounded failure"),
+        ],
+    )
+    def test_preparation_retains_admission_and_construction_errors(
+        self, case, status, detail
+    ):
+        from fastapi import HTTPException
+
+        namespace = self._server_namespace()
+
+        def fail_builder(*args):
+            raise ValueError("bounded failure")
+
+        namespace["build_json_logits_processor"] = fail_builder
+        with pytest.raises(HTTPException) as excinfo:
+            namespace["_prepare_json_logits_processor"](
+                None if case == "tokenizer" else object(),
+                [],
+                {"type": "outlines" if case == "backend" else "json_object"},
+                tools=[1] if case == "tools" else None,
+                tool_choice=None,
+            )
+        assert (excinfo.value.status_code, excinfo.value.detail) == (status, detail)
+
+    def test_backend_precedes_prompt_and_prompt_precedes_tools(self):
+        from fastapi import HTTPException
+
+        namespace = self._server_namespace()
+
+        def fail_prompt(*args, **kwargs):
+            raise ValueError("prompt first")
+
+        namespace["build_json_system_prompt"] = fail_prompt
+        prepare = namespace["_prepare_json_logits_processor"]
+        with pytest.raises(HTTPException) as excinfo:
+            prepare(object(), [], {"type": "outlines"}, tools=[1], tool_choice=None)
+        assert excinfo.value.status_code == 422
+        with pytest.raises(ValueError, match="prompt first"):
+            prepare(object(), [], {"type": "json_object"}, tools=[1], tool_choice=None)
+
+
+class TestJsonDecoderValueContract:
+    """Recursive decoder typing and existing extraction/consumer behavior."""
+
+    @pytest.mark.parametrize(
+        "name", ["_repair_truncated_json", "extract_json_from_text"]
+    )
+    def test_return_contract_includes_recursive_json_values(self, name):
+        from typing import Any, ForwardRef, get_args, get_origin, get_type_hints
+
+        from vllm_mlx.api import tool_calling
+
+        result = get_type_hints(getattr(tool_calling, name))["return"]
+        members = get_args(result)
+        assert {get_origin(member) or member for member in members} == {
+            dict,
+            list,
+            str,
+            int,
+            float,
+            bool,
+            type(None),
+        }
+        assert (
+            getattr(tool_calling, name).__annotations__["return"]
+            is tool_calling._JSONValue
+        )
+
+        def check(member):
+            assert member is not Any and member is not object
+            if isinstance(member, ForwardRef):
+                assert member.__forward_arg__ == "_JSONValue"
+                return
+            for arg in get_args(member):
+                check(arg)
+
+        check(result)
+        containers = {
+            get_origin(member): member for member in get_args(tool_calling._JSONValue)
+        }
+        assert get_args(containers[dict])[0] is str
+        assert get_args(containers[dict])[1] == get_args(containers[list])[0]
+        assert isinstance(get_args(containers[list])[0], ForwardRef)
+
+    @pytest.mark.parametrize(
+        "name,site",
+        [("_repair_truncated_json", 0)]
+        + [("extract_json_from_text", site) for site in range(4)],
+    )
+    def test_each_decoder_producer_has_typed_immediate_result(self, name, site):
+        import ast
+        import inspect
+        import textwrap
+
+        from vllm_mlx.api import tool_calling
+
+        function = getattr(tool_calling, name)
+        tree = ast.parse(textwrap.dedent(inspect.getsource(function)))
+        calls = sorted(
+            (
+                node
+                for node in ast.walk(tree)
+                if isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "json"
+                and node.func.attr == "loads"
+            ),
+            key=lambda node: node.lineno,
+        )
+        assert len(calls) == (1 if name == "_repair_truncated_json" else 4)
+        call = calls[site]
+        assert len(call.args) == 1 and not call.keywords
+        parent = next(
+            node for node in ast.walk(tree) if call in list(ast.iter_child_nodes(node))
+        )
+        assert isinstance(parent, ast.AnnAssign), "Untyped stdlib decoder result"
+        assert isinstance(parent.target, ast.Name)
+        assert (
+            eval(ast.unparse(parent.annotation), vars(tool_calling))
+            == function.__annotations__["return"]
+        )
+        containing_try = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Try) and parent in node.body
+        )
+        following = containing_try.body[containing_try.body.index(parent) + 1]
+        assert isinstance(following, ast.Return)
+        assert isinstance(following.value, ast.Name)
+        assert following.value.id == parent.target.id
+
+    @pytest.mark.parametrize("path", ["direct", "complete_fence", "open_fence"])
+    @pytest.mark.parametrize(
+        "text,want,kind",
+        [
+            (
+                '{"a":[null,true,1,1.5,"Zoë",{"b":false}]}',
+                {"a": [None, True, 1, 1.5, "Zoë", {"b": False}]},
+                dict,
+            ),
+            ('[1,{"x":null}]', [1, {"x": None}], list),
+            ('"Zoë"', "Zoë", str),
+            ("42", 42, int),
+            ("-2.5", -2.5, float),
+            ("true", True, bool),
+            ("false", False, bool),
+            ("null", None, type(None)),
+            ("NaN", "nan", float),
+            ("Infinity", "inf", float),
+            ("-Infinity", "-inf", float),
+            ("1e400", "inf", float),
+        ],
+    )
+    def test_real_decoder_root_domain(self, path, text, want, kind):
+        import math
+
+        if path != "direct":
+            text = "before\n```json\n" + text
+            if path == "complete_fence":
+                text += "\n```"
+        result = extract_json_from_text(text)
+        assert type(result) is kind
+        if want == "nan":
+            assert math.isnan(result)
+        elif want in ("inf", "-inf"):
+            assert math.isinf(result)
+            assert (result > 0) == (want == "inf")
+        else:
+            assert result == want
+        if isinstance(result, dict):
+            assert type(result["a"][1]) is bool
+            assert type(result["a"][2]) is int
+
+    @pytest.mark.parametrize(
+        "fragment,want,attempts",
+        [
+            ('{"a":1', {"a": 1}, ['{"a":1}']),
+            ("[1,", [1], ["[1,]", "[1]"]),
+            (
+                '{"a":1,"dangling":',
+                {"a": 1},
+                ['{"a":1,"dangling":}', '{"a":1,"dangling"}', '{"a":1}'],
+            ),
+            ("[1, tr", [1], ["[1, tr]", "[1]"]),
+            ('"abc', "abc", ['"abc"']),
+            ("[1, nope", None, ["[1, nope]"]),
+        ],
+    )
+    def test_existing_repair_candidates_and_retry_order(
+        self, monkeypatch, fragment, want, attempts
+    ):
+        from vllm_mlx.api.tool_calling import _repair_truncated_json
+
+        loads = json.loads
+        seen = []
+
+        def record(text, *args, **kwargs):
+            seen.append(text)
+            assert not args and not kwargs
+            return loads(text, *args, **kwargs)
+
+        monkeypatch.setattr(json, "loads", record)
+        result = _repair_truncated_json(fragment)
+        assert result == want and type(result) is type(want)
+        assert seen == attempts
+
+    @pytest.mark.parametrize(
+        "name,text,attempts",
+        [
+            ("_repair_truncated_json", '{"x":1', ['{"x":1}']),
+            ("extract_json_from_text", '{"x":1}', ['{"x":1}']),
+            (
+                "extract_json_from_text",
+                'before ```json\n{"x":1}\n```',
+                ['before ```json\n{"x":1}\n```', '{"x":1}'],
+            ),
+            (
+                "extract_json_from_text",
+                'before ```json\n{"x":1}',
+                ['before ```json\n{"x":1}', '{"x":1}'],
+            ),
+            (
+                "extract_json_from_text",
+                'before {"x":1} after',
+                ['before {"x":1} after', '{"x":1}'],
+            ),
+        ],
+    )
+    def test_all_five_paths_return_original_decoder_result(
+        self, monkeypatch, name, text, attempts
+    ):
+        from vllm_mlx.api import tool_calling
+
+        loads = json.loads
+        made = []
+        seen = []
+
+        def record(value, *args, **kwargs):
+            seen.append(value)
+            assert not args and not kwargs
+            result = loads(value, *args, **kwargs)
+            made.append(result)
+            return result
+
+        monkeypatch.setattr(json, "loads", record)
+        result = getattr(tool_calling, name)(text)
+        assert result == {"x": 1} and result is made[-1]
+        assert seen == attempts
+
+    @pytest.mark.parametrize("exception", [ValueError, TypeError, RecursionError])
+    @pytest.mark.parametrize(
+        "name,text",
+        [
+            ("_repair_truncated_json", '{"x":1'),
+            ("extract_json_from_text", '{"x":1}'),
+            ("extract_json_from_text", 'before ```json\n{"x":1}\n```'),
+            ("extract_json_from_text", 'before ```json\n{"x":1}'),
+            ("extract_json_from_text", 'before {"x":1} after'),
+        ],
+    )
+    def test_non_decode_errors_propagate_at_each_producer(
+        self, monkeypatch, exception, name, text
+    ):
+        from vllm_mlx.api import tool_calling
+
+        loads = json.loads
+        error = exception("decoder boundary")
+
+        def decode(value, *args, **kwargs):
+            if value == '{"x":1}':
+                raise error
+            return loads(value, *args, **kwargs)
+
+        monkeypatch.setattr(json, "loads", decode)
+        with pytest.raises(exception) as caught:
+            getattr(tool_calling, name)(text)
+        assert caught.value is error
+
+    @pytest.mark.parametrize(
+        "text,want",
+        [("before [1,2] after", [1, 2]), ('before {"x":[1]} after', {"x": [1]})],
+    )
+    def test_balanced_scan_reachable_container_roots(self, text, want):
+        result = extract_json_from_text(text)
+        assert type(result) is type(want) and result == want
+
+    def test_existing_object_before_array_scan_preference(self):
+        assert extract_json_from_text('before [1] then {"later":2}') == {"later": 2}
+
+    def test_existing_null_first_fence_stops_before_later_block(self, monkeypatch):
+        loads = json.loads
+        seen = []
+
+        def record(text):
+            seen.append(text)
+            return loads(text)
+
+        monkeypatch.setattr(json, "loads", record)
+        text = '```json\nnull\n```\n```json\n{"later":1}\n```'
+        assert extract_json_from_text(text) is None
+        assert seen == [text, "null"]
+
+    def test_existing_private_string_repair_is_not_bare_string_extraction(self):
+        from vllm_mlx.api.tool_calling import _repair_truncated_json
+
+        assert _repair_truncated_json('"abc') == "abc"
+        assert extract_json_from_text('"abc') is None
+
+    @pytest.mark.parametrize(
+        "text,want", [("[1]", [1]), ('"abc"', "abc"), ("42", 42), ("true", True)]
+    )
+    def test_object_root_restriction_remains_in_parser(self, text, want):
+        extracted = extract_json_from_text(text)
+        assert type(extracted) is type(want) and extracted == want
+        _, parsed, valid, error = parse_json_output(text, {"type": "json_object"})
+        assert parsed == want and not valid
+        assert error == "JSON object root must be an object"
+        _, parsed, valid, error = parse_json_output(
+            text, {"type": "json_schema", "json_schema": {"schema": {}}}
+        )
+        assert parsed == want and valid and error is None

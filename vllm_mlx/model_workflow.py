@@ -110,7 +110,8 @@ def _bytes_to_gb(size: int | float | None) -> float | None:
 
 def _read_json(path: Path) -> dict[str, Any]:
     try:
-        return json.loads(path.read_text())
+        payload: dict[str, Any] = json.loads(path.read_text())
+        return payload
     except (FileNotFoundError, json.JSONDecodeError):
         return {}
 
@@ -305,6 +306,7 @@ def inspect_model(
 ) -> dict[str, Any]:
     """Inspect a local model path or Hugging Face model id without loading weights."""
     model_path = Path(model).expanduser()
+    total_bytes: int | None
     warnings = []
 
     if model_path.exists():

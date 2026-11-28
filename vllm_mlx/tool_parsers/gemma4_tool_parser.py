@@ -159,7 +159,7 @@ def _find_balanced_paren(text: str, start: int) -> int:
     return -1
 
 
-def _quote_bare_value(m: re.Match) -> str:
+def _quote_bare_value(m: re.Match[str]) -> str:
     """Substitution callback for _BARE_VALUE — quotes bare identifiers that
     are not JSON literals (true/false/null)."""
     ws, word = m.group(1), m.group(2)
@@ -456,10 +456,10 @@ class Gemma4ToolParser(ToolParser):
         # Drop residual `print(tool_code)` lines left by the unfenced assignment
         # convention — they are bookkeeping noise, not reply content.
         content = re.sub(r"(?m)^[ \t]*print\([^\n]*\)[ \t]*$", "", content)
-        content = content.strip() or None
+        final_content = content.strip() or None
 
         return ExtractedToolCallInformation(
-            tools_called=True, tool_calls=tool_calls, content=content
+            tools_called=True, tool_calls=tool_calls, content=final_content
         )
 
     def _format_streaming(self, result: ExtractedToolCallInformation) -> dict[str, Any]:

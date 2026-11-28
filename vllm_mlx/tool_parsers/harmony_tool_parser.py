@@ -159,7 +159,7 @@ class HarmonyToolParser(ToolParser):
         as regular content deltas and plain text passes through unchanged.
         """
         if not hasattr(self, "_emitted_streaming_signatures"):
-            self._emitted_streaming_signatures = set()
+            self._emitted_streaming_signatures: set[tuple[str, str]] = set()
 
         # No harmony channel at all: plain text passes through
         if "<|channel|>" not in current_text:

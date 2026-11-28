@@ -24,9 +24,10 @@ import os
 import socket
 import tempfile
 import threading
-from collections.abc import Iterator
+from collections.abc import Generator, Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any, cast
 from urllib.parse import urljoin, urlparse
 
 import numpy as np
@@ -279,7 +280,8 @@ def _normalize_mllm_tool_calls(tool_calls: list) -> list:
     normalized = normalize_messages_for_chat_template(
         [{"role": "assistant", "tool_calls": plain_calls}]
     )
-    return normalized[0].get("tool_calls", plain_calls)
+    normalized_calls: list = normalized[0].get("tool_calls", plain_calls)
+    return normalized_calls
 
 
 def _audio_inputs_in_message_order(
@@ -546,9 +548,11 @@ def load_gemma4_assistant_drafter(model_path: str):
         json.loads(config_path.read_text(encoding="utf-8"))
     )
     model = arch.Model(config)
-    weights = {}
+    weights: dict[str, Any] = {}
     for weight_path in weight_paths:
-        weights.update(mx.load(str(weight_path)))
+        # Safetensors files yield a weight dictionary without metadata.
+        shard_weights = cast("dict[str, mx.array]", mx.load(str(weight_path)))
+        weights.update(shard_weights)
     if hasattr(model, "sanitize"):
         weights = model.sanitize(weights)
     model.load_weights(list(weights.items()))
@@ -1155,8 +1159,10 @@ def process_video_input(video: str | dict) -> str:
     if isinstance(video, dict):
         url = video.get("url", video.get("video_url", ""))
         if isinstance(url, dict):
-            url = url.get("url", "")
-        video = url
+            resolved_url: str = url.get("url", "")
+        else:
+            resolved_url = url
+        video = resolved_url
 
     if not video:
         raise ValueError("Empty video input")
@@ -1187,8 +1193,10 @@ def process_audio_input(audio: str | dict) -> str:
     if isinstance(audio, dict):
         url = audio.get("url", audio.get("audio_url", ""))
         if isinstance(url, dict):
-            url = url.get("url", "")
-        audio = url
+            resolved_url: str = url.get("url", "")
+        else:
+            resolved_url = url
+        audio = resolved_url
 
     if not audio:
         raise ValueError("Empty audio input")
@@ -1356,7 +1364,7 @@ def save_base64_image(base64_string: str) -> str:
     return path
 
 
-def process_image_input(image: str | dict) -> str:
+def process_image_input(image: str | dict | None) -> str:
     """
     Process image input in various formats and return local path.
 
@@ -1369,8 +1377,10 @@ def process_image_input(image: str | dict) -> str:
     if isinstance(image, dict):
         url = image.get("url", image.get("image_url", ""))
         if isinstance(url, dict):
-            url = url.get("url", "")
-        image = url
+            resolved_url: str = url.get("url", "")
+        else:
+            resolved_url = url
+        image = resolved_url
 
     if not image:
         raise ValueError("Empty image input")
@@ -1574,8 +1584,8 @@ class MLXMultimodalLM:
         self.draft_block_size = draft_block_size
         self.default_draft_enabled = default_draft_enabled
 
-        self.model = None
-        self.processor = None
+        self.model: Any | None = None
+        self.processor: Any | None = None
         self.config = None
         self._draft_model = None
         self._loaded = False
@@ -1605,6 +1615,7 @@ class MLXMultimodalLM:
                 _install_draft_metrics_hooks(self._draft_model)
 
             self._loaded = True
+            assert self.model is not None
             self._video_native = hasattr(
                 self.model.config, "video_token_id"
             ) or hasattr(self.model.config, "video_token_index")
@@ -1853,6 +1864,8 @@ class MLXMultimodalLM:
             messages, video_fps, video_max_frames
         )
 
+        assert self.processor is not None
+
         # Use HF processor's chat template (handles timestamp interleaving)
         template_kwargs: dict = {}
         if tools:
@@ -2032,7 +2045,7 @@ class MLXMultimodalLM:
                     has_explicit_audio = True
                     break
 
-            new_content = []
+            new_content: list[dict[str, Any]] = []
             for item in content:
                 if hasattr(item, "model_dump"):
                     item = item.model_dump(exclude_none=True)
@@ -2050,7 +2063,7 @@ class MLXMultimodalLM:
 
                 elif item_type == "image_url":
                     img_url = item.get("image_url", {})
-                    url = (
+                    url: str | dict = (
                         img_url.get("url", img_url)
                         if isinstance(img_url, dict)
                         else img_url
@@ -2069,7 +2082,7 @@ class MLXMultimodalLM:
                     if item_type == "video_url":
                         vid_url = item.get("video_url", {})
                         if isinstance(vid_url, str):
-                            video_source = vid_url
+                            video_source: str | dict | None = vid_url
                         elif isinstance(vid_url, dict):
                             video_source = vid_url.get("url", "")
                         else:
@@ -2106,7 +2119,7 @@ class MLXMultimodalLM:
                     if item_type == "audio_url":
                         aud_url = item.get("audio_url", {})
                         if isinstance(aud_url, str):
-                            audio_source = aud_url
+                            audio_source: str | dict | None = aud_url
                         elif isinstance(aud_url, dict):
                             audio_source = aud_url.get("url", "")
                         else:
@@ -2307,7 +2320,7 @@ class MLXMultimodalLM:
         temperature: float = 0.7,
         video_fps: float = DEFAULT_FPS,
         **kwargs,
-    ) -> Iterator[str]:
+    ) -> Generator[str, None, None]:
         """
         Stream text generation for multimodal input.
 
@@ -2420,7 +2433,7 @@ class MLXMultimodalLM:
 
         # Extract text, images and audio from messages
         # Build chat_messages for multi-turn support WITH proper image/audio tokens per message
-        all_image_urls = []  # Raw URLs/paths to process later
+        all_image_urls: list[str] = []  # Raw URLs/paths to process later
         chat_messages = []  # List of properly formatted messages for chat template
 
         logger.info(f"MLLM.chat() called with {len(messages)} messages")
@@ -2584,6 +2597,7 @@ class MLXMultimodalLM:
         cache_hit = False
 
         # Tokenize prompt for cache lookup
+        assert self.processor is not None
         tokenizer = (
             self.processor.tokenizer
             if hasattr(self.processor, "tokenizer")
@@ -2619,7 +2633,7 @@ class MLXMultimodalLM:
         start_time = time.time()
 
         # Create or reuse prompt cache for prefix caching speedup
-        prompt_cache = None
+        prompt_cache: list[Any] | None = None
         skip_prompt_processing = False
 
         if cache_hit and cache_entry and cache_entry.kv_cache:
@@ -2821,7 +2835,7 @@ class MLXMultimodalLM:
 
         # Extract text and images from messages
         # Build chat_messages for multi-turn support WITH proper image tokens per message
-        all_image_urls = []  # Raw URLs/paths to process later
+        all_image_urls: list[str] = []  # Raw URLs/paths to process later
         chat_messages = []  # List of properly formatted messages for chat template
 
         # Pop params early so they don't leak into mlx_vlm.generate()

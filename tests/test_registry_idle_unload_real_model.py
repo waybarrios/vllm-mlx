@@ -31,11 +31,6 @@ import tempfile
 import time
 from pathlib import Path
 
-# Skip if not on Apple Silicon
-if sys.platform != "darwin" or platform.machine() != "arm64":
-    print("This test requires Apple Silicon")
-    sys.exit(0)
-
 PORT = 8971
 IDLE_UNLOAD_SECONDS = 10
 STARTUP_TIMEOUT_S = 60
@@ -234,6 +229,10 @@ models:
 
 
 def main():
+    if sys.platform != "darwin" or platform.machine() != "arm64":
+        print("This test requires Apple Silicon")
+        sys.exit(0)
+
     parser = argparse.ArgumentParser(
         description="Test registry-mode idle-unload memory reclaim with a real model"
     )

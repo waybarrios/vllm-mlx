@@ -6,6 +6,8 @@ user-controlled request bodies. Unknown model names must be rejected before any
 engine instantiation or download path is reached.
 """
 
+from typing import NoReturn
+
 from fastapi import HTTPException
 
 _EMBEDDING_MODELS = frozenset(
@@ -50,7 +52,7 @@ _STT_MODEL_MAP = _with_identity_aliases(_STT_MODEL_ALIASES)
 _TTS_MODEL_MAP = _with_identity_aliases(_TTS_MODEL_ALIASES)
 
 
-def _reject_unknown_embedding_model(requested_model: str) -> None:
+def _reject_unknown_embedding_model(requested_model: str) -> NoReturn:
     supported = ", ".join(sorted(_EMBEDDING_MODELS))
     raise HTTPException(
         status_code=400,
@@ -67,7 +69,7 @@ def _reject_unknown_audio_model(
     endpoint: str,
     requested_model: str,
     supported_aliases: dict[str, str],
-) -> None:
+) -> NoReturn:
     aliases = ", ".join(sorted(supported_aliases))
     raise HTTPException(
         status_code=400,

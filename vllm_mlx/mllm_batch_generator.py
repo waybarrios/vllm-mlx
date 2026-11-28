@@ -22,7 +22,18 @@ import os
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Dict,
+    Iterator,
+    List,
+    Optional,
+    Tuple,
+    TypedDict,
+    cast,
+)
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -30,6 +41,7 @@ import mlx.nn as nn
 from .memory_cache import (
     MemoryAwarePrefixCache,
     MemoryCacheConfig,
+    _CacheEntry,
     is_text_only_prefix_cache_request,
 )
 from .multimodal_processor import MultimodalProcessor
@@ -51,8 +63,12 @@ def _processors_can_retire(processors: Optional[List[Callable]]) -> bool:
     if os.getenv("VLLM_MLX_ENABLE_THINKING_RETIREMENT_RESUME") != "1":
         return False
     return bool(processors) and any(
-        isinstance(getattr(p, "is_retired", None), bool) for p in processors
+        isinstance(getattr(p, "is_retired", None), bool) for p in processors or []
     )
+
+
+def _request_has_media(request: "MLLMBatchRequest") -> bool:
+    return bool(request.images or request.videos or request.audio)
 
 
 def _mark_mtp_attempts_on_primary_responses(
@@ -115,7 +131,9 @@ def _sampling_logprobs(logits: mx.array, request: Any) -> mx.array:
     if temperature in (0, 0.0):
         token = mx.argmax(logprobs, axis=-1)
         result = mx.full(logprobs.shape, -float("inf"))
-        return mx.put_along_axis(result, token[:, None], 0.0, axis=-1)
+        return mx.put_along_axis(
+            result, token[:, None], mx.array(0.0, dtype=result.dtype), axis=-1
+        )
 
     if 0.0 < top_p < 1.0:
         logprobs = apply_top_p(logprobs, top_p)
@@ -400,6 +418,7 @@ class MLLMBatch:
                 if self.decode_rope_deltas is not None
                 else other.decode_rope_deltas
             )
+            assert template is not None
             self_len = len(self.uids) - len(other.uids)
             left = self.decode_rope_deltas
             right = other.decode_rope_deltas
@@ -440,21 +459,23 @@ class MLLMBatch:
             RotatingKVCache,
         )
 
-        result = []
+        result: List[Any] = []
         for c in self.cache:
             if not hasattr(c, "extract"):
                 result.append(None)
             elif isinstance(c, BatchRotatingKVCache):
                 # Custom extraction: clamp left_padding to >= 0
                 cache = RotatingKVCache(c.max_size)
-                padding = max(0, c.left_padding[idx].item())
+                padding = max(0, cast(int, c.left_padding[idx].item()))
                 offset = c.offset[idx].item()
+                assert c.keys is not None
+                assert c.values is not None
                 cache.keys = c.keys[idx : idx + 1]
                 cache.values = c.values[idx : idx + 1]
                 cache._idx = c._idx
                 if c.rotated:
-                    cache.keys = mx.roll(cache.keys, -c._idx, axis=2)
-                    cache.values = mx.roll(cache.values, -c._idx, axis=2)
+                    cache.keys = mx.roll(cache.keys, -c._idx, 2)
+                    cache.values = mx.roll(cache.values, -c._idx, 2)
                     cache._idx = c.max_size
                 cache.keys = mx.contiguous(cache.keys[:, :, padding : cache._idx])
                 cache.values = mx.contiguous(cache.values[:, :, padding : cache._idx])
@@ -524,6 +545,33 @@ def _left_pad_prompts(
     return mx.array([[0] * (max_length - len(p)) + list(p) for p in prompts])
 
 
+class _PenaltyKwargs(TypedDict, total=False):
+    repetition_penalty: float
+    presence_penalty: float
+
+
+class _SpecPrefillStats(TypedDict):
+    decisions: int
+    engaged: int
+    fallbacks: int
+    original_tokens: int
+    selected_tokens: int
+    bypass_counts: Dict[str, int]
+
+
+class _PartialPrefill(TypedDict):
+    request: MLLMBatchRequest
+    cache: List[Any]
+    remaining_ids: mx.array
+    processed: int
+    total: int
+    cached_count: int
+    chunk_count: int
+    checkpoint_at: Optional[int]
+    checkpoint_key: Optional[List[int]]
+    checkpoint_entry: Optional[_CacheEntry]
+
+
 class MLLMBatchGenerator:
     """
     Batch generator for Vision Language Models.
@@ -550,6 +598,12 @@ class MLLMBatchGenerator:
 
     # Generation stream for async eval
     _stream = None
+
+    if TYPE_CHECKING:
+        get_mtp_stats: Callable[[], Dict[str, Any]]
+        _inner_next: Callable[[], List[MLLMBatchResponse]]
+        _partial: Optional[_PartialPrefill]
+        _chunked_prefill_budget: int
 
     def __init__(
         self,
@@ -602,7 +656,7 @@ class MLLMBatchGenerator:
         self.specprefill_backbone_pct = specprefill_backbone_pct
         self.specprefill_runtime_reason = specprefill_runtime_reason
         self._mtp_runtime_implementation: Optional[str] = None
-        self._specprefill_stats = {
+        self._specprefill_stats: _SpecPrefillStats = {
             "decisions": 0,
             "engaged": 0,
             "fallbacks": 0,
@@ -612,7 +666,7 @@ class MLLMBatchGenerator:
         }
 
         # Get language model for text generation
-        self.language_model = getattr(model, "language_model", model)
+        self.language_model: Any = getattr(model, "language_model", model)
 
         # Check if this is actually a VLM with separate language model
         self.is_vlm = hasattr(model, "language_model")
@@ -725,7 +779,7 @@ class MLLMBatchGenerator:
         self._old_wired_limit = None
         if mx.metal.is_available():
             self._old_wired_limit = mx.set_wired_limit(
-                mx.device_info()["max_recommended_working_set_size"]
+                cast(int, mx.device_info()["max_recommended_working_set_size"])
             )
 
     def _normalize_chat_template_for_prefix_cache(self) -> None:
@@ -807,8 +861,13 @@ class MLLMBatchGenerator:
         and, if the template appends one, when it is disabled (e.g.
         ``<think>\n\n</think>\n\n``). Empty when unknown. Hybrid prefill
         uses them to find a prompt's conversation boundary.
+
+        Templates whose enabled prompt ends with no think tag but whose
+        disabled prompt appends a short empty thought block after the same
+        assistant header (Gemma 4: ``<|channel>thought\\n<channel|>``) record
+        only the disabled block and return 0.
         """
-        self._think_suffixes = ()
+        self._think_suffixes: Tuple[Tuple[int, ...], ...] = ()
         try:
             # Find something with apply_chat_template
             applicator = None
@@ -878,6 +937,23 @@ class MLLMBatchGenerator:
                         )
                     return max(0, suffix_len)
 
+            # No think tag when enabled, but the disabled prompt may still
+            # append an empty thought block after the same assistant header.
+            # The enabled prompt is then a prefix of the next turn already;
+            # only the disabled block marks a conversation boundary.
+            tail = min(8, len(text_with))
+            header = text_with[-tail:] if tail else ""
+            pos = text_without.rfind(header) if header else -1
+            disabled = text_without[pos + tail :] if pos >= 0 else ""
+            if 0 < len(disabled) <= 64:
+                tokenizer = getattr(self.processor, "tokenizer", self.processor)
+                ids = self._suffix_token_ids(tokenizer, disabled, tokenizer.encode(""))
+                if ids:
+                    self._think_suffixes = (ids,)
+                    logger.info(
+                        f"[think_suffix] Detected disabled thought block "
+                        f"= {len(ids)} token(s)"
+                    )
             return 0
         except Exception:
             return 0
@@ -1356,7 +1432,7 @@ class MLLMBatchGenerator:
         return copied
 
     @classmethod
-    def _needs_prefill_checkpoint(cls, cache_list) -> bool:
+    def _needs_prefill_checkpoint(cls, cache_list, pending_tokens: int = 0) -> bool:
         """Return whether any cache leaf cannot be rewound after generation.
 
         Hybrid models such as Qwen3.5 mix ordinary KV caches with recurrent
@@ -1364,10 +1440,24 @@ class MLLMBatchGenerator:
         resume, but it cannot be rewound after output tokens have advanced it.
         Such models must therefore store their reusable prompt state while
         prefill is still at the cache-key boundary.
+
+        ``pending_tokens`` is the number of prompt tokens about to be
+        prefilled. A sliding-window ``RotatingKVCache`` is rewindable while
+        empty but not once it wraps, so it needs a checkpoint when the
+        pending tokens will fill its window.
         """
         for cache in cls._cache_leaves(cache_list):
             is_trimmable = getattr(cache, "is_trimmable", None)
             if not callable(is_trimmable) or not is_trimmable():
+                return True
+            max_size = getattr(cache, "max_size", None)
+            offset = getattr(cache, "offset", 0)
+            if (
+                pending_tokens > 0
+                and isinstance(max_size, int)
+                and isinstance(offset, int)
+                and offset + pending_tokens >= max_size
+            ):
                 return True
         return False
 
@@ -1407,7 +1497,8 @@ class MLLMBatchGenerator:
                 f"request batch {input_ids.shape[0]}"
             )
         request.prompt_position_ids = position_ids
-        return rope_deltas
+        deltas: mx.array = rope_deltas
+        return deltas
 
     @staticmethod
     def _language_model_kwargs(
@@ -1445,7 +1536,7 @@ class MLLMBatchGenerator:
             return None
         if any(delta is None for delta in deltas):
             raise RuntimeError("Cannot batch mixed mRoPE and non-mRoPE requests")
-        return mx.concatenate(deltas, axis=0)
+        return mx.concatenate(cast(List[mx.array], deltas), axis=0)
 
     def _conversation_boundary(self, token_ids: List[int]) -> Optional[int]:
         """Return the token count before a trailing think suffix, else None.
@@ -1478,11 +1569,16 @@ class MLLMBatchGenerator:
         and its final logits are stored after prefill, as before.
 
         ``start`` is the number of prompt tokens already restored from the
-        prefix cache; a boundary at or before it is already stored.
+        prefix cache. Boundaries at or before it cannot be captured during
+        this prefill.
         """
-        if self.prefix_cache is None or not self._needs_prefill_checkpoint(cache_list):
+        if self.prefix_cache is None:
             return None, None
-        token_ids = input_ids.reshape(-1).tolist()
+        token_ids = cast(List[int], input_ids.reshape(-1).tolist())
+        if not self._needs_prefill_checkpoint(
+            cache_list, pending_tokens=len(token_ids) - start
+        ):
+            return None, None
         boundary = self._conversation_boundary(token_ids)
         if boundary is None or boundary <= start:
             return None, None
@@ -1498,17 +1594,16 @@ class MLLMBatchGenerator:
         its entry extends the one it was restored from and supersedes it, so a
         growing conversation holds one entry instead of one per turn.
         """
-        if checkpoint_entry is None:
-            return False
-        checkpoint_key = list(checkpoint_entry.tokens)
-        checkpoint_state: Dict[str, Any] = {
-            "key": checkpoint_key,
-            "cancelled": False,
-        }
         with self._prefix_checkpoint_lock:
             if request_id in self._aborted_request_ids:
                 self._aborted_request_ids.discard(request_id)
                 raise PrefillAbortedError(request_id)
+            if checkpoint_entry is None:
+                return False
+            checkpoint_state: Dict[str, Any] = {
+                "key": list(checkpoint_entry.tokens),
+                "cancelled": False,
+            }
             self._request_prefix_checkpoints[request_id] = checkpoint_state
 
         def _commit_allowed() -> bool:
@@ -1517,6 +1612,7 @@ class MLLMBatchGenerator:
                 and not checkpoint_state["cancelled"]
             )
 
+        assert self.prefix_cache is not None
         stored = self.prefix_cache.commit_prepared(
             checkpoint_entry,
             evict_prefixes=evict_prefixes,
@@ -1540,15 +1636,12 @@ class MLLMBatchGenerator:
         last_logits: Any,
         *,
         extends_cached: bool,
-    ) -> None:
-        """Publish a hybrid prompt's full state and final logits after prefill.
+    ) -> bool:
+        """Keep a resident conversation checkpoint or store the full prompt.
 
-        Only for non-rewindable (hybrid) caches: ordinary KV caches are stored
-        on completion instead. Skipped when the prompt ends with the think
-        suffix, because prefill already published its conversation-boundary
-        checkpoint, which replaces this entry (see _prefill_checkpoint_plan).
-        ``extends_cached`` marks prefill that resumed from a prefix-cache hit;
-        the new entry then supersedes the one it was restored from.
+        For non-rewindable caches, store the final logits with the full prompt
+        so exact resends can reuse it. A full prompt ending in a think suffix
+        cannot supersede a shorter checkpoint for future conversation turns.
         """
         if (
             self.prefix_cache is None
@@ -1556,17 +1649,18 @@ class MLLMBatchGenerator:
             or not self._needs_prefill_checkpoint(cache)
             or not callable(getattr(self.prefix_cache, "prepare_store", None))
         ):
-            return
-        token_ids = req.input_ids.reshape(-1).tolist()
-        if self._conversation_boundary(token_ids) is not None:
-            return
+            return False
+        assert req.input_ids is not None
+        token_ids = cast(List[int], req.input_ids.reshape(-1).tolist())
+        boundary = self._conversation_boundary(token_ids)
+        if boundary is not None and token_ids[:boundary] in self.prefix_cache:
+            return True
         entry = self.prefix_cache.prepare_store(
             token_ids, cache, auxiliary={"last_logits": last_logits}
         )
-        if entry is not None:
-            self._publish_prefill_checkpoint(
-                req.request_id, entry, evict_prefixes=extends_cached
-            )
+        return self._publish_prefill_checkpoint(
+            req.request_id, entry, evict_prefixes=extends_cached and boundary is None
+        )
 
     def _run_chunked_text_prefill(
         self, request: MLLMBatchRequest, cache: List[Any], start: int = 0
@@ -1586,6 +1680,7 @@ class MLLMBatchGenerator:
             Logits from the last chunk (same contract as _run_vision_encoding).
         """
         input_ids = request.input_ids
+        assert input_ids is not None
         if input_ids.ndim == 1:
             input_ids = input_ids[None, :]
 
@@ -1611,9 +1706,10 @@ class MLLMBatchGenerator:
             request.vision_encoded = True
             # Release preprocessed inputs after encoding (issue #442)
             self._release_preprocessed_inputs(request)
-            if hasattr(output, "logits"):
-                return output.logits
-            return output
+            short_output: mx.array = (
+                output.logits if hasattr(output, "logits") else output
+            )
+            return short_output
 
         if total - start > step or checkpoint_at is not None:
             logger.info(
@@ -1657,6 +1753,7 @@ class MLLMBatchGenerator:
                 _eval_prompt_cache(cache)
                 checkpoint_snapshot = self._rewind_prefix_cache(cache, 0)
                 if checkpoint_snapshot is not None:
+                    assert self.prefix_cache is not None
                     checkpoint_entry = self.prefix_cache.prepare_store(
                         checkpoint_key, checkpoint_snapshot
                     )
@@ -1697,7 +1794,7 @@ class MLLMBatchGenerator:
             if chunk_count % 4 == 0:
                 mx.clear_cache()
 
-        final_output = output.logits if hasattr(output, "logits") else output
+        final_output: mx.array = output.logits if hasattr(output, "logits") else output
 
         # A disconnect may arrive while the final suffix is executing.  Do
         # not let an aborted or failed prefill populate or evict shared cache
@@ -1761,6 +1858,7 @@ class MLLMBatchGenerator:
         # The VLM passes cache= through to self.language_model(),
         # so the language model writes KV state directly into our cache.
         input_ids = request.input_ids
+        assert input_ids is not None
         if input_ids.ndim == 1:
             input_ids = input_ids[None, :]
 
@@ -1774,9 +1872,8 @@ class MLLMBatchGenerator:
         self._release_preprocessed_inputs(request)
 
         # Handle LanguageModelOutput or plain tensor
-        if hasattr(output, "logits"):
-            return output.logits
-        return output
+        logits: mx.array = output.logits if hasattr(output, "logits") else output
+        return logits
 
     @staticmethod
     def _release_preprocessed_inputs(request: MLLMBatchRequest) -> None:
@@ -1900,6 +1997,8 @@ class MLLMBatchGenerator:
                 self._aborted_request_ids.discard(request.request_id)
                 raise PrefillAbortedError(request.request_id)
 
+        assert config.keep_pct is not None
+        assert config.backbone_pct is not None
         try:
             logits, decode_rope_delta, selected_tokens = run_media_specprefill(
                 self.model,
@@ -1970,7 +2069,7 @@ class MLLMBatchGenerator:
                 self.language_model, "_rope_deltas", None
             )
 
-    def _process_prompts(self, requests: List[MLLMBatchRequest]) -> MLLMBatch:
+    def _process_prompts(self, requests: List[MLLMBatchRequest]) -> Optional[MLLMBatch]:
         """
         Process a batch of requests through vision encoding and initial prefill.
 
@@ -2029,7 +2128,7 @@ class MLLMBatchGenerator:
             need_pres = req.presence_penalty and req.presence_penalty != 0.0
             combined: List[Callable] = []
             if need_rep or need_pres:
-                lp_kwargs = {}
+                lp_kwargs: _PenaltyKwargs = {}
                 if need_rep:
                     lp_kwargs["repetition_penalty"] = req.repetition_penalty
                 if need_pres:
@@ -2122,7 +2221,8 @@ class MLLMBatchGenerator:
                 if self.prefix_cache is not None and is_text_only_prefix_cache_request(
                     req
                 ):
-                    input_ids_list = req.input_ids.reshape(-1).tolist()
+                    assert req.input_ids is not None
+                    input_ids_list = cast(List[int], req.input_ids.reshape(-1).tolist())
                     fetch_auxiliary = getattr(
                         self.prefix_cache, "fetch_exact_auxiliary", None
                     )
@@ -2194,6 +2294,7 @@ class MLLMBatchGenerator:
                         cached_kv = None
 
                 if cached_kv is not None and cached_last_logits is not None:
+                    assert prepared_cache is not None
                     request_cache = prepared_cache
                     last_logits = cached_last_logits
                     sampled, logprobs = _sample_first_token(req, last_logits)
@@ -2208,11 +2309,12 @@ class MLLMBatchGenerator:
                 elif cached_kv is not None and remaining_ids:
                     # Prefix/LCP match — run language model on remaining tokens.
                     # The prepared cache is an isolated recursive copy.
+                    assert prepared_cache is not None
                     request_cache = prepared_cache
                     cached_count = len(input_ids_list) - len(remaining_ids)
                     remaining_count = len(remaining_ids)
 
-                    with mx.stream(MLLMBatchGenerator._stream):
+                    with mx.stream(cast(mx.Stream, MLLMBatchGenerator._stream)):
                         # Same chunked prefill as a miss, resumed at the restored
                         # prefix, so a hit can publish its own (longer) reusable
                         # state for the next turn.
@@ -2246,6 +2348,8 @@ class MLLMBatchGenerator:
                     # Trim by 1 so re-running the last token produces correct
                     # logits for the next-token prediction.
                     # The prepared cache is a safe recursive one-token rewind.
+                    assert prepared_cache is not None
+                    assert req.input_ids is not None
                     request_cache = prepared_cache
                     last_token = req.input_ids[:, -1:]
                     total_tokens = len(input_ids_list)
@@ -2254,7 +2358,7 @@ class MLLMBatchGenerator:
                         total_tokens,
                     )
 
-                    with mx.stream(MLLMBatchGenerator._stream):
+                    with mx.stream(cast(mx.Stream, MLLMBatchGenerator._stream)):
                         logits = self.language_model(
                             last_token,
                             cache=request_cache,
@@ -2286,7 +2390,7 @@ class MLLMBatchGenerator:
                         max_kv_size=self.max_kv_size or None,
                     )
 
-                    with mx.stream(MLLMBatchGenerator._stream):
+                    with mx.stream(cast(mx.Stream, MLLMBatchGenerator._stream)):
                         # Text-only: chunked prefill with real progress tracking
                         # Multimodal: atomic VLM forward (vision encoder needs full input)
                         if req.is_text_only:
@@ -2517,7 +2621,7 @@ class MLLMBatchGenerator:
                     # tokens including the current step's input token (built
                     # by the caller as ``req.output_tokens + [token]``).
                     full_context = output_tokens[e]
-                    for processor in logits_processors[e]:
+                    for processor in logits_processors[e] or []:
                         sample_logits = processor(mx.array(full_context), sample_logits)
                 processed_logits.append(sample_logits)
             logits = mx.concatenate(processed_logits, axis=0)
@@ -2527,7 +2631,7 @@ class MLLMBatchGenerator:
         if samplers and any(samplers):
             sampled_list = []
             for e in range(logprobs.shape[0]):
-                s = samplers[e] if samplers[e] else self.sampler
+                s = samplers[e] or self.sampler
                 sampled_list.append(s(logprobs[e : e + 1]))
             sampled = mx.concatenate(sampled_list, axis=0)
         else:
@@ -2603,7 +2707,7 @@ class MLLMBatchGenerator:
             self, "_allow_mid_batch_extend", True
         ):
             text_only = self._compatible_pending_requests(
-                [r for r in self.unprocessed_requests if not r.images and not r.videos],
+                [r for r in self.unprocessed_requests if not _request_has_media(r)],
                 self.completion_batch_size,
             )
 
@@ -2618,6 +2722,7 @@ class MLLMBatchGenerator:
                         r for r in self.unprocessed_requests if r.uid not in all_uids
                     ]
                     if new_batch is not None:
+                        assert batch is not None
                         batch.extend(new_batch)
                     prompt_processing = True
                 except Exception as e:
@@ -2659,7 +2764,7 @@ class MLLMBatchGenerator:
         y, logprobs = batch.y, batch.logprobs
         output_tokens = None
         if batch.logits_processors:
-            y_list = y.tolist()
+            y_list = cast(List[int], y.tolist())
             output_tokens = [
                 list(req.output_tokens) + [token]
                 for req, token in zip(batch.requests, y_list)
@@ -2676,7 +2781,7 @@ class MLLMBatchGenerator:
         )
         mx.async_eval(batch.y, batch.logprobs)
 
-        y = y.tolist()
+        emitted_tokens = cast(List[int], y.tolist())
         toc = time.perf_counter()
 
         if prompt_processing and num_active == 0:
@@ -2694,7 +2799,7 @@ class MLLMBatchGenerator:
 
         for i, (token, uid, request_id, num_tok, max_tok, req) in enumerate(
             zip(
-                y,
+                emitted_tokens,
                 batch.uids,
                 batch.request_ids,
                 batch.num_tokens,
@@ -2781,7 +2886,7 @@ class MLLMBatchGenerator:
         Returns:
             List of MLLMBatchResponse, one per active request
         """
-        with mx.stream(MLLMBatchGenerator._stream):
+        with mx.stream(cast(mx.Stream, MLLMBatchGenerator._stream)):
             return self._next()
 
     def stats(self) -> MLLMBatchStats:
@@ -2837,10 +2942,11 @@ class MLLMBatchGenerator:
         for i in end_indices:
             req = batch.requests[i]
             if is_text_only_prefix_cache_request(req):
+                assert req.input_ids is not None
                 self._discard_prefill_checkpoint(req.request_id)
                 try:
                     extracted = batch.extract_cache(i)
-                    input_ids_list = req.input_ids.reshape(-1).tolist()
+                    input_ids_list = cast(List[int], req.input_ids.reshape(-1).tolist())
                     # Store prompt-only KV: trim generated tokens (+ think
                     # suffix) so the stored offset equals key length exactly.
                     # The exact-match path trims by 1 at fetch time to
@@ -2887,7 +2993,7 @@ class MLLMBatchGenerator:
 
     def get_specprefill_stats(self) -> Dict[str, Any]:
         """Return aggregate media SpecPrefill decisions and compression."""
-        stats = dict(self._specprefill_stats)
+        stats: Dict[str, Any] = dict(self._specprefill_stats)
         stats["bypass_counts"] = dict(stats["bypass_counts"])
         stats.update(
             {
@@ -2920,7 +3026,7 @@ def _draft_external_mtp_active_batch(
     """Draft one token per row without conflating mixed KV positions."""
     from mlx_vlm.speculative.mtp import _mtp_draft_block_active
 
-    return _mtp_draft_block_active(
+    draft_block: mx.array = _mtp_draft_block_active(
         draft_model,
         primary_tokens.tolist(),
         hidden_states[:, -1:, :],
@@ -2929,7 +3035,8 @@ def _draft_external_mtp_active_batch(
         primary_tokens.dtype,
         positions,
         greedy_sampling=True,
-    )[:, 0]
+    )
+    return draft_block[:, 0]
 
 
 def install_mtp_mllm(
@@ -2975,12 +3082,14 @@ def install_mtp_mllm(
     def _shared_kv(cache: List[Any]) -> Dict[str, Any]:
         from mlx_vlm.speculative.mtp import _mtp_shared_kv_from_prompt_cache
 
-        return _mtp_shared_kv_from_prompt_cache(language_model, cache)
+        shared: Dict[str, Any] = _mtp_shared_kv_from_prompt_cache(language_model, cache)
+        return shared
 
     def _cache_positions(cache: List[Any], batch_size: int) -> Tuple[int, List[int]]:
         from mlx_vlm.speculative.mtp import _mtp_cache_positions
 
-        return _mtp_cache_positions(cache, batch_size)
+        positions: Tuple[int, List[int]] = _mtp_cache_positions(cache, batch_size)
+        return positions
 
     # Skip state belongs to a request, not a batch position. Text-only work
     # may join/leave a continuous batch between decode steps; positional state
@@ -3098,6 +3207,7 @@ def install_mtp_mllm(
                 **original_step_kwargs,
             )
 
+        assert batch_gen.active_batch is not None
         current_uids = list(batch_gen.active_batch.uids)
         skip_entries = [_skip_state_by_uid.pop(uid, None) for uid in current_uids]
         if any(skip_entries) and not all(skip_entries):
@@ -3115,9 +3225,12 @@ def install_mtp_mllm(
             skip_entries = []
 
         if skip_entries and all(skip_entries):
-            logits = mx.concatenate([entry["logits"] for entry in skip_entries], axis=0)
-            hidden_states = mx.concatenate(
-                [entry["hidden"] for entry in skip_entries], axis=0
+            present_entries = [entry for entry in skip_entries if entry is not None]
+            logits = mx.concatenate(
+                [entry["logits"] for entry in present_entries], axis=0
+            )
+            hidden_states: Optional[mx.array] = mx.concatenate(
+                [entry["hidden"] for entry in present_entries], axis=0
             )
         else:
             # Normal forward with return_hidden
@@ -3139,13 +3252,14 @@ def install_mtp_mllm(
                 )
             logits = logits[:, -1, :]
 
+        assert hidden_states is not None
         # Apply logits processors before sampling
         if logits_processors and output_tokens and any(logits_processors):
             processed_logits = []
             for e in range(batch_size):
                 sample_logits = logits[e : e + 1]
                 if logits_processors[e]:
-                    for processor in logits_processors[e]:
+                    for processor in logits_processors[e] or []:
                         sample_logits = processor(
                             mx.array(output_tokens[e]), sample_logits
                         )
@@ -3157,7 +3271,7 @@ def install_mtp_mllm(
         if samplers and any(samplers):
             sampled_list = []
             for e in range(logprobs.shape[0]):
-                s = samplers[e] if samplers[e] else batch_gen.sampler
+                s = samplers[e] or batch_gen.sampler
                 sampled_list.append(s(logprobs[e : e + 1]))
             primary_tokens = mx.concatenate(sampled_list, axis=0)
         else:
@@ -3253,7 +3367,7 @@ def install_mtp_mllm(
             # Verify in each request's sampler space. The old argmax equality
             # check was valid only for greedy decoding and silently bypassed
             # Qwen's normal temperature/top-p/top-k requests.
-            draft_list = draft_tokens.tolist()
+            draft_list = cast(List[int], draft_tokens.tolist())
             residual_tokens_by_uid: Dict[int, int] = {}
             residual_logprobs_by_uid: Dict[int, mx.array] = {}
             if uses_stochastic_sampling and external_drafter:
@@ -3271,11 +3385,12 @@ def install_mtp_mllm(
                 mx.eval(sampled_target, draft_tokens)
                 all_accepted = sampled_target.tolist() == draft_list
                 if not all_accepted:
-                    sampled_target_list = sampled_target.tolist()
+                    sampled_target_list = cast(List[int], sampled_target.tolist())
                     for row, uid in enumerate(current_uids):
                         residual_tokens_by_uid[uid] = int(sampled_target_list[row])
                         residual_logprobs_by_uid[uid] = verify_distribution[row]
             elif uses_stochastic_sampling:
+                assert draft_distribution is not None
                 verify_distribution = mx.concatenate(
                     [
                         _sampling_logprobs(verify_logits[row : row + 1, 0, :], request)
@@ -3289,9 +3404,11 @@ def install_mtp_mllm(
                 for row, uid in enumerate(current_uids):
                     draft_token = int(draft_list[row])
                     accepted = _accept_sampled_draft(
-                        float(verify_distribution[row, draft_token].item()),
-                        float(draft_distribution[row, draft_token].item()),
-                        float(draws[row].item()),
+                        float(
+                            cast(float, verify_distribution[row, draft_token].item())
+                        ),
+                        float(cast(float, draft_distribution[row, draft_token].item())),
+                        float(cast(float, draws[row].item())),
                     )
                     all_accepted = all_accepted and accepted
                     if not accepted and batch_size == 1:
@@ -3301,7 +3418,9 @@ def install_mtp_mllm(
                         )
                         residual_token = mx.random.categorical(residual)
                         mx.eval(residual_token)
-                        residual_tokens_by_uid[uid] = int(residual_token.item())
+                        residual_tokens_by_uid[uid] = int(
+                            cast(int, residual_token.item())
+                        )
                         residual_logprobs_by_uid[uid] = residual[0]
             else:
                 verify_pred = mx.argmax(verify_logits[:, 0, :], axis=-1)
@@ -3410,6 +3529,7 @@ def install_mtp_mllm(
                             # 2-D (batch, vocab) convention every other
                             # _skip_state_by_uid write in this function uses.
                             rerun_logits = rerun_logits[:, -1, :]
+                            assert rerun_hidden is not None
                             rerun_hidden = rerun_hidden[:, -1:, :]
                         else:
                             rerun_logits, rerun_hidden = rerun_out[:, -1, :], None
@@ -3593,8 +3713,8 @@ def install_mtp_mllm(
 
         return augmented
 
-    batch_gen._step = _mtp_step
-    batch_gen._next = _mtp_next
+    setattr(batch_gen, "_step", _mtp_step)
+    setattr(batch_gen, "_next", _mtp_next)
     batch_gen._mtp_runtime_implementation = (
         "external_assistant" if external_drafter else "native_target_head"
     )
@@ -3671,7 +3791,7 @@ def install_chunked_prefill_mllm(
         # Synchronous eval — must have results before context switch
         mx.eval(batch.y, batch.logprobs)
 
-        y = y.tolist()
+        emitted_tokens = cast(List[int], y.tolist())
         batch_gen._stats.generation_time += time.perf_counter() - tic
 
         # Build responses and track finished
@@ -3681,7 +3801,7 @@ def install_chunked_prefill_mllm(
 
         for i, (token, uid, request_id, num_tok, max_tok, req) in enumerate(
             zip(
-                y,
+                emitted_tokens,
                 batch.uids,
                 batch.request_ids,
                 batch.num_tokens,
@@ -3711,6 +3831,9 @@ def install_chunked_prefill_mllm(
             req = batch.requests[i]
             prompt_tokens = req.input_ids.size if req.input_ids is not None else None
 
+            def cache_fn(idx: int = i) -> List[Any]:
+                return batch.extract_cache(idx)
+
             responses.append(
                 MLLMBatchResponse(
                     uid=uid,
@@ -3718,11 +3841,7 @@ def install_chunked_prefill_mllm(
                     token=token,
                     logprobs=logprobs[i],
                     finish_reason=finish_reason,
-                    prompt_cache=(
-                        (lambda idx=i: batch.extract_cache(idx))
-                        if finish_reason is not None
-                        else None
-                    ),
+                    prompt_cache=cache_fn if finish_reason is not None else None,
                     prompt_tokens=prompt_tokens,
                     specprefill_outcome=req.specprefill_outcome,
                 )
@@ -3801,6 +3920,8 @@ def install_chunked_prefill_mllm(
                         partial["cache"], 0
                     )
                     if checkpoint_snapshot is not None:
+                        assert batch_gen.prefix_cache is not None
+                        assert partial["checkpoint_key"] is not None
                         partial["checkpoint_entry"] = (
                             batch_gen.prefix_cache.prepare_store(
                                 partial["checkpoint_key"], checkpoint_snapshot
@@ -3875,6 +3996,10 @@ def install_chunked_prefill_mllm(
                                     )
                                 )
                                 continue
+                        # Resolve audio once (including terminal failures), but
+                        # never select it for the text-only inline path.
+                        if _request_has_media(r):
+                            continue
                         if r.input_ids is not None and r.input_ids.size <= _budget:
                             short_reqs.append(r)
                     if short_reqs:
@@ -3918,7 +4043,7 @@ def install_chunked_prefill_mllm(
                 )
 
                 # Apply logits processors for first token
-                if getattr(req, "logits_processors", None):
+                if req.logits_processors:
                     # Preserve the raw prompt logits stored with the checkpoint.
                     last_logits = prompt_last_logits + 0
                     empty_tokens = mx.array([], dtype=mx.int32)
@@ -3934,67 +4059,48 @@ def install_chunked_prefill_mllm(
                 # Snapshot only after first-token sampling has materialized.
                 # The stored auxiliary remains the raw prompt logits, before
                 # request-local processors are applied.
-                # A prompt ending with the think suffix already holds its
-                # conversation-boundary checkpoint, which replaces this entry.
                 extends_cached = partial["cached_count"] > 0
-                if (
-                    getattr(batch_gen, "prefix_cache", None) is not None
-                    and is_text_only_prefix_cache_request(req)
-                    and batch_gen._needs_prefill_checkpoint(partial["cache"])
-                    and batch_gen._conversation_boundary(
-                        req.input_ids.reshape(-1).tolist()
-                    )
-                    is None
-                ):
-                    full_prompt_entry = batch_gen.prefix_cache.prepare_store(
-                        req.input_ids.reshape(-1).tolist(),
-                        partial["cache"],
-                        auxiliary={"last_logits": prompt_last_logits},
-                    )
-                    if full_prompt_entry is not None:
-                        try:
-                            batch_gen._publish_prefill_checkpoint(
-                                req.request_id,
-                                full_prompt_entry,
-                                evict_prefixes=extends_cached,
-                            )
-                        except PrefillAbortedError:
-                            batch_gen._partial = None
-                            batch_gen._prefill_progress.pop(req.request_id, None)
-                            batch_gen._pending_error_responses.append(
-                                MLLMBatchResponse(
-                                    uid=req.uid,
-                                    request_id=req.request_id,
-                                    token=0,
-                                    logprobs=mx.zeros(1),
-                                    finish_reason="abort",
-                                )
-                            )
-                            mx.clear_cache()
-                            return _generation_step()
-
+                prefix_cache: Optional[MemoryAwarePrefixCache] = getattr(
+                    batch_gen, "prefix_cache", None
+                )
                 checkpoint_entry = partial.get("checkpoint_entry")
-                if checkpoint_entry is not None:
-                    try:
-                        batch_gen._publish_prefill_checkpoint(
+                try:
+                    prompt_cached = (
+                        checkpoint_entry is not None
+                        and batch_gen._publish_prefill_checkpoint(
                             req.request_id,
                             checkpoint_entry,
                             evict_prefixes=extends_cached,
                         )
-                    except PrefillAbortedError:
-                        batch_gen._partial = None
-                        batch_gen._prefill_progress.pop(req.request_id, None)
-                        batch_gen._pending_error_responses.append(
-                            MLLMBatchResponse(
-                                uid=req.uid,
-                                request_id=req.request_id,
-                                token=0,
-                                logprobs=mx.zeros(1),
-                                finish_reason="abort",
-                            )
+                    )
+                    if (
+                        not prompt_cached
+                        and prefix_cache is not None
+                        and req.input_ids is not None
+                    ):
+                        prompt_cached = batch_gen._publish_prompt_state(
+                            req,
+                            partial["cache"],
+                            prompt_last_logits,
+                            extends_cached=extends_cached,
                         )
-                        mx.clear_cache()
-                        return _generation_step()
+                    if req.request_id in batch_gen._aborted_request_ids:
+                        batch_gen._aborted_request_ids.discard(req.request_id)
+                        raise PrefillAbortedError(req.request_id)
+                except PrefillAbortedError:
+                    batch_gen._partial = None
+                    batch_gen._prefill_progress.pop(req.request_id, None)
+                    batch_gen._pending_error_responses.append(
+                        MLLMBatchResponse(
+                            uid=req.uid,
+                            request_id=req.request_id,
+                            token=0,
+                            logprobs=mx.zeros(1),
+                            finish_reason="abort",
+                        )
+                    )
+                    mx.clear_cache()
+                    return _generation_step()
 
                 batch_gen._prefill_progress[req.request_id] = (
                     partial["total"],
@@ -4009,7 +4115,7 @@ def install_chunked_prefill_mllm(
                 need_rep = req.repetition_penalty and req.repetition_penalty != 1.0
                 need_pres = req.presence_penalty and req.presence_penalty != 0.0
                 if need_rep or need_pres:
-                    lp_kwargs = {}
+                    lp_kwargs: _PenaltyKwargs = {}
                     if need_rep:
                         lp_kwargs["repetition_penalty"] = req.repetition_penalty
                     if need_pres:
@@ -4076,22 +4182,22 @@ def install_chunked_prefill_mllm(
 
                 # Store in prefix cache (prompt-only)
                 if (
-                    checkpoint_entry is None
-                    and batch_gen.prefix_cache is not None
+                    not prompt_cached
+                    and prefix_cache is not None
                     and is_text_only_prefix_cache_request(req)
                 ):
                     try:
-                        input_ids_list = req.input_ids.reshape(-1).tolist()
+                        assert req.input_ids is not None
+                        input_ids_list = cast(
+                            List[int], req.input_ids.reshape(-1).tolist()
+                        )
                         S = batch_gen._think_suffix_len
                         cache_key = input_ids_list[:-S] if S > 0 else input_ids_list
-                        # Trim output: at store time output_count=0, so
-                        # trim by S only (matching canonical path's
-                        # output_count + S invariant).
-                        trim_amount = S
+                        # At store time output_count=0, so trim by S only.
                         batch_gen._store_prefix_snapshot(
                             cache_key,
                             partial["cache"],
-                            trim_amount,
+                            S,
                             req.request_id,
                             "interleaved prefill",
                         )
@@ -4125,7 +4231,7 @@ def install_chunked_prefill_mllm(
                 len(batch_gen.unprocessed_requests),
             )
             for r in compatible_pending:
-                if not r.images and not r.videos and not r.audio:
+                if not _request_has_media(r):
                     text_only_req = r
                     break
 
@@ -4156,6 +4262,7 @@ def install_chunked_prefill_mllm(
 
                 # Check prefix cache
                 input_ids = text_only_req.input_ids
+                assert input_ids is not None
                 if input_ids.ndim == 1:
                     input_ids = input_ids[None, :]
 
@@ -4167,7 +4274,7 @@ def install_chunked_prefill_mllm(
                 if batch_gen.prefix_cache is not None and (
                     is_text_only_prefix_cache_request(text_only_req)
                 ):
-                    input_ids_list = input_ids.reshape(-1).tolist()
+                    input_ids_list = cast(List[int], input_ids.reshape(-1).tolist())
                     fetch_auxiliary = getattr(
                         batch_gen.prefix_cache, "fetch_exact_auxiliary", None
                     )
@@ -4215,6 +4322,7 @@ def install_chunked_prefill_mllm(
 
                 if cached_kv is not None and remaining_ids:
                     # Prefix cache hit
+                    assert prepared_cache is not None
                     request_cache = prepared_cache
                     remaining = mx.array(remaining_ids)[None, :]
                     cached_count = total_tokens - len(remaining_ids)
@@ -4222,6 +4330,7 @@ def install_chunked_prefill_mllm(
                 elif cached_kv is not None and not remaining_ids:
                     # Exact hit — trim cache by 1 so replaying the last token
                     # produces correct logits (same as _process_prompts path).
+                    assert prepared_cache is not None
                     request_cache = prepared_cache
                     remaining = input_ids[:, -1:]
                     cached_count = total_tokens - 1
@@ -4294,6 +4403,7 @@ def install_chunked_prefill_mllm(
                             request_cache, 0
                         )
                         if checkpoint_snapshot is not None:
+                            assert batch_gen.prefix_cache is not None
                             batch_gen._partial["checkpoint_entry"] = (
                                 batch_gen.prefix_cache.prepare_store(
                                     checkpoint_key, checkpoint_snapshot
@@ -4342,7 +4452,7 @@ def install_chunked_prefill_mllm(
                 mx.clear_cache()
         _orig_remove(uids)
 
-    batch_gen.remove = _patched_remove
-    batch_gen._next = _chunked_next
+    setattr(batch_gen, "remove", _patched_remove)
+    setattr(batch_gen, "_next", _chunked_next)
 
     logger.info(f"[chunked-prefill-mllm] Installed (budget={budget} tokens/step)")

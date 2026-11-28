@@ -85,7 +85,7 @@ class BaseThinkingReasoningParser(ReasoningParser):
         self._in_tool_call = False
         self._tool_call_buffer = ""
         # Trailing text withheld because it might be the start of a tag.
-        self._pending = ""
+        self._pending: str = ""
         # Template injected an open <think>: untagged output is reasoning.
         self._implicit_mode = False
 
@@ -300,9 +300,9 @@ class BaseThinkingReasoningParser(ReasoningParser):
             remainder = stripped
             break
 
-        reasoning = "\n".join(reasoning_parts).strip() or None
+        final_reasoning = "\n".join(reasoning_parts).strip() or None
         content = remainder.strip() or None
-        return reasoning, content
+        return final_reasoning, content
 
     def _transition_to_content(
         self, reasoning: str | None, content: str | None
@@ -489,7 +489,7 @@ class BaseThinkingReasoningParser(ReasoningParser):
             unclosed_block = unclosed_match.group(0)
             cleaned = cleaned[: unclosed_match.start()]
 
-        cleaned = cleaned.strip() or None
+        final_reasoning = cleaned.strip() or None
         promoted_count = len(closed) + (1 if unclosed_block else 0)
 
         if promoted_count == 0:
@@ -510,7 +510,7 @@ class BaseThinkingReasoningParser(ReasoningParser):
                 result_content + "\n" + closed_text if result_content else closed_text
             )
 
-        result_content = result_content.strip() or None
+        final_content = result_content.strip() or None
 
         logger.warning(
             "Promoted %d tool_call block(s) from reasoning to content "
@@ -520,4 +520,4 @@ class BaseThinkingReasoningParser(ReasoningParser):
             1 if unclosed_block else 0,
         )
 
-        return cleaned, result_content
+        return final_reasoning, final_content

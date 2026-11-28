@@ -90,7 +90,7 @@ def build_message_content(text: str, files: list[str] | None = None) -> list | s
     if not files:
         return text
 
-    content = []
+    content: list[dict[str, str | dict[str, str]]] = []
 
     # Add text part first
     if text:
@@ -127,7 +127,7 @@ def create_chat_function(
         Chat function compatible with gr.ChatInterface
     """
     # Store media from previous messages to include in context
-    media_cache = {}  # Maps message index to list of file data URLs
+    media_cache: dict[int, list[dict[str, str | dict[str, str]]]] = {}
 
     def chat(message: dict, history: list) -> str:
         """
@@ -158,6 +158,7 @@ def create_chat_function(
                 # Check if this message had media cached
                 if i in media_cache and role == "user":
                     # Rebuild multimodal content with cached media
+                    rebuilt_content: list[dict[str, str | dict[str, str]]]
                     if isinstance(content, str):
                         rebuilt_content = [{"type": "text", "text": content}]
                     elif isinstance(content, list):
@@ -200,7 +201,7 @@ def create_chat_function(
         # Cache media for this message (will be at index len(history) after this turn)
         if files:
             current_idx = len(history)
-            media_items = []
+            media_items: list[dict[str, str | dict[str, str]]] = []
             for file_path in files:
                 data_url, media_type = encode_file_to_base64(file_path)
                 if media_type == "image":
@@ -228,7 +229,8 @@ def create_chat_function(
             )
             response.raise_for_status()
             result = response.json()
-            return result["choices"][0]["message"]["content"]
+            response_text: str = result["choices"][0]["message"]["content"]
+            return response_text
 
         except requests.exceptions.ConnectionError:
             return "Error: Cannot connect to server. Make sure vllm-mlx is running."
@@ -342,7 +344,8 @@ Note: Make sure the vllm-mlx server is running with a multimodal model:
                 )
                 response.raise_for_status()
                 result = response.json()
-                return result["choices"][0]["message"]["content"]
+                response_text: str = result["choices"][0]["message"]["content"]
+                return response_text
             except requests.exceptions.ConnectionError:
                 return "Error: Cannot connect to server. Make sure vllm-mlx is running."
             except requests.exceptions.Timeout:

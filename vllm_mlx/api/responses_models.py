@@ -209,9 +209,7 @@ class ResponseObject(BaseModel):
     user: str | None = None
     store: bool = True
 
-    @computed_field
-    @property
-    def output_text(self) -> str:
+    def _output_text(self) -> str:
         """Concatenate assistant text content into the convenience field."""
         text_parts: list[str] = []
         for item in self.output:
@@ -224,6 +222,8 @@ class ResponseObject(BaseModel):
                 if part.type == "output_text":
                     text_parts.append(part.text)
         return "".join(text_parts)
+
+    output_text = computed_field(property(_output_text))
 
 
 class ResponsesEventBase(BaseModel):

@@ -55,7 +55,7 @@ def normalize_messages_for_chat_template(messages: list[Any]) -> list[dict]:
     - convert OpenAI tool-call argument JSON strings to mappings for templates
       that iterate argument keys
     """
-    normalized = json.loads(
+    normalized: list[Any] = json.loads(
         json.dumps([_message_to_dict(message) for message in messages], default=str)
     )
     for message in normalized:

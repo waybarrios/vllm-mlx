@@ -59,8 +59,8 @@ class EmbeddingEngine:
         token_budget: int = DEFAULT_EMBEDDING_TOKEN_BUDGET,
     ):
         self.model_name = model_name
-        self._model = None
-        self._tokenizer = None
+        self._model: Any | None = None
+        self._tokenizer: Any | None = None
         self._max_length: int | None = None
         self._max_length_ceiling = max_length_ceiling
         self._overflow_policy = overflow_policy
@@ -129,12 +129,14 @@ class EmbeddingEngine:
         tokenizer failure instead of masking it with a heuristic; see
         _estimated_token_length() for the reporting-only fallback.
         """
+        assert self._tokenizer is not None
         tokens = self._tokenizer.encode(text)
         if isinstance(tokens, list):
             return len(tokens)
         elif hasattr(tokens, "__len__"):
             return len(tokens)
-        return tokens.size
+        size: int = tokens.size
+        return size
 
     def _estimated_token_length(self, text: str) -> int:
         """Approximate token count for usage reporting only (count_tokens()).
@@ -242,8 +244,10 @@ class EmbeddingEngine:
 
         input_ids = mx.array(encoded["input_ids"])
         attention_mask = mx.array(encoded["attention_mask"])
+        assert self._model is not None
         output = self._model(input_ids, attention_mask=attention_mask)
-        return output.text_embeds.tolist()
+        embeddings: list[list[float]] = output.text_embeds.tolist()
+        return embeddings
 
     def _token_budget_batches(self, effective_counts: list[int]) -> list[list[int]]:
         """Group text indices into sub-batches whose padded token positions

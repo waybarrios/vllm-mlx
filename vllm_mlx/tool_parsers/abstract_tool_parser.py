@@ -8,12 +8,10 @@ Inspired by vLLM's tool parser architecture but simplified for MLX backend.
 import importlib
 import re
 from abc import ABC, abstractmethod
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from functools import cached_property
-from typing import Any
-
-from transformers import PreTrainedTokenizerBase
+from typing import Any, Protocol, TypeVar, overload
 
 # Pattern to match and strip think tags
 # Handles two cases:
@@ -35,6 +33,10 @@ class ExtractedToolCallInformation:
 
     content: str | None = None
     """Any content that wasn't part of tool calls."""
+
+
+class ToolParserTokenizer(Protocol):
+    def get_vocab(self) -> dict[str, int]: ...
 
 
 class ToolParser(ABC):
@@ -100,7 +102,7 @@ class ToolParser(ABC):
 
         return result.strip()
 
-    def __init__(self, tokenizer: PreTrainedTokenizerBase | None = None):
+    def __init__(self, tokenizer: ToolParserTokenizer | None = None):
         """
         Initialize the tool parser.
 
@@ -117,7 +119,8 @@ class ToolParser(ABC):
         """Get the tokenizer vocabulary."""
         if self.model_tokenizer is None:
             return {}
-        return self.model_tokenizer.get_vocab()
+        vocab: dict[str, int] = self.model_tokenizer.get_vocab()
+        return vocab
 
     @abstractmethod
     def extract_tool_calls(
@@ -195,6 +198,9 @@ class ToolParser(ABC):
         self.prev_tool_call_arr = []
 
 
+_ToolParserT = TypeVar("_ToolParserT", bound=ToolParser)
+
+
 class ToolParserManager:
     """
     Central registry for ToolParser implementations.
@@ -236,7 +242,7 @@ class ToolParserManager:
         module_path, class_name = cls.lazy_parsers[name]
         try:
             mod = importlib.import_module(module_path)
-            parser_cls = getattr(mod, class_name)
+            parser_cls: type[ToolParser] = getattr(mod, class_name)
             if not issubclass(parser_cls, ToolParser):
                 raise TypeError(
                     f"{class_name} in {module_path} is not a ToolParser subclass."
@@ -249,12 +255,30 @@ class ToolParserManager:
             ) from e
 
     @classmethod
+    @overload
     def register_module(
         cls,
         name: str | list[str],
-        module: type[ToolParser] | None = None,
+        module: type[_ToolParserT],
         force: bool = True,
-    ) -> type[ToolParser] | None:
+    ) -> type[_ToolParserT]: ...
+
+    @classmethod
+    @overload
+    def register_module(
+        cls,
+        name: str | list[str],
+        module: None = None,
+        force: bool = True,
+    ) -> Callable[[type[_ToolParserT]], type[_ToolParserT]]: ...
+
+    @classmethod
+    def register_module(
+        cls,
+        name: str | list[str],
+        module: type[_ToolParserT] | None = None,
+        force: bool = True,
+    ) -> type[_ToolParserT] | Callable[[type[_ToolParserT]], type[_ToolParserT]]:
         """
         Register a ToolParser class.
 
@@ -283,14 +307,14 @@ class ToolParserManager:
             return module
 
         # Decorator usage
-        def decorator(parser_cls: type[ToolParser]) -> type[ToolParser]:
+        def decorator(parser_cls: type[_ToolParserT]) -> type[_ToolParserT]:
             for n in names:
                 if not force and n in cls.tool_parsers:
                     raise KeyError(f"Parser '{n}' is already registered")
                 cls.tool_parsers[n] = parser_cls
             return parser_cls
 
-        return decorator  # type: ignore
+        return decorator
 
     @classmethod
     def register_lazy_module(cls, name: str, module_path: str, class_name: str) -> None:
