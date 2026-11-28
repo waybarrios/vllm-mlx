@@ -3,15 +3,11 @@
 Reasoning parser for GLM-4 models (GLM-4.5-Air, GLM-4.6V, GLM-4.7, etc.).
 
 GLM-4 uses <think>...</think> tags for reasoning content, same as Qwen3.
-However, unlike Qwen3, GLM-4 does NOT inject <think> in the prompt —
-the model decides autonomously whether to reason.
-
-This means:
-- Output without tags = normal response (no reasoning)
-- Output with tags = reasoning + content
-
-This is the opposite of Qwen3 where no tags = pure reasoning (because
-<think> was injected in the prompt and the model hit max_tokens).
+The prompt format depends on the chat template. GLM-4.7 injects an open
+<think> when thinking is enabled and a closing </think> when disabled.
+The server detects an injected opening tag and enables implicit reasoning
+for that request's streaming parser. Without that signal, untagged streaming
+output remains normal content.
 
 GLM-4.6V also wraps responses in <|begin_of_box|>...<|end_of_box|> container
 tags which must be stripped before returning content.
@@ -29,13 +25,13 @@ class Glm4ReasoningParser(BaseThinkingReasoningParser):
     Reasoning parser for GLM-4 models.
 
     GLM-4 uses <think>...</think> tokens to denote reasoning text.
-    Unlike Qwen3, the template does NOT inject <think> in the prompt,
-    so output without tags is a normal response (not truncated reasoning).
+    Untagged streaming output is normal content by default. A template that
+    injects an opening tag enables implicit reasoning for that stream.
 
     Supports three scenarios:
     1. Both tags in output: <think>reasoning</think>content
     2. Only closing tag (think in prompt): reasoning</think>content
-    3. No tags: pure content (NOT reasoning)
+    3. No tags: pure content in complete output and autonomous streams
 
     Example (with thinking):
         Input: "<think>Let me analyze...</think>The answer is 42."
@@ -70,9 +66,9 @@ class Glm4ReasoningParser(BaseThinkingReasoningParser):
         """
         Extract reasoning from streaming delta.
 
-        Overrides base class pre_think behavior: when no tags have been seen,
-        emit delta as content (not reasoning). GLM-4 doesn't inject <think>
-        in the prompt, so early tokens without tags are normal content.
+        When no tags have been seen, emit the delta as content unless the
+        request's template injected an opening tag. With implicit reasoning
+        enabled, delegate to the base parser until the closing tag arrives.
 
         Once <think> is seen, delegates to base class state machine.
         """
