@@ -78,6 +78,52 @@ def test_model_stream_generate_passes_num_draft_tokens():
     assert captured_kwargs["num_draft_tokens"] == 4
 
 
+@pytest.mark.parametrize(
+    "chunk_count, terminal_text, terminal_metadata, stop, expected_reason",
+    [
+        pytest.param(1, "", {"finish_reason": "stop"}, None, "stop", id="early-eos"),
+        pytest.param(2, "", {"finish_reason": "stop"}, None, "stop", id="eos-at-cap"),
+        pytest.param(
+            2, "world", {"finish_reason": "length"}, None, "length", id="token-cap"
+        ),
+        pytest.param(2, "world", {}, None, "length", id="missing-backend-reason"),
+        pytest.param(
+            2,
+            "world END",
+            {"finish_reason": "length"},
+            ["END"],
+            "stop",
+            id="custom-stop-at-cap",
+        ),
+    ],
+)
+def test_model_stream_generate_preserves_finish_reason(
+    chunk_count, terminal_text, terminal_metadata, stop, expected_reason
+):
+    from vllm_mlx.models.llm import MLXLanguageModel
+
+    model = MLXLanguageModel("test-model")
+    model._loaded = True
+    model.model = object()
+    model.tokenizer = MagicMock()
+    model.tokenizer.encode.return_value = [1, 2, 3]
+
+    responses = []
+    if chunk_count == 2:
+        responses.append(SimpleNamespace(text="Hello ", token=1, finish_reason=None))
+    responses.append(SimpleNamespace(text=terminal_text, token=2, **terminal_metadata))
+
+    with patch("mlx_lm.stream_generate", return_value=iter(responses)):
+        chunks = list(model.stream_generate("Hello", max_tokens=2, stop=stop))
+
+    assert len(chunks) == chunk_count
+    for chunk in chunks[:-1]:
+        assert not chunk.finished
+        assert chunk.finish_reason is None
+    assert chunks[-1].finish_reason == expected_reason
+    assert chunks[-1].finished
+
+
 @pytest.mark.slow
 def test_model_load(small_model_name):
     """Test loading a model (slow test, downloads model)."""
