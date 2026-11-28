@@ -5315,10 +5315,18 @@ class TestChatCompletionStreamingModeSwitching:
         assert response.status_code == 200
         assert extract_calls["count"] == 1
 
+    @pytest.mark.parametrize(
+        "terminal_text, finish_reason, expected_stop_reason",
+        [
+            pytest.param("b", "length", "max_tokens", id="length-with-text"),
+            pytest.param("", "length", "max_tokens", id="length-without-text"),
+            pytest.param("", "stop", "end_turn", id="eos-without-text"),
+        ],
+    )
     def test_anthropic_stream_reports_max_tokens_and_input_tokens(
-        self, client, monkeypatch
+        self, client, monkeypatch, terminal_text, finish_reason, expected_stop_reason
     ):
-        """Anthropic streaming should surface finish_reason=length and prompt usage."""
+        """Anthropic streaming should report the final reason and cumulative usage."""
         import json
 
         import vllm_mlx.server as server
@@ -5331,15 +5339,19 @@ class TestChatCompletionStreamingModeSwitching:
 
             async def stream_chat(self, messages, **kwargs):
                 yield GenerationOutput(
-                    text="a", new_text="a", prompt_tokens=7, completion_tokens=1
+                    text="a",
+                    new_text="a",
+                    completion_tokens=1,
+                    finished=False,
+                    finish_reason=None,
                 )
                 yield GenerationOutput(
-                    text="ab",
-                    new_text="b",
+                    text="a" + terminal_text,
+                    new_text=terminal_text,
                     prompt_tokens=7,
                     completion_tokens=2,
                     finished=True,
-                    finish_reason="length",
+                    finish_reason=finish_reason,
                 )
 
         monkeypatch.setattr(server, "_engine", FakeEngine())
@@ -5370,7 +5382,7 @@ class TestChatCompletionStreamingModeSwitching:
             for line in response.text.splitlines()
             if line.startswith("data: ") and '"message_delta"' in line
         )
-        assert delta["delta"]["stop_reason"] == "max_tokens"
+        assert delta["delta"]["stop_reason"] == expected_stop_reason
         assert delta["usage"] == {"input_tokens": 7, "output_tokens": 2}
 
 

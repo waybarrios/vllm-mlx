@@ -321,10 +321,13 @@ class MLXLanguageModel:
                         break
                 accumulated_tail = combined[-max_stop_len:]
 
-            finished = should_stop or token_count >= max_tokens
-            finish_reason = None
-            if finished:
-                finish_reason = "stop" if should_stop else "length"
+            # The backend can report EOS on the last allowed token.
+            finish_reason = (
+                "stop" if should_stop else getattr(response, "finish_reason", None)
+            )
+            if finish_reason is None and token_count >= max_tokens:
+                finish_reason = "length"
+            finished = finish_reason is not None
 
             yield StreamingOutput(
                 text=new_text,
